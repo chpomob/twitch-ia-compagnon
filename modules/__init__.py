@@ -1,0 +1,1 @@
+"""Filesystem-discovered companion modules."""
