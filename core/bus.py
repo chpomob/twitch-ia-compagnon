@@ -13,6 +13,13 @@ Event = dict[str, Any]
 Handler = Callable[[Event], Any]
 
 
+@lru_cache(maxsize=4096)
+def matches_event_pattern(pattern: str, event_type: str) -> bool:
+    """Return whether a concrete event type matches a subscription pattern."""
+
+    return _matches(_validate_pattern(pattern), _validate_event_type(event_type))
+
+
 class PublicationError(RuntimeError):
     """Raised when a subscriber fails while handling a publication."""
 

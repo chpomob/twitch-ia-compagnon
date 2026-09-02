@@ -1,0 +1,6 @@
+name: brain
+produces:
+  - channel.chat.send
+consumes:
+  - channel.chat.message
+middleware: false
