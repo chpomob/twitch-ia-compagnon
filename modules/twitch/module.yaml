@@ -1,0 +1,6 @@
+name: twitch
+produces:
+  - channel.chat.message
+consumes:
+  - channel.chat.send
+middleware: false
