@@ -1,0 +1,74 @@
+[
+  {
+    "id": "P1",
+    "severity": "major",
+    "step": "P7",
+    "summary": "The three module.yaml manifests are created in P7 but P4-P6 write the module packages earlier and P7 depends only on [P3], so the module directories are incomplete between steps and P5/P6 are written against manifests that do not exist yet.",
+    "evidence": "P7 Files: [`modules/twitch/module.yaml`, `modules/brain/module.yaml`, `modules/audit/module.yaml`, `config.yaml.example`, `tests/test_examples.py`] with Dependencies: [P3]; P4 Files: [`modules/twitch/__init__.py`, ...], P5 Files: [`modules/brain/__init__.py`, ...], P6 Files: [`modules/audit/__init__.py`, ...], each Dependencies: [P2]. P2 states the loader 'requires and safely parses `module.yaml`' for every immediate child directory, so after P4-P6 each `modules/<name>/` directory is undiscoverable until P7 lands.",
+    "confidence": "high",
+    "basis": "code"
+  },
+  {
+    "id": "P2",
+    "severity": "major",
+    "step": "P6",
+    "summary": "P6 derives its subscription order from the audit manifest, an artifact produced by the later step P7, but declares no dependency on it.",
+    "evidence": "P6 Description: 'register exactly one `**` handler using the audit manifest's required order `90`'; P6 Dependencies: [P2]. The audit manifest is created only in P7 ('audit consumes `**`, produces no events, sets `middleware: true`, and sets integer order `90`').",
+    "confidence": "medium",
+    "basis": "code"
+  },
+  {
+    "id": "P3",
+    "severity": "major",
+    "step": "P5",
+    "summary": "P5 validates tags against the brain manifest's declared `produces` patterns, but that manifest is authored in the later step P7 and P5 does not depend on it.",
+    "evidence": "P5 Description: 'validate every tag as a concrete event type permitted by the brain manifest's declared `produces` patterns'; P5 Dependencies: [P2]. `modules/brain/module.yaml` first appears in P7 Files.",
+    "confidence": "medium",
+    "basis": "code"
+  },
+  {
+    "id": "P4",
+    "severity": "major",
+    "step": "P4",
+    "summary": "P4 is too large for one dev-loop iteration: it bundles authentication, EventSub session establishment, background reception, deduplication, two distinct reconnect branches, and the Helix send path in a single step covering four acceptance criteria.",
+    "evidence": "P4 Description covers 'Validate the configured access token/client identity ... establish an EventSub WebSocket, wait for its welcome session, and create the broadcaster `channel.chat.message` subscription ... Run reception in a managed background task ... add a message ID to an activation-lifetime deduplication set ... Handle Twitch reconnect instructions ... recover other retryable disconnects with bounded backoff ... Subscribe to `channel.chat.send` ... POST one Helix chat-message request', all in [`modules/twitch/__init__.py`, `tests/test_twitch.py`] for AC10-AC13. The source (AC10/AC11) and sink (AC12) halves are separable and could be split into two steps.",
+    "confidence": "medium",
+    "basis": "inference"
+  },
+  {
+    "id": "P5",
+    "severity": "minor",
+    "step": "P1",
+    "summary": "P1's Risks field points to the wrong step for audit non-blocking behavior (P7 is manifests/example config; audit is P6).",
+    "evidence": "P1 Risks: 'while audit non-blocking behavior is handled separately in P7.' P7 is 'Supply coherent manifests and a secret-free runnable example'; audit middleware is P6.",
+    "confidence": "high",
+    "basis": "code"
+  },
+  {
+    "id": "P6",
+    "severity": "minor",
+    "step": "P3",
+    "summary": "Validation of the `modules` mapping keys against discovered manifest names is assigned to both P2 (core/loader.py) and P3 (core/main.py) with no stated boundary, and P3's entry point cannot know manifest names before the loader discovers them.",
+    "evidence": "P3: 'require ... a `modules` mapping keyed only by manifest names'; P2: 'Validate both every `enabled_modules` entry and every key in the configuration's `modules` mapping against the discovered manifest names'. Both steps also test the same case (P3 Tests: 'a `modules` key that is not a discovered manifest name'; P2 Tests: 'an undiscovered name referenced only as a `modules` mapping key').",
+    "confidence": "high",
+    "basis": "code"
+  },
+  {
+    "id": "P7",
+    "severity": "minor",
+    "step": "overall",
+    "summary": "The requirement-coverage table maps R3 to AC20, which is an R7 acceptance criterion about `config.yaml.example`, overstating R3's coverage scope.",
+    "evidence": "Requirement coverage table row: '| R3 | P3, P7, P8, P9 | AC7-AC9, AC20, and lifecycle portions of AC21 |'. Spec lists 'AC20 (R7)'.",
+    "confidence": "high",
+    "basis": "spec"
+  },
+  {
+    "id": "P8",
+    "severity": "nit",
+    "step": "P9",
+    "summary": "P9 lists all 20 repository files in its Files field although it is a review gate that writes no files, which conflicts with the convention that Files names the artifacts a step produces or modifies.",
+    "evidence": "P9 Files enumerates `pyproject.toml` through `tests/test_integration.py`, while its Description says 'Gate PR delivery on a review of the complete branch diff' and its Tests say 'Record review evidence in the PR/check result rather than adding generated reports to the repository.'",
+    "confidence": "high",
+    "basis": "code"
+  }
+]
