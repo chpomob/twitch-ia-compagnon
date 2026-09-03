@@ -1,0 +1,6 @@
+name: audit
+produces: []
+consumes:
+  - "**"
+middleware: true
+order: 90
