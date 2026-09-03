@@ -1,0 +1,26 @@
+# Copy this file to config.yaml, export the referenced environment variables,
+# then run: python -m core.main --config config.yaml
+# Environment references must remain in the exact ${NAME} form shown below.
+
+modules_directory: ./modules
+
+enabled_modules:
+  - twitch
+  - brain
+  - audit
+
+modules:
+  twitch:
+    client_id: ${TWITCH_CLIENT_ID}
+    client_secret: ${TWITCH_CLIENT_SECRET}
+    access_token: ${TWITCH_ACCESS_TOKEN}
+    broadcaster_id: ${TWITCH_BROADCASTER_ID}
+    bot_user_id: ${TWITCH_BOT_USER_ID}
+
+  brain:
+    endpoint: ${OPENAI_ENDPOINT}
+    model: ${OPENAI_MODEL}
+    api_key: ${OPENAI_API_KEY}
+
+  audit:
+    output: stdout
