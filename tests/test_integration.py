@@ -218,8 +218,10 @@ async def _start_application(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("self_echo", [False, True])
 async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
     monkeypatch: pytest.MonkeyPatch,
+    self_echo: bool,
 ) -> None:
     environ = _environment()
     websocket = FakeWebSocket(_welcome())
@@ -255,6 +257,13 @@ async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
     ready = asyncio.Event()
     task = await _start_application(environ, stop, ready, diagnostics)
     try:
+        if self_echo:
+            own_message = _notification(environ, "bot-echo", "Hello there")
+            own_message["payload"]["event"]["chatter_user_id"] = environ[
+                "TWITCH_BOT_USER_ID"
+            ]
+            websocket.feed(own_message)
+            websocket.feed(own_message)
         websocket.feed(_notification(environ, "incoming-one", "Hello companion"))
         await asyncio.wait_for(audit_complete.wait(), timeout=1)
     finally:
@@ -264,6 +273,9 @@ async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
     assert diagnostics == []
     assert len(brain_session.post_calls) == 1
     model_call = brain_session.post_calls[0]
+    assert "source_message_id: incoming-one" in (
+        model_call["json"]["messages"][-1]["content"]
+    )
     assert model_call["url"] == environ["OPENAI_ENDPOINT"]
     assert model_call["json"]["model"] == environ["OPENAI_MODEL"]
     assert model_call["headers"]["Authorization"] == (

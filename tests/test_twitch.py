@@ -14,6 +14,7 @@ from modules.twitch import (
     EVENTSUB_URL,
     HELIX_CHAT_URL,
     TOKEN_VALIDATION_URL,
+    TwitchModule,
     TwitchModuleError,
     activate,
 )
@@ -780,3 +781,48 @@ async def test_pending_send_releases_response_on_timeout_cancellation_and_close(
         await handle.close()
     assert session.close_calls == 1
     assert websocket.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_self_notifications_are_not_published_or_deduplicated() -> None:
+    session = FakeSession([FakeWebSocket(welcome("session-self"))])
+    handle, bus, diagnostics = await activate_with(session)
+    try:
+        own_message = notification("self-message")
+        own_message["payload"]["event"]["chatter_user_id"] = SETTINGS["bot_user_id"]
+        await handle._publish_notification(own_message)
+        await handle._publish_notification(own_message)
+        assert bus.list_events() == []
+
+        # Ignored echoes must not change the publication dedupe state.
+        await handle._publish_notification(notification("self-message"))
+        await handle._publish_notification(notification("self-message"))
+        assert len(bus.list_events()) == 1
+        assert bus.list_events()[0]["payload"]["chatter_id"] == "viewer-7"
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity",
+    [{}, {"bot_user_id": None}, {"bot_user_id": ""}, {"bot_user_id": "   "}],
+)
+async def test_notification_filter_tolerates_missing_identity(
+    identity: dict[str, Any],
+) -> None:
+    # Activation requires a bot ID for EventSub; exercise reception defensively
+    # with incomplete settings without weakening that transport contract.
+    bus = EventBus()
+    diagnostics: list[str] = []
+    handle = TwitchModule(
+        bus, SimpleNamespace(**identity), FakeSession([]), diagnostics.append, no_delay
+    )
+    try:
+        await handle._publish_notification(notification("viewer-message"))
+        assert len(bus.list_events()) == 1
+        assert bus.list_events()[0]["payload"]["chatter_id"] == "viewer-7"
+        assert diagnostics == []
+    finally:
+        await handle.close()

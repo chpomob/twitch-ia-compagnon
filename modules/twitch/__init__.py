@@ -550,6 +550,15 @@ class TwitchModule:
             "message_id": _required_string(event, "message_id"),
             "text": _required_string(message, "text", allow_empty=True),
         }
+        # Drop self echoes before they can trigger any bus consumer (brain).
+        bot_user_id = getattr(self._settings, "bot_user_id", None)
+        if (
+            isinstance(bot_user_id, str)
+            and bot_user_id.strip()
+            and mapped["chatter_id"] == bot_user_id
+        ):
+            return
+
         message_id = mapped["message_id"]
 
         async with self._publish_lock:
