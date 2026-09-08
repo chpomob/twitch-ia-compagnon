@@ -150,13 +150,19 @@ async def run(
             bus = EventBus()
             loader = ModuleLoader(bus, config["modules_directory"])
             activations = await loader.activate_enabled(config)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             partial = (
                 []
                 if loader is None
                 else list(getattr(loader, "activations", ()))
             )
             close_failures = await _close_activations(partial)
+            if isinstance(exc, asyncio.CancelledError):
+                # The assignment above has not completed; the loader owns the
+                # handles already returned by successful activation hooks.
+                for failure in close_failures:
+                    report_diagnostic(failure)
+                raise
             report_diagnostic(_startup_diagnostic(exc))
             for failure in close_failures:
                 report_diagnostic(failure)
