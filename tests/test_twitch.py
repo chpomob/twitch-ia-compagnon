@@ -12,6 +12,7 @@ from core.bus import EventBus
 from modules.twitch import (
     EVENTSUB_SUBSCRIPTIONS_URL,
     EVENTSUB_URL,
+    HELIX_CHAT_URL,
     TOKEN_VALIDATION_URL,
     TwitchModuleError,
     activate,
@@ -67,6 +68,7 @@ class FakeSession:
         *,
         validation: FakeResponse | None = None,
         subscriptions: list[FakeResponse] | None = None,
+        sends: list[Any] | None = None,
     ) -> None:
         self.websockets = list(websockets)
         self.validation = validation or FakeResponse(
@@ -76,6 +78,7 @@ class FakeSession:
         self.subscriptions = subscriptions or [
             FakeResponse(202, {"data": [{"id": "subscription"}]})
         ]
+        self.sends = list(sends or [])
         self.get_calls: list[dict[str, Any]] = []
         self.post_calls: list[dict[str, Any]] = []
         self.ws_calls: list[str] = []
@@ -90,6 +93,11 @@ class FakeSession:
         self.post_calls.append(call)
         if url == EVENTSUB_SUBSCRIPTIONS_URL:
             return self.subscriptions.pop(0)
+        if url == HELIX_CHAT_URL:
+            result = self.sends.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
         raise AssertionError(f"unexpected POST URL: {url}")
 
     async def ws_connect(self, url: str) -> FakeWebSocket:
@@ -604,3 +612,171 @@ def test_transport_urls_are_the_expected_twitch_operations() -> None:
     assert EVENTSUB_SUBSCRIPTIONS_URL == (
         "https://api.twitch.tv/helix/eventsub/subscriptions"
     )
+
+
+def sent_response() -> FakeResponse:
+    return FakeResponse(200, {"data": [{"message_id": "sent", "is_sent": True}]})
+
+
+@pytest.mark.asyncio
+async def test_chat_send_uses_configured_identity_and_preserves_event() -> None:
+    class RecordingBus(EventBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.patterns: list[str] = []
+
+        def subscribe(self, pattern, handler, order=0):
+            self.patterns.append(pattern)
+            super().subscribe(pattern, handler, order)
+
+    response = sent_response()
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[response])
+    handle, bus, diagnostics = await activate_with(session, RecordingBus())
+    payload = {"text": " Hello! ", "parent_message_id": "parent"}
+    metadata = {"source": "test", "delivery_status": "failed"}
+    try:
+        result = await bus.publish("channel.chat.send", payload, metadata)
+        assert bus.patterns == ["channel.chat.send"]
+        assert session.post_calls[-1] == {
+            "url": HELIX_CHAT_URL,
+            "headers": {
+                "Authorization": f"Bearer {SETTINGS['access_token']}",
+                "Client-Id": SETTINGS["client_id"],
+                "Content-Type": "application/json",
+            },
+            "json": {
+                "broadcaster_id": SETTINGS["broadcaster_id"],
+                "sender_id": SETTINGS["bot_user_id"],
+                "message": " Hello! ",
+                "reply_parent_message_id": "parent",
+            },
+        }
+        assert result["payload"] == payload
+        assert result["metadata"] == {"source": "test", "delivery_status": "sent"}
+        assert metadata == {"source": "test", "delivery_status": "failed"}
+        assert response.release_calls == 1
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {}, {"text": None}, {"text": 42}, {"text": ""}, {"text": " \n\t"},
+    {"text": "hello", "parent_message_id": None},
+    {"text": "hello", "parent_message_id": " "},
+])
+async def test_invalid_send_is_a_failed_attempt_without_request(
+    payload: dict[str, Any],
+) -> None:
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, bus, diagnostics = await activate_with(session)
+    try:
+        result = await bus.publish("channel.chat.send", payload, {})
+        assert result["metadata"]["delivery_status"] == "failed"
+        assert len(session.post_calls) == 1  # EventSub subscription only.
+        result = await bus.publish("channel.chat.send", {"text": "next"}, {})
+        assert result["metadata"]["delivery_status"] == "sent"
+        assert diagnostics == ["twitch chat send: invalid input"]
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response, diagnostic", [
+    (FakeResponse(503, {"message": SETTINGS["access_token"]}), "rejected (status 503)"),
+    (FakeResponse(401, {"message": SETTINGS["client_secret"]}), "rejected (status 401)"),
+    (FakeResponse(202, {"data": [{"is_sent": True, "message_id": "id"}]}), "rejected (status 202)"),
+    (FakeResponse(200, None), "malformed response"),
+    (FakeResponse(200, {"data": []}), "malformed response"),
+    (FakeResponse(200, {"data": {}}), "malformed response"),
+    (FakeResponse(200, {"data": [None]}), "malformed response"),
+    (FakeResponse(200, {"data": [{}, {}]}), "malformed response"),
+    (FakeResponse(200, {"data": [{"message_id": "id"}]}), "malformed response"),
+    (FakeResponse(200, {"data": [{"is_sent": 1, "message_id": "id"}]}), "malformed response"),
+    (FakeResponse(200, {"data": [{"is_sent": False, "drop_reason": SETTINGS["access_token"]}]}), "rejected (status 200)"),
+    (FakeResponse(200, {"data": [{"is_sent": True}]}), "malformed response"),
+    (FakeResponse(200, {"data": [{"is_sent": True, "message_id": " "}]}), "malformed response"),
+    (FakeResponse(200, {"data": [{"is_sent": True, "message_id": 1}]}), "malformed response"),
+    (FakeResponse(200, ValueError(SETTINGS["access_token"])), "malformed response"),
+    (OSError(SETTINGS["access_token"]), "request failed"),
+    (asyncio.TimeoutError(SETTINGS["client_secret"]), "request timed out"),
+])
+async def test_send_failure_continues_chain_and_next_send_succeeds(
+    response: Any, diagnostic: str,
+) -> None:
+    success = sent_response()
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[response, success])
+    handle, bus, diagnostics = await activate_with(session)
+    observed = []
+    bus.subscribe("**", lambda event: observed.append(event), order=90)
+    try:
+        first = await bus.publish("channel.chat.send", {"text": "first"}, {})
+        second = await bus.publish("channel.chat.send", {"text": "next"}, {})
+        assert first["metadata"]["delivery_status"] == "failed"
+        assert second["metadata"]["delivery_status"] == "sent"
+        assert observed == bus.list_events() == [first, second]
+        assert len(session.post_calls) == 3
+        assert diagnostics == [f"twitch chat send: {diagnostic}"]
+        assert_sanitized(diagnostics)
+        assert SETTINGS["access_token"] not in str(observed)
+        assert SETTINGS["client_secret"] not in str(observed)
+        if isinstance(response, FakeResponse):
+            assert response.release_calls == 1
+        assert success.release_calls == 1
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["timeout", "cancel", "close"])
+async def test_pending_send_releases_response_on_timeout_cancellation_and_close(
+    action: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import modules.twitch as twitch
+
+    started = asyncio.Event()
+
+    class PendingResponse(FakeResponse):
+        async def json(self) -> Any:
+            started.set()
+            await asyncio.Event().wait()
+
+    pending = PendingResponse(200, None)
+    websocket = FakeWebSocket(welcome("one"))
+    session = FakeSession([websocket], sends=[pending, sent_response()])
+    handle, bus, diagnostics = await activate_with(session)
+    if action == "timeout":
+        monkeypatch.setattr(twitch, "_CHAT_SEND_TIMEOUT_SECONDS", 0.01)
+    publication = asyncio.create_task(
+        bus.publish("channel.chat.send", {"text": "first"}, {})
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if action == "timeout":
+            result = await asyncio.wait_for(publication, timeout=1)
+            assert result["metadata"]["delivery_status"] == "failed"
+            assert diagnostics == ["twitch chat send: request timed out"]
+        else:
+            if action == "cancel":
+                publication.cancel()
+            else:
+                await asyncio.wait_for(handle.close(), timeout=1)
+            with pytest.raises(asyncio.CancelledError):
+                await publication
+            assert bus.list_events() == []
+            assert diagnostics == []
+        assert pending.release_calls == 1
+        assert not handle._active_send_tasks
+        next_result = await bus.publish("channel.chat.send", {"text": "next"}, {})
+        assert next_result["metadata"]["delivery_status"] == (
+            "failed" if action == "close" else "sent"
+        )
+        assert len(session.post_calls) == (2 if action == "close" else 3)
+    finally:
+        if not publication.done():
+            publication.cancel()
+            await asyncio.gather(publication, return_exceptions=True)
+        await handle.close()
+    assert session.close_calls == 1
+    assert websocket.close_calls == 1

@@ -175,7 +175,7 @@ class BrainModule:
             delivered: list[tuple[str, str]] = []
             for event_type, section_text in sections:
                 try:
-                    await self._bus.publish(
+                    published = await self._bus.publish(
                         event_type,
                         {"text": section_text},
                         dict(metadata),
@@ -191,9 +191,23 @@ class BrainModule:
                             _render_sections(delivered),
                         )
                     return
+                # Bus acceptance records an attempt, not necessarily delivery.
+                # Sinks report operational failure without stopping audit.
+                if (
+                    isinstance(published, Mapping)
+                    and published["metadata"].get("delivery_status") == "failed"
+                ):
+                    continue
                 delivered.append((event_type, section_text))
 
-            await self._remember(viewer_id, user_content, content)
+            if delivered:
+                await self._remember(
+                    viewer_id,
+                    user_content,
+                    content
+                    if len(delivered) == len(sections)
+                    else _render_sections(delivered),
+                )
         finally:
             if task is not None:
                 self._active_handlers.discard(task)

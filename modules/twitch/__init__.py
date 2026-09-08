@@ -1,4 +1,4 @@
-"""Twitch EventSub chat-message source."""
+"""Twitch EventSub chat source and Helix chat sink."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ EVENTSUB_URL = "wss://eventsub.wss.twitch.tv/ws"
 EVENTSUB_SUBSCRIPTIONS_URL = (
     "https://api.twitch.tv/helix/eventsub/subscriptions"
 )
+HELIX_CHAT_URL = "https://api.twitch.tv/helix/chat/messages"
 TOKEN_VALIDATION_URL = "https://id.twitch.tv/oauth2/validate"
 
 # Module-level seams make the network client and retry clock replaceable without
@@ -35,6 +36,7 @@ SESSION_FACTORY: Callable[[], Any] = _default_session_factory
 RETRY_DELAY: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 _CHAT_EVENT = "channel.chat.message"
+_CHAT_SEND_TIMEOUT_SECONDS = 10.0
 _NON_RETRYABLE_CLOSE_CODES = {4001, 4003}
 _STABLE_CONNECTION_SECONDS = 10.0
 
@@ -101,6 +103,7 @@ class TwitchModule:
         self._websocket: Any | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._handoff_tasks: set[asyncio.Task[None]] = set()
+        self._active_send_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._close_lock = asyncio.Lock()
 
@@ -117,6 +120,7 @@ class TwitchModule:
             raise
 
         self._websocket = websocket
+        self._bus.subscribe("channel.chat.send", self.handle_chat_send)
         self._receive_task = asyncio.create_task(
             self._receive_forever(websocket),
             name="twitch-eventsub-receiver",
@@ -146,11 +150,108 @@ class TwitchModule:
                     await handoff_task
             self._handoff_tasks.clear()
 
+            current = asyncio.current_task()
+            active_sends = tuple(
+                task for task in self._active_send_tasks if task is not current
+            )
+            for send_task in active_sends:
+                send_task.cancel()
+            if active_sends:
+                await asyncio.gather(*active_sends, return_exceptions=True)
+
             websocket = self._websocket
             self._websocket = None
             if websocket is not None:
                 await _close_websocket(websocket)
             await _close_session(self._session)
+
+    async def handle_chat_send(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        """Record an attempted send, with an explicit delivery outcome.
+
+        Operational failures continue the bus chain so audit sees the attempt.
+        Only a validated Helix acknowledgement means sent; brain must not infer
+        delivery from bus acceptance. Cancellation propagates without a record.
+        No response body or external exception text enters diagnostics/metadata.
+        """
+
+        def outcome(status: str) -> dict[str, Any]:
+            return {
+                **event,
+                "metadata": {**event["metadata"], "delivery_status": status},
+            }
+
+        if self._closed:
+            return outcome("failed")
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_send_tasks.add(task)
+        try:
+            try:
+                payload = _mapping_at(event, "payload")
+                text = _required_string(payload, "text")
+                if not text.strip():
+                    raise ValueError
+                request_body = {
+                    "broadcaster_id": self._settings.broadcaster_id,
+                    "sender_id": self._settings.bot_user_id,
+                    "message": text,
+                }
+                if "parent_message_id" in payload:
+                    parent = _required_string(payload, "parent_message_id")
+                    if not parent.strip():
+                        raise ValueError
+                    request_body["reply_parent_message_id"] = parent
+            except ValueError:
+                self._diagnose("twitch chat send: invalid input")
+                return outcome("failed")
+
+            try:
+                status, body = await asyncio.wait_for(
+                    self._post_chat(request_body), timeout=_CHAT_SEND_TIMEOUT_SECONDS
+                )
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                self._diagnose("twitch chat send: request timed out")
+                return outcome("failed")
+            except Exception:
+                self._diagnose("twitch chat send: request failed")
+                return outcome("failed")
+
+            if status != 200:
+                self._diagnose(
+                    f"twitch chat send: rejected (status {_safe_status(status)})"
+                )
+                return outcome("failed")
+            data = body.get("data") if isinstance(body, Mapping) else None
+            sent = data[0] if isinstance(data, list) and len(data) == 1 else None
+            if (
+                not isinstance(sent, Mapping)
+                or not isinstance(sent.get("is_sent"), bool)
+            ):
+                self._diagnose("twitch chat send: malformed response")
+                return outcome("failed")
+            if not sent["is_sent"]:
+                self._diagnose("twitch chat send: rejected (status 200)")
+                return outcome("failed")
+            message_id = sent.get("message_id")
+            if not isinstance(message_id, str) or not message_id.strip():
+                self._diagnose("twitch chat send: malformed response")
+                return outcome("failed")
+            return outcome("sent")
+        finally:
+            if task is not None:
+                self._active_send_tasks.discard(task)
+
+    async def _post_chat(
+        self, request_body: Mapping[str, str]
+    ) -> tuple[int | None, Any]:
+        response = await _resolve(
+            self._session.post(
+                HELIX_CHAT_URL, headers=self._helix_headers(), json=request_body
+            )
+        )
+        return await _read_response(response)
 
     async def _authenticate(self) -> None:
         try:

@@ -389,6 +389,11 @@ async def test_failed_helix_publication_is_sanitized_and_next_one_succeeds(
     audit_types = [json.loads(line)["type"] for line in audit_lines]
     assert audit_types.count("channel.chat.message") == 2
     assert audit_types.count("channel.chat.send") == 2
+    # The second model request must not treat the rejected reply as delivered.
+    assert all(
+        message["role"] != "assistant"
+        for message in brain_session.post_calls[1]["json"]["messages"]
+    )
 
 
 def test_configured_runtime_values_are_absent_from_python_sources() -> None:

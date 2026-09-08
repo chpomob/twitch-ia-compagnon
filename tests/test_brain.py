@@ -464,3 +464,45 @@ async def test_partial_publish_failure_remembers_only_delivered_sections() -> No
         assert diagnostics == ["brain output publish: failed"]
     finally:
         await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_sent", [False, True])
+async def test_delivery_outcome_excludes_refused_sections_from_history(
+    first_sent: bool,
+) -> None:
+    handle, bus, session, diagnostics = await activate_with(
+        FakeResponse(200, completion(
+            "[send:channel.chat.send]First reply"
+            "[send:channel.chat.send]Refused reply"
+            "[send:channel.chat.send]Last reply"
+        )),
+        FakeResponse(200, completion("[send:channel.chat.send]Next reply")),
+    )
+
+    def report_delivery(event: dict[str, Any]) -> dict[str, Any]:
+        sent = first_sent and event["payload"]["text"] != "Refused reply"
+        return {
+            **event,
+            "metadata": {
+                **event["metadata"],
+                "delivery_status": "sent" if sent else "failed",
+            },
+        }
+
+    bus.subscribe("channel.chat.send", report_delivery)
+    try:
+        await send_input(bus, message_id="one")
+        await send_input(bus, message_id="two")
+        prior = session.post_calls[1]["json"]["messages"][1:-1]
+        rendered = "\n".join(message["content"] for message in prior)
+        assert "Refused reply" not in rendered
+        if first_sent:
+            assert "First reply" in rendered
+            assert "Last reply" in rendered
+        else:
+            assert prior == []
+        assert len(outbound(bus)) == 4
+        assert diagnostics == []
+    finally:
+        await handle.close()
