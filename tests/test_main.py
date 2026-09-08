@@ -130,7 +130,7 @@ def _delete_nested(config: dict[str, Any], path: tuple[object, ...]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_valid_config_waits_for_stop_and_closes_in_reverse_order(
+async def test_valid_config_waits_for_stop_and_closes_producers_before_audit(
     tmp_path: Path,
 ) -> None:
     modules = tmp_path / "modules"
@@ -176,9 +176,9 @@ async def test_valid_config_waits_for_stop_and_closes_in_reverse_order(
         "activate:twitch",
         "activate:brain",
         "activate:audit",
-        "close:audit",
-        "close:brain",
         "close:twitch",
+        "close:brain",
+        "close:audit",
     ]
 
 
@@ -721,9 +721,9 @@ async def test_shutdown_failure_is_nonzero_and_does_not_skip_other_modules(
 
     assert status != 0
     assert lifecycle_log.read_text(encoding="utf-8").splitlines()[-3:] == [
-        "close:audit",
-        "close:brain",
         "close:twitch",
+        "close:brain",
+        "close:audit",
     ]
     assert diagnostics == ["module 'brain': shutdown failed"]
     assert secret not in "\n".join(diagnostics)

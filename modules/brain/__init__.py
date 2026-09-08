@@ -128,7 +128,7 @@ class BrainModule:
         self._reporter = reporter
         self._histories: OrderedDict[str, deque[dict[str, str]]] = OrderedDict()
         self._history_lock = asyncio.Lock()
-        self._active_handlers: set[asyncio.Task[Any]] = set()
+        self._active_handlers: dict[asyncio.Future[None], asyncio.Task[Any] | None] = {}
         self._close_lock = asyncio.Lock()
         self._closed = False
 
@@ -138,8 +138,8 @@ class BrainModule:
         task = asyncio.current_task()
         if self._closed:
             return
-        if task is not None:
-            self._active_handlers.add(task)
+        completed = asyncio.get_running_loop().create_future()
+        self._active_handlers[completed] = task
         try:
             try:
                 text, source_message_id, viewer_id = _incoming_context(event)
@@ -209,8 +209,9 @@ class BrainModule:
                     else _render_sections(delivered),
                 )
         finally:
-            if task is not None:
-                self._active_handlers.discard(task)
+            self._active_handlers.pop(completed, None)
+            if not completed.done():
+                completed.set_result(None)
 
     async def close(self) -> None:
         """Stop future work and close the owned transport exactly once."""
@@ -221,9 +222,13 @@ class BrainModule:
             self._closed = True
             current = asyncio.current_task()
             active = tuple(
-                task for task in self._active_handlers if task is not current
+                completed
+                for completed, owner in self._active_handlers.items()
+                if owner is not current
             )
             if active:
+                # A caller may be a long-lived receiver. Wait for its handler,
+                # not for the entire task that happened to invoke it.
                 await asyncio.gather(*active, return_exceptions=True)
             async with self._history_lock:
                 self._histories.clear()

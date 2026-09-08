@@ -103,6 +103,8 @@ class TwitchModule:
         self._websocket: Any | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._handoff_tasks: set[asyncio.Task[None]] = set()
+        self._publication_tasks: set[asyncio.Task[None]] = set()
+        self._stopping = False
         self._active_send_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._close_lock = asyncio.Lock()
@@ -132,7 +134,7 @@ class TwitchModule:
         async with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
+            self._stopping = True
 
             task = self._receive_task
             if task is not None and not task.done():
@@ -150,20 +152,29 @@ class TwitchModule:
                     await handoff_task
             self._handoff_tasks.clear()
 
-            current = asyncio.current_task()
-            active_sends = tuple(
-                task for task in self._active_send_tasks if task is not current
-            )
-            for send_task in active_sends:
-                send_task.cancel()
-            if active_sends:
-                await asyncio.gather(*active_sends, return_exceptions=True)
+            # Reception is stopped, but accepted publications must finish their
+            # model/send/audit chain before the send transport is closed.
+            publications = tuple(self._publication_tasks)
+            try:
+                if publications:
+                    await asyncio.gather(*publications, return_exceptions=True)
+            finally:
+                self._closed = True
 
-            websocket = self._websocket
-            self._websocket = None
-            if websocket is not None:
-                await _close_websocket(websocket)
-            await _close_session(self._session)
+                current = asyncio.current_task()
+                active_sends = tuple(
+                    task for task in self._active_send_tasks if task is not current
+                )
+                for send_task in active_sends:
+                    send_task.cancel()
+                if active_sends:
+                    await asyncio.gather(*active_sends, return_exceptions=True)
+
+                websocket = self._websocket
+                self._websocket = None
+                if websocket is not None:
+                    await _close_websocket(websocket)
+                await _close_session(self._session)
 
     async def handle_chat_send(self, event: Mapping[str, Any]) -> dict[str, Any]:
         """Record an attempted send, with an explicit delivery outcome.
@@ -357,9 +368,9 @@ class TwitchModule:
         retry_attempt = 0
         connected_at = asyncio.get_running_loop().time()
         try:
-            while not self._closed:
+            while not self._closed and not self._stopping:
                 result = await self._consume(websocket)
-                if self._closed:
+                if self._closed or self._stopping:
                     return
                 socket_already_closed = False
 
@@ -396,15 +407,17 @@ class TwitchModule:
                     await _close_websocket(websocket)
                 if self._websocket is websocket:
                     self._websocket = None
-                if self._closed:
+                if self._closed or self._stopping:
                     return
 
                 replacement = None
-                while replacement is None and not self._closed:
+                while (
+                    replacement is None and not self._closed and not self._stopping
+                ):
                     delay = min(0.25 * (2**retry_attempt), 5.0)
                     retry_attempt = min(retry_attempt + 1, 5)
                     await _resolve(self._retry_delay(delay))
-                    if self._closed:
+                    if self._closed or self._stopping:
                         return
                     replacement = await self._connect_for_recovery(
                         EVENTSUB_URL, subscribe=True
@@ -470,7 +483,7 @@ class TwitchModule:
     ) -> _ConsumeResult:
         """Consume one socket until it needs handoff, retry, or shutdown."""
 
-        while not self._closed:
+        while not self._closed and not self._stopping:
             try:
                 frame = await websocket.receive()
             except asyncio.CancelledError:
@@ -505,7 +518,13 @@ class TwitchModule:
                 if message_type == "session_keepalive":
                     continue
                 if message_type == "notification":
-                    await self._publish_notification(envelope)
+                    publication = asyncio.create_task(
+                        self._publish_notification(envelope),
+                        name="twitch-eventsub-publication",
+                    )
+                    self._publication_tasks.add(publication)
+                    publication.add_done_callback(self._publication_finished)
+                    await asyncio.shield(publication)
                     continue
                 if message_type == "session_reconnect":
                     payload = _mapping_at(envelope, "payload")
@@ -527,6 +546,12 @@ class TwitchModule:
                 self._diagnose("twitch notification: malformed data")
 
         return _ConsumeResult("stop")
+
+    def _publication_finished(self, task: asyncio.Task[None]) -> None:
+        self._publication_tasks.discard(task)
+        if not task.cancelled():
+            # A receiver may already be stopped when publication fails.
+            task.exception()
 
     async def _publish_notification(self, envelope: Mapping[str, Any]) -> None:
         metadata = _mapping_at(envelope, "metadata")

@@ -8,7 +8,9 @@ import os
 import re
 import signal
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,23 @@ from .loader import ModuleActivation, ModuleLoadError, ModuleLoader
 
 class ConfigurationError(RuntimeError):
     """A configuration defect safe to show without revealing its value."""
+
+
+# Each hook gets a grace period; the CLI watchdog also covers cancellation-
+# resistant tasks and asyncio.run() joining a blocked default-executor writer.
+# On expiry the process exits with status 1; undrained records may be lost.
+_SHUTDOWN_TIMEOUT_SECONDS = 120.0
+_CLOSE_TIMEOUT_SECONDS = 60.0
+_CANCEL_TIMEOUT_SECONDS = 0.1
+_shutdown_watchdog: ContextVar[threading.Timer | None] = ContextVar(
+    "shutdown_watchdog", default=None
+)
+
+
+def _arm_shutdown_watchdog() -> None:
+    watchdog = _shutdown_watchdog.get()
+    if watchdog is not None and not watchdog.is_alive():
+        watchdog.start()
 
 
 Reporter = Callable[[str], None]
@@ -171,7 +190,14 @@ async def run(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse command-line arguments and execute the async application."""
+    """Execute the application with a hard 120-second shutdown deadline.
+
+    Module hooks have a 60-second grace period and 100 ms for cancellation.
+    The global deadline starts at cleanup and includes asyncio's task/executor
+    teardown. If a task or synchronous writer cannot stop, os._exit(1) bypasses
+    interpreter thread joins and stream flushing; pending records may be lost.
+    Embedded users of run() own their process/executor teardown policy.
+    """
 
     parser = argparse.ArgumentParser(description="Run the Twitch AI companion")
     parser.add_argument(
@@ -181,8 +207,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="path to the YAML configuration file",
     )
     arguments = parser.parse_args(argv)
+    watchdog = threading.Timer(_SHUTDOWN_TIMEOUT_SECONDS, os._exit, args=(1,))
+    watchdog.daemon = True
+    token = _shutdown_watchdog.set(watchdog)
+
+    async def execute() -> int:
+        try:
+            return await run(arguments.config)
+        finally:
+            # Keep the deadline active through the runner's executor cleanup.
+            _arm_shutdown_watchdog()
+
     try:
-        return asyncio.run(run(arguments.config))
+        return asyncio.run(execute())
     except KeyboardInterrupt:
         # This fallback is only reached on platforms where asyncio cannot own
         # signal handlers. The runner's cancellation cleanup has already run.
@@ -190,6 +227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         _default_diagnostic_reporter("application: unexpected failure")
         return 1
+    finally:
+        watchdog.cancel()
+        _shutdown_watchdog.reset(token)
 
 
 def _resolve_environment(
@@ -312,16 +352,42 @@ def _validate_config(config: Mapping[str, Any]) -> None:
 async def _close_activations(
     activations: Sequence[ModuleActivation],
 ) -> list[str]:
+    _arm_shutdown_watchdog()
     failures: list[str] = []
-    for activation in reversed(activations):
+    # Twitch stops reception and drains accepted publications while its send
+    # transport is still usable. Brain then releases its resources; audit last.
+    ordered = sorted(
+        reversed(activations),
+        key=lambda activation: {"twitch": 0, "audit": 2}.get(activation.name, 1),
+    )
+    for activation in ordered:
+        task = asyncio.create_task(activation.close())
         try:
-            await activation.close()
+            done, _ = await asyncio.wait({task}, timeout=_CLOSE_TIMEOUT_SECONDS)
+            if not done:
+                task.cancel()
+                await asyncio.wait({task}, timeout=_CANCEL_TIMEOUT_SECONDS)
+                # Retrieve even late exceptions without waiting indefinitely.
+                task.add_done_callback(_consume_close_result)
+                raise TimeoutError
+            if task.cancelled():
+                raise RuntimeError("close was cancelled")
+            task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(_consume_close_result)
+            raise
         except Exception:
             name = getattr(activation, "name", "<unknown>")
             if not isinstance(name, str) or not name:
                 name = "<unknown>"
             failures.append(f"module {name!r}: shutdown failed")
     return failures
+
+
+def _consume_close_result(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _startup_diagnostic(exc: Exception) -> str:
