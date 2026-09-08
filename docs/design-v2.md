@@ -5,7 +5,7 @@ Point de départ : `66d9a7e`, suite de référence de 189 tests.
 
 Ce document fixe la direction produit et les contrats d'architecture. Il ne livre aucune fonctionnalité. **Existant** désigne le code à ce SHA ; **cible** désigne les décisions à réaliser en phases 0–2 ; **plus tard** désigne les extensions conditionnelles de phase 3+. Les nouveaux noms de contrats, chemins et paramètres ci-dessous sont des propositions normatives pour l'implémentation, pas des API déjà disponibles.
 
-Autorité : les décisions utilisateur de septembre 2026 priment sur les questions encore ouvertes de la review du 08-09-2026 (`/tmp/twitchia-arch-review.md`, sections A, B1–B8 et C.1–C.5). En particulier, multi-plateforme, boucle agentique, déploiement local/distant et capture déléguée aux modules sont **actés**. La review reste une source de travail externe, non nécessaire pour comprendre ce fichier. Le [plan](../plan.md), la [spec MVP](../spec.md) et l'[index documentaire](README.md) conservent leur rôle historique ; leurs garanties ne deviennent pas automatiquement celles de v2.
+Autorité : les décisions utilisateur de septembre 2026 priment sur les questions encore ouvertes de la review du 08-09-2026 (`/tmp/twitchia-arch-review.md`, sections A, B1–B8 et C.1–C.5). En particulier, multi-plateforme, boucle agentique, déploiement local/distant, capture déléguée aux modules et déclenchements configurables par input sont **actés**. La review reste une source de travail externe, non nécessaire pour comprendre ce fichier. Le [plan](../plan.md), la [spec MVP](../spec.md) et l'[index documentaire](README.md) conservent leur rôle historique ; leurs garanties ne deviennent pas automatiquement celles de v2.
 
 ## 1. Vision et principes
 
@@ -15,7 +15,7 @@ Le **brain est un moteur de runs multi-turn** : le modèle peut demander une lec
 
 Les responsabilités sont stables :
 
-- Le **socle** possède les contrats, le registre, les services partagés et la coordination du lifecycle.
+- Le **socle** possède les contrats, le registre, les services partagés, le moteur d'évaluation des triggers par input et la coordination du lifecycle.
 - Le **brain** possède l'admission, l'ordonnancement par session, les tâches de run, les budgets et la conversation de travail du modèle.
 - Chaque **module** possède ses capacités, transports, ressources et handlers ; le brain ne connaît ni OBS, ni la capture OS/jeu, ni Helix.
 - Le **bus** transporte les faits, entrées normalisées et traces internes. Il conserve son contrat awaitable à chaîne ordonnée ; il n'est ni un RPC ni une preuve de livraison externe.
@@ -26,7 +26,9 @@ Le compagnon peut tourner sur le PC du streamer, sur un serveur, ou avec un brai
 ```text
 Sources de plateformes → channel.chat.message → bus de faits
                                                   │ handlers courts
-                                    contexte chat + admission bornée
+                                    contexte chat + trigger par input
+                                                  │
+                                          admission bornée
                                                   │
                                     files de sessions → workers limités
                                                   │
@@ -38,7 +40,7 @@ Sources de plateformes → channel.chat.message → bus de faits
                                                   │
                                   sortie acquittée → fin du run
 
-Bus ← faits de santé, d'admission, de run et d'action corrélés
+Bus ← faits de santé, de trigger, d'admission, de run et d'action corrélés
 ```
 
 ## 2. Vocabulaire neutre plateforme
@@ -78,6 +80,7 @@ Nouveaux types cibles, selon la convention pointée actuelle :
 | Événements | Émetteur et contenu utile |
 | --- | --- |
 | `module.ready`, `module.degraded`, `module.stopped` | Supervision : provider/module, capacités concernées, raison assainie, date. |
+| `input.trigger.accepted`, `input.trigger.rejected` | Ingestion : événement source, input/canal, version de politique, décision et motif borné ; aucun `run_id` à ce stade. |
 | `brain.admission.accepted`, `brain.admission.rejected` | Admission : message, session, `run_id` si accepté, motif et profondeur de file. |
 | `brain.run.started`, `brain.run.completed` | Brain : corrélation, délais, compteurs, état terminal et résultat de livraison séparé. |
 | `action.started`, `action.completed` | Exécuteur : action, provider, `call_id`, statut terminal, durée et sommaire borné. |
@@ -86,6 +89,31 @@ Nouveaux types cibles, selon la convention pointée actuelle :
 Ces événements **décrivent** les transitions ; aucun subscriber ne doit répondre pour débloquer un appel. L'état terminal est enregistré chez son propriétaire avant la publication de sa trace. Une erreur d'audit ne peut ni annuler un effet externe ni déclencher sa répétition. Une séquence locale et les IDs permettent de reconstruire la causalité sans supposer un ordre global des publications.
 
 L'audit conserve des métadonnées sélectionnées et expurgées, des statuts, temps d'attente, coûts/tokens si connus, rejets, timeouts et pertes de traces. Il n'archive ni images, ni prompts complets, ni raisonnement privé du modèle par défaut. Les arguments et résultats ne sont journalisés que sous une forme autorisée et bornée. Les événements internes et les propres sorties du compagnon ne sont pas des déclencheurs de run.
+
+### 2.4. Déclenchements configurables par input
+
+**Décision actée :** le streamer choisit une politique de déclenchement **par input/canal**, dans sa configuration ou ses profils. Les types disponibles dépendent du module d'input : ce n'est ni une politique globale ni une décision du brain. Le socle évalue la politique à l'ingestion, avant l'admission, les budgets de run et tout appel modèle.
+
+| Contrat cible | Déclaration et responsabilité |
+| --- | --- |
+| `TriggerSpec` | Déclaration versionnée des types supportés et des schémas de paramètres par le module d'input, dans son manifest (section 4.1), par exemple `triggers: [probability, audience, keyword]`. Le module fournit les prédicats et les faits spécifiques à sa source. |
+| Politique par input/canal | Règles sélectionnées et paramétrées par le streamer parmi ces capacités ; version de politique identifiée à l'ingestion. Types, paramètres et combinaisons non supportés sont refusés à la validation. |
+| Évaluation | Fonction bornée, déterministe à événement normalisé, contexte fiable, configuration et dépendances injectées identiques. RNG et horloge sont injectables, notamment pour le probabiliste ; le tirage et les éléments nécessaires à la reproduction sont conservés sous une forme bornée et expurgée avec la décision. |
+
+Le trigger transforme **événement ingéré → travail admissible pour un run brain**. Une acceptation ne crée pas encore de run et ne garantit pas son admission. Un rejet par trigger est une décision traitée et tracée, pas une erreur ; il ne lance aucun modèle. La déduplication conserve cette décision dans sa fenêtre bornée : une redélivrance du même événement n'effectue pas un nouveau tirage. La traçabilité suit les limites et garanties d'audit de la section 2.3.
+
+Ordre à l'ingestion : **normalisation → trigger configuré → admission bornée → run**. L'authenticité, la validation et les exclusions anti-boucle (propres sorties et événements internes) sont des invariants système appliqués à la frontière avant le trigger ; les contrôles de sécurité restent également actifs à l'exécution. Le streamer ne peut pas désactiver ces invariants par une règle de trigger. L'admission de charge reste toujours active pour les événements acceptés : aucune politique, même « toujours », ne contourne la saturation. Le trigger précède les budgets de run, sans supprimer les bornes des transports, de l'ingestion ou de sa propre évaluation.
+
+| Input | Exemples de règles, syntaxe illustrative |
+| --- | --- |
+| Chat | `probability: 0.1` : 10 % de chance par événement unique ; `audience: subscribers` : seuls les messages d'abonnés ; `keyword: [bonjour, compagnon]` : mots-clés configurés. |
+| Vocal | Types propres au module vocal, par exemple `wake_word` ou `voice_command` : le module détecte un mot de réveil ou une commande vocale et fournit l'événement normalisé nécessaire à l'évaluation. Ces capacités ne sont pas imposées à tous les inputs. |
+
+Les combinaisons sont possibles selon les capacités déclarées du module, par exemple abonnés **ET** mot-clé **ET** probabilité de 10 %. Les opérateurs et leur ordre d'évaluation doivent être explicites et testables ; aucune composition implicite. Les prédicats de rôles/abonnement utilisent un contexte fiable fourni par la plateforme ou le provider, avec provenance ; le texte d'un message ou d'une transcription ne prouve jamais un rôle. Une information absente ne satisfait pas un prédicat exigeant ce rôle.
+
+Une observation retournée à un run par `chat.read` ou `audio.capture` ne déclenche pas un autre run. Les triggers vocaux concernent les entrées spontanées émises par le module vocal lorsqu'il supporte cette capacité ; ils ne promettent pas une écoute continue dès la première capture audio. Les réglages par défaut et la syntaxe exacte restent à préciser en section 7.
+
+**Existant :** aucun moteur de triggers configurables n'est implémenté ; `BrainModule.handle_chat_message` appelle aujourd'hui le modèle pour tout message valide reçu, hors arrêt. Ce comportement n'est pas un défaut produit adopté pour v2 ; la phase 0 introduit la sélection par input.
 
 ## 3. Brain agentique : moteur de runs
 
@@ -143,19 +171,19 @@ L'adaptateur modèle résout les références et encode les médias au format du
 
 ### 3.4. Admission, sessions et budgets
 
-Le handler `BrainModule.handle_chat_message` cible valide et copie une entrée bornée et effectue une admission immédiate ; il n'attend pas le modèle. La copie est indépendante des mutations ultérieures du bus. La lecture réseau ne crée pas une tâche illimitée par message : toute file intermédiaire de source est également bornée et possède une politique de saturation.
+Le handler `BrainModule.handle_chat_message` cible valide et copie une entrée bornée, puis fait évaluer le trigger par input (section 2.4). Seul un événement accepté par ce trigger passe à l'admission immédiate ; le handler n'attend pas le modèle. La copie est indépendante des mutations ultérieures du bus. La lecture réseau ne crée pas une tâche illimitée par message : toute file intermédiaire de source est également bornée et possède une politique de saturation.
 
 Un ordonnanceur possède une file FIFO bornée par `SessionKey`, un plafond global de travaux en attente, un plafond de sessions et un nombre limité de workers. Une session a au plus un run actif ; les sessions distinctes peuvent progresser en parallèle, avec répartition équitable. Les files/session locks inactifs sont évincés. Les actions partageant une ressource de canal, comme un sondage ou une scène, ajoutent un verrou ou une file **bornée** chez le provider : sérialiser les conversations ne suffit pas.
 
-Le profil technique initial proposé est « nouveau message en file ; file pleine : rejet du nouveau travail ». Il reste à faire valider comme comportement produit en section 7. L'admission rejetée est tracée avec motif et compteur ; elle ne lance aucun modèle et ne promet aucun replay. Le contexte de chat peut conserver le message reçu même si aucun run n'est admis.
+Le profil technique initial proposé est « nouvel événement accepté par le trigger en file ; file pleine : rejet du nouveau travail ». Il reste à faire valider comme comportement produit en section 7. L'admission rejetée est tracée avec motif et compteur ; elle ne lance aucun modèle et ne promet aucun replay. Le contexte de chat peut conserver le message reçu même si aucun run n'est admis, y compris après un rejet par trigger.
 
-L'acceptation signifie seulement que le runtime possède un travail en mémoire. La déduplication source et le contexte enregistrent une décision d'ingestion unique avant tout travail long ; un rejet explicite de surcharge est une décision traitée, pas une exécution réussie. Une erreur technique avant cette décision peut être retentée. Les callbacks courts d'ingestion doivent être idempotents sur la clé du message, même si un subscriber ultérieur échoue. Une panne processus peut perdre un run accepté : aucune garantie durable avant phase 3+.
+L'acceptation par l'admission signifie seulement que le runtime possède un travail en mémoire. La déduplication source et le contexte enregistrent une décision d'ingestion unique avant tout travail long ; un rejet explicite par trigger ou pour surcharge est une décision traitée, pas une exécution réussie. Une erreur technique avant cette décision peut être retentée. Les callbacks courts d'ingestion doivent être idempotents sur la clé du message, même si un subscriber ultérieur échoue. Une panne processus peut perdre un run accepté : aucune garantie durable avant phase 3+.
 
 Chaque profil configure des valeurs finies et validées pour : attente maximale, deadline totale **depuis admission jusqu'à livraison**, tours modèle, appels d'actions (livraison incluse), tokens entrée/sortie/cumul, volume d'observations et médias, délai par modèle/action, débit et budget par canal. Les valeurs par défaut restent une décision produit ; aucun profil agentique n'est utilisable avec des limites omises ou infinies. Le runtime réserve de la marge pour la sortie et borne le prochain appel par le temps restant. Si le backend ne fournit pas les tokens réels, une estimation conservatrice est signalée comme telle et les tailles d'entrée/sortie restent plafonnées.
 
 La deadline locale utilise une horloge monotone. Un proxy transmet une échéance UTC et un temps restant ; le receveur applique une limite conservatrice et ne renouvelle jamais le budget à chaque saut. Le protocole doit tester les écarts d'horloge et la latence ; des timestamps muraux seuls ne suffisent pas.
 
-L'anti-boucle combine filtre anti-écho existant, exclusion des traces comme déclencheurs, quotas par canal, limite de tours et détection de répétitions action/arguments/observation sans progrès. Les lectures répétées peuvent être utiles si leur timestamp change, mais restent budgétées. Après un effet incertain, aucun retry aveugle : utiliser une idempotence effectivement supportée ou réconcilier l'état. `call_id` permet la corrélation, sans garantir à lui seul une exécution exactement une fois.
+L'anti-boucle est un invariant système que les triggers configurables ne peuvent pas désactiver ; elle combine filtre anti-écho existant, exclusion des traces comme déclencheurs, quotas par canal, limite de tours et détection de répétitions action/arguments/observation sans progrès. Les lectures répétées peuvent être utiles si leur timestamp change, mais restent budgétées. Après un effet incertain, aucun retry aveugle : utiliser une idempotence effectivement supportée ou réconcilier l'état. `call_id` permet la corrélation, sans garantir à lui seul une exécution exactement une fois.
 
 ### 3.5. Trois mémoires séparées, toutes bornées
 
@@ -171,7 +199,7 @@ L'anti-boucle combine filtre anti-écho existant, exclusion des traces comme dé
 
 ### 4.1. Manifest versionné et activation
 
-La cible étend `modules/*/module.yaml` avec `manifest_version: 2`, `runtime_api: 2`, `settings_schema`, `actions` et des dépendances/capacités de lifecycle. Chaque entrée `actions` porte les champs de `ActionSpec` ; un schéma peut être inline ou référencé dans le répertoire du module, avec validation des chemins. `produces`, `consumes`, `middleware`, `order` conservent leur sens événementiel. Déclarer `produces: [channel.chat.send]` n'autorise pas l'action `chat.write`.
+La cible étend `modules/*/module.yaml` avec `manifest_version: 2`, `runtime_api: 2`, `settings_schema`, `actions`, `triggers` pour les modules d'input et des dépendances/capacités de lifecycle. Les déclarations `triggers` décrivent les types, versions, schémas de paramètres et combinaisons supportés (`TriggerSpec`, section 2.4) ; les règles choisies restent dans la config/profil de chaque input/canal, distinctes des actions exposées au modèle. Chaque entrée `actions` porte les champs de `ActionSpec` ; un schéma peut être inline ou référencé dans le répertoire du module, avec validation des chemins. `produces`, `consumes`, `middleware`, `order` conservent leur sens événementiel. Déclarer `produces: [channel.chat.send]` n'autorise pas l'action `chat.write`.
 
 Le loader distingue trois vues :
 
@@ -179,7 +207,7 @@ Le loader distingue trois vues :
 2. **Enregistré et prêt** : handler async enregistré pendant l'activation/préparation, schémas compatibles, ressources et authentification utilisables. Un enregistrement seul ne signifie pas prêt.
 3. **Autorisé** : sous-ensemble prêt filtré par principal, session, destination et politique. Seule cette vue est exposée au modèle ; contrôle répété à l'exécution.
 
-Un `RuntimeContext` versionné (cible : `core/runtime.py`) injecte bus, registre/exécuteur, store, horloge, supervision, diagnostics et factories de transports. La configuration YAML ne contient que des données ; les callables de tests quittent progressivement les settings. L'API v2 cible `validate_settings(settings)` puis `activate(context, settings, catalog)`, qui retourne un handle préparé et enregistre ses handlers async via `context.actions.register(spec, handler, provider_id)`. L'activation ne démarre pas les producteurs.
+Un `RuntimeContext` versionné (cible : `core/runtime.py`) injecte bus, registre/exécuteur, store, moteur de triggers, RNG et horloge injectables, supervision, diagnostics et factories de transports. La configuration YAML ne contient que des données ; les callables de tests quittent progressivement les settings. L'API v2 cible `validate_settings(settings)` puis `activate(context, settings, catalog)`, qui retourne un handle préparé et enregistre ses handlers async via `context.actions.register(spec, handler, provider_id)`. L'activation ne démarre pas les producteurs.
 
 Le core valide YAML, environnement, chemins et versions ; chaque module valide ses contraintes métier, pour **tous les activés avant leurs effets réseau**. Les imports doivent rester sans effets externes. Les manifests désactivés restent validés ; leurs secrets ne sont pas résolus ni leurs settings métier exigés. `${NAME}` reste une référence entière ; conversion et bornes des nombres appartiennent au schéma/hook du module. Un modèle local ne requiert une clé que si son adaptateur l'exige.
 
@@ -190,7 +218,7 @@ Le handle v2 expose des hooks async idempotents et bornés ; un module sans rôl
 | Phase | Garantie |
 | --- | --- |
 | Validation, puis préparation par `activate` | Tous les settings sont validés ; enregistrer consommateurs, handlers, ressources et tâches supervisées sans émettre d'entrées. Nettoyer localement si le handle n'a pas encore été rendu. |
-| Barrière de préparation puis `start_inputs()` | Tous les consommateurs et providers requis sont prêts avant la première entrée ; l'admission est opérationnelle avant ouverture des producteurs. Readiness globale après démarrage réussi. |
+| Barrière de préparation puis `start_inputs()` | Tous les consommateurs et providers requis sont prêts avant la première entrée ; les politiques de triggers sont validées et leur évaluation ainsi que l'admission sont opérationnelles avant ouverture des producteurs. Readiness globale après démarrage réussi. |
 | `stop_inputs()` | À l'arrêt, couper les nouvelles sources et terminer les admissions courtes en vol ; fermer ensuite l'admission. Conserver les transports nécessaires aux outputs et lectures des runs. |
 | `drain(deadline)` | Terminer les travaux acceptés dans le budget d'arrêt ou les annuler explicitement ; garder les exécuteurs et sorties disponibles jusqu'aux bilans terminaux. |
 | `close()` des ressources ordinaires | Fermer transports et stores après les appels ; collecter les erreurs sans ignorer les autres modules. |
@@ -265,10 +293,11 @@ Les phases v2 ne renumérotent pas les étapes historiques P1–P9. Les critère
 
 ### Phase 0 — Socle cohérent avant multi-turn
 
-**Lot indissociable : admission bornée + lifecycle par phases + registre/exécuteur d'actions + identités et ordonnancement de session + rétention bornée.** Ajouter validation de modules, supervision et traces minimales. Garder initialement un seul appel modèle par travail ; faire passer sa sortie par le résultat explicite du service d'envoi. Définir les références médias et tester le quota du store avant d'intégrer une capture.
+**Lot indissociable : moteur de triggers par input + admission bornée + lifecycle par phases + registre/exécuteur d'actions + identités et ordonnancement de session + rétention bornée.** Ajouter validation de modules, supervision et traces minimales. Livrer `TriggerSpec`, déclarations des capacités et configuration par input/canal, puis évaluation avant admission ; appliquer les premières politiques au chat pour remplacer l'appel modèle systématique actuel avant la verticale agentique. Les types vocaux arrivent avec les capacités du module audio en phase 2. Garder initialement un seul appel modèle par travail ; faire passer sa sortie par le résultat explicite du service d'envoi. Définir les références médias et tester le quota du store avant d'intégrer une capture.
 
 Critères de sortie :
 
+- Deux inputs/canaux peuvent appliquer des politiques distinctes ; types/combinaisons non déclarés refusés avant réseau. Probabilité, abonnement fiable et mot-clé sont vérifiés avec RNG/horloge injectés : même décision reproductible, aucun nouveau tirage sur doublon dans la fenêtre de dédup. Un rejet trigger est tracé sans admission ni appel modèle ; une acceptation reste soumise à la saturation et aux invariants anti-boucle/sécurité.
 - Un faux modèle maintenu en attente n'empêche pas la réception d'un deuxième message ni d'un keepalive ; les files et tâches restent sous leurs limites en surcharge, avec rejets comptés.
 - Deux messages d'une même session voient les historiques dans l'ordre ; une autre session progresse dans la limite des workers ; mêmes IDs de viewer sur deux plateformes/canaux ne partagent pas leur mémoire.
 - Une activation de consommateur volontairement lente ne laisse passer aucune entrée avant la barrière. Un quatrième module producteur/sink fictif démarre et s'arrête sans ajout de nom dans `core/main.py`.
@@ -314,11 +343,11 @@ Critères de sortie :
 
 ## 7. Questions produit à trancher avant chaque phase
 
-Ces points restent ouverts ; ils ne rouvrent ni le multi-plateforme ni le choix de rendre les providers indépendants du transport.
+**Déclenchement décidé :** triggers configurables par input/canal, au choix du streamer, avec des types dépendant des modules et une évaluation avant admission (section 2.4). Les points ci-dessous restent ouverts ; ils ne rouvrent ni cette décision, ni le multi-plateforme, ni le choix de rendre les providers indépendants du transport.
 
 | Décision attendue | Échéance et conséquence |
 | --- | --- |
-| Déclenchement : mentions, commandes, tous les messages, initiative ? | Avant phase 0 : sélection à l'admission, volume et anti-boucle. Le traitement actuel de tout message valide n'est pas un défaut produit adopté pour v2. |
+| Défauts de triggers et syntaxe exacte de configuration/profils | Avant phase 0 pour le chat, puis avec chaque nouvel input : préciser règles par défaut, comportement sans règle et syntaxe de composition parmi les capacités déclarées. Le traitement actuel de tout message valide ne vaut pas adoption du défaut v2. |
 | Granularité : viewer, thread, canal ; quelles identités peuvent partager une mémoire ? | Avant phase 0 : choisir le profil `SessionKey`. Plateforme + canal restent obligatoires dans tous les cas. |
 | Nouveau message pendant un run : attendre, fusionner, interrompre ? | Avant phase 0 : valider le profil FIFO proposé ou spécifier une alternative avec annulation/traçabilité ; pas de fusion implicite. |
 | Budgets et comportement en surcharge/expiration | Avant phase 0 pour admission/arrêt, avant phase 1 pour tours/tokens/médias : fixer valeurs et éventuel message de repli. Une réponse de repli consomme elle aussi le budget de sortie. |
