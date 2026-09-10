@@ -602,6 +602,76 @@ class ActionRegistry:
         existing.extend(candidates)
         return tuple(candidates)
 
+    # -- registration ------------------------------------------------------- #
+
+    def register(
+        self,
+        spec: ActionSpec,
+        provider: Any,
+        *,
+        module: str,
+        destinations: Destination | Sequence[Destination] | None = None,
+        provider_name: str | None = None,
+    ) -> tuple[ActionBinding, ...]:
+        """Declare *spec* and bind *provider* to it, all or nothing.
+
+        The registration a v2 activation performs: the manifest declaration and
+        the live handler arrive together. :meth:`declare` and :meth:`bind` are
+        each atomic on their own, but the pair is not — an invalid provider or
+        an unsupported destination would otherwise leave the declaration
+        committed, so ``discovered()`` would name an action nothing can serve
+        and a corrected specification could no longer be declared under that
+        name. The declaration is therefore restored to exactly what it was
+        before the call whenever the binding is refused (AC16).
+        """
+
+        if not isinstance(spec, ActionSpec):
+            raise ContractError("ActionRegistry.register", "expects an ActionSpec")
+        declared = spec.name in self._specs
+        previous_spec = self._specs.get(spec.name)
+        previous_module = self._modules.get(spec.name)
+
+        self.declare(spec, module=module)
+        try:
+            return self.bind(
+                spec.name,
+                provider,
+                module=module,
+                destinations=destinations,
+                provider_name=provider_name,
+            )
+        except BaseException:
+            self._rollback_declaration(
+                spec.name, declared, previous_spec, previous_module
+            )
+            raise
+
+    def _rollback_declaration(
+        self,
+        action_name: str,
+        declared: bool,
+        previous_spec: ActionSpec | None,
+        previous_module: str | None,
+    ) -> None:
+        """Undo the declaration half of a registration whose binding failed.
+
+        A name that was not declared before the call is removed outright,
+        including the empty binding list :meth:`declare` seeded. A name that
+        was already declared keeps its owner and its specification: the
+        redeclaration is reverted, never the original.
+        """
+
+        if declared:
+            if previous_spec is not None:
+                self._specs[action_name] = previous_spec
+            if previous_module is not None:
+                self._modules[action_name] = previous_module
+            return
+        self._specs.pop(action_name, None)
+        self._modules.pop(action_name, None)
+        if not self._bindings.get(action_name):
+            self._bindings.pop(action_name, None)
+
     # -- readiness barrier -------------------------------------------------- #
 
     def mark_ready(self, module: str) -> None:
