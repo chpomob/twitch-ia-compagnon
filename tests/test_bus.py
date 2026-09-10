@@ -233,3 +233,190 @@ def test_invalid_patterns_are_rejected(invalid: str) -> None:
 async def test_invalid_event_types_are_rejected(invalid: str) -> None:
     with pytest.raises((TypeError, ValueError)):
         await EventBus().publish(invalid, {}, {})
+
+
+def _payload_of(event: dict) -> dict:
+    return event["payload"]
+
+
+@pytest.mark.asyncio
+async def test_count_limit_keeps_newest_records_without_skipping_subscribers() -> None:
+    """AC20 (R6): 15 publications under a 10-event limit retain the 10 newest."""
+
+    bus = EventBus(history_max_events=10)
+    calls: list[str] = []
+
+    def handler(name: str):
+        async def handle(event: dict) -> None:
+            calls.append(f"{name}:{event['payload']['index']}")
+
+        return handle
+
+    bus.subscribe("**", handler("last"), order=90)
+    bus.subscribe("**", handler("first"), order=10)
+    bus.subscribe("**", handler("second"), order=10)
+
+    for index in range(15):
+        await bus.publish("channel.chat.message", {"index": index}, {})
+
+    assert calls == [
+        f"{name}:{index}"
+        for index in range(15)
+        for name in ("first", "second", "last")
+    ]
+
+    retained = bus.list_events()
+    assert len(retained) == 10
+    assert [_payload_of(event)["index"] for event in retained] == list(range(5, 15))
+    assert all(_payload_of(event)["index"] >= 5 for event in retained)
+
+
+@pytest.mark.asyncio
+async def test_byte_limit_evicts_before_count_limit_without_failing_publications(
+) -> None:
+    """AC20 (R6): a byte bound reached first retains fewer than 10 records."""
+
+    bus = EventBus(history_max_events=10, history_max_bytes=400)
+    failures: list[Exception] = []
+
+    for index in range(15):
+        try:
+            await bus.publish(
+                "channel.chat.message",
+                {"index": index, "text": "x" * 100},
+                {},
+            )
+        except PublicationError as exc:  # pragma: no cover - guards AC20
+            failures.append(exc)
+
+    retained = bus.list_events()
+    assert failures == []
+    assert 0 < len(retained) < 10
+    assert [_payload_of(event)["index"] for event in retained] == list(
+        range(15 - len(retained), 15)
+    )
+
+
+@pytest.mark.asyncio
+async def test_age_limit_evicts_on_append_and_on_read_with_injected_clock() -> None:
+    """AC20 (R6): the age bound is applied both at append and at read time."""
+
+    now = [0.0]
+    bus = EventBus(
+        history_max_events=10,
+        history_max_age_seconds=10.0,
+        clock=lambda: now[0],
+    )
+
+    await bus.publish("channel.chat.message", {"index": 0}, {})
+    now[0] = 6.0
+    await bus.publish("channel.chat.message", {"index": 1}, {})
+    assert [_payload_of(event)["index"] for event in bus.list_events()] == [0, 1]
+
+    # Appending past the first record's age evicts it, keeping the newer one.
+    now[0] = 11.0
+    await bus.publish("channel.chat.message", {"index": 2}, {})
+    assert [_payload_of(event)["index"] for event in bus.list_events()] == [1, 2]
+
+    # No publication at all: reading alone must not return a stale record.
+    now[0] = 22.0
+    assert bus.list_events() == []
+
+    now[0] = 23.0
+    await bus.publish("channel.chat.message", {"index": 3}, {})
+    assert [_payload_of(event)["index"] for event in bus.list_events()] == [3]
+
+
+@pytest.mark.asyncio
+async def test_full_history_never_fails_a_publication() -> None:
+    """AC20 (R6): eviction runs after the chain, so a saturated bus still publishes."""
+
+    bus = EventBus(history_max_events=1, history_max_bytes=1)
+    seen: list[int] = []
+    bus.subscribe("**", lambda event: seen.append(event["payload"]["index"]))
+
+    for index in range(5):
+        finalized = await bus.publish("channel.chat.message", {"index": index}, {})
+        assert finalized["payload"]["index"] == index
+
+    assert seen == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_eviction_preserves_replacement_and_publication_error_semantics(
+) -> None:
+    """AC20 (R6): bounded retention leaves replacement and failure semantics intact."""
+
+    bus = EventBus(history_max_events=2)
+    replacement = {
+        "type": "channel.chat.rewritten",
+        "payload": {"text": "updated"},
+        "metadata": {"source": "middleware"},
+    }
+    bus.subscribe("channel.chat.message", lambda event: replacement)
+    bus.subscribe("broken", lambda event: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    await bus.publish("channel.chat.message", {"text": "original"}, {})
+    with pytest.raises(PublicationError):
+        await bus.publish("broken", {}, {})
+    await bus.publish("channel.chat.message", {"text": "original"}, {})
+
+    assert bus.list_events() == [replacement, replacement]
+
+
+_VALID_LIMITS = {
+    "history_max_events": 10,
+    "history_max_bytes": 4096,
+    "history_max_age_seconds": 60.0,
+}
+
+
+@pytest.mark.parametrize("setting", sorted(_VALID_LIMITS))
+@pytest.mark.parametrize(
+    "invalid",
+    [None, float("inf"), float("-inf"), float("nan"), 0, -1, "10"],
+)
+def test_absent_or_non_finite_limit_is_rejected_naming_the_setting(
+    setting: str, invalid: object
+) -> None:
+    """AC20 (R6): every bound is validated as finite and positive, by name."""
+
+    assert EventBus(**_VALID_LIMITS) is not None
+
+    limits = dict(_VALID_LIMITS, **{setting: invalid})
+    with pytest.raises((TypeError, ValueError)) as caught:
+        EventBus(**limits)
+
+    assert setting in str(caught.value)
+
+
+def test_non_callable_clock_is_rejected() -> None:
+    with pytest.raises(TypeError):
+        EventBus(clock=0.0)
+
+
+class _Holder:
+    """A payload value JSON cannot represent, hiding a large buffer."""
+
+    def __init__(self, buffer: bytearray) -> None:
+        self.buffer = buffer
+
+
+@pytest.mark.asyncio
+async def test_byte_limit_charges_retained_contents_not_their_repr() -> None:
+    """AC20 (R6): an opaque value is charged for the buffer the history keeps."""
+
+    bus = EventBus(history_max_events=10, history_max_bytes=4096)
+
+    for index in range(5):
+        await bus.publish(
+            "channel.chat.message",
+            {"index": index, "holder": _Holder(bytearray(2048))},
+            {},
+        )
+
+    retained = bus.list_events()
+    assert 0 < len(retained) < 5
+    assert [_payload_of(event)["index"] for event in retained] == list(
+        range(5 - len(retained), 5)
+    )
