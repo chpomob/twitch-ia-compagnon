@@ -25,6 +25,30 @@ modules:
     endpoint: ${OPENAI_ENDPOINT}
     model: ${OPENAI_MODEL}
     api_key: ${OPENAI_API_KEY}
+    # The limits the brain owns (design §3.4). Its manifest requires the three
+    # blocks below and its settings validator checks each value is finite and
+    # positive before any transport opens; startup stops with a diagnostic
+    # naming the field when one is absent, zero, negative or infinite. The
+    # admission and conversation_memory groups mirror the ones under `limits`
+    # until the core hands those over entirely.
+    admission:
+      session_queue_capacity: 4
+      global_pending_capacity: 64
+      max_sessions: 32
+      workers: 4
+      wait_seconds: 30
+      total_run_seconds: 120
+    budget:
+      model_turns: 5
+      model_call_seconds: 30
+      action_seconds: 10
+      max_tokens: 8192
+      max_observation_bytes: 5242880
+    conversation_memory:
+      max_sessions: 64
+      max_exchanges: 20
+      max_bytes: 65536
+      max_age_seconds: 3600
 
   audit:
     output: stdout

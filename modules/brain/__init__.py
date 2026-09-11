@@ -1,4 +1,20 @@
-"""Capability-driven language-model pipeline and tagged event router."""
+"""Language-model run engine: manifest v2, module-owned settings validation (R7).
+
+The manifest beside this package declares ``manifest_version: 2`` and names
+:func:`validate_settings` as its ``settings_validator``. The loader runs that
+hook for every enabled module before any of them is activated, so a
+misconfigured engine is reported with 0 transports opened (R7, AC24). The hook
+is a standalone function: it reads nothing from the run engine below and the
+run engine reads nothing from it yet — the engine's own parsing, the tagged
+``[send:...]`` output and the viewer-keyed memory are the compatibility
+behaviour the next step replaces on the versioned runtime.
+
+The limits the hook requires are the ones this module owns: the admission
+scheduler's, the per-run budgets' and the conversation memory's. Each must be
+present, numeric, finite and positive; an absent or unevaluable limit is a
+diagnostic, never a pass, because an engine with an omitted or infinite bound
+is not a usable engine (R2, R6).
+"""
 
 from __future__ import annotations
 
@@ -12,6 +28,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from core.bus import matches_event_pattern
 
@@ -21,12 +38,171 @@ except ModuleNotFoundError:  # pragma: no cover - production installs dependenci
     aiohttp = None  # type: ignore[assignment]
 
 
+MODULE_NAME = "brain"
+
 _INPUT_EVENT = "channel.chat.message"
-_MODULE_NAME = "brain"
 _TAG = re.compile(r"\[send:([^\]\r\n]+)\]")
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _DEFAULT_HISTORY_MESSAGES = 8
 _DEFAULT_MAX_HISTORY_VIEWERS = 1_000
+
+# --------------------------------------------------------------------------- #
+# Module-owned settings validation (R7)
+# --------------------------------------------------------------------------- #
+
+_COUNT = "count"
+"""A positive integer: works, sessions, workers, turns, tokens, bytes."""
+
+_SECONDS = "seconds"
+"""A finite, strictly positive number of seconds."""
+
+_ENDPOINT_SCHEMES = frozenset({"http", "https"})
+_ENV_REFERENCE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
+
+#: Every limit this module owns, by group, with its kind. The vocabulary is
+#: the one the manifest's ``settings_schema`` declares; the hook checks what
+#: that schema cannot — finiteness and strict positivity — and, called on its
+#: own, also presence and type, so a handle built outside the loader is
+#: refused on the same terms.
+_OWNED_LIMITS: Mapping[str, Mapping[str, str]] = {
+    "admission": {
+        "session_queue_capacity": _COUNT,
+        "global_pending_capacity": _COUNT,
+        "max_sessions": _COUNT,
+        "workers": _COUNT,
+        "wait_seconds": _SECONDS,
+        "total_run_seconds": _SECONDS,
+    },
+    "budget": {
+        "model_turns": _COUNT,
+        "model_call_seconds": _SECONDS,
+        "action_seconds": _SECONDS,
+        "max_tokens": _COUNT,
+        "max_observation_bytes": _COUNT,
+    },
+    "conversation_memory": {
+        "max_sessions": _COUNT,
+        "max_exchanges": _COUNT,
+        "max_bytes": _COUNT,
+        "max_age_seconds": _SECONDS,
+    },
+}
+
+
+def validate_settings(settings: Any) -> list[str]:
+    """Check this module's settings; return one diagnostic per offending field.
+
+    This is the hook ``settings_validator`` in the manifest names. The loader
+    runs it for every enabled module before any of them is activated (R7).
+    Each diagnostic names the module and the field and nothing else: the
+    endpoint and the key are configured values, so no value is ever echoed
+    (AC24). An empty list means the settings are accepted.
+
+    Beyond the shape the schema states, the hook checks that the endpoint is
+    a well-formed ``http(s)`` URL, that the model name is non-empty, that the
+    key resolved to a non-empty string rather than a still-unresolved
+    ``${NAME}`` reference, and that every owned limit is present, numeric,
+    finite and positive.
+    """
+
+    if not isinstance(settings, Mapping):
+        return [_setting_diagnostic("settings", "must be a mapping")]
+    diagnostics: list[str] = []
+
+    endpoint = settings.get("endpoint")
+    if endpoint is None:
+        diagnostics.append(_setting_diagnostic("endpoint", "is required"))
+    elif not _is_well_formed_url(endpoint):
+        diagnostics.append(
+            _setting_diagnostic("endpoint", "must be a well-formed http(s) URL")
+        )
+
+    model = settings.get("model")
+    if model is None:
+        diagnostics.append(_setting_diagnostic("model", "is required"))
+    elif not isinstance(model, str) or not model.strip():
+        diagnostics.append(_setting_diagnostic("model", "must be a non-empty string"))
+
+    api_key = settings.get("api_key")
+    if api_key is None:
+        diagnostics.append(_setting_diagnostic("api_key", "is required"))
+    elif not isinstance(api_key, str) or not api_key.strip():
+        diagnostics.append(
+            _setting_diagnostic("api_key", "must be a non-empty string")
+        )
+    elif _ENV_REFERENCE.match(api_key.strip()):
+        diagnostics.append(
+            _setting_diagnostic("api_key", "is an unresolved environment reference")
+        )
+
+    for group, limits in _OWNED_LIMITS.items():
+        section = settings.get(group)
+        if section is None:
+            diagnostics.append(_setting_diagnostic(group, "is required"))
+            continue
+        if not isinstance(section, Mapping):
+            diagnostics.append(_setting_diagnostic(group, "must be a mapping of limits"))
+            continue
+        for field_name in section:
+            if field_name not in limits:
+                diagnostics.append(
+                    _setting_diagnostic(
+                        f"{group}.{field_name}", "is not a limit this module owns"
+                    )
+                )
+        for field_name, kind in limits.items():
+            reason = _limit_reason(section.get(field_name), kind)
+            if reason is not None:
+                diagnostics.append(_setting_diagnostic(f"{group}.{field_name}", reason))
+    return diagnostics
+
+
+def _limit_reason(value: Any, kind: str) -> str | None:
+    """Why *value* is not an acceptable limit of *kind*, or ``None`` if it is."""
+
+    if value is None:
+        return "is required"
+    if isinstance(value, bool):
+        return _limit_wording(kind)
+    if kind == _COUNT:
+        if not isinstance(value, int) or value < 1:
+            return _limit_wording(kind)
+        return None
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return _limit_wording(kind)
+    return None
+
+
+def _limit_wording(kind: str) -> str:
+    if kind == _COUNT:
+        return "must be a positive integer"
+    return "must be a finite positive number"
+
+
+def _is_well_formed_url(value: Any) -> bool:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if any(character.isspace() for character in value):
+        return False
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        # ``port`` is parsed lazily: a non-numeric or out-of-range port raises
+        # only when read, so it is read here to fail preflight rather than the
+        # first request.
+        parts.port
+    except ValueError:
+        return False
+    return parts.scheme in _ENDPOINT_SCHEMES and bool(parts.netloc) and bool(hostname)
+
+
+def _setting_diagnostic(field_name: str, reason: str) -> str:
+    return f"module {MODULE_NAME!r}: field {field_name!r}: {reason}"
+
+
+# --------------------------------------------------------------------------- #
+# Run engine (compatibility behaviour until its migration)
+# --------------------------------------------------------------------------- #
 
 
 def _default_session_factory() -> Any:
@@ -168,7 +344,7 @@ class BrainModule:
                 return
 
             metadata = {
-                "source": _MODULE_NAME,
+                "source": MODULE_NAME,
                 "source_message_id": source_message_id,
                 "viewer_id": viewer_id,
             }
@@ -328,12 +504,19 @@ class _MalformedResponse(Exception):
 
 
 async def activate(
-    bus: Any,
+    runtime: Any,
     settings: Mapping[str, Any],
     catalog: Mapping[str, Mapping[str, Any]],
 ) -> BrainModule:
-    """Create the configured model client and subscribe to incoming chat."""
+    """Create the configured model client and subscribe to incoming chat.
 
+    The manifest declares v2, so the loader hands the module's scoped runtime
+    context; a direct caller may still pass the bus itself. Either way the
+    engine below speaks the bus contract only, until its migration takes the
+    scheduler, the executor and supervision from that context.
+    """
+
+    bus = _bus_of(runtime)
     parsed = _Settings.from_mapping(settings)
     reporter = settings.get("diagnostic_reporter", _default_reporter)
     if not callable(reporter):
@@ -366,6 +549,16 @@ async def activate(
     return handle
 
 
+def _bus_of(runtime: Any) -> Any:
+    """The bus behind *runtime*: the bus itself, or the context that carries it."""
+
+    if callable(getattr(runtime, "subscribe", None)) and callable(
+        getattr(runtime, "publish", None)
+    ):
+        return runtime
+    return runtime.bus
+
+
 def _catalog_contract(
     catalog: Mapping[str, Mapping[str, Any]],
 ) -> tuple[str, tuple[str, ...]]:
@@ -391,7 +584,7 @@ def _catalog_contract(
             produced = tuple(produces)
             consumed = tuple(consumes)
             rows.append((name, produced, consumed))
-            if name == _MODULE_NAME:
+            if name == MODULE_NAME:
                 brain_produces = produced
     except Exception:
         raise BrainModuleError("brain capabilities: malformed catalog") from None
@@ -535,4 +728,10 @@ def _default_reporter(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-__all__ = ["BrainModule", "BrainModuleError", "activate"]
+__all__ = [
+    "MODULE_NAME",
+    "BrainModule",
+    "BrainModuleError",
+    "activate",
+    "validate_settings",
+]

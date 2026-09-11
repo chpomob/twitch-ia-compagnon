@@ -1,6 +1,147 @@
+# Language-model run engine — manifest v2 (R7).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no credential, no endpoint and no grant
+# lives here. `produces: [channel.chat.send]` and `consumes:
+# [channel.chat.message]` describe routing; neither authorizes anything, and
+# this manifest declares no action and no trigger, so the action registry
+# discovers nothing from it and the authorized view it offers the model stays
+# empty until an explicit rule grants a provider's action (R5, R7).
+
 name: brain
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
 produces:
   - channel.chat.send
 consumes:
   - channel.chat.message
 middleware: false
+
+# Lifecycle participation, never the module name, decides what each phase asks
+# of this module (R4). The engine is neither an `input` (it opens no source, so
+# it has no `start_inputs`/`stop_inputs` phase) nor an `observation` (it flushes
+# nothing after the last close). With no role it takes part in the phases of an
+# ordinary resource — `prepare`, the readiness barrier, `drain` and `close` —
+# through whichever of those hooks its handle exposes.
+lifecycle:
+  roles: []
+
+# Business settings belong to the module (R7). The schema states the shape;
+# the declared hook, defined by the module package, checks what a schema
+# cannot — a well-formed endpoint, a resolved key, finite positive limits —
+# and reports one diagnostic per offending field naming module and field,
+# with no configured value echoed back.
+settings_schema:
+  type: object
+  properties:
+    endpoint:
+      type: string
+      description: Chat-completions URL of the configured model backend.
+    model:
+      type: string
+      description: Name of the model requested from that backend.
+    api_key:
+      type: string
+      description: Bearer credential, resolved from an environment reference.
+    # Admission limits the engine owns: one bounded FIFO per session, a global
+    # pending cap, a live-session cap, a bounded worker count, a finite wait
+    # deadline per queued item and a finite total deadline per run (R2).
+    admission:
+      type: object
+      properties:
+        session_queue_capacity:
+          type: integer
+          minimum: 1
+          description: Maximum queued works per session.
+        global_pending_capacity:
+          type: integer
+          minimum: 1
+          description: Maximum queued works across every session.
+        max_sessions:
+          type: integer
+          minimum: 1
+          description: Maximum live sessions before a new one is refused.
+        workers:
+          type: integer
+          minimum: 1
+          description: Bounded number of run workers.
+        wait_seconds:
+          type: number
+          description: Finite deadline a queued work may wait before it starts.
+        total_run_seconds:
+          type: number
+          description: Finite deadline from admission to delivery, wait included.
+      required:
+        - session_queue_capacity
+        - global_pending_capacity
+        - max_sessions
+        - workers
+        - wait_seconds
+        - total_run_seconds
+    # Per-run budgets the engine owns (design §3.4): model turns, the delay of
+    # one model call, the delay of one action call (delivery included), the
+    # cumulated token budget and the largest observation the transcript
+    # accepts.
+    budget:
+      type: object
+      properties:
+        model_turns:
+          type: integer
+          minimum: 1
+          description: Maximum model calls per run.
+        model_call_seconds:
+          type: number
+          description: Finite deadline of one model call.
+        action_seconds:
+          type: number
+          description: Finite deadline of one action call, delivery included.
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: Cumulated input and output tokens per run.
+        max_observation_bytes:
+          type: integer
+          minimum: 1
+          description: Largest observation or medium admitted into a transcript.
+      required:
+        - model_turns
+        - model_call_seconds
+        - action_seconds
+        - max_tokens
+        - max_observation_bytes
+    # Conversation memory the engine owns, bounded in sessions, exchanges,
+    # bytes and age (R6).
+    conversation_memory:
+      type: object
+      properties:
+        max_sessions:
+          type: integer
+          minimum: 1
+          description: Maximum remembered sessions; the oldest is evicted first.
+        max_exchanges:
+          type: integer
+          minimum: 1
+          description: Maximum retained exchanges per session.
+        max_bytes:
+          type: integer
+          minimum: 1
+          description: Maximum retained bytes of exchanges per session.
+        max_age_seconds:
+          type: number
+          description: Finite age after which a retained exchange is evicted.
+      required:
+        - max_sessions
+        - max_exchanges
+        - max_bytes
+        - max_age_seconds
+  required:
+    - endpoint
+    - model
+    - api_key
+    - admission
+    - budget
+    - conversation_memory
+settings_validator: validate_settings

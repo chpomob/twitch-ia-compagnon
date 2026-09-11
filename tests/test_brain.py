@@ -7,15 +7,50 @@ from typing import Any
 import pytest
 import yaml
 
+from core.actions import ActionExecutor, ActionRegistry, AuthorizationPolicy
 from core.bus import EventBus
-from modules.brain import activate
+from core.contracts import Counters
+from core.lifecycle import PhaseCoordinator, SupervisedTasks
+from core.loader import ModuleLoader
+from core.runtime import RUNTIME_API, RuntimeContext, Supervision
+from modules.brain import MODULE_NAME, activate, validate_settings
 
+
+ROOT = Path(__file__).parents[1]
 
 SETTINGS = {
     "endpoint": "https://configured.invalid/chat/completions",
     "model": "configured-model",
     "api_key": "never-show-api-key",
 }
+
+# The limits the engine owns (R2, R6): required by its manifest's schema and
+# checked finite and positive by its declared hook.
+LIMITS = {
+    "admission": {
+        "session_queue_capacity": 4,
+        "global_pending_capacity": 64,
+        "max_sessions": 32,
+        "workers": 4,
+        "wait_seconds": 30,
+        "total_run_seconds": 120,
+    },
+    "budget": {
+        "model_turns": 5,
+        "model_call_seconds": 30,
+        "action_seconds": 10,
+        "max_tokens": 8192,
+        "max_observation_bytes": 5_242_880,
+    },
+    "conversation_memory": {
+        "max_sessions": 64,
+        "max_exchanges": 20,
+        "max_bytes": 65_536,
+        "max_age_seconds": 3600.5,
+    },
+}
+
+VALID_SETTINGS = {**SETTINGS, **LIMITS}
 
 CATALOG = {
     "twitch": {
@@ -128,16 +163,219 @@ def assert_sanitized(diagnostics: list[str]) -> None:
     assert "What is up?" not in rendered
 
 
-def test_manifest_declares_brain_source_and_route() -> None:
-    manifest_path = Path(__file__).parents[1] / "modules" / "brain" / "module.yaml"
-    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-
-    assert manifest == {
-        "name": "brain",
-        "produces": ["channel.chat.send"],
-        "consumes": ["channel.chat.message"],
-        "middleware": False,
+def copy_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: dict(value) if isinstance(value, dict) else value
+        for key, value in settings.items()
     }
+
+
+def runtime_context(bus: EventBus | None = None) -> RuntimeContext:
+    """The versioned runtime over a real bus, registry, executor and tasks.
+
+    No trigger engine: the engine's manifest declares no triggers, so the
+    loader has nothing to register and nothing to refuse.
+    """
+
+    target_bus = bus or EventBus()
+    counters = Counters()
+    policy = AuthorizationPolicy()
+    actions = ActionRegistry(authorization=policy)
+    supervision = Supervision(target_bus, counters=counters)
+    return RuntimeContext(
+        bus=target_bus,
+        actions=actions,
+        supervision=supervision,
+        tasks=SupervisedTasks(),
+        executor=ActionExecutor(
+            actions, policy, supervision=supervision, counters=counters
+        ),
+    )
+
+
+def test_manifest_declares_v2_shape_settings_hook_and_no_grant() -> None:
+    """R7 supersedes the former whole-manifest equality.
+
+    The manifest carries ``manifest_version`` and ``runtime_api``, keeps the
+    routing keys, declares no lifecycle role, states its settings schema and
+    names its settings-validation hook. It declares no trigger and no action:
+    ``produces`` and ``consumes`` describe routing and authorize nothing.
+    """
+
+    manifest_path = ROOT / "modules" / "brain" / "module.yaml"
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    manifest = yaml.safe_load(manifest_text)
+
+    assert manifest["name"] == MODULE_NAME == "brain"
+    assert manifest["manifest_version"] == 2
+    assert manifest["runtime_api"] == RUNTIME_API
+    assert manifest["produces"] == ["channel.chat.send"]
+    assert manifest["consumes"] == ["channel.chat.message"]
+    assert manifest["middleware"] is False
+    assert manifest["lifecycle"] == {"roles": []}
+    assert "triggers" not in manifest
+    assert "actions" not in manifest
+
+    schema = manifest["settings_schema"]
+    assert schema["type"] == "object"
+    assert set(schema["required"]) == set(VALID_SETTINGS)
+    assert set(schema["properties"]) == set(VALID_SETTINGS)
+    for group, limits in LIMITS.items():
+        group_schema = schema["properties"][group]
+        assert group_schema["type"] == "object"
+        assert set(group_schema["required"]) == set(limits)
+        assert set(group_schema["properties"]) == set(limits)
+        for name in limits:
+            declared = group_schema["properties"][name]["type"]
+            assert declared == ("number" if name.endswith("_seconds") else "integer")
+    assert manifest["settings_validator"] == "validate_settings"
+    assert callable(validate_settings)
+    for value in SETTINGS.values():
+        assert value not in manifest_text
+
+
+def test_settings_hook_names_module_and_field_without_values() -> None:
+    """R7/AC24: one diagnostic per offending field; no configured value echoed."""
+
+    assert validate_settings(VALID_SETTINGS) == []
+
+    invalid = copy_settings(VALID_SETTINGS)
+    invalid["endpoint"] = "configured.invalid/chat/completions"
+    del invalid["conversation_memory"]["max_exchanges"]
+    diagnostics = validate_settings(invalid)
+
+    assert diagnostics == [
+        "module 'brain': field 'endpoint': must be a well-formed http(s) URL",
+        "module 'brain': field 'conversation_memory.max_exchanges': is required",
+    ]
+    assert len(diagnostics) == 2
+    for diagnostic in diagnostics:
+        assert "'brain'" in diagnostic
+    rendered = "\n".join(diagnostics)
+    assert rendered.count(SETTINGS["api_key"]) == 0
+    assert rendered.count(invalid["endpoint"]) == 0
+    assert validate_settings(["not", "a", "mapping"]) == [
+        "module 'brain': field 'settings': must be a mapping"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "expected"),
+    [
+        (("endpoint",), "ftp://configured.invalid/x", "field 'endpoint': must be a well-formed http(s) URL"),
+        (("endpoint",), "https://", "field 'endpoint': must be a well-formed http(s) URL"),
+        (("endpoint",), "https://host.invalid/a b", "field 'endpoint': must be a well-formed http(s) URL"),
+        (("endpoint",), "https://host.invalid:abc/chat/completions", "field 'endpoint': must be a well-formed http(s) URL"),
+        (("endpoint",), "https://host.invalid:99999/chat/completions", "field 'endpoint': must be a well-formed http(s) URL"),
+        (("endpoint",), None, "field 'endpoint': is required"),
+        (("model",), "   ", "field 'model': must be a non-empty string"),
+        (("model",), 3, "field 'model': must be a non-empty string"),
+        (("api_key",), "", "field 'api_key': must be a non-empty string"),
+        (("api_key",), "${MODEL_API_KEY}", "field 'api_key': is an unresolved environment reference"),
+        (("admission",), None, "field 'admission': is required"),
+        (("budget",), [5], "field 'budget': must be a mapping of limits"),
+        (("admission", "workers"), 0, "field 'admission.workers': must be a positive integer"),
+        (("admission", "workers"), 2.0, "field 'admission.workers': must be a positive integer"),
+        (("admission", "workers"), True, "field 'admission.workers': must be a positive integer"),
+        (("admission", "wait_seconds"), float("inf"), "field 'admission.wait_seconds': must be a finite positive number"),
+        (("admission", "wait_seconds"), float("nan"), "field 'admission.wait_seconds': must be a finite positive number"),
+        (("admission", "wait_seconds"), "30", "field 'admission.wait_seconds': must be a finite positive number"),
+        (("budget", "model_call_seconds"), 0, "field 'budget.model_call_seconds': must be a finite positive number"),
+        (("budget", "max_tokens"), -1, "field 'budget.max_tokens': must be a positive integer"),
+        (("conversation_memory", "max_age_seconds"), -0.5, "field 'conversation_memory.max_age_seconds': must be a finite positive number"),
+        (("conversation_memory", "max_exchange"), 3, "field 'conversation_memory.max_exchange': is not a limit this module owns"),
+    ],
+)
+def test_settings_hook_refuses_each_unevaluable_field_with_one_diagnostic(
+    path: tuple[str, ...], value: Any, expected: str
+) -> None:
+    """R2/R6/R7: an absent, non-numeric, infinite or non-positive limit is a diagnostic."""
+
+    invalid = copy_settings(VALID_SETTINGS)
+    target: Any = invalid
+    for component in path[:-1]:
+        target = target[component]
+    if value is None:
+        del target[path[-1]]
+    else:
+        target[path[-1]] = value
+
+    diagnostics = validate_settings(invalid)
+
+    assert f"module 'brain': {expected}" in diagnostics
+    assert len(diagnostics) == 1
+    assert_sanitized(diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_loader_resolves_the_declared_hook_and_grants_nothing_from_produces() -> None:
+    """R7: the declared hook name resolves to this package's callable, and
+    ``produces: [channel.chat.send]`` puts 0 actions in the registry's
+    discovered, ready and authorized views.
+    """
+
+    session = FakeSession()
+    diagnostics: list[str] = []
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    settings = {
+        **copy_settings(VALID_SETTINGS),
+        "_session_factory": lambda: session,
+        "diagnostic_reporter": diagnostics.append,
+    }
+
+    activations = await loader.activate_enabled(
+        {"enabled_modules": ["brain"], "modules": {"brain": settings}}
+    )
+
+    (activation,) = activations
+    assert activation.name == "brain"
+    assert activation.manifest_version == 2
+    assert activation.roles == frozenset()
+    assert type(activation.handle).__name__ == "BrainModule"
+    assert diagnostics == []
+    assert dict(context.actions.discovered()) == {}
+    assert dict(context.actions.registered_ready()) == {}
+    assert dict(context.actions.authorized(principal="viewer")) == {}
+    assert context.actions.bindings() == ()
+
+    coordinator = PhaseCoordinator(
+        activations, tasks=context.tasks, reporter=diagnostics.append
+    )
+    assert (await coordinator.start()).status == 0
+    assert (await coordinator.stop()).status == 0
+    assert diagnostics == []
+    assert session.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_loader_refuses_settings_the_hook_rejects_before_activation() -> None:
+    """R7/AC24: the declared hook refuses through the loader, value-free."""
+
+    from core.loader import ModuleLoadError
+
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    # Well-formed for the schema, refused by the hook: the schema cannot see
+    # that this endpoint has no scheme or that this limit is infinite.
+    invalid = copy_settings(VALID_SETTINGS)
+    invalid["endpoint"] = "configured.invalid/chat/completions"
+    invalid["conversation_memory"]["max_age_seconds"] = float("inf")
+    activated: list[str] = []
+    invalid["_session_factory"] = lambda: activated.append("session")
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled(
+            {"enabled_modules": ["brain"], "modules": {"brain": invalid}}
+        )
+
+    assert "'brain'" in str(caught.value)
+    assert "validate_settings" in str(caught.value)
+    assert "2 diagnostics" in str(caught.value)
+    assert_sanitized([str(caught.value)])
+    assert invalid["endpoint"] not in str(caught.value)
+    assert activated == []
+    assert loader.activations == []
 
 
 @pytest.mark.asyncio

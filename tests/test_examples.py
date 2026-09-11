@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -170,3 +171,35 @@ def test_example_config_carries_what_the_versioned_runtime_requires() -> None:
     assert companion_name.strip()
     assert ENV_REFERENCE.fullmatch(companion_name) is None
 
+
+
+def test_example_config_satisfies_every_module_owned_settings_validator() -> None:
+    """R7: the quick-start example passes each module's own preflight.
+
+    A module manifest may require settings beyond the credentials — the brain
+    requires its admission, budget and conversation memory limits — and the
+    loader runs the module's ``settings_validator`` on ``modules.<name>`` as
+    shipped, without merging the top-level ``limits`` block into it. An
+    example that satisfied the core's limits but not a module's would refuse
+    to start with valid credentials, so every validator is run here on the
+    expanded example with sample values for its references.
+    """
+
+    config = _read_yaml(EXAMPLE_PATH)
+    environ: dict[str, str] = {}
+    for module_settings in config["modules"].values():
+        for setting_name, value in module_settings.items():
+            if isinstance(value, str):
+                match = ENV_REFERENCE.fullmatch(value)
+                if match is not None:
+                    environ[match.group(1)] = f"https://sample.invalid/{setting_name}"
+    expanded = load_config(EXAMPLE_PATH, environ=environ)
+
+    for module_name in MODULE_NAMES:
+        manifest = _read_yaml(ROOT / "modules" / module_name / "module.yaml")
+        hook_name = manifest.get("settings_validator")
+        if hook_name is None:
+            continue
+        module = importlib.import_module(f"modules.{module_name}")
+        validator = getattr(module, hook_name)
+        assert validator(expanded["modules"][module_name]) == [], module_name
