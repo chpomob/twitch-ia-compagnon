@@ -24,6 +24,12 @@ Phase                        Guarantee
                              budget or is explicitly cancelled, with a
                              grace period so a cancelled run can still
                              publish its terminal outcome (AC15).
+``close`` (compatibility)    A v1 activation, which has no phase but
+                             ``close()``, stops its inputs, drains and
+                             releases all at once here: after every
+                             versioned producer stopped and drained, and
+                             before any versioned resource it may still
+                             publish into closes.
 ``close``                    Ordinary transports and stores close.
                              Failures are collected, never swallowed,
                              and never skip the remaining modules.
@@ -756,12 +762,25 @@ class PhaseCoordinator:
     Every hook runs under ``min(hook_timeout, remaining global budget)``, so
     however many modules there are, startup cannot exceed one finite startup
     deadline and shutdown cannot exceed one finite shutdown deadline.
+
+    *compatibility* holds the activations that took the loader's v1 route.
+    They have no startup phase here — a v1 module opens its transport at
+    activation — and exactly one shutdown hook, ``close()``, which stops
+    their inputs, drains what they accepted and releases their resources all
+    at once. The coordinator runs it as its own step of the shutdown
+    sequence, between the drain phase and the close phase, so that in a
+    mixed pipeline every direction is safe: a versioned producer has stopped
+    and drained before a v1 sink closes, and a v1 producer has closed before
+    the versioned consumers and observation services it publishes into close
+    or flush. The step shares the one global shutdown deadline, whether
+    shutdown was requested or is the unwinding of a failed startup.
     """
 
     __slots__ = (
         "_barrier",
         "_cancel_grace_seconds",
         "_clock",
+        "_compatibility",
         "_current",
         "_diagnostics",
         "_drain_deadline_seconds",
@@ -786,6 +805,7 @@ class PhaseCoordinator:
         self,
         modules: Iterable[Any],
         *,
+        compatibility: Iterable[Any] = (),
         startup_deadline_seconds: float = DEFAULT_STARTUP_DEADLINE_SECONDS,
         shutdown_deadline_seconds: float = DEFAULT_SHUTDOWN_DEADLINE_SECONDS,
         hook_timeout_seconds: float = DEFAULT_HOOK_TIMEOUT_SECONDS,
@@ -808,6 +828,9 @@ class PhaseCoordinator:
         for module in self._modules:
             # Refuse an undeclared role before any transport is opened.
             module_roles(module)
+        # A v1 activation declares no role: it is routed by its contract, not
+        # by anything read from it, so nothing is validated here.
+        self._compatibility = list(compatibility)
 
         self._startup_deadline_seconds = _finite(
             startup_deadline_seconds, "startup_deadline_seconds"
@@ -905,6 +928,11 @@ class PhaseCoordinator:
             for module in self._modules
             if ROLE_OBSERVATION in module_roles(module)
         )
+
+    def compatibility(self) -> tuple[Any, ...]:
+        """The v1 activations closed between drain and close, in activation order."""
+
+        return tuple(self._compatibility)
 
     # -- phases -------------------------------------------------------------- #
 
@@ -1043,6 +1071,10 @@ class PhaseCoordinator:
 
         await self._drain(deadline_at)
 
+        # Every versioned transport, store and observation service is still
+        # open: whatever a v1 module drains here still has somewhere to go.
+        await self._close_compatibility(deadline_at)
+
         observers = set(map(id, self.observers()))
         ordinary = [
             module for module in self._modules if id(module) not in observers
@@ -1087,6 +1119,34 @@ class PhaseCoordinator:
             self._note(message)
         for message in closing.failures:
             self._fail(message)
+
+    async def _close_compatibility(self, deadline_at: float) -> None:
+        """Close the v1 activations one at a time, in activation order.
+
+        A v1 configuration lists its pipeline from source to sink, and a v1
+        close is the module's whole shutdown, so closing the source first
+        lets the work it accepted reach the sinks before those close — the
+        guarantee the name-ordered entry point gave, given here without a
+        name. Each close gets the hook grace period capped by what remains
+        of the global shutdown deadline; one that overruns is cancelled and
+        the next module is still closed. A close already run — a resumed
+        sequence — is not run again.
+        """
+
+        for module in self._compatibility:
+            key = (_module_name(module), PHASE_CLOSE)
+            if key in self._invoked:
+                continue
+            self._invoked.add(key)
+            for failure in await close_modules(
+                [module],
+                timeout_seconds=self._hook_timeout_seconds,
+                cancel_grace_seconds=self._cancel_grace_seconds,
+                sleeper=self._sleep,
+                clock=self._clock,
+                deadline_at=deadline_at,
+            ):
+                self._fail(failure)
 
     def _drain_budget(self, deadline_at: float) -> float:
         """The drain allowance left inside the global shutdown deadline."""

@@ -174,11 +174,18 @@ async def test_stubborn_close_is_bounded_and_audit_still_closes(monkeypatch) -> 
     monkeypatch.setattr(application, "_CLOSE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(application, "_CANCEL_TIMEOUT_SECONDS", 0.01)
     try:
-        failures = await asyncio.wait_for(application._close_activations([
-            ModuleActivation("brain", {}, SimpleNamespace(close=stubborn)),
-            ModuleActivation("audit", {}, SimpleNamespace(close=close_audit)),
-        ]), 1)
-        assert failures == ["module 'brain': shutdown failed"]
+        # Two v1 activations: the coordinator closes them as its compatibility
+        # step, one bounded close after the other, in activation order.
+        coordinator = application._coordinator(
+            [
+                ModuleActivation("brain", {}, SimpleNamespace(close=stubborn)),
+                ModuleActivation("audit", {}, SimpleNamespace(close=close_audit)),
+            ],
+            application._assemble_runtime({}),
+            lambda _message: None,
+        )
+        report = await asyncio.wait_for(coordinator.stop(), 1)
+        assert report.failures == ("module 'brain': shutdown failed",)
         assert closed == ["audit"]
     finally:
         release.set()
@@ -210,8 +217,13 @@ async def run(config):
     handle.handle_event({"type": "test.event", "payload": {}})
     while not started.is_set():
         await asyncio.sleep(0.001)
-    failures = await app._close_activations([ModuleActivation("audit", {}, handle)])
-    assert not failures
+    coordinator = app._coordinator(
+        [ModuleActivation("audit", {}, handle)],
+        app._assemble_runtime({}),
+        lambda _message: None,
+    )
+    report = await coordinator.stop()
+    assert not report.failures
     print("cleanup completed", flush=True)
     return 0
 
@@ -247,10 +259,13 @@ async def close():
             pass
 
 async def run(config):
-    failures = await app._close_activations([
-        ModuleActivation("brain", {}, SimpleNamespace(close=close)),
-    ])
-    assert failures == ["module 'brain': shutdown failed"]
+    coordinator = app._coordinator(
+        [ModuleActivation("brain", {}, SimpleNamespace(close=close))],
+        app._assemble_runtime({}),
+        lambda _message: None,
+    )
+    report = await coordinator.stop()
+    assert report.failures == ("module 'brain': shutdown failed",)
     print("cleanup bounded", flush=True)
     return 1
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import signal
 from pathlib import Path
 from typing import Any, Callable
@@ -55,6 +56,84 @@ async def activate(bus, settings, catalog):
 """
 
 
+PHASED_MODULE_SOURCE = """
+import json
+from pathlib import Path
+
+
+def record(settings, operation):
+    path = Path(settings["lifecycle_log"])
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"{operation}:{settings['label']}\\n")
+
+
+class Handle:
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def prepare(self):
+        record(self.settings, "prepare")
+
+    async def start_inputs(self):
+        record(self.settings, "start_inputs")
+
+    async def stop_inputs(self):
+        record(self.settings, "stop_inputs")
+
+    async def drain(self, allowance):
+        record(self.settings, "drain")
+
+    async def flush(self, allowance):
+        record(self.settings, "flush")
+
+    async def close(self):
+        record(self.settings, "close")
+
+
+async def activate(context, settings, catalog):
+    record(settings, "activate")
+    context_log = settings.get("context_log")
+    if context_log:
+        with Path(context_log).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "module": context.module,
+                "runtime_api": context.runtime_api,
+                "chat": context.chat is not None,
+                "attachments": context.attachments is not None,
+                "triggers": context.triggers is not None,
+                "executor": context.executor is not None,
+            }, sort_keys=True) + "\\n")
+    return Handle(settings)
+"""
+
+
+REFUSING_HOOK_SOURCE = PHASED_MODULE_SOURCE + """
+
+def validate_settings(settings):
+    # A module-authored refusal that carries the rejected credential in its
+    # message: the entry point must not echo it (R7, AC24).
+    raise ValueError(f"refused {settings['api_key']}")
+"""
+
+
+MISSING_FIELD_HOOK_SOURCE = PHASED_MODULE_SOURCE + """
+
+def validate_settings(settings):
+    # The module, not the core, knows which of its settings are required.
+    for field_name in ("access_token", "api_key"):
+        value = settings.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} is required, got {settings!r}")
+"""
+
+
+ACCEPTING_HOOK_SOURCE = PHASED_MODULE_SOURCE + """
+
+def validate_settings(settings):
+    return None
+"""
+
+
 def _make_module(root: Path, name: str, source: str = MODULE_SOURCE) -> None:
     directory = root / name
     directory.mkdir()
@@ -68,6 +147,95 @@ def _make_module(root: Path, name: str, source: str = MODULE_SOURCE) -> None:
         yaml.safe_dump(manifest), encoding="utf-8"
     )
     (directory / "__init__.py").write_text(source, encoding="utf-8")
+
+
+def _make_phased_module(
+    root: Path,
+    name: str,
+    *,
+    roles: tuple[str, ...] = (),
+    source: str = PHASED_MODULE_SOURCE,
+    settings_schema: dict[str, Any] | None = None,
+    settings_validator: str | None = None,
+) -> None:
+    """Write a ``manifest_version: 2`` module declaring *roles* and hooks."""
+
+    directory = root / name
+    directory.mkdir()
+    manifest: dict[str, Any] = {
+        "name": name,
+        "manifest_version": 2,
+        "runtime_api": 2,
+        "produces": [],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": list(roles)},
+    }
+    if settings_schema is not None:
+        manifest["settings_schema"] = settings_schema
+    if settings_validator is not None:
+        manifest["settings_validator"] = settings_validator
+    (directory / "module.yaml").write_text(
+        yaml.safe_dump(manifest), encoding="utf-8"
+    )
+    (directory / "__init__.py").write_text(source, encoding="utf-8")
+
+
+def _finite_limits() -> dict[str, dict[str, Any]]:
+    """Every retention and admission limit, finite and positive (AC32)."""
+
+    return {
+        "bus_history": {"max_events": 100, "max_bytes": 65536, "max_age_seconds": 60},
+        "observation_queue": {"max_records": 64, "max_bytes": 65536},
+        "dedup": {"max_entries": 32, "ttl_seconds": 30.0},
+        "attachments": {
+            "max_object_bytes": 1024,
+            "max_objects": 8,
+            "max_total_bytes": 4096,
+            "max_bytes_per_run": 2048,
+            "ttl_seconds": 30.0,
+        },
+        "conversation_memory": {
+            "max_sessions": 4,
+            "max_exchanges": 6,
+            "max_bytes": 4096,
+            "max_age_seconds": 120.0,
+        },
+        "chat_context": {
+            "max_messages": 16,
+            "max_bytes": 4096,
+            "max_age_seconds": 60.0,
+            "max_channels": 4,
+        },
+        "admission": {
+            "session_queue_capacity": 2,
+            "global_pending_capacity": 8,
+            "max_sessions": 4,
+            "workers": 2,
+            "wait_seconds": 5.0,
+            "total_run_seconds": 20.0,
+        },
+    }
+
+
+def _phased_config(
+    modules_directory: str,
+    lifecycle_log: Path,
+    names: tuple[str, ...],
+    *,
+    limits: bool = True,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "modules_directory": modules_directory,
+        "enabled_modules": list(names),
+        "modules": {
+            name: {"lifecycle_log": str(lifecycle_log), "label": name}
+            for name in names
+        },
+    }
+    if limits:
+        config["limits"] = _finite_limits()
+    return config
 
 
 def _opaque(label: str) -> str:
@@ -130,17 +298,31 @@ def _delete_nested(config: dict[str, Any], path: tuple[object, ...]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_valid_config_waits_for_stop_and_closes_producers_before_audit(
+async def test_valid_config_waits_for_stop_and_unwinds_declared_phases_in_order(
     tmp_path: Path,
 ) -> None:
+    """Phase-ordered replacement of the name-ordered close assertion (R4, AC13).
+
+    The former ``twitch, brain, audit`` close order came from a name map in
+    ``core/main.py``; R4 forbids ordering by name. The order now follows the
+    lifecycle roles each manifest declares: the observation service is
+    activated *first* and named to sort first, yet it flushes and closes last;
+    the producer is started only after every module prepared and stopped
+    first; ordinary resources unwind in reverse activation order.
+    """
+
     modules = tmp_path / "modules"
     modules.mkdir()
-    for name in ("twitch", "brain", "audit"):
-        _make_module(modules, name)
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_phased_module(modules, "relay")
 
     lifecycle_log = tmp_path / "lifecycle.log"
     config_path = tmp_path / "config.yaml"
-    _write_config(config_path, _valid_config("./modules", lifecycle_log))
+    _write_config(
+        config_path,
+        _phased_config("./modules", lifecycle_log, ("alpha", "source", "relay")),
+    )
 
     stop = asyncio.Event()
     ready = asyncio.Event()
@@ -163,22 +345,299 @@ async def test_valid_config_waits_for_stop_and_closes_producers_before_audit(
 
     assert task.done() is False
     assert readiness == ["ready"]
-    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
-        "activate:twitch",
-        "activate:brain",
-        "activate:audit",
+    started = [
+        "activate:alpha",
+        "activate:source",
+        "activate:relay",
+        "prepare:alpha",
+        "prepare:source",
+        "prepare:relay",
+        "start_inputs:source",
     ]
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == started
 
     stop.set()
     assert await asyncio.wait_for(task, timeout=1) == 0
     assert diagnostics == []
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == started + [
+        "stop_inputs:source",
+        "drain:relay",
+        "drain:source",
+        "drain:alpha",
+        "close:relay",
+        "close:source",
+        "flush:alpha",
+        "close:alpha",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v1_source_closes_before_the_versioned_sinks_it_feeds(
+    tmp_path: Path,
+) -> None:
+    """A mixed pipeline unwinds in an order that is safe in both directions.
+
+    The v1 source's ``close()`` is its stop, drain and release in one; it
+    runs after the versioned producer stopped and drained, and before the
+    versioned relay closes or the observation service flushes — so whatever
+    the v1 source still delivers while closing has somewhere to go.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    _make_module(modules, "legacy")
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_phased_module(modules, "relay")
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        _phased_config(
+            "./modules", lifecycle_log, ("alpha", "legacy", "source", "relay")
+        ),
+    )
+    stop = asyncio.Event()
+    stop.set()
+
+    status = await application.run(
+        config_path,
+        stop,
+        ready_reporter=lambda _message: None,
+        diagnostic_reporter=lambda message: pytest.fail(message),
+    )
+
+    assert status == 0
     assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
-        "activate:twitch",
-        "activate:brain",
-        "activate:audit",
-        "close:twitch",
-        "close:brain",
-        "close:audit",
+        "activate:alpha",
+        "activate:legacy",
+        "activate:source",
+        "activate:relay",
+        "prepare:alpha",
+        "prepare:source",
+        "prepare:relay",
+        "start_inputs:source",
+        "stop_inputs:source",
+        "drain:relay",
+        "drain:source",
+        "drain:alpha",
+        "close:legacy",
+        "close:relay",
+        "close:source",
+        "flush:alpha",
+        "close:alpha",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_unwinds_the_v1_route_through_the_same_coordinator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: one coordinator, one shutdown deadline, for both routes.
+
+    The v1 activation is handed to the coordinator as its compatibility
+    step, so a failed preparation unwinds it inside the same sequence and
+    budget as the versioned modules instead of a second, fresh one.
+    """
+
+    constructed: list[tuple[list[str], list[str]]] = []
+    real_coordinator = application.PhaseCoordinator
+
+    class Recording(real_coordinator):  # type: ignore[misc, valid-type]
+        def __init__(self, modules: Any, **options: Any) -> None:
+            constructed.append(
+                (
+                    [module.name for module in modules],
+                    [module.name for module in options.get("compatibility", ())],
+                )
+            )
+            super().__init__(modules, **options)
+
+    monkeypatch.setattr(application, "PhaseCoordinator", Recording)
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_module(modules, "legacy")
+    _make_phased_module(
+        modules,
+        "relay",
+        source=PHASED_MODULE_SOURCE.replace(
+            'record(self.settings, "prepare")',
+            'record(self.settings, "prepare")\n'
+            '        raise RuntimeError(self.settings["label"])',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("legacy", "relay"))
+    )
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert diagnostics == ["module 'relay': phase 'prepare' failed"]
+    assert constructed == [(["relay"], ["legacy"])]
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
+        "activate:legacy",
+        "activate:relay",
+        "prepare:relay",
+        "drain:relay",
+        "close:legacy",
+        "close:relay",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_versioned_module_receives_the_runtime_built_from_limits(
+    tmp_path: Path,
+) -> None:
+    """R7: activation receives the versioned context, not a bare bus."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "relay")
+    lifecycle_log = tmp_path / "lifecycle.log"
+    context_log = tmp_path / "context.jsonl"
+    config = _phased_config("./modules", lifecycle_log, ("relay",))
+    config["modules"]["relay"]["context_log"] = str(context_log)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    stop = asyncio.Event()
+    stop.set()
+
+    status = await application.run(
+        config_path,
+        stop,
+        ready_reporter=lambda _message: None,
+        diagnostic_reporter=lambda message: pytest.fail(message),
+    )
+
+    assert status == 0
+    assert [
+        json.loads(line)
+        for line in context_log.read_text(encoding="utf-8").splitlines()
+    ] == [
+        {
+            "module": "relay",
+            "runtime_api": 2,
+            "chat": True,
+            "attachments": True,
+            "triggers": True,
+            "executor": True,
+        }
+    ]
+
+
+def test_entry_point_contains_no_module_name_literal_or_core_field_table() -> None:
+    """AC13, AC24: the literal grep the specification asks for."""
+
+    source = (
+        Path(__file__).resolve().parents[1] / "core" / "main.py"
+    ).read_text(encoding="utf-8")
+
+    assert source.count("_MODULE_REQUIRED_FIELDS") == 0
+    for literal in ("twitch", "brain", "audit"):
+        assert source.lower().count(literal) == 0, literal
+
+
+def test_entry_point_drives_the_coordinator_under_finite_global_deadlines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: one finite startup deadline and one finite shutdown deadline."""
+
+    constructed: list[dict[str, Any]] = []
+    real_coordinator = application.PhaseCoordinator
+
+    class Recording(real_coordinator):  # type: ignore[misc, valid-type]
+        def __init__(self, modules: Any, **options: Any) -> None:
+            constructed.append(dict(options))
+            super().__init__(modules, **options)
+
+    monkeypatch.setattr(application, "PhaseCoordinator", Recording)
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "relay")
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", tmp_path / "lifecycle.log", ("relay",))
+    )
+    stop = asyncio.Event()
+    stop.set()
+
+    status = asyncio.run(
+        application.run(
+            config_path,
+            stop,
+            ready_reporter=lambda _message: None,
+            diagnostic_reporter=lambda message: pytest.fail(message),
+        )
+    )
+
+    assert status == 0
+    assert len(constructed) == 1
+    options = constructed[0]
+    for deadline in ("startup_deadline_seconds", "shutdown_deadline_seconds"):
+        value = options[deadline]
+        assert isinstance(value, (int, float)) and not isinstance(value, bool)
+        assert math.isfinite(value) and value > 0
+    assert options["hook_timeout_seconds"] <= options["shutdown_deadline_seconds"]
+
+
+@pytest.mark.asyncio
+async def test_failed_preparation_unwinds_partial_startup_without_readiness(
+    tmp_path: Path,
+) -> None:
+    """R4: a failed phase stops startup, names the module and cleans up."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_phased_module(
+        modules,
+        "relay",
+        source=PHASED_MODULE_SOURCE.replace(
+            'record(self.settings, "prepare")',
+            'record(self.settings, "prepare")\n'
+            '        raise RuntimeError(self.settings["label"])',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("source", "relay"))
+    )
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert diagnostics == ["module 'relay': phase 'prepare' failed"]
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
+        "activate:source",
+        "activate:relay",
+        "prepare:source",
+        "prepare:relay",
+        # Never started, still stopped: the hooks are idempotent by contract.
+        "stop_inputs:source",
+        "drain:relay",
+        "drain:source",
+        "close:relay",
+        "close:source",
     ]
 
 
@@ -373,28 +832,71 @@ async def test_invalid_configuration_structure_fails_before_readiness(
     assert all(value not in diagnostics[0] for value in credentials)
 
 
+def _hooked_config(
+    modules_directory: str, lifecycle_log: Path
+) -> tuple[dict[str, Any], set[str]]:
+    """Two enabled modules whose credentials must never reach a diagnostic."""
+
+    config = _phased_config(modules_directory, lifecycle_log, ("gateway", "engine"))
+    credentials = {
+        "gateway": {
+            "access_token": _opaque("token"),
+            "api_key": _opaque("gateway-key"),
+        },
+        "engine": {
+            "access_token": _opaque("engine-token"),
+            "api_key": _opaque("key"),
+        },
+    }
+    for name, settings in credentials.items():
+        config["modules"][name].update(settings)
+    values = {value for settings in credentials.values() for value in settings.values()}
+    return config, values
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("module_name", "field_name"),
+    ("module_name", "field_name", "invalid_value"),
     [
-        ("brain", "endpoint"),
-        ("brain", "model"),
-        ("brain", "api_key"),
-        ("twitch", "client_id"),
-        ("twitch", "client_secret"),
-        ("twitch", "access_token"),
-        ("twitch", "broadcaster_id"),
-        ("twitch", "bot_user_id"),
+        ("gateway", "access_token", None),
+        ("gateway", "access_token", 42),
+        ("gateway", "api_key", " "),
+        ("engine", "api_key", None),
+        ("engine", "api_key", ["not", "a", "string"]),
+        ("engine", "access_token", ""),
     ],
 )
-async def test_each_type_invalid_required_module_setting_is_rejected(
+async def test_each_type_invalid_module_setting_is_rejected_by_the_module_hook(
     tmp_path: Path,
     module_name: str,
     field_name: str,
+    invalid_value: Any,
 ) -> None:
-    config = _valid_config("./modules", tmp_path / "unused.log")
-    credentials = _configured_credentials(config)
-    _set_nested(config, ("modules", module_name, field_name), None)
+    """Module-hook replacement of the core-owned required-field table (R7).
+
+    The former assertion expected ``core/main.py`` to emit
+    ``modules.<name>.<field>: must be a non-empty string`` from its own field
+    table; R7 moves the knowledge of which settings are required into each
+    module's declared ``settings_validator`` hook. The core no longer knows
+    the field, so the diagnostic names the module and the hook that refused,
+    and it never echoes the refused value — the hook's own message does.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    for name in ("gateway", "engine"):
+        _make_phased_module(
+            modules,
+            name,
+            source=MISSING_FIELD_HOOK_SOURCE,
+            settings_validator="validate_settings",
+        )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config, credentials = _hooked_config("./modules", lifecycle_log)
+    if invalid_value is None:
+        _delete_nested(config, ("modules", module_name, field_name))
+    else:
+        _set_nested(config, ("modules", module_name, field_name), invalid_value)
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, config)
     diagnostics: list[str] = []
@@ -408,25 +910,41 @@ async def test_each_type_invalid_required_module_setting_is_rejected(
 
     assert status != 0
     assert diagnostics == [
-        f"modules.{module_name}.{field_name}: must be a non-empty string"
+        f"module {module_name!r}: field 'validate_settings': "
+        "settings were refused by the module"
     ]
     assert all(value not in diagnostics[0] for value in credentials)
+    assert not lifecycle_log.exists()
 
 
 @pytest.mark.asyncio
-async def test_missing_required_setting_fails_before_readiness_without_values(
+async def test_missing_setting_fails_before_readiness_naming_module_and_field(
     tmp_path: Path,
 ) -> None:
+    """Module-owned replacement of the core-owned ``access_token`` check (R7).
+
+    The module declares the field through its ``settings_schema``; the core
+    reports the module and the field it declared, with 0 configured values.
+    """
+
     modules = tmp_path / "modules"
     modules.mkdir()
-    lifecycle_log = tmp_path / "unused.log"
-    config = _valid_config(str(modules), lifecycle_log)
-    configured_values = {
-        config["modules"]["twitch"]["client_secret"],
-        config["modules"]["twitch"]["access_token"],
-        config["modules"]["brain"]["api_key"],
-    }
-    del config["modules"]["twitch"]["access_token"]
+    _make_phased_module(
+        modules,
+        "gateway",
+        settings_schema={
+            "type": "object",
+            "properties": {
+                "access_token": {"type": "string"},
+                "api_key": {"type": "string"},
+            },
+            "required": ["access_token", "api_key"],
+        },
+    )
+    _make_phased_module(modules, "engine")
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config, credentials = _hooked_config(str(modules), lifecycle_log)
+    del config["modules"]["gateway"]["access_token"]
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, config)
     readiness: list[str] = []
@@ -442,8 +960,304 @@ async def test_missing_required_setting_fails_before_readiness_without_values(
     combined = "\n".join(diagnostics)
     assert status != 0
     assert readiness == []
-    assert "modules.twitch.access_token" in combined
-    assert all(value not in combined for value in configured_values)
+    assert diagnostics == [
+        "module 'gateway': field 'settings.access_token': is required and missing"
+    ]
+    assert all(value not in combined for value in credentials)
+    assert not lifecycle_log.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["both", "second-only"])
+async def test_invalid_modules_are_refused_before_either_opens_a_transport(
+    tmp_path: Path, invalid: str
+) -> None:
+    """AC24: every enabled module is validated before any is activated.
+
+    With both modules refusing their settings, startup stops naming the
+    refusing module and field and echoing 0 credential values; with only the
+    second refusing, the first — valid — module is still never activated, so
+    0 transports are opened either way. The loader stops at its first
+    refusal, so the second module's own diagnostic is not reported yet: that
+    half of AC24 needs the loader to collect refusals across modules.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(
+        modules,
+        "gateway",
+        roles=("input",),
+        source=REFUSING_HOOK_SOURCE if invalid == "both" else ACCEPTING_HOOK_SOURCE,
+        settings_validator="validate_settings",
+    )
+    _make_phased_module(
+        modules,
+        "engine",
+        source=REFUSING_HOOK_SOURCE,
+        settings_validator="validate_settings",
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config, credentials = _hooked_config("./modules", lifecycle_log)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    refused = "gateway" if invalid == "both" else "engine"
+    assert status != 0
+    assert readiness == []
+    assert diagnostics[0] == (
+        f"module {refused!r}: field 'validate_settings': "
+        "settings were refused by the module"
+    )
+    assert all(
+        value not in diagnostic for diagnostic in diagnostics for value in credentials
+    )
+    # 0 activations means 0 transports: nothing was opened only to be closed.
+    assert not lifecycle_log.exists()
+
+
+@pytest.mark.asyncio
+async def test_declared_hook_that_cannot_be_resolved_stops_startup(
+    tmp_path: Path,
+) -> None:
+    """A manifest naming a hook its module lacks is a failure, never "valid"."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "gateway", settings_validator="validate_settings")
+    _make_phased_module(modules, "engine")
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config, credentials = _hooked_config("./modules", lifecycle_log)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert diagnostics == [
+        "module 'gateway': field 'settings_validator': "
+        "names a settings hook the module does not define"
+    ]
+    assert all(value not in diagnostics[0] for value in credentials)
+    assert not lifecycle_log.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutate", "expected_diagnostic"),
+    [
+        pytest.param(
+            lambda limits: limits["bus_history"].pop("max_events"),
+            "limits.bus_history.max_events: is required",
+            id="absent-bus-history-event-limit",
+        ),
+        pytest.param(
+            lambda limits: limits["observation_queue"].__setitem__("max_bytes", -1),
+            "limits.observation_queue.max_bytes: must be a positive integer",
+            id="negative-observation-queue-byte-limit",
+        ),
+        pytest.param(
+            lambda limits: limits["dedup"].__setitem__("ttl_seconds", "soon"),
+            "limits.dedup.ttl_seconds: must be a finite positive number",
+            id="non-numeric-dedup-ttl",
+        ),
+        pytest.param(
+            lambda limits: limits["attachments"].__setitem__(
+                "max_total_bytes", float("inf")
+            ),
+            "limits.attachments.max_total_bytes: must be a positive integer",
+            id="infinite-attachment-total-volume",
+        ),
+        pytest.param(
+            lambda limits: limits["conversation_memory"].pop("max_exchanges"),
+            "limits.conversation_memory.max_exchanges: is required",
+            id="absent-conversation-memory-exchange-limit",
+        ),
+    ],
+)
+async def test_each_bad_retention_limit_stops_startup_before_any_transport(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, Any]], object],
+    expected_diagnostic: str,
+) -> None:
+    """AC32: one bad limit at a time stops startup naming that setting."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_module(modules, "sink")
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config = _phased_config("./modules", lifecycle_log, ("source", "sink"))
+    mutate(config["limits"])
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert diagnostics == [expected_diagnostic]
+    assert not lifecycle_log.exists()
+
+
+@pytest.mark.asyncio
+async def test_all_finite_retention_limits_start_the_application(
+    tmp_path: Path,
+) -> None:
+    """AC32's control: the same configuration with finite limits starts."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_module(modules, "sink")
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("source", "sink"))
+    )
+    stop = asyncio.Event()
+    stop.set()
+    readiness: list[str] = []
+
+    status = await application.run(
+        config_path,
+        stop,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=lambda message: pytest.fail(message),
+    )
+
+    assert status == 0
+    assert readiness == ["ready"]
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
+        "activate:source",
+        "activate:sink",
+        "prepare:source",
+        "start_inputs:source",
+        "stop_inputs:source",
+        "drain:source",
+        # The v1 sink's close is its whole shutdown; it runs after the
+        # versioned producer stopped and drained, before that producer's
+        # resources close.
+        "close:sink",
+        "close:source",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_diagnostic"),
+    [
+        pytest.param(
+            lambda config: config.__setitem__("limits", []),
+            "limits: must be a mapping",
+            id="non-mapping-limits",
+        ),
+        pytest.param(
+            lambda config: config["limits"].pop("admission"),
+            "limits.admission: is required",
+            id="absent-limit-group",
+        ),
+        pytest.param(
+            lambda config: config["limits"].__setitem__("admission", 3),
+            "limits.admission: must be a mapping",
+            id="non-mapping-limit-group",
+        ),
+        pytest.param(
+            lambda config: config["limits"].__setitem__("history", {}),
+            "limits.history: is not a known limit group",
+            id="unknown-limit-group",
+        ),
+        pytest.param(
+            lambda config: config["limits"]["dedup"].__setitem__("max_age", 1),
+            "limits.dedup.max_age: is not a known limit",
+            id="unknown-limit",
+        ),
+        pytest.param(
+            lambda config: config["limits"]["admission"].__setitem__("workers", True),
+            "limits.admission.workers: must be a positive integer",
+            id="boolean-count-limit",
+        ),
+        pytest.param(
+            lambda config: config["limits"]["admission"].__setitem__("workers", 0),
+            "limits.admission.workers: must be a positive integer",
+            id="zero-count-limit",
+        ),
+        pytest.param(
+            lambda config: config["limits"]["admission"].__setitem__(
+                "wait_seconds", float("nan")
+            ),
+            "limits.admission.wait_seconds: must be a finite positive number",
+            id="nan-duration-limit",
+        ),
+        pytest.param(
+            lambda config: config["limits"]["chat_context"].__setitem__(
+                "max_age_seconds", 0
+            ),
+            "limits.chat_context.max_age_seconds: must be a finite positive number",
+            id="zero-duration-limit",
+        ),
+    ],
+)
+def test_load_config_validates_every_limit_group_and_kind(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, Any]], object],
+    expected_diagnostic: str,
+) -> None:
+    """R6: every admission and retention limit is validated by the core."""
+
+    config = _phased_config("./modules", tmp_path / "unused.log", ("relay",))
+    mutate(config)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(application.ConfigurationError) as raised:
+        application.load_config(config_path, environ={})
+
+    assert str(raised.value) == expected_diagnostic
+
+
+def test_load_config_leaves_disabled_module_references_unresolved(
+    tmp_path: Path,
+) -> None:
+    """R7: a disabled module's secrets are not resolved, so none is required."""
+
+    config = _valid_config("./modules", tmp_path / "unused.log")
+    config["enabled_modules"] = ["twitch", "audit"]
+    config["modules"]["brain"]["api_key"] = "${MISSING_MODEL_API_KEY}"
+    config["modules"]["twitch"]["access_token"] = "${TWITCH_ACCESS_TOKEN}"
+    expected = _opaque("token")
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = application.load_config(
+        config_path, environ={"TWITCH_ACCESS_TOKEN": expected}
+    )
+
+    assert loaded["modules"]["twitch"]["access_token"] == expected
+    assert loaded["modules"]["brain"]["api_key"] == "${MISSING_MODEL_API_KEY}"
 
 
 def test_load_config_expands_environment_and_resolves_relative_directory(

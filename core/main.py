@@ -1,58 +1,182 @@
-"""Command-line entry point and application lifecycle coordination."""
+"""Command-line entry point: configuration, runtime assembly, phase lifecycle.
+
+The entry point knows no module by name (R4). It loads one configuration
+file, validates what the core owns — structure, environment references, paths,
+declared versions and every retention or admission limit (R6, R7) — assembles
+the versioned runtime the modules are activated with, and then drives the
+:class:`~core.lifecycle.PhaseCoordinator` under one finite global startup
+deadline and one finite global shutdown deadline. Business settings are the
+modules' own business: each enabled module validates them through the hook its
+manifest declares, all of them before any module opens a transport (R7).
+
+Two activation contracts leave the loader, and the coordinator is told which
+route each activation took so that one shutdown sequence, under one deadline,
+covers both:
+
+versioned (``manifest_version: 2``)
+    The coordinator reads the activation's declared lifecycle roles and the
+    hooks its handle exposes. Producers are started only after the readiness
+    barrier and stopped first, accepted work is drained under the shutdown
+    deadline, ordinary resources close, and declared observation services
+    flush and close last.
+
+compatibility (no ``manifest_version``)
+    A v1 module has exactly one lifecycle hook, ``close()``, which stops its
+    inputs, drains what it accepted and releases its resources all at once.
+    The coordinator runs these closes as one step of its sequence, in the
+    order the modules were activated, after the versioned producers have
+    stopped and drained and before any versioned resource closes: a v1
+    configuration lists its pipeline from source to sink, so the work a v1
+    source accepted reaches every sink — v1 or versioned, including the
+    observation services that flush last — before those close. That is the
+    guarantee the previous, name-ordered entry point gave, now given without
+    a name and extended to a mixed pipeline in both directions.
+
+Diagnostics name settings, modules, fields and phases. They never interpolate
+a configured value.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
+import random
 import re
 import signal
 import sys
-import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
-from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from .actions import ActionExecutor, ActionRegistry, AuthorizationPolicy
+from .attachments import AttachmentStore
 from .bus import EventBus
-from .loader import ModuleActivation, ModuleLoadError, ModuleLoader
+from .context import ChatContext
+from .contracts import Counters
+from .lifecycle import (
+    DEFAULT_CANCEL_GRACE_SECONDS,
+    DEFAULT_DRAIN_DEADLINE_SECONDS,
+    DEFAULT_HOOK_TIMEOUT_SECONDS,
+    DEFAULT_SHUTDOWN_DEADLINE_SECONDS,
+    DEFAULT_STARTUP_DEADLINE_SECONDS,
+    PhaseCoordinator,
+    ProcessWatchdog,
+    SupervisedTasks,
+    arm_shutdown_watchdog,
+    install_shutdown_watchdog,
+    reset_shutdown_watchdog,
+)
+from .loader import (
+    MANIFEST_VERSION_V2,
+    ModuleActivation,
+    ModuleLoadError,
+    ModuleLoader,
+)
+from .runtime import RuntimeContext, Supervision
+from .triggers import TriggerEngine, TriggerRegistry
 
 
 class ConfigurationError(RuntimeError):
     """A configuration defect safe to show without revealing its value."""
 
 
-# Each hook gets a grace period; the CLI watchdog also covers cancellation-
-# resistant tasks and asyncio.run() joining a blocked default-executor writer.
-# On expiry the process exits with status 1; undrained records may be lost.
-_SHUTDOWN_TIMEOUT_SECONDS = 120.0
-_CLOSE_TIMEOUT_SECONDS = 60.0
-_CANCEL_TIMEOUT_SECONDS = 0.1
-_shutdown_watchdog: ContextVar[threading.Timer | None] = ContextVar(
-    "shutdown_watchdog", default=None
-)
-
-
-def _arm_shutdown_watchdog() -> None:
-    watchdog = _shutdown_watchdog.get()
-    if watchdog is not None and not watchdog.is_alive():
-        watchdog.start()
-
+# One finite global deadline for startup and one for shutdown (R4). Each phase
+# hook is additionally bounded by a per-hook grace period that the global
+# deadline caps, so local timeouts never sum past the budget. The process
+# watchdog is the last resort behind the shutdown deadline: it also covers
+# cancellation-resistant tasks and asyncio.run() joining a blocked
+# default-executor writer. On expiry the process exits with status 1;
+# undrained records may be lost.
+_STARTUP_DEADLINE_SECONDS = DEFAULT_STARTUP_DEADLINE_SECONDS
+_SHUTDOWN_DEADLINE_SECONDS = DEFAULT_SHUTDOWN_DEADLINE_SECONDS
+_SHUTDOWN_TIMEOUT_SECONDS = DEFAULT_SHUTDOWN_DEADLINE_SECONDS
+_CLOSE_TIMEOUT_SECONDS = DEFAULT_HOOK_TIMEOUT_SECONDS
+_CANCEL_TIMEOUT_SECONDS = DEFAULT_CANCEL_GRACE_SECONDS
+_DRAIN_DEADLINE_SECONDS = DEFAULT_DRAIN_DEADLINE_SECONDS
 
 Reporter = Callable[[str], None]
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
-_MODULE_REQUIRED_FIELDS: Mapping[str, tuple[str, ...]] = {
-    "brain": ("endpoint", "model", "api_key"),
-    "twitch": (
-        "client_id",
-        "client_secret",
-        "access_token",
-        "broadcaster_id",
-        "bot_user_id",
-    ),
+
+# --------------------------------------------------------------------------- #
+# Retention and admission limits (R6)
+# --------------------------------------------------------------------------- #
+
+LIMITS_KEY = "limits"
+"""The configuration block holding every retention and admission limit.
+
+The block is optional as a whole and all-or-nothing in content. Without it the
+application runs the compatibility runtime: the bus at its own built-in
+bounds, and no chat context, attachment store or trigger engine — a versioned
+module that declares triggers is then refused by the loader with a diagnostic
+naming it. With the block present, every limit below is required and must be
+finite and positive, so an absent, negative, non-numeric or infinite limit
+stops startup before any module is activated (R6, AC32).
+"""
+
+_COUNT = "count"
+"""A positive integer: events, bytes, records, entries, objects, workers."""
+
+_SECONDS = "seconds"
+"""A finite, strictly positive number of seconds."""
+
+_LIMITS: Mapping[str, Mapping[str, str]] = {
+    "bus_history": {
+        "max_events": _COUNT,
+        "max_bytes": _COUNT,
+        "max_age_seconds": _SECONDS,
+    },
+    "observation_queue": {
+        "max_records": _COUNT,
+        "max_bytes": _COUNT,
+    },
+    "dedup": {
+        "max_entries": _COUNT,
+        "ttl_seconds": _SECONDS,
+    },
+    "attachments": {
+        "max_object_bytes": _COUNT,
+        "max_objects": _COUNT,
+        "max_total_bytes": _COUNT,
+        "max_bytes_per_run": _COUNT,
+        "ttl_seconds": _SECONDS,
+    },
+    "conversation_memory": {
+        "max_sessions": _COUNT,
+        "max_exchanges": _COUNT,
+        "max_bytes": _COUNT,
+        "max_age_seconds": _SECONDS,
+    },
+    "chat_context": {
+        "max_messages": _COUNT,
+        "max_bytes": _COUNT,
+        "max_age_seconds": _SECONDS,
+        "max_channels": _COUNT,
+    },
+    "admission": {
+        "session_queue_capacity": _COUNT,
+        "global_pending_capacity": _COUNT,
+        "max_sessions": _COUNT,
+        "workers": _COUNT,
+        "wait_seconds": _SECONDS,
+        "total_run_seconds": _SECONDS,
+    },
 }
+"""Every limit the core validates at startup, by group, with its kind.
+
+The core-owned components — the bus history, the trigger engine's dedup
+window, the attachment store and the chat context — are built from their
+groups here. The observation queue, the conversation memory and the admission
+scheduler are owned by the modules that hold that state; their limits are
+validated here so that a deployment never starts with one of them absent or
+infinite, and handing them to their owners is part of those modules' move to
+the versioned runtime.
+"""
 
 
 def load_config(
@@ -65,6 +189,11 @@ def load_config(
     Relative module directories are resolved from the configuration file rather
     than from the process working directory. Errors contain setting paths, but
     never interpolate setting values or YAML parser excerpts.
+
+    ``${NAME}`` references are resolved everywhere except inside the settings
+    of a module that is not enabled: a disabled module's secrets are never
+    looked up, so an unresolvable reference there does not stop an
+    application that does not run that module (R7).
     """
 
     try:
@@ -82,14 +211,31 @@ def load_config(
     if not isinstance(loaded, Mapping):
         raise ConfigurationError("configuration: must be a mapping")
 
-    expanded = _resolve_environment(
-        loaded,
-        environ=os.environ if environ is None else environ,
-        path="configuration",
-        active=set(),
-    )
-    config = dict(expanded)
+    resolver = os.environ if environ is None else environ
+    config = {
+        key: (
+            value
+            if key == "modules"
+            else _resolve_environment(
+                value,
+                environ=resolver,
+                path=_mapping_path("configuration", key),
+                active=set(),
+            )
+        )
+        for key, value in loaded.items()
+    }
     _validate_config(config)
+
+    modules = dict(config["modules"])
+    for name in config["enabled_modules"]:
+        modules[name] = _resolve_environment(
+            modules[name],
+            environ=resolver,
+            path=f"configuration.modules.{name}",
+            active=set(),
+        )
+    config["modules"] = modules
 
     raw_modules_directory = config["modules_directory"]
     try:
@@ -143,38 +289,49 @@ async def run(
             report_diagnostic("signal handlers: could not be installed")
             return 1
 
-    loader: ModuleLoader | None = None
-    activations: list[ModuleActivation] = []
     try:
         try:
-            bus = EventBus()
-            loader = ModuleLoader(bus, config["modules_directory"])
+            runtime = _assemble_runtime(config)
+        except Exception:
+            report_diagnostic("runtime: could not be assembled")
+            return 1
+
+        loader: ModuleLoader | None = None
+        try:
+            loader = ModuleLoader(runtime.bus, config["modules_directory"])
+            # The context and the environment are handed over after
+            # construction so the loader keeps its original two-argument
+            # shape, which is also the shape an embedding substitutes.
+            loader.context = runtime.context
+            loader.environ = os.environ if environ is None else environ
             activations = await loader.activate_enabled(config)
         except (Exception, asyncio.CancelledError) as exc:
-            partial = (
-                []
-                if loader is None
-                else list(getattr(loader, "activations", ()))
-            )
-            close_failures = await _close_activations(partial)
+            # The loader owns the handles already returned by successful
+            # activation hooks; the assignment above has not completed.
+            partial = [] if loader is None else list(getattr(loader, "activations", ()))
+            coordinator = _coordinator(partial, runtime, report_diagnostic)
+            # Nothing was started, yet everything activated is unwound through
+            # the ordinary sequence, both routes under one shutdown deadline.
+            await coordinator.stop()
             if isinstance(exc, asyncio.CancelledError):
-                # The assignment above has not completed; the loader owns the
-                # handles already returned by successful activation hooks.
-                for failure in close_failures:
-                    report_diagnostic(failure)
                 raise
             report_diagnostic(_startup_diagnostic(exc))
-            for failure in close_failures:
-                report_diagnostic(failure)
+            return 1
+
+        coordinator = _coordinator(activations, runtime, report_diagnostic)
+        # A failed or cancelled startup is unwound by the coordinator itself,
+        # compatibility closes included, under the one shutdown deadline it
+        # took when the failure was met; the diagnostics were reported as they
+        # happened.
+        startup = await coordinator.start()
+        if startup.status != 0:
             return 1
 
         try:
             report_ready("ready")
         except Exception:
-            close_failures = await _close_activations(activations)
+            await coordinator.stop()
             report_diagnostic("readiness: could not be reported")
-            for failure in close_failures:
-                report_diagnostic(failure)
             return 1
 
         try:
@@ -182,30 +339,27 @@ async def run(
         except asyncio.CancelledError:
             # Cancellation is not the normal signal path, but embedded callers
             # still receive the same cleanup guarantee before it propagates.
-            close_failures = await _close_activations(activations)
-            for failure in close_failures:
-                report_diagnostic(failure)
+            await coordinator.stop()
             raise
 
-        close_failures = await _close_activations(activations)
-        for failure in close_failures:
-            report_diagnostic(failure)
-        return 1 if close_failures else 0
+        report = await coordinator.stop()
+        return 1 if report.failures else 0
     finally:
         remove_signal_handlers()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Execute the application with a hard 120-second shutdown deadline.
+    """Execute the application behind a hard process shutdown deadline.
 
-    Module hooks have a 60-second grace period and 100 ms for cancellation.
-    The global deadline starts at cleanup and includes asyncio's task/executor
-    teardown. If a task or synchronous writer cannot stop, os._exit(1) bypasses
-    interpreter thread joins and stream flushing; pending records may be lost.
-    Embedded users of run() own their process/executor teardown policy.
+    Phase hooks have a bounded grace period and a short cancellation window,
+    all capped by the global shutdown deadline. The process watchdog starts at
+    cleanup and includes asyncio's task/executor teardown. If a task or
+    synchronous writer cannot stop, os._exit(1) bypasses interpreter thread
+    joins and stream flushing; pending records may be lost. Embedded users of
+    run() own their process/executor teardown policy.
     """
 
-    parser = argparse.ArgumentParser(description="Run the Twitch AI companion")
+    parser = argparse.ArgumentParser(description="Run the chat companion")
     parser.add_argument(
         "--config",
         required=True,
@@ -213,16 +367,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="path to the YAML configuration file",
     )
     arguments = parser.parse_args(argv)
-    watchdog = threading.Timer(_SHUTDOWN_TIMEOUT_SECONDS, os._exit, args=(1,))
-    watchdog.daemon = True
-    token = _shutdown_watchdog.set(watchdog)
+    watchdog = ProcessWatchdog(_SHUTDOWN_TIMEOUT_SECONDS)
+    token = install_shutdown_watchdog(watchdog)
 
     async def execute() -> int:
         try:
             return await run(arguments.config)
         finally:
             # Keep the deadline active through the runner's executor cleanup.
-            _arm_shutdown_watchdog()
+            arm_shutdown_watchdog()
 
     try:
         return asyncio.run(execute())
@@ -235,7 +388,150 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         watchdog.cancel()
-        _shutdown_watchdog.reset(token)
+        reset_shutdown_watchdog(token)
+
+
+# --------------------------------------------------------------------------- #
+# Runtime assembly (R7)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class _Runtime:
+    """The core-owned collaborators one run of the application is built on."""
+
+    bus: EventBus
+    context: RuntimeContext
+    tasks: SupervisedTasks
+    clock: Callable[[], float]
+
+
+def _assemble_runtime(config: Mapping[str, Any]) -> _Runtime:
+    """Build the bus and the versioned runtime context from validated limits.
+
+    Every component validates its own bounds again at construction; the
+    limits were validated by :func:`load_config` first so that a rejected
+    limit is reported by its configuration path, before anything exists.
+    """
+
+    clock = time.monotonic
+    rng = random.Random()
+    counters = Counters()
+    limits = config.get(LIMITS_KEY)
+
+    if limits is None:
+        bus = EventBus(clock=clock)
+        triggers = chat = attachments = None
+    else:
+        bus_history = limits["bus_history"]
+        bus = EventBus(
+            history_max_events=bus_history["max_events"],
+            history_max_bytes=bus_history["max_bytes"],
+            history_max_age_seconds=bus_history["max_age_seconds"],
+            clock=clock,
+        )
+        dedup = limits["dedup"]
+        triggers = TriggerEngine(
+            TriggerRegistry(),
+            dedup_max_entries=dedup["max_entries"],
+            dedup_ttl_seconds=dedup["ttl_seconds"],
+            clock=clock,
+            rng=rng,
+            counters=counters,
+        )
+        chat = ChatContext(clock=clock, **limits["chat_context"])
+        attachments = AttachmentStore(clock=clock, **limits["attachments"])
+
+    tasks = SupervisedTasks(clock=clock)
+    supervision = Supervision(bus, counters=counters)
+    # No rule is configured here, and a policy that says nothing refuses
+    # everything: declaring an action never authorizes it (R5, R7).
+    authorization = AuthorizationPolicy()
+    registry = ActionRegistry(authorization=authorization)
+    executor = ActionExecutor(
+        registry,
+        authorization,
+        supervision=supervision,
+        counters=counters,
+        clock=clock,
+    )
+    context = RuntimeContext(
+        bus=bus,
+        actions=registry,
+        supervision=supervision,
+        tasks=tasks,
+        executor=executor,
+        triggers=triggers,
+        chat=chat,
+        attachments=attachments,
+        clock=clock,
+        rng=rng,
+    )
+    return _Runtime(bus=bus, context=context, tasks=tasks, clock=clock)
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle (R4)
+# --------------------------------------------------------------------------- #
+
+
+def _split_routes(
+    activations: Sequence[ModuleActivation],
+) -> tuple[list[ModuleActivation], list[ModuleActivation]]:
+    """Separate the versioned activations from the compatibility ones.
+
+    The split reads the declared manifest version carried by each activation
+    and nothing else: a module with no declared version took the v1 route
+    through the loader and keeps it here.
+    """
+
+    versioned: list[ModuleActivation] = []
+    legacy: list[ModuleActivation] = []
+    for activation in activations:
+        declared = getattr(activation, "manifest_version", None)
+        if isinstance(declared, int) and declared >= MANIFEST_VERSION_V2:
+            versioned.append(activation)
+        else:
+            legacy.append(activation)
+    return versioned, legacy
+
+
+def _coordinator(
+    activations: Sequence[ModuleActivation],
+    runtime: _Runtime,
+    reporter: Reporter,
+) -> PhaseCoordinator:
+    """The coordinator driving *activations*, each on the route it declared.
+
+    The coordinator reports every diagnostic through *reporter* as it happens,
+    so a caller only reads the status of the report it returns. One global
+    startup deadline and one global shutdown deadline cover both routes.
+    """
+
+    versioned, legacy = _split_routes(activations)
+    return PhaseCoordinator(
+        versioned,
+        compatibility=legacy,
+        startup_deadline_seconds=_STARTUP_DEADLINE_SECONDS,
+        shutdown_deadline_seconds=_SHUTDOWN_DEADLINE_SECONDS,
+        hook_timeout_seconds=_CLOSE_TIMEOUT_SECONDS,
+        drain_deadline_seconds=_DRAIN_DEADLINE_SECONDS,
+        cancel_grace_seconds=_CANCEL_TIMEOUT_SECONDS,
+        clock=runtime.clock,
+        tasks=runtime.tasks,
+        reporter=reporter,
+    )
+
+
+def _startup_diagnostic(exc: Exception) -> str:
+    if isinstance(exc, ModuleLoadError):
+        return str(exc)
+    return "module activation: startup failed"
+
+
+# --------------------------------------------------------------------------- #
+# Configuration validation (R6, R7)
+# --------------------------------------------------------------------------- #
 
 
 def _resolve_environment(
@@ -310,6 +606,13 @@ def _resolve_environment(
 
 
 def _validate_config(config: Mapping[str, Any]) -> None:
+    """Validate what the core owns: structure, paths and limits (R6, R7).
+
+    A module's business settings are not inspected here. They belong to the
+    module, which validates them through its declared hook before any module
+    is activated.
+    """
+
     modules_directory = config.get("modules_directory")
     if not isinstance(modules_directory, str) or not modules_directory.strip():
         raise ConfigurationError(
@@ -345,61 +648,61 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     for name in enabled:
         if name not in modules:
             raise ConfigurationError(f"modules.{name}: settings are required")
-        settings = modules[name]
 
-        for field_name in _MODULE_REQUIRED_FIELDS.get(name, ()):
-            value = settings.get(field_name)
-            if not isinstance(value, str) or not value.strip():
+    _validate_limits(config)
+
+
+def _validate_limits(config: Mapping[str, Any]) -> None:
+    """Every configured limit is present, numeric, finite and positive (R6)."""
+
+    if LIMITS_KEY not in config:
+        return
+    block = config[LIMITS_KEY]
+    if not isinstance(block, Mapping):
+        raise ConfigurationError(f"{LIMITS_KEY}: must be a mapping")
+    for group in block:
+        if group not in _LIMITS:
+            raise ConfigurationError(
+                f"{_mapping_path(LIMITS_KEY, group)}: is not a known limit group"
+            )
+    for group, fields in _LIMITS.items():
+        label = f"{LIMITS_KEY}.{group}"
+        if group not in block:
+            raise ConfigurationError(f"{label}: is required")
+        section = block[group]
+        if not isinstance(section, Mapping):
+            raise ConfigurationError(f"{label}: must be a mapping")
+        for field_name in section:
+            if field_name not in fields:
                 raise ConfigurationError(
-                    f"modules.{name}.{field_name}: must be a non-empty string"
+                    f"{_mapping_path(label, field_name)}: is not a known limit"
                 )
+        for field_name, kind in fields.items():
+            _validate_limit(section, field_name, f"{label}.{field_name}", kind)
 
 
-async def _close_activations(
-    activations: Sequence[ModuleActivation],
-) -> list[str]:
-    _arm_shutdown_watchdog()
-    failures: list[str] = []
-    # Twitch stops reception and drains accepted publications while its send
-    # transport is still usable. Brain then releases its resources; audit last.
-    ordered = sorted(
-        reversed(activations),
-        key=lambda activation: {"twitch": 0, "audit": 2}.get(activation.name, 1),
-    )
-    for activation in ordered:
-        task = asyncio.create_task(activation.close())
-        try:
-            done, _ = await asyncio.wait({task}, timeout=_CLOSE_TIMEOUT_SECONDS)
-            if not done:
-                task.cancel()
-                await asyncio.wait({task}, timeout=_CANCEL_TIMEOUT_SECONDS)
-                # Retrieve even late exceptions without waiting indefinitely.
-                task.add_done_callback(_consume_close_result)
-                raise TimeoutError
-            if task.cancelled():
-                raise RuntimeError("close was cancelled")
-            task.result()
-        except asyncio.CancelledError:
-            task.cancel()
-            task.add_done_callback(_consume_close_result)
-            raise
-        except Exception:
-            name = getattr(activation, "name", "<unknown>")
-            if not isinstance(name, str) or not name:
-                name = "<unknown>"
-            failures.append(f"module {name!r}: shutdown failed")
-    return failures
+def _validate_limit(
+    section: Mapping[str, Any], field_name: str, label: str, kind: str
+) -> None:
+    if field_name not in section or section[field_name] is None:
+        raise ConfigurationError(f"{label}: is required")
+    value = section[field_name]
+    if kind == _COUNT:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigurationError(f"{label}: must be a positive integer")
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ConfigurationError(f"{label}: must be a finite positive number")
 
 
-def _consume_close_result(task: asyncio.Task[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
-
-
-def _startup_diagnostic(exc: Exception) -> str:
-    if isinstance(exc, ModuleLoadError):
-        return str(exc)
-    return "module activation: startup failed"
+# --------------------------------------------------------------------------- #
+# Signals and reporting
+# --------------------------------------------------------------------------- #
 
 
 def _install_signal_handlers(stop_event: asyncio.Event) -> Callable[[], None]:
@@ -470,7 +773,7 @@ def _default_diagnostic_reporter(message: str) -> None:
     print(f"error: {message}", file=sys.stderr, flush=True)
 
 
-__all__ = ["ConfigurationError", "load_config", "main", "run"]
+__all__ = ["LIMITS_KEY", "ConfigurationError", "load_config", "main", "run"]
 
 
 if __name__ == "__main__":

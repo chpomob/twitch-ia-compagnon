@@ -990,6 +990,175 @@ async def test_one_global_shutdown_deadline_caps_the_sum_of_local_timeouts() -> 
         await asyncio.sleep(0)
 
 
+# --------------------------------------------------------------------------- #
+# The compatibility step of a mixed pipeline
+# --------------------------------------------------------------------------- #
+
+
+def legacy(name: str, close: Any) -> ModuleActivation:
+    """A v1 activation: no declared version, no role, only ``close()``."""
+
+    return ModuleActivation(name=name, manifest={"name": name}, handle=SimpleNamespace(close=close))
+
+
+async def test_compatibility_close_runs_after_drain_and_before_any_versioned_close(
+) -> None:
+    """A v1 producer's whole shutdown is its close; it still has sinks to reach.
+
+    The v1 source publishes the work it accepted into a versioned sink and a
+    versioned observation service *from its close*. Both must still be open:
+    the close therefore runs after the versioned producers stopped and
+    drained, before the ordinary close phase, and before the observation
+    service flushes what it saw.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    sink = Transport(events, label="sink")
+    observed: list[str] = []
+
+    async def legacy_close() -> None:
+        events.append("close:legacy")
+        sink.send("late work")
+        observed.append("legacy stopped")
+
+    async def flush(*_: Any) -> None:
+        events.append(f"flush:alpha[{','.join(observed)}]")
+
+    versioned_feed = module(
+        "feed",
+        roles=(ROLE_INPUT,),
+        start_inputs=hook(events, "start:feed"),
+        stop_inputs=hook(events, "stop:feed"),
+        drain=hook(events, "drain:feed"),
+        close=hook(events, "close:feed"),
+    )
+    ledger = module(
+        "alpha",
+        roles=(ROLE_OBSERVATION,),
+        flush=flush,
+        close=hook(events, "close:alpha"),
+    )
+    coordinator = coordinator_for(
+        [ledger, module("sink", close=sink.close), versioned_feed],
+        timeline,
+        compatibility=[legacy("legacy", legacy_close)],
+    )
+
+    assert [item.name for item in coordinator.compatibility()] == ["legacy"]
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    report = await asyncio.wait_for(coordinator.stop(), 1)
+
+    assert report.status == 0
+    assert sink.sent == ["late work"]
+    assert events == [
+        "start:feed",
+        "stop:feed",
+        "drain:feed",
+        "close:legacy",
+        "close:feed",
+        "close:sink",
+        "flush:alpha[legacy stopped]",
+        "close:alpha",
+    ]
+
+
+async def test_compatibility_closes_in_activation_order_collecting_failures() -> None:
+    """A v1 pipeline is listed source to sink; one failure skips no close."""
+
+    timeline = Timeline()
+    events: list[str] = []
+
+    async def broken() -> None:
+        events.append("close:relay")
+        raise RuntimeError("secret-token-must-not-leak")
+
+    coordinator = coordinator_for(
+        [module("engine", close=hook(events, "close:engine"))],
+        timeline,
+        compatibility=[
+            legacy("source", hook(events, "close:source")),
+            legacy("relay", broken),
+            legacy("sink", hook(events, "close:sink")),
+        ],
+    )
+
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    report = await asyncio.wait_for(coordinator.stop(), 1)
+    again = await asyncio.wait_for(coordinator.stop(), 1)
+
+    assert report.status == 1
+    assert report.failures == ("module 'relay': shutdown failed",)
+    assert all("secret-token" not in message for message in report.diagnostics)
+    assert events == ["close:source", "close:relay", "close:sink", "close:engine"]
+    # Idempotent like every other phase: nothing closes twice.
+    assert again == report
+
+
+async def test_failed_startup_closes_compatibility_under_the_same_deadline() -> None:
+    """R4: a failed start unwinds both routes inside one shutdown budget.
+
+    The versioned module fails to prepare. Its unwinding takes the one
+    global shutdown deadline of 15 units; the v1 close blocks and is capped
+    by its 10-unit hook timeout, then the versioned close is capped by the 5
+    units left — not granted a fresh budget of its own.
+    """
+
+    timeline = Timeline()
+    invoked: dict[str, float] = {}
+    let_go = asyncio.Event()
+
+    def blocking(label: str):
+        async def run(*_: Any) -> None:
+            invoked[label] = timeline.now
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await let_go.wait()
+                raise
+
+        return run
+
+    async def failing(*_: Any) -> None:
+        raise RuntimeError("prepare failed")
+
+    coordinator = coordinator_for(
+        [module("gate", prepare=failing, close=blocking("close:gate"))],
+        timeline,
+        compatibility=[legacy("legacy", blocking("close:legacy"))],
+        hook_timeout_seconds=10.0,
+        shutdown_deadline_seconds=15.0,
+        cancel_grace_seconds=0.1,
+    )
+
+    start = asyncio.create_task(coordinator.start())
+    await asyncio.sleep(0)
+    timeline.release()
+    try:
+        report = await asyncio.wait_for(start, 1)
+
+        assert report.status == 1
+        assert coordinator.ready is False
+        assert list(invoked) == ["close:legacy", "close:gate"]
+        assert report.failures == (
+            "module 'gate': phase 'prepare' failed",
+            "module 'legacy': shutdown failed",
+            "module 'gate': phase 'close' timed out",
+        )
+        # The released timeline spends the prepare hook's own timer before the
+        # unwinding begins, so the budget is measured from the first close.
+        # Two 10-unit local timeouts would have spent 20; the one global
+        # deadline held at 15 plus the two cancellation grace windows, and the
+        # versioned close got only what the v1 close left, not 10 of its own.
+        unwinding_began = invoked["close:legacy"]
+        assert invoked["close:gate"] - unwinding_began == pytest.approx(10.1)
+        assert timeline.now - invoked["close:gate"] < 10.0
+        assert timeline.now <= unwinding_began + 15.0 + 2 * 0.1
+    finally:
+        let_go.set()
+        await asyncio.sleep(0)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
