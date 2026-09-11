@@ -797,6 +797,59 @@ async def test_declared_triggers_reach_the_trigger_registry(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_companion_name_token_resolves_from_the_declaring_module_settings(
+    tmp_path: Path,
+) -> None:
+    """R1: the name behind ``${companion_name}`` is the input's own setting.
+
+    The registry the application builds knows no name — the core's
+    configuration carries no module vocabulary — so the loader hands the name
+    configured in the declaring module's settings to the registry for that
+    input, and a module configured without one is refused at load, before
+    any activation, naming the input and the field.
+    """
+
+    make_module(
+        tmp_path,
+        "chat",
+        manifest=v2_manifest(
+            "chat", triggers=KEYWORD_TRIGGERS, actions=[CHAT_WRITE_ACTION]
+        ),
+        source=V2_MODULE_SOURCE,
+    )
+    context = runtime_context(
+        triggers=TriggerEngine(
+            TriggerRegistry(), dedup_max_entries=8, dedup_ttl_seconds=60.0
+        )
+    )
+    settings = {**v2_settings("chat"), "companion_name": "Ada"}
+
+    await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+        {"enabled_modules": ["chat"], "modules": {"chat": settings}}
+    )
+
+    registry = context.triggers.registry
+    assert registry.companion_name is None
+    assert registry.companion_name_for("chat") == "Ada"
+    assert settings["calls"]
+
+    unnamed = runtime_context(
+        triggers=TriggerEngine(
+            TriggerRegistry(), dedup_max_entries=8, dedup_ttl_seconds=60.0
+        )
+    )
+    refused = v2_settings("chat")
+    with pytest.raises(ModuleLoadError) as excinfo:
+        await ModuleLoader(unnamed.bus, tmp_path, context=unnamed).activate_enabled(
+            {"enabled_modules": ["chat"], "modules": {"chat": refused}}
+        )
+    assert "module 'chat': field 'triggers'" in str(excinfo.value)
+    assert "no companion name is configured" in str(excinfo.value)
+    assert refused["calls"] == []
+    assert unnamed.triggers.registry.inputs() == ()
+
+
+@pytest.mark.asyncio
 async def test_settings_schema_and_declared_hook_run_before_any_activation(
     tmp_path: Path,
 ) -> None:
@@ -922,6 +975,50 @@ async def test_settings_hook_cannot_echo_the_rejected_credential(
     assert "s3cret" not in str(caught.value)
     assert "'chat'" in str(caught.value)
     assert "validate_settings" in str(caught.value)
+    assert settings["calls"] == []
+
+
+RETURNING_VALIDATOR_SOURCE = V2_MODULE_SOURCE.replace(
+    'def validate_settings(settings):\n    settings["validated"] = True\n',
+    "def validate_settings(settings):\n"
+    "    settings['validated'] = True\n"
+    "    return [\n"
+    "        f\"module 'chat': field 'api_key': {settings['api_key']}\",\n"
+    "        \"module 'chat': field 'channel': must be a non-empty string\",\n"
+    "    ]\n",
+)
+
+
+@pytest.mark.asyncio
+async def test_settings_hook_refuses_by_returning_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """R7/AC24: a hook returning diagnostics refuses like one that raises.
+
+    The module's diagnostics name module and field, so the loader borrows
+    their count only: the text stays out of the report, as a careless hook
+    could still echo the value it was handed.
+    """
+
+    make_module(
+        tmp_path,
+        "chat",
+        manifest=v2_manifest("chat", settings_validator="validate_settings"),
+        source=RETURNING_VALIDATOR_SOURCE,
+    )
+    context = runtime_context()
+    settings = {**v2_settings("chat"), "api_key": "s3cret"}
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["chat"], "modules": {"chat": settings}}
+        )
+
+    assert settings["validated"] is True
+    assert "s3cret" not in str(caught.value)
+    assert "'chat'" in str(caught.value)
+    assert "validate_settings" in str(caught.value)
+    assert "2 diagnostics" in str(caught.value)
     assert settings["calls"] == []
 
 

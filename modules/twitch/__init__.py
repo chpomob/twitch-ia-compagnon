@@ -1,4 +1,27 @@
-"""Twitch EventSub chat source and Helix chat sink."""
+"""Twitch EventSub chat source and Helix chat sink, on the v2 runtime (R4, R7).
+
+The manifest beside this package declares ``manifest_version: 2``, so the
+loader hands :func:`activate` a scoped runtime context rather than the bus,
+and the handle it returns is driven by the phase coordinator through the
+hooks of the ``input`` role it declares:
+
+``validate_settings``  The module-owned hook the manifest names. It reports
+                       one diagnostic per offending field, naming module and
+                       field and never the configured value (R7, AC24).
+``activate``           Parses the settings and creates the HTTP session. It
+                       opens no transport and produces no input.
+``prepare``            Validates the credential and registers the chat-send
+                       consumer on the bus. Still no input.
+``start_inputs``       After the readiness barrier: opens the EventSub socket,
+                       subscribes and starts the supervised receiver.
+``stop_inputs``        Cuts the source. Accepted publications keep running
+                       and the send transport stays open for them.
+``drain``              Lets accepted publications finish inside the budget
+                       and cancels the rest.
+``close``              Releases every owned transport exactly once. It is
+                       complete on its own, so a handle that never reached
+                       ``stop_inputs`` — a failed startup — is still released.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +31,7 @@ import json
 import sys
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 try:  # Keep the module importable for transport-injected contract tests.
@@ -35,7 +58,10 @@ def _default_session_factory() -> Any:
 SESSION_FACTORY: Callable[[], Any] = _default_session_factory
 RETRY_DELAY: Callable[[float], Awaitable[None]] = asyncio.sleep
 
+MODULE_NAME = "twitch"
+
 _CHAT_EVENT = "channel.chat.message"
+_CHAT_SEND_EVENT = "channel.chat.send"
 _CHAT_SEND_TIMEOUT_SECONDS = 10.0
 _NON_RETRYABLE_CLOSE_CODES = {4001, 4003}
 _STABLE_CONNECTION_SECONDS = 10.0
@@ -43,6 +69,43 @@ _STABLE_CONNECTION_SECONDS = 10.0
 
 class TwitchModuleError(RuntimeError):
     """A Twitch operation failure whose text is safe to surface."""
+
+
+# The business settings this module owns (R7). ``companion_name`` is required
+# here because the manifest's default trigger policy refers to it; the trigger
+# registry, not this module, reads it.
+_REQUIRED_SETTINGS: tuple[str, ...] = (
+    "client_id",
+    "client_secret",
+    "access_token",
+    "broadcaster_id",
+    "bot_user_id",
+    "companion_name",
+)
+
+
+def validate_settings(settings: Any) -> list[str]:
+    """Check this module's settings; return one diagnostic per offending field.
+
+    This is the hook ``settings_validator`` in the manifest names. The loader
+    runs it for every enabled module before any of them is activated (R7).
+    Each diagnostic names the module and the field and nothing else: a
+    rejected value may be a credential, so no value is ever echoed (AC24).
+    An empty list means the settings are accepted.
+    """
+
+    if not isinstance(settings, Mapping):
+        return [_setting_diagnostic("settings", "must be a mapping")]
+    diagnostics: list[str] = []
+    for name in _REQUIRED_SETTINGS:
+        value = settings.get(name)
+        if not isinstance(value, str) or not value.strip():
+            diagnostics.append(_setting_diagnostic(name, "must be a non-empty string"))
+    return diagnostics
+
+
+def _setting_diagnostic(field_name: str, reason: str) -> str:
+    return f"module {MODULE_NAME!r}: field {field_name!r}: {reason}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,38 +125,40 @@ class _Settings:
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
-        if not isinstance(settings, Mapping):
-            raise TwitchModuleError("twitch configuration: settings must be a mapping")
+        """Parse accepted settings; the first diagnostic of a refusal is raised.
 
-        values: dict[str, str] = {}
-        for name in (
-            "client_id",
-            "client_secret",
-            "access_token",
-            "broadcaster_id",
-            "bot_user_id",
-        ):
-            value = settings.get(name)
-            if not isinstance(value, str) or not value.strip():
-                raise TwitchModuleError(
-                    f"twitch configuration: field {name!r} is required"
-                )
-            values[name] = value
-        return cls(**values)
+        The same hook the loader ran decides here, so a handle built outside
+        the loader is refused on the same terms and with the same value-free
+        diagnostic.
+        """
+
+        diagnostics = validate_settings(settings)
+        if diagnostics:
+            raise TwitchModuleError(diagnostics[0])
+        return cls(**{field.name: settings[field.name] for field in fields(cls)})
 
 
 class TwitchModule:
-    """Own one Twitch HTTP session and an activation-lifetime dedupe set."""
+    """The v2 handle: one HTTP session, one supervised receiver, phase hooks.
+
+    Every hook is idempotent and safe out of order — ``close`` after a failed
+    ``prepare``, ``stop_inputs`` before any ``start_inputs`` — because the
+    coordinator unwinds a failed startup through the ordinary shutdown
+    sequence (R4). Dedupe of platform redeliveries lives for the handle's
+    lifetime, across socket replacements.
+    """
 
     def __init__(
         self,
         bus: Any,
+        tasks: Any,
         settings: _Settings,
         session: Any,
         reporter: Callable[[str], None],
         retry_delay: Callable[[float], Awaitable[None]],
     ) -> None:
         self._bus = bus
+        self._tasks = tasks
         self._settings = settings
         self._session = session
         self._reporter = reporter
@@ -104,53 +169,103 @@ class TwitchModule:
         self._receive_task: asyncio.Task[None] | None = None
         self._handoff_tasks: set[asyncio.Task[None]] = set()
         self._publication_tasks: set[asyncio.Task[None]] = set()
+        self._prepared = False
         self._stopping = False
+        self._reception_lock = asyncio.Lock()
         self._active_send_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._close_lock = asyncio.Lock()
 
-    async def start(self) -> None:
-        """Complete all readiness-critical setup and then start reception."""
+    # -- startup phases ---------------------------------------------------- #
 
+    async def prepare(self) -> None:
+        """Validate the credential and register the send consumer.
+
+        Readiness-critical and free of input: a rejected token stops startup
+        here, before the barrier, and the ``channel.chat.send`` consumer is
+        routed before any producer may publish into it.
+        """
+
+        if self._prepared or self._closed:
+            return
         await self._authenticate()
+        self._bus.subscribe(_CHAT_SEND_EVENT, self.handle_chat_send)
+        self._prepared = True
+
+    async def start_inputs(self) -> None:
+        """Open the EventSub source. Only the coordinator, past the barrier, calls this."""
+
+        if self._receive_task is not None or self._stopping or self._closed:
+            return
+        if not self._prepared:
+            raise TwitchModuleError("twitch lifecycle: start_inputs requires prepare")
+
         websocket = await self._connect(EVENTSUB_URL)
         try:
             session_id = await self._receive_welcome(websocket)
             await self._subscribe(session_id)
+            self._websocket = websocket
+            # Owned by the supervised registry: its failure is observed under
+            # this module's name and shutdown never orphans it.
+            self._receive_task = self._tasks.spawn(
+                self._receive_forever(websocket), name="twitch-eventsub-receiver"
+            )
         except BaseException:
+            self._websocket = None
             await _close_websocket(websocket)
             raise
 
-        self._websocket = websocket
-        self._bus.subscribe("channel.chat.send", self.handle_chat_send)
-        self._receive_task = asyncio.create_task(
-            self._receive_forever(websocket),
-            name="twitch-eventsub-receiver",
+    # -- shutdown phases --------------------------------------------------- #
+
+    async def stop_inputs(self) -> None:
+        """Cut the source: stop reception and close the EventSub socket.
+
+        Accepted publications keep running — they finish in :meth:`drain` —
+        and the send transport stays open until :meth:`close`, so a reply to
+        the last accepted message can still be delivered.
+        """
+
+        await self._stop_reception()
+
+    async def drain(self, deadline_seconds: float) -> None:
+        """Let accepted publications finish inside the budget; cancel the rest.
+
+        A publication is the model/send/audit chain of one accepted message.
+        On the coordinator's own cancellation the pending ones are cancelled
+        explicitly rather than left to run into the close phase.
+        """
+
+        publications = tuple(
+            task for task in self._publication_tasks if not task.done()
         )
+        if not publications:
+            return
+        try:
+            _, pending = await asyncio.wait(
+                publications, timeout=max(float(deadline_seconds), 0.0)
+            )
+        except asyncio.CancelledError:
+            for task in publications:
+                if not task.done():
+                    task.cancel()
+            raise
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def close(self) -> None:
-        """Stop reception and close every owned transport exactly once."""
+        """Release every owned transport exactly once.
+
+        Complete on its own: reception is stopped if it still runs and the
+        publications still accepted are awaited, so a handle closed without
+        the earlier phases — a failed startup, a harness — leaks nothing.
+        """
 
         async with self._close_lock:
             if self._closed:
                 return
-            self._stopping = True
-
-            task = self._receive_task
-            if task is not None and not task.done():
-                task.cancel()
-            if task is not None:
-                with suppress(asyncio.CancelledError, Exception):
-                    await task
-
-            handoff_tasks = tuple(self._handoff_tasks)
-            for handoff_task in handoff_tasks:
-                if not handoff_task.done():
-                    handoff_task.cancel()
-            for handoff_task in handoff_tasks:
-                with suppress(asyncio.CancelledError, Exception):
-                    await handoff_task
-            self._handoff_tasks.clear()
+            await self._stop_reception()
 
             # Reception is stopped, but accepted publications must finish their
             # model/send/audit chain before the send transport is closed.
@@ -170,11 +285,36 @@ class TwitchModule:
                 if active_sends:
                     await asyncio.gather(*active_sends, return_exceptions=True)
 
-                websocket = self._websocket
-                self._websocket = None
-                if websocket is not None:
-                    await _close_websocket(websocket)
                 await _close_session(self._session)
+
+    async def _stop_reception(self) -> None:
+        """Stop the receiver and its handoff drains, then close the socket."""
+
+        async with self._reception_lock:
+            self._stopping = True
+
+            task = self._receive_task
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+
+            handoff_tasks = tuple(self._handoff_tasks)
+            for handoff_task in handoff_tasks:
+                if not handoff_task.done():
+                    handoff_task.cancel()
+            for handoff_task in handoff_tasks:
+                with suppress(asyncio.CancelledError, Exception):
+                    await handoff_task
+            self._handoff_tasks.clear()
+
+            websocket = self._websocket
+            self._websocket = None
+            if websocket is not None:
+                await _close_websocket(websocket)
+
+    # -- chat send --------------------------------------------------------- #
 
     async def handle_chat_send(self, event: Mapping[str, Any]) -> dict[str, Any]:
         """Record an attempted send, with an explicit delivery outcome.
@@ -622,13 +762,20 @@ class TwitchModule:
 
 
 async def activate(
-    bus: Any,
+    context: Any,
     settings: Mapping[str, Any],
     catalog: Mapping[str, Mapping[str, Any]],
 ) -> TwitchModule:
-    """Authenticate, establish EventSub, and return an async lifecycle handle."""
+    """Build the prepared handle from the scoped runtime context (R7, AC26).
+
+    *context* is the module-scoped view of the versioned runtime: the bus is
+    read from it and the receiver is owned through its supervised tasks.
+    Nothing here reaches the network — authentication is ``prepare`` and the
+    source is ``start_inputs`` — so a refused activation has nothing to undo.
+    """
 
     del catalog  # Capabilities are declared by the colocated manifest.
+    bus, tasks = _runtime_surfaces(context)
     parsed = _Settings.from_mapping(settings)
     reporter = settings.get("diagnostic_reporter", _default_reporter)
     if not callable(reporter):
@@ -645,13 +792,22 @@ async def activate(
         _safe_report(reporter, "twitch transport: session creation failed")
         raise TwitchModuleError("twitch transport initialization failed") from None
 
-    handle = TwitchModule(bus, parsed, session, reporter, retry_delay)
-    try:
-        await handle.start()
-    except BaseException:
-        await handle.close()
-        raise
-    return handle
+    return TwitchModule(bus, tasks, parsed, session, reporter, retry_delay)
+
+
+def _runtime_surfaces(context: Any) -> tuple[Any, Any]:
+    """The two runtime surfaces this module uses, checked by shape (AC26)."""
+
+    bus = getattr(context, "bus", None)
+    tasks = getattr(context, "tasks", None)
+    if (
+        bus is None
+        or not callable(getattr(bus, "publish", None))
+        or not callable(getattr(bus, "subscribe", None))
+        or not callable(getattr(tasks, "spawn", None))
+    ):
+        raise TwitchModuleError("twitch activation: runtime context is invalid")
+    return bus, tasks
 
 
 def _mapping_at(value: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -770,4 +926,10 @@ def _default_reporter(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-__all__ = ["TwitchModule", "TwitchModuleError", "activate"]
+__all__ = [
+    "MODULE_NAME",
+    "TwitchModule",
+    "TwitchModuleError",
+    "activate",
+    "validate_settings",
+]

@@ -309,6 +309,37 @@ def test_module_default_takes_the_companion_name_from_configuration() -> None:
     assert COMPANION_NAME_TOKEN in str(error.value)
 
 
+def test_input_registered_with_its_own_companion_name_resolves_the_token() -> None:
+    """R1: the name is the declaring input's setting; the registry-wide one is a fallback.
+
+    The application builds its registry without a name — the core's own
+    configuration carries no module vocabulary — and the loader registers
+    each input with the name found in that module's settings. The name given
+    at registration decides both validation and evaluation for that input,
+    and an input registered without one falls back to the registry-wide name.
+    """
+
+    nameless = TriggerRegistry()
+    nameless.register(CHAT_INPUT, _chat_spec(), companion_name="Ada")
+    assert nameless.companion_name is None
+    assert nameless.companion_name_for(CHAT_INPUT) == "Ada"
+    assert nameless.companion_name_for("other-input") is None
+    engine = _engine(nameless)
+    assert engine.evaluate(_message(message_id="m1", text="hello Ada")).accepted is True
+    assert (
+        engine.evaluate(_message(message_id="m2", text=f"hello {COMPANION_NAME}")).accepted
+        is False
+    )
+
+    shared = TriggerRegistry(companion_name=COMPANION_NAME)
+    shared.register(CHAT_INPUT, _chat_spec())
+    assert shared.companion_name_for(CHAT_INPUT) == COMPANION_NAME
+
+    with pytest.raises(ContractError) as error:
+        TriggerRegistry().register(CHAT_INPUT, _chat_spec(), companion_name="   ")
+    assert f"triggers.{CHAT_INPUT}.companion_name" in str(error.value)
+
+
 # --------------------------------------------------------------------------- #
 # AC2 — four invalid configurations, refused before any transport
 # --------------------------------------------------------------------------- #

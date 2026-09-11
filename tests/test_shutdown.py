@@ -23,6 +23,15 @@ from test_twitch import FakeResponse, FakeSession, FakeWebSocket, notification, 
 
 @pytest.mark.parametrize("phase", ["model", "send", "stuck_model", "startup"])
 async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
+    """Shutdown drains the in-flight publication before any transport closes.
+
+    Twitch is a versioned producer now (R4): the coordinator stops its input
+    first, drains its accepted publication under the drain hook, closes the
+    v1 sinks it published into, then closes its send transport. The former
+    ``module 'twitch': shutdown failed`` of the v1 close route is therefore
+    the drain phase timing out when the model never answers.
+    """
+
     entered = asyncio.Event()
     release = asyncio.Event()
     records = []
@@ -49,6 +58,7 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
     class Loader:
         def __init__(self, bus, directory):
             self.bus = bus
+            self.context = None
             self.activations = []
 
         async def activate_enabled(self, config):
@@ -61,16 +71,31 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
                 self.bus, {"_writer": records.append}, CATALOG
             )
             handles["twitch"] = await twitch.activate(
-                self.bus,
+                self.context.for_module("twitch"),
                 {**TWITCH_SETTINGS, "_session_factory": lambda: twitch_session},
                 CATALOG,
             )
             # Match the production activation order that formerly deadlocked.
             self.activations = [
                 ModuleActivation(name, {}, handles[name])
-                for name in ("twitch", "brain", "audit")
+                for name in ("brain", "audit")
             ]
+            self.activations.insert(
+                0,
+                ModuleActivation(
+                    "twitch",
+                    {},
+                    handles["twitch"],
+                    roles=frozenset({"input"}),
+                    manifest_version=2,
+                ),
+            )
             if phase == "startup":
+                # The coordinator never starts here, so the harness opens the
+                # producer itself to hold a publication in flight; the
+                # coordinator's own calls, if any, are idempotent no-ops.
+                await handles["twitch"].prepare()
+                await handles["twitch"].start_inputs()
                 await asyncio.Future()
             return self.activations
 
@@ -96,7 +121,7 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
     websocket.feed(notification("too-late"))
     if phase == "stuck_model":
         assert await asyncio.wait_for(task, 1) == 1
-        assert diagnostics == ["module 'twitch': shutdown failed"]
+        assert diagnostics == ["module 'twitch': phase 'drain' timed out"]
         assert model_session.close_calls == twitch_session.close_calls == 1
         assert handles["audit"]._writer_task.done()
         assert not handles["twitch"]._publication_tasks

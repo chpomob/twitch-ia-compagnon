@@ -16,6 +16,10 @@ modules:
     access_token: ${TWITCH_ACCESS_TOKEN}
     broadcaster_id: ${TWITCH_BROADCASTER_ID}
     bot_user_id: ${TWITCH_BOT_USER_ID}
+    # The name viewers use to address the companion. Configuration owns this
+    # value: the module manifest's default trigger policy ("the message
+    # mentions the companion name") refers to it by token only.
+    companion_name: Companion
 
   brain:
     endpoint: ${OPENAI_ENDPOINT}
@@ -24,3 +28,44 @@ modules:
 
   audit:
     output: stdout
+
+# Retention and admission limits. The block is optional as a whole, but a
+# module built against the versioned runtime (the chat input declares triggers) needs
+# it: without it the application runs the compatibility runtime and refuses
+# such a module at startup. With the block present every limit below is
+# required and must be finite and positive; startup stops before any
+# transport opens when one is absent, negative, non-numeric or infinite.
+limits:
+  bus_history:
+    max_events: 1000
+    max_bytes: 4194304
+    max_age_seconds: 600
+  observation_queue:
+    max_records: 1000
+    max_bytes: 4194304
+  dedup:
+    max_entries: 4096
+    ttl_seconds: 600
+  attachments:
+    max_object_bytes: 1048576
+    max_objects: 256
+    max_total_bytes: 67108864
+    max_bytes_per_run: 8388608
+    ttl_seconds: 900
+  conversation_memory:
+    max_sessions: 64
+    max_exchanges: 20
+    max_bytes: 65536
+    max_age_seconds: 3600
+  chat_context:
+    max_messages: 50
+    max_bytes: 65536
+    max_age_seconds: 900
+    max_channels: 8
+  admission:
+    session_queue_capacity: 4
+    global_pending_capacity: 64
+    max_sessions: 32
+    workers: 4
+    wait_seconds: 30
+    total_run_seconds: 120

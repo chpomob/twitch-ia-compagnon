@@ -86,6 +86,7 @@ __all__ = [
     "AUDIENCE_CLAIMS",
     "BUILTIN_TRIGGER_TYPES",
     "BUILTIN_TRIGGER_TYPE_NAMES",
+    "COMPANION_NAME_SETTING",
     "COMPANION_NAME_TOKEN",
     "NORMALIZED_SCHEMA_VERSION",
     "REASON_INTERNAL_TRACE",
@@ -125,15 +126,25 @@ TRIGGER_TYPE_PROBABILITY = "probability"
 TRIGGER_TYPE_AUDIENCE = "audience"
 TRIGGER_TYPE_KEYWORD = "keyword"
 
+COMPANION_NAME_SETTING = "companion_name"
+"""The input module setting :data:`COMPANION_NAME_TOKEN` resolves from.
+
+The name is business configuration of the input that declares the policy, so
+it lives in that module's own settings — the loader hands it to the registry
+when it records the module's declaration — and never in the core's own
+configuration, which stays free of any module's vocabulary (R1, R7).
+"""
+
 COMPANION_NAME_TOKEN = "${companion_name}"
 """Placeholder a ``keyword`` rule uses for the configured companion name.
 
 R1 makes the chat input's default policy "the message text mentions the
 configured companion name", *with that name coming from configuration*. A
 manifest therefore cannot spell the name out: it declares this token, and the
-registry resolves it from its configured ``companion_name``. A policy using the
-token when no name is configured fails validation at startup, naming the input
-and the field, rather than silently never matching.
+registry resolves it from the name configured for that input, or from its
+own ``companion_name`` when the input carries none. A policy using the token
+when no name is configured fails validation at startup, naming the input and
+the field, rather than silently never matching.
 """
 
 AUDIENCE_CLAIMS: Mapping[str, str | None] = {
@@ -397,36 +408,55 @@ class TriggerRegistry:
     ingestion by :class:`TriggerEngine`.
     """
 
-    __slots__ = ("_companion_name", "_specs", "_inputs", "_channels")
+    __slots__ = ("_companion_name", "_names", "_specs", "_inputs", "_channels")
 
     def __init__(self, *, companion_name: str | None = None) -> None:
         """Build a registry resolving :data:`COMPANION_NAME_TOKEN` to *companion_name*.
 
         The name is configuration, not a module constant, so it lives here
-        rather than in any manifest (R1).
+        rather than in any manifest (R1). This one is the registry-wide
+        fallback; an input registered with its own configured name uses that
+        name instead.
         """
 
         if companion_name is not None:
-            _require_text(companion_name, "companion_name")
+            _require_text(companion_name, COMPANION_NAME_SETTING)
         self._companion_name = companion_name
+        self._names: dict[str, str] = {}
         self._specs: dict[str, TriggerSpec] = {}
         self._inputs: dict[str, TriggerPolicy] = {}
         self._channels: dict[tuple[str, str], TriggerPolicy] = {}
 
     @property
     def companion_name(self) -> str | None:
-        """The configured companion name, or ``None`` when unset."""
+        """The registry-wide companion name, or ``None`` when unset."""
 
         return self._companion_name
 
-    def register(self, input_name: str, spec: TriggerSpec) -> None:
+    def companion_name_for(self, input_name: str) -> str | None:
+        """The name :data:`COMPANION_NAME_TOKEN` resolves to for *input_name*.
+
+        The name the input was registered with wins over the registry-wide
+        one; ``None`` means no name is configured anywhere for this input.
+        """
+
+        return self._names.get(input_name, self._companion_name)
+
+    def register(
+        self,
+        input_name: str,
+        spec: TriggerSpec,
+        *,
+        companion_name: str | None = None,
+    ) -> None:
         """Record the :class:`~core.contracts.TriggerSpec` *input_name* declares.
 
         Every declared type must be one this engine can execute and every
         declared schema must be one the matching evaluator understands, both
         checked here so a manifest that could only fail at ingestion fails at
         load instead. The module's own default policy is validated the same way
-        as a configured one.
+        as a configured one. *companion_name* is the name configured in this
+        input's own settings; it resolves the token for this input only.
         """
 
         name = _require_text(input_name, "input_name")
@@ -436,6 +466,8 @@ class TriggerRegistry:
             )
         if name in self._specs:
             raise ContractError(f"triggers.{name}", "is already declared by a module")
+        if companion_name is not None:
+            _require_text(companion_name, f"triggers.{name}.{COMPANION_NAME_SETTING}")
 
         for index, declaration in enumerate(spec.types):
             if declaration.name not in _BUILTIN_BY_NAME:
@@ -448,10 +480,16 @@ class TriggerRegistry:
 
         if spec.default_policy is not None:
             self._validate_executable(
-                spec.default_policy, label=f"triggers.{name}.default_policy"
+                spec.default_policy,
+                label=f"triggers.{name}.default_policy",
+                companion_name=(
+                    self._companion_name if companion_name is None else companion_name
+                ),
             )
 
         self._specs[name] = spec
+        if companion_name is not None:
+            self._names[name] = companion_name
 
     def spec(self, input_name: str) -> TriggerSpec | None:
         """Return the spec declared for *input_name*, or ``None``."""
@@ -483,7 +521,9 @@ class TriggerRegistry:
                 f"names an input no module declares; declared inputs: {declared}",
             )
         spec.validate_policy(policy, label=label)
-        self._validate_executable(policy, label=label)
+        self._validate_executable(
+            policy, label=label, companion_name=self.companion_name_for(name)
+        )
 
     def configure(
         self, input_name: str, policy: TriggerPolicy, *, channel_id: str | None = None
@@ -525,13 +565,16 @@ class TriggerRegistry:
         spec = self._specs.get(input_name)
         return None if spec is None else spec.default_policy
 
-    def _validate_executable(self, policy: TriggerPolicy, *, label: str) -> None:
+    @staticmethod
+    def _validate_executable(
+        policy: TriggerPolicy, *, label: str, companion_name: str | None
+    ) -> None:
         """Check every rule against the canonical schema of its built-in type."""
 
         for index, rule in enumerate(policy.rules):
             _validate_builtin_rule(
                 rule,
-                companion_name=self._companion_name,
+                companion_name=companion_name,
                 label=f"{label}.rules[{index}]",
             )
 
@@ -861,7 +904,9 @@ class TriggerEngine:
                     text=normalized.text,
                     context=context,
                     rng=rng,
-                    companion_name=self._registry.companion_name,
+                    companion_name=self._registry.companion_name_for(
+                        normalized.input_name
+                    ),
                     label=label,
                 )
             )

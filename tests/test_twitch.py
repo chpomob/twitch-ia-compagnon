@@ -8,7 +8,12 @@ from typing import Any
 import pytest
 import yaml
 
+from core.actions import ActionRegistry, AuthorizationPolicy
 from core.bus import EventBus
+from core.lifecycle import PhaseCoordinator, SupervisedTasks
+from core.loader import ModuleLoader
+from core.runtime import ModuleContext, RuntimeContext, Supervision
+from core.triggers import TriggerEngine, TriggerRegistry
 from modules.twitch import (
     EVENTSUB_SUBSCRIPTIONS_URL,
     EVENTSUB_URL,
@@ -17,8 +22,11 @@ from modules.twitch import (
     TwitchModule,
     TwitchModuleError,
     activate,
+    validate_settings,
 )
 
+
+ROOT = Path(__file__).parents[1]
 
 SETTINGS = {
     "client_id": "configured-client",
@@ -26,6 +34,7 @@ SETTINGS = {
     "access_token": "never-show-access-token",
     "broadcaster_id": "broadcaster-42",
     "bot_user_id": "bot-24",
+    "companion_name": "Companion",
 }
 
 
@@ -151,6 +160,44 @@ async def wait_until(predicate: Any) -> None:
     raise AssertionError("condition did not become true")
 
 
+def runtime_context(bus: EventBus | None = None) -> RuntimeContext:
+    """The versioned runtime over a real bus, registry, supervision and tasks."""
+
+    target_bus = bus or EventBus()
+    return RuntimeContext(
+        bus=target_bus,
+        actions=ActionRegistry(authorization=AuthorizationPolicy()),
+        supervision=Supervision(target_bus),
+        tasks=SupervisedTasks(),
+        triggers=TriggerEngine(
+            TriggerRegistry(companion_name=SETTINGS["companion_name"]),
+            dedup_max_entries=8,
+            dedup_ttl_seconds=60.0,
+        ),
+    )
+
+
+def module_context(bus: EventBus | None = None) -> ModuleContext:
+    return runtime_context(bus).for_module("twitch")
+
+
+async def start_module(settings: dict[str, Any], bus: EventBus | None = None):
+    """Activate and run the startup phases the coordinator would run (R4).
+
+    A failing phase unwinds through ``close()`` exactly as the coordinator
+    does before the failure propagates.
+    """
+
+    handle = await activate(module_context(bus), settings, {})
+    try:
+        await handle.prepare()
+        await handle.start_inputs()
+    except BaseException:
+        await handle.close()
+        raise
+    return handle
+
+
 async def activate_with(
     session: FakeSession,
     bus: EventBus | None = None,
@@ -164,7 +211,7 @@ async def activate_with(
         "_retry_delay": no_delay,
         "diagnostic_reporter": target_diagnostics.append,
     }
-    handle = await activate(target_bus, settings, {})
+    handle = await start_module(settings, target_bus)
     return handle, target_bus, target_diagnostics
 
 
@@ -175,15 +222,206 @@ def assert_sanitized(diagnostics: list[str]) -> None:
 
 
 def test_manifest_declares_twitch_source_and_sink() -> None:
-    manifest_path = Path(__file__).parents[1] / "modules" / "twitch" / "module.yaml"
+    """R7/R1/R5: the manifest is v2 — the former 4-key equality is superseded.
+
+    It declares the runtime contract it is built against, the ``input`` role,
+    a settings schema and the hook this package implements, the three trigger
+    types with their parameter schemas, the combination operators, exactly
+    one default policy that names the companion only by token, and the
+    ``chat.write`` action contract.
+    """
+
+    from core.runtime import RUNTIME_API
+
+    manifest_path = ROOT / "modules" / "twitch" / "module.yaml"
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
 
-    assert manifest == {
-        "name": "twitch",
-        "produces": ["channel.chat.message"],
-        "consumes": ["channel.chat.send"],
-        "middleware": False,
+    assert manifest["name"] == "twitch"
+    assert manifest["manifest_version"] == 2
+    assert manifest["runtime_api"] == RUNTIME_API
+    assert manifest["produces"] == ["channel.chat.message"]
+    assert manifest["consumes"] == ["channel.chat.send"]
+    assert manifest["middleware"] is False
+    assert manifest["lifecycle"] == {"roles": ["input"]}
+
+    schema = manifest["settings_schema"]
+    assert set(schema["required"]) == set(SETTINGS)
+    assert set(schema["properties"]) == set(SETTINGS)
+    assert manifest["settings_validator"] == "validate_settings"
+    assert callable(validate_settings)
+
+    triggers = manifest["triggers"]
+    declared = {declaration["name"]: declaration for declaration in triggers["types"]}
+    assert set(declared) == {"probability", "audience", "keyword"}
+    for declaration in declared.values():
+        assert declaration["parameter_schema"]["type"] == "object"
+    assert set(triggers["combinations"]) == {"all_of", "any_of", "none_of"}
+    default_policy = triggers["default_policy"]
+    assert default_policy == {
+        "combination": "all_of",
+        "rules": [
+            {"type": "keyword", "parameters": {"keywords": ["${companion_name}"]}}
+        ],
     }
+    assert SETTINGS["companion_name"] not in manifest_path.read_text(encoding="utf-8")
+
+    (action,) = manifest["actions"]
+    assert action["name"] == "chat.write"
+    assert action["version"] == 1
+    assert action["nature"] == "write"
+    assert action["required_permissions"] == ["chat.write"]
+    assert action["supported_destinations"] == [
+        {"platform": "twitch", "channel_id": "*", "scope": "chat"}
+    ]
+    assert action["argument_schema"]["required"] == ["text"]
+    assert set(action["result_schema"]["required"]) == {"message_id", "destination"}
+    assert action["timeout_seconds"] == 10
+    assert action["idempotency"] == "none"
+
+
+def test_settings_hook_names_module_and_field_without_values() -> None:
+    """R7/AC24: one diagnostic per offending field; no configured value echoed."""
+
+    assert validate_settings(SETTINGS) == []
+
+    invalid = {**SETTINGS, "companion_name": "   "}
+    del invalid["broadcaster_id"]
+    diagnostics = validate_settings(invalid)
+
+    assert diagnostics == [
+        "module 'twitch': field 'broadcaster_id': must be a non-empty string",
+        "module 'twitch': field 'companion_name': must be a non-empty string",
+    ]
+    assert_sanitized(diagnostics)
+    assert validate_settings(["not", "a", "mapping"]) == [
+        "module 'twitch': field 'settings': must be a mapping"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_loader_activates_the_v2_manifest_and_coordinator_drives_the_phases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4/R7: the manifest's declarations and this package load together.
+
+    The real loader resolves the declared hook, validates the settings, records
+    the declarations and activates through the context; the coordinator then
+    opens the source only after the readiness barrier and releases every
+    transport on stop.
+    """
+
+    websocket = FakeWebSocket(welcome("session-1"))
+    session = FakeSession([websocket])
+    diagnostics: list[str] = []
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    settings = {
+        **SETTINGS,
+        "_session_factory": lambda: session,
+        "_retry_delay": no_delay,
+        "diagnostic_reporter": diagnostics.append,
+    }
+
+    activations = await loader.activate_enabled(
+        {"enabled_modules": ["twitch"], "modules": {"twitch": settings}}
+    )
+
+    (activation,) = activations
+    assert activation.manifest_version == 2
+    assert activation.roles == frozenset({"input"})
+    assert type(activation.handle).__name__ == TwitchModule.__name__
+    # Activation touched no transport: that is what the barrier protects.
+    assert session.get_calls == []
+    assert session.ws_calls == []
+    assert "chat.write" in context.actions.discovered()
+    assert context.triggers.registry.spec("twitch") is not None
+
+    coordinator = PhaseCoordinator(
+        activations, tasks=context.tasks, reporter=diagnostics.append
+    )
+    assert (await coordinator.start()).status == 0
+    assert coordinator.ready
+    assert [call["url"] for call in session.get_calls] == [TOKEN_VALIDATION_URL]
+    assert session.ws_calls == [EVENTSUB_URL]
+
+    websocket.feed(notification("loaded-1"))
+    await wait_until(lambda: len(context.bus.list_events()) == 1)
+    assert context.bus.list_events()[0]["payload"]["message_id"] == "loaded-1"
+
+    report = await coordinator.stop()
+    assert report.status == 0
+    assert diagnostics == []
+    assert websocket.close_calls == 1
+    assert session.close_calls == 1
+    assert context.tasks.active == 0
+
+
+@pytest.mark.asyncio
+async def test_loader_refuses_settings_the_hook_rejects_before_activation() -> None:
+    """R7/AC24: the declared hook refuses through the loader, value-free."""
+
+    from core.loader import ModuleLoadError
+
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    invalid = {**SETTINGS, "companion_name": ""}
+    activated: list[Any] = []
+    invalid["_session_factory"] = lambda: activated.append("session")
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled(
+            {"enabled_modules": ["twitch"], "modules": {"twitch": invalid}}
+        )
+
+    assert "'twitch'" in str(caught.value)
+    assert "validate_settings" in str(caught.value)
+    assert_sanitized([str(caught.value)])
+    assert activated == []
+    assert loader.activations == []
+
+
+@pytest.mark.asyncio
+async def test_phase_hooks_are_idempotent_and_safe_out_of_order() -> None:
+    """R4: a second call of any phase is a no-op; close alone releases all."""
+
+    websocket = FakeWebSocket(welcome("session-1"))
+    session = FakeSession([websocket])
+    handle, _, diagnostics = await activate_with(session)
+
+    await handle.prepare()
+    await handle.start_inputs()
+    assert len(session.get_calls) == 1
+    assert session.ws_calls == [EVENTSUB_URL]
+
+    await handle.stop_inputs()
+    await handle.stop_inputs()
+    assert websocket.close_calls == 1
+    assert session.close_calls == 0
+    # The source is cut, but the send transport still serves a late reply.
+    assert handle._receive_task.done()
+
+    await handle.drain(0.5)
+    await handle.close()
+    await handle.close()
+    assert session.close_calls == 1
+    assert diagnostics == []
+
+    unprepared = await activate(
+        module_context(),
+        {**SETTINGS, "_session_factory": lambda: FakeSession([])},
+        {},
+    )
+    with pytest.raises(TwitchModuleError, match="requires prepare"):
+        await unprepared.start_inputs()
+    await unprepared.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_refuses_a_context_without_the_runtime_surfaces() -> None:
+    """AC26: the bus is read from the context, never received in its place."""
+
+    with pytest.raises(TwitchModuleError, match="runtime context is invalid"):
+        await activate(EventBus(), {**SETTINGS, "_session_factory": FakeSession}, {})
 
 
 @pytest.mark.asyncio
@@ -439,7 +677,7 @@ async def test_immediate_reconnect_failures_escalate_bounded_backoff() -> None:
         "_retry_delay": record_delay,
         "diagnostic_reporter": lambda _: None,
     }
-    handle = await activate(EventBus(), settings, {})
+    handle = await start_module(settings)
     try:
         await wait_until(lambda: len(delays) == 2)
         assert delays == [0.25, 0.5]
@@ -494,7 +732,7 @@ async def test_close_cancels_a_pending_retry() -> None:
         "_retry_delay": pending_retry,
         "diagnostic_reporter": lambda _: None,
     }
-    handle = await activate(EventBus(), settings, {})
+    handle = await start_module(settings)
     await wait_until(retry_started.is_set)
 
     await asyncio.wait_for(handle.close(), timeout=1)
@@ -517,7 +755,7 @@ async def test_authentication_rejection_is_sanitized_and_cleans_up() -> None:
     }
 
     with pytest.raises(TwitchModuleError, match="authentication rejected"):
-        await activate(EventBus(), settings, {})
+        await start_module(settings)
 
     assert diagnostics == ["twitch authentication: rejected (status 401)"]
     assert_sanitized(diagnostics)
@@ -542,7 +780,7 @@ async def test_subscription_rejection_is_sanitized_and_has_no_false_event() -> N
     }
 
     with pytest.raises(TwitchModuleError, match="subscription rejected"):
-        await activate(bus, settings, {})
+        await start_module(settings, bus)
 
     assert diagnostics == ["twitch subscription: rejected (status 403)"]
     assert bus.list_events() == []
@@ -563,7 +801,7 @@ async def test_authentication_non_json_rejection_preserves_status() -> None:
     }
 
     with pytest.raises(TwitchModuleError, match="authentication rejected"):
-        await activate(EventBus(), settings, {})
+        await start_module(settings)
 
     assert diagnostics == ["twitch authentication: rejected (status 502)"]
     assert response.release_calls == 1
@@ -582,7 +820,7 @@ async def test_subscription_non_json_rejection_preserves_status() -> None:
     }
 
     with pytest.raises(TwitchModuleError, match="subscription rejected"):
-        await activate(EventBus(), settings, {})
+        await start_module(settings)
 
     assert diagnostics == ["twitch subscription: rejected (status 503)"]
     assert response.release_calls == 1
@@ -817,7 +1055,12 @@ async def test_notification_filter_tolerates_missing_identity(
     bus = EventBus()
     diagnostics: list[str] = []
     handle = TwitchModule(
-        bus, SimpleNamespace(**identity), FakeSession([]), diagnostics.append, no_delay
+        bus,
+        module_context(bus).tasks,
+        SimpleNamespace(**identity),
+        FakeSession([]),
+        diagnostics.append,
+        no_delay,
     )
     try:
         await handle._publish_notification(notification("viewer-message"))

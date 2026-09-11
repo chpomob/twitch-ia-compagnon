@@ -87,6 +87,7 @@ from .lifecycle import (
     ROLES,
 )
 from .runtime import SUPPORTED_RUNTIME_APIS
+from .triggers import COMPANION_NAME_SETTING
 
 
 __all__: Sequence[str] = (
@@ -363,7 +364,7 @@ class ModuleLoader:
 
         # Declaring records; it never grants (R7, R5).
         for name in enabled:
-            self._register_declarations(name, declarations[name])
+            self._register_declarations(name, declarations[name], resolved[name])
 
         for name in enabled:
             declaration = declarations[name]
@@ -547,9 +548,10 @@ class ModuleLoader:
     ) -> None:
         """Run this module's own settings validation, before any activation.
 
-        The declared schema first, then the declared hook. Diagnostics name the
-        module and the field and never interpolate a value, so a rejected
-        credential is not echoed into the report (R7, AC24).
+        The declared schema first, then the declared hook. The hook refuses by
+        raising or by returning a non-empty list of diagnostics; either way
+        the report names the module and the hook and never interpolates a
+        value, so a rejected credential is not echoed into it (R7, AC24).
         """
 
         if declaration.settings_schema is not None:
@@ -571,10 +573,11 @@ class ModuleLoader:
                     "names a settings hook that could not be resolved",
                 )
             return
+        hook_name = declaration.settings_validator or MANIFEST_SETTINGS_VALIDATOR_KEY
         try:
             outcome = validator(settings)
             if inspect.isawaitable(outcome):
-                await outcome
+                outcome = await outcome
         except Exception:
             # Nothing the hook raises reaches the report, whatever its type.
             # Its message and its field are module-authored text, and the hook
@@ -582,13 +585,23 @@ class ModuleLoader:
             # credential back out. The diagnostic is built here instead, from
             # the module name and the declared hook alone (R7, AC24).
             raise _field_error(
-                name,
-                declaration.settings_validator or MANIFEST_SETTINGS_VALIDATOR_KEY,
-                "settings were refused by the module",
+                name, hook_name, "settings were refused by the module"
             ) from None
+        # A hook may also *return* its diagnostics, one per offending field.
+        # A non-empty list is a refusal like a raise, and for the same reason
+        # its text stays out of the report: the count is all that is borrowed.
+        if isinstance(outcome, (list, tuple)) and outcome:
+            raise _field_error(
+                name,
+                hook_name,
+                f"settings were refused by the module ({len(outcome)} diagnostics)",
+            )
 
     def _register_declarations(
-        self, name: str, declaration: ManifestDeclaration
+        self,
+        name: str,
+        declaration: ManifestDeclaration,
+        settings: Mapping[str, Any],
     ) -> None:
         """Record declared actions and triggers. Recording is not granting.
 
@@ -597,6 +610,12 @@ class ModuleLoader:
         authorizes it. Neither the declaration, the module's capabilities, its
         produced events nor a ``read`` nature moves it into the *authorized*
         view (R7, R5).
+
+        A declared trigger policy may refer to the companion name by token;
+        the name itself is business configuration of the declaring input, so
+        it is read from that module's own validated *settings* and handed to
+        the registry for this input only (R1). The core's configuration never
+        carries it.
         """
 
         if not declaration.is_v2:
@@ -621,8 +640,13 @@ class ModuleLoader:
                 MANIFEST_TRIGGERS_KEY,
                 "declares triggers, and the runtime context carries no trigger engine",
             )
+        companion_name = settings.get(COMPANION_NAME_SETTING)
+        if not isinstance(companion_name, str) or not companion_name.strip():
+            companion_name = None
         try:
-            registry.register(name, declaration.triggers)
+            registry.register(
+                name, declaration.triggers, companion_name=companion_name
+            )
         except Exception as exc:
             raise _field_error(
                 name, MANIFEST_TRIGGERS_KEY, _sanitised_reason(str(exc))
