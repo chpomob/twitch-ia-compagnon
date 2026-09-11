@@ -8,16 +8,39 @@ from typing import Any
 import pytest
 import yaml
 
-from core.actions import ActionRegistry, AuthorizationPolicy
+from core.actions import (
+    ActionExecutor,
+    ActionRegistry,
+    AuthorizationPolicy,
+    AuthorizationRule,
+)
 from core.bus import EventBus
+from core.context import ChatContext
+from core.contracts import (
+    COUNTER_DEDUP_EVICTIONS,
+    COUNTER_LOST_TRACES,
+    COUNTER_TRIGGER_REJECTIONS,
+    ActionCall,
+    Counters,
+    Destination,
+    SessionKey,
+    TriggerPolicy,
+    TriggerRule,
+    TriggerSpec,
+    TriggerTypeDeclaration,
+)
 from core.lifecycle import PhaseCoordinator, SupervisedTasks
 from core.loader import ModuleLoader
 from core.runtime import ModuleContext, RuntimeContext, Supervision
 from core.triggers import TriggerEngine, TriggerRegistry
 from modules.twitch import (
+    CHAT_WRITE_ACTION,
+    CHAT_WRITE_PROVIDER,
     EVENTSUB_SUBSCRIPTIONS_URL,
     EVENTSUB_URL,
     HELIX_CHAT_URL,
+    MANIFEST_PATH,
+    PLATFORM,
     TOKEN_VALIDATION_URL,
     TwitchModule,
     TwitchModuleError,
@@ -160,35 +183,132 @@ async def wait_until(predicate: Any) -> None:
     raise AssertionError("condition did not become true")
 
 
-def runtime_context(bus: EventBus | None = None) -> RuntimeContext:
-    """The versioned runtime over a real bus, registry, supervision and tasks."""
+class FakeClock:
+    """An injected monotonic clock; tests advance it, nothing sleeps."""
 
-    target_bus = bus or EventBus()
-    return RuntimeContext(
-        bus=target_bus,
-        actions=ActionRegistry(authorization=AuthorizationPolicy()),
-        supervision=Supervision(target_bus),
-        tasks=SupervisedTasks(),
-        triggers=TriggerEngine(
-            TriggerRegistry(companion_name=SETTINGS["companion_name"]),
-            dedup_max_entries=8,
-            dedup_ttl_seconds=60.0,
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class RecordingScheduler:
+    """Records what ingestion admits; runs nothing (the run engine is P16)."""
+
+    def __init__(self) -> None:
+        self.admissions: list[tuple[SessionKey, Any]] = []
+
+    def admit(self, session_key: SessionKey, work: Any) -> Any:
+        self.admissions.append((session_key, work))
+        return SimpleNamespace(accepted=True, run_id=f"run-{len(self.admissions)}")
+
+
+def manifest() -> dict[str, Any]:
+    return yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def manifest_trigger_spec() -> TriggerSpec:
+    """The trigger declaration of the real manifest, built by public contracts."""
+
+    declared = manifest()["triggers"]
+    default = declared["default_policy"]
+    return TriggerSpec(
+        types=tuple(
+            TriggerTypeDeclaration(
+                name=entry["name"], parameter_schema=entry["parameter_schema"]
+            )
+            for entry in declared["types"]
+        ),
+        combinations=tuple(declared["combinations"]),
+        default_policy=TriggerPolicy(
+            rules=tuple(
+                TriggerRule(type=rule["type"], parameters=rule["parameters"])
+                for rule in default["rules"]
+            ),
+            combination=default["combination"],
         ),
     )
 
 
-def module_context(bus: EventBus | None = None) -> ModuleContext:
-    return runtime_context(bus).for_module("twitch")
+def runtime_context(
+    bus: EventBus | None = None,
+    *,
+    clock: Any = None,
+    dedup_max_entries: int = 8,
+    dedup_ttl_seconds: float = 60.0,
+    scheduler: Any = None,
+    declare_triggers: bool = True,
+    authorization: AuthorizationPolicy | None = None,
+) -> RuntimeContext:
+    """The versioned runtime over a real bus, registry, engine, context and tasks.
+
+    ``declare_triggers`` registers the manifest's trigger declaration for the
+    ``twitch`` input, as the loader would; a test that runs the real loader
+    passes ``False`` so the loader can register it itself.
+    """
+
+    target_bus = bus or EventBus()
+    target_clock = clock if clock is not None else FakeClock()
+    counters = Counters()
+    registry = TriggerRegistry(companion_name=SETTINGS["companion_name"])
+    if declare_triggers:
+        registry.register(
+            "twitch", manifest_trigger_spec(), companion_name=SETTINGS["companion_name"]
+        )
+    policy = authorization if authorization is not None else AuthorizationPolicy()
+    actions = ActionRegistry(authorization=policy)
+    supervision = Supervision(target_bus, counters=counters)
+    return RuntimeContext(
+        bus=target_bus,
+        actions=actions,
+        supervision=supervision,
+        tasks=SupervisedTasks(),
+        executor=ActionExecutor(
+            actions, policy, supervision=supervision, counters=counters, clock=target_clock
+        ),
+        triggers=TriggerEngine(
+            registry,
+            dedup_max_entries=dedup_max_entries,
+            dedup_ttl_seconds=dedup_ttl_seconds,
+            clock=target_clock,
+            counters=counters,
+        ),
+        chat=ChatContext(
+            max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=target_clock
+        ),
+        scheduler=scheduler,
+        clock=target_clock,
+    )
 
 
-async def start_module(settings: dict[str, Any], bus: EventBus | None = None):
+def module_context(bus: EventBus | None = None, **options: Any) -> ModuleContext:
+    return runtime_context(bus, **options).for_module("twitch")
+
+
+def events_of(bus: EventBus, event_type: str) -> list[dict[str, Any]]:
+    return [event for event in bus.list_events() if event["type"] == event_type]
+
+
+def chat_events(bus: EventBus) -> list[dict[str, Any]]:
+    return events_of(bus, "channel.chat.message")
+
+
+async def start_module(
+    settings: dict[str, Any],
+    bus: EventBus | None = None,
+    context: ModuleContext | None = None,
+):
     """Activate and run the startup phases the coordinator would run (R4).
 
     A failing phase unwinds through ``close()`` exactly as the coordinator
     does before the failure propagates.
     """
 
-    handle = await activate(module_context(bus), settings, {})
+    handle = await activate(context or module_context(bus), settings, {})
     try:
         await handle.prepare()
         await handle.start_inputs()
@@ -202,8 +322,9 @@ async def activate_with(
     session: FakeSession,
     bus: EventBus | None = None,
     diagnostics: list[str] | None = None,
+    context: ModuleContext | None = None,
 ):
-    target_bus = bus or EventBus()
+    target_bus = context.bus if context is not None else (bus or EventBus())
     target_diagnostics = diagnostics if diagnostics is not None else []
     settings = {
         **SETTINGS,
@@ -211,7 +332,7 @@ async def activate_with(
         "_retry_delay": no_delay,
         "diagnostic_reporter": target_diagnostics.append,
     }
-    handle = await start_module(settings, target_bus)
+    handle = await start_module(settings, target_bus, context)
     return handle, target_bus, target_diagnostics
 
 
@@ -313,7 +434,7 @@ async def test_loader_activates_the_v2_manifest_and_coordinator_drives_the_phase
     websocket = FakeWebSocket(welcome("session-1"))
     session = FakeSession([websocket])
     diagnostics: list[str] = []
-    context = runtime_context()
+    context = runtime_context(declare_triggers=False)
     loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
     settings = {
         **SETTINGS,
@@ -333,7 +454,8 @@ async def test_loader_activates_the_v2_manifest_and_coordinator_drives_the_phase
     # Activation touched no transport: that is what the barrier protects.
     assert session.get_calls == []
     assert session.ws_calls == []
-    assert "chat.write" in context.actions.discovered()
+    assert CHAT_WRITE_ACTION in context.actions.discovered()
+    assert context.actions.bindings(CHAT_WRITE_ACTION) == ()
     assert context.triggers.registry.spec("twitch") is not None
 
     coordinator = PhaseCoordinator(
@@ -343,10 +465,25 @@ async def test_loader_activates_the_v2_manifest_and_coordinator_drives_the_phase
     assert coordinator.ready
     assert [call["url"] for call in session.get_calls] == [TOKEN_VALIDATION_URL]
     assert session.ws_calls == [EVENTSUB_URL]
+    # Preparation bound the provider to the manifest's own declaration, over
+    # the configured channel only, and marked the module ready (R5).
+    (binding,) = context.actions.bindings(CHAT_WRITE_ACTION)
+    assert binding.provider_name == CHAT_WRITE_PROVIDER
+    assert binding.module == "twitch"
+    assert binding.destination == Destination(PLATFORM, SETTINGS["broadcaster_id"], "chat")
+    assert CHAT_WRITE_ACTION in context.actions.registered_ready()
 
     websocket.feed(notification("loaded-1"))
-    await wait_until(lambda: len(context.bus.list_events()) == 1)
-    assert context.bus.list_events()[0]["payload"]["message_id"] == "loaded-1"
+    await wait_until(lambda: len(chat_events(context.bus)) == 1)
+    assert chat_events(context.bus)[0]["payload"]["message_id"] == "loaded-1"
+    # The loader registered the manifest's default policy for this input:
+    # "hello" mentions no companion name, so the decision is a traced
+    # rejection resolved from that declaration (R1).
+    await wait_until(lambda: len(events_of(context.bus, "input.trigger.rejected")) == 1)
+    (rejected,) = events_of(context.bus, "input.trigger.rejected")
+    assert rejected["payload"]["input"] == "twitch"
+    assert rejected["payload"]["source_event_id"] == "loaded-1"
+    assert rejected["payload"]["reason"] == "rejected:keyword_no_match"
 
     report = await coordinator.stop()
     assert report.status == 0
@@ -354,6 +491,7 @@ async def test_loader_activates_the_v2_manifest_and_coordinator_drives_the_phase
     assert websocket.close_calls == 1
     assert session.close_calls == 1
     assert context.tasks.active == 0
+    assert CHAT_WRITE_ACTION not in context.actions.registered_ready()
 
 
 @pytest.mark.asyncio
@@ -456,19 +594,22 @@ async def test_notification_mapping_dedup_and_retry_reconnect() -> None:
     )
     handle, bus, diagnostics = await activate_with(session)
     try:
-        await wait_until(lambda: len(bus.list_events()) == 2)
+        await wait_until(lambda: len(chat_events(bus)) == 2)
 
-        events = bus.list_events()
+        events = chat_events(bus)
+        # Normalised once, at the boundary, into the schema-version-2 shape
+        # (R3). "first" names no companion, so the trigger refused it and the
+        # bus copy carries no ``viewer_id`` bridge for the v1 consumer (R1).
         assert events[0] == {
             "type": "channel.chat.message",
             "payload": {
-                "broadcaster_id": SETTINGS["broadcaster_id"],
-                "chatter_id": "viewer-7",
-                "chatter_name": "ViewerName",
+                "platform": "twitch",
+                "channel_id": SETTINGS["broadcaster_id"],
+                "author": {"id": "viewer-7", "display_name": "ViewerName"},
                 "message_id": "message-1",
                 "text": "first",
             },
-            "metadata": {"source": "twitch"},
+            "metadata": {"source": "twitch", "schema_version": 2},
         }
         assert events[1]["payload"]["message_id"] == "message-2"
         assert session.ws_calls == [EVENTSUB_URL, EVENTSUB_URL]
@@ -523,7 +664,7 @@ async def test_twitch_directed_handoff_preserves_subscription() -> None:
     session = FakeSession([first, second])
     handle, bus, diagnostics = await activate_with(session)
     try:
-        await wait_until(lambda: len(bus.list_events()) == 1)
+        await wait_until(lambda: len(chat_events(bus)) == 1)
         subscription_calls = [
             call
             for call in session.post_calls
@@ -552,15 +693,15 @@ async def test_twitch_directed_handoff_drains_old_socket_during_overlap() -> Non
     session = FakeSession([first, second])
     handle, bus, diagnostics = await activate_with(session)
     try:
-        await wait_until(lambda: len(bus.list_events()) == 1)
-        assert bus.list_events()[0]["payload"]["message_id"] == "message-old"
+        await wait_until(lambda: len(chat_events(bus)) == 1)
+        assert chat_events(bus)[0]["payload"]["message_id"] == "message-old"
 
         second.feed(welcome("session-2"))
         second.feed(notification("message-new", "from replacement socket"))
-        await wait_until(lambda: len(bus.list_events()) == 2)
+        await wait_until(lambda: len(chat_events(bus)) == 2)
 
         assert [
-            event["payload"]["message_id"] for event in bus.list_events()
+            event["payload"]["message_id"] for event in chat_events(bus)
         ] == ["message-old", "message-new"]
         assert first.close_calls == 1
         assert diagnostics == []
@@ -598,10 +739,14 @@ async def test_handoff_overlap_deduplicates_concurrent_notifications() -> None:
     try:
         await wait_until(publish_started.is_set)
         release_publish.set()
-        await wait_until(lambda: len(bus.list_events()) == 1)
+        await wait_until(lambda: len(chat_events(bus)) == 1)
         await asyncio.sleep(0)
 
-        assert len(bus.list_events()) == 1
+        # The window records the decision before the publication awaits any
+        # consumer, so the concurrent redelivery finds it and publishes,
+        # feeds and decides nothing a second time (R6).
+        assert len(chat_events(bus)) == 1
+        assert len(events_of(bus, "input.trigger.rejected")) == 1
         assert diagnostics == []
     finally:
         await handle.close()
@@ -645,7 +790,7 @@ async def test_recoverable_twitch_close_codes_create_fresh_session(
     )
     handle, bus, diagnostics = await activate_with(session)
     try:
-        await wait_until(lambda: len(bus.list_events()) == 1)
+        await wait_until(lambda: len(chat_events(bus)) == 1)
         assert session.ws_calls == [EVENTSUB_URL, EVENTSUB_URL]
         assert diagnostics == []
     finally:
@@ -856,6 +1001,15 @@ def test_transport_urls_are_the_expected_twitch_operations() -> None:
 def sent_response() -> FakeResponse:
     return FakeResponse(200, {"data": [{"message_id": "sent", "is_sent": True}]})
 
+async def sent_traces_settled(handle: TwitchModule) -> None:
+    """Wait for the ``channel.chat.sent`` publications a confirmed send handed
+    to the loop: the send outcome never waits for them (R8)."""
+
+    pending = tuple(handle._sent_traces)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 
 @pytest.mark.asyncio
 async def test_chat_send_uses_configured_identity_and_preserves_event() -> None:
@@ -891,10 +1045,33 @@ async def test_chat_send_uses_configured_identity_and_preserves_event() -> None:
             },
         }
         assert result["payload"] == payload
-        assert result["metadata"] == {"source": "test", "delivery_status": "sent"}
+        assert result["metadata"] == {
+            "source": "test",
+            "delivery_status": "sent",
+            "delivery_outcome": "success",
+        }
         assert metadata == {"source": "test", "delivery_status": "failed"}
         assert response.release_calls == 1
         assert diagnostics == []
+        # The confirmed send is one traced fact, published after the record
+        # was written and correlated to the compatibility route (R8); the
+        # route reported ``sent`` without waiting for it.
+        await sent_traces_settled(handle)
+        (sent,) = events_of(bus, "channel.chat.sent")
+        assert sent["payload"] == {
+            "platform": "twitch",
+            "channel_id": SETTINGS["broadcaster_id"],
+            "message_id": "sent",
+            "provider": CHAT_WRITE_PROVIDER,
+            "route": "channel.chat.send",
+        }
+        assert handle.send_record.snapshot() == {
+            "emitted": 1,
+            "confirmed": 1,
+            "failed": 0,
+            "unknown": 0,
+            "last_message_id": "sent",
+        }
     finally:
         await handle.close()
 
@@ -922,28 +1099,33 @@ async def test_invalid_send_is_a_failed_attempt_without_request(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("response, diagnostic", [
-    (FakeResponse(503, {"message": SETTINGS["access_token"]}), "rejected (status 503)"),
-    (FakeResponse(401, {"message": SETTINGS["client_secret"]}), "rejected (status 401)"),
-    (FakeResponse(202, {"data": [{"is_sent": True, "message_id": "id"}]}), "rejected (status 202)"),
-    (FakeResponse(200, None), "malformed response"),
-    (FakeResponse(200, {"data": []}), "malformed response"),
-    (FakeResponse(200, {"data": {}}), "malformed response"),
-    (FakeResponse(200, {"data": [None]}), "malformed response"),
-    (FakeResponse(200, {"data": [{}, {}]}), "malformed response"),
-    (FakeResponse(200, {"data": [{"message_id": "id"}]}), "malformed response"),
-    (FakeResponse(200, {"data": [{"is_sent": 1, "message_id": "id"}]}), "malformed response"),
-    (FakeResponse(200, {"data": [{"is_sent": False, "drop_reason": SETTINGS["access_token"]}]}), "rejected (status 200)"),
-    (FakeResponse(200, {"data": [{"is_sent": True}]}), "malformed response"),
-    (FakeResponse(200, {"data": [{"is_sent": True, "message_id": " "}]}), "malformed response"),
-    (FakeResponse(200, {"data": [{"is_sent": True, "message_id": 1}]}), "malformed response"),
-    (FakeResponse(200, ValueError(SETTINGS["access_token"])), "malformed response"),
-    (OSError(SETTINGS["access_token"]), "request failed"),
-    (asyncio.TimeoutError(SETTINGS["client_secret"]), "request timed out"),
+@pytest.mark.parametrize("response, diagnostic, outcome", [
+    (FakeResponse(503, {"message": SETTINGS["access_token"]}), "rejected (status 503)", "error"),
+    (FakeResponse(401, {"message": SETTINGS["client_secret"]}), "rejected (status 401)", "error"),
+    (FakeResponse(202, {"data": [{"is_sent": True, "message_id": "id"}]}), "rejected (status 202)", "error"),
+    (FakeResponse(200, None), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": []}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": {}}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": [None]}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": [{}, {}]}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": [{"message_id": "id"}]}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": [{"is_sent": 1, "message_id": "id"}]}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": [{"is_sent": False, "drop_reason": SETTINGS["access_token"]}]}), "rejected (status 200)", "error"),
+    (FakeResponse(200, {"data": [{"is_sent": True}]}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": [{"is_sent": True, "message_id": " "}]}), "malformed response", "external_unknown"),
+    (FakeResponse(200, {"data": [{"is_sent": True, "message_id": 1}]}), "malformed response", "external_unknown"),
+    (FakeResponse(200, ValueError(SETTINGS["access_token"])), "malformed response", "external_unknown"),
+    (OSError(SETTINGS["access_token"]), "request failed", "external_unknown"),
+    (asyncio.TimeoutError(SETTINGS["client_secret"]), "request timed out", "external_unknown"),
 ])
 async def test_send_failure_continues_chain_and_next_send_succeeds(
-    response: Any, diagnostic: str,
+    response: Any, diagnostic: str, outcome: str,
 ) -> None:
+    """R5/R8: an unconfirmed send is ``error`` or ``external_unknown``, never
+    ``success``, and emits no ``channel.chat.sent``; the next confirmed send
+    emits exactly one. The former ``[first, second]`` history equality is
+    superseded by R8's confirmed-send trace, retained on the same bus."""
+
     success = sent_response()
     session = FakeSession([FakeWebSocket(welcome("one"))], sends=[response, success])
     handle, bus, diagnostics = await activate_with(session)
@@ -951,10 +1133,25 @@ async def test_send_failure_continues_chain_and_next_send_succeeds(
     bus.subscribe("**", lambda event: observed.append(event), order=90)
     try:
         first = await bus.publish("channel.chat.send", {"text": "first"}, {})
+        assert events_of(bus, "channel.chat.sent") == []
         second = await bus.publish("channel.chat.send", {"text": "next"}, {})
         assert first["metadata"]["delivery_status"] == "failed"
+        assert first["metadata"]["delivery_outcome"] == outcome
         assert second["metadata"]["delivery_status"] == "sent"
-        assert observed == bus.list_events() == [first, second]
+        assert second["metadata"]["delivery_outcome"] == "success"
+        # The route reported the confirmed send without waiting for its
+        # trace, so the trace lands after the route's own record (R8).
+        await sent_traces_settled(handle)
+        (sent,) = events_of(bus, "channel.chat.sent")
+        assert sent["payload"]["message_id"] == "sent"
+        assert observed == bus.list_events() == [first, second, sent]
+        assert handle.send_record.snapshot() == {
+            "emitted": 2,
+            "confirmed": 1,
+            "failed": 1 if outcome == "error" else 0,
+            "unknown": 1 if outcome == "external_unknown" else 0,
+            "last_message_id": "sent",
+        }
         assert len(session.post_calls) == 3
         assert diagnostics == [f"twitch chat send: {diagnostic}"]
         assert_sanitized(diagnostics)
@@ -1035,8 +1232,8 @@ async def test_self_notifications_are_not_published_or_deduplicated() -> None:
         # Ignored echoes must not change the publication dedupe state.
         await handle._publish_notification(notification("self-message"))
         await handle._publish_notification(notification("self-message"))
-        assert len(bus.list_events()) == 1
-        assert bus.list_events()[0]["payload"]["chatter_id"] == "viewer-7"
+        assert len(chat_events(bus)) == 1
+        assert chat_events(bus)[0]["payload"]["author"]["id"] == "viewer-7"
         assert diagnostics == []
     finally:
         await handle.close()
@@ -1055,8 +1252,7 @@ async def test_notification_filter_tolerates_missing_identity(
     bus = EventBus()
     diagnostics: list[str] = []
     handle = TwitchModule(
-        bus,
-        module_context(bus).tasks,
+        module_context(bus),
         SimpleNamespace(**identity),
         FakeSession([]),
         diagnostics.append,
@@ -1064,8 +1260,615 @@ async def test_notification_filter_tolerates_missing_identity(
     )
     try:
         await handle._publish_notification(notification("viewer-message"))
-        assert len(bus.list_events()) == 1
-        assert bus.list_events()[0]["payload"]["chatter_id"] == "viewer-7"
+        assert len(chat_events(bus)) == 1
+        assert chat_events(bus)[0]["payload"]["author"]["id"] == "viewer-7"
         assert diagnostics == []
     finally:
         await handle.close()
+
+
+# --------------------------------------------------------------------------- #
+# Reception on the v2 runtime: normalisation, identity, dedup window, admission
+# (R1, R3, R6 — AC12, AC22)
+# --------------------------------------------------------------------------- #
+
+
+async def _ingest(handle: TwitchModule, envelope: dict[str, Any]) -> None:
+    """Feed one envelope through the reception task exactly as the socket does."""
+
+    task = asyncio.create_task(handle._publish_notification(envelope))
+    await task
+
+
+@pytest.mark.asyncio
+async def test_untrusted_identity_is_one_traced_rejection_and_valid_event_is_normalized() -> None:
+    """AC12 (R3): no trusted viewer identity → 0 admissions, 0 publications and
+    exactly 1 traced rejection; a valid notification → exactly 1 normalised
+    event with ``schema_version`` 2 and the five non-empty payload fields,
+    fed to the chat context, decided, and admitted under its session key."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    bus = context.bus
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, _, diagnostics = await activate_with(session, context=context)
+    try:
+        anonymous = notification("anonymous-1", "Companion, who am I?")
+        del anonymous["payload"]["event"]["chatter_user_id"]
+        await _ingest(handle, anonymous)
+
+        assert scheduler.admissions == []
+        assert chat_events(bus) == []
+        assert events_of(bus, "input.trigger.accepted") == []
+        (rejected,) = events_of(bus, "input.trigger.rejected")
+        assert rejected["payload"] == {
+            "source_event_id": "anonymous-1",
+            "input": "twitch",
+            "platform": "twitch",
+            "channel_id": SETTINGS["broadcaster_id"],
+            "policy_version": None,
+            "reason": "unauthenticated",
+        }
+        assert "run_id" not in rejected["payload"]
+        assert context.supervision.snapshot()[COUNTER_TRIGGER_REJECTIONS] == 1
+        assert context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10) == ()
+        assert diagnostics == []
+
+        await _ingest(handle, notification("valid-1", "Hello Companion"))
+
+        (event,) = chat_events(bus)
+        assert event["metadata"]["schema_version"] == 2
+        assert event["metadata"]["source"] == "twitch"
+        payload = event["payload"]
+        for field_value in (
+            payload["platform"],
+            payload["channel_id"],
+            payload["author"]["id"],
+            payload["message_id"],
+            payload["text"],
+        ):
+            assert isinstance(field_value, str) and field_value
+        assert payload["platform"] == PLATFORM
+        assert payload["channel_id"] == SETTINGS["broadcaster_id"]
+        assert payload["author"]["id"] == "viewer-7"
+        assert payload["message_id"] == "valid-1"
+        assert payload["text"] == "Hello Companion"
+
+        (accepted,) = events_of(bus, "input.trigger.accepted")
+        assert accepted["payload"]["source_event_id"] == "valid-1"
+        assert accepted["payload"]["platform"] == "twitch"
+        assert accepted["payload"]["channel_id"] == SETTINGS["broadcaster_id"]
+        assert accepted["payload"]["reason"] == "accepted:keyword_match"
+        assert isinstance(accepted["payload"]["policy_version"], str)
+        assert "run_id" not in accepted["payload"]
+        # Traced before it was admitted, and admitted exactly once (AC27).
+        assert [e["type"] for e in bus.list_events()] == [
+            "input.trigger.rejected",
+            "channel.chat.message",
+            "input.trigger.accepted",
+        ]
+        ((session_key, work),) = scheduler.admissions
+        assert session_key == SessionKey("twitch", SETTINGS["broadcaster_id"], "viewer-7")
+        assert work.source_event_id == "valid-1"
+        assert work.kind == "chat.message"
+        assert work.payload["payload"]["message_id"] == "valid-1"
+        assert work.payload["metadata"]["schema_version"] == 2
+
+        (record,) = context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10)
+        assert (record.author_id, record.message_id, record.text) == (
+            "viewer-7", "valid-1", "Hello Companion",
+        )
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_trigger_is_fed_traced_and_never_admitted() -> None:
+    """R1/R3: a trigger rejection still feeds the chat context and records the
+    input, creates 0 admissions and is exactly 1 traced decision."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    try:
+        await _ingest(handle, notification("plain-1", "nothing addressed to anyone"))
+        await _ingest(handle, notification("plain-2", "still nothing"))
+
+        assert scheduler.admissions == []
+        assert len(chat_events(bus)) == 2
+        assert len(events_of(bus, "input.trigger.rejected")) == 2
+        assert events_of(bus, "input.trigger.accepted") == []
+        records = context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10)
+        assert [record.message_id for record in records] == ["plain-1", "plain-2"]
+        assert context.supervision.snapshot()[COUNTER_TRIGGER_REJECTIONS] == 2
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_trigger_reaches_no_bus_driven_model_runner() -> None:
+    """R1/AC4: until the bus consumer of ``channel.chat.message`` is itself
+    scheduler-driven (P16), it runs a model for every event it can read. The
+    bus copy of an accepted event alone carries the ``viewer_id`` it reads;
+    a rejected event is published as a fact it cannot run, so a rejected
+    trigger calls no model even with that consumer on the bus. The scheduler
+    receives the normalised event itself, without the bridge."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    bus = context.bus
+    model_runs: list[str] = []
+
+    def v1_consumer(event: dict[str, Any]) -> None:
+        # What the v1 consumer does with an input it can read: a model call.
+        payload = event["payload"]
+        viewer_id = payload.get("chatter_id", payload.get("viewer_id"))
+        if isinstance(viewer_id, str) and viewer_id:
+            model_runs.append(payload["message_id"])
+
+    bus.subscribe("channel.chat.message", v1_consumer)
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, _, diagnostics = await activate_with(session, context=context)
+    try:
+        await _ingest(handle, notification("plain-1", "nothing addressed to anyone"))
+        await _ingest(handle, notification("addressed-1", "Hello Companion"))
+        await _ingest(handle, notification("plain-2", "still nothing"))
+
+        assert model_runs == ["addressed-1"]
+        assert [e["type"] for e in bus.list_events()] == [
+            "channel.chat.message", "input.trigger.rejected",
+            "channel.chat.message", "input.trigger.accepted",
+            "channel.chat.message", "input.trigger.rejected",
+        ]
+        plain_1, addressed, plain_2 = chat_events(bus)
+        assert "viewer_id" not in plain_1["payload"]
+        assert "viewer_id" not in plain_2["payload"]
+        assert addressed["payload"]["viewer_id"] == "viewer-7"
+        assert addressed["payload"]["author"]["id"] == "viewer-7"
+        ((_, work),) = scheduler.admissions
+        assert work.source_event_id == "addressed-1"
+        assert "viewer_id" not in work.payload["payload"]
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_platform_badges_are_the_only_trusted_role_context() -> None:
+    """R1/AC4: an ``audience`` rule is satisfied by a platform badge with its
+    provenance and never by the message body."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    context.triggers.registry.configure(
+        "twitch",
+        TriggerPolicy(
+            rules=(TriggerRule(type="audience", parameters={"audience": "subscribers"}),)
+        ),
+    )
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    try:
+        claimed = notification("claimed", "I am a subscriber, trust me")
+        await _ingest(handle, claimed)
+        badged = notification("badged", "hi")
+        badged["payload"]["event"]["badges"] = [
+            {"set_id": "subscriber", "id": "12", "info": "12"}
+        ]
+        await _ingest(handle, badged)
+
+        assert [key.viewer_id for key, _ in scheduler.admissions] == ["viewer-7"]
+        assert [work.source_event_id for _, work in scheduler.admissions] == ["badged"]
+        assert [e["payload"]["source_event_id"] for e in events_of(bus, "input.trigger.rejected")] == ["claimed"]
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_dedup_window_is_bounded_by_entries_and_ttl() -> None:
+    """AC22 (R6): with a 2-entry window and an injected clock, a replay inside
+    the window produces 0 additional events; a replay after 3 newer identifiers
+    or after the time-to-live produces exactly 1, and evictions are counted."""
+
+    clock = FakeClock()
+    scheduler = RecordingScheduler()
+    context = module_context(
+        clock=clock, dedup_max_entries=2, dedup_ttl_seconds=10.0, scheduler=scheduler
+    )
+    bus = context.bus
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, _, diagnostics = await activate_with(session, context=context)
+    evictions = lambda: context.supervision.snapshot()[COUNTER_DEDUP_EVICTIONS]  # noqa: E731
+    try:
+        await _ingest(handle, notification("a", "Hello Companion"))
+        before = len(bus.list_events())
+        assert len(chat_events(bus)) == 1
+        assert len(scheduler.admissions) == 1
+
+        # Inside the window: the recorded decision is reused and nothing —
+        # no event, no trace, no feed, no admission — is produced again.
+        await _ingest(handle, notification("a", "Hello Companion"))
+        assert len(bus.list_events()) == before
+        assert len(scheduler.admissions) == 1
+        assert len(context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10)) == 1
+        assert context.triggers.window_size == 1
+
+        # 3 newer identifiers push "a" out of the 2-entry window, oldest first.
+        for identifier in ("b", "c", "d"):
+            await _ingest(handle, notification(identifier, "Hello Companion"))
+        assert context.triggers.window_size == 2
+        assert evictions() == 2
+        assert len(chat_events(bus)) == 4
+
+        await _ingest(handle, notification("a", "Hello Companion"))
+        assert len(chat_events(bus)) == 5
+        assert [e["payload"]["message_id"] for e in chat_events(bus)][-1] == "a"
+        assert len(scheduler.admissions) == 5
+        assert evictions() == 3
+
+        # Past the time-to-live the entry reads as absent and is reprocessed.
+        await _ingest(handle, notification("e", "Hello Companion"))
+        assert len(chat_events(bus)) == 6
+        clock.advance(11.0)
+        await _ingest(handle, notification("e", "Hello Companion"))
+        assert len(chat_events(bus)) == 7
+        assert [e["payload"]["message_id"] for e in chat_events(bus)][-2:] == ["e", "e"]
+        assert len(scheduler.admissions) == 7
+        assert evictions() >= 4
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ingestion_returns_without_awaiting_run_work() -> None:
+    """R2: the ingestion path admits and returns; nothing in it awaits a run.
+    With the scheduler recording only, the publish lock is free again as soon
+    as the notification is decided, so a second notification is not blocked."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    try:
+        first = asyncio.create_task(
+            handle._publish_notification(notification("one", "Hello Companion"))
+        )
+        second = asyncio.create_task(
+            handle._publish_notification(notification("two", "Hello Companion"))
+        )
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+        assert not handle._publish_lock.locked()
+        assert [work.source_event_id for _, work in scheduler.admissions] == ["one", "two"]
+        assert len(chat_events(bus)) == 2
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+# --------------------------------------------------------------------------- #
+# Delivery: the chat.write provider and the confirmed-send trace (R5, R8)
+# --------------------------------------------------------------------------- #
+
+
+def grant_chat_write(context: ModuleContext | RuntimeContext) -> None:
+    runtime = context._runtime if isinstance(context, ModuleContext) else context
+    runtime.actions._authorization.grant(  # the policy the fixture built
+        AuthorizationRule(
+            rule_id="grant-chat-write",
+            action_name=CHAT_WRITE_ACTION,
+            granted_permissions=("chat.write",),
+        )
+    )
+
+
+def chat_write_call(call_id: str = "call-1", **overrides: Any) -> ActionCall:
+    fields = {
+        "action_name": CHAT_WRITE_ACTION,
+        "action_version": 1,
+        "arguments": {"text": "Hello there", "parent_message_id": "parent-1"},
+        "conversation_id": "conversation-1",
+        "run_id": "run-1",
+        "call_id": call_id,
+        "source_event_id": "source-1",
+        "destination": Destination("twitch", SETTINGS["broadcaster_id"], "chat"),
+        "principal": "brain",
+        "deadline": 10_000.0,
+        "message_id": "source-1",
+    }
+    fields.update(overrides)
+    return ActionCall(**fields)
+
+
+@pytest.mark.asyncio
+async def test_chat_write_provider_reports_success_only_on_confirmation() -> None:
+    """R5/R8: through the executor, a confirmed send is ``success`` carrying
+    the platform identifier and exactly 1 ``channel.chat.sent`` correlated to
+    the run; a request that left with no readable answer is ``external_unknown``
+    with 0 traces; a platform refusal is ``error`` with 0 traces."""
+
+    context = module_context()
+    grant_chat_write(context)
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        sends=[
+            sent_response(),
+            FakeResponse(200, {"data": [{"is_sent": True}]}),
+            FakeResponse(503, {"message": SETTINGS["access_token"]}),
+        ],
+    )
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    executor = context.executor
+    try:
+        confirmed = await executor.invoke(chat_write_call("call-1"))
+        assert confirmed.status == "success"
+        assert confirmed.result == {
+            "message_id": "sent",
+            "destination": {"platform": "twitch", "channel_id": SETTINGS["broadcaster_id"]},
+        }
+        assert confirmed.provenance["provider"] == CHAT_WRITE_PROVIDER
+        assert confirmed.provenance["emission"] == "emitted"
+        assert session.post_calls[-1]["json"] == {
+            "broadcaster_id": SETTINGS["broadcaster_id"],
+            "sender_id": SETTINGS["bot_user_id"],
+            "message": "Hello there",
+            "reply_parent_message_id": "parent-1",
+        }
+        (sent,) = events_of(bus, "channel.chat.sent")
+        assert sent["payload"] == {
+            "platform": "twitch",
+            "channel_id": SETTINGS["broadcaster_id"],
+            "message_id": "sent",
+            "provider": CHAT_WRITE_PROVIDER,
+            "route": "chat.write",
+            "run_id": "run-1",
+            "call_id": "call-1",
+            "conversation_id": "conversation-1",
+            "source_event_id": "source-1",
+            "source_message_id": "source-1",
+        }
+        # The send fact was recorded before its trace, and the trace follows
+        # the executor's own action.started: it exists only once the transport
+        # confirmed (AC27). Its place against action.completed is not a
+        # contract — the send hands the trace to the loop and returns, so the
+        # executor's terminal trace never waits on it (R8).
+        types = [e["type"] for e in bus.list_events()]
+        assert types.index("action.started") < types.index("channel.chat.sent")
+        assert types.count("action.completed") == 1
+
+        unknown = await executor.invoke(chat_write_call("call-2"))
+        assert unknown.status == "external_unknown"
+        assert unknown.error["code"] == "malformed_response"
+        assert unknown.provenance["emission"] == "emitted"
+
+        refused = await executor.invoke(chat_write_call("call-3"))
+        assert refused.status == "error"
+        assert refused.error["code"] == "platform_rejected"
+        assert refused.error["retryable"] is False
+
+        assert len(events_of(bus, "channel.chat.sent")) == 1
+        assert executor.provider_invocations == 3
+        assert handle.send_record.snapshot() == {
+            "emitted": 3,
+            "confirmed": 1,
+            "failed": 1,
+            "unknown": 1,
+            "last_message_id": "sent",
+        }
+        assert diagnostics == [
+            "twitch chat send: malformed response",
+            "twitch chat send: rejected (status 503)",
+        ]
+        assert_sanitized(diagnostics)
+        assert SETTINGS["access_token"] not in str(bus.list_events())
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_write_refuses_without_a_rule_blank_text_and_other_channels() -> None:
+    """R5: default-deny with 0 rules and 0 provider invocations; what the
+    schema cannot say is refused by the provider before any emission."""
+
+    context = module_context()
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    executor = context.executor
+    try:
+        refused = await executor.invoke(chat_write_call("call-0"))
+        assert refused.status == "refused"
+        assert executor.provider_invocations == 0
+
+        grant_chat_write(context)
+        blank = await executor.invoke(
+            chat_write_call("call-blank", arguments={"text": "   "})
+        )
+        assert blank.status == "error"
+        assert blank.error["code"] == "invalid_arguments"
+        assert blank.provenance["emission"] == "not_emitted"
+
+        elsewhere = await executor.invoke(
+            chat_write_call(
+                "call-elsewhere",
+                destination=Destination("twitch", "another-channel", "chat"),
+            )
+        )
+        assert elsewhere.status == "error"
+        assert elsewhere.error["code"] == "no_provider"
+
+        assert [c["url"] for c in session.post_calls] == [EVENTSUB_SUBSCRIPTIONS_URL]
+        assert events_of(bus, "channel.chat.sent") == []
+        assert handle.send_record.emitted == 0
+        assert diagnostics == ["twitch chat send: invalid input"]
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat.write", "channel.chat.send"])
+async def test_lost_sent_trace_neither_retries_nor_repeats_the_send(route: str) -> None:
+    """R8/AC28: with ``channel.chat.sent`` publication always raising, the send
+    record still shows exactly 1 confirmed send, the transport is invoked
+    exactly 1 time, the loss is counted, and the route still reports success."""
+
+    runtime = runtime_context()
+    context = runtime.for_module("twitch")
+    grant_chat_write(context)
+    bus = context.bus
+
+    def explode(event: dict[str, Any]) -> None:
+        raise RuntimeError(SETTINGS["access_token"])
+
+    bus.subscribe("channel.chat.sent", explode)
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, _, diagnostics = await activate_with(session, context=context)
+    try:
+        if route == "chat.write":
+            observation = await context.executor.invoke(chat_write_call("call-1"))
+            assert observation.status == "success"
+            assert observation.result["message_id"] == "sent"
+        else:
+            result = await bus.publish("channel.chat.send", {"text": "Hello there"}, {})
+            assert result["metadata"]["delivery_status"] == "sent"
+            assert result["metadata"]["delivery_outcome"] == "success"
+
+        helix_calls = [c for c in session.post_calls if c["url"] == HELIX_CHAT_URL]
+        assert len(helix_calls) == 1
+        # Recorded before the outcome was returned, whatever the trace does.
+        assert handle.send_record.confirmed == 1
+        assert handle.send_record.emitted == 1
+        await sent_traces_settled(handle)
+        assert events_of(bus, "channel.chat.sent") == []
+        assert context.supervision.snapshot()[COUNTER_LOST_TRACES] == 1
+        (loss,) = runtime.supervision.losses
+        assert loss.startswith("channel.chat.sent: PublicationError")
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat.write", "channel.chat.send"])
+async def test_confirmed_outcome_never_waits_for_the_sent_trace(route: str) -> None:
+    """R5/R8: with a ``channel.chat.sent`` subscriber held, a confirmed send
+    still reports ``success`` at once on either route — the executor's
+    budget is not spent on the trace, so the confirmed send is never turned
+    into ``external_unknown``, and the compatibility caller is not held. The
+    record is already written when the outcome is returned; ``close`` then
+    waits for the trace, which lands exactly once."""
+
+    context = module_context()
+    grant_chat_write(context)
+    bus = context.bus
+    release = asyncio.Event()
+    held: list[dict[str, Any]] = []
+
+    async def slow_subscriber(event: dict[str, Any]) -> None:
+        held.append(event)
+        await release.wait()
+
+    bus.subscribe("channel.chat.sent", slow_subscriber)
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, _, diagnostics = await activate_with(session, context=context)
+    try:
+        if route == "chat.write":
+            observation = await asyncio.wait_for(
+                context.executor.invoke(chat_write_call("call-1")), timeout=1
+            )
+            assert observation.status == "success"
+            assert observation.result["message_id"] == "sent"
+        else:
+            result = await asyncio.wait_for(
+                bus.publish("channel.chat.send", {"text": "Hello there"}, {}),
+                timeout=1,
+            )
+            assert result["metadata"]["delivery_status"] == "sent"
+            assert result["metadata"]["delivery_outcome"] == "success"
+
+        # The subscriber still holds the trace; the outcome did not wait.
+        await wait_until(lambda: len(held) == 1)
+        assert not release.is_set()
+        assert handle.send_record.confirmed == 1
+        assert handle.send_record.last_message_id == "sent"
+        assert events_of(bus, "channel.chat.sent") == []
+        if route == "chat.write":
+            assert len(events_of(bus, "action.completed")) == 1
+
+        closing = asyncio.create_task(handle.close())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not closing.done()
+        release.set()
+        await asyncio.wait_for(closing, timeout=1)
+        (sent,) = events_of(bus, "channel.chat.sent")
+        assert sent["payload"]["message_id"] == "sent"
+        assert sent["payload"]["route"] == route
+        assert not handle._sent_traces
+        helix_calls = [c for c in session.post_calls if c["url"] == HELIX_CHAT_URL]
+        assert len(helix_calls) == 1
+        assert diagnostics == []
+    finally:
+        release.set()
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_binding_is_the_manifest_contract_and_refuses_ambiguity() -> None:
+    """R5/AC16: preparation binds the manifest's ``chat.write`` declaration;
+    a second provider already bound over the same channel fails preparation
+    with a diagnostic naming the action and both providers, and 0 requests."""
+
+    context = module_context()
+    declared = manifest()["actions"][0]
+    assert declared["name"] == CHAT_WRITE_ACTION
+
+    class Rival:
+        name = "rival"
+
+        async def invoke(self, invocation: Any) -> Any:
+            raise AssertionError("never invoked")
+
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle = await activate(
+        context,
+        {**SETTINGS, "_session_factory": lambda: session, "diagnostic_reporter": print},
+        {},
+    )
+    assert context.actions.discovered() == {}
+    await handle.prepare()
+    await handle.close()
+    spec = context.actions.discovered()[CHAT_WRITE_ACTION]
+    assert spec.version == declared["version"]
+    assert spec.nature == "write"
+    assert spec.required_permissions == tuple(declared["required_permissions"])
+
+    diagnostics: list[str] = []
+    rival_context = module_context()
+    rival_context.actions.register(
+        spec, Rival(), destinations=Destination("twitch", "*", "chat")
+    )
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    ambiguous = await activate(
+        rival_context,
+        {
+            **SETTINGS,
+            "_session_factory": lambda: session,
+            "diagnostic_reporter": diagnostics.append,
+        },
+        {},
+    )
+    try:
+        with pytest.raises(TwitchModuleError, match="action binding failed"):
+            await ambiguous.prepare()
+        assert session.get_calls == []
+        assert session.post_calls == []
+        (diagnostic,) = diagnostics
+        assert CHAT_WRITE_ACTION in diagnostic
+        assert "rival" in diagnostic and CHAT_WRITE_PROVIDER in diagnostic
+        assert_sanitized(diagnostics)
+    finally:
+        await ambiguous.close()

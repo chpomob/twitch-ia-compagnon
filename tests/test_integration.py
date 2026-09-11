@@ -240,7 +240,9 @@ async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
 
     async def write_audit(line: str) -> None:
         audit_lines.append(line)
-        if len(audit_lines) == 2:
+        # The input, its traced trigger decision, the confirmed-send fact and
+        # the compatibility send route are all audited (R8).
+        if len(audit_lines) == 4:
             audit_complete.set()
 
     _inject_boundaries(
@@ -314,14 +316,26 @@ async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
     assert helix_calls[0]["headers"]["Client-Id"] == environ["TWITCH_CLIENT_ID"]
 
     audit_records = [json.loads(line) for line in audit_lines]
-    assert len(audit_records) == 2
-    assert {record["type"] for record in audit_records} == {
+    assert len(audit_records) == 4
+    assert sorted(record["type"] for record in audit_records) == [
         "channel.chat.message",
         "channel.chat.send",
-    }
+        "channel.chat.sent",
+        "input.trigger.accepted",
+    ]
     assert next(
         record for record in audit_records if record["type"] == "channel.chat.send"
     )["payload"] == {"text": "Hello there"}
+    sent = next(
+        record for record in audit_records if record["type"] == "channel.chat.sent"
+    )
+    assert sent["payload"]["message_id"] == "sent"
+    assert sent["payload"]["channel_id"] == environ["TWITCH_BROADCASTER_ID"]
+    incoming = next(
+        record for record in audit_records if record["type"] == "channel.chat.message"
+    )
+    assert incoming["payload"]["platform"] == "twitch"
+    assert incoming["payload"]["author"]["id"] == "integration-viewer"
 
     assert len(resolved_configs) == 1
     resolved = resolved_configs[0]["modules"]
@@ -338,6 +352,15 @@ async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
 async def test_failed_helix_publication_is_sanitized_and_next_one_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A refused platform send is sanitised and the next send succeeds.
+
+    The former fixed record count and 2 model calls for messages that no
+    trigger policy accepts are superseded by R1 (a rejected trigger calls no
+    model) and R8 (the traced decisions and the confirmed-send fact): both
+    messages here address the companion, so the 2 model calls are the 2
+    accepted triggers' own.
+    """
+
     environ = _environment()
     websocket = FakeWebSocket(_welcome())
     leaked_body = {"message": "|".join(environ.values())}
@@ -364,7 +387,9 @@ async def test_failed_helix_publication_is_sanitized_and_next_one_succeeds(
 
     async def write_audit(line: str) -> None:
         audit_lines.append(line)
-        if len(audit_lines) == 4:
+        # 2 accepted inputs, their 2 traced decisions, 2 send attempts and
+        # the 1 confirmed-send fact of the second attempt (R8).
+        if len(audit_lines) == 7:
             audit_complete.set()
 
     _inject_boundaries(
@@ -381,9 +406,15 @@ async def test_failed_helix_publication_is_sanitized_and_next_one_succeeds(
     ready = asyncio.Event()
     task = await _start_application(environ, stop, ready, diagnostics)
     try:
-        websocket.feed(_notification(environ, "failed-publication", "First request"))
+        # Both messages address the companion: only an accepted trigger may
+        # reach the model (R1), and this scenario is about the two sends.
+        websocket.feed(
+            _notification(environ, "failed-publication", "Companion, first request")
+        )
         await asyncio.wait_for(twitch_session.helix_called.wait(), timeout=1)
-        websocket.feed(_notification(environ, "later-publication", "Second request"))
+        websocket.feed(
+            _notification(environ, "later-publication", "Companion, second request")
+        )
         await asyncio.wait_for(audit_complete.wait(), timeout=1)
     finally:
         stop.set()
@@ -397,10 +428,14 @@ async def test_failed_helix_publication_is_sanitized_and_next_one_succeeds(
     rendered_diagnostics = "\n".join(diagnostics)
     assert all(value not in rendered_diagnostics for value in environ.values())
     assert len(brain_session.post_calls) == 2
-    assert len(audit_lines) == 4
+    assert len(audit_lines) == 7
     audit_types = [json.loads(line)["type"] for line in audit_lines]
     assert audit_types.count("channel.chat.message") == 2
     assert audit_types.count("channel.chat.send") == 2
+    assert audit_types.count("input.trigger.accepted") == 2
+    assert audit_types.count("input.trigger.rejected") == 0
+    # Only the confirmed send is a send fact; the rejected one leaves none.
+    assert audit_types.count("channel.chat.sent") == 1
     # The second model request must not treat the rejected reply as delivered.
     assert all(
         message["role"] != "assistant"
