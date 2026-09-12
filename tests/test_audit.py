@@ -3,39 +3,85 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
 import yaml
 
 from core import EventBus
+from core.actions import ActionRegistry, AuthorizationPolicy
+from core.contracts import COUNTER_AUDIT_RECORD_LOSSES, Counters
+from core.lifecycle import SupervisedTasks
+from core.runtime import ModuleContext, RuntimeContext, Supervision
 
 
 audit = importlib.import_module("modules.audit")
 
-CATALOG = {
-    "audit": {
-        "name": "audit",
-        "produces": [],
-        "consumes": ["**"],
-        "middleware": True,
-        "order": 90,
-    }
+MANIFEST = {
+    "name": "audit",
+    "manifest_version": 2,
+    "runtime_api": 2,
+    "produces": [],
+    "consumes": ["**"],
+    "middleware": True,
+    "order": 90,
+    "lifecycle": {"roles": ["observation"]},
+    "settings_validator": "validate_settings",
 }
+"""The v2 manifest the audit module ships, minus the settings schema."""
+
+SETTINGS = {
+    "output": "stdout",
+    "queue": {"max_records": 1000, "max_bytes": 4 * 1024 * 1024},
+}
+"""The settings the manifest requires, as the example configuration ships them."""
+
+
+def runtime_context(bus: EventBus | None = None) -> RuntimeContext:
+    """The versioned runtime the audit activation reads its surfaces from."""
+
+    target_bus = bus if bus is not None else EventBus()
+    supervision = Supervision(target_bus, counters=Counters())
+    return RuntimeContext(
+        bus=target_bus,
+        actions=ActionRegistry(authorization=AuthorizationPolicy()),
+        supervision=supervision,
+        tasks=SupervisedTasks(),
+    )
+
+
+def module_context(bus: EventBus | None = None) -> ModuleContext:
+    return runtime_context(bus).for_module("audit")
+
+
+async def activate(
+    bus: EventBus, settings: dict | None = None
+) -> audit.AuditModule:
+    """Activate on a fresh runtime over *bus* and register the middleware."""
+
+    handle = await audit.activate(module_context(bus), {**SETTINGS, **(settings or {})}, {})
+    await handle.prepare()
+    return handle
 
 
 def test_manifest_declares_catch_all_middleware_at_order_90() -> None:
     path = Path(audit.__file__).with_name("module.yaml")
     manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
 
-    assert manifest == CATALOG["audit"]
+    schema = manifest.pop("settings_schema")
+    assert manifest == MANIFEST
     assert type(manifest["order"]) is int
+    assert schema["type"] == "object"
+    assert sorted(schema["required"]) == ["output", "queue"]
+    assert sorted(schema["properties"]["queue"]["required"]) == ["max_bytes", "max_records"]
+    assert callable(getattr(audit, manifest["settings_validator"]))
 
 
 @pytest.mark.asyncio
 async def test_writes_one_json_line_and_preserves_event(capsys) -> None:
     bus = EventBus()
-    handle = await audit.activate(bus, {}, CATALOG)
+    handle = await activate(bus)
     seen: list[dict] = []
     bus.subscribe("**", lambda event: seen.append(event), order=100)
 
@@ -47,8 +93,44 @@ async def test_writes_one_json_line_and_preserves_event(capsys) -> None:
     assert json.loads(lines[0]) == {
         "type": "channel.chat.message",
         "payload": {"text": "hello"},
+        "metadata": {},
     }
     assert seen == [event]
+
+
+@pytest.mark.asyncio
+async def test_activation_refuses_a_bare_bus_and_refused_settings() -> None:
+    """AC26: the handle is built from the scoped context, never from a bus."""
+
+    bus = EventBus()
+    with pytest.raises(audit.AuditModuleError):
+        await audit.activate(bus, SETTINGS, {})
+    with pytest.raises(audit.AuditModuleError):
+        await audit.activate(module_context(bus), {"output": "stdout"}, {})
+    assert bus.list_events() == []
+
+
+@pytest.mark.asyncio
+async def test_middleware_registers_at_prepare_and_losses_reach_supervision() -> None:
+    """R4, R6: registration is the prepare hook; a loss is counted in supervision."""
+
+    context = runtime_context()
+    writes: list[str] = []
+    handle = await audit.activate(
+        context.for_module("audit"),
+        {**SETTINGS, "_writer": writes.append, "queue": {"max_records": 1, "max_bytes": 1}},
+        {},
+    )
+    await context.bus.publish("before.prepare", {}, {})
+    assert handle.pending == 0
+
+    await handle.prepare()
+    await context.bus.publish("after.prepare", {}, {})
+    assert handle.losses == 1
+    assert context.supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 1
+    await handle.flush(0.1)
+    await handle.close()
+    assert writes == []
 
 
 @pytest.mark.asyncio
@@ -79,10 +161,8 @@ async def test_delayed_and_failed_writes_do_not_delay_publication() -> None:
         raise OSError("stdout unavailable")
 
     bus = EventBus()
-    handle = await audit.activate(
-        bus,
-        {"_writer": delayed_failure, "_close_timeout_seconds": 0.1},
-        CATALOG,
+    handle = await activate(
+        bus, {"_writer": delayed_failure, "_close_timeout_seconds": 0.1}
     )
     downstream = asyncio.Event()
     bus.subscribe("**", lambda event: downstream.set(), order=100)
@@ -158,3 +238,77 @@ async def test_writer_continues_after_a_failed_record() -> None:
 
     assert calls == 2
     assert json.loads(successful[0])["type"] == "second"
+
+
+@pytest.mark.asyncio
+async def test_records_abandoned_at_close_are_counted_as_losses() -> None:
+    """R6: a cancelled writer and the records queued behind it are losses."""
+
+    counted: list[str] = []
+
+    class Supervision:
+        def count(self, name: str) -> None:
+            counted.append(name)
+
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def stuck_writer(line: str) -> None:
+        started.set()
+        await never.wait()
+
+    handle = audit.AuditModule(
+        stuck_writer,
+        max_records=2,
+        close_timeout_seconds=0.05,
+        supervision=Supervision(),
+    )
+    handle.handle_event({"type": "first", "payload": {}, "metadata": {}})
+    handle.handle_event({"type": "second", "payload": {}, "metadata": {}})
+    await asyncio.wait_for(started.wait(), 1.0)
+    assert handle.pending == 2
+
+    await handle.close()
+
+    assert handle.losses == 2
+    assert counted == [audit.COUNTER_AUDIT_RECORD_LOSSES] * 2
+    assert handle.pending == 0
+    assert handle.pending_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_block_the_loop_on_a_stalled_file_sink(
+    tmp_path: Path,
+) -> None:
+    """A3: closing the file sink runs off the loop and within the budget."""
+
+    sink = audit._FileSink(str(tmp_path / "audit.log"))
+    handle = audit.AuditModule(sink, close_timeout_seconds=0.05)
+    handle.handle_event({"type": "first", "payload": {}, "metadata": {}})
+    await handle.close()
+    assert handle.losses == 0
+
+    stalled = audit._FileSink(str(tmp_path / "stalled.log"))
+    stalled.open()
+    release = threading.Event()
+
+    def blocking_close() -> None:
+        release.wait(2.0)
+
+    stalled._handle.close = blocking_close  # type: ignore[method-assign]
+    handle = audit.AuditModule(stalled, close_timeout_seconds=0.05)
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    await asyncio.wait_for(handle.close(), 1.0)
+    beat.cancel()
+    release.set()
+
+    assert ticks >= 2

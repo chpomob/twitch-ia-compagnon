@@ -52,6 +52,15 @@ modules:
 
   audit:
     output: stdout
+    # The record queue the audit module owns (R6). Its manifest requires both
+    # bounds and its settings validator checks each is a finite positive
+    # integer before any transport opens. When either bound is reached the
+    # newly offered record is dropped and the audit loss counter incremented;
+    # publication never waits. The values mirror `limits.observation_queue`
+    # below until the core hands that group over entirely.
+    queue:
+      max_records: 1000
+      max_bytes: 4194304
 
 # Retention and admission limits. The block is optional as a whole, but a
 # module built against the versioned runtime (the chat input declares triggers) needs

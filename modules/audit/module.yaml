@@ -1,6 +1,62 @@
+# Redacting JSON audit middleware — manifest v2 (R4, R6, R7).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no output path and no limit value lives
+# here. `consumes: ["**"]` with `middleware: true` at `order: 90` describes the
+# catch-all observation stage; it authorizes nothing and declares no action.
+
 name: audit
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
 produces: []
 consumes:
   - "**"
 middleware: true
 order: 90
+
+# Lifecycle role, never the module name, decides what each phase asks of this
+# module (R4). An `observation` service takes part in `prepare`, then, after
+# every ordinary resource has closed, in `flush(deadline)` and in its own
+# close phase — so the last trace of the last close still reaches the output.
+# The coordinator reads this declaration; it never consults the name `audit`.
+lifecycle:
+  roles:
+    - observation
+
+# Business settings belong to the module (R7). The schema states the shape;
+# the declared hook, defined by the module package, checks what a schema
+# cannot — a writable output, finite positive limits — and reports one
+# diagnostic per offending field naming module and field, with no configured
+# value echoed back.
+settings_schema:
+  type: object
+  properties:
+    output:
+      type: string
+      description: >-
+        Where records are written: the literal `stdout` or `stderr`, or a
+        writable file path (created on first write, appended to afterwards).
+    # Retention of the record queue this module owns (R6). Admission never
+    # blocks the publication chain: when either bound is reached the newly
+    # offered record is dropped and the loss counter is incremented.
+    queue:
+      type: object
+      properties:
+        max_records:
+          type: integer
+          minimum: 1
+          description: Maximum records admitted and not yet written.
+        max_bytes:
+          type: integer
+          minimum: 1
+          description: Maximum serialized bytes admitted and not yet written.
+      required:
+        - max_records
+        - max_bytes
+  required:
+    - output
+    - queue
+settings_validator: validate_settings

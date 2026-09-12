@@ -23,16 +23,11 @@ from test_twitch import SETTINGS as TWITCH_SETTINGS
 from test_twitch import FakeResponse, FakeSession, FakeWebSocket, notification, welcome
 
 
-CATALOG = {
-    "audit": {
-        "name": "audit",
-        "produces": (),
-        "consumes": ("**",),
-        "middleware": True,
-        "order": 90,
-    },
+AUDIT_SETTINGS = {
+    "output": "stdout",
+    "queue": {"max_records": 1000, "max_bytes": 4 * 1024 * 1024},
 }
-"""The v1 capability catalog the audit activation reads its contract from."""
+"""The settings the audit manifest requires; the writer seam replaces the output."""
 
 PIPELINE_TRACES = (
     "channel.chat.message",
@@ -118,7 +113,9 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
                 {},
             )
             handles["audit"] = await audit.activate(
-                self.bus, {"_writer": records.append}, CATALOG
+                self.context.for_module("audit"),
+                {**AUDIT_SETTINGS, "_writer": records.append},
+                {},
             )
             handles["twitch"] = await twitch.activate(
                 self.context.for_module("twitch"),
@@ -126,8 +123,9 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
                 {},
             )
             # Match the production activation order that formerly deadlocked:
-            # the input first, then the two consumers; the audit stays a v1
-            # activation and the brain declares no lifecycle role.
+            # the input first, then the two consumers; the brain declares no
+            # lifecycle role and the audit declares the observation role, so
+            # it flushes and closes after every ordinary resource (R4).
             self.activations = [
                 ModuleActivation(
                     "twitch",
@@ -139,7 +137,13 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
                 ModuleActivation(
                     "brain", {}, handles["brain"], roles=frozenset(), manifest_version=2
                 ),
-                ModuleActivation("audit", {}, handles["audit"]),
+                ModuleActivation(
+                    "audit",
+                    {},
+                    handles["audit"],
+                    roles=frozenset({"observation"}),
+                    manifest_version=2,
+                ),
             ]
             if phase == "startup":
                 # The coordinator never starts here, so the harness prepares
@@ -147,6 +151,7 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
                 # a run in flight; the coordinator's own calls, if any, are
                 # idempotent no-ops.
                 await handles["brain"].prepare()
+                await handles["audit"].prepare()
                 await handles["twitch"].prepare()
                 await handles["twitch"].start_inputs()
                 await asyncio.Future()
@@ -189,14 +194,18 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
         assert record.status == "cancelled"
         assert record.model_calls == 1
         assert record.sends == 0
-        # The completion is traced once, on the bus: the v1 audit is closed
-        # by the compatibility step before the versioned close that ends the
-        # run, so its records stop at ``brain.run.started``.
+        # The completion is traced once, on the bus, and the audit — an
+        # observation service, flushed and closed after every ordinary
+        # resource (R4) — still records the trace the brain's close
+        # published, so its records end with the cancelled completion.
         bus_types = [event["type"] for event in handles["bus"].list_events()]
         assert bus_types.count("brain.run.started") == 1
         assert bus_types.count("brain.run.completed") == 1
         decoded = [json.loads(record) for record in records]
-        assert [r["type"] for r in decoded][-1] == "brain.run.started"
+        assert [r["type"] for r in decoded].count("brain.run.completed") == 1
+        assert decoded[-1]["type"] == "brain.run.completed"
+        assert decoded[-1]["payload"]["status"] == "cancelled"
+        assert handles["audit"].losses == 0
         return
     release.set()
     if phase == "startup":
