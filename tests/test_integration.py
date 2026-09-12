@@ -10,14 +10,12 @@ from uuid import uuid4
 import pytest
 
 import core.main as application
-from core.actions import AuthorizationPolicy
 from modules.twitch import (
     EVENTSUB_SUBSCRIPTIONS_URL,
     EVENTSUB_URL,
     HELIX_CHAT_URL,
     TOKEN_VALIDATION_URL,
 )
-from test_brain import BRAIN_GRANT
 
 
 ROOT = Path(__file__).parents[1]
@@ -231,20 +229,6 @@ PIPELINE_TRACES = (
 )
 """One accepted message through the real pipeline, in order (R8, AC27)."""
 
-def _grant_brain_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Seed the runtime's policy with the one grant the brain's reply needs.
-
-    The entry point assembles an empty policy — declaring ``chat.write``
-    authorizes nothing (R5) — and the configured grant is a later step's,
-    so the harness supplies the rule at the boundary the policy is built at.
-    """
-
-    def policy_with_grant() -> AuthorizationPolicy:
-        return AuthorizationPolicy([BRAIN_GRANT])
-
-    monkeypatch.setattr(application, "AuthorizationPolicy", policy_with_grant)
-
-
 def _audit_until(audit_lines: list[str], event_type: str, count: int) -> tuple[Callable[[str], Any], asyncio.Event]:
     """An audit writer that signals once *count* records of *event_type* landed."""
 
@@ -301,13 +285,14 @@ async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
 ) -> None:
     """Replaces the synchronous 4-record pipeline test (allowlisted; R1, R2, R8).
 
-    The message addresses the companion, so the configured default trigger
-    accepts it (R1); the brain admits it and the run executes detached from
-    the ingestion (R2); the reply is delivered through the executor onto the
-    platform send service, and the traces of the run — admission, start,
-    action start and completion, the confirmed send, completion — are all
-    audited with one run id (R8, AC27). The compatibility ``channel.chat.send``
-    route carries nothing. A self echo is dropped before any of it (AC5).
+    The message carries the configured keyword, so the channel's selected
+    trigger policy accepts it (R1); the brain admits it and the run executes
+    detached from the ingestion (R2); the reply is delivered through the
+    executor onto the platform send service, and the traces of the run —
+    admission, start, action start and completion, the confirmed send,
+    completion — are all audited with one run id (R8, AC27). The compatibility
+    ``channel.chat.send`` route carries nothing. A self echo is dropped before
+    any of it (AC5).
     """
 
     environ = _environment()
@@ -332,20 +317,23 @@ async def test_example_config_drives_full_chat_pipeline_and_clean_shutdown(
         diagnostics=diagnostics,
         resolved_configs=resolved_configs,
     )
-    _grant_brain_delivery(monkeypatch)
 
     stop = asyncio.Event()
     ready = asyncio.Event()
     task = await _start_application(environ, stop, ready, diagnostics)
     try:
         if self_echo:
-            own_message = _notification(environ, "bot-echo", "Companion, hello there")
+            own_message = _notification(
+                environ, "bot-echo", "!ask Companion, hello there"
+            )
             own_message["payload"]["event"]["chatter_user_id"] = environ[
                 "TWITCH_BOT_USER_ID"
             ]
             websocket.feed(own_message)
             websocket.feed(own_message)
-        websocket.feed(_notification(environ, "incoming-one", "Companion, hello"))
+        websocket.feed(
+            _notification(environ, "incoming-one", "!ask Companion, hello")
+        )
         await asyncio.wait_for(audit_complete.wait(), timeout=1)
     finally:
         stop.set()
@@ -439,11 +427,12 @@ async def test_failed_helix_publication_is_sanitized_and_next_one_succeeds(
     """A refused platform send is sanitised and the next send succeeds.
 
     Replaces the fixed 7-record, 2-synchronous-model-call variant
-    (allowlisted; R1, R2, R8). Both messages address the companion, so the 2
-    model calls are the 2 accepted triggers' own (R1); each run is admitted
-    and executes detached (R2); the refused delivery is the executor's
-    explicit observation — the run reports ``delivery: error`` and 0 sends,
-    and the confirmed send of the second run is the only send fact (R5, R8).
+    (allowlisted; R1, R2, R8). Both messages carry the configured keyword, so
+    the 2 model calls are the 2 accepted triggers' own (R1); each run is
+    admitted and executes detached (R2); the refused delivery is the
+    executor's explicit observation — the run reports ``delivery: error``
+    and 0 sends, and the confirmed send of the second run is the only send
+    fact (R5, R8).
     """
 
     environ = _environment()
@@ -479,18 +468,21 @@ async def test_failed_helix_publication_is_sanitized_and_next_one_succeeds(
         diagnostics=diagnostics,
         resolved_configs=[],
     )
-    _grant_brain_delivery(monkeypatch)
 
     stop = asyncio.Event()
     ready = asyncio.Event()
     task = await _start_application(environ, stop, ready, diagnostics)
     try:
         websocket.feed(
-            _notification(environ, "failed-publication", "Companion, first request")
+            _notification(
+                environ, "failed-publication", "!ask Companion, first request"
+            )
         )
         await asyncio.wait_for(twitch_session.helix_called.wait(), timeout=1)
         websocket.feed(
-            _notification(environ, "later-publication", "Companion, second request")
+            _notification(
+                environ, "later-publication", "!ask Companion, second request"
+            )
         )
         await asyncio.wait_for(audit_complete.wait(), timeout=1)
     finally:

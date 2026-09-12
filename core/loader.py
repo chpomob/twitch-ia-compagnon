@@ -366,6 +366,10 @@ class ModuleLoader:
         for name in enabled:
             self._register_declarations(name, declarations[name], resolved[name])
 
+        # What configuration selects, applied after every input registered its
+        # declaration and before any module is activated (R1, R7).
+        self._apply_trigger_configuration(config)
+
         for name in enabled:
             declaration = declarations[name]
             activate = entry_points[name].activate
@@ -651,6 +655,67 @@ class ModuleLoader:
             raise _field_error(
                 name, MANIFEST_TRIGGERS_KEY, _sanitised_reason(str(exc))
             ) from None
+
+    def _apply_trigger_configuration(
+        self, config: Mapping[str, Any]
+    ) -> None:
+        """Select the trigger policies configuration asks for (R1).
+
+        Runs after every enabled input registered its declaration, so each
+        configured policy is validated against what its input really declares
+        — a type the module does not declare, a parameter its schema refuses
+        or an operator it does not support stops startup here, before any
+        module is activated (R7) — and the selected policy replaces the module
+        default entirely, per channel (AC1).
+        """
+
+        configured = config.get("triggers")
+        if configured is None:
+            return
+        engine = getattr(self.context, "triggers", None)
+        registry = getattr(engine, "registry", engine)
+        if registry is None or not callable(getattr(registry, "configure", None)):
+            raise _field_error(
+                "<config>",
+                "triggers",
+                "selects trigger policies, and the runtime context carries no "
+                "trigger engine; the limits block is required",
+            )
+        if not isinstance(configured, Mapping):
+            raise _field_error("<config>", "triggers", "must be a mapping")
+        for input_name, entry in configured.items():
+            if not isinstance(input_name, str) or not input_name.strip():
+                raise _field_error(
+                    "<config>", "triggers", "must use non-empty input names"
+                )
+            if not isinstance(entry, Mapping):
+                raise _field_error(input_name, "triggers", "must be a mapping")
+            label = f"triggers.{input_name}"
+            unknown = sorted(set(entry) - {"channels"})
+            if unknown:
+                raise _field_error(
+                    input_name,
+                    label,
+                    f"is not a known trigger configuration key ({', '.join(unknown)})",
+                )
+            channels = entry.get("channels")
+            if not isinstance(channels, Mapping):
+                raise _field_error(input_name, f"{label}.channels", "must be a mapping")
+            for channel_id, channel_entry in channels.items():
+                if not isinstance(channel_id, str) or not channel_id.strip():
+                    raise _field_error(
+                        input_name,
+                        f"{label}.channels",
+                        "must use non-empty channel identifiers",
+                    )
+                channel_label = f"{label}.channels.{channel_id}"
+                policy = _trigger_policy(input_name, channel_label, channel_entry)
+                try:
+                    registry.configure(input_name, policy, channel_id=channel_id)
+                except Exception as exc:
+                    raise _field_error(
+                        input_name, channel_label, _sanitised_reason(str(exc))
+                    ) from None
 
     # -- discovery --------------------------------------------------------- #
 

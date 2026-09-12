@@ -1,6 +1,7 @@
 # Copy this file to config.yaml, export the referenced environment variables,
 # then run: python -m core.main --config config.yaml
-# Environment references must remain in the exact ${NAME} form shown below.
+# Environment references must remain in the exact ${NAME} form shown below,
+# and resolve in values and in mapping keys alike.
 
 modules_directory: ./modules
 
@@ -61,6 +62,53 @@ modules:
     queue:
       max_records: 1000
       max_bytes: 4194304
+
+# Trigger policies, selected per input and per channel (R1). The key under
+# `triggers` names the input module. An entry under `channels` selects the
+# policy for that one channel and replaces the module default entirely:
+# rules are never merged with the default they replace. A channel with no
+# entry of its own falls back to the default the input's manifest declares
+# — for the chat input, "the message text mentions the configured companion
+# name" (AC1). Only types the module declares may be configured (the chat
+# input declares `probability`, `audience` and `keyword`), only parameters
+# their schemas accept and only combination operators its manifest
+# supports; anything else stops startup before any transport opens.
+triggers:
+  twitch:
+    channels:
+      # The served channel answers only to an explicit keyword; a mention of
+      # the companion name alone no longer triggers a run here.
+      ${TWITCH_BROADCASTER_ID}:
+        combination: all_of
+        rules:
+          - type: keyword
+            parameters:
+              keywords:
+                - "!ask"
+      # A channel with no entry of its own keeps the module default: the
+      # message text mentions `companion_name` above. Deleting the entry
+      # above hands the served channel back to that default.
+
+# Explicit action authorization rules (R5). Authorization is default-deny:
+# the absence of an applicable rule is a refusal — for reads exactly as for
+# writes — and the provider is never invoked for a refused call. Declaring
+# an action in a module manifest grants nothing by itself, and the executor
+# re-evaluates these rules on every call, so removing the rule below
+# refuses the very next reply.
+actions:
+  # The reply delivery the brain module asks for, on the served channel.
+  - rule_id: brain-delivers-chat-replies
+    action_name: chat.write
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: chat
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - chat.write
 
 # Retention and admission limits. The block is optional as a whole, but a
 # module built against the versioned runtime (the chat input declares triggers) needs

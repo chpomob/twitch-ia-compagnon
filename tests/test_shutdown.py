@@ -11,10 +11,9 @@ import pytest
 
 import core.main as application
 from core.loader import ModuleActivation
-from core.actions import AuthorizationPolicy
 from modules import audit, brain, twitch
 from modules.twitch import HELIX_CHAT_URL
-from test_brain import BRAIN_GRANT, VALID_SETTINGS as BRAIN_SETTINGS, chat_payload, completion
+from test_brain import VALID_SETTINGS as BRAIN_SETTINGS, chat_payload, completion
 from test_brain import FakeResponse as ModelResponse
 from test_brain import FakeSession as ModelSession
 from test_brain import runtime_context as brain_runtime_context
@@ -46,17 +45,29 @@ send service records and emits it before it returns the observation (R8).
 
 
 def _grant_brain_delivery(monkeypatch) -> None:
-    """Seed the runtime's policy with the one grant the brain's reply needs.
+    """Hand the entry point the one grant the brain's reply needs.
 
-    The runtime assembles an empty policy (R5: declaring an action never
-    authorizes it); the configured grant is a later step's, so the harness
-    supplies it at the same boundary the entry point builds the policy at.
+    The runtime's policy holds exactly what the actions block configures (R5:
+    declaring an action never authorizes it), and this harness stubs
+    load_config down to a bare mapping, so the grant rides the stubbed
+    configuration — the same route production configuration takes.
     """
 
-    def policy_with_grant() -> AuthorizationPolicy:
-        return AuthorizationPolicy([BRAIN_GRANT])
-
-    monkeypatch.setattr(application, "AuthorizationPolicy", policy_with_grant)
+    monkeypatch.setattr(
+        application,
+        "load_config",
+        lambda *args, **kwargs: {
+            "modules_directory": ".",
+            "actions": [
+                {
+                    "rule_id": "brain-chat-write",
+                    "action_name": brain.DELIVERY_ACTION,
+                    "principals": [brain.PRINCIPAL],
+                    "granted_permissions": ["chat.write"],
+                }
+            ],
+        },
+    )
 
 
 @pytest.mark.parametrize("phase", ["model", "send", "stuck_model", "startup"])
@@ -158,7 +169,6 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
             return self.activations
 
     monkeypatch.setattr(application, "ModuleLoader", Loader)
-    monkeypatch.setattr(application, "load_config", lambda *a, **k: {"modules_directory": "."})
     _grant_brain_delivery(monkeypatch)
     if phase == "stuck_model":
         # Below the brain's drain poll interval, so the coordinator's timer

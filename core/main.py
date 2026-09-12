@@ -54,11 +54,19 @@ from typing import Any
 
 import yaml
 
-from .actions import ActionExecutor, ActionRegistry, AuthorizationPolicy
+from .actions import (
+    ACTION_NATURES,
+    ANY_ACTION,
+    ANY_PRINCIPAL,
+    ActionExecutor,
+    ActionRegistry,
+    AuthorizationPolicy,
+    AuthorizationRule,
+)
 from .attachments import AttachmentStore
 from .bus import EventBus
 from .context import ChatContext
-from .contracts import Counters
+from .contracts import Counters, Destination, WILDCARD
 from .lifecycle import (
     DEFAULT_CANCEL_GRACE_SECONDS,
     DEFAULT_DRAIN_DEADLINE_SECONDS,
@@ -444,9 +452,10 @@ def _assemble_runtime(config: Mapping[str, Any]) -> _Runtime:
 
     tasks = SupervisedTasks(clock=clock)
     supervision = Supervision(bus, counters=counters)
-    # No rule is configured here, and a policy that says nothing refuses
-    # everything: declaring an action never authorizes it (R5, R7).
-    authorization = AuthorizationPolicy()
+    # The only rules are the ones the actions block grants explicitly, and a
+    # policy without an applicable rule refuses the call: declaring an action
+    # never authorizes it (R5, R7).
+    authorization = AuthorizationPolicy(_authorization_rules(config))
     registry = ActionRegistry(authorization=authorization)
     executor = ActionExecutor(
         registry,
@@ -530,6 +539,127 @@ def _startup_diagnostic(exc: Exception) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Explicit authorization rules (R5)
+# --------------------------------------------------------------------------- #
+
+ACTIONS_KEY = "actions"
+"""The configuration block holding every explicit authorization grant.
+
+The block is optional as a whole; without it the policy holds no rule and
+refuses every call, read nature included, which is default-deny as shipped
+(R5). Every field below a rule is validated here, value-free, before any
+runtime exists; :func:`_authorization_rules` then turns the validated block
+into the rules the executor re-evaluates on every call.
+"""
+
+_RULE_KEYS: frozenset[str] = frozenset(
+    {
+        "rule_id",
+        "action_name",
+        "destination",
+        "principals",
+        "natures",
+        "granted_permissions",
+    }
+)
+_DESTINATION_KEYS: frozenset[str] = frozenset({"platform", "channel_id", "scope"})
+
+
+def _validate_actions(config: Mapping[str, Any]) -> None:
+    """Every configured grant is well formed, before anything exists (R5)."""
+
+    if ACTIONS_KEY not in config:
+        return
+    declared = config[ACTIONS_KEY]
+    if not isinstance(declared, list):
+        raise ConfigurationError(f"{ACTIONS_KEY}: must be a list")
+    seen: set[str] = set()
+    for index, entry in enumerate(declared):
+        label = f"{ACTIONS_KEY}[{index}]"
+        if not isinstance(entry, Mapping):
+            raise ConfigurationError(f"{label}: must be a mapping")
+        unknown = sorted(set(entry) - _RULE_KEYS)
+        if unknown:
+            raise ConfigurationError(
+                f"{label}: is not a known authorization rule key ({', '.join(unknown)})"
+            )
+        rule_id = entry.get("rule_id")
+        if not _is_text(rule_id):
+            raise ConfigurationError(f"{label}.rule_id: must be a non-empty string")
+        if rule_id in seen:
+            raise ConfigurationError(f"{label}.rule_id: must be unique")
+        seen.add(rule_id)
+        for field_name in ("action_name",):
+            value = entry.get(field_name)
+            if value is not None and not _is_text(value):
+                raise ConfigurationError(
+                    f"{label}.{field_name}: must be a non-empty string"
+                )
+        destination = entry.get("destination")
+        if destination is not None:
+            if not isinstance(destination, Mapping):
+                raise ConfigurationError(f"{label}.destination: must be a mapping")
+            unknown = sorted(set(destination) - _DESTINATION_KEYS)
+            if unknown:
+                raise ConfigurationError(
+                    f"{label}.destination: is not a known destination key "
+                    f"({', '.join(unknown)})"
+                )
+            for field_name in sorted(_DESTINATION_KEYS):
+                value = destination.get(field_name)
+                if value is not None and not _is_text(value):
+                    raise ConfigurationError(
+                        f"{label}.destination.{field_name}: must be a non-empty string"
+                    )
+        minimums = (("principals", 1), ("natures", 1), ("granted_permissions", 0))
+        for field_name, minimum in minimums:
+            value = entry.get(field_name)
+            if value is None:
+                continue
+            if not isinstance(value, list) or len(value) < minimum or not all(
+                _is_text(item) for item in value
+            ):
+                raise ConfigurationError(
+                    f"{label}.{field_name}: must be a list of non-empty strings"
+                )
+        natures = entry.get("natures")
+        if natures is not None:
+            invalid = sorted(set(natures) - ACTION_NATURES)
+            if invalid:
+                allowed = ", ".join(sorted(ACTION_NATURES))
+                raise ConfigurationError(
+                    f"{label}.natures: must be one of {allowed} ({', '.join(invalid)})"
+                )
+
+
+def _authorization_rules(config: Mapping[str, Any]) -> list[AuthorizationRule]:
+    """The explicit grants the ``actions`` block configures, or none (R5)."""
+
+    rules: list[AuthorizationRule] = []
+    for entry in config.get(ACTIONS_KEY) or ():
+        destination = entry.get("destination") or {}
+        rules.append(
+            AuthorizationRule(
+                rule_id=entry["rule_id"],
+                action_name=entry.get("action_name", ANY_ACTION),
+                destination=Destination(
+                    platform=destination.get("platform", WILDCARD),
+                    channel_id=destination.get("channel_id", WILDCARD),
+                    scope=destination.get("scope", WILDCARD),
+                ),
+                principals=tuple(entry.get("principals") or (ANY_PRINCIPAL,)),
+                natures=tuple(entry.get("natures") or sorted(ACTION_NATURES)),
+                granted_permissions=tuple(entry.get("granted_permissions") or ()),
+            )
+        )
+    return rules
+
+
+def _is_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+# --------------------------------------------------------------------------- #
 # Configuration validation (R6, R7)
 # --------------------------------------------------------------------------- #
 
@@ -570,15 +700,24 @@ def _resolve_environment(
             )
         active.add(identity)
         try:
-            return {
-                key: _resolve_environment(
+            # Keys resolve like values, so a channel selected by an
+            # environment reference names the channel it means (R1).
+            resolved: dict[Any, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, str) and "${" in key:
+                    key = _resolve_environment(
+                        key,
+                        environ=environ,
+                        path=_mapping_path(path, key),
+                        active=active,
+                    )
+                resolved[key] = _resolve_environment(
                     item,
                     environ=environ,
                     path=_mapping_path(path, key),
                     active=active,
                 )
-                for key, item in value.items()
-            }
+            return resolved
         finally:
             active.remove(identity)
 
@@ -650,6 +789,7 @@ def _validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigurationError(f"modules.{name}: settings are required")
 
     _validate_limits(config)
+    _validate_actions(config)
 
 
 def _validate_limits(config: Mapping[str, Any]) -> None:

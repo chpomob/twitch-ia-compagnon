@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import signal
 from pathlib import Path
 from typing import Any, Callable
@@ -1675,3 +1676,163 @@ def test_main_sanitizes_unexpected_failures(
 
     assert application.main(["--config", "chosen.yaml"]) == 1
     assert diagnostics == ["application: unexpected failure"]
+
+
+# --------------------------------------------------------------------------- #
+# The explicit authorization rules and the trigger channel keys (R5, R1)
+# --------------------------------------------------------------------------- #
+
+
+_CHAT_WRITE_SPEC = {
+    "name": "chat.write",
+    "version": 1,
+    "description": "Send one chat message",
+    "argument_schema": {"type": "object"},
+    "result_schema": {"type": "object"},
+    "nature": "write",
+    "required_permissions": ["chat.write"],
+    "supported_destinations": [
+        {"platform": "twitch", "channel_id": "*", "scope": "chat"}
+    ],
+    "timeout_seconds": 5,
+    "idempotency": "none",
+}
+
+
+class _Provider:
+    name = "recorder"
+
+    async def invoke(self, invocation: Any) -> None:
+        raise AssertionError("no call is made while listing authorized actions")
+
+
+def _declared_registry(runtime: Any) -> Any:
+    """The assembled registry with chat.write declared, bound and ready."""
+
+    from core.contracts import ActionSpec, Destination
+
+    spec = ActionSpec(
+        name=_CHAT_WRITE_SPEC["name"],
+        version=_CHAT_WRITE_SPEC["version"],
+        description=_CHAT_WRITE_SPEC["description"],
+        argument_schema=_CHAT_WRITE_SPEC["argument_schema"],
+        result_schema=_CHAT_WRITE_SPEC["result_schema"],
+        nature=_CHAT_WRITE_SPEC["nature"],
+        required_permissions=tuple(_CHAT_WRITE_SPEC["required_permissions"]),
+        supported_destinations=tuple(
+            Destination(**entry)
+            for entry in _CHAT_WRITE_SPEC["supported_destinations"]
+        ),
+        timeout_seconds=_CHAT_WRITE_SPEC["timeout_seconds"],
+        idempotency=_CHAT_WRITE_SPEC["idempotency"],
+    )
+    registry = runtime.context.actions
+    registry.declare(spec, module="brain")
+    registry.bind(
+        "chat.write",
+        _Provider(),
+        module="brain",
+        destinations=None,
+    )
+    registry.mark_ready(module="brain")
+    return registry
+
+
+def test_assembled_runtime_grants_only_the_configured_action_rules() -> None:
+    """R5: the actions block is the one source of grants, and none is default."""
+
+    from core.contracts import Destination
+
+    rule = {
+        "rule_id": "brain-delivers-chat-replies",
+        "action_name": "chat.write",
+        "destination": {
+            "platform": "twitch",
+            "channel_id": "42",
+            "scope": "chat",
+        },
+        "principals": ["brain"],
+        "natures": ["write"],
+        "granted_permissions": ["chat.write"],
+    }
+    config = {"limits": _finite_limits(), "actions": [rule]}
+
+    granted = _declared_registry(application._assemble_runtime(config))
+    assert set(
+        granted.authorized(
+            principal="brain", destination=Destination("twitch", "42", "chat")
+        )
+    ) == {"chat.write"}
+    # Default-deny everywhere the rule does not reach: another channel,
+    # another principal, and the whole block absent.
+    assert not granted.authorized(
+        principal="brain", destination=Destination("twitch", "43", "chat")
+    )
+    assert not granted.authorized(
+        principal="viewer", destination=Destination("twitch", "42", "chat")
+    )
+
+    refused = _declared_registry(application._assemble_runtime(dict(config, actions=[])))
+    assert not refused.authorized(
+        principal="brain", destination=Destination("twitch", "42", "chat")
+    )
+
+
+@pytest.mark.parametrize(
+    ("rule", "diagnostic"),
+    [
+        ({"rule_id": "x", "natures": ["scribble"]},
+         "actions[0].natures: must be one of read, write (scribble)"),
+        ({"rule_id": "x", "principals": []},
+         "actions[0].principals: must be a list of non-empty strings"),
+        ({"rule_id": "x", "bogus": 1},
+         "actions[0]: is not a known authorization rule key (bogus)"),
+        ({"action_name": "chat.write"},
+         "actions[0].rule_id: must be a non-empty string"),
+        ("not-a-mapping", "actions[0]: must be a mapping"),
+        ({"rule_id": "x", "destination": "twitch"},
+         "actions[0].destination: must be a mapping"),
+        ({"rule_id": "x", "destination": {"bogus": "twitch"}},
+         "actions[0].destination: is not a known destination key (bogus)"),
+    ],
+)
+def test_load_config_validates_the_actions_block(
+    tmp_path: Path, rule: object, diagnostic: str
+) -> None:
+    """R5: a malformed grant stops startup before any runtime exists."""
+
+    config = _valid_config("./modules", tmp_path / "unused.log")
+    config["actions"] = [rule]
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(
+        application.ConfigurationError, match=f"^{re.escape(diagnostic)}$"
+    ):
+        application.load_config(config_path, environ={})
+
+
+def test_load_config_resolves_environment_references_in_mapping_keys(
+    tmp_path: Path,
+) -> None:
+    """R1: the channel a policy selects may be named by ${NAME}."""
+
+    config = _valid_config("./modules", tmp_path / "unused.log")
+    config["triggers"] = {
+        "twitch": {"channels": {"${CHANNEL}": {"rules": []}}}
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = application.load_config(
+        config_path, environ={"CHANNEL": "42"}
+    )
+
+    assert next(iter(loaded["triggers"]["twitch"]["channels"])) == "42"
+
+    with pytest.raises(
+        application.ConfigurationError,
+        match=r"^triggers\.twitch\.channels\.\$\{CHANNEL\}: "
+        r"environment reference is unresolved$",
+    ):
+        application.load_config(config_path, environ={})

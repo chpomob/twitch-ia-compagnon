@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 
@@ -1346,3 +1347,161 @@ async def activate(context, settings, catalog):
     # "binder" is activated first and still sees the declaration of "declarer".
     assert binder["discovered"] == ["chat.write"]
     assert [binding.module for binding in context.actions.bindings()] == ["binder"]
+
+
+# --------------------------------------------------------------------------- #
+# The trigger policies configuration selects (R1)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_configured_channel_trigger_policies_replace_the_module_default(
+    tmp_path: Path,
+) -> None:
+    """R1, AC1: a channel policy replaces the default; others keep it."""
+
+    make_module(
+        tmp_path,
+        "chat",
+        manifest=v2_manifest(
+            "chat", triggers=KEYWORD_TRIGGERS, actions=[CHAT_WRITE_ACTION]
+        ),
+        source=V2_MODULE_SOURCE,
+    )
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context)
+
+    await loader.activate_enabled(
+        {
+            "enabled_modules": ["chat"],
+            "modules": {"chat": v2_settings()},
+            "triggers": {
+                "chat": {
+                    "channels": {
+                        "42": {
+                            "combination": "all_of",
+                            "rules": [
+                                {
+                                    "type": "keyword",
+                                    "parameters": {"keywords": ["!ask"]},
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    )
+
+    registry = context.triggers.registry
+    selected = registry.resolve("chat", "42")
+    assert selected is not None
+    assert list(selected.rules[0].parameters["keywords"]) == ["!ask"]
+    kept = registry.resolve("chat", "43")
+    assert kept is not None
+    assert "${companion_name}" in kept.rules[0].parameters["keywords"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "context_without_engine", "diagnostic"),
+    [
+        (
+            {
+                "chat": {
+                    "channels": {
+                        "42": {
+                            "rules": [
+                                {
+                                    "type": "probability",
+                                    "parameters": {"probability": 0.5},
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+            False,
+            "is not declared by the module; declared: keyword",
+        ),
+        (
+            {
+                "ghost": {
+                    "channels": {
+                        "42": {
+                            "rules": [
+                                {
+                                    "type": "keyword",
+                                    "parameters": {"keywords": ["!ask"]},
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+            False,
+            "names an input no module declares; declared inputs: chat",
+        ),
+        (
+            {
+                "chat": {
+                    "channels": {
+                        "42": {
+                            "rules": [
+                                {
+                                    "type": "keyword",
+                                    "parameters": {"keywords": ["!ask"]},
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+            True,
+            "the runtime context carries no trigger engine",
+        ),
+    ],
+)
+async def test_an_invalid_configured_trigger_policy_stops_startup(
+    tmp_path: Path,
+    configured: dict,
+    context_without_engine: bool,
+    diagnostic: str,
+) -> None:
+    """R1, R7: a policy the input cannot honour stops startup, 0 activated."""
+
+    # Without an engine the module must not declare triggers of its own, or
+    # the refusal would name the declaration instead of the configuration.
+    make_module(
+        tmp_path,
+        "chat",
+        manifest=v2_manifest(
+            "chat",
+            triggers=None if context_without_engine else KEYWORD_TRIGGERS,
+            actions=[CHAT_WRITE_ACTION],
+        ),
+        source=V2_MODULE_SOURCE,
+    )
+    fields: dict = (
+        {"triggers": None}
+        if context_without_engine
+        else {
+            "triggers": TriggerEngine(
+                TriggerRegistry(companion_name="companion"),
+                dedup_max_entries=8,
+                dedup_ttl_seconds=60.0,
+            )
+        }
+    )
+    context = runtime_context(**fields)
+    loader = ModuleLoader(context.bus, tmp_path, context=context)
+
+    with pytest.raises(ModuleLoadError, match=re.escape(diagnostic)):
+        await loader.activate_enabled(
+            {
+                "enabled_modules": ["chat"],
+                "modules": {"chat": v2_settings()},
+                "triggers": configured,
+            }
+        )
+    assert loader.activations == []
