@@ -10,10 +10,9 @@ import pytest
 import yaml
 
 from core import EventBus
-from core.actions import ActionRegistry, AuthorizationPolicy
-from core.contracts import COUNTER_AUDIT_RECORD_LOSSES, Counters
-from core.lifecycle import SupervisedTasks
-from core.runtime import ModuleContext, RuntimeContext, Supervision
+from core.contracts import COUNTER_AUDIT_RECORD_LOSSES
+from core.runtime import ModuleContext
+from conftest import runtime_context
 
 
 audit = importlib.import_module("modules.audit")
@@ -38,19 +37,6 @@ SETTINGS = {
 """The settings the manifest requires, as the example configuration ships them."""
 
 
-def runtime_context(bus: EventBus | None = None) -> RuntimeContext:
-    """The versioned runtime the audit activation reads its surfaces from."""
-
-    target_bus = bus if bus is not None else EventBus()
-    supervision = Supervision(target_bus, counters=Counters())
-    return RuntimeContext(
-        bus=target_bus,
-        actions=ActionRegistry(authorization=AuthorizationPolicy()),
-        supervision=supervision,
-        tasks=SupervisedTasks(),
-    )
-
-
 def module_context(bus: EventBus | None = None) -> ModuleContext:
     return runtime_context(bus).for_module("audit")
 
@@ -66,6 +52,12 @@ async def activate(
 
 
 def test_manifest_declares_catch_all_middleware_at_order_90() -> None:
+    """R7/R4 supersede the former whole-manifest equality: the manifest is
+    v2 — ``manifest_version``, the ``runtime_api`` it is built against, the
+    settings schema with its declared ``settings_validator`` hook, and the
+    declared ``observation`` lifecycle role that makes the coordinator flush
+    it last, instead of the core ordering it by name."""
+
     path = Path(audit.__file__).with_name("module.yaml")
     manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -131,6 +123,60 @@ async def test_middleware_registers_at_prepare_and_losses_reach_supervision() ->
     await handle.flush(0.1)
     await handle.close()
     assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_writer_saturating_the_queue_drops_new_records_and_counts_the_loss() -> None:
+    """AC21 (R6): with an audit queue capacity of 2 records and a writer
+    held blocked, publishing 5 events completes 5 publications, at most 2
+    records are admitted (one in the writer's hands, one queued), the loss
+    counter reads 3 outside the queue, and 0 publications are lost."""
+
+    context = runtime_context()
+    started = asyncio.Event()
+    never = asyncio.Event()
+    handed: list[str] = []
+
+    async def blocked_writer(line: str) -> None:
+        handed.append(line)
+        started.set()
+        await never.wait()
+
+    handle = await audit.activate(
+        context.for_module("audit"),
+        {
+            **SETTINGS,
+            "_writer": blocked_writer,
+            "queue": {"max_records": 2, "max_bytes": 4096},
+        },
+        {},
+    )
+    bus = context.bus
+    try:
+        await handle.prepare()
+        for index in range(5):
+            # Each publication completes: admission never blocks on the writer.
+            await asyncio.wait_for(
+                bus.publish(f"saturated.event.{index}", {"value": index}, {}),
+                timeout=0.5,
+            )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        published = [
+            event
+            for event in bus.list_events()
+            if event["type"].startswith("saturated.event.")
+        ]
+        assert len(published) == 5
+        assert handle.pending == 2
+        assert len(handed) <= 2
+        assert handle.losses == 3
+        # The counter is readable outside the saturated queue, from the
+        # registry in memory, never from a bus event it would itself feed.
+        assert context.supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 3
+    finally:
+        never.set()
+        await handle.close()
 
 
 @pytest.mark.asyncio

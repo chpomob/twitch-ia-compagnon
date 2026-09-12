@@ -8,12 +8,7 @@ from typing import Any
 import pytest
 import yaml
 
-from core.actions import (
-    ActionExecutor,
-    ActionRegistry,
-    AuthorizationPolicy,
-    AuthorizationRule,
-)
+from core.actions import AuthorizationPolicy, AuthorizationRule
 from core.bus import EventBus
 from core.context import ChatContext
 from core.contracts import (
@@ -21,7 +16,6 @@ from core.contracts import (
     COUNTER_LOST_TRACES,
     COUNTER_TRIGGER_REJECTIONS,
     ActionCall,
-    Counters,
     Destination,
     SessionKey,
     TriggerPolicy,
@@ -29,10 +23,18 @@ from core.contracts import (
     TriggerSpec,
     TriggerTypeDeclaration,
 )
-from core.lifecycle import PhaseCoordinator, SupervisedTasks
+from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
-from core.runtime import ModuleContext, RuntimeContext, Supervision
-from core.triggers import TriggerEngine, TriggerRegistry
+from core.runtime import ModuleContext, RuntimeContext
+from core.triggers import TriggerRegistry
+from conftest import (
+    FakeResponse,
+    ManualClock,
+    RecordingScheduler,
+    events_of,
+    runtime_context as build_context,
+    wait_until,
+)
 from modules.twitch import (
     CHAT_WRITE_ACTION,
     CHAT_WRITE_PROVIDER,
@@ -59,21 +61,6 @@ SETTINGS = {
     "bot_user_id": "bot-24",
     "companion_name": "Companion",
 }
-
-
-class FakeResponse:
-    def __init__(self, status: int, body: Any) -> None:
-        self.status = status
-        self.body = body
-        self.release_calls = 0
-
-    async def json(self) -> Any:
-        if isinstance(self.body, Exception):
-            raise self.body
-        return self.body
-
-    def release(self) -> None:
-        self.release_calls += 1
 
 
 class FakeWebSocket:
@@ -175,38 +162,6 @@ async def no_delay(_: float) -> None:
     await asyncio.sleep(0)
 
 
-async def wait_until(predicate: Any) -> None:
-    for _ in range(200):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("condition did not become true")
-
-
-class FakeClock:
-    """An injected monotonic clock; tests advance it, nothing sleeps."""
-
-    def __init__(self, start: float = 1000.0) -> None:
-        self.now = start
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
-class RecordingScheduler:
-    """Records what ingestion admits; runs nothing (the run engine is P16)."""
-
-    def __init__(self) -> None:
-        self.admissions: list[tuple[SessionKey, Any]] = []
-
-    def admit(self, session_key: SessionKey, work: Any) -> Any:
-        self.admissions.append((session_key, work))
-        return SimpleNamespace(accepted=True, run_id=f"run-{len(self.admissions)}")
-
-
 def manifest() -> dict[str, Any]:
     return yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
 
@@ -244,53 +199,38 @@ def runtime_context(
     declare_triggers: bool = True,
     authorization: AuthorizationPolicy | None = None,
 ) -> RuntimeContext:
-    """The versioned runtime over a real bus, registry, engine, context and tasks.
+    """The shared fixture (``conftest.runtime_context``) carrying this
+    module's declarations: the manifest's trigger spec registered for the
+    ``twitch`` input and the chat context bounds its ingestion feeds.
 
-    ``declare_triggers`` registers the manifest's trigger declaration for the
-    ``twitch`` input, as the loader would; a test that runs the real loader
-    passes ``False`` so the loader can register it itself.
+    ``declare_triggers`` registers the manifest's trigger declaration, as
+    the loader would; a test that runs the real loader passes ``False`` so
+    the loader can register it itself. The executor, supervision, counters
+    and tasks are the shared assembly — no twitch-specific wiring here.
     """
 
-    target_bus = bus or EventBus()
-    target_clock = clock if clock is not None else FakeClock()
-    counters = Counters()
     registry = TriggerRegistry(companion_name=SETTINGS["companion_name"])
     if declare_triggers:
         registry.register(
             "twitch", manifest_trigger_spec(), companion_name=SETTINGS["companion_name"]
         )
-    policy = authorization if authorization is not None else AuthorizationPolicy()
-    actions = ActionRegistry(authorization=policy)
-    supervision = Supervision(target_bus, counters=counters)
-    return RuntimeContext(
-        bus=target_bus,
-        actions=actions,
-        supervision=supervision,
-        tasks=SupervisedTasks(),
-        executor=ActionExecutor(
-            actions, policy, supervision=supervision, counters=counters, clock=target_clock
-        ),
-        triggers=TriggerEngine(
-            registry,
-            dedup_max_entries=dedup_max_entries,
-            dedup_ttl_seconds=dedup_ttl_seconds,
-            clock=target_clock,
-            counters=counters,
-        ),
+    target_clock = clock if clock is not None else ManualClock()
+    return build_context(
+        bus,
+        clock=target_clock,
+        scheduler=scheduler,
+        authorization=authorization,
+        trigger_registry=registry,
+        dedup_max_entries=dedup_max_entries,
+        dedup_ttl_seconds=dedup_ttl_seconds,
         chat=ChatContext(
             max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=target_clock
         ),
-        scheduler=scheduler,
-        clock=target_clock,
     )
 
 
 def module_context(bus: EventBus | None = None, **options: Any) -> ModuleContext:
     return runtime_context(bus, **options).for_module("twitch")
-
-
-def events_of(bus: EventBus, event_type: str) -> list[dict[str, Any]]:
-    return [event for event in bus.list_events() if event["type"] == event_type]
 
 
 def chat_events(bus: EventBus) -> list[dict[str, Any]]:
@@ -1474,7 +1414,7 @@ async def test_dedup_window_is_bounded_by_entries_and_ttl() -> None:
     the window produces 0 additional events; a replay after 3 newer identifiers
     or after the time-to-live produces exactly 1, and evictions are counted."""
 
-    clock = FakeClock()
+    clock = ManualClock()
     scheduler = RecordingScheduler()
     context = module_context(
         clock=clock, dedup_max_entries=2, dedup_ttl_seconds=10.0, scheduler=scheduler

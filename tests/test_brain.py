@@ -31,7 +31,6 @@ from core.actions import (
     ERROR_NOT_AUTHORIZED,
     ERROR_PROVIDER_FAILED,
     ERROR_TIMED_OUT,
-    ActionExecutor,
     ActionRegistry,
     AuthorizationPolicy,
     AuthorizationRule,
@@ -45,7 +44,6 @@ from core.contracts import (
     TRACE_BRAIN_RUN_COMPLETED,
     TRACE_BRAIN_RUN_STARTED,
     WILDCARD,
-    ActionObservation,
     ActionSpec,
     Counters,
     Destination,
@@ -54,6 +52,24 @@ from core.contracts import (
 from core.lifecycle import PhaseCoordinator, SupervisedTasks
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext, Supervision
+from conftest import (
+    FAIL_AFTER_EMISSION,
+    FAIL_BEFORE_EMISSION,
+    HeldSession,
+    FakeResponse,
+    FakeSendProvider,
+    FakeSession,
+    FakeTransport,
+    ManualClock,
+    SENT,
+    TIMEOUT_BEFORE_EMISSION,
+    RecordingScheduler,
+    completion,
+    events_of,
+    runtime_context as build_context,
+    settle,
+    wait_until,
+)
 from modules.brain import (
     CHAT_SCOPE,
     DELIVERY_ACTION,
@@ -155,155 +171,8 @@ BRAIN_GRANT = AuthorizationRule(
 
 
 # --------------------------------------------------------------------------- #
-# Doubles: the model transport, the send edge, the clock, the trigger window
+# Doubles: the trigger window, the publisher-recording bus
 # --------------------------------------------------------------------------- #
-
-
-class FakeResponse:
-    def __init__(self, status: int, body: Any) -> None:
-        self.status = status
-        self.body = body
-        self.release_calls = 0
-
-    async def json(self) -> Any:
-        if isinstance(self.body, Exception):
-            raise self.body
-        return self.body
-
-    def release(self) -> None:
-        self.release_calls += 1
-
-
-class FakeSession:
-    """The model transport: one prepared result per request, in order."""
-
-    def __init__(self, *results: Any) -> None:
-        self.results = list(results)
-        self.post_calls: list[dict[str, Any]] = []
-        self.close_calls = 0
-
-    async def post(self, url: str, **kwargs: Any) -> Any:
-        self.post_calls.append({"url": url, **kwargs})
-        result = self.results.pop(0)
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    async def close(self) -> None:
-        self.close_calls += 1
-
-
-class HeldSession(FakeSession):
-    """A model transport that holds every request until released."""
-
-    def __init__(self, *results: Any) -> None:
-        super().__init__(*results)
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def post(self, url: str, **kwargs: Any) -> Any:
-        self.post_calls.append({"url": url, **kwargs})
-        result = self.results.pop(0)
-        self.entered.set()
-        await self.release.wait()
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-
-def completion(content: str, usage: dict[str, int] | None = None) -> dict[str, Any]:
-    body: dict[str, Any] = {"choices": [{"message": {"content": content}}]}
-    if usage is not None:
-        body["usage"] = usage
-    return body
-
-
-class FakeTransport:
-    """The send edge behind the real executor: what actually left (AC19)."""
-
-    def __init__(self, *outcomes: str) -> None:
-        self.outcomes = list(outcomes)
-        self.sends: list[dict[str, Any]] = []
-
-
-class FakeSendProvider:
-    """A ``chat.write`` provider bound in the real registry over the fake edge."""
-
-    name = "fake-send"
-
-    def __init__(self, transport: FakeTransport) -> None:
-        self._transport = transport
-
-    async def invoke(self, invocation: Any) -> ActionObservation:
-        invocation.mark_not_emitted()
-        call = invocation.call
-        outcome = self._transport.outcomes.pop(0) if self._transport.outcomes else SENT
-        provenance = {"provider": self.name}
-        if outcome == FAIL_BEFORE_EMISSION:
-            raise RuntimeError("transport unavailable")
-        if outcome == TIMEOUT_BEFORE_EMISSION:
-            return ActionObservation(
-                status="timeout",
-                provenance=provenance,
-                error={"code": ERROR_TIMED_OUT, "message": "", "retryable": False},
-            )
-        invocation.mark_emitted()
-        if outcome == FAIL_AFTER_EMISSION:
-            raise RuntimeError("no confirmation")
-        self._transport.sends.append(
-            {
-                "text": call.arguments["text"],
-                "destination": call.destination,
-                "principal": call.principal,
-                "run_id": call.run_id,
-                "call_id": call.call_id,
-                "conversation_id": call.conversation_id,
-                "source_event_id": call.source_event_id,
-                "message_id": call.message_id,
-            }
-        )
-        return ActionObservation(
-            status="success",
-            provenance=provenance,
-            result={"message_id": f"sent-{len(self._transport.sends)}"},
-        )
-
-
-class ManualClock:
-    """A monotonic clock nobody waits on: time only moves when a test says so.
-
-    ``sleep`` is the sleeper injected into the engine's owned scheduler; it
-    parks a future until :meth:`advance` brings the clock past it, so no
-    deadline ever fires because a test waited.
-    """
-
-    def __init__(self, now: float = 1000.0) -> None:
-        self.now = now
-        self._waiters: list[tuple[float, asyncio.Future[None]]] = []
-
-    def __call__(self) -> float:
-        return self.now
-
-    async def sleep(self, delay: float) -> None:
-        if delay <= 0:
-            await asyncio.sleep(0)
-            return
-        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        entry = (self.now + delay, waiter)
-        self._waiters.append(entry)
-        try:
-            await waiter
-        except asyncio.CancelledError:
-            self._waiters = [item for item in self._waiters if item is not entry]
-            raise
-
-    def advance(self, delta: float) -> None:
-        self.now += delta
-        due = [item for item in self._waiters if item[0] <= self.now]
-        self._waiters = [item for item in self._waiters if item[0] > self.now]
-        for _deadline, waiter in due:
-            if not waiter.done():
-                waiter.set_result(None)
 
 
 class FakeTriggerEngine:
@@ -335,17 +204,6 @@ class FakeTriggerEngine:
         self, *, platform: str, channel_id: str, source_event_id: str, clock: Any = None
     ) -> Any:
         return self.decisions.get((platform, channel_id, source_event_id))
-
-
-class RecordingScheduler:
-    """A scheduler shared through the context; records what is admitted."""
-
-    def __init__(self) -> None:
-        self.admissions: list[tuple[SessionKey, Any]] = []
-
-    def admit(self, session_key: SessionKey, work: Any) -> Any:
-        self.admissions.append((session_key, work))
-        return SimpleNamespace(accepted=True, run_id=f"run-{len(self.admissions)}")
 
 
 class PublisherRecordingBus(EventBus):
@@ -393,18 +251,15 @@ def runtime_context(
     triggers: Any = None,
     scheduler: Any = None,
 ) -> RuntimeContext:
-    """The versioned runtime: real bus, registry, executor, supervision, tasks.
-
-    A ``chat.write`` provider over the fake send edge is registered and ready
-    under another module's name, as the input module's would be, and the
-    policy carries the one explicit grant the engine's principal needs —
-    or none, so a test can watch default deny refuse the delivery (R5). The
-    engine builds its own scheduler unless one is shared through the context.
+    """The shared fixture (``conftest.runtime_context``) carrying this
+    engine's delivery declarations: a ``chat.write`` provider over the fake
+    send edge, registered and ready under another module's name as the input
+    module's would be, and the policy carrying the one explicit grant the
+    engine's principal needs — or none, so a test can watch default deny
+    refuse the delivery (R5). The engine builds its own real scheduler
+    unless one is shared through the context.
     """
 
-    target_bus = bus or EventBus()
-    target_clock = clock if clock is not None else ManualClock()
-    counters = Counters()
     policy = AuthorizationPolicy([BRAIN_GRANT] if grant else [])
     actions = ActionRegistry(authorization=policy)
     actions.register(
@@ -413,18 +268,13 @@ def runtime_context(
         module=SENDER_MODULE,
     )
     actions.mark_ready(SENDER_MODULE)
-    supervision = Supervision(target_bus, counters=counters)
-    return RuntimeContext(
-        bus=target_bus,
-        actions=actions,
-        supervision=supervision,
-        tasks=SupervisedTasks(),
-        executor=ActionExecutor(
-            actions, policy, supervision=supervision, counters=counters, clock=target_clock
-        ),
-        triggers=triggers,
+    return build_context(
+        bus,
+        clock=clock,
         scheduler=scheduler,
-        clock=target_clock,
+        triggers=triggers,
+        authorization=policy,
+        actions=actions,
     )
 
 
@@ -565,25 +415,6 @@ def copy_settings(settings: dict[str, Any]) -> dict[str, Any]:
         key: dict(value) if isinstance(value, dict) else value
         for key, value in settings.items()
     }
-
-
-async def settle(turns: int = 20) -> None:
-    """Give the loop *turns* bare reschedules. Zero delay, so no time passes."""
-
-    for _ in range(turns):
-        await asyncio.sleep(0)
-
-
-async def wait_until(predicate: Any, turns: int = 2000) -> None:
-    for _ in range(turns):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("condition did not become true within the turn budget")
-
-
-def events_of(bus: EventBus, event_type: str) -> list[dict[str, Any]]:
-    return [event for event in bus.list_events() if event["type"] == event_type]
 
 
 def assert_sanitized(diagnostics: list[str]) -> None:
