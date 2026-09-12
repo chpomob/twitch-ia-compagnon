@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import core.main as application
+from conftest import wait_until
 from core.loader import ModuleActivation
 from modules import audit, brain, twitch
 from modules.twitch import HELIX_CHAT_URL
@@ -17,7 +18,14 @@ from test_brain import VALID_SETTINGS as BRAIN_SETTINGS, chat_payload, completio
 from test_brain import FakeResponse as ModelResponse
 from test_brain import FakeSession as ModelSession
 from test_brain import runtime_context as brain_runtime_context
-from test_main import _make_module, _valid_config, _write_config
+from test_main import (
+    PHASED_MODULE_SOURCE,
+    _make_module,
+    _make_phased_module,
+    _phased_config,
+    _valid_config,
+    _write_config,
+)
 from test_twitch import SETTINGS as TWITCH_SETTINGS
 from test_twitch import FakeResponse, FakeSession, FakeWebSocket, notification, welcome
 
@@ -309,6 +317,16 @@ async def test_brain_close_ends_the_held_run_without_blocking_the_publisher() ->
 
 
 async def test_stubborn_close_is_bounded_and_audit_still_closes(monkeypatch) -> None:
+    """A close that resists cancellation is bounded; the observation role still closes.
+
+    Both activations are versioned and declare their phase roles: the
+    stubborn one has no role, so it closes as an ordinary resource; the
+    other declares ``observation``, so the coordinator flushes and closes it
+    after every ordinary close — by declared role, never by name (R4). The
+    bounded close is reported against the module that overran, and the
+    observation service is not skipped.
+    """
+
     release = asyncio.Event()
     closed = []
     tasks = []
@@ -327,18 +345,29 @@ async def test_stubborn_close_is_bounded_and_audit_still_closes(monkeypatch) -> 
     monkeypatch.setattr(application, "_CLOSE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(application, "_CANCEL_TIMEOUT_SECONDS", 0.01)
     try:
-        # Two v1 activations: the coordinator closes them as its compatibility
-        # step, one bounded close after the other, in activation order.
         coordinator = application._coordinator(
             [
-                ModuleActivation("brain", {}, SimpleNamespace(close=stubborn)),
-                ModuleActivation("audit", {}, SimpleNamespace(close=close_audit)),
+                ModuleActivation(
+                    "brain",
+                    {},
+                    SimpleNamespace(close=stubborn),
+                    roles=frozenset(),
+                    manifest_version=2,
+                ),
+                ModuleActivation(
+                    "audit",
+                    {},
+                    SimpleNamespace(close=close_audit),
+                    roles=frozenset({"observation"}),
+                    manifest_version=2,
+                ),
             ],
             application._assemble_runtime({}),
             lambda _message: None,
         )
         report = await asyncio.wait_for(coordinator.stop(), 1)
-        assert report.failures == ("module 'brain': shutdown failed",)
+        assert report.status == 1
+        assert report.failures == ("module 'brain': phase 'close' timed out",)
         assert closed == ["audit"]
     finally:
         release.set()
@@ -370,8 +399,12 @@ async def run(config):
     handle.handle_event({"type": "test.event", "payload": {}})
     while not started.is_set():
         await asyncio.sleep(0.001)
+    # The declared observation role puts the writer in the flush and
+    # observation-close phases; the coordinator never reads its name (R4).
     coordinator = app._coordinator(
-        [ModuleActivation("audit", {}, handle)],
+        [ModuleActivation(
+            "audit", {}, handle, roles=frozenset({"observation"}), manifest_version=2
+        )],
         app._assemble_runtime({}),
         lambda _message: None,
     )
@@ -412,13 +445,18 @@ async def close():
             pass
 
 async def run(config):
+    # A versioned activation with no declared role: closed as an ordinary
+    # resource in the close phase, bounded and reported by module (R4).
     coordinator = app._coordinator(
-        [ModuleActivation("brain", {}, SimpleNamespace(close=close))],
+        [ModuleActivation(
+            "brain", {}, SimpleNamespace(close=close), roles=frozenset(), manifest_version=2
+        )],
         app._assemble_runtime({}),
         lambda _message: None,
     )
     report = await coordinator.stop()
-    assert report.failures == ("module 'brain': shutdown failed",)
+    assert report.status == 1
+    assert report.failures == ("module 'brain': phase 'close' timed out",)
     print("cleanup bounded", flush=True)
     return 1
 
@@ -528,3 +566,85 @@ async def test_cancellation_during_activation_closes_partial_startup(
             background.cancel()
         await asyncio.gather(task, *workers, return_exceptions=True)
         loop.set_exception_handler(previous_handler)
+
+
+async def test_cancelled_preparation_through_the_entry_point_names_the_module(
+    tmp_path, monkeypatch,
+) -> None:
+    """AC15: a ``CancelledError`` during a versioned activation, end to end.
+
+    The coordinator is cancelled while the last module is still preparing.
+    The entry point reports the phase the cancellation interrupted, against
+    the module it interrupted, then unwinds every module already prepared
+    through the ordinary shutdown sequence — the producer stopped and the
+    resources closed — before the cancellation reaches the caller.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_phased_module(
+        modules,
+        "slow",
+        source=PHASED_MODULE_SOURCE.replace(
+            'record(self.settings, "prepare")',
+            'record(self.settings, "prepare")\n'
+            '        await asyncio.Future()',
+        ).replace("import json\n", "import asyncio\nimport json\n", 1),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        _phased_config("./modules", lifecycle_log, ("alpha", "source", "slow")),
+    )
+    readiness = []
+    diagnostics = []
+    removed = []
+    monkeypatch.setattr(
+        application, "_install_signal_handlers",
+        lambda stop: lambda: removed.append(True),
+    )
+
+    def log_lines() -> list[str]:
+        if not lifecycle_log.exists():
+            return []
+        return lifecycle_log.read_text(encoding="utf-8").splitlines()
+
+    task = asyncio.create_task(application.run(
+        config_path,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    ))
+    try:
+        await wait_until(lambda: "prepare:slow" in log_lines())
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert done == {task}, "startup cancellation cleanup hung"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert readiness == []
+    assert removed == [True]
+    assert diagnostics == ["module 'slow': phase 'prepare' was cancelled"]
+    assert log_lines() == [
+        "activate:alpha",
+        "activate:source",
+        "activate:slow",
+        "prepare:alpha",
+        "prepare:source",
+        "prepare:slow",
+        # Never started, still stopped and drained: hooks are idempotent.
+        "stop_inputs:source",
+        "drain:slow",
+        "drain:source",
+        "drain:alpha",
+        "close:slow",
+        "close:source",
+        "flush:alpha",
+        "close:alpha",
+    ]

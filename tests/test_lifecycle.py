@@ -1,19 +1,25 @@
-"""Phase lifecycle coordination and supervised task ownership (R4, AC14, AC15).
+"""Phase lifecycle coordination and supervised task ownership (R4, AC13-AC15).
 
 Nothing here waits on wall-clock time. :class:`Timeline` is the injected clock
 and the injected sleeper: a deadline fires because the test advances the
-timeline, never because a real duration elapsed.
+timeline, never because a real duration elapsed. The one suite member that
+runs the real entry point — the fourth fictional module of AC13 — waits on
+loop turns, not on a duration.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
+import core.main as application
+from conftest import wait_until
 from core.lifecycle import (
     DEFAULT_SHUTDOWN_DEADLINE_SECONDS,
     PHASES,
@@ -41,6 +47,7 @@ from core.lifecycle import (
     reset_shutdown_watchdog,
 )
 from core.loader import ModuleActivation
+from test_main import _finite_limits
 
 
 # --------------------------------------------------------------------------- #
@@ -1441,3 +1448,337 @@ def test_arm_shutdown_watchdog_is_safe_with_no_watchdog_installed() -> None:
         arm_shutdown_watchdog()
     finally:
         reset_shutdown_watchdog(token)
+
+
+# --------------------------------------------------------------------------- #
+# AC13 — the fourth fictional module, through the real loader and entry point
+# --------------------------------------------------------------------------- #
+
+
+FOURTH_MODULE_NAME = "beacon"
+"""A module the entry point has never heard of: it must need nothing from it."""
+
+FOURTH_MODULE_INPUT = "beacon.pulse"
+FOURTH_MODULE_ACTION = "beacon.note"
+FOURTH_MODULE_PERMISSION = "note.write"
+
+FOURTH_MODULE_MANIFEST: dict[str, Any] = {
+    "name": FOURTH_MODULE_NAME,
+    "manifest_version": 2,
+    "runtime_api": 2,
+    "produces": [FOURTH_MODULE_INPUT],
+    "consumes": [FOURTH_MODULE_INPUT],
+    "middleware": False,
+    # The one thing the coordinator reads to decide what each phase asks of
+    # this module (R4). Producing an input is the ``input`` role.
+    "lifecycle": {"roles": [ROLE_INPUT]},
+    "settings_schema": {
+        "type": "object",
+        "properties": {
+            "lifecycle_log": {"type": "string"},
+            "channel": {"type": "string"},
+        },
+        "required": ["lifecycle_log", "channel"],
+    },
+    "settings_validator": "validate_settings",
+    # Declared, therefore discovered; authorized only by the rule the
+    # configuration grants below (R5).
+    "actions": [
+        {
+            "name": FOURTH_MODULE_ACTION,
+            "version": 1,
+            "description": "Keep one note about a pulse.",
+            "argument_schema": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+            "result_schema": {
+                "type": "object",
+                "properties": {"noted": {"type": "boolean"}},
+                "required": ["noted"],
+                "additionalProperties": False,
+            },
+            "nature": "write",
+            "required_permissions": [FOURTH_MODULE_PERMISSION],
+            "supported_destinations": [
+                {"platform": FOURTH_MODULE_NAME, "channel_id": "*", "scope": "notes"}
+            ],
+            "timeout_seconds": 5,
+            "idempotency": "none",
+        }
+    ],
+}
+
+FOURTH_MODULE_SOURCE = '''
+"""A fictional versioned module: one input source, one action it consumes.
+
+It exposes every phase hook a producer has and records each one. Its input
+is a single pulse published from the source it opens in ``start_inputs``;
+its own handler admits that pulse and detaches a run that consumes the
+declared action through the runtime's executor, so both directions of the
+pipeline pass through the versioned runtime the entry point assembled.
+"""
+
+import asyncio
+from pathlib import Path
+
+from core.contracts import ActionCall, ActionObservation, Destination
+
+INPUT_EVENT = "beacon.pulse"
+ACTION = "beacon.note"
+PRINCIPAL = "beacon"
+PROVIDER = "beacon-notebook"
+
+
+def _record(settings, line):
+    with Path(settings["lifecycle_log"]).open("a", encoding="utf-8") as stream:
+        stream.write(line + "\\n")
+
+
+def validate_settings(settings):
+    _record(settings, "validate_settings")
+    return []
+
+
+class Notebook:
+    """The provider behind the declared action: it keeps the note."""
+
+    name = PROVIDER
+
+    def __init__(self, settings):
+        self._settings = settings
+
+    async def invoke(self, invocation):
+        invocation.mark_not_emitted()
+        text = invocation.call.arguments["text"]
+        invocation.mark_emitted()
+        _record(self._settings, f"provide:{text}")
+        return ActionObservation(
+            status="success",
+            provenance={"provider": self.name},
+            result={"noted": True},
+        )
+
+
+class Handle:
+    def __init__(self, context, settings):
+        self._context = context
+        self._settings = settings
+        self._destination = Destination(
+            platform=PRINCIPAL, channel_id=settings["channel"], scope="notes"
+        )
+        self._prepared = False
+        self._source = None
+        self._stopped = asyncio.Event()
+        self._closed = False
+
+    # -- startup ------------------------------------------------------------ #
+
+    async def prepare(self):
+        if self._prepared or self._closed:
+            return
+        _record(self._settings, "prepare")
+        # Bind to the action the manifest declared and the loader recorded;
+        # the consumer route is subscribed before any producer may publish.
+        self._context.actions.bind(
+            ACTION,
+            Notebook(self._settings),
+            destinations=self._destination,
+            provider_name=PROVIDER,
+        )
+        self._context.bus.subscribe(INPUT_EVENT, self.handle_pulse)
+        self._context.actions.mark_ready()
+        self._prepared = True
+
+    async def start_inputs(self):
+        if self._source is not None or self._closed:
+            return
+        if not self._prepared:
+            raise RuntimeError("start_inputs requires prepare")
+        _record(self._settings, "start_inputs")
+        self._source = self._context.tasks.spawn(self._pulse(), name="beacon-source")
+
+    async def _pulse(self):
+        _record(self._settings, "input:published")
+        await self._context.bus.publish(
+            INPUT_EVENT, {"text": "ping", "message_id": "pulse-1"}, {}
+        )
+        # A source stays open until the coordinator cuts it.
+        await self._stopped.wait()
+
+    # -- the input handler: admit, detach, return (R2) ------------------------ #
+
+    async def handle_pulse(self, event):
+        self._context.tasks.spawn(self._consume(event), name="beacon-run")
+
+    async def _consume(self, event):
+        call = ActionCall(
+            action_name=ACTION,
+            action_version=1,
+            arguments={"text": event["payload"]["text"]},
+            conversation_id="beacon:conversation",
+            run_id="beacon-run-1",
+            call_id="beacon-run-1/call-1",
+            source_event_id=event["payload"]["message_id"],
+            destination=self._destination,
+            principal=PRINCIPAL,
+            deadline=self._context.clock() + 5.0,
+        )
+        observation = await self._context.executor.invoke(call)
+        _record(self._settings, f"action:{observation.status}")
+
+    # -- shutdown ----------------------------------------------------------- #
+
+    async def stop_inputs(self):
+        _record(self._settings, "stop_inputs")
+        self._stopped.set()
+        if self._source is not None:
+            await asyncio.gather(self._source, return_exceptions=True)
+
+    async def drain(self, deadline_seconds):
+        _record(self._settings, "drain")
+
+    async def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        _record(self._settings, "close")
+
+
+async def activate(context, settings, catalog):
+    _record(settings, "activate")
+    return Handle(context, settings)
+'''
+
+
+def _write_fourth_module(root: Path) -> None:
+    """The module lives under its own ``modules`` root the loader is pointed at."""
+
+    directory = root / FOURTH_MODULE_NAME
+    directory.mkdir(parents=True)
+    (directory / "module.yaml").write_text(
+        yaml.safe_dump(FOURTH_MODULE_MANIFEST), encoding="utf-8"
+    )
+    (directory / "__init__.py").write_text(FOURTH_MODULE_SOURCE, encoding="utf-8")
+
+
+def _entry_point_source() -> str:
+    return (
+        Path(__file__).resolve().parents[1] / "core" / "main.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_entry_point_names_no_module() -> None:
+    """AC13: the literal search — ``twitch``, ``brain``, ``audit`` — finds 0."""
+
+    source = _entry_point_source().lower()
+
+    for literal in ("twitch", "brain", "audit"):
+        assert source.count(literal) == 0, literal
+
+
+async def test_fourth_module_starts_and_stops_through_every_phase_unnamed(
+    tmp_path: Path,
+) -> None:
+    """AC13: a module the entry point never heard of runs every phase.
+
+    The fourth fictional module both produces an input and consumes an
+    action. It is discovered by the real loader from its own directory,
+    activated on the versioned runtime the entry point assembled, started
+    only after the readiness barrier, and stopped, drained and closed by the
+    coordinator — with 0 occurrences of its name, or of any module name, in
+    ``core/main.py``.
+    """
+
+    modules = tmp_path / "modules"
+    _write_fourth_module(modules)
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "modules_directory": "./modules",
+                "enabled_modules": [FOURTH_MODULE_NAME],
+                "modules": {
+                    FOURTH_MODULE_NAME: {
+                        "lifecycle_log": str(lifecycle_log),
+                        "channel": "main",
+                    }
+                },
+                "limits": _finite_limits(),
+                # Declaring the action authorized nothing; this rule does (R5).
+                "actions": [
+                    {
+                        "rule_id": "beacon-notes",
+                        "action_name": FOURTH_MODULE_ACTION,
+                        "principals": [FOURTH_MODULE_NAME],
+                        "granted_permissions": [FOURTH_MODULE_PERMISSION],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def log_lines() -> list[str]:
+        if not lifecycle_log.exists():
+            return []
+        return lifecycle_log.read_text(encoding="utf-8").splitlines()
+
+    stop = asyncio.Event()
+    ready = asyncio.Event()
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    def report_ready(message: str) -> None:
+        readiness.append(message)
+        ready.set()
+
+    task = asyncio.create_task(
+        application.run(
+            config_path,
+            stop,
+            ready_reporter=report_ready,
+            diagnostic_reporter=diagnostics.append,
+        )
+    )
+    try:
+        await asyncio.wait_for(ready.wait(), 1)
+        assert readiness == ["ready"]
+        assert not task.done()
+        # Validation, activation and preparation all preceded the barrier;
+        # the source opened only after it.
+        assert log_lines()[:4] == [
+            "validate_settings",
+            "activate",
+            "prepare",
+            "start_inputs",
+        ]
+        # The pulse is produced, admitted, and its detached run consumes the
+        # declared action through the real executor and the granted rule.
+        await wait_until(lambda: "action:success" in log_lines())
+        assert log_lines()[4:] == ["input:published", "provide:ping", "action:success"]
+    finally:
+        stop.set()
+    assert await asyncio.wait_for(task, 1) == 0
+    assert diagnostics == []
+    assert log_lines() == [
+        "validate_settings",
+        "activate",
+        "prepare",
+        "start_inputs",
+        "input:published",
+        "provide:ping",
+        "action:success",
+        "stop_inputs",
+        "drain",
+        "close",
+    ]
+
+    # 0 module-name literals were needed for any of that: not the fourth
+    # module's, and not the three the entry point used to order by name.
+    source = _entry_point_source().lower()
+    for literal in (FOURTH_MODULE_NAME, "twitch", "brain", "audit"):
+        assert source.count(literal) == 0, literal

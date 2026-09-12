@@ -1460,6 +1460,8 @@ async def test_unresolved_environment_reference_names_setting_path_only(
 async def test_activation_failure_closes_partial_startup_without_leaking_values(
     tmp_path: Path,
 ) -> None:
+    """The v1 compatibility route: activation order is the only order it has (R4)."""
+
     modules = tmp_path / "modules"
     modules.mkdir()
     _make_module(modules, "twitch")
@@ -1503,9 +1505,72 @@ async def activate(bus, settings, catalog):
 
 
 @pytest.mark.asyncio
+async def test_versioned_activation_failure_unwinds_prepared_modules_by_phase(
+    tmp_path: Path,
+) -> None:
+    """Phase-ordered counterpart of the v1 partial-startup test (R4, AC15).
+
+    Three versioned modules; the last one fails inside ``activate`` with the
+    configured credential in its message. The loader hands the two already
+    activated to the coordinator, which unwinds them through the declared
+    phases — the producer stopped and drained before its close, the
+    observation service flushed and closed after every ordinary resource —
+    under one shutdown deadline, with a non-zero status, a diagnostic naming
+    the failing module and 0 credential values echoed.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_phased_module(
+        modules,
+        "relay",
+        source=PHASED_MODULE_SOURCE.replace(
+            'record(settings, "activate")',
+            'raise RuntimeError(settings["api_key"])',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config = _phased_config("./modules", lifecycle_log, ("alpha", "source", "relay"))
+    secret = _opaque("key")
+    config["modules"]["relay"]["api_key"] = secret
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert diagnostics == ["module 'relay': field 'activate': activation failed"]
+    assert secret not in "\n".join(diagnostics)
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
+        "activate:alpha",
+        "activate:source",
+        # Never prepared or started, still stopped and drained: the hooks are
+        # idempotent by contract, and nothing was skipped.
+        "stop_inputs:source",
+        "drain:source",
+        "drain:alpha",
+        "close:source",
+        "flush:alpha",
+        "close:alpha",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_failure_is_nonzero_and_does_not_skip_other_modules(
     tmp_path: Path,
 ) -> None:
+    """The v1 compatibility route: one ``close()`` each, in activation order (R4)."""
+
     modules = tmp_path / "modules"
     modules.mkdir()
     _make_module(modules, "twitch")
@@ -1542,6 +1607,64 @@ async def test_shutdown_failure_is_nonzero_and_does_not_skip_other_modules(
     ]
     assert diagnostics == ["module 'brain': shutdown failed"]
     assert secret not in "\n".join(diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_versioned_close_failure_is_nonzero_and_later_phases_still_run(
+    tmp_path: Path,
+) -> None:
+    """Phase-ordered counterpart of the v1 shutdown-failure test (R4).
+
+    A versioned module whose ``close`` raises — with the configured
+    credential in its message — is reported against its module and phase,
+    the status is non-zero, and the phases that follow still run: the other
+    ordinary resource closes and the declared observation service flushes and
+    closes last, so the failure's own trace has somewhere to go.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_phased_module(
+        modules,
+        "relay",
+        source=PHASED_MODULE_SOURCE.replace(
+            'record(self.settings, "close")',
+            'record(self.settings, "close")\n'
+            '        raise RuntimeError(self.settings["api_key"])',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config = _phased_config("./modules", lifecycle_log, ("alpha", "source", "relay"))
+    secret = _opaque("key")
+    config["modules"]["relay"]["api_key"] = secret
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    stop = asyncio.Event()
+    stop.set()
+    diagnostics: list[str] = []
+
+    status = await application.run(
+        config_path,
+        stop,
+        ready_reporter=lambda _message: None,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert diagnostics == ["module 'relay': phase 'close' failed"]
+    assert secret not in "\n".join(diagnostics)
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines()[-8:] == [
+        "stop_inputs:source",
+        "drain:relay",
+        "drain:source",
+        "drain:alpha",
+        "close:relay",
+        "close:source",
+        "flush:alpha",
+        "close:alpha",
+    ]
 
 
 @pytest.mark.asyncio
