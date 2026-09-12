@@ -1,25 +1,55 @@
-"""Bounded retention: chat transcript context and attachment store (R3, R6).
+"""The retention surface, end to end, on an injected clock (R6).
 
-Two stores share this file because they answer the same requirement from
-opposite ends. The chat context (AC11) is *lossy by design*: it evicts its
-oldest entries so ingestion is never refused. The attachment store (AC23,
-AC31) is *refusing by design*: it never drops a reference leased to a live run
-to make room, because those bytes are an observation a run still holds.
+Every retained state the runtime holds is bounded, and every bound is
+exercised here against the component that owns it *as the application wires
+it* — never against a test-built stand-in with a friendlier default:
 
-The full AC11 pipeline assertion — three real ingestions through triggers,
-admission and a stale run — is added in P22; these tests pin the stores
-themselves: appends are total, reads are ordered, dated and channel-isolated,
-every context bound evicts oldest first against an injected clock, every
-attachment bound refuses by name without evicting, per-run quotas are
-independent, releasing a run frees exactly its bytes, an expired reference
-reads as an explicit error rather than empty content, and a non-finite bound
-is refused at construction by name in both stores.
+* the bus publication history, by events, bytes and age, with the
+  subscription, ordering, replacement and publication-error semantics intact
+  under saturation (AC20);
+* the audit record queue, saturated under a writer held blocked, losing
+  records and never publications, with the loss counter read outside the
+  queue (AC21);
+* the source dedup window, driven through the real chat input over a fake
+  socket: a replay inside the window produces nothing, a replay after
+  eviction by count or by time-to-live is reprocessed (AC22);
+* the attachment store — refusing by design, it never drops a reference
+  leased to a live run to make room — by count, per-object size, total
+  volume, per-run quota and time-to-live (AC23, AC31);
+* the conversation memory, driven through the real run engine so that what is
+  asserted is the next model request, by sessions, exchanges, bytes and age
+  (AC30);
+* and startup itself, through ``core.main.run``: each of the five non-finite
+  retention configurations stops before any module is activated, naming the
+  offending setting, while the all-finite control starts and hands the
+  modules a bus and a store bounded exactly as configured (AC32).
+
+The chat transcript context (AC11) — lossy by design, it evicts its oldest
+entries so ingestion is never refused — keeps its store-level pins here too;
+its pipeline assertion lives with the integration suite.
+
+The fakes at the module edges (the chat input's socket and session, the run
+engine's model transport and send edge) are the module suites' own; they are
+imported from there rather than re-implemented, so this suite drives the same
+assembly those suites do — the real executor, scheduler and supervision
+behind the shared ``conftest.runtime_context`` — and cannot pass on a mock
+the module suites would refuse. Nothing here sleeps: every clock is injected
+and every wait is a bounded number of bare loop turns.
 """
 
+from __future__ import annotations
+
+import asyncio
+import importlib
+import json
 from array import array
+from pathlib import Path
+from typing import Any, Callable
 
 import pytest
+import yaml
 
+import core.main as application
 from core import attachments
 from core.attachments import (
     AttachmentExpired,
@@ -29,8 +59,42 @@ from core.attachments import (
     AttachmentUnknown,
     RunUsage,
 )
+from core.bus import EventBus, PublicationError
 from core.context import ChatContext, ChatEntry
-from core.contracts import ContractError, SessionKey
+from core.contracts import (
+    COUNTER_AUDIT_RECORD_LOSSES,
+    COUNTER_DEDUP_EVICTIONS,
+    ContractError,
+    SessionKey,
+)
+from conftest import (
+    FakeResponse,
+    ManualClock,
+    RecordingScheduler,
+    completion,
+    runtime_context,
+    wait_until,
+)
+from test_brain import (
+    CHANNEL as BRAIN_CHANNEL,
+    PLATFORM as BRAIN_PLATFORM,
+    activate_with as activate_brain,
+    rendered_history,
+)
+from test_twitch import (
+    PLATFORM as TWITCH_PLATFORM,
+    SETTINGS as TWITCH_SETTINGS,
+    FakeSession as TwitchSession,
+    FakeWebSocket,
+    activate_with as activate_twitch,
+    chat_events,
+    module_context as twitch_context,
+    notification,
+    welcome,
+)
+
+
+audit = importlib.import_module("modules.audit")
 
 
 class _Clock:
@@ -383,7 +447,7 @@ def _assert_intact(store: AttachmentStore, refs: list[AttachmentRef]) -> None:
         assert len(store.get(ref)) == ref.size
 
 
-def test_a_third_object_is_refused_naming_the_object_count_and_evicts_nothing() -> None:
+def test_ac23_a_third_object_is_refused_naming_the_object_count_and_evicts_nothing() -> None:
     """AC23 (R6): the store refuses rather than dropping a live run's lease."""
 
     store, refs = _saturated_store()
@@ -396,7 +460,7 @@ def test_a_third_object_is_refused_naming_the_object_count_and_evicts_nothing() 
     _assert_intact(store, refs)
 
 
-def test_an_over_sized_object_is_refused_naming_the_per_object_limit() -> None:
+def test_ac23_an_over_sized_object_is_refused_naming_the_per_object_limit() -> None:
     """AC23 (R6): the per-object bound is checked first and evicts nothing."""
 
     store, refs = _saturated_store()
@@ -433,7 +497,7 @@ def test_total_volume_is_refused_by_name_before_the_per_run_quota() -> None:
     _assert_intact(store, refs)
 
 
-def test_ending_the_run_releases_its_two_references() -> None:
+def test_ac23_ending_the_run_releases_its_two_references() -> None:
     """AC23 (R6): a run's end frees exactly its objects and bytes."""
 
     store, refs = _saturated_store()
@@ -457,7 +521,7 @@ def test_ending_the_run_releases_its_two_references() -> None:
     assert store.get(reborn) == _payload(1)
 
 
-def test_reading_a_reference_after_its_ttl_raises_rather_than_returning_empty() -> None:
+def test_ac23_reading_a_reference_after_its_ttl_raises_rather_than_returning_empty() -> None:
     """AC23 (R6): expiry is an explicit read error, never empty content."""
 
     clock = _Clock()
@@ -519,7 +583,7 @@ def _quota_store(clock: _Clock | None = None) -> AttachmentStore:
     )
 
 
-def test_per_run_quota_refuses_by_name_while_a_concurrent_run_still_stores() -> None:
+def test_ac31_per_run_quota_refuses_by_name_while_a_concurrent_run_still_stores() -> None:
     """AC31 (R6): quotas are keyed by run, so one run cannot starve another."""
 
     store = _quota_store()
@@ -547,7 +611,7 @@ def test_per_run_quota_refuses_by_name_while_a_concurrent_run_still_stores() -> 
     assert sorted(store.live_runs()) == ["run-a", "run-b"]
 
 
-def test_releasing_one_run_frees_exactly_its_units_and_restores_its_quota() -> None:
+def test_ac31_releasing_one_run_frees_exactly_its_units_and_restores_its_quota() -> None:
     """AC31 (R6): a run's end frees its 2 units, and only its own."""
 
     store = _quota_store()
@@ -741,3 +805,728 @@ def test_a_factory_that_repeats_an_identifier_is_refused_by_name() -> None:
     with pytest.raises(ContractError) as caught:
         store.put("run-1", b"y", content_type="image/png")
     assert "id_factory" in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# Bus history bounded by events, bytes and age (R6, AC20)
+# --------------------------------------------------------------------------- #
+
+
+_GENEROUS_HISTORY = {
+    "history_max_events": 1000,
+    "history_max_bytes": 1 << 20,
+    "history_max_age_seconds": 1000.0,
+}
+
+
+def _bus(clock: ManualClock, **overrides: object) -> EventBus:
+    return EventBus(clock=clock, **dict(_GENEROUS_HISTORY, **overrides))  # type: ignore[arg-type]
+
+
+def _history_types(bus: EventBus, prefix: str = "retention.") -> list[str]:
+    return [event["type"] for event in bus.list_events() if event["type"].startswith(prefix)]
+
+
+def _serialized_bytes(event: dict[str, Any]) -> int:
+    """The byte weight the bus charges a JSON-representable event."""
+
+    return len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
+
+
+async def test_ac20_bus_history_event_limit_keeps_the_newest_ten_and_invokes_every_subscriber_in_order() -> None:
+    """AC20 (R6): 15 publications under a 10-event history leave exactly 10
+    records, the 5 oldest absent, while every one of the 15 still ran its
+    full subscriber chain in the documented order — by ``order`` first, then
+    by registration, sync and async alike — and none of them failed."""
+
+    clock = ManualClock(0.0)
+    bus = _bus(clock, history_max_events=10)
+    seen: list[tuple[str, str]] = []
+
+    async def async_handler(event: dict[str, Any]) -> None:
+        seen.append(("middle", event["type"]))
+
+    bus.subscribe("retention.*", lambda event: seen.append(("late", event["type"])), order=10)
+    bus.subscribe("retention.**", async_handler, order=5)
+    bus.subscribe("retention.*", lambda event: seen.append(("early", event["type"])), order=0)
+
+    published = []
+    for index in range(15):
+        clock.now = float(index)
+        published.append(await bus.publish(f"retention.{index}", {"index": index}, {}))
+
+    assert [event["type"] for event in published] == [f"retention.{i}" for i in range(15)]
+    assert _history_types(bus) == [f"retention.{i}" for i in range(5, 15)]
+    assert seen == [
+        (label, f"retention.{index}")
+        for index in range(15)
+        for label in ("early", "middle", "late")
+    ]
+
+
+async def test_ac20_bus_history_byte_limit_evicts_before_the_count_limit_without_failing_a_publication() -> None:
+    """AC20 (R6): a byte bound reached before the 10-event bound leaves fewer
+    than 10 records — the newest, within the bound — and no publication
+    fails: every returned record is the event that was published."""
+
+    clock = ManualClock(0.0)
+    probe = {"type": "retention.0", "payload": {"index": 0}, "metadata": {}}
+    # Room for a handful of records, well under the 10-event bound.
+    byte_limit = _serialized_bytes(probe) * 4
+    bus = _bus(clock, history_max_events=10, history_max_bytes=byte_limit)
+    seen: list[str] = []
+    bus.subscribe("retention.*", lambda event: seen.append(event["type"]))
+
+    for index in range(15):
+        returned = await bus.publish(f"retention.{index}", {"index": index}, {})
+        assert returned == {
+            "type": f"retention.{index}",
+            "payload": {"index": index},
+            "metadata": {},
+        }
+
+    retained = bus.list_events()
+    assert 0 < len(retained) < 10
+    assert sum(_serialized_bytes(event) for event in retained) <= byte_limit
+    # Oldest first: what survives is a suffix of what was published.
+    suffix = [f"retention.{i}" for i in range(15 - len(retained), 15)]
+    assert _history_types(bus) == suffix
+    assert seen == [f"retention.{i}" for i in range(15)]
+
+
+async def test_ac20_bus_history_age_limit_evicts_on_publish_and_on_read_with_the_injected_clock() -> None:
+    """R6: the age bound is applied when a record is appended and again when
+    the history is read, on the injected clock, so a stale record is never
+    returned even when nothing was published since it went stale."""
+
+    clock = ManualClock(0.0)
+    bus = _bus(clock, history_max_age_seconds=10.0)
+
+    for index in range(15):
+        clock.now = float(index)
+        await bus.publish(f"retention.{index}", {"index": index}, {})
+
+    # At t=14 the horizon is t=4: records dated strictly before it are gone.
+    assert _history_types(bus) == [f"retention.{i}" for i in range(4, 15)]
+
+    clock.now = 30.0
+    assert bus.list_events() == []
+
+    clock.now = 31.0
+    await bus.publish("retention.late", {}, {})
+    assert _history_types(bus) == ["retention.late"]
+
+
+async def test_ac20_saturated_history_keeps_replacement_and_publication_error_semantics() -> None:
+    """R6: eviction changes what is retained, never what a publication means —
+    a replacement mapping is what the chain continues with and what history
+    keeps, ``False`` still stops the chain, and a failing handler still fails
+    the publication without touching the records already retained."""
+
+    clock = ManualClock(0.0)
+    bus = _bus(clock, history_max_events=2)
+    reached: list[str] = []
+
+    def replace(event: dict[str, Any]) -> dict[str, Any] | bool | None:
+        if event["type"] == "retention.replaced":
+            return {"type": "retention.replaced", "payload": {"replaced": True}, "metadata": {}}
+        if event["type"] == "retention.stopped":
+            return False
+        if event["type"] == "retention.failing":
+            raise RuntimeError("handler failure")
+        return None
+
+    bus.subscribe("retention.*", replace, order=0)
+    bus.subscribe("retention.*", lambda event: reached.append(event["type"]), order=1)
+
+    await bus.publish("retention.0", {}, {})
+    await bus.publish("retention.1", {}, {})
+    await bus.publish("retention.replaced", {"replaced": False}, {})
+    assert _history_types(bus) == ["retention.1", "retention.replaced"]
+    assert bus.list_events()[-1]["payload"] == {"replaced": True}
+
+    await bus.publish("retention.stopped", {}, {})
+    assert _history_types(bus) == ["retention.replaced", "retention.stopped"]
+    assert reached == ["retention.0", "retention.1", "retention.replaced"]
+
+    with pytest.raises(PublicationError) as caught:
+        await bus.publish("retention.failing", {}, {})
+    assert caught.value.event_type == "retention.failing"
+    assert _history_types(bus) == ["retention.replaced", "retention.stopped"]
+
+    # The bus is not poisoned: the next publication is retained as usual.
+    await bus.publish("retention.after", {}, {})
+    assert _history_types(bus) == ["retention.stopped", "retention.after"]
+
+
+# --------------------------------------------------------------------------- #
+# Audit queue: loss counter under a blocked writer (R6, AC21)
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac21_audit_queue_of_two_under_a_blocked_writer_loses_records_never_publications() -> None:
+    """AC21 (R6): with a record capacity of 2 and the writer held blocked,
+    5 publications all complete, at most 2 records reach the writer, the
+    loss counter reads 3 — from the handle and from supervision's in-memory
+    snapshot, outside the queue, never through a bus event that would feed
+    it — and 0 publications are lost: every one of the 5 reached the stage
+    after the audit middleware and every one of the 5 is in the history."""
+
+    context = runtime_context()
+    bus = context.bus
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    handed: list[str] = []
+
+    async def blocked_writer(line: str) -> None:
+        handed.append(line)
+        entered.set()
+        await release.wait()
+
+    handle = await audit.activate(
+        context.for_module("audit"),
+        {
+            "output": "stdout",
+            "_writer": blocked_writer,
+            "queue": {"max_records": 2, "max_bytes": 4096},
+        },
+        {},
+    )
+    downstream: list[str] = []
+    try:
+        await handle.prepare()
+        # Registered after the middleware (order 90): reached only when the
+        # audit stage returned the event, whatever the queue did with it.
+        bus.subscribe("retention.**", lambda event: downstream.append(event["type"]), order=100)
+
+        completed = []
+        for index in range(5):
+            completed.append(await bus.publish(f"retention.audit.{index}", {"index": index}, {}))
+        expected = [f"retention.audit.{i}" for i in range(5)]
+
+        assert [event["type"] for event in completed] == expected
+        assert downstream == expected
+        assert _history_types(bus) == expected
+
+        await wait_until(entered.is_set)
+        assert len(handed) <= 2
+        assert handle.pending == 2
+        assert handle.losses == 3
+        assert context.supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 3
+        # The counter was reported without a single additional publication.
+        assert len(bus.list_events()) == 5
+    finally:
+        release.set()
+        await handle.close()
+
+    # Released at close, the writer wrote what was admitted: at most 2.
+    assert len(handed) <= 2
+    assert handle.losses == 3
+
+
+# --------------------------------------------------------------------------- #
+# Dedup window: eviction by count and time-to-live, replay after eviction
+# (R6, AC22)
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac22_dedup_window_of_two_entries_replays_only_after_count_or_ttl_eviction() -> None:
+    """AC22 (R6): through the real chat input over a fake socket, with a
+    2-entry window and an injected clock — a replay inside the window
+    produces 0 additional events and 0 admissions; a replay after 3 newer
+    identifiers, or after the time-to-live, produces exactly 1 new event and
+    1 admission; the window never holds more than 2 entries."""
+
+    clock = ManualClock(0.0)
+    scheduler = RecordingScheduler()
+    context = twitch_context(
+        clock=clock, dedup_max_entries=2, dedup_ttl_seconds=10.0, scheduler=scheduler
+    )
+    bus = context.bus
+    websocket = FakeWebSocket(welcome("session-1"))
+    handle, _, diagnostics = await activate_twitch(TwitchSession([websocket]), context=context)
+
+    def published() -> list[str]:
+        return [event["payload"]["message_id"] for event in chat_events(bus)]
+
+    def admitted() -> list[str]:
+        return [work.source_event_id for _, work in scheduler.admissions]
+
+    def recorded(message_id: str) -> bool:
+        return context.triggers.recorded(
+            platform=TWITCH_PLATFORM,
+            channel_id=TWITCH_SETTINGS["broadcaster_id"],
+            source_event_id=message_id,
+        ) is not None
+
+    def feed(*message_ids: str) -> None:
+        for message_id in message_ids:
+            websocket.feed(notification(message_id, "Hello Companion"))
+
+    try:
+        feed("a")
+        await wait_until(lambda: published() == ["a"])
+        assert admitted() == ["a"]
+
+        # Reception is ordered: once "b" landed, the replay of "a" queued
+        # ahead of it has been decided — and it produced nothing.
+        feed("a", "b")
+        await wait_until(lambda: "b" in published())
+        assert published() == ["a", "b"]
+        assert admitted() == ["a", "b"]
+        assert context.triggers.window_size == 2
+
+        # 3 newer identifiers ("b", "c", "d") push "a" out, oldest first.
+        feed("c", "d")
+        await wait_until(lambda: published() == ["a", "b", "c", "d"])
+        assert context.triggers.window_size == 2
+        assert not recorded("a")
+        assert recorded("c") and recorded("d")
+
+        feed("a")
+        await wait_until(lambda: published() == ["a", "b", "c", "d", "a"])
+        assert admitted() == ["a", "b", "c", "d", "a"]
+        assert context.supervision.snapshot()[COUNTER_DEDUP_EVICTIONS] == 3
+
+        # Inside the time-to-live "e" is still recorded; 11 units later it is
+        # not, and the replay is reprocessed as a new event.
+        feed("e")
+        await wait_until(lambda: published()[-1] == "e")
+        feed("e", "f")
+        await wait_until(lambda: published()[-1] == "f")
+        assert published() == ["a", "b", "c", "d", "a", "e", "f"]
+        assert recorded("e")
+
+        clock.advance(11.0)
+        assert not recorded("e")
+        feed("e")
+        await wait_until(lambda: len(published()) == 8)
+        assert published() == ["a", "b", "c", "d", "a", "e", "f", "e"]
+        assert admitted() == published()
+        assert context.triggers.window_size == 1
+        # 5 evictions by count ("a", "b", "c", "d", "a") and 2 by age ("e", "f").
+        assert context.supervision.snapshot()[COUNTER_DEDUP_EVICTIONS] == 7
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+# --------------------------------------------------------------------------- #
+# Conversation memory: sessions, exchanges, bytes and age, read from the
+# next model request (R6, AC30)
+# --------------------------------------------------------------------------- #
+
+
+MEMORY_LIMITS = {
+    "conversation_memory": {
+        "max_sessions": 2,
+        "max_exchanges": 3,
+        "max_bytes": 200,
+        "max_age_seconds": 10,
+    }
+}
+"""AC30's bounds, handed to the engine as its own settings."""
+
+
+def _replies(count: int) -> list[FakeResponse]:
+    return [FakeResponse(200, completion(f"reply-{index}")) for index in range(count)]
+
+
+def _brain_key(viewer_id: str) -> SessionKey:
+    return SessionKey(platform=BRAIN_PLATFORM, channel_id=BRAIN_CHANNEL, viewer_id=viewer_id)
+
+
+def _exchanges_in(prompt: list[dict[str, str]]) -> int:
+    """Exchanges a request carries: one user and one assistant message each."""
+
+    between = prompt[1:-1]
+    assert len(between) % 2 == 0
+    return len(between) // 2
+
+
+async def test_ac30_session_cap_evicts_exactly_one_memory_and_the_evicted_session_starts_empty() -> None:
+    """AC30 (R6): limited to 2 sessions, a third distinct session evicts
+    exactly 1 memory so exactly 2 remain; the evicted session's next model
+    request carries 0 earlier exchanges, while a retained session's next
+    request still carries its own."""
+
+    harness = await activate_brain(*_replies(5), settings_overrides=MEMORY_LIMITS)
+    try:
+        await harness.send("first question", message_id="m1", viewer_id="viewer-1")
+        await harness.completed(1)
+        await harness.send("second question", message_id="m2", viewer_id="viewer-2")
+        await harness.completed(2)
+        assert len(harness.handle.memory.sessions()) == 2
+
+        await harness.send("third question", message_id="m3", viewer_id="viewer-3")
+        await harness.completed(3)
+        assert len(harness.handle.memory.sessions()) == 2
+        assert harness.handle.memory.recall(_brain_key("viewer-1")) == ()
+
+        await harness.send("first returns", message_id="m4", viewer_id="viewer-1")
+        await harness.completed(4)
+        assert _exchanges_in(harness.prompt(3)) == 0
+        assert rendered_history(harness.prompt(3)) == ""
+
+        await harness.send("third returns", message_id="m5", viewer_id="viewer-3")
+        await harness.completed(5)
+        assert _exchanges_in(harness.prompt(4)) == 1
+        history = rendered_history(harness.prompt(4))
+        assert "third question" in history
+        assert "reply-2" in history
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+async def test_ac30_exchange_cap_leaves_exactly_three_in_the_next_request_with_the_oldest_absent() -> None:
+    """AC30 (R6): a 4th exchange in 1 session leaves exactly 3 exchanges in
+    the next model request, the oldest absent and the newest 3 present.
+
+    The exchanges are kept short — the engine prefixes the viewer and
+    message identifiers into what it remembers — so that 4 of them stay
+    under the 200-byte bound and the count bound is the one that evicts.
+    """
+
+    replies = [FakeResponse(200, completion(f"r{index}")) for index in range(5)]
+    harness = await activate_brain(*replies, settings_overrides=MEMORY_LIMITS)
+    key = _brain_key("v")
+    try:
+        for index in range(4):
+            await harness.send(f"q{index}", message_id=str(index), viewer_id="v")
+            await harness.completed(index + 1)
+        retained = harness.handle.memory.recall(key)
+        assert sum(exchange.size for exchange in retained) < 200
+        assert [exchange.assistant for exchange in retained] == ["r1", "r2", "r3"]
+
+        await harness.send("q4", message_id="4", viewer_id="v")
+        await harness.completed(5)
+
+        assert _exchanges_in(harness.prompt(4)) == 3
+        history = rendered_history(harness.prompt(4))
+        assert "message: q0" not in history
+        assert "r0" not in history
+        for index in (1, 2, 3):
+            assert f"message: q{index}" in history
+            assert f"r{index}" in history
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+async def test_ac30_byte_cap_leaves_fewer_than_three_exchanges_and_at_most_two_hundred_bytes() -> None:
+    """AC30 (R6): exchanges totalling more than 200 bytes leave fewer than 3
+    retained and at most 200 bytes, the newest kept and the oldest gone."""
+
+    replies = [f"reply-{index}-" + "r" * 30 for index in range(4)]
+    harness = await activate_brain(
+        *(FakeResponse(200, completion(reply)) for reply in replies),
+        settings_overrides=MEMORY_LIMITS,
+    )
+    key = _brain_key("viewer-4")
+    try:
+        for index in range(3):
+            await harness.send(f"question-{index}-" + "q" * 30, message_id=f"m{index}")
+            await harness.completed(index + 1)
+
+        # What was offered: each request's user content plus its confirmed
+        # reply, weighed as the memory weighs them — more than 200 bytes.
+        offered = sum(
+            len(harness.prompt(index)[-1]["content"].encode("utf-8"))
+            + len(replies[index].encode("utf-8"))
+            for index in range(3)
+        )
+        assert offered > 200
+
+        retained = harness.handle.memory.recall(key)
+        assert 0 < len(retained) < 3
+        assert sum(exchange.size for exchange in retained) <= 200
+        assert retained[-1].assistant.startswith("reply-2-")
+
+        await harness.send("question-3", message_id="m3")
+        await harness.completed(4)
+        assert 0 < _exchanges_in(harness.prompt(3)) < 3
+        history = rendered_history(harness.prompt(3))
+        assert "reply-2-" in history
+        assert "reply-0-" not in history
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+async def test_ac30_age_bound_drops_every_exchange_after_eleven_units_and_keeps_a_later_one() -> None:
+    """AC30 (R6): advancing the injected clock by 11 time units leaves 0
+    retained exchanges for the session — its next model request carries
+    none — while the exchange added afterwards is retained."""
+
+    harness = await activate_brain(*_replies(4), settings_overrides=MEMORY_LIMITS)
+    key = _brain_key("viewer-4")
+    try:
+        await harness.send("old question", message_id="m0")
+        await harness.completed(1)
+        await harness.send("older question", message_id="m1")
+        await harness.completed(2)
+        assert len(harness.handle.memory.recall(key)) == 2
+
+        harness.clock.advance(11.0)
+        assert harness.handle.memory.recall(key) == ()
+
+        await harness.send("new question", message_id="m2")
+        await harness.completed(3)
+        assert _exchanges_in(harness.prompt(2)) == 0
+
+        retained = harness.handle.memory.recall(key)
+        assert [exchange.assistant for exchange in retained] == ["reply-2"]
+        await harness.send("newer question", message_id="m3")
+        await harness.completed(4)
+        assert _exchanges_in(harness.prompt(3)) == 1
+        assert "new question" in rendered_history(harness.prompt(3))
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# Startup: non-finite retention limits are refused through core.main.run
+# (R6, AC32)
+# --------------------------------------------------------------------------- #
+
+
+PROBE_MODULE_SOURCE = '''
+"""A fictional input that probes the retention the application wired.
+
+It records, in the log configuration names, when it was activated, when its
+transport phase ran, and what the bus and the attachment store it was handed
+actually retained — so the suite reads the wired bounds, not a component it
+built itself.
+"""
+
+import json
+from pathlib import Path
+
+
+def record(settings, entry):
+    with Path(settings["log"]).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, sort_keys=True) + "\\n")
+
+
+class Handle:
+    def __init__(self, context, settings):
+        self.context = context
+        self.settings = settings
+        self.seen = []
+
+    async def prepare(self):
+        self.context.bus.subscribe(
+            "retention.probe.*", lambda event: self.seen.append(event["type"])
+        )
+
+    async def start_inputs(self):
+        # The phase in which a real input opens its transport.
+        record(self.settings, {"transport": "opened"})
+        bus = self.context.bus
+        for index in range(15):
+            await bus.publish("retention.probe.%d" % index, {"index": index}, {})
+        retained = [
+            event["type"]
+            for event in bus.list_events()
+            if event["type"].startswith("retention.probe.")
+        ]
+        store = self.context.attachments
+        refusals = []
+        for _ in range(3):
+            try:
+                store.put("probe-run", b"x" * 512, content_type="application/octet-stream")
+            except Exception as exc:
+                refusals.append(getattr(exc, "limit", type(exc).__name__))
+        released = store.release("probe-run")
+        record(
+            self.settings,
+            {
+                "retained": retained,
+                "seen": list(self.seen),
+                "refusals": refusals,
+                "released_objects": released.objects,
+            },
+        )
+
+    async def stop_inputs(self):
+        return None
+
+    async def close(self):
+        return None
+
+
+async def activate(context, settings, catalog):
+    record(settings, {"activated": context.module})
+    return Handle(context, settings)
+'''
+
+
+def _finite_limits() -> dict[str, dict[str, Any]]:
+    """Every retention and admission limit, finite and positive (AC32)."""
+
+    return {
+        "bus_history": {"max_events": 10, "max_bytes": 65536, "max_age_seconds": 60},
+        "observation_queue": {"max_records": 64, "max_bytes": 65536},
+        "dedup": {"max_entries": 32, "ttl_seconds": 30.0},
+        "attachments": {
+            "max_object_bytes": 1024,
+            "max_objects": 2,
+            "max_total_bytes": 4096,
+            "max_bytes_per_run": 2048,
+            "ttl_seconds": 30.0,
+        },
+        "conversation_memory": {
+            "max_sessions": 4,
+            "max_exchanges": 6,
+            "max_bytes": 4096,
+            "max_age_seconds": 120.0,
+        },
+        "chat_context": {
+            "max_messages": 16,
+            "max_bytes": 4096,
+            "max_age_seconds": 60.0,
+            "max_channels": 4,
+        },
+        "admission": {
+            "session_queue_capacity": 2,
+            "global_pending_capacity": 8,
+            "max_sessions": 4,
+            "workers": 2,
+            "wait_seconds": 5.0,
+            "total_run_seconds": 20.0,
+        },
+    }
+
+
+def _write_probe_application(tmp_path: Path) -> tuple[Path, Path, dict[str, Any]]:
+    """A modules directory holding the probe input, and the configuration
+    that enables it with every limit finite; the caller mutates the limits."""
+
+    modules = tmp_path / "modules"
+    directory = modules / "probe"
+    directory.mkdir(parents=True)
+    manifest = {
+        "name": "probe",
+        "manifest_version": 2,
+        "runtime_api": 2,
+        "produces": ["retention.probe.*"],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": ["input"]},
+    }
+    (directory / "module.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    (directory / "__init__.py").write_text(PROBE_MODULE_SOURCE, encoding="utf-8")
+    log = tmp_path / "probe.jsonl"
+    config: dict[str, Any] = {
+        "modules_directory": "./modules",
+        "enabled_modules": ["probe"],
+        "modules": {"probe": {"log": str(log)}},
+        "limits": _finite_limits(),
+    }
+    return tmp_path / "config.yaml", log, config
+
+
+def _probe_log(log: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "setting"),
+    [
+        pytest.param(
+            lambda limits: limits["bus_history"].pop("max_events"),
+            "limits.bus_history.max_events",
+            id="absent-bus-history-event-limit",
+        ),
+        pytest.param(
+            lambda limits: limits["observation_queue"].__setitem__("max_bytes", -1),
+            "limits.observation_queue.max_bytes",
+            id="negative-audit-queue-byte-limit",
+        ),
+        pytest.param(
+            lambda limits: limits["dedup"].__setitem__("ttl_seconds", "soon"),
+            "limits.dedup.ttl_seconds",
+            id="non-numeric-dedup-ttl",
+        ),
+        pytest.param(
+            lambda limits: limits["attachments"].__setitem__("max_total_bytes", float("inf")),
+            "limits.attachments.max_total_bytes",
+            id="infinite-attachment-total-volume",
+        ),
+        pytest.param(
+            lambda limits: limits["conversation_memory"].pop("max_exchanges"),
+            "limits.conversation_memory.max_exchanges",
+            id="absent-conversation-memory-exchange-limit",
+        ),
+    ],
+)
+async def test_ac32_each_non_finite_retention_limit_stops_startup_naming_it_with_zero_transports(
+    tmp_path: Path, mutate: Callable[[dict[str, Any]], object], setting: str
+) -> None:
+    """AC32 (R6): through ``core.main.run``, one non-finite retention limit
+    at a time stops startup with a non-zero status and exactly 1 diagnostic
+    naming that setting; readiness is never reported, 0 modules are
+    activated and 0 transports are opened."""
+
+    config_path, log, config = _write_probe_application(tmp_path)
+    mutate(config["limits"])
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+    # Already set: a startup that wrongly got past validation would stop at
+    # once with status 0 and fail below, rather than wait here forever.
+    stop = asyncio.Event()
+    stop.set()
+
+    status = await application.run(
+        config_path,
+        stop,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert len(diagnostics) == 1
+    assert diagnostics[0].startswith(f"{setting}: ")
+    # Neither activation nor the transport phase left a trace.
+    assert not log.exists()
+
+
+async def test_ac32_all_finite_retention_limits_start_and_wire_the_configured_bounds(
+    tmp_path: Path,
+) -> None:
+    """AC32's control (R6): the same configuration with every limit finite
+    and positive starts, reports readiness and stops cleanly — and the bus
+    and the attachment store the module was handed are bounded exactly as
+    configured, not at a built-in default: 15 publications leave the 10
+    newest records while all 15 reached the subscriber, and a 2-object store
+    refuses the third object by name and releases 2 at the run's end."""
+
+    config_path, log, config = _write_probe_application(tmp_path)
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    stop = asyncio.Event()
+    stop.set()
+    readiness: list[str] = []
+
+    status = await application.run(
+        config_path,
+        stop,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=lambda message: pytest.fail(message),
+    )
+
+    assert status == 0
+    assert readiness == ["ready"]
+    assert _probe_log(log) == [
+        {"activated": "probe"},
+        {"transport": "opened"},
+        {
+            "retained": [f"retention.probe.{index}" for index in range(5, 15)],
+            "seen": [f"retention.probe.{index}" for index in range(15)],
+            "refusals": ["max_objects"],
+            "released_objects": 2,
+        },
+    ]

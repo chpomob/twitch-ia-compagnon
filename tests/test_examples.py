@@ -1,3 +1,15 @@
+"""The quick-start example and the shipped manifests (R1, R5, R6, R7).
+
+The example is loaded through the same path ``core.main`` uses — never a
+permissive parser — and the manifests are checked as the versioned runtime
+reads them: every one is v2, declares the runtime contract it is built
+against, its lifecycle roles, its settings schema and the hook its package
+implements. The former whole-manifest equality (allowlisted; R7) is replaced
+by this shape check: the routing keys stay exact, the contract declarations
+are asserted for presence and coherence, and their detail belongs to each
+module's own suite.
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -8,7 +20,13 @@ from typing import Any
 
 import yaml
 
+import core.main as application
+from core.contracts import Destination
+from core.lifecycle import ROLE_INPUT, ROLE_OBSERVATION
+from core.loader import ModuleLoader
 from core.main import LIMITS_KEY, load_config
+from core.runtime import RUNTIME_API
+from conftest import FakeResponse, FakeSession
 
 
 ROOT = Path(__file__).parents[1]
@@ -16,30 +34,47 @@ EXAMPLE_PATH = ROOT / "config.yaml.example"
 MODULE_NAMES = ("twitch", "brain", "audit")
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
-# The routing keys every manifest declares, v1 or v2. A v2 manifest carries
-# its contract declarations beside them; those are asserted by the module's
-# own suite, not by this cross-manifest coherence check.
+# What every v2 manifest declares exactly: the routing keys of v1, the
+# version and runtime contract, the lifecycle roles the coordinator reads
+# instead of the module name (R4), and the name of the settings hook the
+# package implements (R7). The contract declarations beside them — the
+# settings schema, the chat input's triggers and action — are asserted for
+# presence here and in detail by the module's own suite.
 EXPECTED_MANIFESTS = {
     "twitch": {
         "name": "twitch",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
         "produces": ["channel.chat.message"],
         "consumes": ["channel.chat.send"],
         "middleware": False,
+        "lifecycle": {"roles": [ROLE_INPUT]},
+        "settings_validator": "validate_settings",
     },
     "brain": {
         "name": "brain",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
         "produces": ["channel.chat.send"],
         "consumes": ["channel.chat.message"],
         "middleware": False,
+        "lifecycle": {"roles": []},
+        "settings_validator": "validate_settings",
     },
     "audit": {
         "name": "audit",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
         "produces": [],
         "consumes": ["**"],
         "middleware": True,
         "order": 90,
+        "lifecycle": {"roles": [ROLE_OBSERVATION]},
+        "settings_validator": "validate_settings",
     },
 }
+# The declarations only the chat input carries (R1, R5).
+DECLARATION_KEYS = {"twitch": {"triggers", "actions"}, "brain": set(), "audit": set()}
 
 SECRET_SETTINGS = {
     "twitch": ("client_id", "client_secret", "access_token"),
@@ -64,35 +99,49 @@ def _assert_sample_or_environment_reference(value: Any) -> None:
         assert ENV_REFERENCE.fullmatch(value)
 
 
-def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
-    """R7: the former whole-manifest equality is superseded by versioning.
-
-    Every manifest still declares exactly the expected routing keys; a v2
-    manifest (twitch, since R7 requires ``manifest_version``) additionally
-    carries its contract declarations, checked here only for presence.
-    """
-
-    manifests = {
+def _manifests() -> dict[str, Mapping[str, Any]]:
+    return {
         module_name: _read_yaml(ROOT / "modules" / module_name / "module.yaml")
         for module_name in MODULE_NAMES
     }
 
+
+def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
+    """R7 supersedes the former whole-manifest equality (allowlisted).
+
+    Every shipped manifest is v2: it declares the routing keys exactly as
+    before, the runtime contract it is built against, its lifecycle roles,
+    a settings schema and a settings hook its package really implements.
+    Only the chat input declares triggers and an action; the manifests
+    carry no key beyond those, so nothing is declared that the runtime
+    does not read.
+    """
+
+    manifests = _manifests()
+
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
+
     for module_name, expected in EXPECTED_MANIFESTS.items():
         manifest = manifests[module_name]
-        assert {key: manifest.get(key) for key in expected} == expected
-        if manifest.get("manifest_version") is None:
-            assert manifest == expected
-        else:
-            assert manifest["manifest_version"] == 2
-            assert set(expected) < set(manifest)
-    assert manifests["twitch"]["manifest_version"] == 2
+        assert {key: manifest.get(key) for key in expected} == expected, module_name
+        assert set(manifest) == set(expected) | {"settings_schema"} | DECLARATION_KEYS[module_name]
+
+        schema = manifest["settings_schema"]
+        assert isinstance(schema, Mapping) and schema.get("type") == "object"
+        assert isinstance(schema.get("properties"), Mapping) and schema["properties"]
+        assert set(schema.get("required", ())) <= set(schema["properties"])
+
+        module = importlib.import_module(f"modules.{module_name}")
+        assert callable(getattr(module, manifest["settings_validator"]))
 
     for manifest in manifests.values():
+        assert type(manifest["manifest_version"]) is int
         assert type(manifest["middleware"]) is bool
     assert type(manifests["audit"]["order"]) is int
+    assert isinstance(manifests["twitch"]["triggers"], Mapping)
+    assert isinstance(manifests["twitch"]["actions"], list) and manifests["twitch"]["actions"]
 
 
 def test_example_config_is_complete_and_contains_no_literal_credentials() -> None:
@@ -203,3 +252,188 @@ def test_example_config_satisfies_every_module_owned_settings_validator() -> Non
         module = importlib.import_module(f"modules.{module_name}")
         validator = getattr(module, hook_name)
         assert validator(expanded["modules"][module_name]) == [], module_name
+
+
+# --------------------------------------------------------------------------- #
+# The example through the real assembly and the real loader (R1, R5, R6)
+# --------------------------------------------------------------------------- #
+
+
+def _referenced_variables(value: Any) -> set[str]:
+    """Every ``${NAME}`` the example references, in values and mapping keys."""
+
+    found: set[str] = set()
+    if isinstance(value, str):
+        match = ENV_REFERENCE.fullmatch(value)
+        if match is not None:
+            found.add(match.group(1))
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            found |= _referenced_variables(key)
+            found |= _referenced_variables(item)
+    elif isinstance(value, list):
+        for item in value:
+            found |= _referenced_variables(item)
+    return found
+
+
+def _sample_environ() -> dict[str, str]:
+    """A sample value per referenced variable; endpoints get a URL shape."""
+
+    return {
+        name: (
+            f"https://sample.invalid/{name.lower()}"
+            if name.endswith("ENDPOINT")
+            else f"sample-{name.lower()}"
+        )
+        for name in _referenced_variables(_read_yaml(EXAMPLE_PATH))
+    }
+
+
+class _TwitchSession:
+    """The chat input's transport, reaching preparation and nothing beyond.
+
+    Preparation validates the credential over ``get``; no subscription, no
+    socket and no send is ever requested by these tests.
+    """
+
+    def __init__(self, environ: Mapping[str, str]) -> None:
+        self._identity = {
+            "client_id": environ["TWITCH_CLIENT_ID"],
+            "user_id": environ["TWITCH_BOT_USER_ID"],
+        }
+        self.close_calls = 0
+
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        return FakeResponse(200, dict(self._identity))
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        raise AssertionError(f"unexpected request beyond preparation: {url}")
+
+    async def ws_connect(self, url: str) -> Any:
+        raise AssertionError(f"unexpected socket beyond preparation: {url}")
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def _activate_example(
+    environ: Mapping[str, str],
+) -> tuple[Any, list[Any], list[str]]:
+    """Load the example as ``core.main`` does, assemble the runtime from its
+    limits and its authorization rules, and activate the enabled modules
+    through the real loader — with the transport seams pointed at fakes, so
+    nothing reaches a network — returning the runtime, the activations and
+    the diagnostics the modules reported."""
+
+    config = load_config(EXAMPLE_PATH, environ=environ)
+    runtime = application._assemble_runtime(config)
+    diagnostics: list[str] = []
+    config["modules"]["twitch"].update(
+        {
+            "_session_factory": lambda: _TwitchSession(environ),
+            "diagnostic_reporter": diagnostics.append,
+        }
+    )
+    config["modules"]["brain"].update(
+        {"_session_factory": FakeSession, "diagnostic_reporter": diagnostics.append}
+    )
+    config["modules"]["audit"]["_writer"] = lambda line: None
+
+    loader = ModuleLoader(runtime.bus, config["modules_directory"])
+    loader.context = runtime.context
+    loader.environ = environ
+    activations = await loader.activate_enabled(config)
+    return runtime, activations, diagnostics
+
+
+def _chat_event(channel_id: str, message_id: str, text: str) -> dict[str, Any]:
+    """A schema-version-2 normalised chat message, as the chat input publishes it."""
+
+    return {
+        "type": "channel.chat.message",
+        "payload": {
+            "platform": "twitch",
+            "channel_id": channel_id,
+            "author": {"id": "viewer-1", "display_name": "Viewer"},
+            "message_id": message_id,
+            "text": text,
+        },
+        "metadata": {"source": "twitch", "schema_version": 2},
+    }
+
+
+async def test_example_trigger_policies_give_the_two_channels_two_distinct_policies() -> None:
+    """AC1 (R1) on the example: the served channel carries an explicit
+    ``keyword`` rule and accepts exactly 1 of 2 messages — the one with the
+    keyword, not the one that merely mentions the companion — while a
+    channel with no entry falls back to the manifest default and accepts
+    only the 1 message of 2 that mentions the configured companion name:
+    2 accepted and 2 rejected decisions, from one registry in one process."""
+
+    environ = _sample_environ()
+    runtime, activations, diagnostics = await _activate_example(environ)
+    try:
+        engine = runtime.context.triggers
+        served = environ["TWITCH_BROADCASTER_ID"]
+        other = "another-channel"
+        companion = _read_yaml(EXAMPLE_PATH)["modules"]["twitch"]["companion_name"]
+        keyword = "!ask"
+        assert companion.casefold() not in keyword.casefold()
+
+        decisions = {
+            "served-keyword": engine.evaluate(_chat_event(served, "s1", f"{keyword} what time is it")),
+            "served-mention": engine.evaluate(_chat_event(served, "s2", f"{companion}, what time is it")),
+            "other-keyword": engine.evaluate(_chat_event(other, "o1", f"{keyword} what time is it")),
+            "other-mention": engine.evaluate(_chat_event(other, "o2", f"{companion}, what time is it")),
+        }
+
+        assert {name: decision.accepted for name, decision in decisions.items()} == {
+            "served-keyword": True,
+            "served-mention": False,
+            "other-keyword": False,
+            "other-mention": True,
+        }
+        assert sum(decision.accepted for decision in decisions.values()) == 2
+        # Two distinct policies, not one merged one: the served channel's
+        # version differs from the default's.
+        assert decisions["served-keyword"].policy_version != decisions["other-mention"].policy_version
+        assert decisions["served-keyword"].policy_version == decisions["served-mention"].policy_version
+        assert diagnostics == []
+    finally:
+        for activation in reversed(activations):
+            await activation.handle.close()
+
+
+async def test_example_authorization_grants_exactly_the_actions_the_modules_declare() -> None:
+    """R5 on the example: once the chat input has bound its provider, the
+    authorized view offered to the run engine's principal on the served
+    channel is exactly the set of actions the enabled manifests declare —
+    and nothing anywhere the example's rules do not reach: another channel,
+    another principal."""
+
+    environ = _sample_environ()
+    runtime, activations, diagnostics = await _activate_example(environ)
+    try:
+        registry = runtime.context.actions
+        declared = set(registry.discovered())
+        assert declared == {"chat.write"}
+        assert registry.authorized(principal="brain") == {}
+
+        (twitch,) = [activation for activation in activations if activation.name == "twitch"]
+        await twitch.handle.prepare()
+        served = Destination("twitch", environ["TWITCH_BROADCASTER_ID"], "chat")
+
+        assert set(registry.authorized(principal="brain", destination=served)) == declared
+        assert registry.authorized(principal="brain", destination=Destination("twitch", "another-channel", "chat")) == {}
+        assert registry.authorized(principal="twitch", destination=served) == {}
+        assert registry.authorized(principal="audit", destination=served) == {}
+
+        # The rules grant exactly the declared actions: no rule names an
+        # action nobody declares.
+        rules = _read_yaml(EXAMPLE_PATH)["actions"]
+        assert {rule["action_name"] for rule in rules} == declared
+        assert diagnostics == []
+    finally:
+        for activation in reversed(activations):
+            await activation.handle.close()
