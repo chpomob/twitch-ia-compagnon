@@ -1,19 +1,70 @@
+"""The brain run engine on the v2 runtime (R2, R3, R5, R6, R7).
+
+The former suite drove the model synchronously from the publication chain,
+fed v1 payloads carrying ``chatter_id`` only, read delivery from ``[send:...]``
+tags republished on the bus and keyed memory by viewer alone. Every one of
+those assertions is on the specification's allowlist; each is replaced below
+by its admission-driven, ``SessionKey``-keyed, executor-confirmed equivalent,
+with the superseding requirement named in the test's docstring.
+
+The harness wires the **real** :class:`~core.actions.ActionExecutor`, the
+real :class:`~core.admission.AdmissionScheduler` the engine builds for itself
+and the real :class:`~core.runtime.Supervision`; only the model transport and
+the send edge behind ``chat.write`` are fakes. Nothing here sleeps: the clock
+is injected and every wait is a bounded number of bare loop turns.
+"""
+
 from __future__ import annotations
 
 import asyncio
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import yaml
 
-from core.actions import ActionExecutor, ActionRegistry, AuthorizationPolicy
+from core.actions import (
+    ERROR_EXTERNAL_UNKNOWN,
+    ERROR_NOT_AUTHORIZED,
+    ERROR_PROVIDER_FAILED,
+    ERROR_TIMED_OUT,
+    ActionExecutor,
+    ActionRegistry,
+    AuthorizationPolicy,
+    AuthorizationRule,
+)
+from core.admission import REASON_CANCELLED
 from core.bus import EventBus
-from core.contracts import Counters
+from core.contracts import (
+    TRACE_ACTION_COMPLETED,
+    TRACE_ACTION_STARTED,
+    TRACE_BRAIN_ADMISSION_ACCEPTED,
+    TRACE_BRAIN_RUN_COMPLETED,
+    TRACE_BRAIN_RUN_STARTED,
+    WILDCARD,
+    ActionObservation,
+    ActionSpec,
+    Counters,
+    Destination,
+    SessionKey,
+)
 from core.lifecycle import PhaseCoordinator, SupervisedTasks
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext, Supervision
-from modules.brain import MODULE_NAME, activate, validate_settings
+from modules.brain import (
+    CHAT_SCOPE,
+    DELIVERY_ACTION,
+    DELIVERY_NOT_ATTEMPTED,
+    MODULE_NAME,
+    PRINCIPAL,
+    BrainModuleError,
+    ConversationMemory,
+    activate,
+    validate_settings,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -52,27 +103,60 @@ LIMITS = {
 
 VALID_SETTINGS = {**SETTINGS, **LIMITS}
 
-CATALOG = {
-    "twitch": {
-        "name": "twitch",
-        "produces": ("channel.chat.message",),
-        "consumes": ("channel.chat.send",),
-        "middleware": False,
+PLATFORM = "twitch"
+OTHER_PLATFORM = "other-platform"
+CHANNEL = "channel-1"
+OTHER_CHANNEL = "channel-2"
+VIEWER = "viewer-4"
+INPUT_EVENT = "channel.chat.message"
+COMPATIBILITY_ROUTE = "channel.chat.send"
+SENDER_MODULE = "sender"
+PERMISSION = "chat.write"
+
+# Outcomes the fake send edge can be told to produce for one delivery.
+SENT = "sent"
+FAIL_BEFORE_EMISSION = "fail_before_emission"
+FAIL_AFTER_EMISSION = "fail_after_emission"
+TIMEOUT_BEFORE_EMISSION = "timeout_before_emission"
+
+RUN_TRACES = (TRACE_BRAIN_RUN_STARTED, TRACE_BRAIN_RUN_COMPLETED)
+
+CHAT_WRITE_SPEC = ActionSpec(
+    name=DELIVERY_ACTION,
+    version=1,
+    description="Send one chat message to the channel.",
+    argument_schema={
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": False,
     },
-    "brain": {
-        "name": "brain",
-        "produces": ("channel.chat.send",),
-        "consumes": ("channel.chat.message",),
-        "middleware": False,
+    result_schema={
+        "type": "object",
+        "properties": {"message_id": {"type": "string"}},
+        "required": ["message_id"],
     },
-    "audit": {
-        "name": "audit",
-        "produces": (),
-        "consumes": ("**",),
-        "middleware": True,
-        "order": 90,
-    },
-}
+    nature="write",
+    required_permissions=(PERMISSION,),
+    supported_destinations=(
+        Destination(PLATFORM, WILDCARD, CHAT_SCOPE),
+        Destination(OTHER_PLATFORM, WILDCARD, CHAT_SCOPE),
+    ),
+    timeout_seconds=10.0,
+    idempotency="key",
+)
+
+BRAIN_GRANT = AuthorizationRule(
+    rule_id="brain-chat-write",
+    action_name=DELIVERY_ACTION,
+    principals=(PRINCIPAL,),
+    granted_permissions=(PERMISSION,),
+)
+
+
+# --------------------------------------------------------------------------- #
+# Doubles: the model transport, the send edge, the clock, the trigger window
+# --------------------------------------------------------------------------- #
 
 
 class FakeResponse:
@@ -91,6 +175,8 @@ class FakeResponse:
 
 
 class FakeSession:
+    """The model transport: one prepared result per request, in order."""
+
     def __init__(self, *results: Any) -> None:
         self.results = list(results)
         self.post_calls: list[dict[str, Any]] = []
@@ -107,60 +193,371 @@ class FakeSession:
         self.close_calls += 1
 
 
-def completion(content: str) -> dict[str, Any]:
-    return {"choices": [{"message": {"content": content}}]}
+class HeldSession(FakeSession):
+    """A model transport that holds every request until released."""
+
+    def __init__(self, *results: Any) -> None:
+        super().__init__(*results)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.post_calls.append({"url": url, **kwargs})
+        result = self.results.pop(0)
+        self.entered.set()
+        await self.release.wait()
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def completion(content: str, usage: dict[str, int] | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {"choices": [{"message": {"content": content}}]}
+    if usage is not None:
+        body["usage"] = usage
+    return body
+
+
+class FakeTransport:
+    """The send edge behind the real executor: what actually left (AC19)."""
+
+    def __init__(self, *outcomes: str) -> None:
+        self.outcomes = list(outcomes)
+        self.sends: list[dict[str, Any]] = []
+
+
+class FakeSendProvider:
+    """A ``chat.write`` provider bound in the real registry over the fake edge."""
+
+    name = "fake-send"
+
+    def __init__(self, transport: FakeTransport) -> None:
+        self._transport = transport
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        invocation.mark_not_emitted()
+        call = invocation.call
+        outcome = self._transport.outcomes.pop(0) if self._transport.outcomes else SENT
+        provenance = {"provider": self.name}
+        if outcome == FAIL_BEFORE_EMISSION:
+            raise RuntimeError("transport unavailable")
+        if outcome == TIMEOUT_BEFORE_EMISSION:
+            return ActionObservation(
+                status="timeout",
+                provenance=provenance,
+                error={"code": ERROR_TIMED_OUT, "message": "", "retryable": False},
+            )
+        invocation.mark_emitted()
+        if outcome == FAIL_AFTER_EMISSION:
+            raise RuntimeError("no confirmation")
+        self._transport.sends.append(
+            {
+                "text": call.arguments["text"],
+                "destination": call.destination,
+                "principal": call.principal,
+                "run_id": call.run_id,
+                "call_id": call.call_id,
+                "conversation_id": call.conversation_id,
+                "source_event_id": call.source_event_id,
+                "message_id": call.message_id,
+            }
+        )
+        return ActionObservation(
+            status="success",
+            provenance=provenance,
+            result={"message_id": f"sent-{len(self._transport.sends)}"},
+        )
+
+
+class ManualClock:
+    """A monotonic clock nobody waits on: time only moves when a test says so.
+
+    ``sleep`` is the sleeper injected into the engine's owned scheduler; it
+    parks a future until :meth:`advance` brings the clock past it, so no
+    deadline ever fires because a test waited.
+    """
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+        self._waiters: list[tuple[float, asyncio.Future[None]]] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        if delay <= 0:
+            await asyncio.sleep(0)
+            return
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        entry = (self.now + delay, waiter)
+        self._waiters.append(entry)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            self._waiters = [item for item in self._waiters if item is not entry]
+            raise
+
+    def advance(self, delta: float) -> None:
+        self.now += delta
+        due = [item for item in self._waiters if item[0] <= self.now]
+        self._waiters = [item for item in self._waiters if item[0] > self.now]
+        for _deadline, waiter in due:
+            if not waiter.done():
+                waiter.set_result(None)
+
+
+class FakeTriggerEngine:
+    """A window of recorded decisions the engine consults; it evaluates nothing.
+
+    The brain never evaluates a trigger — the input module does, before it
+    publishes (R1) — so only ``recorded`` is ever reached from here.
+    """
+
+    def __init__(self) -> None:
+        self.decisions: dict[tuple[str, str, str], Any] = {}
+
+    def decide(
+        self,
+        message_id: str,
+        *,
+        accepted: bool,
+        platform: str = PLATFORM,
+        channel_id: str = CHANNEL,
+    ) -> None:
+        self.decisions[(platform, channel_id, message_id)] = SimpleNamespace(
+            accepted=accepted
+        )
+
+    def evaluate(self, event: Any, **_: Any) -> Any:
+        raise AssertionError("the brain evaluates no trigger")
+
+    def recorded(
+        self, *, platform: str, channel_id: str, source_event_id: str, clock: Any = None
+    ) -> Any:
+        return self.decisions.get((platform, channel_id, source_event_id))
+
+
+class RecordingScheduler:
+    """A scheduler shared through the context; records what is admitted."""
+
+    def __init__(self) -> None:
+        self.admissions: list[tuple[SessionKey, Any]] = []
+
+    def admit(self, session_key: SessionKey, work: Any) -> Any:
+        self.admissions.append((session_key, work))
+        return SimpleNamespace(accepted=True, run_id=f"run-{len(self.admissions)}")
+
+
+class PublisherRecordingBus(EventBus):
+    """A bus that records which component published each event.
+
+    The publishing component is the first frame on the publishing call stack
+    outside the bus and the supervision facade, so a trace handed to
+    supervision by the scheduler is attributed to ``core.admission`` and one
+    published by the engine would be attributed to ``modules.brain``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.publishers: list[tuple[str, str]] = []
+
+    async def publish(self, event_type: str, payload: Any, metadata: Any) -> Any:
+        self.publishers.append((event_type, _publishing_component()))
+        return await super().publish(event_type, payload, metadata)
+
+
+def _publishing_component() -> str:
+    frame = sys._getframe(1)
+    while frame is not None:
+        module = frame.f_globals.get("__name__", "")
+        if module.startswith(("core.", "modules.")) and module not in (
+            "core.bus",
+            "core.runtime",
+        ):
+            return module
+        frame = frame.f_back
+    return "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# The runtime the engine is activated on
+# --------------------------------------------------------------------------- #
+
+
+def runtime_context(
+    bus: EventBus | None = None,
+    *,
+    clock: Any = None,
+    transport: FakeTransport | None = None,
+    grant: bool = True,
+    triggers: Any = None,
+    scheduler: Any = None,
+) -> RuntimeContext:
+    """The versioned runtime: real bus, registry, executor, supervision, tasks.
+
+    A ``chat.write`` provider over the fake send edge is registered and ready
+    under another module's name, as the input module's would be, and the
+    policy carries the one explicit grant the engine's principal needs —
+    or none, so a test can watch default deny refuse the delivery (R5). The
+    engine builds its own scheduler unless one is shared through the context.
+    """
+
+    target_bus = bus or EventBus()
+    target_clock = clock if clock is not None else ManualClock()
+    counters = Counters()
+    policy = AuthorizationPolicy([BRAIN_GRANT] if grant else [])
+    actions = ActionRegistry(authorization=policy)
+    actions.register(
+        CHAT_WRITE_SPEC,
+        FakeSendProvider(transport if transport is not None else FakeTransport()),
+        module=SENDER_MODULE,
+    )
+    actions.mark_ready(SENDER_MODULE)
+    supervision = Supervision(target_bus, counters=counters)
+    return RuntimeContext(
+        bus=target_bus,
+        actions=actions,
+        supervision=supervision,
+        tasks=SupervisedTasks(),
+        executor=ActionExecutor(
+            actions, policy, supervision=supervision, counters=counters, clock=target_clock
+        ),
+        triggers=triggers,
+        scheduler=scheduler,
+        clock=target_clock,
+    )
+
+
+@dataclass
+class Harness:
+    """One activated, prepared engine and every edge a test reads."""
+
+    handle: Any
+    context: RuntimeContext
+    session: FakeSession
+    transport: FakeTransport
+    diagnostics: list[str]
+    clock: ManualClock
+    compatibility_sends: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def bus(self) -> EventBus:
+        return self.context.bus
+
+    @property
+    def executor(self) -> ActionExecutor:
+        return self.context.executor
+
+    async def send(
+        self,
+        text: str = "What is up?",
+        *,
+        message_id: str = "message-7",
+        viewer_id: str = VIEWER,
+        channel_id: str = CHANNEL,
+        platform: str = PLATFORM,
+    ) -> None:
+        await self.bus.publish(
+            INPUT_EVENT,
+            chat_payload(
+                text,
+                message_id=message_id,
+                viewer_id=viewer_id,
+                channel_id=channel_id,
+                platform=platform,
+            ),
+            {"source": "test", "schema_version": 2},
+        )
+
+    async def completed(self, count: int = 1) -> list[Any]:
+        """Wait, in bare loop turns, until *count* runs have a terminal record."""
+
+        await wait_until(lambda: len(self.handle.scheduler.run_records()) >= count)
+        return self.records()
+
+    def records(self) -> list[Any]:
+        return list(self.handle.scheduler.run_records().values())
+
+    def traces(self, event_type: str) -> list[dict[str, Any]]:
+        return events_of(self.bus, event_type)
+
+    def requests(self) -> list[dict[str, Any]]:
+        return self.session.post_calls
+
+    def prompt(self, index: int = -1) -> list[dict[str, str]]:
+        return self.session.post_calls[index]["json"]["messages"]
+
+    async def close(self) -> None:
+        await self.handle.close()
+
+
+def chat_payload(
+    text: str = "What is up?",
+    *,
+    message_id: str = "message-7",
+    viewer_id: str = VIEWER,
+    channel_id: str = CHANNEL,
+    platform: str = PLATFORM,
+) -> dict[str, Any]:
+    """A schema-version-2 normalised chat message, as an input publishes it."""
+
+    return {
+        "platform": platform,
+        "channel_id": channel_id,
+        "author": {"id": viewer_id, "display_name": "Viewer"},
+        "message_id": message_id,
+        "text": text,
+    }
 
 
 async def activate_with(
-    *results: Any, settings_overrides: dict[str, Any] | None = None
-):
-    session = FakeSession(*results)
-    bus = EventBus()
-    diagnostics: list[str] = []
-    handle = await activate(
+    *results: Any,
+    settings_overrides: dict[str, Any] | None = None,
+    grant: bool = True,
+    transport: FakeTransport | None = None,
+    session: FakeSession | None = None,
+    triggers: Any = None,
+    scheduler: Any = None,
+    bus: EventBus | None = None,
+    prepare: bool = True,
+) -> Harness:
+    """Activate the engine on a fresh runtime and run its ``prepare`` phase."""
+
+    target_session = session if session is not None else FakeSession(*results)
+    target_transport = transport if transport is not None else FakeTransport()
+    clock = ManualClock()
+    context = runtime_context(
         bus,
+        clock=clock,
+        transport=target_transport,
+        grant=grant,
+        triggers=triggers,
+        scheduler=scheduler,
+    )
+    diagnostics: list[str] = []
+    settings = merge_settings(settings_overrides)
+    settings.update(
         {
-            **SETTINGS,
-            **(settings_overrides or {}),
-            "_session_factory": lambda: session,
+            "_session_factory": lambda: target_session,
+            "_sleeper": clock.sleep,
             "diagnostic_reporter": diagnostics.append,
-        },
-        CATALOG,
+        }
     )
-    return handle, bus, session, diagnostics
+    handle = await activate(context.for_module(MODULE_NAME), settings, {})
+    harness = Harness(handle, context, target_session, target_transport, diagnostics, clock)
+    if prepare:
+        await handle.prepare()
+    return harness
 
 
-async def send_input(
-    bus: EventBus,
-    *,
-    text: str = "What is up?",
-    message_id: str = "message-7",
-    viewer_id: str = "viewer-4",
-) -> None:
-    await bus.publish(
-        "channel.chat.message",
-        {
-            "text": text,
-            "message_id": message_id,
-            "chatter_id": viewer_id,
-        },
-        {"source": "test"},
-    )
-
-
-def outbound(bus: EventBus) -> list[dict[str, Any]]:
-    return [
-        event
-        for event in bus.list_events()
-        if event["type"] == "channel.chat.send"
-    ]
-
-
-def assert_sanitized(diagnostics: list[str]) -> None:
-    rendered = "\n".join(diagnostics)
-    assert SETTINGS["api_key"] not in rendered
-    assert SETTINGS["endpoint"] not in rendered
-    assert "What is up?" not in rendered
+def merge_settings(overrides: dict[str, Any] | None) -> dict[str, Any]:
+    settings = copy_settings(VALID_SETTINGS)
+    for key, value in (overrides or {}).items():
+        if isinstance(value, dict) and isinstance(settings.get(key), dict):
+            settings[key] = {**settings[key], **value}
+        else:
+            settings[key] = value
+    return settings
 
 
 def copy_settings(settings: dict[str, Any]) -> dict[str, Any]:
@@ -170,27 +567,41 @@ def copy_settings(settings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def runtime_context(bus: EventBus | None = None) -> RuntimeContext:
-    """The versioned runtime over a real bus, registry, executor and tasks.
+async def settle(turns: int = 20) -> None:
+    """Give the loop *turns* bare reschedules. Zero delay, so no time passes."""
 
-    No trigger engine: the engine's manifest declares no triggers, so the
-    loader has nothing to register and nothing to refuse.
-    """
+    for _ in range(turns):
+        await asyncio.sleep(0)
 
-    target_bus = bus or EventBus()
-    counters = Counters()
-    policy = AuthorizationPolicy()
-    actions = ActionRegistry(authorization=policy)
-    supervision = Supervision(target_bus, counters=counters)
-    return RuntimeContext(
-        bus=target_bus,
-        actions=actions,
-        supervision=supervision,
-        tasks=SupervisedTasks(),
-        executor=ActionExecutor(
-            actions, policy, supervision=supervision, counters=counters
-        ),
-    )
+
+async def wait_until(predicate: Any, turns: int = 2000) -> None:
+    for _ in range(turns):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition did not become true within the turn budget")
+
+
+def events_of(bus: EventBus, event_type: str) -> list[dict[str, Any]]:
+    return [event for event in bus.list_events() if event["type"] == event_type]
+
+
+def assert_sanitized(diagnostics: list[str]) -> None:
+    rendered = "\n".join(diagnostics)
+    assert SETTINGS["api_key"] not in rendered
+    assert SETTINGS["endpoint"] not in rendered
+    assert "What is up?" not in rendered
+
+
+def rendered_history(prompt: list[dict[str, str]]) -> str:
+    """The retained exchanges of a request: everything between system and user."""
+
+    return "\n".join(message["content"] for message in prompt[1:-1])
+
+
+# --------------------------------------------------------------------------- #
+# Manifest and settings hook (R7)
+# --------------------------------------------------------------------------- #
 
 
 def test_manifest_declares_v2_shape_settings_hook_and_no_grant() -> None:
@@ -310,8 +721,9 @@ def test_settings_hook_refuses_each_unevaluable_field_with_one_diagnostic(
 @pytest.mark.asyncio
 async def test_loader_resolves_the_declared_hook_and_grants_nothing_from_produces() -> None:
     """R7: the declared hook name resolves to this package's callable, and
-    ``produces: [channel.chat.send]`` puts 0 actions in the registry's
-    discovered, ready and authorized views.
+    ``produces: [channel.chat.send]`` puts 0 actions of the brain's in the
+    registry's discovered, ready and authorized views — the one action there
+    is the send edge's, registered by the harness under another module.
     """
 
     session = FakeSession()
@@ -334,10 +746,10 @@ async def test_loader_resolves_the_declared_hook_and_grants_nothing_from_produce
     assert activation.roles == frozenset()
     assert type(activation.handle).__name__ == "BrainModule"
     assert diagnostics == []
-    assert dict(context.actions.discovered()) == {}
-    assert dict(context.actions.registered_ready()) == {}
+    assert set(context.actions.discovered()) == {DELIVERY_ACTION}
+    assert set(context.actions.registered_ready()) == {DELIVERY_ACTION}
     assert dict(context.actions.authorized(principal="viewer")) == {}
-    assert context.actions.bindings() == ()
+    assert all(binding.module == SENDER_MODULE for binding in context.actions.bindings())
 
     coordinator = PhaseCoordinator(
         activations, tasks=context.tasks, reporter=diagnostics.append
@@ -379,368 +791,727 @@ async def test_loader_refuses_settings_the_hook_rejects_before_activation() -> N
 
 
 @pytest.mark.asyncio
-async def test_configured_request_contains_capabilities_and_viewer_context() -> None:
-    response = FakeResponse(200, completion("[send:channel.chat.send]Hello"))
-    handle, bus, session, diagnostics = await activate_with(response)
-    try:
-        await send_input(bus)
+async def test_activation_refuses_a_bare_bus_and_a_context_without_executor() -> None:
+    """R7/AC26: the engine is reached through the versioned context only.
 
-        assert len(session.post_calls) == 1
-        request = session.post_calls[0]
+    The compatibility signature's bare bus is refused before any session is
+    created, and so is a context whose executor is absent: delivery is one
+    executor call and nothing else (R5), so there is no engine without it.
+    """
+
+    created: list[str] = []
+    settings = {**copy_settings(VALID_SETTINGS), "_session_factory": lambda: created.append("session")}
+
+    with pytest.raises(BrainModuleError, match="runtime context is invalid"):
+        await activate(EventBus(), settings, {})
+    without_executor = RuntimeContext(
+        bus=EventBus(),
+        actions=ActionRegistry(authorization=AuthorizationPolicy()),
+        supervision=Supervision(EventBus(), counters=Counters()),
+        tasks=SupervisedTasks(),
+    )
+    with pytest.raises(BrainModuleError, match="runtime context is invalid"):
+        await activate(without_executor.for_module(MODULE_NAME), settings, {})
+    assert created == []
+
+
+# --------------------------------------------------------------------------- #
+# The request (R2, R3, R5)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_admitted_message_drives_one_configured_request_with_viewer_context() -> None:
+    """Replaces the synchronous request inspection (allowlisted; R1, R2, R3).
+
+    The request is observed once the admitted run has completed, not when the
+    publication returns; the viewer identity is the attested ``author.id``
+    of the normalised event, never a ``chatter_id``; and the instructions
+    offer the model the registry's *authorized* view — the one action the
+    engine's principal holds a grant for — and nothing else (R5).
+    """
+
+    harness = await activate_with(FakeResponse(200, completion("Hello")))
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert record.status == "success"
+        assert len(harness.requests()) == 1
+        request = harness.requests()[0]
         assert request["url"] == SETTINGS["endpoint"]
         assert request["json"]["model"] == SETTINGS["model"]
-        assert request["headers"]["Authorization"] == (
-            f"Bearer {SETTINGS['api_key']}"
-        )
+        assert request["headers"]["Authorization"] == f"Bearer {SETTINGS['api_key']}"
         messages = request["json"]["messages"]
         assert messages[0]["role"] == "system"
         system = messages[0]["content"]
-        for module, produced, consumed in (
-            ("audit", "", "**"),
-            ("brain", "channel.chat.send", "channel.chat.message"),
-            ("twitch", "channel.chat.message", "channel.chat.send"),
-        ):
-            assert module in system
-            assert produced in system
-            assert consumed in system
-        assert system.index("audit") < system.index("brain") < system.index("twitch")
+        assert DELIVERY_ACTION in system
+        assert CHAT_WRITE_SPEC.description in system
+        assert "[send:" not in system
+        assert messages[-1]["role"] == "user"
         assert "What is up?" in messages[-1]["content"]
-        assert "viewer-4" in messages[-1]["content"]
+        assert VIEWER in messages[-1]["content"]
         assert "message-7" in messages[-1]["content"]
-        assert diagnostics == []
-        assert response.release_calls == 1
+        assert harness.diagnostics == []
+        assert harness.session.results == []
     finally:
-        await handle.close()
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_request_offers_no_action_without_a_grant_and_reads_the_view_afresh() -> None:
+    """R5: the capability prompt is the authorized view, read for every run.
+
+    With no rule the model is offered nothing (default deny as a surface); a
+    grant added between two runs reaches the next prompt, so a policy change
+    is never cached across runs.
+    """
+
+    harness = await activate_with(
+        FakeResponse(200, completion("First")),
+        FakeResponse(200, completion("Second")),
+        grant=False,
+    )
+    try:
+        await harness.send(message_id="one")
+        await harness.completed(1)
+        assert DELIVERY_ACTION not in harness.prompt(0)[0]["content"]
+        assert "No action is authorized" in harness.prompt(0)[0]["content"]
+
+        harness.executor._authorization.grant(BRAIN_GRANT)
+        await harness.send(message_id="two")
+        await harness.completed(2)
+        assert DELIVERY_ACTION in harness.prompt(1)[0]["content"]
+    finally:
+        await harness.close()
 
 
 @pytest.mark.asyncio
 async def test_configured_request_strips_string_settings() -> None:
-    handle, bus, session, diagnostics = await activate_with(
-        FakeResponse(200, completion("[send:channel.chat.send]Hello")),
+    """Replaces the synchronous variant (allowlisted; R1, R2, R3): run-driven.
+
+    A padded model name and key are used stripped; a padded endpoint is no
+    longer stripped but refused by the declared settings hook (R7), so the
+    request is only ever sent to an endpoint exactly as configured.
+    """
+
+    padded = copy_settings(VALID_SETTINGS)
+    padded["endpoint"] = f"  {SETTINGS['endpoint']}\n"
+    assert validate_settings(padded) == [
+        "module 'brain': field 'endpoint': must be a well-formed http(s) URL"
+    ]
+
+    harness = await activate_with(
+        FakeResponse(200, completion("Hello")),
         settings_overrides={
-            "endpoint": f"  {SETTINGS['endpoint']}\n",
             "model": f" {SETTINGS['model']} ",
             "api_key": f"{SETTINGS['api_key']}\n",
         },
     )
     try:
-        await send_input(bus)
+        await harness.send()
+        await harness.completed()
 
-        request = session.post_calls[0]
+        request = harness.requests()[0]
         assert request["url"] == SETTINGS["endpoint"]
         assert request["json"]["model"] == SETTINGS["model"]
-        assert request["headers"]["Authorization"] == (
-            f"Bearer {SETTINGS['api_key']}"
-        )
-        assert diagnostics == []
+        assert request["headers"]["Authorization"] == f"Bearer {SETTINGS['api_key']}"
+        assert harness.diagnostics == []
     finally:
-        await handle.close()
+        await harness.close()
 
 
 @pytest.mark.asyncio
-async def test_tagged_output_is_published_with_source_context() -> None:
-    handle, bus, _, diagnostics = await activate_with(
-        FakeResponse(200, completion("[send:channel.chat.send]Hello there"))
-    )
-    try:
-        await send_input(bus)
+async def test_ingestion_returns_before_the_model_answers_and_queues_the_next() -> None:
+    """R2/AC6: validate, copy, admit, return — the handler never awaits the model.
 
-        assert outbound(bus) == [
-            {
-                "type": "channel.chat.send",
-                "payload": {"text": "Hello there"},
-                "metadata": {
-                    "source": "brain",
-                    "source_message_id": "message-7",
-                    "viewer_id": "viewer-4",
-                },
-            }
+    With the model held on a first message, publishing a second message of
+    the same session completes at once; it is queued behind the held run,
+    and both complete once the model is released.
+    """
+
+    session = HeldSession(
+        FakeResponse(200, completion("One")), FakeResponse(200, completion("Two"))
+    )
+    harness = await activate_with(session=session)
+    try:
+        await harness.send(message_id="one")
+        await asyncio.wait_for(session.entered.wait(), timeout=1)
+        # The publication of a second message returns while the first is held.
+        await asyncio.wait_for(harness.send(message_id="two"), timeout=1)
+        assert len(session.post_calls) == 1
+        assert harness.handle.scheduler.pending == 1
+        assert harness.records() == []
+
+        session.release.set()
+        records = await harness.completed(2)
+        assert [record.status for record in records] == ["success", "success"]
+        assert len(session.post_calls) == 2
+        assert [send["text"] for send in harness.transport.sends] == ["One", "Two"]
+    finally:
+        session.release.set()
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ingestion_refuses_events_without_trusted_identity_or_shape() -> None:
+    """R3/AC12: no ``author.id``, no admission; a malformed event admits nothing."""
+
+    harness = await activate_with(FakeResponse(200, completion("never")))
+    try:
+        untrusted = chat_payload(message_id="anonymous")
+        untrusted["author"] = {"display_name": "Someone"}
+        await harness.bus.publish(INPUT_EVENT, untrusted, {"source": "test"})
+        await harness.bus.publish(
+            INPUT_EVENT, {"text": "hello", "message_id": "v1", "chatter_id": "x"}, {}
+        )
+        await wait_until(lambda: len(harness.diagnostics) == 2)
+
+        assert harness.diagnostics == [
+            "brain input: no trusted viewer identity",
+            "brain input: malformed chat message",
         ]
-        assert diagnostics == []
+        assert harness.traces(TRACE_BRAIN_ADMISSION_ACCEPTED) == []
+        assert harness.requests() == []
+        assert harness.records() == []
     finally:
-        await handle.close()
+        await harness.close()
 
 
 @pytest.mark.asyncio
-async def test_multiple_sections_preserve_source_order() -> None:
-    handle, bus, _, diagnostics = await activate_with(
-        FakeResponse(
-            200,
-            completion(
-                "[send:channel.chat.send]First\n"
-                "[send:channel.chat.send]Second"
-            ),
-        )
-    )
-    try:
-        await send_input(bus)
+async def test_only_an_accepted_recorded_trigger_decision_is_admitted() -> None:
+    """R1/AC4: a rejected or missing decision admits nothing and calls no model."""
 
-        assert [event["payload"]["text"] for event in outbound(bus)] == [
-            "First",
-            "Second",
-        ]
-        assert diagnostics == []
+    triggers = FakeTriggerEngine()
+    harness = await activate_with(FakeResponse(200, completion("Hello")), triggers=triggers)
+    try:
+        triggers.decide("rejected", accepted=False)
+        await harness.send(message_id="rejected")
+        await harness.send(message_id="undecided")
+        await wait_until(lambda: len(harness.diagnostics) == 1)
+        assert harness.diagnostics == ["brain input: no trigger decision recorded"]
+        assert harness.traces(TRACE_BRAIN_ADMISSION_ACCEPTED) == []
+        assert harness.requests() == []
+
+        triggers.decide("accepted", accepted=True)
+        await harness.send(message_id="accepted")
+        (record,) = await harness.completed()
+        assert record.status == "success"
+        assert len(harness.requests()) == 1
+        assert len(harness.transport.sends) == 1
     finally:
-        await handle.close()
+        await harness.close()
 
 
 @pytest.mark.asyncio
-async def test_malformed_send_prefix_in_section_body_is_plain_text() -> None:
-    text = "The literal [send:example is an incomplete routing tag."
-    handle, bus, _, diagnostics = await activate_with(
-        FakeResponse(
-            200,
-            completion(f"[send:channel.chat.send]{text}"),
-        )
-    )
-    try:
-        await send_input(bus)
+async def test_a_scheduler_shared_through_the_context_is_fed_by_the_producer() -> None:
+    """AC27: with a shared scheduler the bus copy is a fact, not a second admission."""
 
-        assert [event["payload"]["text"] for event in outbound(bus)] == [text]
-        assert diagnostics == []
+    scheduler = RecordingScheduler()
+    harness = await activate_with(FakeResponse(200, completion("never")), scheduler=scheduler)
+    try:
+        assert harness.handle.owns_scheduler is False
+        assert harness.handle.scheduler is scheduler
+        await harness.send()
+        await settle()
+        assert scheduler.admissions == []
+        assert harness.requests() == []
     finally:
-        await handle.close()
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# Delivery (R5, AC19)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_reply_is_delivered_through_exactly_one_executor_call_and_one_send() -> None:
+    """Replaces the tagged republication (allowlisted; R2, R5) — AC19.
+
+    One admitted message: exactly 1 model call, exactly 1 executor call and
+    exactly 1 send at the fake transport. The delivery is a ``chat.write``
+    call carrying the engine's principal, the run's identity, the session's
+    destination and the source message; the compatibility
+    ``channel.chat.send`` route — subscribed here as another sink would be —
+    carries 0 of it, so the two paths together produce exactly 1 send.
+    """
+
+    harness = await activate_with(FakeResponse(200, completion("Hello there")))
+    harness.bus.subscribe(COMPATIBILITY_ROUTE, harness.compatibility_sends.append)
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert len(harness.requests()) == 1
+        assert harness.executor.provider_invocations == 1
+        (send,) = harness.transport.sends
+        assert send["text"] == "Hello there"
+        assert send["principal"] == PRINCIPAL
+        assert send["destination"] == Destination(PLATFORM, CHANNEL, CHAT_SCOPE)
+        assert send["run_id"] == record.run_id
+        assert send["call_id"] == f"{record.run_id}/call-1"
+        assert send["source_event_id"] == "message-7"
+        assert send["message_id"] == "message-7"
+        assert harness.compatibility_sends == []
+        assert harness.traces(COMPATIBILITY_ROUTE) == []
+
+        assert record.status == "success"
+        assert record.delivery == "success"
+        assert record.model_calls == 1
+        assert record.sends == 1
+        (started,) = harness.traces(TRACE_ACTION_STARTED)
+        (completed,) = harness.traces(TRACE_ACTION_COMPLETED)
+        assert started["payload"]["run_id"] == completed["payload"]["run_id"] == record.run_id
+        assert completed["payload"]["status"] == "success"
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "content",
     [
+        "[send:channel.chat.send]Hello",
+        "[send:channel.chat.send]First\n[send:channel.chat.send]Second",
+        "The literal [send:example is an incomplete routing tag.",
         "[send:unsupported.event]No",
-        "[send:channel.chat.send]",
-        "[send:channel.chat.send][send:channel.chat.send]Second",
-        "preface[send:channel.chat.send]No",
         "plain untagged output",
-        "[send:channel.chat.send]Valid[send:unsupported.event]Invalid",
     ],
 )
-async def test_invalid_tagged_output_is_rejected_atomically(content: str) -> None:
-    handle, bus, _, diagnostics = await activate_with(
-        FakeResponse(200, completion(content))
-    )
-    try:
-        await send_input(bus)
+async def test_reply_text_is_delivered_verbatim_with_no_tag_parsing(content: str) -> None:
+    """Replaces the ``[send:...]`` section tests (allowlisted; R5).
 
-        assert outbound(bus) == []
-        assert diagnostics == ["brain model response: invalid tagged output"]
-        assert_sanitized(diagnostics)
+    There is no tag encoding: the model's reply is one plain-text message
+    delivered as written through the one executor call, whether or not it
+    happens to contain what the former encoding would have parsed.
+    """
+
+    harness = await activate_with(FakeResponse(200, completion(content)))
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert record.status == "success"
+        assert [send["text"] for send in harness.transport.sends] == [content]
+        assert harness.executor.provider_invocations == 1
+        assert harness.traces(COMPATIBILITY_ROUTE) == []
+        assert harness.diagnostics == []
     finally:
-        await handle.close()
+        await harness.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("result", "expected"),
+    ("result", "expected", "status"),
     [
-        (FakeResponse(500, {"api_key": SETTINGS["api_key"]}), "non-success"),
-        (FakeResponse(200, {}), "malformed"),
-        (asyncio.TimeoutError(SETTINGS["api_key"]), "timed out"),
-        (RuntimeError(SETTINGS["api_key"]), "transport failed"),
+        (FakeResponse(500, {"api_key": SETTINGS["api_key"]}), "non-success", "error"),
+        (FakeResponse(200, {}), "malformed", "error"),
+        (FakeResponse(200, completion("   ")), "malformed", "error"),
+        (asyncio.TimeoutError(SETTINGS["api_key"]), "timed out", "timeout"),
+        (RuntimeError(SETTINGS["api_key"]), "transport failed", "error"),
     ],
 )
-async def test_model_failures_publish_nothing_and_are_sanitized(
-    result: Any, expected: str
+async def test_model_failures_deliver_nothing_and_are_sanitized(
+    result: Any, expected: str, status: str
 ) -> None:
-    handle, bus, _, diagnostics = await activate_with(result)
-    try:
-        await send_input(bus)
+    """Replaces the synchronous failure inspection (allowlisted; R2).
 
-        assert outbound(bus) == []
-        assert len(diagnostics) == 1
-        assert expected in diagnostics[0]
-        assert_sanitized(diagnostics)
+    The failure is the run's terminal state, read from its record and its
+    one ``brain.run.completed``: delivery not attempted, 0 executor calls,
+    0 sends, and one value-free diagnostic.
+    """
+
+    harness = await activate_with(result)
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert record.status == status
+        assert record.delivery == DELIVERY_NOT_ATTEMPTED
+        assert record.model_calls == 1
+        assert record.sends == 0
+        assert harness.executor.provider_invocations == 0
+        assert harness.transport.sends == []
+        assert len(harness.diagnostics) == 1
+        assert expected in harness.diagnostics[0]
+        assert_sanitized(harness.diagnostics)
+        (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["status"] == status
+        assert completed["payload"]["delivery"] == DELIVERY_NOT_ATTEMPTED
     finally:
-        await handle.close()
+        await harness.close()
 
 
 @pytest.mark.asyncio
-async def test_history_is_retained_per_viewer_and_session_close_is_idempotent() -> None:
-    handle, bus, session, diagnostics = await activate_with(
-        FakeResponse(200, completion("[send:channel.chat.send]First reply")),
-        FakeResponse(200, completion("[send:channel.chat.send]Second reply")),
-        FakeResponse(200, completion("[send:channel.chat.send]Other reply")),
+async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
+    """Design §3.4: ``budget.max_tokens`` bounds input and output together.
+
+    A prompt that leaves the reply no room ends the run with 0 model calls;
+    the request carries the room the prompt leaves as its output cap; and a
+    reply whose reported usage puts the run over the bound is discarded.
+    """
+
+    harness = await activate_with(
+        FakeResponse(200, completion("Hello", usage={"total_tokens": 9000})),
+        FakeResponse(200, completion("Hello")),
     )
     try:
-        await send_input(bus, text="First question", message_id="one")
-        await send_input(bus, text="Second question", message_id="two")
-        await send_input(
-            bus,
-            text="Separate viewer",
-            message_id="three",
-            viewer_id="viewer-other",
-        )
-
-        second_messages = session.post_calls[1]["json"]["messages"]
-        assert any("First question" in item["content"] for item in second_messages)
-        assert any("First reply" in item["content"] for item in second_messages)
-        other_messages = session.post_calls[2]["json"]["messages"]
-        assert all("First question" not in item["content"] for item in other_messages)
-        assert diagnostics == []
+        await harness.send(message_id="over")
+        (over,) = await harness.completed(1)
+        assert over.status == "error"
+        assert over.delivery == DELIVERY_NOT_ATTEMPTED
+        assert harness.transport.sends == []
+        (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["failure"] == "token_budget_exceeded"
+        assert completed["payload"]["tokens"] == 9000
+        assert completed["payload"]["tokens_estimated"] is False
+        request = harness.requests()[0]
+        assert 0 < request["json"]["max_tokens"] < LIMITS["budget"]["max_tokens"]
+        assert harness.diagnostics == ["brain model response: token budget exceeded"]
     finally:
-        await asyncio.gather(handle.close(), handle.close())
+        await harness.close()
 
+    tiny = await activate_with(
+        FakeResponse(200, completion("never")), settings_overrides={"budget": {"max_tokens": 8}}
+    )
+    try:
+        await tiny.send()
+        (record,) = await tiny.completed()
+        assert record.status == "error"
+        assert record.model_calls == 0
+        assert tiny.requests() == []
+        assert tiny.diagnostics == ["brain run: prompt exceeds the token budget"]
+    finally:
+        await tiny.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "grant", "delivery", "code"),
+    [
+        (SENT, False, "refused", ERROR_NOT_AUTHORIZED),
+        (FAIL_BEFORE_EMISSION, True, "error", ERROR_PROVIDER_FAILED),
+        (FAIL_AFTER_EMISSION, True, "external_unknown", ERROR_EXTERNAL_UNKNOWN),
+        (TIMEOUT_BEFORE_EMISSION, True, "timeout", ERROR_TIMED_OUT),
+    ],
+)
+async def test_only_a_success_observation_writes_back_to_memory(
+    outcome: str, grant: bool, delivery: str, code: str
+) -> None:
+    """Replaces the bus-outcome and ``delivery_status`` history tests (allowlisted; R5).
+
+    The delivery outcome is the executor's explicit observation, never a bus
+    publication result or a mutated field: a refused, failed, uncertain or
+    timed-out delivery is reported as such in the run's record and trace,
+    and writes nothing into memory, so the next request carries 0 assistant
+    messages — the model is never told it said something it did not.
+    """
+
+    harness = await activate_with(
+        FakeResponse(200, completion("Undelivered reply")),
+        FakeResponse(200, completion("Next reply")),
+        grant=grant,
+        transport=FakeTransport(outcome),
+    )
+    try:
+        await harness.send("First question", message_id="one")
+        (first,) = await harness.completed(1)
+        assert first.status == delivery
+        assert first.delivery == delivery
+        assert first.sends == 0
+        assert harness.transport.sends == []
+        (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["delivery"] == delivery
+        assert completed["payload"]["delivery_error"] == code
+        assert harness.executor.provider_invocations == (0 if not grant else 1)
+
+        await harness.send("Next question", message_id="two")
+        await harness.completed(2)
+        prior = harness.prompt(1)[1:-1]
+        assert prior == []
+        assert "Undelivered reply" not in "\n".join(m["content"] for m in harness.prompt(1))
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_run_lifecycle_traces_are_published_by_the_scheduler_only() -> None:
+    """R8: one admitted message, exactly 1 ``brain.run.started`` and exactly 1
+    ``brain.run.completed``, both published by the scheduler; the engine
+    itself publishes 0 events of either type and 0 events of its own.
+    """
+
+    bus = PublisherRecordingBus()
+    harness = await activate_with(FakeResponse(200, completion("Hello")), bus=bus)
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+        await wait_until(lambda: len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) == 1)
+
+        assert len(harness.traces(TRACE_BRAIN_RUN_STARTED)) == 1
+        assert len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) == 1
+        run_publishers = [
+            publisher for event_type, publisher in bus.publishers if event_type in RUN_TRACES
+        ]
+        assert run_publishers == ["core.admission", "core.admission"]
+        assert all(
+            not publisher.startswith("modules.brain")
+            for _event_type, publisher in bus.publishers
+        )
+        (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["run_id"] == record.run_id
+        assert completed["payload"]["status"] == "success"
+        assert completed["payload"]["delivery"] == "success"
+        assert completed["payload"]["model_calls"] == 1
+        assert completed["payload"]["sends"] == 1
+        assert completed["payload"]["action"] == DELIVERY_ACTION
+        assert completed["payload"]["call_id"] == f"{record.run_id}/call-1"
+    finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency and shutdown (R2)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_model_requests_for_different_sessions_overlap_within_the_worker_cap() -> None:
+    """Replaces the unbounded overlap test (allowlisted; R2).
+
+    Two sessions' model calls overlap on 2 workers while a third message of
+    the first session waits behind its held run: overlap is bounded by the
+    worker count and by one active run per session, never unbounded.
+    """
+
+    session = HeldSession(
+        FakeResponse(200, completion("One")),
+        FakeResponse(200, completion("Two")),
+        FakeResponse(200, completion("Three")),
+    )
+    harness = await activate_with(session=session, settings_overrides={"admission": {"workers": 2}})
+    try:
+        await harness.send(message_id="one", viewer_id="viewer-one")
+        await harness.send(message_id="two", viewer_id="viewer-two")
+        await harness.send(message_id="three", viewer_id="viewer-one")
+        await wait_until(lambda: len(session.post_calls) == 2)
+        assert harness.handle.scheduler.active_runs == 2
+        assert harness.handle.scheduler.pending == 1
+
+        session.release.set()
+        records = await harness.completed(3)
+        assert [record.status for record in records] == ["success"] * 3
+        assert len(session.post_calls) == 3
+        assert harness.diagnostics == []
+    finally:
+        session.release.set()
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_close_ends_a_held_run_cancelled_with_its_model_call_counted() -> None:
+    """R2/R4: close cancels the run still in its model call; the run is
+    recorded exactly once, ``cancelled``, with the call it already issued
+    counted; the session is closed once however many times close is called.
+    """
+
+    session = HeldSession(FakeResponse(200, completion("never")))
+    harness = await activate_with(session=session)
+    await harness.send()
+    await asyncio.wait_for(session.entered.wait(), timeout=1)
+
+    await asyncio.gather(harness.close(), harness.close())
+
+    (record,) = harness.records()
+    assert record.status == "cancelled"
+    assert record.reason == REASON_CANCELLED
+    assert record.model_calls == 1
+    assert record.sends == 0
+    assert len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) == 1
+    assert harness.transport.sends == []
     assert session.close_calls == 1
 
 
-@pytest.mark.asyncio
-async def test_model_requests_for_different_viewers_can_overlap() -> None:
-    class CoordinatedSession(FakeSession):
-        def __init__(self) -> None:
-            super().__init__(
-                FakeResponse(200, completion("[send:channel.chat.send]One")),
-                FakeResponse(200, completion("[send:channel.chat.send]Two")),
-            )
-            self.both_started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def post(self, url: str, **kwargs: Any) -> Any:
-            self.post_calls.append({"url": url, **kwargs})
-            result = self.results.pop(0)
-            if len(self.post_calls) == 2:
-                self.both_started.set()
-            await self.release.wait()
-            return result
-
-    session = CoordinatedSession()
-    bus = EventBus()
-    diagnostics: list[str] = []
-    handle = await activate(
-        bus,
-        {
-            **SETTINGS,
-            "_session_factory": lambda: session,
-            "diagnostic_reporter": diagnostics.append,
-        },
-        CATALOG,
-    )
-    first = asyncio.create_task(
-        send_input(bus, message_id="one", viewer_id="viewer-one")
-    )
-    second = asyncio.create_task(
-        send_input(bus, message_id="two", viewer_id="viewer-two")
-    )
-    try:
-        await asyncio.wait_for(session.both_started.wait(), timeout=1)
-        session.release.set()
-        await asyncio.gather(first, second)
-
-        assert len(session.post_calls) == 2
-        assert diagnostics == []
-    finally:
-        session.release.set()
-        await asyncio.gather(first, second, return_exceptions=True)
-        await handle.close()
+# --------------------------------------------------------------------------- #
+# Conversation memory (R3, R6, AC10, AC30)
+# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_viewer_histories_are_lru_bounded() -> None:
-    handle, bus, session, diagnostics = await activate_with(
-        *(
-            FakeResponse(
-                200,
-                completion(f"[send:channel.chat.send]reply-{index}"),
-            )
-            for index in range(4)
-        ),
-        settings_overrides={"max_history_viewers": 2},
-    )
-    try:
-        await send_input(
-            bus,
-            text="evicted viewer question",
-            message_id="one",
-            viewer_id="viewer-one",
-        )
-        await send_input(bus, message_id="two", viewer_id="viewer-two")
-        await send_input(bus, message_id="three", viewer_id="viewer-three")
-        await send_input(
-            bus,
-            text="viewer one returns",
-            message_id="four",
-            viewer_id="viewer-one",
-        )
+async def test_memory_is_keyed_by_session_key_not_by_viewer() -> None:
+    """Replaces the viewer-keyed history tests (allowlisted; R3) — AC10.
 
-        returning_messages = session.post_calls[3]["json"]["messages"]
-        assert all(
-            "evicted viewer question" not in message["content"]
-            for message in returning_messages
-        )
-        assert len(handle._histories) == 2
-        assert diagnostics == []
+    The same ``viewer_id`` on 2 platforms and in 2 channels holds 4 distinct
+    memories, each request carrying 0 exchanges of the other 3; 2 viewers in
+    1 channel hold 2 distinct memories. Memory is confirmed text only: a
+    request carries what the send edge confirmed and nothing else (R5).
+    """
+
+    sessions = [
+        (PLATFORM, CHANNEL, VIEWER),
+        (OTHER_PLATFORM, CHANNEL, VIEWER),
+        (PLATFORM, OTHER_CHANNEL, VIEWER),
+        (OTHER_PLATFORM, OTHER_CHANNEL, VIEWER),
+        (PLATFORM, CHANNEL, "viewer-other"),
+    ]
+    responses = [
+        FakeResponse(200, completion(f"reply-{index}-{turn}"))
+        for turn in range(2)
+        for index in range(len(sessions))
+    ]
+    harness = await activate_with(*responses)
+    try:
+        for turn in range(2):
+            for index, (platform, channel_id, viewer_id) in enumerate(sessions):
+                await harness.send(
+                    f"question-{index}-{turn}",
+                    message_id=f"m-{index}-{turn}",
+                    viewer_id=viewer_id,
+                    channel_id=channel_id,
+                    platform=platform,
+                )
+                await harness.completed(turn * len(sessions) + index + 1)
+
+        assert len(harness.handle.memory.sessions()) == 5
+        for index, (platform, channel_id, viewer_id) in enumerate(sessions):
+            history = rendered_history(harness.prompt(len(sessions) + index))
+            assert f"question-{index}-0" in history
+            assert f"reply-{index}-0" in history
+            for other in range(len(sessions)):
+                if other != index:
+                    assert f"question-{other}-0" not in history
+                    assert f"reply-{other}-0" not in history
+            key = SessionKey(platform=platform, channel_id=channel_id, viewer_id=viewer_id)
+            assert [
+                (exchange.assistant) for exchange in harness.handle.memory.recall(key)
+            ] == [f"reply-{index}-0", f"reply-{index}-1"]
+        assert all(record.status == "success" for record in harness.records())
+        assert harness.diagnostics == []
     finally:
-        await handle.close()
+        await harness.close()
 
 
 @pytest.mark.asyncio
-async def test_partial_publish_failure_remembers_only_delivered_sections() -> None:
-    handle, bus, session, diagnostics = await activate_with(
-        FakeResponse(
-            200,
-            completion(
-                "[send:channel.chat.send]Delivered reply"
-                "[send:channel.chat.send]Undelivered reply"
-            ),
-        ),
-        FakeResponse(200, completion("[send:channel.chat.send]Next reply")),
+async def test_memory_bounds_evict_through_the_configured_limits() -> None:
+    """AC30 through the engine: the configured session cap evicts the least
+    recently used session, so the evicted viewer's next request carries 0
+    earlier exchanges while a retained viewer's still carries its own.
+    """
+
+    harness = await activate_with(
+        *(FakeResponse(200, completion(f"reply-{index}")) for index in range(5)),
+        settings_overrides={"conversation_memory": {"max_sessions": 2}},
+    )
+    try:
+        await harness.send("evicted viewer question", message_id="one", viewer_id="viewer-one")
+        await harness.completed(1)
+        await harness.send("second viewer question", message_id="two", viewer_id="viewer-two")
+        await harness.completed(2)
+        await harness.send("third viewer question", message_id="three", viewer_id="viewer-three")
+        await harness.completed(3)
+        assert len(harness.handle.memory.sessions()) == 2
+
+        await harness.send("viewer one returns", message_id="four", viewer_id="viewer-one")
+        await harness.completed(4)
+        assert rendered_history(harness.prompt(3)) == ""
+        # Viewer one's return evicted the next least recently used session
+        # (viewer two); viewer three, used more recently, keeps its own.
+        assert len(harness.handle.memory.sessions()) == 2
+        await harness.send("viewer three returns", message_id="five", viewer_id="viewer-three")
+        await harness.completed(5)
+        assert "third viewer question" in rendered_history(harness.prompt(4))
+        assert "reply-2" in rendered_history(harness.prompt(4))
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+def memory_of(clock: ManualClock) -> ConversationMemory:
+    return ConversationMemory(
+        max_sessions=2, max_exchanges=3, max_bytes=200, max_age_seconds=10, clock=clock
     )
 
-    async def reject_undelivered(event: dict[str, Any]) -> None:
-        if event["payload"]["text"] == "Undelivered reply":
-            raise RuntimeError("send failed")
 
-    bus.subscribe("channel.chat.send", reject_undelivered)
-    try:
-        await send_input(bus, text="First question", message_id="one")
-        await send_input(bus, text="Next question", message_id="two")
-
-        next_messages = session.post_calls[1]["json"]["messages"]
-        prior_content = "\n".join(
-            message["content"] for message in next_messages[:-1]
-        )
-        assert "Delivered reply" in prior_content
-        assert "Undelivered reply" not in prior_content
-        assert diagnostics == ["brain output publish: failed"]
-    finally:
-        await handle.close()
+def key_of(viewer_id: str) -> SessionKey:
+    return SessionKey(platform=PLATFORM, channel_id=CHANNEL, viewer_id=viewer_id)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("first_sent", [False, True])
-async def test_delivery_outcome_excludes_refused_sections_from_history(
-    first_sent: bool,
-) -> None:
-    handle, bus, session, diagnostics = await activate_with(
-        FakeResponse(200, completion(
-            "[send:channel.chat.send]First reply"
-            "[send:channel.chat.send]Refused reply"
-            "[send:channel.chat.send]Last reply"
-        )),
-        FakeResponse(200, completion("[send:channel.chat.send]Next reply")),
-    )
+def test_memory_session_cap_evicts_exactly_the_least_recently_used_session() -> None:
+    """AC30: 2 sessions retained; a 3rd evicts exactly 1, the silent longest."""
 
-    def report_delivery(event: dict[str, Any]) -> dict[str, Any]:
-        sent = first_sent and event["payload"]["text"] != "Refused reply"
-        return {
-            **event,
-            "metadata": {
-                **event["metadata"],
-                "delivery_status": "sent" if sent else "failed",
-            },
-        }
+    clock = ManualClock(0.0)
+    memory = memory_of(clock)
+    memory.remember(key_of("a"), "qa", "ra")
+    memory.remember(key_of("b"), "qb", "rb")
+    memory.recall(key_of("a"))  # ``a`` is now the most recently used.
 
-    bus.subscribe("channel.chat.send", report_delivery)
-    try:
-        await send_input(bus, message_id="one")
-        await send_input(bus, message_id="two")
-        prior = session.post_calls[1]["json"]["messages"][1:-1]
-        rendered = "\n".join(message["content"] for message in prior)
-        assert "Refused reply" not in rendered
-        if first_sent:
-            assert "First reply" in rendered
-            assert "Last reply" in rendered
-        else:
-            assert prior == []
-        assert len(outbound(bus)) == 4
-        assert diagnostics == []
-    finally:
-        await handle.close()
+    memory.remember(key_of("c"), "qc", "rc")
+
+    assert len(memory.sessions()) == 2
+    assert memory.recall(key_of("b")) == ()
+    assert [exchange.assistant for exchange in memory.recall(key_of("a"))] == ["ra"]
+    assert [exchange.assistant for exchange in memory.recall(key_of("c"))] == ["rc"]
+
+
+def test_memory_exchange_cap_keeps_the_newest_three() -> None:
+    """AC30: a 4th exchange leaves exactly 3, the oldest absent."""
+
+    memory = memory_of(ManualClock(0.0))
+    for index in range(4):
+        memory.remember(key_of("a"), f"q{index}", f"r{index}")
+
+    assert [exchange.assistant for exchange in memory.recall(key_of("a"))] == ["r1", "r2", "r3"]
+
+
+def test_memory_byte_cap_keeps_at_most_200_bytes() -> None:
+    """AC30: exchanges totalling more than 200 bytes leave fewer than 3
+    retained and at most 200 bytes; one exchange over the bound alone is
+    not retained at all — the bound wins over the memory.
+    """
+
+    memory = memory_of(ManualClock(0.0))
+    for index in range(3):
+        memory.remember(key_of("a"), "q" * 40, f"{index}" * 40)
+
+    retained = memory.recall(key_of("a"))
+    assert 0 < len(retained) < 3
+    assert sum(exchange.size for exchange in retained) <= 200
+    assert retained[-1].assistant == "2" * 40
+
+    memory.remember(key_of("a"), "x" * 150, "y" * 100)
+    assert memory.recall(key_of("a")) == ()
+
+
+def test_memory_age_bound_drops_expired_exchanges_and_keeps_later_ones() -> None:
+    """AC30: 11 time units later 0 exchanges remain; one added afterwards is kept."""
+
+    clock = ManualClock(0.0)
+    memory = memory_of(clock)
+    memory.remember(key_of("a"), "old question", "old reply")
+    memory.remember(key_of("a"), "older question", "older reply")
+
+    clock.advance(11)
+    assert memory.recall(key_of("a")) == ()
+    memory.remember(key_of("a"), "new question", "new reply")
+    assert [exchange.assistant for exchange in memory.recall(key_of("a"))] == ["new reply"]
+    assert memory.sessions() == (key_of("a").serialize(),)
+
+
+@pytest.mark.parametrize(
+    ("limits", "field_name"),
+    [
+        ({"max_sessions": 0}, "max_sessions"),
+        ({"max_exchanges": 2.5}, "max_exchanges"),
+        ({"max_bytes": True}, "max_bytes"),
+        ({"max_age_seconds": float("inf")}, "max_age_seconds"),
+    ],
+)
+def test_memory_refuses_absent_or_non_finite_bounds(limits: dict[str, Any], field_name: str) -> None:
+    """R6: every bound is required, finite and positive at construction."""
+
+    settings = {"max_sessions": 2, "max_exchanges": 3, "max_bytes": 200, "max_age_seconds": 10, **limits}
+    with pytest.raises(BrainModuleError, match=f"conversation_memory.{field_name}"):
+        ConversationMemory(**settings)

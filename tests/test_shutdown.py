@@ -10,26 +10,75 @@ from types import SimpleNamespace
 import pytest
 
 import core.main as application
-from core.bus import EventBus
 from core.loader import ModuleActivation
+from core.actions import AuthorizationPolicy
 from modules import audit, brain, twitch
-from test_brain import CATALOG, SETTINGS as BRAIN_SETTINGS, completion
+from modules.twitch import HELIX_CHAT_URL
+from test_brain import BRAIN_GRANT, VALID_SETTINGS as BRAIN_SETTINGS, chat_payload, completion
 from test_brain import FakeResponse as ModelResponse
 from test_brain import FakeSession as ModelSession
+from test_brain import runtime_context as brain_runtime_context
 from test_main import _make_module, _valid_config, _write_config
 from test_twitch import SETTINGS as TWITCH_SETTINGS
 from test_twitch import FakeResponse, FakeSession, FakeWebSocket, notification, welcome
 
 
+CATALOG = {
+    "audit": {
+        "name": "audit",
+        "produces": (),
+        "consumes": ("**",),
+        "middleware": True,
+        "order": 90,
+    },
+}
+"""The v1 capability catalog the audit activation reads its contract from."""
+
+PIPELINE_TRACES = (
+    "channel.chat.message",
+    "brain.admission.accepted",
+    "brain.run.started",
+    "action.started",
+    "channel.chat.sent",
+    "action.completed",
+    "brain.run.completed",
+)
+"""The traces of one accepted message through the real pipeline, in order.
+
+The confirmed-send fact precedes the executor's terminal trace because the
+send service records and emits it before it returns the observation (R8).
+"""
+
+
+def _grant_brain_delivery(monkeypatch) -> None:
+    """Seed the runtime's policy with the one grant the brain's reply needs.
+
+    The runtime assembles an empty policy (R5: declaring an action never
+    authorizes it); the configured grant is a later step's, so the harness
+    supplies it at the same boundary the entry point builds the policy at.
+    """
+
+    def policy_with_grant() -> AuthorizationPolicy:
+        return AuthorizationPolicy([BRAIN_GRANT])
+
+    monkeypatch.setattr(application, "AuthorizationPolicy", policy_with_grant)
+
+
 @pytest.mark.parametrize("phase", ["model", "send", "stuck_model", "startup"])
 async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
-    """Shutdown drains the in-flight publication before any transport closes.
+    """Shutdown drains the in-flight run before any transport closes.
 
-    Twitch is a versioned producer now (R4): the coordinator stops its input
-    first, drains its accepted publication under the drain hook, closes the
-    v1 sinks it published into, then closes its send transport. The former
-    ``module 'twitch': shutdown failed`` of the v1 close route is therefore
-    the drain phase timing out when the model never answers.
+    The brain is a versioned module now (R2): its handler admits the input and
+    returns, and the run — model call, executor delivery, confirmed send — is
+    owned by the scheduler the brain built. The coordinator stops the input
+    first, drains the run under the drain hook (R4), then closes the
+    transports. The former record order ``channel.chat.send`` then
+    ``channel.chat.message`` — the output-before-input invariant of the
+    synchronous publication chain — is superseded by R2's detached run
+    ownership and R4's phase order: the input is recorded at ingestion and
+    the run's own traces follow it, the confirmed send before the run's
+    completion (R8). The former ``module 'twitch': phase 'drain' timed out``
+    of a model that never answers is therefore the brain's drain timing out.
     """
 
     entered = asyncio.Event()
@@ -46,10 +95,10 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
             return await super().json()
 
     model_response = (DelayedResponse if phase != "send" else ModelResponse)(
-        200, completion("[send:channel.chat.send]bonjour")
+        200, completion("bonjour")
     )
     send_response = (DelayedResponse if phase == "send" else FakeResponse)(
-        200, {"data": [{"is_sent": True}]}
+        200, {"data": [{"message_id": "sent", "is_sent": True}]}
     )
     model_session = ModelSession(model_response)
     websocket = FakeWebSocket(welcome("session"), notification("in-flight"))
@@ -60,12 +109,13 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
             self.bus = bus
             self.context = None
             self.activations = []
+            handles["bus"] = bus
 
         async def activate_enabled(self, config):
             handles["brain"] = await brain.activate(
-                self.bus,
+                self.context.for_module("brain"),
                 {**BRAIN_SETTINGS, "_session_factory": lambda: model_session},
-                CATALOG,
+                {},
             )
             handles["audit"] = await audit.activate(
                 self.bus, {"_writer": records.append}, CATALOG
@@ -73,15 +123,12 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
             handles["twitch"] = await twitch.activate(
                 self.context.for_module("twitch"),
                 {**TWITCH_SETTINGS, "_session_factory": lambda: twitch_session},
-                CATALOG,
+                {},
             )
-            # Match the production activation order that formerly deadlocked.
+            # Match the production activation order that formerly deadlocked:
+            # the input first, then the two consumers; the audit stays a v1
+            # activation and the brain declares no lifecycle role.
             self.activations = [
-                ModuleActivation(name, {}, handles[name])
-                for name in ("brain", "audit")
-            ]
-            self.activations.insert(
-                0,
                 ModuleActivation(
                     "twitch",
                     {},
@@ -89,11 +136,17 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
                     roles=frozenset({"input"}),
                     manifest_version=2,
                 ),
-            )
+                ModuleActivation(
+                    "brain", {}, handles["brain"], roles=frozenset(), manifest_version=2
+                ),
+                ModuleActivation("audit", {}, handles["audit"]),
+            ]
             if phase == "startup":
-                # The coordinator never starts here, so the harness opens the
-                # producer itself to hold a publication in flight; the
-                # coordinator's own calls, if any, are idempotent no-ops.
+                # The coordinator never starts here, so the harness prepares
+                # both versioned modules and opens the producer itself to hold
+                # a run in flight; the coordinator's own calls, if any, are
+                # idempotent no-ops.
+                await handles["brain"].prepare()
                 await handles["twitch"].prepare()
                 await handles["twitch"].start_inputs()
                 await asyncio.Future()
@@ -101,8 +154,12 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
 
     monkeypatch.setattr(application, "ModuleLoader", Loader)
     monkeypatch.setattr(application, "load_config", lambda *a, **k: {"modules_directory": "."})
+    _grant_brain_delivery(monkeypatch)
     if phase == "stuck_model":
-        monkeypatch.setattr(application, "_CLOSE_TIMEOUT_SECONDS", 0.05)
+        # Below the brain's drain poll interval, so the coordinator's timer
+        # and the drain's own deadline check never coincide: the hook is
+        # reported as overrunning, deterministically, while the run is held.
+        monkeypatch.setattr(application, "_CLOSE_TIMEOUT_SECONDS", 0.02)
     task = asyncio.create_task(application.run(
         "unused", stop, ready_reporter=lambda _: None,
         diagnostic_reporter=diagnostics.append,
@@ -113,18 +170,33 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
         task.cancel()
     else:
         stop.set()
-    # Wait until shutdown has stopped the producer while the publication is held.
+    # Wait until shutdown has stopped the producer while the run is held.
     await asyncio.wait_for(asyncio.gather(receiver, return_exceptions=True), 1)
     assert not task.done()
     assert not handles["audit"]._closed
     assert twitch_session.close_calls == 0
+    assert model_session.close_calls == 0
     websocket.feed(notification("too-late"))
     if phase == "stuck_model":
         assert await asyncio.wait_for(task, 1) == 1
-        assert diagnostics == ["module 'twitch': phase 'drain' timed out"]
+        assert diagnostics == ["module 'brain': phase 'drain' timed out"]
         assert model_session.close_calls == twitch_session.close_calls == 1
         assert handles["audit"]._writer_task.done()
         assert not handles["twitch"]._publication_tasks
+        # The held run was ended by the close, recorded once, cancelled, with
+        # the model call it had already issued counted (R2, R8).
+        (record,) = handles["brain"].scheduler.run_records().values()
+        assert record.status == "cancelled"
+        assert record.model_calls == 1
+        assert record.sends == 0
+        # The completion is traced once, on the bus: the v1 audit is closed
+        # by the compatibility step before the versioned close that ends the
+        # run, so its records stop at ``brain.run.started``.
+        bus_types = [event["type"] for event in handles["bus"].list_events()]
+        assert bus_types.count("brain.run.started") == 1
+        assert bus_types.count("brain.run.completed") == 1
+        decoded = [json.loads(record) for record in records]
+        assert [r["type"] for r in decoded][-1] == "brain.run.started"
         return
     release.set()
     if phase == "startup":
@@ -134,16 +206,37 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
         assert await asyncio.wait_for(task, 1) == 0
     assert diagnostics == []
     decoded = [json.loads(record) for record in records]
-    assert [record["type"] for record in decoded] == [
-        "channel.chat.send", "channel.chat.message",
+    pipeline = [record for record in decoded if record["type"] in PIPELINE_TRACES]
+    assert [record["type"] for record in pipeline] == list(PIPELINE_TRACES)
+    assert pipeline[0]["payload"]["message_id"] == "in-flight"
+    run_ids = {record["payload"]["run_id"] for record in pipeline[1:]}
+    assert len(run_ids) == 1
+    assert pipeline[-1]["payload"]["status"] == "success"
+    assert pipeline[-1]["payload"]["delivery"] == "success"
+    assert [r["type"] for r in decoded].count("channel.chat.send") == 0
+    helix_calls = [
+        call for call in twitch_session.post_calls if call["url"] == HELIX_CHAT_URL
     ]
-    assert decoded[1]["payload"]["message_id"] == "in-flight"
+    assert [call["json"]["message"] for call in helix_calls] == ["bonjour"]
+    (record,) = handles["brain"].scheduler.run_records().values()
+    assert record.status == "success"
+    assert record.sends == 1
     assert model_session.close_calls == twitch_session.close_calls == 1
     assert handles["audit"]._writer_task.done()
     assert not handles["twitch"]._publication_tasks
 
 
-async def test_brain_close_waits_for_handler_not_long_lived_caller() -> None:
+async def test_brain_close_ends_the_held_run_without_blocking_the_publisher() -> None:
+    """Replaces "close waits for the handler" (allowlisted; R2, R4).
+
+    The former test asserted that the brain's close blocked while the
+    publication handler awaited the model. Under R2 the handler admits and
+    returns before the model responds, so the publisher is never held; the
+    run is the brain's own admitted work, and close ends it ``cancelled``
+    (R4) instead of waiting on a model that has not answered — the record
+    and its one ``brain.run.completed`` are written before the session closes.
+    """
+
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -153,29 +246,45 @@ async def test_brain_close_waits_for_handler_not_long_lived_caller() -> None:
             await release.wait()
             return await super().json()
 
-    session = ModelSession(Response(200, completion("[send:channel.chat.send]hello")))
-    bus = EventBus()
+    session = ModelSession(Response(200, completion("hello")))
+    context = brain_runtime_context()
     handle = await brain.activate(
-        bus, {**BRAIN_SETTINGS, "_session_factory": lambda: session}, CATALOG
+        context.for_module("brain"),
+        {**BRAIN_SETTINGS, "_session_factory": lambda: session},
+        {},
     )
+    await handle.prepare()
+    published = asyncio.Event()
 
     async def caller():
-        await bus.publish("channel.chat.message", {
-            "text": "hello", "message_id": "one", "chatter_id": "viewer",
-        }, {})
+        await context.bus.publish("channel.chat.message", chat_payload(), {})
+        published.set()
         await asyncio.Future()
 
     task = asyncio.create_task(caller())
     try:
+        # The publication returns while the model is still held (R2).
+        await asyncio.wait_for(published.wait(), 1)
         await asyncio.wait_for(entered.wait(), 1)
-        closing = asyncio.create_task(handle.close())
-        await asyncio.sleep(0)
-        assert not closing.done()
-        release.set()
-        await asyncio.wait_for(closing, 1)
+        assert not task.done()
+        assert handle.scheduler.run_records() == {}
+
+        # Close does not wait for the model: the held run is cancelled.
+        await asyncio.wait_for(handle.close(), 1)
+        assert not release.is_set()
+        (record,) = handle.scheduler.run_records().values()
+        assert record.status == "cancelled"
+        assert record.model_calls == 1
+        completions = [
+            event for event in context.bus.list_events()
+            if event["type"] == "brain.run.completed"
+        ]
+        assert len(completions) == 1
+        assert completions[0]["payload"]["status"] == "cancelled"
         assert not task.done()
         assert session.close_calls == 1
     finally:
+        release.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

@@ -706,6 +706,16 @@ class ModuleActions:
 
         return self._registry.discovered()
 
+    def authorized(self, *, principal: str, destination: Any = None) -> Mapping[str, Any]:
+        """The registry's authorized view — the only view a model is offered (R5).
+
+        Evaluated against the registry's own policy: this facade takes no
+        policy override, so a module reads what the streamer's rules permit
+        and cannot substitute its own.
+        """
+
+        return self._registry.authorized(principal=principal, destination=destination)
+
 
 class ModuleTasks:
     """A module's own access to the supervised task registry.
