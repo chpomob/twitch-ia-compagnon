@@ -458,26 +458,7 @@ class ModuleLoader:
         self.cancellation_diagnostics = []
 
         declarations = {name: _declaration(discovered[name]) for name in enabled}
-
-        # R4: a v1 module has no ``start_inputs`` phase, so a v1 producer could
-        # only open its source inside ``activate``, ahead of the barrier. It is
-        # refused here, by declaration, before any module is activated.
-        for name in enabled:
-            declaration = declarations[name]
-            if not declaration.is_v2 and ROLE_INPUT in declaration.roles:
-                raise _field_error(
-                    name,
-                    f"{MANIFEST_LIFECYCLE_KEY}.{MANIFEST_ROLES_KEY}",
-                    "a v1 module cannot honour the readiness barrier; declare "
-                    f"{MANIFEST_VERSION_KEY} {MANIFEST_VERSION_V2} to produce inputs",
-                )
-            if declaration.is_v2 and self.context is None:
-                raise _field_error(
-                    name,
-                    MANIFEST_VERSION_KEY,
-                    f"{MANIFEST_VERSION_KEY} {MANIFEST_VERSION_V2} requires a runtime "
-                    "context, and the loader was built without one",
-                )
+        self._validate_compatibility(enabled, declarations)
 
         # Secrets belong to the enabled set only (R7, AC25). A disabled module's
         # ``${NAME}`` reference is never looked up, so an unresolvable one does
@@ -546,6 +527,39 @@ class ModuleLoader:
         return await self.activate_enabled(config)
 
     # -- the v1/v2 fork ---------------------------------------------------- #
+
+    def _validate_compatibility(
+        self,
+        enabled: Sequence[str],
+        declarations: Mapping[str, ManifestDeclaration],
+    ) -> None:
+        """Refuse, by declaration, what neither activation shape could honour.
+
+        R4: a v1 module has no ``start_inputs`` phase, so a v1 producer could
+        only open its source inside ``activate``, ahead of the barrier; it is
+        refused before any module is activated. A v2 module needs the runtime
+        context its activation is handed, so a loader built without one
+        refuses it just as early. This runs on the startup path and on the
+        configuration check alike, so the check cannot accept what startup
+        rejects.
+        """
+
+        for name in enabled:
+            declaration = declarations[name]
+            if not declaration.is_v2 and ROLE_INPUT in declaration.roles:
+                raise _field_error(
+                    name,
+                    f"{MANIFEST_LIFECYCLE_KEY}.{MANIFEST_ROLES_KEY}",
+                    "a v1 module cannot honour the readiness barrier; declare "
+                    f"{MANIFEST_VERSION_KEY} {MANIFEST_VERSION_V2} to produce inputs",
+                )
+            if declaration.is_v2 and self.context is None:
+                raise _field_error(
+                    name,
+                    MANIFEST_VERSION_KEY,
+                    f"{MANIFEST_VERSION_KEY} {MANIFEST_VERSION_V2} requires a runtime "
+                    "context, and the loader was built without one",
+                )
 
     async def _activate(
         self,

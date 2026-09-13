@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 import signal
 import time
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -14,6 +17,7 @@ import pytest
 import yaml
 
 import core.main as application
+from core.bus import EventBus
 from core.contracts import (
     COUNTER_AUDIT_RECORD_LOSSES,
     COUNTER_LOST_TRACES,
@@ -22,6 +26,7 @@ from core.contracts import (
     TRACE_BRAIN_ADMISSION_REJECTED,
     TRACE_BRAIN_RUN_COMPLETED,
 )
+from core.loader import ModuleLoader
 from core.runtime import Supervision
 from conftest import FakeResponse, FakeSession, completion, wait_until
 from test_integration import (
@@ -2871,3 +2876,432 @@ def test_example_config_names_its_credentials_and_nothing_traces_correlate_by() 
         environ["OPENAI_ENDPOINT"],
     ]
     assert environ["TWITCH_BROADCASTER_ID"] not in loaded["secrets"]
+
+
+# --------------------------------------------------------------------------- #
+# `modules_directory: builtin` and `--check-config` (R7, R8; AC40, AC43)
+# --------------------------------------------------------------------------- #
+
+
+def _discovered_names(modules_directory: str) -> list[str]:
+    """The manifests a loader over *modules_directory* discovers, by name."""
+
+    loader = ModuleLoader(EventBus(), modules_directory)
+    return sorted(loader._discover())
+
+
+def _builtin_config(tmp_path: Path) -> Path:
+    """The shipped example, pointed at the shipped modules by the literal."""
+
+    config = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    config["modules_directory"] = application.MODULES_DIRECTORY_BUILTIN
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    return config_path
+
+
+def test_builtin_modules_directory_resolves_to_the_shipped_package(
+    tmp_path: Path,
+) -> None:
+    """R8 (AC43 groundwork): the literal names the importable package, not a
+    path relative to the configuration file; a loader over it discovers the
+    same manifests as one over the checkout's ``./modules``."""
+
+    environ = _environment()
+    builtin = application.load_config(_builtin_config(tmp_path), environ=environ)
+
+    relative = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    relative["modules_directory"] = os.path.relpath(ROOT / "modules", tmp_path)
+    relative_path = tmp_path / "relative.yaml"
+    _write_config(relative_path, relative)
+    checkout = application.load_config(relative_path, environ=environ)
+
+    assert builtin["modules_directory"] == str((ROOT / "modules").resolve())
+    assert builtin["modules_directory"] == checkout["modules_directory"]
+    names = _discovered_names(builtin["modules_directory"])
+    assert names == _discovered_names(checkout["modules_directory"])
+    assert names == sorted(
+        child.name for child in (ROOT / "modules").iterdir()
+        if (child / "module.yaml").is_file()
+    )
+    assert names
+
+
+@pytest.mark.parametrize(
+    ("spec", "reason"),
+    [
+        (None, "is not importable"),
+        (SimpleNamespace(origin=None), "has no directory"),
+        (SimpleNamespace(origin=""), "has no directory"),
+    ],
+)
+def test_builtin_modules_directory_names_the_field_when_the_package_is_unresolvable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spec: Any, reason: str
+) -> None:
+    """R8: a literal that selects a package the interpreter cannot import, or
+    one with no directory, is a configuration defect naming the field."""
+
+    monkeypatch.setattr(
+        application.importlib.util, "find_spec", lambda _name: spec
+    )
+
+    with pytest.raises(
+        application.ConfigurationError,
+        match=rf"^modules_directory: builtin names a modules package that {reason}$",
+    ):
+        application.load_config(_builtin_config(tmp_path), environ=_environment())
+
+
+def test_builtin_modules_directory_names_the_field_when_the_origin_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R8: an origin whose directory no longer exists names the field too."""
+
+    missing = tmp_path / "gone" / "__init__.py"
+    monkeypatch.setattr(
+        application.importlib.util,
+        "find_spec",
+        lambda _name: SimpleNamespace(origin=str(missing)),
+    )
+
+    with pytest.raises(
+        application.ConfigurationError,
+        match=r"^modules_directory: builtin names a modules package that has no directory$",
+    ):
+        application.load_config(_builtin_config(tmp_path), environ=_environment())
+
+
+def test_other_modules_directory_values_keep_their_relative_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R8: only the exact literal is reserved; ``./builtin`` is still a path
+    relative to the configuration file, resolved without the import system."""
+
+    def unexpected_find_spec(_name: str) -> Any:
+        pytest.fail("a relative path must not consult the import system")
+
+    monkeypatch.setattr(application.importlib.util, "find_spec", unexpected_find_spec)
+    (tmp_path / "builtin").mkdir()
+    config = _valid_config("./builtin", tmp_path / "unused.log")
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = application.load_config(config_path)
+
+    assert loaded["modules_directory"] == str((tmp_path / "builtin").resolve())
+
+
+def _spy_entry_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], list[str]]:
+    """Wrap every entry point the loader imports; record loads and activations.
+
+    Returns ``(loaded, activated)``: the module names whose entry point was
+    imported, and the names whose ``activate`` was called. A check must fill
+    the first and leave the second empty (AC40).
+    """
+
+    loaded: list[str] = []
+    activated: list[str] = []
+    real_load = ModuleLoader._load_entry_point
+
+    def load_with_spy(self: ModuleLoader, module: Any) -> Any:
+        entry_point = real_load(self, module)
+        loaded.append(module.name)
+        real_activate = entry_point.activate
+
+        async def spied_activate(*args: Any, **kwargs: Any) -> Any:
+            activated.append(module.name)
+            return await real_activate(*args, **kwargs)
+
+        return replace(entry_point, activate=spied_activate)
+
+    monkeypatch.setattr(ModuleLoader, "_load_entry_point", load_with_spy)
+    return loaded, activated
+
+
+@pytest.mark.asyncio
+async def test_check_config_accepts_the_example_and_activates_no_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC40: the shipped example with dummy environment values is accepted —
+    every enabled entry point imported and validated, 0 activated."""
+
+    loaded, activated = _spy_entry_points(monkeypatch)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        EXAMPLE_CONFIG,
+        environ=_environment(),
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status == 0
+    assert diagnostics == []
+    enabled = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))["enabled_modules"]
+    assert loaded == enabled
+    assert activated == []
+
+
+@pytest.mark.asyncio
+async def test_check_config_accepts_the_example_through_the_builtin_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R8: the same check passes when the profile names the shipped package."""
+
+    _loaded, activated = _spy_entry_points(monkeypatch)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        _builtin_config(tmp_path),
+        environ=_environment(),
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert (status, diagnostics, activated) == (0, [], [])
+
+
+@pytest.mark.asyncio
+async def test_check_config_names_the_unset_credential_path_and_no_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC40: with ``TWITCH_ACCESS_TOKEN`` unset the check exits 2 and the one
+    diagnostic names the setting path — never a configured value."""
+
+    _loaded, activated = _spy_entry_points(monkeypatch)
+    environ = _environment()
+    del environ["TWITCH_ACCESS_TOKEN"]
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        EXAMPLE_CONFIG,
+        environ=environ,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status == 2
+    assert diagnostics == [
+        "modules.twitch.access_token: environment reference is unresolved"
+    ]
+    assert all(value not in diagnostics[0] for value in environ.values())
+    assert activated == []
+
+
+@pytest.mark.asyncio
+async def test_check_config_reports_every_refusing_module_by_module_and_field(
+    tmp_path: Path,
+) -> None:
+    """R7: the check runs each enabled module's own settings hook through the
+    loader's pre-activation path — both refusals are reported, each naming
+    module and field with the echoed credential redacted, and 0 modules are
+    activated (AC24 applied to the check)."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(
+        modules,
+        "gateway",
+        roles=("input",),
+        source=ECHOING_FIELD_HOOK_SOURCE,
+        settings_validator="validate_settings",
+    )
+    _make_phased_module(
+        modules,
+        "engine",
+        source=REFUSING_HOOK_SOURCE,
+        settings_validator="validate_settings",
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config, credentials = _hooked_config("./modules", lifecycle_log)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        config_path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+
+    assert status == 2
+    assert diagnostics == [
+        "module 'gateway': field 'api_key': rejected '<redacted>'",
+        "module 'engine': field 'validate_settings': settings were refused by the module",
+    ]
+    assert all(
+        value not in diagnostic for diagnostic in diagnostics for value in credentials
+    )
+    assert not lifecycle_log.exists()
+
+
+@pytest.mark.asyncio
+async def test_check_config_accepts_a_valid_profile_and_activates_nothing(
+    tmp_path: Path,
+) -> None:
+    """R7: an accepted profile leaves the lifecycle log untouched — no hook
+    past validation ran — and hands the accepted limits to the hook."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(
+        modules,
+        "gateway",
+        roles=("input",),
+        source=ACCEPTING_HOOK_SOURCE,
+        settings_validator="validate_settings",
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config = _phased_config("./modules", lifecycle_log, ("gateway",))
+    config["modules"]["gateway"]["api_key"] = "${GATEWAY_KEY}"
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        config_path,
+        environ={"GATEWAY_KEY": _opaque("key")},
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert (status, diagnostics) == (0, [])
+    assert not lifecycle_log.exists()
+
+
+@pytest.mark.asyncio
+async def test_check_config_reports_a_manifest_the_enabled_set_lacks(
+    tmp_path: Path,
+) -> None:
+    """R7: the enabled set is validated against every discovered manifest."""
+
+    (tmp_path / "modules").mkdir()
+    config = _phased_config("./modules", tmp_path / "unused.log", ("absent",))
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        config_path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+
+    assert status == 2
+    assert diagnostics == ["module 'absent': field 'enabled_modules': has no manifest"]
+
+
+@pytest.mark.asyncio
+async def test_check_config_refuses_the_v1_input_startup_refuses(
+    tmp_path: Path,
+) -> None:
+    """R4, R7: the check runs the loader's compatibility validation, so a v1
+    manifest declaring the ``input`` role is refused here exactly as startup
+    refuses it before activation — never accepted by the check alone."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_module(modules, "legacy")
+    manifest_path = modules / "legacy" / "module.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["lifecycle"] = {"roles": ["input"]}
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    config = _phased_config("./modules", tmp_path / "unused.log", ("legacy",))
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        config_path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+
+    assert status == 2
+    assert len(diagnostics) == 1
+    assert diagnostics[0].startswith("module 'legacy': field 'lifecycle.roles': ")
+    assert "cannot honour the readiness barrier" in diagnostics[0]
+
+
+def _example_environment(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Export the dummy environment the example references into the process."""
+
+    environ = _environment()
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    return environ
+
+
+def _forbid_the_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("--check-config must not install the process watchdog")
+
+    monkeypatch.setattr(application, "ProcessWatchdog", unexpected)
+    monkeypatch.setattr(application, "install_shutdown_watchdog", unexpected)
+    monkeypatch.setattr(application, "arm_shutdown_watchdog", unexpected)
+
+
+def test_main_check_config_returns_the_check_status_without_the_watchdog(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC40: ``main`` dispatches the flag to the check and returns its status
+    — 0 with the environment exported, 2 without the access token, the
+    diagnostic on stderr — and never installs the watchdog's process exit."""
+
+    _forbid_the_watchdog(monkeypatch)
+    _loaded, activated = _spy_entry_points(monkeypatch)
+    _example_environment(monkeypatch)
+
+    assert application.main(["--config", str(EXAMPLE_CONFIG), "--check-config"]) == 0
+    assert capsys.readouterr().err == ""
+
+    monkeypatch.delenv("TWITCH_ACCESS_TOKEN")
+
+    assert application.main(["--check-config", "--config", str(EXAMPLE_CONFIG)]) == 2
+    assert capsys.readouterr().err == (
+        "error: modules.twitch.access_token: environment reference is unresolved\n"
+    )
+    assert activated == []
+
+
+def test_main_check_config_does_not_run_the_application(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_run(*_args: Any, **_kwargs: Any) -> int:
+        pytest.fail("--check-config must not run the application")
+
+    async def fake_check(config_path: str, **_kwargs: Any) -> int:
+        checked.append(config_path)
+        return 2
+
+    checked: list[str] = []
+    _forbid_the_watchdog(monkeypatch)
+    monkeypatch.setattr(application, "run", unexpected_run)
+    monkeypatch.setattr(application, "check_config", fake_check)
+
+    assert application.main(["--config", "chosen.yaml", "--check-config"]) == 2
+    assert checked == ["chosen.yaml"]
+
+
+def test_main_check_config_sanitizes_unexpected_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostics: list[str] = []
+
+    async def failing_check(_config_path: str, **_kwargs: Any) -> int:
+        raise RuntimeError(_opaque("sensitive"))
+
+    _forbid_the_watchdog(monkeypatch)
+    monkeypatch.setattr(application, "check_config", failing_check)
+    monkeypatch.setattr(
+        application, "_default_diagnostic_reporter", diagnostics.append
+    )
+
+    assert application.main(["--config", "chosen.yaml", "--check-config"]) == 1
+    assert diagnostics == ["configuration check: unexpected failure"]
+
+
+def test_main_help_exits_zero_and_documents_the_check(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R8 (AC43 groundwork): ``--help`` exits 0 and names both options."""
+
+    with pytest.raises(SystemExit) as raised:
+        application.main(["--help"])
+
+    assert raised.value.code == 0
+    usage = capsys.readouterr().out
+    assert "--config PATH" in usage
+    assert "--check-config" in usage

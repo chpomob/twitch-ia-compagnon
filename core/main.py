@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import math
 import os
 import random
@@ -98,6 +99,8 @@ from .loader import (
     ModuleActivation,
     ModuleLoadError,
     ModuleLoader,
+    _declaration,
+    _entry_point,
 )
 from .runtime import RuntimeContext, Supervision
 from .triggers import TriggerEngine, TriggerRegistry
@@ -123,6 +126,17 @@ _DRAIN_DEADLINE_SECONDS = DEFAULT_DRAIN_DEADLINE_SECONDS
 
 Reporter = Callable[[str], None]
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
+
+MODULES_DIRECTORY_BUILTIN = "builtin"
+"""The reserved ``modules_directory`` value naming the shipped modules (R8).
+
+An installed distribution has no checkout for a relative path to point into:
+the literal resolves to the directory of the importable ``modules`` package,
+wherever the interpreter finds it, so a clean environment discovers the
+shipped manifests from a configuration file kept anywhere. Any other value
+keeps its meaning: a path, relative to the configuration file.
+"""
+_BUILTIN_MODULES_PACKAGE = "modules"
 
 # --------------------------------------------------------------------------- #
 # Retention and admission limits (R6)
@@ -236,8 +250,10 @@ def load_config(
     """Load, expand, and validate one YAML configuration file.
 
     Relative module directories are resolved from the configuration file rather
-    than from the process working directory. Errors contain setting paths, but
-    never interpolate setting values or YAML parser excerpts.
+    than from the process working directory; the reserved value
+    :data:`MODULES_DIRECTORY_BUILTIN` resolves to the shipped modules package
+    instead (R8). Errors contain setting paths, but never interpolate setting
+    values or YAML parser excerpts.
 
     ``${NAME}`` references are resolved everywhere except inside the settings
     of a module that is not enabled: a disabled module's secrets are never
@@ -324,6 +340,9 @@ def load_config(
     ]
 
     raw_modules_directory = config["modules_directory"]
+    if raw_modules_directory == MODULES_DIRECTORY_BUILTIN:
+        config["modules_directory"] = str(_builtin_modules_directory())
+        return config
     try:
         modules_directory = Path(raw_modules_directory).expanduser()
         if not modules_directory.is_absolute():
@@ -335,6 +354,35 @@ def load_config(
         ) from None
 
     return config
+
+
+def _builtin_modules_directory() -> Path:
+    """The directory of the importable shipped modules package (R8).
+
+    Resolved through the import system and never through the checkout, so
+    the same configuration file discovers the same manifests from an
+    installed distribution. A package the interpreter cannot import, or one
+    with no directory of its own, is a configuration defect naming the
+    field: the literal selects a package that is not there to select.
+    """
+
+    try:
+        spec = importlib.util.find_spec(_BUILTIN_MODULES_PACKAGE)
+    except (ImportError, ValueError):
+        spec = None
+    if spec is None:
+        raise ConfigurationError(
+            f"modules_directory: {MODULES_DIRECTORY_BUILTIN} names a modules "
+            "package that is not importable"
+        )
+    origin = getattr(spec, "origin", None)
+    directory = None if not isinstance(origin, str) or not origin else Path(origin).parent
+    if directory is None or not directory.is_dir():
+        raise ConfigurationError(
+            f"modules_directory: {MODULES_DIRECTORY_BUILTIN} names a modules "
+            "package that has no directory"
+        )
+    return directory.resolve()
 
 
 async def run(
@@ -479,6 +527,123 @@ async def run(
         remove_signal_handlers()
 
 
+async def check_config(
+    config_path: str | os.PathLike[str],
+    *,
+    environ: Mapping[str, str] | None = None,
+    diagnostic_reporter: Reporter | None = None,
+) -> int:
+    """Validate a profile without opening a transport; return its status (R7).
+
+    Everything :func:`run` checks before it activates the first module is
+    checked here, in the same order and through the same code: the
+    configuration file, every discovered manifest — disabled ones included —
+    the enabled set, the ``${NAME}`` references of the enabled modules, the
+    credentials the manifests declare (handed to redaction, so the runtime
+    contract holds) and each enabled module's own settings hook, given the
+    accepted ``limits`` block, under the same global startup deadline. The
+    runtime is assembled because the loader validates against it; assembly
+    constructs collaborators and opens nothing, and no entry point's
+    ``activate`` is called, so 0 modules are activated and 0 sockets are
+    opened (AC40).
+
+    Returns 0 when the profile is accepted, 2 otherwise — with one diagnostic
+    per failure, each naming the module and the field and never a configured
+    value, reported through *diagnostic_reporter* as it is found.
+    """
+
+    report_diagnostic = diagnostic_reporter or _default_diagnostic_reporter
+
+    try:
+        config = load_config(config_path, environ=environ)
+    except ConfigurationError as exc:
+        report_diagnostic(str(exc))
+        return 2
+    except Exception:
+        report_diagnostic("configuration file: could not be loaded")
+        return 2
+
+    try:
+        runtime = _assemble_runtime(config)
+    except Exception:
+        report_diagnostic("runtime: could not be assembled")
+        return 2
+
+    loader = ModuleLoader(runtime.bus, config["modules_directory"])
+    loader.context = runtime.context
+    loader.environ = os.environ if environ is None else environ
+    loader.clock = runtime.clock
+    try:
+        refusals = await _validate_enabled(
+            loader,
+            config,
+            deadline_at=runtime.clock() + _STARTUP_DEADLINE_SECONDS,
+        )
+    except ModuleLoadError as exc:
+        for diagnostic in exc.diagnostics:
+            report_diagnostic(diagnostic)
+        return 2
+    except Exception:
+        report_diagnostic("configuration check: could not be completed")
+        return 2
+    for diagnostic in refusals:
+        report_diagnostic(diagnostic)
+    return 2 if refusals else 0
+
+
+async def _validate_enabled(
+    loader: ModuleLoader,
+    config: Mapping[str, Any],
+    *,
+    deadline_at: float,
+) -> list[str]:
+    """The loader's pre-activation path, stopped short of the first activation.
+
+    The steps are the ones :meth:`~core.loader.ModuleLoader.activate_enabled`
+    takes before it activates anything, called in its order on its own
+    methods so the check cannot drift from what startup enforces: discovery
+    validates every manifest, the enabled set is checked against it, every
+    enabled entry point is imported, the declarations are checked for what
+    no activation shape could honour (a v1 input, a v2 module without a
+    runtime context), secrets are resolved for the enabled
+    modules only, every settings hook runs and every refusal is collected
+    before any is reported, the declared credentials reach redaction, and
+    the declarations and the configured trigger policies are registered
+    against the runtime (R7, AC24, AC25). What one of those steps raises is
+    the loader's own :class:`~core.loader.ModuleLoadError`; the hooks'
+    refusals are returned, one diagnostic each.
+    """
+
+    discovered = loader._discover()
+    enabled, settings = loader._validate_config(config, discovered)
+    entry_points = {
+        name: _entry_point(loader._load_entry_point(discovered[name]))
+        for name in enabled
+    }
+    declarations = {name: _declaration(discovered[name]) for name in enabled}
+    loader._validate_compatibility(enabled, declarations)
+    # The one global startup deadline every awaited hook is bounded by: the
+    # attribute activate_enabled sets from its own argument (R4).
+    loader._deadline_at = deadline_at
+    resolved = {name: loader._resolve_secrets(name, settings[name]) for name in enabled}
+
+    refusals: list[str] = []
+    for name in enabled:
+        refusals.extend(
+            await loader._validate_settings(
+                name, declarations[name], entry_points[name], resolved[name]
+            )
+        )
+    if refusals:
+        return refusals
+
+    loader._redact_credentials(enabled, declarations, resolved)
+    for name in enabled:
+        loader._register_declarations(name, declarations[name], resolved[name])
+    loader._apply_trigger_configuration(config)
+    return []
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Execute the application behind a hard process shutdown deadline.
 
@@ -497,7 +662,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="PATH",
         help="path to the YAML configuration file",
     )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help=(
+            "validate the configuration, the module manifests and each "
+            "enabled module's settings without opening any transport, then "
+            "exit 0 (accepted) or 2 (diagnostics)"
+        ),
+    )
     arguments = parser.parse_args(argv)
+
+    if arguments.check_config:
+        # Nothing is activated, so there is no cleanup for the watchdog to
+        # bound: the check returns its status and the process exits by it.
+        try:
+            return asyncio.run(check_config(arguments.config))
+        except KeyboardInterrupt:
+            return 1
+        except Exception:
+            _default_diagnostic_reporter("configuration check: unexpected failure")
+            return 1
+
     watchdog = ProcessWatchdog(_SHUTDOWN_TIMEOUT_SECONDS)
     token = install_shutdown_watchdog(watchdog)
 
@@ -1173,8 +1359,10 @@ def _default_diagnostic_reporter(message: str) -> None:
 
 __all__ = [
     "LIMITS_KEY",
+    "MODULES_DIRECTORY_BUILTIN",
     "SECRETS_KEY",
     "ConfigurationError",
+    "check_config",
     "load_config",
     "main",
     "run",
