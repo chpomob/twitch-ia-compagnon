@@ -27,6 +27,7 @@ from core.actions import (
     AuthorizationPolicy,
     AuthorizationRule,
 )
+from core.attachments import AttachmentStore, AttachmentUnknown, RunUsage
 from core.admission import (
     REASON_ADMITTED,
     REASON_CANCELLED,
@@ -1007,6 +1008,285 @@ async def test_closing_completes_the_work_still_waiting_in_a_queue():
     assert harness.scheduler.live_sessions == 0
 
 
+# --------------------------------------------------------------------------- #
+# F9 — no admitted item vanishes on a shutdown that lands mid-publication
+# --------------------------------------------------------------------------- #
+
+
+def _gate_publications(
+    harness, *, blocked_types: set[str], blocked_sources: set[str] | None = None
+) -> asyncio.Event:
+    """Hold chosen publications on a gate the terminal trace then opens.
+
+    The gate is released by the first ``brain.run.completed`` the scheduler
+    publishes, so the blocked traces finish and ``aclose`` can drain them:
+    the test blocks the *pre-terminal* publications, never the accounting.
+    """
+
+    gate = asyncio.Event()
+    upstream = harness.bus.publish
+
+    async def gated(event_type, payload):
+        if event_type in blocked_types and (
+            blocked_sources is None or payload.get("source_event_id") in blocked_sources
+        ):
+            await gate.wait()
+        await upstream(event_type, payload)
+
+    harness.bus.publish = gated
+
+    def open_on_completion(event_type, _payload):
+        if event_type == TRACE_BRAIN_RUN_COMPLETED:
+            gate.set()
+
+    harness.bus.on_publish = open_on_completion
+    return gate
+
+
+async def test_shutdown_inside_the_admission_trace_settlement_still_records_the_run():
+    """F9: a cancelled worker may not leave its dequeued item unrecorded."""
+
+    body = RunSpy()
+    harness = Harness(body, workers=1)
+    await harness.scheduler.start()
+    _gate_publications(harness, blocked_types={TRACE_BRAIN_ADMISSION_ACCEPTED})
+
+    admitted = harness.scheduler.admit(SESSION_A, message("victim"))
+    await settle()
+    # Dequeued (a session is locked on it) yet recorded nowhere: the exact
+    # ownership window F9 names, parked inside the admission publication.
+    assert harness.scheduler.active_runs == 1
+    assert harness.scheduler.pending == 0
+    assert harness.scheduler.run_record(admitted.run_id) is None
+    assert body.started == []
+
+    await harness.scheduler.aclose()
+
+    record = harness.scheduler.run_record(admitted.run_id)
+    assert record is not None
+    assert (record.status, record.reason) == ("cancelled", REASON_CANCELLED)
+    assert record.started is False
+    assert (record.model_calls, record.sends) == (0, 0)
+    assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, admitted.run_id)) == 1
+    # Never started, so it never claimed a `brain.run.started` either.
+    assert harness.bus.for_run(TRACE_BRAIN_RUN_STARTED, admitted.run_id) == []
+    # No orphaned work: nothing pending, no session held, no active run.
+    assert harness.scheduler.pending == 0
+    assert harness.scheduler.active_runs == 0
+    assert harness.scheduler.live_sessions == 0
+
+
+async def test_shutdown_inside_the_started_publication_still_records_the_run():
+    """F9: the started trace is awaited before the cancellation handler."""
+
+    body = RunSpy()
+    harness = Harness(body, workers=1)
+    await harness.scheduler.start()
+    _gate_publications(harness, blocked_types={TRACE_BRAIN_RUN_STARTED})
+
+    admitted = harness.scheduler.admit(SESSION_A, message("victim"))
+    await settle()
+    assert harness.scheduler.active_runs == 1
+    assert harness.scheduler.run_record(admitted.run_id) is None
+    assert body.started == []
+    # The admission trace settled; the worker is inside the started one.
+    assert len(harness.bus.for_run(TRACE_BRAIN_ADMISSION_ACCEPTED, admitted.run_id)) == 1
+
+    await harness.scheduler.aclose()
+
+    record = harness.scheduler.run_record(admitted.run_id)
+    assert record is not None
+    assert (record.status, record.reason) == ("cancelled", REASON_CANCELLED)
+    assert record.started is False
+    assert (record.model_calls, record.sends) == (0, 0)
+    assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, admitted.run_id)) == 1
+    assert harness.bus.for_run(TRACE_BRAIN_RUN_STARTED, admitted.run_id) == []
+    assert body.started == []
+    assert harness.scheduler.pending == 0
+    assert harness.scheduler.active_runs == 0
+    assert harness.scheduler.live_sessions == 0
+
+
+async def test_shutdown_inside_a_stale_batch_completion_still_records_the_run():
+    """F9: the reaper owns its claimed stale items until they are recorded."""
+
+    body = RunSpy()
+    body.hold_all = True
+    harness = Harness(body, workers=1, wait_seconds=5.0)
+    await harness.scheduler.start()
+    _gate_publications(
+        harness,
+        blocked_types={TRACE_BRAIN_ADMISSION_ACCEPTED},
+        blocked_sources={"evt-victim"},
+    )
+
+    held = harness.scheduler.admit(HOLDER, message("holder"))
+    await settle()
+    assert body.started == ["holder"]
+
+    victim = harness.scheduler.admit(SESSION_B, message("victim"))
+    harness.clock.advance(6.0)
+    await settle()
+    # Removed from its queue by the reaper's batch, completion parked on the
+    # blocked admission trace, and recorded nowhere yet.
+    assert harness.scheduler.pending == 0
+    assert harness.scheduler.run_record(victim.run_id) is None
+    assert body.started == ["holder"]
+
+    await harness.scheduler.aclose()
+
+    # The stale item kept the terminal state it was claimed for, not a hole.
+    record = harness.scheduler.run_record(victim.run_id)
+    assert record is not None
+    assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+    assert record.started is False
+    assert (record.model_calls, record.sends) == (0, 0)
+    assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, victim.run_id)) == 1
+    assert harness.counters.get(COUNTER_STALE_DROP) == 1
+    # The held run is accounted for exactly once too: one terminal record
+    # per accepted item, and no orphaned work anywhere.
+    held_record = harness.scheduler.run_record(held.run_id)
+    assert held_record is not None
+    assert (held_record.status, held_record.reason) == ("cancelled", REASON_CANCELLED)
+    assert len(harness.bus.of_type(TRACE_BRAIN_RUN_COMPLETED)) == 2
+    assert harness.scheduler.pending == 0
+    assert harness.scheduler.active_runs == 0
+    assert harness.scheduler.live_sessions == 0
+
+
+async def test_a_cancelled_stale_batch_is_not_duplicated_when_the_record_cache_evicted():
+    """F9 review: an evicted record must not read as an unfinished item.
+
+    ``max_records=1``: the first stale item's completion is fully published,
+    the second blocks on its publication *after* its record evicted the
+    first. Cancelling the reaper then hands the whole batch back — the
+    already-terminal items must be recognised on the items themselves, not
+    finished a second time with a duplicated record and stale-drop count.
+    """
+
+    body = RunSpy()
+    body.hold_all = True
+    harness = Harness(body, workers=1, wait_seconds=5.0, max_records=1)
+    await harness.scheduler.start()
+
+    held = harness.scheduler.admit(HOLDER, message("holder"))
+    await settle()
+    assert body.started == ["holder"]
+
+    first = harness.scheduler.admit(SESSION_A, message("first"))
+    second = harness.scheduler.admit(SESSION_A, message("second"))
+    harness.clock.advance(6.0)
+
+    # Block only the second item's completion, and only once, so a buggy
+    # re-publication would complete rather than park the reaper forever.
+    gate = asyncio.Event()
+    blocked = False
+    upstream = harness.bus.publish
+
+    async def gated(event_type, payload):
+        nonlocal blocked
+        if (
+            event_type == TRACE_BRAIN_RUN_COMPLETED
+            and payload["run_id"] == second.run_id
+            and not blocked
+        ):
+            blocked = True
+            await gate.wait()
+        await upstream(event_type, payload)
+
+    harness.bus.publish = gated
+    await settle()
+
+    # The reaper claimed both stale items: the first is recorded *and*
+    # published, the second is recorded — evicting the first — and parked.
+    assert harness.scheduler.pending == 0
+    assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, first.run_id)) == 1
+    assert harness.scheduler.run_record(second.run_id) is not None
+    assert harness.scheduler.run_record(first.run_id) is None
+
+    reaper = harness.scheduler._reaper
+    reaper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reaper
+
+    # No duplicated terminal events: the first item was not finished a
+    # second time after its eviction. The second's own publication was the
+    # one cancelled — its record stands, its trace is the documented loss.
+    assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, first.run_id)) == 1
+    assert harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, second.run_id) == []
+    assert harness.counters.get(COUNTER_STALE_DROP) == 2
+    record = harness.scheduler.run_record(second.run_id)
+    assert record is not None
+    assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+
+    await harness.scheduler.aclose()
+
+    # The held run is accounted for exactly once as well: one terminal event
+    # per *published* item, one record per accepted item, no orphaned work.
+    assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, held.run_id)) == 1
+    assert len(harness.bus.of_type(TRACE_BRAIN_RUN_COMPLETED)) == 2
+    assert harness.counters.get(COUNTER_STALE_DROP) == 2
+    assert harness.scheduler.pending == 0
+    assert harness.scheduler.active_runs == 0
+    assert harness.scheduler.live_sessions == 0
+
+
+async def test_shutdown_inside_deadline_cleanup_keeps_the_started_run_accounting():
+    """F9 review: a run cancelled while being abandoned keeps its real counts.
+
+    The total deadline expires with the body in flight and its activity
+    recorded; shutdown then lands inside ``_abandon``'s bounded courtesy,
+    outside the inner cancellation handler. The terminal record must keep
+    the started state and those counts, not restart as an unstarted
+    ``stale_drop`` with zeros.
+    """
+
+    abandoned = asyncio.Event()
+
+    async def run_body(context):
+        context.note_model_call(2)
+        context.note_send(1)
+        swallowed = False
+        while True:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if swallowed:
+                    raise
+                # First boundary cancellation: the worker is inside
+                # ``_abandon`` now, waiting for this body to stop.
+                swallowed = True
+                abandoned.set()
+
+    harness = Harness(run_body, workers=1, total_run_seconds=10.0, wait_seconds=5.0)
+    await harness.scheduler.start()
+    admitted = harness.scheduler.admit(SESSION_A, message("busy"))
+    await settle()
+    assert harness.scheduler.active_runs == 1
+
+    harness.clock.advance(11.0)
+    await abandoned.wait()
+    await harness.scheduler.aclose()
+
+    record = harness.scheduler.run_record(admitted.run_id)
+    assert record is not None
+    assert (record.status, record.reason) == ("cancelled", REASON_CANCELLED)
+    assert record.started is True
+    assert (record.model_calls, record.sends) == (2, 1)
+
+    completed = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, admitted.run_id)
+    assert len(completed) == 1
+    assert completed[0]["status"] == "cancelled"
+    assert completed[0]["started"] is True
+    assert (completed[0]["model_calls"], completed[0]["sends"]) == (2, 1)
+
+    # The run had started; it was never a stale drop, and nothing is orphaned.
+    assert harness.counters.get(COUNTER_STALE_DROP) == 0
+    assert harness.scheduler.pending == 0
+    assert harness.scheduler.active_runs == 0
+    assert harness.scheduler.live_sessions == 0
+
+
 async def test_a_blocked_run_started_publication_cannot_outlive_the_total_deadline():
     """R2, AC33: the run budget bounds supervision exactly as it bounds the body."""
 
@@ -1164,3 +1444,204 @@ async def test_an_invalid_run_outcome_ends_the_run_and_not_the_worker():
         assert good is not None
         assert (good.status, good.reason) == ("success", REASON_COMPLETED)
         assert entered == [invalid.run_id, following.run_id]
+
+
+# --------------------------------------------------------------------------- #
+# R6 — the run's end releases what the run leased (P24 F5)
+# --------------------------------------------------------------------------- #
+
+
+LEASE_LIMITS = {
+    "max_object_bytes": 16,
+    "max_objects": 64,
+    "max_total_bytes": 1024,
+    "max_bytes_per_run": 64,
+    "ttl_seconds": 1_000_000.0,
+}
+"""Generous bounds and a time-to-live no test reaches: only the run's end frees."""
+
+
+class LeasingBody:
+    """A run body that leases attachments under its own run identity.
+
+    What the body does after leasing is chosen per session: it finishes, it
+    fails, or it holds inside its "model" until the test lets it go or the
+    scheduler ends it — the four terminal paths F5 names.
+    """
+
+    def __init__(self, store: AttachmentStore) -> None:
+        self.store = store
+        self.gates: dict[str, asyncio.Event] = {}
+        self.leased: dict[str, list] = {}
+
+    async def __call__(self, context):
+        run_id = context.run_id
+        self.leased[run_id] = [
+            self.store.put(run_id, b"x" * 16, content_type="image/png"),
+            self.store.put(run_id, b"y" * 16, content_type="image/png"),
+        ]
+        text = context.work.payload["text"]
+        if text == "fail":
+            raise RuntimeError("the body gave up")
+        if text == "hold":
+            await self.gates.setdefault(run_id, asyncio.Event()).wait()
+        return RunOutcome(status="success", delivery="delivered", sends=1)
+
+
+def _leasing_harness(**settings) -> tuple[Harness, AttachmentStore, LeasingBody]:
+    """A scheduler whose ``run_cleanup`` is the store's own ``release``."""
+
+    bound: dict[str, Harness] = {}
+    store = AttachmentStore(clock=lambda: bound["harness"].clock(), **LEASE_LIMITS)
+    body = LeasingBody(store)
+    harness = Harness(body, run_cleanup=store.release, **settings)
+    bound["harness"] = harness
+    return harness, store, body
+
+
+def _assert_released(store: AttachmentStore, body: LeasingBody, run_id: str) -> None:
+    assert store.usage(run_id) == RunUsage(objects=0, total_bytes=0)
+    assert run_id not in store.live_runs()
+    for ref in body.leased[run_id]:
+        with pytest.raises(AttachmentUnknown):
+            store.get(ref)
+
+
+async def test_a_completed_or_failed_run_releases_exactly_its_own_leases():
+    """R6/AC23/AC31 (P24 F5): a genuinely admitted run that leased 2 objects
+    has 0 leases once its terminal record is written — on success and on a
+    body failure alike — with nothing in the test calling ``release``. An
+    unrelated run's leases, and a queued sibling's, survive untouched, and
+    the freed run identity can lease its full quota again."""
+
+    harness, store, body = _leasing_harness(workers=1)
+    bystander = store.put("run-bystander", b"b" * 16, content_type="image/png")
+    async with harness:
+        done = harness.scheduler.admit(SESSION_A, message("done"))
+        failed = harness.scheduler.admit(SESSION_B, message("fail"))
+        await settle()
+
+        for admitted, status, reason in (
+            (done, "success", REASON_COMPLETED),
+            (failed, "error", REASON_RUN_FAILED),
+        ):
+            record = harness.scheduler.run_record(admitted.run_id)
+            assert record is not None
+            assert (record.status, record.reason) == (status, reason)
+            assert len(body.leased[admitted.run_id]) == 2
+            _assert_released(store, body, admitted.run_id)
+            completed = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, admitted.run_id)
+            assert len(completed) == 1
+
+        # Exactly the two runs' objects went; the bystander's did not.
+        assert store.usage("run-bystander") == RunUsage(objects=1, total_bytes=16)
+        assert store.get(bystander) == b"b" * 16
+        assert store.object_count == 1
+        assert store.total_bytes == 16
+        assert store.live_runs() == ("run-bystander",)
+
+        # The identity is clean: its full quota is available again.
+        for _ in range(4):
+            store.put(done.run_id, b"z" * 16, content_type="image/png")
+        assert store.usage(done.run_id) == RunUsage(objects=4, total_bytes=64)
+        store.release(done.run_id)
+
+    # Not one wait for real time anywhere in the scenario.
+    assert harness.clock.now == 0.0
+
+
+async def test_a_run_ended_by_its_deadline_or_by_shutdown_releases_its_leases():
+    """R6 (P24 F5): the deadline expiry of a run held inside its model frees
+    its 2 leases at the terminal record, while a concurrent held run keeps
+    its 2; closing the scheduler then cancels that run and frees its 2 as
+    well, and a queued item that never started ends with 0 leases to free
+    — every terminal path releases, and none touches another run."""
+
+    harness, store, body = _leasing_harness(workers=2, total_run_seconds=10.0)
+    async with harness:
+        expiring = harness.scheduler.admit(SESSION_A, message("hold"))
+        await settle()
+        harness.clock.advance(5.0)
+        surviving = harness.scheduler.admit(SESSION_B, message("hold"))
+        queued = harness.scheduler.admit(SESSION_B, message("never"))
+        await settle()
+        assert harness.scheduler.active_runs == 2
+        assert harness.scheduler.pending == 1
+        assert store.usage(expiring.run_id) == RunUsage(objects=2, total_bytes=32)
+        assert store.usage(surviving.run_id) == RunUsage(objects=2, total_bytes=32)
+        assert store.object_count == 4
+
+        # The first run's total deadline passes; the second's does not.
+        harness.clock.advance(6.0)
+        await settle()
+        record = harness.scheduler.run_record(expiring.run_id)
+        assert record is not None
+        assert (record.status, record.reason) == ("timeout", REASON_RUN_DEADLINE)
+        _assert_released(store, body, expiring.run_id)
+        assert store.usage(surviving.run_id) == RunUsage(objects=2, total_bytes=32)
+        assert store.object_count == 2
+        assert store.live_runs() == (surviving.run_id,)
+
+    # Shutdown ended the held run and the queued item; each is recorded once.
+    cancelled = harness.scheduler.run_record(surviving.run_id)
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    _assert_released(store, body, surviving.run_id)
+    never = harness.scheduler.run_record(queued.run_id)
+    assert never is not None
+    assert (never.status, never.reason, never.started) == (
+        "cancelled",
+        REASON_CANCELLED,
+        False,
+    )
+    assert queued.run_id not in body.leased
+    assert store.usage(queued.run_id) == RunUsage(objects=0, total_bytes=0)
+    assert store.object_count == 0
+    assert store.total_bytes == 0
+    assert store.live_runs() == ()
+    for run_id in (expiring.run_id, surviving.run_id, queued.run_id):
+        assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, run_id)) == 1
+
+
+async def test_a_stale_dropped_item_and_a_failing_cleanup_never_break_the_record():
+    """R6/R8 (P24 F5): the cleanup runs for a stale-dropped item too — it is
+    a terminal path, with nothing leased — and a cleanup that raises is
+    contained: the record and its one trace still land, and the next run's
+    cleanup is still called."""
+
+    calls: list[str] = []
+
+    def cleanup(run_id: str) -> None:
+        calls.append(run_id)
+        if len(calls) == 1:
+            raise RuntimeError("store unavailable")
+
+    body = RunSpy(FakeModel())
+    async with Harness(
+        body, workers=1, wait_seconds=5.0, run_cleanup=cleanup
+    ) as harness:
+        holder = harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        stale = harness.scheduler.admit(SESSION_A, message("stale"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+
+        record = harness.scheduler.run_record(stale.run_id)
+        assert record is not None
+        assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+        assert calls == [stale.run_id]
+        assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, stale.run_id)) == 1
+
+        body.model.release()
+        await settle()
+        assert harness.scheduler.run_record(holder.run_id) is not None
+        assert calls == [stale.run_id, holder.run_id]
+    # Exactly once per run, and never again for a run already recorded.
+    assert calls == [stale.run_id, holder.run_id]
+
+
+def test_a_non_callable_run_cleanup_is_refused_by_name():
+    with pytest.raises(ContractError) as caught:
+        AdmissionScheduler(lambda _context: None, run_cleanup="release")  # type: ignore[arg-type]
+    assert "run_cleanup" in str(caught.value)

@@ -8,7 +8,13 @@ worker that runs outside the publication chain. Three guarantees hold:
 *and* by serialized bytes. Offering a record is a synchronous, non-blocking
 step of the publication chain; when either bound is reached the **newly
 offered** record is dropped, never an older one, so what was admitted is
-never rewritten. Every drop increments the audit-loss counter.
+never rewritten. Every drop increments the audit-loss counter. The two
+bounds are this module's ``queue`` settings; the entry point validates the
+same pair as ``limits.observation_queue`` and hands its accepted block to
+every enabled module as the reserved ``limits`` setting, and the settings
+hook refuses a ``queue`` value that differs from the accepted one before any
+module is activated — the queue is always bounded by the value the
+configuration was accepted with, never by a stale mirror of it.
 
 **The loss counter is readable outside the queue (R6, R8).** A loss is
 counted in memory on the handle and, when the module runs on the versioned
@@ -71,6 +77,12 @@ OUTPUT_STDERR = "stderr"
 
 _QUEUE_LIMITS = ("max_records", "max_bytes")
 
+#: The reserved setting the entry point hands its accepted ``limits`` block
+#: over in (``core.main.LIMITS_KEY``), and the group of it this module owns:
+#: the ``queue`` settings must equal that group, field by field (R6).
+_ACCEPTED_LIMITS_SETTING = "limits"
+_ACCEPTED_QUEUE_GROUP = "observation_queue"
+
 
 class AuditModuleError(RuntimeError):
     """An audit setup failure whose message contains no event data."""
@@ -110,7 +122,11 @@ def validate_settings(settings: Any) -> list[str]:
 
     Beyond the shape the schema states, the hook checks that ``output`` is
     ``stdout``, ``stderr`` or a writable file path, and that both queue limits
-    are present, integral, finite and positive (R6).
+    are present, integral, finite and positive (R6). When the entry point
+    handed the accepted ``limits`` block over, each queue limit must also
+    equal ``limits.observation_queue``'s: a copy that differs is refused by
+    field, so the queue is never bounded by a value the configuration was not
+    accepted with.
     """
 
     if not isinstance(settings, Mapping):
@@ -134,11 +150,57 @@ def validate_settings(settings: Any) -> list[str]:
                         f"queue.{field_name}", "is not a limit this module owns"
                     )
                 )
+        accepted = _accepted_queue_limits(settings, diagnostics)
         for field_name in _QUEUE_LIMITS:
             reason = _limit_reason(queue.get(field_name))
             if reason is not None:
                 diagnostics.append(_setting_diagnostic(f"queue.{field_name}", reason))
+            elif (
+                accepted is not None
+                and field_name in accepted
+                and queue[field_name] != accepted[field_name]
+            ):
+                diagnostics.append(
+                    _setting_diagnostic(
+                        f"queue.{field_name}",
+                        f"must equal {_ACCEPTED_LIMITS_SETTING}."
+                        f"{_ACCEPTED_QUEUE_GROUP}.{field_name}",
+                    )
+                )
     return diagnostics
+
+
+def _accepted_queue_limits(
+    settings: Mapping[str, Any], diagnostics: list[str]
+) -> Mapping[str, Any] | None:
+    """The accepted ``limits.observation_queue`` group handed over, if any.
+
+    Absent means no block was accepted — a harness or the compatibility
+    runtime — and the ``queue`` settings are the only copy. A block or a group
+    that is not a mapping is a defect of whoever built the settings, reported
+    by field like any other. No value is echoed.
+    """
+
+    accepted = settings.get(_ACCEPTED_LIMITS_SETTING)
+    if accepted is None:
+        return None
+    if not isinstance(accepted, Mapping):
+        diagnostics.append(
+            _setting_diagnostic(_ACCEPTED_LIMITS_SETTING, "must be a mapping of limit groups")
+        )
+        return None
+    group = accepted.get(_ACCEPTED_QUEUE_GROUP)
+    if group is None:
+        return None
+    if not isinstance(group, Mapping):
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{_ACCEPTED_LIMITS_SETTING}.{_ACCEPTED_QUEUE_GROUP}",
+                "must be a mapping of limits",
+            )
+        )
+        return None
+    return group
 
 
 def _output_reason(value: Any) -> str | None:

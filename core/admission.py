@@ -62,6 +62,15 @@ written into the :class:`RunRecord` **before** ``brain.run.completed`` is handed
 to ``Supervision.record_and_emit`` (P10). A publication that fails therefore
 leaves the recorded state intact and re-runs, retries and cancels nothing.
 
+Owning the terminal state also means owning the end of what the run leased.
+An optional ``run_cleanup`` callable is invoked with the ``run_id`` exactly
+once, when its terminal record is first written — on success, error, deadline
+expiry, stale drop, cancellation and the orphan path alike — so a resource
+allocated under a run identity by whatever the run body called (the attachment
+store's leases, R6) is released by the run's end itself rather than left to a
+time-to-live. It runs after the record and before the trace, never awaits, and
+a failure inside it can neither undo the record nor lose the trace.
+
 At most one run per session is active at a time, distinct sessions progress
 concurrently up to the worker limit, and a session whose queue is empty and
 which has no active run is evicted — queue and lock together, and only in that
@@ -553,6 +562,9 @@ class _Item:
     wait_deadline: float
     total_deadline: float
     trace: "asyncio.Future[Any] | None" = None
+    # Written together with the terminal record: the record cache evicts, so
+    # terminal-ness is tracked on the owned item itself (F9 review).
+    completed: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -581,6 +593,7 @@ class AdmissionScheduler:
         "_ready",
         "_records",
         "_run_body",
+        "_run_cleanup",
         "_run_module",
         "_running",
         "_session_queue_capacity",
@@ -612,9 +625,12 @@ class AdmissionScheduler:
         max_records: int = DEFAULT_MAX_RECORDS,
         max_pending_traces: int = DEFAULT_MAX_PENDING_TRACES,
         boundary_yields: int = DEFAULT_BOUNDARY_YIELDS,
+        run_cleanup: Callable[[str], Any] | None = None,
     ) -> None:
         if not callable(run_body):
             raise ContractError("run_body", "must be callable")
+        if run_cleanup is not None and not callable(run_cleanup):
+            raise ContractError("run_cleanup", "must be callable")
         if not callable(clock):
             raise ContractError("clock", "must be callable")
         if sleeper is not None and not callable(sleeper):
@@ -642,6 +658,7 @@ class AdmissionScheduler:
         self._run_module = _require_text(run_module, "run_module")
 
         self._run_body = run_body
+        self._run_cleanup = run_cleanup
         self._clock = clock
         self._sleep: Sleeper = sleeper if sleeper is not None else asyncio.sleep
         self._supervision: Any = (
@@ -887,7 +904,13 @@ class AdmissionScheduler:
             while queue:
                 item = queue.popleft()
                 self._pending -= 1
-                await self._complete_cancelled(item)
+                try:
+                    await self._complete_cancelled(item)
+                except asyncio.CancelledError:
+                    # F9: the item is popped and owned by nothing else; the
+                    # record is written before the cancellation escapes.
+                    await self._terminate_orphans((item,))
+                    raise
         self._ready.clear()
         self._pending = 0
 
@@ -906,6 +929,15 @@ class AdmissionScheduler:
             try:
                 await self._run(item)
             except asyncio.CancelledError:
+                # F9: ``_take`` already removed this item from its queue, so
+                # no drain can recover it. The cancellation can strike inside
+                # ``_run`` before its own handler is reached — while the
+                # admission trace or the started trace is still settling —
+                # which would leave accepted work with neither a RunRecord
+                # nor a ``brain.run.completed``. The records are written here,
+                # with no await before the last one, so even a second
+                # cancellation cannot lose them; the trace is best-effort.
+                await self._terminate_orphans((item,))
                 raise
             except Exception as failure:
                 # The pool outlives its runs. Anything unexpected escaping
@@ -1044,7 +1076,21 @@ class AdmissionScheduler:
             # The budget is spent: stop at the next boundary instead of
             # starting further work, and let whatever is in flight be
             # classified by its own owner rather than cut off here (AC33).
-            outcome = await self._abandon(context, body)
+            try:
+                outcome = await self._abandon(context, body)
+            except asyncio.CancelledError:
+                # Shutdown can also strike inside that bounded courtesy,
+                # which runs outside the inner handler above and would
+                # otherwise reach the worker's guard. The run already
+                # started and its activity counts are real, so it ends
+                # cancelled from its own context rather than being
+                # rewritten as an unstarted stale drop (F9 review).
+                _detach(body)
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._complete(
+                        item, context, "cancelled", REASON_CANCELLED, None
+                    )
+                raise
             self._count(COUNTER_RUN_DEADLINE_EXPIRIES)
             await self._complete(item, context, "timeout", REASON_RUN_DEADLINE, outcome)
             return
@@ -1132,17 +1178,17 @@ class AdmissionScheduler:
             # run: it carries no outcome rather than failing the worker.
             return None
 
-    async def _complete_stale(self, item: _Item, now: float) -> None:
-        """End an item whose wait deadline passed before any worker took it."""
+    def _unstarted_record(
+        self, item: _Item, status: str, reason: str, now: float
+    ) -> RunRecord:
+        """The terminal record of work a worker never entered."""
 
-        await self._settled(item.trace)
-        self._count(COUNTER_STALE_DROP)
         waited = max(0.0, now - item.admitted_at)
-        record = RunRecord(
+        return RunRecord(
             run_id=item.run_id,
             session=item.session,
-            status="timeout",
-            reason=REASON_STALE_DROP,
+            status=status,
+            reason=reason,
             waited_seconds=waited,
             total_seconds=waited,
             model_calls=0,
@@ -1152,27 +1198,57 @@ class AdmissionScheduler:
             admitted_at=item.admitted_at,
             completed_at=now,
         )
+
+    async def _terminate_orphans(self, items: Sequence[_Item]) -> None:
+        """Finish items a cancellation caught between removal and record (F9).
+
+        Once taken by a worker, claimed by the reaper's batch or popped by the
+        drain, an item belongs to nobody else: if cancellation arrives before
+        its own completion path wrote the record, that admitted work would
+        vanish with neither a :class:`RunRecord` nor a
+        ``brain.run.completed``. Every record is therefore written **before
+        the first await** — a second cancellation can cost the traces, never
+        the accounting — and the traces are then published best-effort.
+        """
+
+        pairs: list[tuple[_Item, RunRecord]] = []
+        for item in items:
+            if item.completed:
+                # Already terminal: never a second record, never a downgrade.
+                # Tracked on the item itself, because ``_records`` evicts —
+                # an evicted run_id must not read as unfinished here.
+                continue
+            now = self._clock()
+            if now >= item.wait_deadline:
+                self._count(COUNTER_STALE_DROP)
+                record = self._unstarted_record(
+                    item, "timeout", REASON_STALE_DROP, now
+                )
+            else:
+                record = self._unstarted_record(
+                    item, "cancelled", REASON_CANCELLED, now
+                )
+            self._record(record)
+            item.completed = True
+            pairs.append((item, record))
+        for item, record in pairs:
+            with contextlib.suppress(Exception):
+                await self._publish_completion(item, record, {})
+
+    async def _complete_stale(self, item: _Item, now: float) -> None:
+        """End an item whose wait deadline passed before any worker took it."""
+
+        await self._settled(item.trace)
+        self._count(COUNTER_STALE_DROP)
+        record = self._unstarted_record(item, "timeout", REASON_STALE_DROP, now)
         await self._publish_completion(item, record, {})
 
     async def _complete_cancelled(self, item: _Item) -> None:
         """End a still-queued item at shutdown: it never started, and says so."""
 
         await self._settled(item.trace)
-        now = self._clock()
-        waited = max(0.0, now - item.admitted_at)
-        record = RunRecord(
-            run_id=item.run_id,
-            session=item.session,
-            status="cancelled",
-            reason=REASON_CANCELLED,
-            waited_seconds=waited,
-            total_seconds=waited,
-            model_calls=0,
-            sends=0,
-            delivery=None,
-            started=False,
-            admitted_at=item.admitted_at,
-            completed_at=now,
+        record = self._unstarted_record(
+            item, "cancelled", REASON_CANCELLED, self._clock()
         )
         await self._publish_completion(item, record, {})
 
@@ -1251,6 +1327,7 @@ class AdmissionScheduler:
         """The single ``brain.run.completed`` of this work, recorded first."""
 
         self._record(record)
+        item.completed = True
         payload = {
             **self._correlation(item),
             "status": record.status,
@@ -1286,6 +1363,10 @@ class AdmissionScheduler:
         second write must be a no-op; a *different* terminal state for a
         recorded ``run_id`` is a programming error and is refused, because
         overwriting one silently is exactly the downgrade R8 forbids.
+
+        The first write is the run's end, on every exit path there is: it is
+        where ``run_cleanup`` releases what the run leased (R6), exactly once
+        per ``run_id`` and before the terminal trace is published.
         """
 
         stored = self._records.get(record.run_id)
@@ -1301,6 +1382,22 @@ class AdmissionScheduler:
         self._records[record.run_id] = record
         while len(self._records) > self._max_records:
             self._records.popitem(last=False)
+        self._cleanup_run(record.run_id)
+
+    def _cleanup_run(self, run_id: str) -> None:
+        """Release what *run_id* leased, now that its terminal state stands.
+
+        Synchronous on purpose: it sits between the record and the trace, and
+        an await here would open the F9 window the record was written before
+        the first await to close. The callable is the owner's; a failure
+        inside it is the owner's defect and is contained here, because the
+        terminal record must stand and its trace must still be published.
+        """
+
+        if self._run_cleanup is None:
+            return
+        with contextlib.suppress(Exception):
+            self._run_cleanup(run_id)
 
     # -- the wait-deadline reaper --------------------------------------------- #
 
@@ -1322,8 +1419,15 @@ class AdmissionScheduler:
             if delay > 0:
                 await self._sleep_or_change(delay)
             stale = self._expired_items()
-            for item in stale:
-                await self._complete_stale(item, self._clock())
+            try:
+                for item in stale:
+                    await self._complete_stale(item, self._clock())
+            except asyncio.CancelledError:
+                # F9: the batch already removed these from their queues; the
+                # ones whose record was not yet written are finished here
+                # before the cancellation leaves the reaper.
+                await self._terminate_orphans(stale)
+                raise
             if not stale:
                 # Woken by an admission, or by a deadline a worker got to
                 # first: yield rather than spin, so a reaper that finds

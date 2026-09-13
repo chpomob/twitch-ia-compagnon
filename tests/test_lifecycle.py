@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 import core.main as application
-from conftest import wait_until
+from conftest import ManualClock, settle, wait_until
 from core.lifecycle import (
     DEFAULT_SHUTDOWN_DEADLINE_SECONDS,
     PHASES,
@@ -46,7 +46,14 @@ from core.lifecycle import (
     module_roles,
     reset_shutdown_watchdog,
 )
-from core.loader import ModuleActivation
+from core.loader import ModuleActivation, ModuleLoader
+from test_loader import (
+    EXCEEDED_CLEANUP_DEADLINE,
+    HELD_LATE_CLOSE_SOURCE,
+    _abandon_activation_on_the_clock,
+    _held_close_settings,
+    make_module,
+)
 from test_main import _finite_limits
 
 
@@ -160,6 +167,37 @@ def coordinator_for(modules, timeline: Timeline, **options) -> PhaseCoordinator:
 # --------------------------------------------------------------------------- #
 # AC14 — the readiness barrier
 # --------------------------------------------------------------------------- #
+
+
+async def test_start_honours_a_deadline_established_before_the_phases() -> None:
+    """R4: phase startup spends the deadline it is handed, not a fresh one.
+
+    The entry point establishes the one global startup deadline before the
+    first enabled module is validated or activated; loading spent part of
+    it, and ``start(deadline_at=...)`` must finish inside what is left. A
+    deadline already exhausted is reported against the module and phase,
+    without the hook ever running, and the partial startup unwinds.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    store = module(
+        "store",
+        prepare=hook(events, "prepare:store"),
+        close=hook(events, "close:store"),
+    )
+    coordinator = coordinator_for([store], timeline)
+
+    # Loading consumed the whole budget before the first phase hook ran.
+    timeline.advance(100.0)
+    report = await coordinator.start(deadline_at=timeline())
+
+    assert report.status == 1
+    assert report.failures == (
+        "module 'store': phase 'prepare' exceeded the global startup deadline",
+    )
+    assert events == ["close:store"]
+    assert coordinator.barrier.completed is False
 
 
 async def test_slow_preparation_admits_no_input_and_refuses_an_early_producer() -> None:
@@ -431,9 +469,14 @@ async def test_partial_startup_closes_prepared_modules_and_reports_nonzero() -> 
     assert set(events) >= {"close:store", "close:gate", "close:feed"}
 
 
-async def test_cancelled_activation_closes_partial_startup_and_reports_nonzero(
+async def test_cancelled_preparation_closes_partial_startup_and_reports_nonzero(
 ) -> None:
-    """AC15 scenario 2: a ``CancelledError`` during activation."""
+    """AC15: a ``CancelledError`` during a module's preparation phase.
+
+    The cancellation during ``prepare`` — not during ``activate``, whose
+    cancellation is named by the loader and covered in ``test_loader`` and
+    ``test_shutdown`` — still runs the complete cleanup before it propagates.
+    """
 
     timeline = Timeline()
     events: list[str] = []
@@ -602,6 +645,140 @@ async def test_resistant_close_hook_is_bounded_and_audit_role_still_closes() -> 
     finally:
         let_go.set()
         await asyncio.sleep(0)
+
+
+async def test_a_resistant_close_of_either_owner_never_extends_the_shared_cleanup_deadline(
+    tmp_path: Path,
+) -> None:
+    """R4 (P24 N6): the coordinator's cancellation grace lies inside the deadline.
+
+    The entry point's failed partial startup has two cleanup owners on one
+    absolute deadline: the coordinator unwinding the handles it was given,
+    and the loader closing the handle an abandoned activation returns
+    later. Earlier cleanup spends nine of the ten seconds; with one second
+    left a coordinator-owned close begins and the late handle arrives, its
+    loader-owned close held. Both closes catch their cancellation at the
+    deadline and keep waiting. The coordinator's grace is then capped by
+    what remains of that same deadline — nothing — instead of granting a
+    fresh window after it, so the caller is answered the moment the
+    deadline is reached: the clock never moves past it. Each owner names
+    its unfinished close and keeps owning the task that resisted, which
+    ends only when released, after the caller returned.
+    """
+
+    clock = ManualClock()
+    make_module(tmp_path, "late", source=HELD_LATE_CLOSE_SOURCE)
+    settings = _held_close_settings()
+    reported: list[str] = []
+    loader = ModuleLoader(
+        object(),
+        tmp_path,
+        clock=clock,
+        sleeper=clock.sleep,
+        cancel_grace_seconds=1.0,
+        late_close_seconds=60.0,
+    )
+    loader.late_reporter = reported.append
+    await _abandon_activation_on_the_clock(loader, clock, settings)
+
+    events: list[str] = []
+    beta_entered = asyncio.Event()
+    beta_let_go = asyncio.Event()
+    alpha_entered = asyncio.Event()
+    alpha_release = asyncio.Event()
+    alpha_cancelled: list[str] = []
+    alpha_task: list[asyncio.Task[Any]] = []
+
+    async def slow_close() -> None:
+        # The earlier cleanup: it is released once nine seconds are spent.
+        events.append("close:beta")
+        beta_entered.set()
+        await beta_let_go.wait()
+
+    async def resistant_close() -> None:
+        events.append("close:alpha")
+        alpha_task.append(asyncio.current_task())
+        alpha_entered.set()
+        try:
+            await alpha_release.wait()
+        except asyncio.CancelledError:
+            alpha_cancelled.append("alpha")
+            # Resists the one cancellation the deadline gives it: it ends
+            # only when the test releases it, after the caller was answered.
+            await alpha_release.wait()
+        events.append("released:alpha")
+
+    coordinator = PhaseCoordinator(
+        [module("alpha", close=resistant_close), module("beta", close=slow_close)],
+        clock=clock,
+        sleeper=clock.sleep,
+        hook_timeout_seconds=10.0,
+        shutdown_deadline_seconds=10.0,
+        drain_deadline_seconds=5.0,
+        cancel_grace_seconds=1.0,
+    )
+
+    # What the entry point does once activation failed: one absolute
+    # cleanup deadline, shared by both owners before either close begins.
+    cleanup_deadline_at = clock.now + 10.0
+    loader.cleanup_deadline_at = cleanup_deadline_at
+
+    async def unwind() -> tuple[Any, list[str]]:
+        report = await coordinator.stop(deadline_at=cleanup_deadline_at)
+        late = await application._late_diagnostics(
+            loader, deadline_at=cleanup_deadline_at
+        )
+        return report, late
+
+    caller = asyncio.ensure_future(unwind())
+    try:
+        await wait_until(beta_entered.is_set)
+        clock.advance(9.0)  # the earlier cleanup spends nine of the ten seconds
+        beta_let_go.set()
+        await wait_until(alpha_entered.is_set)
+        # One second left: the late handle arrives now, and its close is held
+        # by the loader while the coordinator waits on the resistant close.
+        settings["gate"].set()
+        await wait_until(lambda: settings["closes"] == ["late"])
+        await settle()
+        assert not caller.done()
+        assert alpha_cancelled == [] and settings["cancelled"] == []
+        assert reported == []
+
+        clock.advance(1.0)  # the shared deadline
+        await wait_until(caller.done)
+        # Answered at the deadline: no grace was granted past it.
+        assert clock.now == cleanup_deadline_at
+        report, late = caller.result()
+
+        assert report.status == 1
+        assert report.failures == ("module 'alpha': phase 'close' timed out",)
+        assert late == []
+        assert reported == [EXCEEDED_CLEANUP_DEADLINE]
+        assert loader.late_diagnostics == [EXCEEDED_CLEANUP_DEADLINE]
+        # Both cancellations reached their close before the caller returned;
+        # both closes resisted, and each owner still holds its own.
+        assert alpha_cancelled == ["alpha"]
+        assert settings["cancelled"] == ["late"]
+        assert events == ["close:beta", "close:alpha"]
+        assert settings["released"] == []
+        assert coordinator.abandoned == tuple(alpha_task)
+        assert loader.abandoned == (settings["close_task"],)
+    finally:
+        alpha_release.set()
+        settings["hold"].set()
+        beta_let_go.set()
+        await asyncio.gather(caller, return_exceptions=True)
+
+    # Ownership is retained, not extended: the resisting closes end only
+    # once released, with nothing more reported.
+    await wait_until(lambda: events[-1:] == ["released:alpha"])
+    await wait_until(lambda: settings["released"] == ["late"])
+    assert coordinator.abandoned == ()
+    await wait_until(lambda: loader.abandoned == ())
+    assert coordinator.report.failures == ("module 'alpha': phase 'close' timed out",)
+    assert reported == [EXCEEDED_CLEANUP_DEADLINE]
+    assert await loader.settle_late_results() == []
 
 
 async def test_synchronous_hook_is_refused_before_anything_is_prepared() -> None:
@@ -807,6 +984,92 @@ async def test_a_cancelled_registry_close_still_refuses_further_work() -> None:
     assert "the supervised registry is closed" in str(refused.value)
 
 
+async def test_a_task_abandoned_by_its_owner_at_close_is_owned_and_reported_nonzero() -> None:
+    """R4/AC15 (P24 N3): work an owner detached outside ``spawn``, cancelled
+    at its own bound and still running, is handed to the registry during the
+    close phase — after the drain closed it to new work. The registry keeps
+    the reference, records the unfinished cancellation as that owner's
+    failure, and the coordinator's report is non-zero for it; a task that
+    already finished is consumed and is no failure."""
+
+    timeline = Timeline()
+    events: list[str] = []
+    let_go = asyncio.Event()
+    resisted = asyncio.Event()
+
+    async def resistant() -> None:
+        while True:
+            try:
+                await let_go.wait()
+            except asyncio.CancelledError:
+                resisted.set()
+                if let_go.is_set():
+                    raise
+                continue
+            return
+
+    async def finished() -> None:
+        return None
+
+    stray = asyncio.ensure_future(resistant())
+    done = asyncio.ensure_future(finished())
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert done.done()
+
+    async def close_sink() -> None:
+        events.append("close:sink")
+        # The registry is already closed to new work at this point ...
+        assert coordinator.tasks.closed
+        # ... yet it takes over what the owner could not stop, and only that.
+        assert coordinator.tasks.abandon(done, name="settled", owner="sink") is None
+        assert coordinator.tasks.abandon(stray, name="trace", owner="sink") == (
+            "module 'sink': task 'trace' did not stop when cancelled"
+        )
+        assert coordinator.tasks.abandoned == (stray,)
+
+    sink = module("sink", close=close_sink)
+    ledger = module(
+        "alpha",
+        roles=(ROLE_OBSERVATION,),
+        flush=hook(events, "flush:alpha"),
+        close=hook(events, "close:alpha"),
+    )
+    coordinator = coordinator_for([ledger, sink], timeline)
+
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    stray.cancel()  # the owner's own cancellation, which the task swallows
+    await asyncio.wait_for(resisted.wait(), 1)
+    assert not stray.done()
+
+    stop = asyncio.create_task(coordinator.stop())
+    await asyncio.sleep(0)
+    timeline.release()
+    try:
+        report = await asyncio.wait_for(stop, 1)
+
+        assert report.status == 1
+        assert report.failures == (
+            "module 'sink': task 'trace' did not stop when cancelled",
+        )
+        # The task still runs: cancelled once by its owner, not again by the
+        # registry, and referenced by it until it ends.
+        assert not stray.done()
+        assert coordinator.tasks.abandoned == (stray,)
+        # The failure is a fact of the shutdown, not of the modules: every
+        # remaining hook still ran.
+        assert events == ["close:sink", "flush:alpha", "close:alpha"]
+    finally:
+        let_go.set()
+        await asyncio.gather(stray, return_exceptions=True)
+    assert stray.done()
+    assert coordinator.tasks.abandoned == ()
+
+    with pytest.raises(LifecycleError) as refused:
+        coordinator.tasks.abandon("not a task", name="trace", owner="sink")
+    assert "field 'abandon': must be a task" in str(refused.value)
+
+
 async def test_shutdown_closes_the_supervised_registry_before_teardown() -> None:
     """Nothing may detach once the drain phase is over."""
 
@@ -995,6 +1258,214 @@ async def test_one_global_shutdown_deadline_caps_the_sum_of_local_timeouts() -> 
     finally:
         let_go.set()
         await asyncio.sleep(0)
+
+
+# --------------------------------------------------------------------------- #
+# R8 — the coordinator's transitions are the source of module.* facts
+# --------------------------------------------------------------------------- #
+
+
+def _health_over(events: list[str]) -> tuple[Any, Any]:
+    """The runtime's real health owner over a bus whose ``module.*`` are logged."""
+
+    from core.bus import EventBus
+    from core.runtime import ModuleHealth, Supervision
+
+    bus = EventBus()
+    bus.subscribe(
+        "module.*",
+        lambda event: events.append(
+            f"{event['type']}:{event['payload']['module']}"
+            + (f":{event['payload']['phase']}" if "phase" in event["payload"] else "")
+        ),
+    )
+    supervision = Supervision(bus)
+    return ModuleHealth(supervision), supervision
+
+
+async def test_coordinator_drives_the_health_owner_through_both_routes() -> None:
+    """R8: ``module.ready`` and ``module.stopped`` come from the coordinator.
+
+    With the runtime's health owner as observer, a versioned module is
+    reported ready once its preparation completed — before the barrier and
+    the producer start, which re-report nothing — and stopped once its close
+    returned; a v1 activation, whose close is its whole shutdown, is reported
+    stopped after that close; the observation service is reported stopped
+    last, after its own close phase. Every ``module.stopped`` is recorded by
+    the owner before it is published, and each module is reported once.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    health, _ = _health_over(events)
+    coordinator = coordinator_for(
+        [
+            module(
+                "feed",
+                roles=("input",),
+                prepare=hook(events, "prepare:feed"),
+                start_inputs=hook(events, "start:feed"),
+                stop_inputs=hook(events, "stop:feed"),
+                close=hook(events, "close:feed"),
+            ),
+            module("engine", close=hook(events, "close:engine")),
+            module(
+                "log",
+                roles=("observation",),
+                prepare=hook(events, "prepare:log"),
+                flush=hook(events, "flush:log"),
+                close=hook(events, "close:log"),
+            ),
+        ],
+        timeline,
+        compatibility=[legacy("relay", hook(events, "close:relay"))],
+        observer=health.observe_phase,
+    )
+
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    assert events == [
+        "prepare:feed",
+        "module.ready:feed:prepare",
+        # A module with no prepare hook is prepared all the same: ready.
+        "module.ready:engine:prepare",
+        "prepare:log",
+        "module.ready:log:prepare",
+        "start:feed",
+    ]
+    assert {name: health.state(name) for name in ("feed", "engine", "log")} == {
+        "feed": "ready", "engine": "ready", "log": "ready"
+    }
+
+    report = await asyncio.wait_for(coordinator.stop(), 1)
+    assert report.status == 0
+    assert events[6:] == [
+        "stop:feed",
+        "close:relay",
+        "module.stopped:relay:close",
+        "close:engine",
+        "module.stopped:engine:close",
+        "close:feed",
+        "module.stopped:feed:close",
+        "flush:log",
+        "close:log",
+        "module.stopped:log:close_observation",
+    ]
+    assert {name: health.state(name) for name in ("feed", "engine", "log", "relay")} == {
+        name: "stopped" for name in ("feed", "engine", "log", "relay")
+    }
+    # Idempotent with the rest of the sequence: a second stop re-reports nothing.
+    await asyncio.wait_for(coordinator.stop(), 1)
+    assert len([event for event in events if event.startswith("module.")]) == 7
+
+
+async def test_a_failed_hook_is_reported_degraded_and_the_sequence_goes_on() -> None:
+    """R8: a hook that fails, times out or is malformed degrades its module.
+
+    The degradation names the phase; the failing module is still driven
+    through its remaining phases, and the other modules are unaffected. A
+    v1 close that fails degrades that module the same way.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    health, _ = _health_over(events)
+
+    async def broken() -> None:
+        raise RuntimeError("secret-token-must-not-leak")
+
+    async def stuck(*_arguments: Any) -> None:
+        await asyncio.Future()
+
+    coordinator = coordinator_for(
+        [
+            module("engine", drain=stuck, close=broken),
+            module("store", close=hook(events, "close:store")),
+        ],
+        timeline,
+        compatibility=[legacy("relay", broken)],
+        observer=health.observe_phase,
+        hook_timeout_seconds=1.0,
+        cancel_grace_seconds=0.0,
+    )
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    events.clear()
+
+    stopping = asyncio.ensure_future(coordinator.stop())
+    await wait_until(lambda: timeline.pending > 0)
+    timeline.release()
+    report = await asyncio.wait_for(stopping, 1)
+
+    assert report.status == 1
+    assert set(report.failures) >= {
+        "module 'relay': shutdown failed",
+        "module 'engine': phase 'drain' timed out",
+        "module 'engine': phase 'close' failed",
+    }
+    assert events == [
+        "module.degraded:engine:drain",
+        "module.degraded:relay:close",
+        "close:store",
+        "module.stopped:store:close",
+        "module.degraded:engine:close",
+    ]
+    assert health.state("engine") == "degraded"
+    assert health.state("relay") == "degraded"
+    assert health.state("store") == "stopped"
+    assert all("secret-token" not in message for message in report.diagnostics)
+
+
+async def test_an_observer_that_fails_or_overruns_never_stops_the_sequence() -> None:
+    """R8 must not cost R4: a health report is a diagnostic, never a failure.
+
+    An observer that raises on one module, and one that blocks on another,
+    leave every hook invoked in order, the report clean of failures, and
+    exactly one bounded diagnostic per lost report.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+
+    async def observe(phase: str, name: str, *, failure: str | None = None) -> None:
+        if name == "engine" and phase == "prepare":
+            raise RuntimeError("health sink unavailable")
+        if name == "store" and phase == "close":
+            await asyncio.Future()
+
+    coordinator = coordinator_for(
+        [
+            module("engine", prepare=hook(events, "prepare:engine"), close=hook(events, "close:engine")),
+            module("store", prepare=hook(events, "prepare:store"), close=hook(events, "close:store")),
+        ],
+        timeline,
+        observer=observe,
+        hook_timeout_seconds=1.0,
+    )
+
+    startup = await asyncio.wait_for(coordinator.start(), 1)
+    assert startup.status == 0
+    assert startup.failures == ()
+    assert startup.diagnostics == ("module 'engine': phase 'prepare': health report failed",)
+
+    stopping = asyncio.ensure_future(coordinator.stop())
+    await wait_until(lambda: timeline.pending > 0)
+    # Every budget claimed from here on is spent at once: the blocked report
+    # is given exactly its allowance, then abandoned.
+    timeline.release()
+    report = await asyncio.wait_for(stopping, 1)
+
+    assert report.status == 0
+    assert report.failures == ()
+    assert report.diagnostics == (
+        "module 'engine': phase 'prepare': health report failed",
+        "module 'store': phase 'close': health report timed out",
+    )
+    assert events == ["prepare:engine", "prepare:store", "close:store", "close:engine"]
+
+
+def test_observer_must_be_callable() -> None:
+    with pytest.raises(LifecycleError) as caught:
+        PhaseCoordinator([], observer="not-a-callable")  # type: ignore[arg-type]
+    assert "observer" in str(caught.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -1215,6 +1686,119 @@ async def test_every_task_failure_is_observed_and_reported_sanitised() -> None:
         loop.set_exception_handler(previous)
 
 
+async def test_drain_cancellation_grace_is_capped_by_the_deadline_it_is_given() -> None:
+    """R4 (P24 N6): the grace after the drain budget lies inside the deadline too.
+
+    The coordinator drains under what remains of the one global shutdown
+    deadline; when that remainder is the whole drain budget, the grace the
+    registry grants a cancelled task must not begin a fresh window past the
+    deadline. The run resists its cancellation: the drain returns the moment
+    the deadline is reached, names the task, and keeps owning it.
+    """
+
+    timeline = Timeline()
+    tasks = SupervisedTasks(clock=timeline, sleeper=timeline.sleep)
+    entered = asyncio.Event()
+    let_go = asyncio.Event()
+    resisted: list[str] = []
+
+    async def resistant() -> None:
+        entered.set()
+        try:
+            await let_go.wait()
+        except asyncio.CancelledError:
+            resisted.append("run-1")
+            await let_go.wait()
+
+    task = tasks.spawn(resistant(), name="run-1", owner="brain")
+    await wait_until(entered.is_set)
+    deadline_at = timeline.now + 1.0
+
+    draining = asyncio.create_task(tasks.drain(1.0, deadline_at=deadline_at))
+    await wait_until(lambda: timeline.pending == 1)
+    assert not draining.done()
+
+    timeline.advance(1.0)  # the deadline: the budget and the grace end here
+    try:
+        await wait_until(draining.done)
+        assert timeline.now == deadline_at
+        report = draining.result()
+        assert report.cancelled == (
+            "module 'brain': task 'run-1' was cancelled at the drain deadline",
+        )
+        assert report.failures == (
+            "module 'brain': task 'run-1' did not stop when cancelled",
+        )
+        assert resisted == ["run-1"]
+        assert tasks.abandoned == (task,)
+    finally:
+        let_go.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert tasks.abandoned == ()
+
+
+@pytest.mark.parametrize("global_deadline", [None, 10.0])
+async def test_drain_grants_the_cancellation_grace_after_its_budget(
+    global_deadline: float | None,
+) -> None:
+    """R4 (P24 F6 A1): the grace stands on the global deadline, not the budget.
+
+    The drain budget is spent by the time the grace begins, so measuring the
+    grace against the budget's own end would grant none at all and report
+    every run with asynchronous cancellation cleanup as abandoned. With no
+    global deadline, or with one that has room, the cancelled run gets the
+    full grace to publish its terminal outcome — and is then not a failure.
+    """
+
+    timeline = Timeline()
+    tasks = SupervisedTasks(clock=timeline, sleeper=timeline.sleep)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    cleaned = asyncio.Event()
+    outcome: list[str] = []
+
+    async def cleans_up_slowly() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await cleaned.wait()
+            outcome.append("run-1: published")
+            raise
+
+    task = tasks.spawn(cleans_up_slowly(), name="run-1", owner="brain")
+    await wait_until(entered.is_set)
+    deadline_at = None if global_deadline is None else timeline.now + global_deadline
+
+    draining = asyncio.create_task(tasks.drain(1.0, deadline_at=deadline_at))
+    try:
+        await wait_until(lambda: timeline.pending == 1)
+        timeline.advance(1.0)  # the budget ends: the run is cancelled here
+        await wait_until(cancelled.is_set)
+        # The grace is a real window on the clock, not the exhausted budget:
+        # the drain is still waiting on a timer, not returning at once.
+        await wait_until(lambda: timeline.pending == 1)
+        assert not draining.done()
+        assert outcome == []
+
+        cleaned.set()
+        await wait_until(draining.done)
+        assert timeline.now == 1.0  # the run finished inside the grace
+    finally:
+        cleaned.set()
+        timeline.release()
+        await asyncio.gather(draining, task, return_exceptions=True)
+    report = draining.result()
+    assert report.cancelled == (
+        "module 'brain': task 'run-1' was cancelled at the drain deadline",
+    )
+    assert report.failures == ()
+    assert outcome == ["run-1: published"]
+    assert tasks.abandoned == ()
+    assert tasks.active == 0
+
+
 async def test_drain_waits_for_owned_work_then_refuses_new_spawns() -> None:
     tasks = SupervisedTasks()
     finished: list[str] = []
@@ -1409,8 +1993,9 @@ async def test_close_modules_stops_at_a_global_deadline_it_was_given() -> None:
 
         assert failures == ["module 'stuck': shutdown failed"]
         assert events == ["other"]
-        # Capped at the 4 units left of the global budget, not the local 10.
-        assert timeline.now <= 4.0 + 0.1
+        # Capped at the 4 units left of the global budget, not the local 10 —
+        # and the cancellation grace is inside that budget too (P24 N6).
+        assert timeline.now == 4.0
     finally:
         let_go.set()
         await asyncio.sleep(0)
@@ -1589,8 +2174,16 @@ class Handle:
             provider_name=PROVIDER,
         )
         self._context.bus.subscribe(INPUT_EVENT, self.handle_pulse)
+        # The provider-health facts the entry point's coordinator reports
+        # about this module (R8), as they land on the bus.
+        self._context.bus.subscribe("module.*", self.observe_health)
         self._context.actions.mark_ready()
         self._prepared = True
+
+    def observe_health(self, event):
+        payload = event["payload"]
+        if payload.get("module") == self._context.module:
+            _record(self._settings, f"health:{event['type']}:{payload['state']}")
 
     async def start_inputs(self):
         if self._source is not None or self._closed:
@@ -1749,25 +2342,31 @@ async def test_fourth_module_starts_and_stops_through_every_phase_unnamed(
         assert readiness == ["ready"]
         assert not task.done()
         # Validation, activation and preparation all preceded the barrier;
-        # the source opened only after it.
-        assert log_lines()[:4] == [
+        # the module was reported ready once prepared, and the source opened
+        # only after the barrier.
+        assert log_lines()[:5] == [
             "validate_settings",
             "activate",
             "prepare",
+            "health:module.ready:ready",
             "start_inputs",
         ]
         # The pulse is produced, admitted, and its detached run consumes the
         # declared action through the real executor and the granted rule.
         await wait_until(lambda: "action:success" in log_lines())
-        assert log_lines()[4:] == ["input:published", "provide:ping", "action:success"]
+        assert log_lines()[5:] == ["input:published", "provide:ping", "action:success"]
     finally:
         stop.set()
     assert await asyncio.wait_for(task, 1) == 0
     assert diagnostics == []
+    # The entry point's coordinator reported the module ready after its
+    # preparation and stopped after its close — exactly once each, with 0
+    # further facts for the phases that change no state (R8).
     assert log_lines() == [
         "validate_settings",
         "activate",
         "prepare",
+        "health:module.ready:ready",
         "start_inputs",
         "input:published",
         "provide:ping",
@@ -1775,6 +2374,7 @@ async def test_fourth_module_starts_and_stops_through_every_phase_unnamed(
         "stop_inputs",
         "drain",
         "close",
+        "health:module.stopped:stopped",
     ]
 
     # 0 module-name literals were needed for any of that: not the fourth

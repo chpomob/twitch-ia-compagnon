@@ -110,6 +110,8 @@ __all__ = [
 Clock = Callable[[], float]
 Sleeper = Callable[[float], Awaitable[None]]
 Reporter = Callable[[str], None]
+PhaseObserver = Callable[..., Any]
+"""``observer(phase, module_name, *, failure=None)`` — see :class:`PhaseCoordinator`."""
 
 
 # --------------------------------------------------------------------------- #
@@ -332,7 +334,15 @@ class SupervisedTasks:
     that raises, or one that survives its cancellation grace, is a failure.
     """
 
-    __slots__ = ("_clock", "_closed", "_failures", "_idle", "_sleep", "_tasks")
+    __slots__ = (
+        "_abandoned",
+        "_clock",
+        "_closed",
+        "_failures",
+        "_idle",
+        "_sleep",
+        "_tasks",
+    )
 
     def __init__(
         self,
@@ -347,6 +357,11 @@ class SupervisedTasks:
         self._clock = clock
         self._sleep: Sleeper = sleeper if sleeper is not None else asyncio.sleep
         self._tasks: dict[asyncio.Task[Any], tuple[str, str]] = {}
+        # Tasks that resisted their cancellation, at the drain deadline or at
+        # an owner's own bound. They stay referenced here until they end: a
+        # pending task nothing references is destroyed by the collector,
+        # unobserved, before the loop's teardown reaches it.
+        self._abandoned: list[asyncio.Task[Any]] = []
         self._failures: list[str] = []
         self._closed = False
         self._idle = asyncio.Event()
@@ -369,6 +384,18 @@ class SupervisedTasks:
         """Sanitised diagnostics for every observed task failure."""
 
         return tuple(self._failures)
+
+    @property
+    def abandoned(self) -> tuple[asyncio.Task[Any], ...]:
+        """The tasks that resisted cancellation and have still not ended.
+
+        Each one is already a recorded failure; the registry holds them so
+        their eventual end is observed by the loop's teardown, not the
+        collector.
+        """
+
+        self._abandoned = [task for task in self._abandoned if not task.done()]
+        return tuple(self._abandoned)
 
     def owners(self) -> tuple[str, ...]:
         """The owners of the tasks still running, in registration order."""
@@ -408,16 +435,67 @@ class SupervisedTasks:
         task.add_done_callback(self._observe)
         return task
 
+    def abandon(
+        self,
+        task: "asyncio.Future[Any]",
+        *,
+        name: str,
+        owner: str,
+    ) -> str | None:
+        """Take over a task its *owner* cancelled and could not stop (R4).
+
+        For work an owner detached outside :meth:`spawn` — a publication a
+        confirmed send handed to the loop, say — bounded by the owner's own
+        budget and still running once that budget and its cancellation grace
+        are spent. Handing it here transfers what is left of the ownership:
+        the task is cancelled if it was not, stays referenced until it ends
+        and has its late outcome consumed. The failure is recorded exactly as
+        a drained task that resists cancellation is (AC15), so a shutdown
+        that had to leave the task behind reports non-zero instead of
+        reading the owner's normal return as success.
+
+        Accepted after :meth:`aclose`, since nothing new detaches — the task
+        already had. A task already done is consumed and is no failure.
+        Returns the diagnostic recorded, or ``None``.
+        """
+
+        if not isinstance(task, asyncio.Future):
+            raise LifecycleError(
+                f"module {_name(owner)!r}: field 'abandon': must be a task"
+            )
+        task_name = _require_text(name, owner, "abandon.name", None)
+        task_owner = _require_text(owner, owner, "abandon.owner", None)
+        if task.done():
+            _consume_result(task)
+            return None
+        if not _cancellation_requested(task):
+            # One request is enough: a second ``CancelledError`` thrown into a
+            # task that is already unwinding — cleaning up slowly in a
+            # ``finally`` — would interrupt the very cleanup it was given.
+            task.cancel()
+        task.add_done_callback(_consume_result)
+        self._abandoned.append(task)
+        failure = (
+            f"module {task_owner!r}: task {task_name!r} did not stop when cancelled"
+        )
+        self._failures.append(failure)
+        return failure
+
     async def wait_idle(self) -> None:
         """Block until no owned task remains."""
 
         await self._idle.wait()
 
-    async def drain(self, deadline_seconds: float) -> DrainReport:
+    async def drain(
+        self, deadline_seconds: float, *, deadline_at: float | None = None
+    ) -> DrainReport:
         """Finish owned tasks inside *deadline_seconds*, then cancel the rest.
 
         Returns what happened; the caller decides what makes the process
-        status non-zero.
+        status non-zero. *deadline_at* is the absolute point on the clock
+        that the cancellation grace after the budget may not pass — the one
+        global shutdown deadline when the coordinator drains under it (R4);
+        without it the grace stands on its own.
         """
 
         budget = _finite(deadline_seconds, "drain deadline", allow_zero=True)
@@ -428,8 +506,11 @@ class SupervisedTasks:
         # One absolute deadline over the *changing* owned set: spawning stays
         # allowed while draining, so a child accepted by a task that then
         # finishes inherits whatever is left of the budget instead of being
-        # cancelled the instant its parent returns.
-        deadline_at = self._clock() + budget
+        # cancelled the instant its parent returns. It is the budget's own
+        # end, kept apart from the optional global *deadline_at*: the budget
+        # is spent by the time the grace starts, so capping the grace by it
+        # would grant none at all.
+        budget_at = self._clock() + budget
         counted: set[asyncio.Task[Any]] = set()
         first = True
         while True:
@@ -446,7 +527,7 @@ class SupervisedTasks:
             waiting = {task for task in self._tasks if not task.done()}
             if not waiting:
                 break
-            remaining = deadline_at - self._clock()
+            remaining = budget_at - self._clock()
             if remaining <= 0 and not first:
                 break
             first = False
@@ -475,7 +556,9 @@ class SupervisedTasks:
         if self._tasks:
             waiting = set(self._tasks)
             finished = await _wait_bounded(
-                waiting, DEFAULT_CANCEL_GRACE_SECONDS, self._sleep
+                waiting,
+                _remaining(DEFAULT_CANCEL_GRACE_SECONDS, self._clock, deadline_at),
+                self._sleep,
             )
             for task, (task_name, task_owner) in list(self._tasks.items()):
                 if task.done() or task in finished:
@@ -484,8 +567,10 @@ class SupervisedTasks:
                     f"module {task_owner!r}: task {task_name!r} did not stop "
                     "when cancelled"
                 )
-                # Retrieve even a late exception, without waiting for it.
+                # Retrieve even a late exception, without waiting for it, and
+                # keep the reference so the task is not collected unobserved.
                 task.add_done_callback(_consume_result)
+                self._abandoned.append(task)
                 self._tasks.pop(task, None)
             if not self._tasks:
                 self._idle.set()
@@ -496,7 +581,12 @@ class SupervisedTasks:
             failures=tuple(failures),
         )
 
-    async def aclose(self, deadline_seconds: float | None = None) -> DrainReport:
+    async def aclose(
+        self,
+        deadline_seconds: float | None = None,
+        *,
+        deadline_at: float | None = None,
+    ) -> DrainReport:
         """Drain, then refuse further work. Idempotent."""
 
         budget = (
@@ -505,7 +595,7 @@ class SupervisedTasks:
             else deadline_seconds
         )
         try:
-            report = await self.drain(budget)
+            report = await self.drain(budget, deadline_at=deadline_at)
         finally:
             # Even a cancelled close refuses further work: the caller asked
             # for the registry to stop accepting, and a half-drained registry
@@ -690,7 +780,8 @@ async def close_modules(
     and otherwise from reverse activation order.
 
     A close that overruns its budget is cancelled explicitly, given a short
-    cancellation window, and left with a callback that retrieves even a late
+    cancellation window — capped, like the budget, by what remains of
+    *deadline_at* — and left with a callback that retrieves even a late
     exception so nothing is reported as never-retrieved.
     """
 
@@ -709,7 +800,10 @@ async def close_modules(
             finished = await _wait_bounded({task}, remaining, wait)
             if task not in finished:
                 task.cancel()
-                await _wait_bounded({task}, grace, wait)
+                # The grace is capped by the same deadline as the close (R4).
+                await _wait_bounded(
+                    {task}, _remaining(grace, clock, deadline_at), wait
+                )
                 # Retrieve even late exceptions without waiting indefinitely.
                 task.add_done_callback(_consume_result)
                 raise TimeoutError
@@ -774,9 +868,21 @@ class PhaseCoordinator:
     the versioned consumers and observation services it publishes into close
     or flush. The step shares the one global shutdown deadline, whether
     shutdown was requested or is the unwinding of a failed startup.
+
+    *observer* is told of every phase transition the coordinator completes,
+    as ``observer(phase, module_name, failure=None)`` after a hook returned —
+    a no-op hook included, since the phase is then complete for that module
+    — and as ``observer(phase, module_name, failure=<diagnostic>)`` after one
+    failed, timed out or was cancelled. It is how the runtime's health owner
+    turns the sequence into ``module.ready``, ``module.degraded`` and
+    ``module.stopped`` (R8) without the coordinator knowing a trace type or a
+    module name. The call is bounded by the same allowance as the hook it
+    follows, and nothing it raises reaches the sequence: a health report
+    that fails is noted as a diagnostic and the next module is still driven.
     """
 
     __slots__ = (
+        "_abandoned",
         "_barrier",
         "_cancel_grace_seconds",
         "_clock",
@@ -788,6 +894,7 @@ class PhaseCoordinator:
         "_hook_timeout_seconds",
         "_invoked",
         "_modules",
+        "_observer",
         "_ready",
         "_reported_task_failures",
         "_reporter",
@@ -816,6 +923,7 @@ class PhaseCoordinator:
         tasks: SupervisedTasks | None = None,
         barrier: ReadinessBarrier | None = None,
         reporter: Reporter | None = None,
+        observer: PhaseObserver | None = None,
     ) -> None:
         if not callable(clock):
             raise LifecycleError("lifecycle: field 'clock': must be callable")
@@ -823,6 +931,8 @@ class PhaseCoordinator:
             raise LifecycleError("lifecycle: field 'sleeper': must be callable")
         if reporter is not None and not callable(reporter):
             raise LifecycleError("lifecycle: field 'reporter': must be callable")
+        if observer is not None and not callable(observer):
+            raise LifecycleError("lifecycle: field 'observer': must be callable")
 
         self._modules = list(modules)
         for module in self._modules:
@@ -851,6 +961,7 @@ class PhaseCoordinator:
         self._clock = clock
         self._sleep: Sleeper = sleeper if sleeper is not None else asyncio.sleep
         self._reporter = reporter
+        self._observer = observer
         self._barrier = barrier if barrier is not None else ReadinessBarrier()
         self._tasks = (
             tasks
@@ -858,6 +969,11 @@ class PhaseCoordinator:
             else SupervisedTasks(clock=clock, sleeper=self._sleep)
         )
         self._invoked: set[tuple[str, str]] = set()
+        # Hook tasks given up on — overrunning, or left behind by a cancelled
+        # caller — stay referenced here: a pending task nothing references is
+        # destroyed by the collector, with a warning on stderr, before the
+        # watchdog or the loop's own teardown reaches it.
+        self._abandoned: list[asyncio.Task[Any]] = []
         self._diagnostics: list[str] = []
         self._failures: list[str] = []
         self._current: tuple[str, str] | None = None
@@ -887,6 +1003,18 @@ class PhaseCoordinator:
         """Whether startup completed through the last producer."""
 
         return self._ready
+
+    @property
+    def abandoned(self) -> tuple[asyncio.Task[Any], ...]:
+        """The hook tasks given up on that have still not ended.
+
+        Each one is already a recorded failure; the coordinator keeps the
+        reference so a hook that resisted its cancellation past the global
+        deadline stays owned — never waited for again — until it ends.
+        """
+
+        self._abandoned = [task for task in self._abandoned if not task.done()]
+        return tuple(self._abandoned)
 
     @property
     def report(self) -> LifecycleReport:
@@ -936,19 +1064,28 @@ class PhaseCoordinator:
 
     # -- phases -------------------------------------------------------------- #
 
-    async def start(self) -> LifecycleReport:
+    async def start(self, *, deadline_at: float | None = None) -> LifecycleReport:
         """Validate, prepare, open the barrier, then start producers.
 
         Idempotent: a second call reports the first outcome and invokes no
         hook again. On any failure the modules already prepared are shut down
         through the ordinary shutdown sequence before the report is returned,
         so a partial startup never leaks a transport.
+
+        *deadline_at* is the absolute point on the injected clock by which
+        startup must be done. It is the one global startup deadline, and the
+        caller that already spent part of it — on loading and activation —
+        hands the same point here so validation, activation and the phases
+        share one budget instead of each getting a fresh one (R4). Without
+        it the coordinator takes its own ``startup_deadline_seconds`` from
+        now.
         """
 
         if self._started:
             return self.report
         self._started = True
-        deadline_at = self._clock() + self._startup_deadline_seconds
+        if deadline_at is None:
+            deadline_at = self._clock() + self._startup_deadline_seconds
 
         try:
             if not self._validate_hooks():
@@ -993,17 +1130,24 @@ class PhaseCoordinator:
         self._ready = True
         return self.report
 
-    async def stop(self) -> LifecycleReport:
+    async def stop(self, *, deadline_at: float | None = None) -> LifecycleReport:
         """Stop producers, drain, close resources, then flush observation.
 
         Idempotent, and safe after a failed :meth:`start` — every hook already
         invoked is skipped.
+
+        *deadline_at* is the absolute point on the injected clock by which the
+        whole cleanup must be done: the one global shutdown deadline, when the
+        caller shares it with another cleanup owner — the loader's late handle
+        closes — so the two never take a budget each (R4). Without it a
+        sequence begun here takes the shutdown budget from now; a sequence
+        already under way keeps the deadline it began with.
         """
 
-        await self._shutdown()
+        await self._shutdown(deadline_at=deadline_at)
         return self.report
 
-    async def _shutdown(self) -> None:
+    async def _shutdown(self, *, deadline_at: float | None = None) -> None:
         """Run the shutdown half of the sequence exactly once.
 
         Reached both from :meth:`stop` and from a failed or cancelled
@@ -1036,7 +1180,8 @@ class PhaseCoordinator:
             self._stopped = True
             self._shutdown_cancelled = False
             arm_shutdown_watchdog()
-            deadline_at = self._clock() + self._shutdown_deadline_seconds
+            if deadline_at is None:
+                deadline_at = self._clock() + self._shutdown_deadline_seconds
             task = asyncio.ensure_future(self._shutdown_phases(deadline_at))
             self._shutdown_task = task
         try:
@@ -1100,7 +1245,9 @@ class PhaseCoordinator:
         before the close phase takes those resources away.
         """
 
-        drain = await self._tasks.drain(self._drain_budget(deadline_at))
+        drain = await self._tasks.drain(
+            self._drain_budget(deadline_at), deadline_at=deadline_at
+        )
         for message in drain.cancelled:
             self._note(message)
         for message in drain.failures:
@@ -1114,7 +1261,9 @@ class PhaseCoordinator:
         # The drain phase is over: nothing may detach any more. A task spawned
         # by a drain or close hook would otherwise outlive the transports about
         # to close, with no later drain left to observe it.
-        closing = await self._tasks.aclose(self._drain_budget(deadline_at))
+        closing = await self._tasks.aclose(
+            self._drain_budget(deadline_at), deadline_at=deadline_at
+        )
         for message in closing.cancelled:
             self._note(message)
         for message in closing.failures:
@@ -1134,19 +1283,29 @@ class PhaseCoordinator:
         """
 
         for module in self._compatibility:
-            key = (_module_name(module), PHASE_CLOSE)
+            name = _module_name(module)
+            key = (name, PHASE_CLOSE)
             if key in self._invoked:
                 continue
             self._invoked.add(key)
-            for failure in await close_modules(
+            failures = await close_modules(
                 [module],
                 timeout_seconds=self._hook_timeout_seconds,
                 cancel_grace_seconds=self._cancel_grace_seconds,
                 sleeper=self._sleep,
                 clock=self._clock,
                 deadline_at=deadline_at,
-            ):
+            )
+            for failure in failures:
                 self._fail(failure)
+            # A v1 close is the module's whole shutdown: stopped, or degraded
+            # by the first failure its close met.
+            await self._observe(
+                PHASE_CLOSE,
+                name,
+                failures[0] if failures else None,
+                deadline_at=deadline_at,
+            )
 
     def _drain_budget(self, deadline_at: float) -> float:
         """The drain allowance left inside the global shutdown deadline."""
@@ -1185,26 +1344,45 @@ class PhaseCoordinator:
             return True
         self._invoked.add(key)
 
+        failure = await self._invoke_hook(
+            module, name, phase, deadline_at=deadline_at, budget=budget
+        )
+        if failure is not None:
+            self._fail(failure)
+        # The transition is complete for this module either way; the health
+        # owner is told which way, under the hook's own allowance (R8).
+        await self._observe(phase, name, failure, deadline_at=deadline_at)
+        return failure is None
+
+    async def _invoke_hook(
+        self,
+        module: Any,
+        name: str,
+        phase: str,
+        *,
+        deadline_at: float,
+        budget: str,
+    ) -> str | None:
+        """Invoke one hook. Returns the failure diagnostic, or ``None``."""
+
         try:
             hook = self._resolve_hook(module, phase)
         except LifecycleError as defect:
             # A malformed hook is reported like any other phase failure, so a
             # startup unwinds through the ordinary shutdown and a shutdown
             # still reaches every remaining module.
-            self._fail(str(defect))
-            return False
+            return str(defect)
         if hook is None:
             # A module with no role in this phase supplies a no-op.
-            return True
+            return None
 
         remaining = _remaining_to(self._clock, deadline_at)
         allowance = min(self._hook_timeout_seconds, remaining)
         if allowance <= 0:
-            self._fail(
+            return (
                 f"module {name!r}: phase {phase!r} exceeded the global "
                 f"{budget} deadline"
             )
-            return False
 
         self._current = (name, phase)
         arguments = (allowance,) if phase in _DEADLINE_PHASES else ()
@@ -1214,28 +1392,89 @@ class PhaseCoordinator:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self._fail(f"module {name!r}: phase {phase!r} failed")
-            return False
+            return f"module {name!r}: phase {phase!r} failed"
         try:
             finished = await _wait_bounded({task}, allowance, self._sleep)
             if task not in finished:
                 task.cancel()
-                await _wait_bounded({task}, self._cancel_grace_seconds, self._sleep)
-                task.add_done_callback(_consume_result)
-                self._fail(f"module {name!r}: phase {phase!r} timed out")
-                return False
+                # The grace to observe the cancellation is capped by the same
+                # global deadline as the hook itself (R4): a hook cut at
+                # that deadline gets one scheduling turn, never a fresh
+                # window past the one absolute point the caller waits on.
+                await _wait_bounded(
+                    {task},
+                    _remaining(self._cancel_grace_seconds, self._clock, deadline_at),
+                    self._sleep,
+                )
+                self._abandon(task)
+                return f"module {name!r}: phase {phase!r} timed out"
             if task.cancelled():
-                self._fail(f"module {name!r}: phase {phase!r} was cancelled")
-                return False
+                return f"module {name!r}: phase {phase!r} was cancelled"
             task.result()
         except asyncio.CancelledError:
             task.cancel()
-            task.add_done_callback(_consume_result)
+            self._abandon(task)
             raise
         except Exception:
-            self._fail(f"module {name!r}: phase {phase!r} failed")
-            return False
-        return True
+            return f"module {name!r}: phase {phase!r} failed"
+        return None
+
+    def _abandon(self, task: "asyncio.Task[Any]") -> None:
+        """Give up on *task*: its late outcome is consumed, never awaited."""
+
+        task.add_done_callback(_consume_result)
+        if not task.done():
+            self._abandoned.append(task)
+
+    async def _observe(
+        self,
+        phase: str,
+        name: str,
+        failure: str | None,
+        *,
+        deadline_at: float,
+    ) -> None:
+        """Tell the observer of one completed transition, bounded, never raising.
+
+        The observer publishes on the bus, so it is given the same allowance a
+        hook gets inside the global deadline and no more; one that overruns
+        is cancelled and noted. A failure inside it is a diagnostic, never a
+        lifecycle failure: a health fact that could not be reported must not
+        stop the module that comes next from being driven.
+        """
+
+        if self._observer is None:
+            return
+        allowance = min(
+            self._hook_timeout_seconds, _remaining_to(self._clock, deadline_at)
+        )
+        try:
+            outcome = self._observer(phase, name, failure=failure)
+            if not inspect.isawaitable(outcome):
+                return
+            task = asyncio.ensure_future(outcome)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._note(f"module {name!r}: phase {phase!r}: health report failed")
+            return
+        try:
+            finished = await _wait_bounded({task}, max(allowance, 0.0), self._sleep)
+            if task not in finished:
+                task.cancel()
+                self._abandon(task)
+                self._note(f"module {name!r}: phase {phase!r}: health report timed out")
+                return
+            if task.cancelled():
+                self._note(f"module {name!r}: phase {phase!r}: health report failed")
+                return
+            task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            self._abandon(task)
+            raise
+        except Exception:
+            self._note(f"module {name!r}: phase {phase!r}: health report failed")
 
     def _resolve_hook(
         self, module: Any, phase: str
@@ -1336,6 +1575,19 @@ async def _wait_bounded(
         timer.cancel()
         timer.add_done_callback(_consume_result)
     return {task for task in tasks if task.done()}
+
+
+def _cancellation_requested(task: "asyncio.Future[Any]") -> bool:
+    """Whether *task* already has a cancellation request pending.
+
+    A task records its requests (``Task.cancelling``, 3.11+); a bare future
+    does not, and is asked again — cancelling a future twice is harmless.
+    """
+
+    cancelling = getattr(task, "cancelling", None)
+    if not callable(cancelling):
+        return False
+    return cancelling() > 0
 
 
 def _consume_result(task: asyncio.Task[Any]) -> None:

@@ -31,11 +31,12 @@ from core.actions import (
     ERROR_NOT_AUTHORIZED,
     ERROR_PROVIDER_FAILED,
     ERROR_TIMED_OUT,
+    ActionExecutor,
     ActionRegistry,
     AuthorizationPolicy,
     AuthorizationRule,
 )
-from core.admission import REASON_CANCELLED
+from core.admission import REASON_CANCELLED, REASON_RUN_DEADLINE
 from core.bus import EventBus
 from core.contracts import (
     TRACE_ACTION_COMPLETED,
@@ -45,6 +46,7 @@ from core.contracts import (
     TRACE_BRAIN_RUN_STARTED,
     WILDCARD,
     ActionSpec,
+    ActionObservation,
     Counters,
     Destination,
     SessionKey,
@@ -70,6 +72,7 @@ from conftest import (
     settle,
     wait_until,
 )
+from modules.brain import _Settings as brain_settings
 from modules.brain import (
     CHAT_SCOPE,
     DELIVERY_ACTION,
@@ -612,11 +615,158 @@ async def test_loader_refuses_settings_the_hook_rejects_before_activation() -> N
             {"enabled_modules": ["brain"], "modules": {"brain": invalid}}
         )
 
-    assert "'brain'" in str(caught.value)
-    assert "validate_settings" in str(caught.value)
-    assert "2 diagnostics" in str(caught.value)
+    # The module's own diagnostics reach the report, naming module and
+    # field, with 0 configured values (AC24).
+    assert caught.value.diagnostics == (
+        "module 'brain': field 'endpoint': must be a well-formed http(s) URL",
+        "module 'brain': field 'conversation_memory.max_age_seconds': "
+        "must be a finite positive number",
+    )
     assert_sanitized([str(caught.value)])
     assert invalid["endpoint"] not in str(caught.value)
+    assert invalid["api_key"] not in str(caught.value)
+    assert activated == []
+    assert loader.activations == []
+
+
+def test_settings_hook_accepts_owned_limits_equal_to_the_accepted_block() -> None:
+    """R6 (P24 F6): handed the accepted ``limits`` block, owned groups equal to
+    it pass; without the block, or with a block lacking the group, the
+    module's own settings are the only copy and pass on their own terms. The
+    ``budget`` group is the module's alone and is never compared."""
+
+    accepted = {
+        "admission": dict(LIMITS["admission"]),
+        "conversation_memory": dict(LIMITS["conversation_memory"]),
+        "bus_history": {"max_events": 1, "max_bytes": 1, "max_age_seconds": 1},
+    }
+
+    assert validate_settings({**copy_settings(VALID_SETTINGS), "limits": accepted}) == []
+    assert validate_settings(VALID_SETTINGS) == []
+    assert validate_settings(
+        {**copy_settings(VALID_SETTINGS), "limits": {"admission": dict(LIMITS["admission"])}}
+    ) == []
+    # Equal as numbers: an integer copy of a float second count is the same bound.
+    same = copy_settings(VALID_SETTINGS)
+    same["admission"]["wait_seconds"] = 30.0
+    assert validate_settings({**same, "limits": accepted}) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "expected"),
+    [
+        (
+            ("admission", "workers"),
+            2,
+            "field 'admission.workers': must equal limits.admission.workers",
+        ),
+        (
+            ("admission", "session_queue_capacity"),
+            1,
+            "field 'admission.session_queue_capacity': "
+            "must equal limits.admission.session_queue_capacity",
+        ),
+        (
+            ("admission", "total_run_seconds"),
+            60,
+            "field 'admission.total_run_seconds': "
+            "must equal limits.admission.total_run_seconds",
+        ),
+        (
+            ("conversation_memory", "max_exchanges"),
+            1,
+            "field 'conversation_memory.max_exchanges': "
+            "must equal limits.conversation_memory.max_exchanges",
+        ),
+        (
+            ("conversation_memory", "max_age_seconds"),
+            3600,
+            "field 'conversation_memory.max_age_seconds': "
+            "must equal limits.conversation_memory.max_age_seconds",
+        ),
+    ],
+)
+def test_settings_hook_refuses_an_owned_limit_that_differs_from_the_accepted_one(
+    path: tuple[str, str], value: Any, expected: str
+) -> None:
+    """R6 (P24 F6): an owned limit that differs from the accepted block is
+    refused by field, value-free, so the scheduler and the memory are never
+    built on a mirror the entry point did not accept."""
+
+    settings = copy_settings(VALID_SETTINGS)
+    settings[path[0]][path[1]] = value
+    settings["limits"] = {
+        "admission": dict(LIMITS["admission"]),
+        "conversation_memory": dict(LIMITS["conversation_memory"]),
+    }
+
+    diagnostics = validate_settings(settings)
+
+    assert diagnostics == [f"module 'brain': {expected}"]
+    assert str(value) not in diagnostics[0]
+    assert str(LIMITS[path[0]][path[1]]) not in diagnostics[0]
+    assert_sanitized(diagnostics)
+    with pytest.raises(BrainModuleError) as caught:
+        brain_settings.from_mapping(settings)
+    assert str(caught.value) == diagnostics[0]
+
+
+def test_settings_hook_reports_every_differing_owned_limit_and_a_malformed_block() -> None:
+    """Every field that differs is its own diagnostic; a limit that is not
+    evaluable is reported as such and not compared; a handed block that is
+    not a mapping, or a group that is not, is named by field."""
+
+    settings = copy_settings(VALID_SETTINGS)
+    settings["admission"]["workers"] = 1
+    settings["admission"]["wait_seconds"] = float("inf")
+    settings["conversation_memory"]["max_bytes"] = 1
+    settings["limits"] = {
+        "admission": dict(LIMITS["admission"]),
+        "conversation_memory": dict(LIMITS["conversation_memory"]),
+    }
+
+    assert validate_settings(settings) == [
+        "module 'brain': field 'admission.workers': must equal limits.admission.workers",
+        "module 'brain': field 'admission.wait_seconds': must be a finite positive number",
+        "module 'brain': field 'conversation_memory.max_bytes': "
+        "must equal limits.conversation_memory.max_bytes",
+    ]
+    assert validate_settings({**copy_settings(VALID_SETTINGS), "limits": [1]}) == [
+        "module 'brain': field 'limits': must be a mapping of limit groups"
+    ]
+    assert validate_settings(
+        {**copy_settings(VALID_SETTINGS), "limits": {"admission": 4}}
+    ) == [
+        "module 'brain': field 'limits.admission': must be a mapping of limits"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_loader_refuses_an_owned_limit_differing_from_the_accepted_block_before_activation() -> None:
+    """R6 (P24 F6): through the real loader, a differing copy stops startup
+    naming module and field with 0 sessions created and 0 activations."""
+
+    from core.loader import ModuleLoadError
+
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    settings = copy_settings(VALID_SETTINGS)
+    settings["limits"] = {
+        "admission": {**LIMITS["admission"], "workers": LIMITS["admission"]["workers"] + 1},
+        "conversation_memory": dict(LIMITS["conversation_memory"]),
+    }
+    activated: list[str] = []
+    settings["_session_factory"] = lambda: activated.append("session")
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled(
+            {"enabled_modules": ["brain"], "modules": {"brain": settings}}
+        )
+
+    assert caught.value.diagnostics == (
+        "module 'brain': field 'admission.workers': must equal limits.admission.workers",
+    )
+    assert_sanitized([str(caught.value)])
     assert activated == []
     assert loader.activations == []
 
@@ -1164,6 +1314,115 @@ async def test_close_ends_a_held_run_cancelled_with_its_model_call_counted() -> 
     assert len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) == 1
     assert harness.transport.sends == []
     assert session.close_calls == 1
+
+
+async def test_a_confirmation_released_after_the_deadline_never_becomes_memory() -> None:
+    """P24 gate F1 / AC33: a send still unconfirmed at expiry stays so.
+
+    Scheduler, real brain engine and real executor share one manual clock.
+    The send is on the wire when the budget ends; the transport then confirms
+    — successfully — only after the clock has passed the total deadline. The
+    confirmation is released in the same synchronous block as the advance, so
+    the executor's race finds both the provider and its timer already ready:
+    the late success must not be adopted, nothing may reach memory, and the
+    run still ends ``timeout``/``run_deadline`` with zero sends.
+    """
+
+    clock = ManualClock()
+    bus = EventBus()
+    counters = Counters()
+    policy = AuthorizationPolicy([BRAIN_GRANT])
+    actions = ActionRegistry(authorization=policy)
+    release = asyncio.Event()
+    requests: list[str] = []
+
+    class LateConfirmingProvider:
+        name = "late-sender"
+
+        async def invoke(self, invocation: Any) -> ActionObservation:
+            requests.append(invocation.call.arguments["text"])
+            invocation.mark_emitted()
+            await release.wait()
+            return ActionObservation(
+                status="success",
+                provenance={"provider": self.name},
+                result={"message_id": "late-1"},
+            )
+
+    actions.register(CHAT_WRITE_SPEC, LateConfirmingProvider(), module=SENDER_MODULE)
+    actions.mark_ready(SENDER_MODULE)
+    supervision = Supervision(bus, counters=counters)
+    executor = ActionExecutor(
+        actions,
+        policy,
+        supervision=supervision,
+        counters=counters,
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+    triggers = FakeTriggerEngine()
+    triggers.decide("late-1", accepted=True)
+    context = RuntimeContext(
+        bus=bus,
+        actions=actions,
+        supervision=supervision,
+        tasks=SupervisedTasks(),
+        executor=executor,
+        triggers=triggers,
+        clock=clock,
+    )
+    diagnostics: list[str] = []
+    settings = merge_settings({"admission": {"total_run_seconds": 10.0}})
+    settings.update(
+        {
+            "_session_factory": lambda: FakeSession(
+                FakeResponse(200, completion("On the wire"))
+            ),
+            "_sleeper": clock.sleep,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    )
+    handle = await activate(context.for_module(MODULE_NAME), settings, {})
+    try:
+        await handle.prepare()
+        await bus.publish(
+            INPUT_EVENT,
+            chat_payload("Hold the reply", message_id="late-1"),
+            {"source": "test", "schema_version": 2},
+        )
+        await wait_until(lambda: requests == ["On the wire"])
+
+        # Past the deadline BEFORE the response is released — and released in
+        # the same synchronous block, so the resumed executor faces both
+        # futures ready and cannot order the confirmation first by itself.
+        release.set()
+        clock.advance(11.0)
+        await wait_until(lambda: len(handle.scheduler.run_records()) == 1)
+
+        (record,) = handle.scheduler.run_records().values()
+        assert (record.status, record.reason) == ("timeout", REASON_RUN_DEADLINE)
+        assert record.sends == 0
+
+        # Zero success observations for the expired send (R2/AC33).
+        statuses = [value.status for value in executor.outcomes().values()]
+        assert statuses == ["external_unknown"]
+        assert statuses.count("success") == 0
+        assert executor.provider_invocations == 1
+
+        # The late reply never reaches memory, so the model is never told it
+        # said something the run recorded as unconfirmed.
+        assert handle.memory.sessions() == ()
+        assert handle.memory.recall(SessionKey(PLATFORM, CHANNEL, VIEWER)) == ()
+
+        # Emitted exactly once, never replayed.
+        assert requests == ["On the wire"]
+        (completed,) = events_of(bus, TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["status"] == "timeout"
+        assert completed["payload"]["reason"] == REASON_RUN_DEADLINE
+        assert completed["payload"]["sends"] == 0
+        assert diagnostics == []
+    finally:
+        await handle.close()
 
 
 # --------------------------------------------------------------------------- #

@@ -37,11 +37,11 @@ publish lock covers normalisation and dedup only; it is released before the
 publication, the trace and the admission. A notification carrying no trusted
 viewer identity is never published, fed or admitted: it is one traced
 rejection (AC12). The dedup guarantee covers the retained window only — a
-repetition arriving after eviction is reprocessed (AC22). Until the bus
-consumer of ``channel.chat.message`` is itself scheduler-driven (P16), the bus
-copy of an *accepted* event alone carries the ``viewer_id`` bridge that
-consumer reads, so nothing the trigger refused can reach a model through the
-bus (R1, AC4).
+repetition arriving after eviction is reprocessed (AC22). The bus copy of the
+event is the normalised event itself, decided either way: the consumer of
+``channel.chat.message`` consults the decision this input recorded in the
+shared trigger engine before it admits anything, so nothing the trigger
+refused can reach a model through the bus (R1, AC4).
 
 **Delivery** (R5, R8). One send service serves two routes: the ``chat.write``
 action, bound at preparation to the configured channel and invoked by the
@@ -55,7 +55,18 @@ neither retries nor repeats the send (AC28). The trace is handed to the loop
 rather than awaited by the send: a confirmed outcome is returned as soon as it
 is recorded, on either route, and never depends on how long a trace subscriber
 takes — it cannot spend the executor's budget and turn a confirmed send into
-``external_unknown``, nor hold the compatibility route's caller.
+``external_unknown``, nor hold the compatibility route's caller. On the action
+route the hand-over runs through the invocation's completion hook, once the
+executor has published its own ``action.completed``, so one run's audit reads
+``action.started``, ``action.completed``, ``channel.chat.sent`` and then
+``brain.run.completed`` — AC27's order — and the fact still exists only once
+the transport confirmed, since the record precedes the hook. Detached, but
+not unbounded (R6): at most ``DEFAULT_MAX_PENDING_SENT_TRACES`` traces may be
+outstanding at once, a trace offered past that cap is dropped and counted — in
+:class:`SendRecord` and as a lost trace — with the confirmed-send record left
+exactly as it was, and ``close`` waits for the outstanding traces inside
+``DEFAULT_SENT_TRACE_CLOSE_SECONDS`` only, cancelling and counting the rest, so
+a subscriber that never returns can neither grow that set nor hold shutdown.
 """
 
 from __future__ import annotations
@@ -63,6 +74,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import sys
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
@@ -75,6 +87,7 @@ import yaml
 from core.admission import Work
 from core.context import ChatEntry
 from core.contracts import (
+    COUNTER_LOST_TRACES,
     TRACE_CHANNEL_CHAT_SENT,
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
@@ -134,6 +147,27 @@ _ROUTE_ACTION = CHAT_WRITE_ACTION
 _ROUTE_COMPATIBILITY = _CHAT_SEND_EVENT
 _CHAT_SEND_TIMEOUT_SECONDS = 10.0
 _NON_RETRYABLE_CLOSE_CODES = {4001, 4003}
+
+DEFAULT_MAX_PENDING_SENT_TRACES = 64
+"""How many ``channel.chat.sent`` publications may be outstanding at once (R6).
+
+A confirmed send hands its trace to the loop rather than awaiting it, so a
+subscriber publishing slower than sends are confirmed would otherwise
+accumulate one pending task per send without limit. Past this many the trace
+is dropped and counted (``SendRecord.dropped_traces``, ``lost_traces``); the
+send itself stays confirmed and recorded. Overridable per activation through
+the ``_max_pending_sent_traces`` seam, validated finite at activation.
+"""
+
+DEFAULT_SENT_TRACE_CLOSE_SECONDS = 5.0
+"""How long ``close`` waits for the outstanding sent traces before cancelling them.
+
+A shutdown must be bounded by the module too, not only by the coordinator's
+global deadline: a subscriber that never returns would otherwise hold the send
+transport open for as long as it pleases. Traces cancelled at this budget are
+counted exactly like dropped ones. Overridable through the
+``_sent_trace_close_seconds`` seam, validated finite at activation.
+"""
 _STABLE_CONNECTION_SECONDS = 10.0
 
 # EventSub badge set identifiers mapped to the trusted claim they attest. Only
@@ -148,14 +182,6 @@ _BADGE_CLAIMS: Mapping[str, str] = {
 }
 _BADGE_PROVENANCE = "eventsub.badges"
 _BROADCASTER_PROVENANCE = "eventsub.broadcaster_user_id"
-
-# The interim admission bridge. The v1 consumer of ``channel.chat.message``
-# runs a model for every event it can read, and it reads the viewer identity
-# from this field, not from ``payload.author.id`` (P16 retires it). It is no
-# part of the normalised event: it is attached, on the bus only, to the events
-# the trigger accepted, so that a rejected trigger stays a traced decision that
-# calls no model even while that consumer is still on the bus (R1, AC4).
-_CONSUMER_BRIDGE_FIELD = "viewer_id"
 
 # Error codes the send service normalises its failures to (R5).
 _ERROR_INVALID_ARGUMENTS = "invalid_arguments"
@@ -268,13 +294,21 @@ class SendRecord:
 
     This is the record ``record_and_emit`` writes *before* ``channel.chat.sent``
     is published (R8): a lost trace leaves ``confirmed`` incremented and the
-    transport untouched. Read it through :attr:`TwitchModule.send_record`.
+    transport untouched. ``dropped_traces`` counts the confirmed sends whose
+    trace was never published because the pending set was saturated or
+    because ``close`` ran out of budget waiting for it (R6); it is written
+    outside the saturated path, so it is readable however held the subscriber
+    is, and every such drop is also counted in the runtime's ``lost_traces``.
+    ``snapshot`` keeps the send outcomes only — the delivery facts the audit
+    and the pipeline read — so the drop count is read from the field. Read
+    the record through :attr:`TwitchModule.send_record`.
     """
 
     emitted: int = 0
     confirmed: int = 0
     failed: int = 0
     unknown: int = 0
+    dropped_traces: int = 0
     last_message_id: str | None = None
 
     def snapshot(self) -> dict[str, Any]:
@@ -356,8 +390,17 @@ class TwitchModule:
         session: Any,
         reporter: Callable[[str], None],
         retry_delay: Callable[[float], Awaitable[None]],
+        *,
+        max_pending_sent_traces: int = DEFAULT_MAX_PENDING_SENT_TRACES,
+        sent_trace_close_seconds: float = DEFAULT_SENT_TRACE_CLOSE_SECONDS,
     ) -> None:
         runtime = _runtime_surfaces(context)
+        self._max_pending_sent_traces = _validate_count_limit(
+            max_pending_sent_traces, "_max_pending_sent_traces"
+        )
+        self._sent_trace_close_seconds = _validate_duration_limit(
+            sent_trace_close_seconds, "_sent_trace_close_seconds"
+        )
         self._bus = runtime.bus
         self._tasks = runtime.tasks
         self._actions = runtime.actions
@@ -384,8 +427,13 @@ class TwitchModule:
         self._reception_lock = asyncio.Lock()
         self._active_send_tasks: set[asyncio.Task[Any]] = set()
         # ``channel.chat.sent`` publications handed to the loop by a confirmed
-        # send; awaited by ``close`` so a shutdown loses none of them.
+        # send: at most ``max_pending_sent_traces`` at once, awaited by
+        # ``close`` inside its own budget (R6).
         self._sent_traces: set[asyncio.Task[None]] = set()
+        # Publications that resisted their cancellation at ``close`` and that
+        # the supervised registry could not take over: still owned here, so
+        # none is left to the collector unobserved (R4).
+        self._abandoned_sent_traces: list[asyncio.Task[None]] = []
         self._closed = False
         self._close_lock = asyncio.Lock()
 
@@ -548,12 +596,99 @@ class TwitchModule:
                     await asyncio.gather(*active_sends, return_exceptions=True)
 
                 # A send confirmed up to this point has handed its trace to
-                # the loop; the facts are published before the handle is gone.
-                sent_traces = tuple(self._sent_traces)
-                if sent_traces:
-                    await asyncio.gather(*sent_traces, return_exceptions=True)
+                # the loop; the facts are published before the handle is gone
+                # — inside this module's own budget, so a subscriber that
+                # never returns cannot hold the shutdown (R6). Whatever the
+                # settlement does, the send transport is closed after it.
+                try:
+                    await self._settle_sent_traces()
+                finally:
+                    await _close_session(self._session)
 
-                await _close_session(self._session)
+    async def _settle_sent_traces(self) -> None:
+        """Wait for the outstanding sent traces inside the close budget.
+
+        The set is already capped, so this waits for at most
+        ``max_pending_sent_traces`` publications; whichever are still pending
+        when the budget runs out — or when the close itself is cancelled — are
+        cancelled and counted as dropped, exactly like a trace refused at the
+        cap. The confirmed-send record is untouched either way: every one of
+        these sends was recorded before its trace existed.
+
+        The cancellation is bounded by the same budget: a subscriber that
+        swallows ``CancelledError`` or cleans up slowly in ``finally`` would
+        otherwise hold the shutdown through the settlement it was meant to
+        end. A trace still unfinished after that second budget is already
+        cancelled and already counted; it is handed to the supervised
+        registry, which keeps owning it and records the unfinished
+        cancellation as a lifecycle failure (R4/AC15) — a shutdown that had
+        to leave a subscriber running is not a clean one, however normally
+        this hook returns — so the transport close behind this call runs no
+        later than twice the budget. A registry without that surface leaves
+        the task owned by this handle instead.
+        """
+
+        sent_traces = tuple(task for task in self._sent_traces if not task.done())
+        if not sent_traces:
+            return
+        try:
+            await asyncio.wait(sent_traces, timeout=self._sent_trace_close_seconds)
+        finally:
+            pending = [task for task in sent_traces if not task.done()]
+            if pending:
+                for task in pending:
+                    task.cancel()
+                # Count outside the saturated path, before the cancellations
+                # are awaited: a held subscriber cannot delay the accounting.
+                self._drop_sent_traces(len(pending), "close budget exhausted")
+                try:
+                    await asyncio.wait(
+                        pending, timeout=self._sent_trace_close_seconds
+                    )
+                finally:
+                    abandoned = [task for task in pending if not task.done()]
+                    if abandoned:
+                        for task in abandoned:
+                            self._sent_traces.discard(task)
+                            self._abandon_sent_trace(task)
+                        self._diagnose(
+                            "twitch sent trace: cancellation abandoned "
+                            f"({len(abandoned)} held past the close budget)"
+                        )
+
+    def _abandon_sent_trace(self, task: asyncio.Task[None]) -> None:
+        """Hand one cancellation-resistant trace to supervised shutdown.
+
+        The registry records it as a task that did not stop when cancelled,
+        which is what makes the lifecycle report non-zero; failing that
+        surface, the handle keeps the reference itself.
+        """
+
+        abandon = getattr(self._tasks, "abandon", None)
+        if callable(abandon):
+            try:
+                abandon(task, name="sent trace")
+                return
+            except Exception:
+                self._diagnose("twitch sent trace: supervised hand-over failed")
+        task.add_done_callback(_consume_task)
+        self._abandoned_sent_traces.append(task)
+
+    def _drop_sent_traces(self, count: int, why: str) -> None:
+        """Account for *count* sent traces that will never be published (R6).
+
+        Written into this module's own record and, when the supervision facade
+        exposes its counters, into the runtime's ``lost_traces`` — the same
+        counter a publication that fails inside ``record_and_emit`` lands in,
+        so the loss is visible in one place whichever way it happened.
+        """
+
+        self._send_record.dropped_traces += count
+        count_lost = getattr(self._supervision, "count", None)
+        if callable(count_lost):
+            with suppress(Exception):
+                count_lost(COUNTER_LOST_TRACES, count)
+        self._diagnose(f"twitch sent trace: dropped ({why})")
 
     async def _stop_reception(self) -> None:
         """Stop the receiver and its handoff drains, then close the socket."""
@@ -649,6 +784,7 @@ class TwitchModule:
             route=_ROUTE_ACTION,
             correlation=correlation,
             on_emit=invocation.mark_emitted,
+            after_completion=invocation.after_completion,
         )
         if outcome.status == _STATUS_SUCCESS:
             return ActionObservation(
@@ -728,6 +864,7 @@ class TwitchModule:
         route: str,
         correlation: Mapping[str, Any],
         on_emit: Callable[[], None] | None = None,
+        after_completion: Callable[[Callable[[], None]], None] | None = None,
     ) -> _SendOutcome:
         """Emit one Helix send and classify its outcome honestly (R5).
 
@@ -736,7 +873,11 @@ class TwitchModule:
         that never left; ``external_unknown`` is a request that left — or may
         have — with no readable answer. *on_emit* is called right before the
         request leaves, so the executor's invocation carries the emission
-        signal from that instant on.
+        signal from that instant on. *after_completion* is the invocation's
+        completion hook on the action route: the confirmed-send trace is
+        handed to the loop through it, once the executor has published its
+        own ``action.completed`` (AC27); without it — the compatibility
+        route — the trace is handed over as soon as the send is recorded.
         """
 
         if self._closed:
@@ -810,7 +951,12 @@ class TwitchModule:
                     "twitch chat send: malformed response",
                 )
             # Recorded before this returns; the trace is not waited for.
-            self._confirm(message_id, route=route, correlation=correlation)
+            self._confirm(
+                message_id,
+                route=route,
+                correlation=correlation,
+                after_completion=after_completion,
+            )
             return _SendOutcome(_STATUS_SUCCESS, message_id=message_id)
         finally:
             if task is not None:
@@ -827,7 +973,12 @@ class TwitchModule:
         return _SendOutcome(status, code=code, reason=diagnostic)
 
     def _confirm(
-        self, message_id: str, *, route: str, correlation: Mapping[str, Any]
+        self,
+        message_id: str,
+        *,
+        route: str,
+        correlation: Mapping[str, Any],
+        after_completion: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         """Record the confirmed send now; hand ``channel.chat.sent`` to the loop (R8).
 
@@ -840,11 +991,28 @@ class TwitchModule:
         — a false uncertainty about an effect that is known — and would hold
         the compatibility route's caller without any bound at all.
 
+        On the action route the hand-over itself waits for the executor:
+        *after_completion* runs it once the executor has recorded the call's
+        observation and published ``action.completed``, so the audit reads
+        the executor's completion before this module's fact — AC27's order —
+        and reads the fact only after the transport confirmed, since the
+        record is already written when the hook is registered. The
+        compatibility route has no executor and hands the trace over at once.
+
         ``record_and_emit`` still runs the record first, as R8's ordering
         primitive; that second write is a no-op, as the scheduler's is. A
         publication that fails is counted by supervision as a lost trace and
         never reaches back here — nothing is retried and nothing is sent
         again (AC28). :meth:`close` waits for the traces still in flight.
+
+        Detached is not unbounded (R6): past ``max_pending_sent_traces``
+        outstanding publications the trace is dropped — the record already
+        stands — and counted through :meth:`_drop_sent_traces`, outside the
+        saturated path, so a subscriber holding ``channel.chat.sent`` can
+        never grow this set beyond the cap. A hand-over reaching a closed
+        handle — the executor's completion held past ``close`` — is dropped
+        and counted the same way: nothing settles a trace created after the
+        settlement ran.
         """
 
         recorded = False
@@ -858,6 +1026,30 @@ class TwitchModule:
             self._send_record.last_message_id = message_id
 
         record()
+
+        def hand_over() -> None:
+            self._hand_over_sent_trace(record, message_id, route, correlation)
+
+        if after_completion is None:
+            hand_over()
+            return
+        after_completion(hand_over)
+
+    def _hand_over_sent_trace(
+        self,
+        record: Callable[[], None],
+        message_id: str,
+        route: str,
+        correlation: Mapping[str, Any],
+    ) -> None:
+        """Hand one recorded send's ``channel.chat.sent`` to the loop, bounded."""
+
+        if self._closed:
+            self._drop_sent_traces(1, "handle closed")
+            return
+        if len(self._sent_traces) >= self._max_pending_sent_traces:
+            self._drop_sent_traces(1, "pending traces saturated")
+            return
         payload: dict[str, Any] = {
             "platform": PLATFORM,
             "channel_id": self._settings.broadcaster_id,
@@ -1192,10 +1384,10 @@ class TwitchModule:
         trigger, then admission — and nothing here awaits a run: the work is
         handed to the scheduler and this returns (R2). The bus carries the
         normalised event as a fact for every trusted input, decided either
-        way; only an accepted one carries the consumer bridge, so the bus
-        consumer of the transition can run a model for nothing the trigger
-        refused (R1, AC4). A malformed envelope raises ``ValueError`` for the
-        receiver to report.
+        way, in exactly one shape; the consumer that admits from the bus
+        reads the recorded decision, so it runs a model for nothing the
+        trigger refused (R1, AC4). A malformed envelope raises ``ValueError``
+        for the receiver to report.
         """
 
         notification = _normalize_notification(envelope)
@@ -1242,15 +1434,11 @@ class TwitchModule:
             return
 
         # With no engine (the compatibility runtime) nothing decides and the
-        # publication is the whole route, as before v2; with one, the bridge
-        # follows its decision. An undecided event (the engine failed) is
-        # published as a fact and bridged to nothing: fail closed.
-        bridged = decision.accepted if decision is not None else engine is None
-        published = _bridged_for_consumer(event, notification) if bridged else event
+        # publication is the whole route, as before v2; with one, the
+        # consumer reads the recorded decision, and an undecided event (the
+        # engine failed) has none to read: fail closed.
         try:
-            await self._bus.publish(
-                _CHAT_EVENT, published["payload"], published["metadata"]
-            )
+            await self._bus.publish(_CHAT_EVENT, event["payload"], event["metadata"])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1260,8 +1448,6 @@ class TwitchModule:
             return
         await self._trace_decision(decision)
         if decision.accepted and self._scheduler is not None:
-            # The scheduler receives the normalised event itself: the bridge
-            # is for the bus consumer alone.
             self._admit(notification, event)
 
     def _is_own_message(self, author_id: str | None) -> bool:
@@ -1384,6 +1570,16 @@ async def activate(
     retry_delay = settings.get("_retry_delay", RETRY_DELAY)
     if not callable(session_factory) or not callable(retry_delay):
         raise TwitchModuleError("twitch configuration: transport seam is invalid")
+    # The detached-trace bounds are validated before any session exists, so a
+    # non-finite limit is refused at startup and never discovered under load.
+    max_pending_sent_traces = _validate_count_limit(
+        settings.get("_max_pending_sent_traces", DEFAULT_MAX_PENDING_SENT_TRACES),
+        "_max_pending_sent_traces",
+    )
+    sent_trace_close_seconds = _validate_duration_limit(
+        settings.get("_sent_trace_close_seconds", DEFAULT_SENT_TRACE_CLOSE_SECONDS),
+        "_sent_trace_close_seconds",
+    )
 
     try:
         created = session_factory()
@@ -1392,7 +1588,40 @@ async def activate(
         _safe_report(reporter, "twitch transport: session creation failed")
         raise TwitchModuleError("twitch transport initialization failed") from None
 
-    return TwitchModule(context, parsed, session, reporter, retry_delay)
+    return TwitchModule(
+        context,
+        parsed,
+        session,
+        reporter,
+        retry_delay,
+        max_pending_sent_traces=max_pending_sent_traces,
+        sent_trace_close_seconds=sent_trace_close_seconds,
+    )
+
+
+def _validate_count_limit(value: Any, field_name: str) -> int:
+    """A positive, finite integer bound, refused with a value-free diagnostic."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise TwitchModuleError(
+            _setting_diagnostic(field_name, "must be a positive integer")
+        )
+    return value
+
+
+def _validate_duration_limit(value: Any, field_name: str) -> float:
+    """A non-negative, finite duration bound, refused with a value-free diagnostic."""
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise TwitchModuleError(
+            _setting_diagnostic(field_name, "must be a finite non-negative number")
+        )
+    return float(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1488,23 +1717,6 @@ def _declared_chat_write_spec() -> ActionSpec:
         raise TwitchModuleError(
             f"twitch prepare: manifest declaration of {CHAT_WRITE_ACTION!r} is invalid"
         ) from None
-
-
-def _bridged_for_consumer(
-    event: Mapping[str, Any], notification: _Notification
-) -> dict[str, Any]:
-    """The bus copy of an accepted event, with the consumer bridge attached.
-
-    A copy: the normalised event handed to the scheduler is left exactly as
-    normalised, and the bridge field is a bus-only alias of the trusted
-    viewer identity, never a second normalisation.
-    """
-
-    assert notification.author_id is not None
-    return {
-        **event,
-        "payload": {**event["payload"], _CONSUMER_BRIDGE_FIELD: notification.author_id},
-    }
 
 
 def _normalize_notification(envelope: Mapping[str, Any]) -> _Notification:
@@ -1675,6 +1887,13 @@ async def _close_websocket(websocket: Any) -> None:
                 await result
 
 
+def _consume_task(task: "asyncio.Future[Any]") -> None:
+    """Retrieve an abandoned task's late outcome so it is never unobserved."""
+
+    if not task.cancelled():
+        task.exception()
+
+
 async def _close_session(session: Any) -> None:
     close = getattr(session, "close", None)
     if callable(close):
@@ -1700,6 +1919,8 @@ def _default_reporter(message: str) -> None:
 __all__ = [
     "CHAT_WRITE_ACTION",
     "CHAT_WRITE_PROVIDER",
+    "DEFAULT_MAX_PENDING_SENT_TRACES",
+    "DEFAULT_SENT_TRACE_CLOSE_SECONDS",
     "MANIFEST_PATH",
     "MODULE_NAME",
     "PLATFORM",

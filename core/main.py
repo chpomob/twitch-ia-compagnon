@@ -9,6 +9,19 @@ deadline and one finite global shutdown deadline. Business settings are the
 modules' own business: each enabled module validates them through the hook its
 manifest declares, all of them before any module opens a transport (R7).
 
+Two things the core owns are handed over generically, by key and never by
+module name. The accepted ``limits`` block reaches every enabled module as the
+reserved ``limits`` setting, so the module that owns a group validates its own
+copy against the one value the entry point accepted and a differing copy stops
+startup before any activation (R6). Credentials are redacted from every trace
+and every lost-trace diagnostic from the first publication on (R8), and the
+entry point learns no business field name to do it: each module's manifest
+declares which of its settings are credentials, and the loader hands their
+accepted values — literal or resolved — to supervision before the first module
+is activated. The optional ``secrets`` block complements that declaration with
+whole-string references the entry point resolves elsewhere in the
+configuration, such as a backend URL that may embed a credential.
+
 Two activation contracts leave the loader, and the coordinator is told which
 route each activation took so that one shutdown sequence, under one deadline,
 covers both:
@@ -115,6 +128,9 @@ _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 # Retention and admission limits (R6)
 # --------------------------------------------------------------------------- #
 
+MODULES_KEY = "modules"
+"""The configuration block holding every module's own business settings."""
+
 LIMITS_KEY = "limits"
 """The configuration block holding every retention and admission limit.
 
@@ -125,6 +141,13 @@ module that declares triggers is then refused by the loader with a diagnostic
 naming it. With the block present, every limit below is required and must be
 finite and positive, so an absent, negative, non-numeric or infinite limit
 stops startup before any module is activated (R6, AC32).
+
+The accepted block is also handed to every enabled module, as the reserved
+setting of the same name inside ``modules.<name>``, so the module that owns a
+group — the observation queue, the conversation memory, the admission
+scheduler — checks its own copy against the one value accepted here, through
+its declared settings hook and before any activation. A module setting named
+``limits`` is therefore refused: that slot belongs to the accepted block.
 """
 
 _COUNT = "count"
@@ -182,8 +205,26 @@ window, the attachment store and the chat context — are built from their
 groups here. The observation queue, the conversation memory and the admission
 scheduler are owned by the modules that hold that state; their limits are
 validated here so that a deployment never starts with one of them absent or
-infinite, and handing them to their owners is part of those modules' move to
-the versioned runtime.
+infinite, and the whole accepted block is handed to every enabled module
+under :data:`LIMITS_KEY` so the owner validates its copy against it: the
+value a module runs on is never allowed to differ from the value accepted
+here (R6).
+"""
+
+SECRETS_KEY = "secrets"
+"""The configuration block naming extra references every trace is redacted of.
+
+The credentials themselves are not opt-in: every setting an enabled module's
+manifest declares as a credential is redacted, literal or resolved, whether
+or not it is listed here — the loader collects those from the declaration
+before any module is activated (R8, AC29). This optional block adds
+whole-string ``${NAME}`` references — the only secret shape configuration
+uses — that no module declares, such as a backend URL that may embed a
+credential; each must be referenced by some setting. It is never resolved on
+its own: a listed reference takes the value an enabled setting resolved it to,
+so a credential of a disabled module is never looked up (R7, AC25).
+``load_config`` replaces the block with exactly those values, an empty list
+when the configuration names none.
 """
 
 
@@ -201,7 +242,16 @@ def load_config(
     ``${NAME}`` references are resolved everywhere except inside the settings
     of a module that is not enabled: a disabled module's secrets are never
     looked up, so an unresolvable reference there does not stop an
-    application that does not run that module (R7).
+    application that does not run that module (R7). The ``secrets`` block is
+    not resolved either: it is replaced by the values the references it
+    lists were resolved to elsewhere — an empty list when absent — which is
+    what keeps a listed credential of a disabled module unresolved (R8). The
+    credentials the enabled modules declare need no entry here: the loader
+    redacts them from their accepted settings before activation.
+
+    The returned settings of every enabled module carry the accepted
+    ``limits`` block under :data:`LIMITS_KEY`, so a module that owns a limit
+    group validates its copy against the accepted value (R6).
     """
 
     try:
@@ -220,30 +270,58 @@ def load_config(
         raise ConfigurationError("configuration: must be a mapping")
 
     resolver = os.environ if environ is None else environ
+    # Every resolution performed, by variable: the secrets block is served
+    # from here rather than from the environment, so it can never cause a
+    # lookup of its own.
+    resolved: dict[str, str] = {}
     config = {
         key: (
             value
-            if key == "modules"
+            if key in (MODULES_KEY, SECRETS_KEY)
             else _resolve_environment(
                 value,
                 environ=resolver,
                 path=_mapping_path("configuration", key),
                 active=set(),
+                resolved=resolved,
             )
         )
         for key, value in loaded.items()
     }
     _validate_config(config)
+    _validate_secrets(
+        config,
+        referenced=_referenced_variables(
+            {key: value for key, value in loaded.items() if key != SECRETS_KEY}
+        ),
+    )
 
-    modules = dict(config["modules"])
+    modules = dict(config[MODULES_KEY])
     for name in config["enabled_modules"]:
         modules[name] = _resolve_environment(
             modules[name],
             environ=resolver,
-            path=f"configuration.modules.{name}",
+            path=f"configuration.{MODULES_KEY}.{name}",
             active=set(),
+            resolved=resolved,
         )
-    config["modules"] = modules
+        if LIMITS_KEY in config:
+            # The accepted block, as its own copy: an owner reads the group it
+            # owns from it and cannot reshape what another owner is handed.
+            modules[name] = {
+                **modules[name],
+                LIMITS_KEY: {
+                    group: dict(section)
+                    for group, section in config[LIMITS_KEY].items()
+                },
+            }
+    config[MODULES_KEY] = modules
+
+    config[SECRETS_KEY] = [
+        resolved[variable]
+        for variable in _listed_secrets(config.get(SECRETS_KEY) or ())
+        if variable in resolved
+    ]
 
     raw_modules_directory = config["modules_directory"]
     try:
@@ -305,6 +383,13 @@ async def run(
             return 1
 
         loader: ModuleLoader | None = None
+        # R4: one finite global startup deadline for the whole startup. It is
+        # established here, before the first enabled module is validated or
+        # activated, so a validator or an activation hook that never returns
+        # cannot block startup indefinitely; loading and the coordinator's
+        # phase startup then share the same absolute point instead of each
+        # taking a fresh budget.
+        startup_deadline_at = runtime.clock() + _STARTUP_DEADLINE_SECONDS
         try:
             loader = ModuleLoader(runtime.bus, config["modules_directory"])
             # The context and the environment are handed over after
@@ -312,26 +397,64 @@ async def run(
             # shape, which is also the shape an embedding substitutes.
             loader.context = runtime.context
             loader.environ = os.environ if environ is None else environ
-            activations = await loader.activate_enabled(config)
+            # Both global deadlines are absolute points on the runtime's
+            # clock, so the loader measures them on that clock too.
+            loader.clock = runtime.clock
+            # A handle an interrupted activation returns only after its
+            # grace is closed by the loader, and that close can finish after
+            # this coroutine has returned: the reporter outlives the call,
+            # so it is the owner that still reports the close's failure.
+            loader.late_reporter = report_diagnostic
+            activations = await loader.activate_enabled(
+                config, deadline_at=startup_deadline_at
+            )
         except (Exception, asyncio.CancelledError) as exc:
             # The loader owns the handles already returned by successful
             # activation hooks; the assignment above has not completed.
             partial = [] if loader is None else list(getattr(loader, "activations", ()))
             coordinator = _coordinator(partial, runtime, report_diagnostic)
+            # R4: one finite global shutdown deadline for the whole cleanup,
+            # established here and shared by both of its owners — the
+            # coordinator unwinding the snapshot and the loader closing the
+            # handles that arrive after it — so neither takes a fresh budget
+            # once the other has spent this one. The loader learns it before
+            # the first late close can begin: a handle is handed over on a
+            # later scheduling turn, and there is no await before this.
+            cleanup_deadline_at = runtime.clock() + _SHUTDOWN_DEADLINE_SECONDS
+            if loader is not None:
+                loader.cleanup_deadline_at = cleanup_deadline_at
             # Nothing was started, yet everything activated is unwound through
             # the ordinary sequence, both routes under one shutdown deadline.
-            await coordinator.stop()
+            await coordinator.stop(deadline_at=cleanup_deadline_at)
+            # A handle an interrupted activation returned only after its
+            # grace is not in the snapshot above: the loader owns its bounded
+            # close. A close already under way is settled before this returns
+            # — within what remains of the same deadline, never beyond it —
+            # and reported here if the loader did not report it itself; one
+            # that begins later reports through the reporter handed over
+            # above, since nothing here is left to read it.
+            for diagnostic in await _late_diagnostics(
+                loader, deadline_at=cleanup_deadline_at
+            ):
+                report_diagnostic(diagnostic)
             if isinstance(exc, asyncio.CancelledError):
+                # The cancellation still reaches the caller, but not before the
+                # module it interrupted is named (AC15): the loader recorded
+                # the diagnostic when its own await was cancelled.
+                for diagnostic in getattr(loader, "cancellation_diagnostics", ()):
+                    report_diagnostic(diagnostic)
                 raise
-            report_diagnostic(_startup_diagnostic(exc))
+            for diagnostic in _startup_diagnostics(exc):
+                report_diagnostic(diagnostic)
             return 1
 
         coordinator = _coordinator(activations, runtime, report_diagnostic)
         # A failed or cancelled startup is unwound by the coordinator itself,
         # compatibility closes included, under the one shutdown deadline it
         # took when the failure was met; the diagnostics were reported as they
-        # happened.
-        startup = await coordinator.start()
+        # happened. Phase startup spends what remains of the same global
+        # startup deadline loading ran under (R4).
+        startup = await coordinator.start(deadline_at=startup_deadline_at)
         if startup.status != 0:
             return 1
 
@@ -451,7 +574,14 @@ def _assemble_runtime(config: Mapping[str, Any]) -> _Runtime:
         attachments = AttachmentStore(clock=clock, **limits["attachments"])
 
     tasks = SupervisedTasks(clock=clock)
-    supervision = Supervision(bus, counters=counters)
+    # The extra references the configuration names, redacted from every
+    # trace and lost-trace diagnostic from the first publication on: they
+    # are known here, before the first module is activated. The credentials
+    # the modules declare join them through the loader, still before the
+    # first activation (R8, AC29).
+    supervision = Supervision(
+        bus, counters=counters, secrets=tuple(config.get(SECRETS_KEY) or ())
+    )
     # The only rules are the ones the actions block grants explicitly, and a
     # policy without an applicable rule refuses the call: declaring an action
     # never authorizes it (R5, R7).
@@ -529,13 +659,43 @@ def _coordinator(
         clock=runtime.clock,
         tasks=runtime.tasks,
         reporter=reporter,
+        # Every transition the coordinator completes reaches the runtime's
+        # health owner, which is where ``module.ready``, ``module.degraded``
+        # and ``module.stopped`` come from (R8). Both routes report: a v1
+        # close is that module's whole shutdown.
+        observer=runtime.context.health.observe_phase,
     )
 
 
-def _startup_diagnostic(exc: Exception) -> str:
+async def _late_diagnostics(
+    loader: ModuleLoader | None, *, deadline_at: float
+) -> list[str]:
+    """Settle the late handle closes the loader owns; return what is unreported.
+
+    *deadline_at* is the global shutdown deadline the coordinator has just
+    spent part of: the settle is bounded by what remains of it (R4). A
+    loader given the entry point's reporter has already reported the
+    diagnostics of the closes it settled here, so this returns nothing for
+    it; a substituted loader without that seam hands them over here instead.
+    """
+
+    settle = None if loader is None else getattr(loader, "settle_late_results", None)
+    if not callable(settle):
+        return []
+    return list(await settle(deadline_at=deadline_at))
+
+
+def _startup_diagnostics(exc: Exception) -> tuple[str, ...]:
+    """Every diagnostic a failed startup carries, one report line each.
+
+    The loader validates every enabled module's settings before it raises,
+    so its error may name several refusals — one per module and field —
+    and each is reported on its own (R7, AC24).
+    """
+
     if isinstance(exc, ModuleLoadError):
-        return str(exc)
-    return "module activation: startup failed"
+        return exc.diagnostics
+    return ("module activation: startup failed",)
 
 
 # --------------------------------------------------------------------------- #
@@ -670,7 +830,10 @@ def _resolve_environment(
     environ: Mapping[str, str],
     path: str,
     active: set[int],
+    resolved: dict[str, str] | None = None,
 ) -> Any:
+    """Resolve every ``${NAME}`` inside *value*, recording each in *resolved*."""
+
     if isinstance(value, str):
         match = _ENV_REFERENCE.fullmatch(value)
         if match is not None:
@@ -679,13 +842,15 @@ def _resolve_environment(
                 raise ConfigurationError(
                     f"{_display_path(path)}: environment reference is unresolved"
                 )
-            resolved = environ[variable]
-            if not isinstance(resolved, str):
+            looked_up = environ[variable]
+            if not isinstance(looked_up, str):
                 raise ConfigurationError(
                     f"{_display_path(path)}: environment reference must resolve "
                     "to a string"
                 )
-            return resolved
+            if resolved is not None:
+                resolved[variable] = looked_up
+            return looked_up
         if "${" in value:
             raise ConfigurationError(
                 f"{_display_path(path)}: environment reference is invalid"
@@ -702,7 +867,7 @@ def _resolve_environment(
         try:
             # Keys resolve like values, so a channel selected by an
             # environment reference names the channel it means (R1).
-            resolved: dict[Any, Any] = {}
+            mapping: dict[Any, Any] = {}
             for key, item in value.items():
                 if isinstance(key, str) and "${" in key:
                     key = _resolve_environment(
@@ -710,14 +875,16 @@ def _resolve_environment(
                         environ=environ,
                         path=_mapping_path(path, key),
                         active=active,
+                        resolved=resolved,
                     )
-                resolved[key] = _resolve_environment(
+                mapping[key] = _resolve_environment(
                     item,
                     environ=environ,
                     path=_mapping_path(path, key),
                     active=active,
+                    resolved=resolved,
                 )
-            return resolved
+            return mapping
         finally:
             active.remove(identity)
 
@@ -735,6 +902,7 @@ def _resolve_environment(
                     environ=environ,
                     path=f"{path}[{index}]",
                     active=active,
+                    resolved=resolved,
                 )
                 for index, item in enumerate(value)
             ]
@@ -774,22 +942,102 @@ def _validate_config(config: Mapping[str, Any]) -> None:
             )
         seen.add(name)
 
-    modules = config.get("modules")
+    modules = config.get(MODULES_KEY)
     if not isinstance(modules, Mapping):
-        raise ConfigurationError("modules: must be a mapping")
+        raise ConfigurationError(f"{MODULES_KEY}: must be a mapping")
 
     for name, settings in modules.items():
         if not isinstance(name, str) or not name.strip():
-            raise ConfigurationError("modules: keys must be non-empty strings")
+            raise ConfigurationError(f"{MODULES_KEY}: keys must be non-empty strings")
         if not isinstance(settings, Mapping):
-            raise ConfigurationError(f"modules.{name}: must be a mapping")
+            raise ConfigurationError(f"{MODULES_KEY}.{name}: must be a mapping")
+        if LIMITS_KEY in settings:
+            # The slot the accepted block is handed over in: a module's own
+            # value there would be a second, unvalidated copy.
+            raise ConfigurationError(
+                f"{MODULES_KEY}.{name}.{LIMITS_KEY}: is reserved for the accepted "
+                f"{LIMITS_KEY} block"
+            )
 
     for name in enabled:
         if name not in modules:
-            raise ConfigurationError(f"modules.{name}: settings are required")
+            raise ConfigurationError(f"{MODULES_KEY}.{name}: settings are required")
 
     _validate_limits(config)
     _validate_actions(config)
+
+
+def _validate_secrets(config: Mapping[str, Any], *, referenced: set[str]) -> None:
+    """Every listed secret is a reference some setting makes (R8).
+
+    The list is validated by shape only — never resolved here: a listed
+    reference that no enabled setting resolves stays unresolved, which is
+    how a disabled module's credential is never looked up (AC25). A
+    reference no setting makes at all is refused, so a misspelt name cannot
+    silently leave a value unredacted. The block may be absent: the
+    credentials proper are declared by the modules, not listed here.
+    """
+
+    if SECRETS_KEY not in config:
+        return
+    declared = config[SECRETS_KEY]
+    if not isinstance(declared, list):
+        raise ConfigurationError(f"{SECRETS_KEY}: must be a list")
+    seen: set[str] = set()
+    for index, entry in enumerate(declared):
+        label = f"{SECRETS_KEY}[{index}]"
+        match = _ENV_REFERENCE.fullmatch(entry) if isinstance(entry, str) else None
+        if match is None:
+            raise ConfigurationError(
+                f"{label}: must be an environment reference of the form ${{NAME}}"
+            )
+        variable = match.group(1)
+        if variable in seen:
+            raise ConfigurationError(f"{label}: must be unique")
+        seen.add(variable)
+        if variable not in referenced:
+            raise ConfigurationError(f"{label}: is referenced by no setting")
+
+
+def _listed_secrets(declared: Sequence[str]) -> list[str]:
+    """The variable names a validated secrets block lists, in order."""
+
+    names: list[str] = []
+    for entry in declared:
+        match = _ENV_REFERENCE.fullmatch(entry)
+        if match is not None:
+            names.append(match.group(1))
+    return names
+
+
+def _referenced_variables(value: Any) -> set[str]:
+    """Every ``${NAME}`` the raw configuration makes, disabled modules included.
+
+    A pure walk: nothing is looked up, so a reference inside a disabled
+    module's settings counts as made without its secret being resolved.
+    """
+
+    found: set[str] = set()
+    pending: list[Any] = [value]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            match = _ENV_REFERENCE.fullmatch(item)
+            if match is not None:
+                found.add(match.group(1))
+        elif isinstance(item, Mapping):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            pending.extend(item)
+    return found
 
 
 def _validate_limits(config: Mapping[str, Any]) -> None:
@@ -913,7 +1161,14 @@ def _default_diagnostic_reporter(message: str) -> None:
     print(f"error: {message}", file=sys.stderr, flush=True)
 
 
-__all__ = ["LIMITS_KEY", "ConfigurationError", "load_config", "main", "run"]
+__all__ = [
+    "LIMITS_KEY",
+    "SECRETS_KEY",
+    "ConfigurationError",
+    "load_config",
+    "main",
+    "run",
+]
 
 
 if __name__ == "__main__":

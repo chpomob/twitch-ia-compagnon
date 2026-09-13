@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
 import yaml
+
+from conftest import ManualClock, settle, wait_until
 
 from core.actions import ActionRegistry, AuthorizationPolicy, AuthorizationRule
 from core.bus import EventBus
@@ -114,6 +117,732 @@ def _base_config(*names: str) -> dict:
             name: {"label": name, "calls": [], "closes": []} for name in names
         },
     }
+
+
+HANGING_ACTIVATE_SOURCE = """
+import asyncio
+
+
+class Handle:
+    async def close(self):
+        return None
+
+
+async def activate(bus, settings, catalog):
+    settings["calls"].append((bus, settings, catalog))
+    await asyncio.Future()
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_activation_is_bounded_by_the_startup_deadline(
+    tmp_path: Path,
+) -> None:
+    """R4: a loader given the global startup deadline cannot hang on activate.
+
+    The activation that never returns is cancelled at the deadline under a
+    bounded grace, and the refusal names the module and its hook, without
+    the module's own output.
+    """
+
+    make_module(tmp_path, "hang", source=HANGING_ACTIVATE_SOURCE)
+    settings = {"label": "hang", "calls": [], "closes": []}
+    loader = ModuleLoader(object(), tmp_path)
+
+    with pytest.raises(ModuleLoadError) as raised:
+        await asyncio.wait_for(
+            loader.activate_enabled(
+                {"enabled_modules": ["hang"], "modules": {"hang": settings}},
+                deadline_at=time.monotonic() + 0.05,
+            ),
+            timeout=2,
+        )
+
+    assert raised.value.diagnostics == (
+        "module 'hang': field 'activate': exceeded the global startup deadline",
+    )
+    assert loader.activations == []
+
+
+LATE_HANDLE_ACTIVATE_SOURCE = """
+import asyncio
+
+
+class Handle:
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def close(self):
+        self.settings["closes"].append(self.settings["label"])
+
+
+async def activate(bus, settings, catalog):
+    settings["calls"].append((bus, settings, catalog))
+    try:
+        # Still activating when the deadline arrives: nothing opens this.
+        await settings["busy"].wait()
+    except asyncio.CancelledError:
+        # The handle is still returned, after the deadline cancelled us.
+        return Handle(settings)
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_handle_returned_during_the_cancel_grace_is_kept_for_cleanup(
+    tmp_path: Path,
+) -> None:
+    """R4: a late activation handle is not lost with the deadline that cut it.
+
+    An activation that observes its cancellation and returns a handle during
+    the grace window still opened resources: the deadline refusal stands, but
+    the handle is registered so startup cleanup can close it. The deadline
+    is driven from the injected clock: the activation is cut only when the
+    test moves it, and the handle is returned inside the grace that follows.
+    """
+
+    clock = ManualClock()
+    make_module(tmp_path, "late", source=LATE_HANDLE_ACTIVATE_SOURCE)
+    settings = {"label": "late", "calls": [], "closes": [], "busy": asyncio.Event()}
+    loader = ModuleLoader(object(), tmp_path, clock=clock, sleeper=clock.sleep)
+
+    task = asyncio.ensure_future(
+        loader.activate_enabled(
+            {"enabled_modules": ["late"], "modules": {"late": settings}},
+            deadline_at=clock.now + 5.0,
+        )
+    )
+    await wait_until(lambda: settings["calls"])
+    await settle()
+    assert not task.done()
+    clock.advance(5.0)  # the startup deadline cancels the activation
+    await wait_until(task.done)
+    with pytest.raises(ModuleLoadError) as raised:
+        task.result()
+
+    assert raised.value.diagnostics == (
+        "module 'late': field 'activate': exceeded the global startup deadline",
+    )
+    assert [activation.name for activation in loader.activations] == ["late"]
+    for activation in loader.activations:
+        await activation.close()
+    assert settings["closes"] == ["late"]
+
+
+IMMEDIATE_HANDLE_ON_CANCEL_SOURCE = """
+import asyncio
+
+
+class Handle:
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def close(self):
+        self.settings["closes"].append(self.settings["label"])
+
+
+async def activate(bus, settings, catalog):
+    settings["calls"].append((bus, settings, catalog))
+    try:
+        await asyncio.Future()
+    except asyncio.CancelledError:
+        # Neither slow nor cancellation-resistant: the handle already opened
+        # is simply returned from the cancellation handler, on the next turn.
+        return Handle(settings)
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_handle_returned_from_the_cancellation_handler_is_kept_when_the_caller_is_cancelled(
+    tmp_path: Path,
+) -> None:
+    """AC15 (P24 N2): caller cancellation gives the hook the same bounded grace.
+
+    The caller is cancelled while ``activate()`` is in flight and the hook
+    answers its cancellation by returning the handle it opened, immediately.
+    Without a scheduling turn between the cancellation and the salvage that
+    handle was discarded unregistered, with no cleanup owner. It is now
+    registered before the cancellation propagates, so the entry point's
+    snapshot of ``activations`` closes it like any other partial activation.
+    """
+
+    make_module(tmp_path, "late", source=IMMEDIATE_HANDLE_ON_CANCEL_SOURCE)
+    settings = {"label": "late", "calls": [], "closes": []}
+    loader = ModuleLoader(object(), tmp_path)
+    task = asyncio.ensure_future(
+        loader.activate_enabled(
+            {"enabled_modules": ["late"], "modules": {"late": settings}}
+        )
+    )
+    await wait_until(lambda: settings["calls"])
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+
+    assert loader.cancellation_diagnostics == [
+        "module 'late': field 'activate': activation was cancelled"
+    ]
+    assert [activation.name for activation in loader.activations] == ["late"]
+    for activation in loader.activations:
+        await activation.close()
+    assert settings["closes"] == ["late"]
+    assert await loader.settle_late_results() == []
+
+
+HANDLE_AFTER_GRACE_SOURCE = """
+import asyncio
+
+
+class Handle:
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def close(self):
+        self.settings["closes"].append(self.settings["label"])
+
+
+async def activate(bus, settings, catalog):
+    settings["calls"].append((bus, settings, catalog))
+    try:
+        await asyncio.Future()
+    except asyncio.CancelledError:
+        pass
+    # Cancelled, then still busy past the grace: the handle is returned only
+    # once the test opens the gate, after it observed the caller answered.
+    await settings["gate"].wait()
+    return Handle(settings)
+"""
+
+
+def _after_grace_settings(label: str = "late") -> dict:
+    """Settings for ``HANDLE_AFTER_GRACE_SOURCE``: the gate is the test's."""
+
+    return {"label": label, "calls": [], "closes": [], "gate": asyncio.Event()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["deadline", "caller"])
+async def test_a_handle_returned_after_the_grace_is_closed_by_the_loader(
+    tmp_path: Path, interruption: str
+) -> None:
+    """R4/AC15 (P24 N2): a handle returned after the grace has a cleanup owner.
+
+    Whether the startup deadline or the caller's cancellation cut the hook,
+    a handle it returns only after the grace window arrives once the caller
+    has been answered and — through the entry point — has already read
+    ``activations``. It is therefore never appended there; the loader owns
+    its bounded close and reports that close's diagnostics on request.
+    """
+
+    make_module(tmp_path, "late", source=HANDLE_AFTER_GRACE_SOURCE)
+    settings = _after_grace_settings()
+    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+    config = {"enabled_modules": ["late"], "modules": {"late": settings}}
+
+    if interruption == "deadline":
+        with pytest.raises(ModuleLoadError) as raised:
+            await loader.activate_enabled(
+                config, deadline_at=time.monotonic() + 0.01
+            )
+        assert raised.value.diagnostics == (
+            "module 'late': field 'activate': exceeded the global startup deadline",
+        )
+    else:
+        task = asyncio.ensure_future(loader.activate_enabled(config))
+        await wait_until(lambda: settings["calls"])
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert loader.cancellation_diagnostics == [
+            "module 'late': field 'activate': activation was cancelled"
+        ]
+
+    # Nothing was registered: the caller has been answered and its snapshot
+    # of the activations is complete without this handle.
+    assert loader.activations == []
+    assert settings["closes"] == []
+
+    # The handle arrives only now, and is closed by the loader, not lost.
+    settings["gate"].set()
+    await wait_until(lambda: settings["closes"] == ["late"])
+    assert await loader.settle_late_results() == []
+    assert loader.activations == []
+
+
+LATE_CLOSE_FAILS_SOURCE = HANDLE_AFTER_GRACE_SOURCE.replace(
+    '        self.settings["closes"].append(self.settings["label"])\n',
+    '        self.settings["closes"].append(self.settings["label"])\n'
+    '        raise RuntimeError(self.settings["label"] + " refused to close")\n',
+)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_late_close_is_reported_by_module_without_its_message(
+    tmp_path: Path,
+) -> None:
+    """The loader's late close is bounded and its failure is a named diagnostic."""
+
+    make_module(tmp_path, "late", source=LATE_CLOSE_FAILS_SOURCE)
+    settings = _after_grace_settings()
+    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+
+    with pytest.raises(ModuleLoadError):
+        await loader.activate_enabled(
+            {"enabled_modules": ["late"], "modules": {"late": settings}},
+            deadline_at=time.monotonic() + 0.01,
+        )
+    settings["gate"].set()
+    await wait_until(lambda: settings["closes"] == ["late"])
+
+    diagnostics = await loader.settle_late_results()
+    assert diagnostics == ["module 'late': field 'close': late handle close failed"]
+    assert "refused to close" not in "\n".join(diagnostics)
+    # Handed over once: a later settle does not repeat it.
+    assert await loader.settle_late_results() == []
+    assert loader.late_diagnostics == diagnostics
+
+
+@pytest.mark.asyncio
+async def test_a_late_close_that_finishes_after_settling_reports_through_the_reporter(
+    tmp_path: Path,
+) -> None:
+    """A late close's failure reaches its reporter even when nobody settles.
+
+    The abandoned hook returns its handle whenever it does — here after the
+    caller has been answered and ``settle_late_results()`` has returned with
+    nothing under way. The loader's reporter outlives both, so the close's
+    diagnostic is reported the moment it exists, and the next settle does
+    not repeat what the reporter already received.
+    """
+
+    make_module(tmp_path, "late", source=LATE_CLOSE_FAILS_SOURCE)
+    settings = _after_grace_settings()
+    reported: list[str] = []
+    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+    loader.late_reporter = reported.append
+
+    with pytest.raises(ModuleLoadError):
+        await loader.activate_enabled(
+            {"enabled_modules": ["late"], "modules": {"late": settings}},
+            deadline_at=time.monotonic() + 0.01,
+        )
+    # Settled before the handle arrived: no close is under way yet.
+    assert settings["closes"] == []
+    assert await loader.settle_late_results() == []
+    assert reported == []
+
+    settings["gate"].set()
+    await wait_until(lambda: reported == [
+        "module 'late': field 'close': late handle close failed"
+    ])
+    assert settings["closes"] == ["late"]
+    assert "refused to close" not in "\n".join(reported)
+    assert await loader.settle_late_results() == []
+    assert loader.late_diagnostics == reported
+
+
+@pytest.mark.asyncio
+async def test_a_failing_late_reporter_keeps_the_diagnostic_for_the_next_settle(
+    tmp_path: Path,
+) -> None:
+    """A reporter that raises loses nothing: the settle hands the diagnostic over."""
+
+    make_module(tmp_path, "late", source=LATE_CLOSE_FAILS_SOURCE)
+    settings = _after_grace_settings()
+    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+
+    def refuse(diagnostic: str) -> None:
+        raise RuntimeError("reporter unavailable")
+
+    loader.late_reporter = refuse
+
+    with pytest.raises(ModuleLoadError):
+        await loader.activate_enabled(
+            {"enabled_modules": ["late"], "modules": {"late": settings}},
+            deadline_at=time.monotonic() + 0.01,
+        )
+    settings["gate"].set()
+    await wait_until(lambda: settings["closes"] == ["late"])
+    await wait_until(lambda: loader.late_diagnostics)
+
+    assert await loader.settle_late_results() == [
+        "module 'late': field 'close': late handle close failed"
+    ]
+    assert await loader.settle_late_results() == []
+
+
+HELD_LATE_CLOSE_SOURCE = HANDLE_AFTER_GRACE_SOURCE.replace(
+    '    async def close(self):\n'
+    '        self.settings["closes"].append(self.settings["label"])\n',
+    '    async def close(self):\n'
+    '        self.settings["closes"].append(self.settings["label"])\n'
+    '        self.settings["close_task"] = asyncio.current_task()\n'
+    '        try:\n'
+    '            await self.settings["hold"].wait()\n'
+    '        except asyncio.CancelledError:\n'
+    '            self.settings["cancelled"].append(self.settings["label"])\n'
+    '            # Resists the one cancellation its owner gives it: it ends\n'
+    '            # only when the test releases it, after every deadline.\n'
+    '            await self.settings["hold"].wait()\n'
+    '        self.settings["released"].append(self.settings["label"])\n',
+)
+"""A late handle whose ``close()`` is held, observes, then resists cancellation."""
+
+EXCEEDED_CLEANUP_DEADLINE = (
+    "module 'late': field 'close': late handle close exceeded the global "
+    "shutdown deadline"
+)
+
+
+def _held_close_settings() -> dict:
+    return {
+        **_after_grace_settings(),
+        "hold": asyncio.Event(),
+        "cancelled": [],
+        "released": [],
+    }
+
+
+async def _abandon_activation_on_the_clock(
+    loader: ModuleLoader, clock: ManualClock, settings: dict
+) -> None:
+    """Drive ``activate_enabled`` to its startup deadline and past its grace.
+
+    The startup budget is 5 seconds and the grace 1 second on *clock*; the
+    hook, cancelled at the deadline, keeps its handle until the test opens
+    ``settings["gate"]``, so the caller is answered with the handle unseen.
+    """
+
+    task = asyncio.ensure_future(
+        loader.activate_enabled(
+            {"enabled_modules": ["late"], "modules": {"late": settings}},
+            deadline_at=clock.now + 5.0,
+        )
+    )
+    await wait_until(lambda: settings["calls"])
+    await settle()
+    clock.advance(5.0)  # the startup deadline: the hook is cancelled
+    await settle()
+    assert not task.done()
+    clock.advance(1.0)  # its grace: the caller is answered
+    await wait_until(task.done)
+    with pytest.raises(ModuleLoadError) as raised:
+        task.result()
+    assert raised.value.diagnostics == (
+        "module 'late': field 'activate': exceeded the global startup deadline",
+    )
+    assert loader.activations == []
+    assert settings["closes"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_late_close_is_capped_by_the_shared_cleanup_deadline(
+    tmp_path: Path,
+) -> None:
+    """R4 (P24 N4): a late close takes no budget of its own past the deadline.
+
+    The entry point establishes one absolute cleanup deadline on the
+    loader's clock and spends most of it unwinding the snapshot. The
+    abandoned hook returns its handle one second before that deadline and
+    the handle's close is held: the loader caps the close by what remains,
+    not by its own 60-second budget, and the settle awaited under the same
+    deadline returns the moment it is reached — cancelling the close,
+    reporting it as having exceeded the global shutdown deadline, and
+    keeping the resisting task owned until it ends. No positive wait is
+    spent anywhere: time moves only when this test moves it.
+    """
+
+    clock = ManualClock()
+    make_module(tmp_path, "late", source=HELD_LATE_CLOSE_SOURCE)
+    settings = _held_close_settings()
+    reported: list[str] = []
+    loader = ModuleLoader(
+        object(),
+        tmp_path,
+        clock=clock,
+        sleeper=clock.sleep,
+        cancel_grace_seconds=1.0,
+        late_close_seconds=60.0,
+    )
+    loader.late_reporter = reported.append
+    await _abandon_activation_on_the_clock(loader, clock, settings)
+
+    # The one cleanup deadline, shared with the coordinator that spends
+    # nine of its ten seconds before the handle arrives.
+    deadline_at = clock.now + 10.0
+    loader.cleanup_deadline_at = deadline_at
+    clock.advance(9.0)
+    settings["gate"].set()
+    await wait_until(lambda: settings["closes"] == ["late"])
+
+    settling = asyncio.ensure_future(
+        loader.settle_late_results(deadline_at=deadline_at)
+    )
+    await settle()
+    # Within the deadline the held close is waited for, and nothing is
+    # reported yet.
+    assert not settling.done()
+    assert reported == []
+    assert settings["cancelled"] == []
+
+    clock.advance(1.0)  # the shared deadline, one second later
+    await wait_until(settling.done)
+    assert clock.now == deadline_at
+    assert settling.result() == []
+    assert reported == [EXCEEDED_CLEANUP_DEADLINE]
+    assert loader.late_diagnostics == [EXCEEDED_CLEANUP_DEADLINE]
+    # The cancellation reached the held close; it resisted, and the loader
+    # still owns it rather than waiting for it.
+    assert settings["cancelled"] == ["late"]
+    assert settings["released"] == []
+    assert loader.abandoned == (settings["close_task"],)
+    assert await loader.settle_late_results() == []
+
+    settings["hold"].set()
+    await wait_until(lambda: settings["released"] == ["late"])
+    assert loader.abandoned == ()
+    assert settings["closes"] == ["late"]
+    assert reported == [EXCEEDED_CLEANUP_DEADLINE]
+
+
+@pytest.mark.asyncio
+async def test_settling_past_the_cleanup_deadline_gives_up_without_waiting(
+    tmp_path: Path,
+) -> None:
+    """R4 (P24 N4): a settle whose deadline has passed never extends the wait.
+
+    The close under way began before any cleanup deadline was known, so it
+    runs under its own 60-second budget; the settle is then given a deadline
+    already behind the clock. It returns within scheduling turns — the
+    clock never moves — with the close cancelled, the unfinished cleanup
+    named, and the resisting task retained by the loader.
+    """
+
+    clock = ManualClock()
+    make_module(tmp_path, "late", source=HELD_LATE_CLOSE_SOURCE)
+    settings = _held_close_settings()
+    loader = ModuleLoader(
+        object(),
+        tmp_path,
+        clock=clock,
+        sleeper=clock.sleep,
+        cancel_grace_seconds=1.0,
+        late_close_seconds=60.0,
+    )
+    await _abandon_activation_on_the_clock(loader, clock, settings)
+
+    settings["gate"].set()
+    await wait_until(lambda: settings["closes"] == ["late"])
+    now = clock.now
+
+    diagnostics = await loader.settle_late_results(deadline_at=now - 1.0)
+
+    assert clock.now == now
+    assert diagnostics == [EXCEEDED_CLEANUP_DEADLINE]
+    assert loader.late_diagnostics == [EXCEEDED_CLEANUP_DEADLINE]
+    assert settings["cancelled"] == ["late"]
+    assert loader.abandoned == (settings["close_task"],)
+    # Handed over once; the loader still owns the task it gave up on.
+    assert await loader.settle_late_results() == []
+    assert loader.abandoned == (settings["close_task"],)
+
+    settings["hold"].set()
+    await wait_until(lambda: settings["released"] == ["late"])
+    assert loader.abandoned == ()
+    assert loader.late_diagnostics == [EXCEEDED_CLEANUP_DEADLINE]
+
+
+@pytest.mark.asyncio
+async def test_a_spent_startup_budget_refuses_before_scheduling_the_hook(
+    tmp_path: Path,
+) -> None:
+    """R4: an exhausted deadline never schedules the activation hook.
+
+    A hook given a scheduling turn on a zero remaining budget could open
+    resources past the deadline and pass as an immediate completion.
+    """
+
+    make_module(tmp_path, "spent", source=HANGING_ACTIVATE_SOURCE)
+    settings = {"label": "spent", "calls": [], "closes": []}
+    loader = ModuleLoader(object(), tmp_path)
+
+    with pytest.raises(ModuleLoadError) as raised:
+        await loader.activate_enabled(
+            {"enabled_modules": ["spent"], "modules": {"spent": settings}},
+            deadline_at=time.monotonic() - 1,
+        )
+
+    assert raised.value.diagnostics == (
+        "module 'spent': field 'activate': exceeded the global startup deadline",
+    )
+    assert settings["calls"] == []
+    assert loader.activations == []
+
+
+LEAKY_ACTIVATE_SOURCE = MODULE_SOURCE.replace(
+    'async def activate(bus, settings, catalog):\n'
+    '    settings["calls"].append((bus, settings, catalog))\n'
+    '    return Handle(settings)\n',
+    "async def activate(bus, settings, catalog):\n"
+    "    from core.loader import ModuleLoadError\n"
+    "\n"
+    "    raise ModuleLoadError(settings['api_key'])\n",
+)
+
+
+@pytest.mark.asyncio
+async def test_an_activation_cannot_echo_the_rejected_credential(
+    tmp_path: Path,
+) -> None:
+    """R7/AC24: what ``activate()`` raises never becomes the diagnostic.
+
+    A module raising the loader's own error type is not a pass-through: it
+    was handed its settings, so its message may be the credential.
+    """
+
+    make_module(tmp_path, "leaky", source=LEAKY_ACTIVATE_SOURCE)
+    settings = {"label": "leaky", "calls": [], "closes": [], "api_key": "s3cret"}
+    loader = ModuleLoader(object(), tmp_path)
+
+    with pytest.raises(ModuleLoadError) as raised:
+        await loader.activate_enabled(
+            {"enabled_modules": ["leaky"], "modules": {"leaky": settings}}
+        )
+
+    assert raised.value.diagnostics == (
+        "module 'leaky': field 'activate': activation failed",
+    )
+    assert "s3cret" not in str(raised.value)
+    assert loader.activations == []
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_settings_validator_is_bounded_by_the_startup_deadline(
+    tmp_path: Path,
+) -> None:
+    """R4: an asynchronous settings hook shares the same deadline.
+
+    The validator that never returns is reported as a refusal naming the
+    module and its hook, before any module is activated (AC24).
+    """
+
+    make_module(
+        tmp_path,
+        "hang",
+        manifest={
+            "name": "hang",
+            "produces": [],
+            "consumes": [],
+            "middleware": False,
+            "manifest_version": 2,
+            "runtime_api": 2,
+            "settings_validator": "validate_settings",
+        },
+        source="import asyncio\n" + MODULE_SOURCE
+        + "\n\n"
+        + "async def validate_settings(settings):\n"
+        + "    await asyncio.Future()\n",
+    )
+    settings = {"label": "hang", "calls": [], "closes": []}
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context)
+
+    with pytest.raises(ModuleLoadError) as raised:
+        await asyncio.wait_for(
+            loader.activate_enabled(
+                {"enabled_modules": ["hang"], "modules": {"hang": settings}},
+                deadline_at=time.monotonic() + 0.05,
+            ),
+            timeout=2,
+        )
+
+    assert raised.value.diagnostics == (
+        "module 'hang': field 'validate_settings': exceeded the global "
+        "startup deadline",
+    )
+    assert settings["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_activation_names_the_module_and_keeps_prior_handles(
+    tmp_path: Path,
+) -> None:
+    """AC15: a cancellation during ``activate()`` names the cancelling module.
+
+    Cancelling the caller while the second module's ``activate()`` is in
+    flight propagates the cancellation, records one sanitised diagnostic
+    naming that module and its hook, and keeps the handle the first module
+    already returned available for cleanup.
+    """
+
+    make_module(tmp_path, "first")
+    make_module(tmp_path, "second", source=HANGING_ACTIVATE_SOURCE)
+    first_settings = {"label": "first", "calls": [], "closes": []}
+    second_settings = {"label": "second", "calls": [], "closes": []}
+    loader = ModuleLoader(object(), tmp_path)
+    task = asyncio.ensure_future(
+        loader.activate_enabled(
+            {
+                "enabled_modules": ["first", "second"],
+                "modules": {"first": first_settings, "second": second_settings},
+            }
+        )
+    )
+    await wait_until(lambda: second_settings["calls"])
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+
+    assert loader.cancellation_diagnostics == [
+        "module 'second': field 'activate': activation was cancelled"
+    ]
+    assert [activation.name for activation in loader.activations] == ["first"]
+
+
+@pytest.mark.asyncio
+async def test_an_activation_that_cancels_itself_is_a_named_failure(
+    tmp_path: Path,
+) -> None:
+    """AC15: a module-internal ``CancelledError`` terminates, not propagates.
+
+    An ``activate()`` that raises ``CancelledError`` on its own — the caller
+    was not cancelled — is a failed activation reported by module and hook,
+    so the entry point returns a non-zero status instead of a cancellation.
+    """
+
+    make_module(
+        tmp_path,
+        "selfcancelling",
+        source="""
+import asyncio
+
+
+class Handle:
+    async def close(self):
+        return None
+
+
+async def activate(bus, settings, catalog):
+    await asyncio.sleep(0)
+    raise asyncio.CancelledError()
+""",
+    )
+    settings = {"label": "selfcancelling", "calls": [], "closes": []}
+    loader = ModuleLoader(object(), tmp_path)
+
+    with pytest.raises(ModuleLoadError) as raised:
+        await loader.activate_enabled(
+            {
+                "enabled_modules": ["selfcancelling"],
+                "modules": {"selfcancelling": settings},
+            }
+        )
+
+    assert raised.value.diagnostics == (
+        "module 'selfcancelling': field 'activate': was cancelled",
+    )
+    assert loader.cancellation_diagnostics == []
 
 
 @pytest.mark.asyncio
@@ -438,6 +1167,7 @@ def v2_manifest(
     triggers: dict | None = None,
     settings_schema: dict | None = None,
     settings_validator: str | None = None,
+    credentials: list[str] | None = None,
     runtime_api: int = RUNTIME_API,
     manifest_version: int = 2,
 ) -> dict:
@@ -461,6 +1191,8 @@ def v2_manifest(
         manifest["settings_schema"] = settings_schema
     if settings_validator is not None:
         manifest["settings_validator"] = settings_validator
+    if credentials is not None:
+        manifest["credentials"] = credentials
     return manifest
 
 
@@ -917,6 +1649,216 @@ async def test_settings_schema_and_declared_hook_run_before_any_activation(
     assert other["calls"] == []
 
 
+CREDENTIAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "token": {"type": "string"},
+        "backend": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}, "port": {"type": "integer"}},
+        },
+    },
+}
+
+PLAIN_V2_SOURCE = V2_MODULE_SOURCE.replace(
+    '    context.actions.bind(\n'
+    '        "chat.write",\n'
+    '        Provider(),\n'
+    '        destinations=Destination("twitch", "*", "chat"),\n'
+    '    )\n',
+    "",
+)
+
+
+@pytest.mark.asyncio
+async def test_declared_credentials_reach_supervision_before_any_activation(
+    tmp_path: Path,
+) -> None:
+    """R8/AC29 (P24 F7): a module's declared credentials are redacted whether
+    they were configured literally or resolved from an environment reference,
+    and they are known to supervision before the first module is activated,
+    so the first trace any module publishes is already redacted of them."""
+
+    make_module(
+        tmp_path,
+        "first",
+        manifest=v2_manifest(
+            "first",
+            settings_schema=CREDENTIAL_SCHEMA,
+            credentials=["token", "backend.key"],
+        ),
+        source=PLAIN_V2_SOURCE.replace(
+            '    settings["bus"] = context.bus\n',
+            '    settings["bus"] = context.bus\n'
+            '    await context.supervision.emit(\n'
+            '        "probe.activation",\n'
+            '        {"reason": "opened with " + settings["token"] + " and "\n'
+            '         + settings["backend"]["key"]},\n'
+            '    )\n',
+        ),
+    )
+    make_module(
+        tmp_path,
+        "second",
+        manifest=v2_manifest(
+            "second", settings_schema=CREDENTIAL_SCHEMA, credentials=["token"]
+        ),
+        source=PLAIN_V2_SOURCE,
+    )
+    context = runtime_context()
+    delivered: list[dict] = []
+    context.bus.subscribe("probe.**", lambda event: delivered.append(event))
+    literal = "literal-credential-9f1c"
+    nested = "nested-credential-4b7e"
+    resolved = "resolved-credential-c03d"
+    first = {**v2_settings("first"), "token": literal, "backend": {"key": nested, "port": 1}}
+    second = {**v2_settings("second"), "token": "${SECOND_TOKEN}"}
+    loader = ModuleLoader(
+        context.bus, tmp_path, context=context, environ={"SECOND_TOKEN": resolved}
+    )
+
+    await loader.activate_enabled(
+        {
+            "enabled_modules": ["first", "second"],
+            "modules": {"first": first, "second": second},
+        }
+    )
+
+    assert loader.redacted_credentials == 3
+    # The first module's own activation trace, published before the second
+    # module was even activated, carries neither its literal credentials nor
+    # the second module's resolved one.
+    (event,) = delivered
+    assert event["payload"]["reason"].startswith("opened with ")
+    assert literal not in event["payload"]["reason"]
+    assert nested not in event["payload"]["reason"]
+    await context.supervision.emit("probe.later", {"reason": "with " + resolved})
+    assert resolved not in delivered[-1]["payload"]["reason"]
+    assert "with " in delivered[-1]["payload"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_credential_the_settings_omit_contributes_nothing(
+    tmp_path: Path,
+) -> None:
+    """An optional credential left unset is not an error and redacts nothing."""
+
+    make_module(
+        tmp_path,
+        "quiet",
+        manifest=v2_manifest(
+            "quiet", settings_schema=CREDENTIAL_SCHEMA, credentials=["token", "backend.key"]
+        ),
+        source=PLAIN_V2_SOURCE,
+    )
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context)
+
+    await loader.activate_enabled(
+        {"enabled_modules": ["quiet"], "modules": {"quiet": v2_settings("quiet")}}
+    )
+
+    assert loader.redacted_credentials == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("declared", "schema", "field"),
+    [
+        pytest.param("token", CREDENTIAL_SCHEMA, "credentials", id="not-a-list"),
+        pytest.param([1], CREDENTIAL_SCHEMA, "credentials[0]", id="not-a-string"),
+        pytest.param([""], CREDENTIAL_SCHEMA, "credentials[0]", id="empty"),
+        pytest.param(["backend..key"], CREDENTIAL_SCHEMA, "credentials[0]", id="malformed"),
+        pytest.param(["token", "token"], CREDENTIAL_SCHEMA, "credentials[1]", id="duplicate"),
+        pytest.param(["tokne"], CREDENTIAL_SCHEMA, "credentials[0]", id="misspelt"),
+        pytest.param(["backend.port"], CREDENTIAL_SCHEMA, "credentials[0]", id="not-a-string-property"),
+        pytest.param(["backend"], CREDENTIAL_SCHEMA, "credentials[0]", id="object-property"),
+        pytest.param(["token"], None, "credentials", id="no-schema"),
+    ],
+)
+async def test_a_credential_declaration_the_schema_does_not_back_is_refused(
+    tmp_path: Path, declared: object, schema: dict | None, field: str
+) -> None:
+    """R8 (P24 F7): a misspelt or unbacked credential declaration is refused at
+    discovery, naming module and entry, rather than silently redacting nothing."""
+
+    manifest = v2_manifest("broken", settings_schema=schema)
+    manifest["credentials"] = declared
+    make_module(tmp_path, "broken", manifest=manifest, source=PLAIN_V2_SOURCE)
+    context = runtime_context()
+    settings = {**v2_settings("broken"), "token": "t0ken"}
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["broken"], "modules": {"broken": settings}}
+        )
+
+    assert str(caught.value).startswith(f"module 'broken': field '{field}': ")
+    assert "t0ken" not in str(caught.value)
+    assert settings["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_v1_manifest_may_not_declare_credentials(tmp_path: Path) -> None:
+    """``credentials`` is a v2 declaration: a v1 module has no schema to back it."""
+
+    make_module(
+        tmp_path,
+        "legacy",
+        manifest={
+            "name": "legacy",
+            "produces": [],
+            "consumes": [],
+            "middleware": False,
+            "credentials": ["api_key"],
+        },
+    )
+    context = runtime_context()
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            _base_config("legacy")
+        )
+
+    assert str(caught.value).startswith("module 'legacy': field 'credentials': ")
+
+
+@pytest.mark.asyncio
+async def test_a_supervision_that_cannot_redact_refuses_a_declared_credential(
+    tmp_path: Path,
+) -> None:
+    """A runtime whose supervision cannot be told the credentials would publish
+    them: the module is refused before activation rather than traced in clear."""
+
+    make_module(
+        tmp_path,
+        "keyed",
+        manifest=v2_manifest("keyed", settings_schema=CREDENTIAL_SCHEMA, credentials=["token"]),
+        source=PLAIN_V2_SOURCE,
+    )
+
+    class Sink:
+        def emit(self, *args, **kwargs):
+            raise AssertionError("never published")
+
+        record_and_emit = emit
+
+        def snapshot(self):
+            return {}
+
+    context = runtime_context(supervision=Sink())
+    settings = {**v2_settings("keyed"), "token": "t0ken"}
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["keyed"], "modules": {"keyed": settings}}
+        )
+
+    assert "field 'supervision'" in str(caught.value)
+    assert "t0ken" not in str(caught.value)
+    assert settings["calls"] == []
+
+
 @pytest.mark.asyncio
 async def test_declared_settings_hook_the_module_does_not_define_stops_startup(
     tmp_path: Path,
@@ -979,6 +1921,14 @@ async def test_settings_hook_cannot_echo_the_rejected_credential(
     assert settings["calls"] == []
 
 
+#: The settings shape the returning hooks below report against: a hook may
+#: only name a field its module declares or was handed (R7).
+CHAT_SETTINGS_SCHEMA = {
+    "type": "object",
+    "properties": {"api_key": {"type": "string"}, "channel": {"type": "string"}},
+}
+
+
 RETURNING_VALIDATOR_SOURCE = V2_MODULE_SOURCE.replace(
     'def validate_settings(settings):\n    settings["validated"] = True\n',
     "def validate_settings(settings):\n"
@@ -996,15 +1946,22 @@ async def test_settings_hook_refuses_by_returning_diagnostics(
 ) -> None:
     """R7/AC24: a hook returning diagnostics refuses like one that raises.
 
-    The module's diagnostics name module and field, so the loader borrows
-    their count only: the text stays out of the report, as a careless hook
-    could still echo the value it was handed.
+    The module's diagnostics name module and field, and they are passed
+    through — the field is what the module knows and the core does not —
+    with every configured value redacted from the reason, so a careless
+    hook that echoes the value it was handed still leaks nothing. The
+    loader used to borrow their count only; the field-naming half of AC24
+    is what this asserts now (P24).
     """
 
     make_module(
         tmp_path,
         "chat",
-        manifest=v2_manifest("chat", settings_validator="validate_settings"),
+        manifest=v2_manifest(
+            "chat",
+            settings_validator="validate_settings",
+            settings_schema=CHAT_SETTINGS_SCHEMA,
+        ),
         source=RETURNING_VALIDATOR_SOURCE,
     )
     context = runtime_context()
@@ -1016,11 +1973,128 @@ async def test_settings_hook_refuses_by_returning_diagnostics(
         )
 
     assert settings["validated"] is True
+    assert caught.value.diagnostics == (
+        "module 'chat': field 'api_key': <redacted>",
+        "module 'chat': field 'channel': must be a non-empty string",
+    )
+    assert str(caught.value) == "\n".join(caught.value.diagnostics)
     assert "s3cret" not in str(caught.value)
-    assert "'chat'" in str(caught.value)
-    assert "validate_settings" in str(caught.value)
-    assert "2 diagnostics" in str(caught.value)
     assert settings["calls"] == []
+
+
+UNTRUSTWORTHY_VALIDATOR_SOURCE = V2_MODULE_SOURCE.replace(
+    'def validate_settings(settings):\n    settings["validated"] = True\n',
+    "def validate_settings(settings):\n"
+    "    return [\n"
+    "        f\"module 'other': field '{settings['api_key']}': is wrong\",\n"
+    "        f\"the key {settings['api_key']} is wrong\",\n"
+    "        42,\n"
+    "        \"module 'chat': field 'not a path!': is wrong\",\n"
+    "        \"module 'chat': field 'missing.nested': is required\",\n"
+    "        \"module 'chat': field 'channel': \" + \"x\" * 1000,\n"
+    "    ]\n",
+)
+
+
+@pytest.mark.asyncio
+async def test_hook_diagnostics_are_held_to_this_module_a_declared_field_and_no_value(
+    tmp_path: Path,
+) -> None:
+    """R7/AC24: what a hook returns is module-authored text, not the report.
+
+    A diagnostic naming another module is re-attributed to this one; a field
+    slot carrying the credential, a field that is not shaped like a setting
+    path, an entry with no field at all and an entry that is not text all
+    fall back to the declared hook's name; a field the settings lack is
+    still named; every reason is redacted of every configured value and
+    bounded in length.
+    """
+
+    make_module(
+        tmp_path,
+        "chat",
+        manifest=v2_manifest(
+            "chat",
+            settings_validator="validate_settings",
+            settings_schema=CHAT_SETTINGS_SCHEMA,
+        ),
+        source=UNTRUSTWORTHY_VALIDATOR_SOURCE,
+    )
+    context = runtime_context()
+    settings = {**v2_settings("chat"), "api_key": "s3cret"}
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["chat"], "modules": {"chat": settings}}
+        )
+
+    diagnostics = caught.value.diagnostics
+    assert diagnostics[:5] == (
+        "module 'chat': field 'validate_settings': is wrong",
+        "module 'chat': field 'validate_settings': the key <redacted> is wrong",
+        "module 'chat': field 'validate_settings': settings were refused by the module",
+        "module 'chat': field 'validate_settings': is wrong",
+        "module 'chat': field 'missing.nested': is required",
+    )
+    assert diagnostics[5].startswith("module 'chat': field 'channel': xxx")
+    assert len(diagnostics[5]) < 400
+    assert "s3cret" not in str(caught.value)
+    assert "'other'" not in str(caught.value)
+    assert settings["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_every_enabled_module_is_validated_and_every_refusal_is_reported(
+    tmp_path: Path,
+) -> None:
+    """AC24: 2 enabled modules with invalid settings are both reported.
+
+    The first module's refusal does not stop the second from being
+    validated: one error carries both diagnostics, each naming its own
+    module and field, 0 activations happened and 0 credential values are
+    echoed.
+    """
+
+    make_module(
+        tmp_path,
+        "chat",
+        manifest=v2_manifest(
+            "chat",
+            settings_validator="validate_settings",
+            settings_schema=CHAT_SETTINGS_SCHEMA,
+        ),
+        source=RETURNING_VALIDATOR_SOURCE,
+    )
+    make_module(
+        tmp_path,
+        "other",
+        manifest=v2_manifest(
+            "other",
+            settings_schema={
+                "type": "object",
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"],
+            },
+        ),
+        source=V2_MODULE_SOURCE,
+    )
+    context = runtime_context()
+    chat = {**v2_settings("chat"), "api_key": "s3cret"}
+    other = v2_settings("other")
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["chat", "other"], "modules": {"chat": chat, "other": other}}
+        )
+
+    assert caught.value.diagnostics == (
+        "module 'chat': field 'api_key': <redacted>",
+        "module 'chat': field 'channel': must be a non-empty string",
+        "module 'other': field 'settings.token': is required and missing",
+    )
+    assert "s3cret" not in str(caught.value)
+    assert chat["calls"] == []
+    assert other["calls"] == []
 
 
 @pytest.mark.asyncio

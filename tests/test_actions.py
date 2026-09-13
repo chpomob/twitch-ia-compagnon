@@ -18,6 +18,7 @@ from core.actions import (
     COUNTER_ACTION_TIMEOUTS,
     COUNTER_LOST_TRACES,
     EMISSION_EMITTED,
+    ERROR_EXTERNAL_UNKNOWN,
     ERROR_INVALID_ARGUMENTS,
     ERROR_INVALID_RESULT,
     ERROR_NOT_AUTHORIZED,
@@ -569,6 +570,186 @@ async def test_deadline_already_expired_never_reaches_the_provider():
     assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 1
 
 
+async def test_a_confirmation_landing_after_the_deadline_is_never_a_success():
+    """R2/AC33: a late response must not become success, even when the race
+    itself cannot tell — both the provider and the timer already ready."""
+
+    timers: list[asyncio.Future] = []
+
+    async def parked_sleep(_delay: float) -> None:
+        """A timer the test fires itself, so both futures can be made ready."""
+
+        waiter = asyncio.get_running_loop().create_future()
+        timers.append(waiter)
+        await waiter
+
+    release = asyncio.Event()
+
+    async def emitted_then_confirms(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        await release.wait()
+        return ActionObservation(
+            status="success",
+            provenance={"transport": "fake"},
+            result={"message_id": "m-1"},
+        )
+
+    harness = Harness(sleeper=parked_sleep)
+    harness.declare(WRITE_SPEC)
+    provider = Provider("sender", emitted_then_confirms)
+    harness.bind(WRITE_SPEC, provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    call = make_call(WRITE_SPEC, call_id="late-1", deadline=1000.0)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(timers) == 1  # the executor is parked on provider and timer
+
+    # The confirmation is released and the timer fires, all before the parked
+    # executor resumes: both futures are done, and the clock is past the
+    # deadline, so the race cannot be ordered by completion alone.
+    release.set()
+    timers[0].set_result(None)
+    harness.clock.now = 1000.0
+
+    observation = await task
+    assert observation.status == "external_unknown"
+    assert observation.result is None
+    assert observation.provenance["emission"] == EMISSION_EMITTED
+    assert (observation.error or {}).get("code") == ERROR_EXTERNAL_UNKNOWN
+    assert len(provider.calls) == 1
+    statuses = [value.status for value in harness.executor.outcomes().values()]
+    assert statuses == ["external_unknown"]
+    assert statuses.count("success") == 0
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+
+
+async def test_a_confirmation_landing_in_time_survives_a_late_adoption():
+    """R5 / design §3.3: confirmed success is judged by when the confirmation
+    *arrived*, not by when the executor got around to adopting it.
+
+    The provider confirms at t=9 against a deadline of t=10; the executor's
+    task is resumed only at t=11. That is a timely confirmation the loop
+    delivered late, not a missing one — turning it into ``external_unknown``
+    would report an uncertain delivery for a send the transport confirmed.
+    """
+
+    timers: list[asyncio.Future] = []
+
+    async def parked_sleep(_delay: float) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        timers.append(waiter)
+        await waiter
+
+    release = asyncio.Event()
+
+    async def emitted_then_confirms(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        await release.wait()
+        return ActionObservation(
+            status="success",
+            provenance={"transport": "fake"},
+            result={"message_id": "m-timely"},
+        )
+
+    harness = Harness(sleeper=parked_sleep)
+    harness.declare(WRITE_SPEC)
+    provider = Provider("sender", emitted_then_confirms)
+    harness.bind(WRITE_SPEC, provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    # Entered at t=6 with a 5 s spec timeout, the call deadline (t=10) is the
+    # limit that applies.
+    harness.clock.now = 6.0
+    call = make_call(WRITE_SPEC, call_id="timely-1", deadline=10.0)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(timers) == 1
+
+    # The confirmation arrives at t=9 — the provider's own task runs and is
+    # stamped before the executor is resumed at all.
+    harness.clock.now = 9.0
+    release.set()
+    (invocation,) = provider.calls
+    for _ in range(20):
+        if invocation.provider_completed_at is not None:
+            break
+        await asyncio.sleep(0)
+    assert invocation.provider_completed_at == 9.0
+    assert not task.done()  # adoption has not happened yet
+
+    # The executor only resumes at t=11, past the deadline.
+    harness.clock.now = 11.0
+
+    observation = await task
+    assert observation.status == "success"
+    assert observation.result == {"message_id": "m-timely"}
+    assert observation.provenance["emission"] == EMISSION_EMITTED
+    statuses = [value.status for value in harness.executor.outcomes().values()]
+    assert statuses == ["success"]
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+    assert [p["status"] for p in harness.bus.of_type(TRACE_ACTION_COMPLETED)] == [
+        "success"
+    ]
+
+
+async def test_a_confirmation_after_the_spec_timeout_is_never_a_success():
+    """R2/AC33: the limit that applies is the shorter of the spec's timeout and
+    the call deadline — a confirmation past the spec timeout is late even while
+    the call deadline is still far in the future."""
+
+    timers: list[asyncio.Future] = []
+
+    async def parked_sleep(_delay: float) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        timers.append(waiter)
+        await waiter
+
+    release = asyncio.Event()
+
+    async def emitted_then_confirms(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        await release.wait()
+        return ActionObservation(
+            status="success",
+            provenance={"transport": "fake"},
+            result={"message_id": "m-late"},
+        )
+
+    harness = Harness(sleeper=parked_sleep)
+    harness.declare(WRITE_SPEC)  # timeout_seconds=5.0
+    provider = Provider("sender", emitted_then_confirms)
+    harness.bind(WRITE_SPEC, provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    call = make_call(WRITE_SPEC, call_id="late-spec-1", deadline=1000.0)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(timers) == 1
+
+    # Past the spec's 5 s timeout, nowhere near the 1000 s deadline; both the
+    # confirmation and the timer are ready when the executor resumes.
+    release.set()
+    timers[0].set_result(None)
+    harness.clock.now = 6.0
+
+    observation = await task
+    assert observation.status == "external_unknown"
+    assert observation.result is None
+    assert observation.provenance["emission"] == EMISSION_EMITTED
+    assert (observation.error or {}).get("code") == ERROR_EXTERNAL_UNKNOWN
+    statuses = [value.status for value in harness.executor.outcomes().values()]
+    assert statuses == ["external_unknown"]
+    assert statuses.count("success") == 0
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+
+
 async def test_cancelled_call_with_no_emitted_effect_yields_cancelled():
     """AC18/5: cancellation below the executor is an outcome, not a propagation."""
 
@@ -967,6 +1148,104 @@ async def test_outer_cancellation_records_the_outcome_before_it_propagates():
     assert recorded is not None
     assert recorded.status == "external_unknown"
     assert len(provider.calls) == 1
+
+
+async def test_a_completion_hook_runs_after_the_recorded_outcome_and_its_trace():
+    """R8/AC27 (P24 F8): a fact a provider defers through the invocation's
+    completion hook follows the executor's own ``action.completed``.
+
+    The hook runs once the observation is recorded and its trace published —
+    it reads both — and exactly once; a hook that raises is the provider's own
+    and neither reaches the returned outcome nor stops the hooks after it."""
+
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    seen: list[tuple[object, int]] = []
+    order: list[str] = []
+
+    def confirmed_then_defers(invocation):
+        invocation.mark_emitted()
+
+        def explode() -> None:
+            order.append("explode")
+            raise RuntimeError("the provider's own")
+
+        def fact() -> None:
+            order.append("fact")
+            seen.append(
+                (
+                    harness.executor.outcome(invocation.call.call_id),
+                    len(harness.bus.of_type(TRACE_ACTION_COMPLETED)),
+                )
+            )
+
+        invocation.after_completion(explode)
+        invocation.after_completion(fact)
+        order.append("returned")
+        return ActionObservation(
+            status="success",
+            provenance={"transport": "fake"},
+            result={"message_id": "m-1"},
+        )
+
+    provider = Provider("sender", confirmed_then_defers)
+    harness.bind(WRITE_SPEC, provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    call = make_call(WRITE_SPEC)
+    observation = await harness.executor.invoke(call)
+
+    assert observation.status == "success"
+    assert order == ["returned", "explode", "fact"]
+    (recorded, completed_traces) = seen[0]
+    assert recorded is observation
+    assert completed_traces == 1
+    assert len(seen) == 1
+    (invocation,) = provider.calls
+    # Registered once the call is terminal, a hook runs at once, exactly once.
+    invocation.after_completion(lambda: order.append("late"))
+    assert order == ["returned", "explode", "fact", "late"]
+    with pytest.raises(ContractError):
+        invocation.after_completion("not callable")
+
+
+async def test_a_completion_hook_still_runs_when_the_call_is_cancelled_from_above():
+    """R8/AC27: an outer cancellation publishes the terminal trace and then
+    runs the hooks — a fact confirmed before the cancellation is never lost."""
+
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    entered = asyncio.Event()
+    seen: list[tuple[str | None, int]] = []
+
+    async def confirmed_then_hang(invocation):
+        invocation.mark_emitted()
+        invocation.after_completion(
+            lambda: seen.append(
+                (
+                    getattr(harness.executor.outcome(invocation.call.call_id), "status", None),
+                    len(harness.bus.of_type(TRACE_ACTION_COMPLETED)),
+                )
+            )
+        )
+        entered.set()
+        await asyncio.Event().wait()
+
+    provider = Provider("sender", confirmed_then_hang)
+    harness.bind(WRITE_SPEC, provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    call = make_call(WRITE_SPEC)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await entered.wait()
+    assert seen == []
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert seen == [("external_unknown", 1)]
 
 
 # --------------------------------------------------------------------------- #

@@ -8,6 +8,18 @@ transports opened (AC24). The hook is a standalone function that reads nothing
 from the engine below; the engine parses its accepted settings through the
 same hook, so a handle built outside the loader is refused on the same terms.
 
+**Owned limits** (R6). The ``admission`` and ``conversation_memory`` groups
+this module runs on are its own settings, and the entry point validates the
+same groups under its top-level ``limits`` block, which it hands to every
+enabled module as the reserved ``limits`` setting. The hook holds the two to
+one value: when the accepted block is present, every owned limit must equal
+the accepted one, field by field, and a differing copy is refused by name
+before any module is activated — so the value the scheduler and the memory
+are built from is always the value the entry point accepted, never a stale
+mirror of it. A handle built with no accepted block (a harness, the
+compatibility runtime) runs on its own settings, which are then the only
+copy.
+
 **Ingestion** (R2). :meth:`BrainModule.handle_chat_message` is the bus consumer
 of ``channel.chat.message``. It validates the normalised event — platform,
 channel, trusted ``author.id``, message identifier and text — copies it into a
@@ -31,7 +43,11 @@ which is what keeps every accepted message at exactly 1 admission (AC27). A
 scheduler this module owns is reached through this handler alone. Whoever
 builds a shared scheduler binds its run body to this module's :meth:`run`
 (through a forwarder resolved after activation, since the scheduler exists
-first).
+first) and wires its ``run_cleanup`` the same way this module does for the
+scheduler it owns: to the context's attachment store, so the leases a
+provider allocated under a run identity are released when the scheduler
+writes that run's terminal record — success, error, expiry or cancellation —
+rather than surviving until a time-to-live (R6, AC23, AC31).
 
 **The run** (R5, R8). One admitted work is exactly one model call and exactly
 one delivery through the :class:`~core.actions.ActionExecutor`: the model's
@@ -150,6 +166,11 @@ _SECONDS = "seconds"
 _ENDPOINT_SCHEMES = frozenset({"http", "https"})
 _ENV_REFERENCE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
 
+#: The reserved setting the entry point hands its accepted ``limits`` block
+#: over in (``core.main.LIMITS_KEY``): the groups it carries are the values
+#: the configuration was accepted with, and the owned copies must equal them.
+_ACCEPTED_LIMITS_SETTING = "limits"
+
 #: Every limit this module owns, by group, with its kind. The vocabulary is
 #: the one the manifest's ``settings_schema`` declares; the hook checks what
 #: that schema cannot — finiteness and strict positivity — and, called on its
@@ -193,7 +214,10 @@ def validate_settings(settings: Any) -> list[str]:
     a well-formed ``http(s)`` URL, that the model name is non-empty, that the
     key resolved to a non-empty string rather than a still-unresolved
     ``${NAME}`` reference, and that every owned limit is present, numeric,
-    finite and positive.
+    finite and positive. When the entry point handed the accepted ``limits``
+    block over, every owned limit must also equal the accepted one (R6): a
+    copy that differs is refused by field, so no bound this module builds
+    can disagree with the configuration that was accepted.
     """
 
     if not isinstance(settings, Mapping):
@@ -226,6 +250,7 @@ def validate_settings(settings: Any) -> list[str]:
             _setting_diagnostic("api_key", "is an unresolved environment reference")
         )
 
+    accepted = _accepted_limits(settings, diagnostics)
     for group, limits in _OWNED_LIMITS.items():
         section = settings.get(group)
         if section is None:
@@ -241,11 +266,70 @@ def validate_settings(settings: Any) -> list[str]:
                         f"{group}.{field_name}", "is not a limit this module owns"
                     )
                 )
+        accepted_group = _accepted_group(accepted, group, diagnostics)
         for field_name, kind in limits.items():
             reason = _limit_reason(section.get(field_name), kind)
             if reason is not None:
                 diagnostics.append(_setting_diagnostic(f"{group}.{field_name}", reason))
+            elif (
+                accepted_group is not None
+                and field_name in accepted_group
+                and section[field_name] != accepted_group[field_name]
+            ):
+                diagnostics.append(
+                    _setting_diagnostic(
+                        f"{group}.{field_name}",
+                        f"must equal {_ACCEPTED_LIMITS_SETTING}.{group}.{field_name}",
+                    )
+                )
     return diagnostics
+
+
+def _accepted_limits(
+    settings: Mapping[str, Any], diagnostics: list[str]
+) -> Mapping[str, Any] | None:
+    """The accepted ``limits`` block the entry point handed over, if any.
+
+    Absent means no block was accepted — a harness or the compatibility
+    runtime — and the module's own settings are the only copy. Present but
+    not a mapping is a defect of whoever built the settings, reported by
+    field like any other.
+    """
+
+    accepted = settings.get(_ACCEPTED_LIMITS_SETTING)
+    if accepted is None:
+        return None
+    if not isinstance(accepted, Mapping):
+        diagnostics.append(
+            _setting_diagnostic(_ACCEPTED_LIMITS_SETTING, "must be a mapping of limit groups")
+        )
+        return None
+    return accepted
+
+
+def _accepted_group(
+    accepted: Mapping[str, Any] | None, group: str, diagnostics: list[str]
+) -> Mapping[str, Any] | None:
+    """The accepted values of one owned group, to compare field by field (R6).
+
+    ``None`` when nothing was handed over for this group: the module's own
+    settings are then the only copy. The comparison itself is value by value,
+    never of whole mappings, so a diagnostic names the one field that differs
+    and a field the accepted group lacks is simply not compared. No value is
+    echoed: both are configured ones.
+    """
+
+    if accepted is None or group not in accepted:
+        return None
+    section = accepted[group]
+    if not isinstance(section, Mapping):
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{_ACCEPTED_LIMITS_SETTING}.{group}", "must be a mapping of limits"
+            )
+        )
+        return None
+    return section
 
 
 def _limit_reason(value: Any, kind: str) -> str | None:
@@ -600,6 +684,7 @@ class _RuntimeSurfaces:
     clock: Callable[[], float]
     triggers: Any | None
     scheduler: Any | None
+    attachments: Any | None
 
 
 _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -617,6 +702,8 @@ _OPTIONAL_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # without a shared scheduler the engine builds its own.
     ("triggers", ("recorded",)),
     ("scheduler", ("admit",)),
+    # Without an attachment store a run leases nothing that its end must free.
+    ("attachments", ("release",)),
 )
 
 
@@ -656,6 +743,7 @@ class BrainModule:
         self._supervision = runtime.supervision
         self._executor = runtime.executor
         self._triggers = runtime.triggers
+        self._attachments = runtime.attachments
         self._clock = runtime.clock
         self._settings = settings
         self._budget = settings.budget
@@ -692,6 +780,9 @@ class BrainModule:
                 ),
                 id_factory=run_id_factory,
                 run_module=MODULE_NAME,
+                # The run's end releases what it leased (R6): the scheduler
+                # owns the terminal record, so it owns this call too.
+                run_cleanup=self._release_run,
             )
         else:
             self._scheduler = runtime.scheduler
@@ -1151,6 +1242,23 @@ class BrainModule:
         except Exception:
             self._diagnose("brain model request: transport failed")
             return _ModelReply(failure="transport_failed")
+
+    def _release_run(self, run_id: str) -> None:
+        """Free every attachment leased under *run_id*; idempotent (R6).
+
+        The scheduler calls this exactly once per run, when the terminal
+        record is written, on every exit path. A store that refuses the call
+        is reported as a diagnostic and nothing else: the record already
+        stands, and the leases it could not free still fall to the store's
+        time-to-live.
+        """
+
+        if self._attachments is None:
+            return
+        try:
+            self._attachments.release(run_id)
+        except Exception:
+            self._diagnose("brain attachments: release failed at run end")
 
     def _diagnose(self, message: str) -> None:
         _safe_report(self._reporter, message)

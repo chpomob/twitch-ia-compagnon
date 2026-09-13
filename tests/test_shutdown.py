@@ -41,15 +41,77 @@ PIPELINE_TRACES = (
     "brain.admission.accepted",
     "brain.run.started",
     "action.started",
-    "channel.chat.sent",
     "action.completed",
+    "channel.chat.sent",
     "brain.run.completed",
 )
 """The traces of one accepted message through the real pipeline, in order.
 
-The confirmed-send fact precedes the executor's terminal trace because the
-send service records and emits it before it returns the observation (R8).
+AC27's order: the send service records the confirmed send before it returns
+the observation, and hands the fact to the loop only through the invocation's
+completion hook, after the executor's own ``action.completed`` (R8).
 """
+
+HANDLE_GATES: dict[str, asyncio.Event] = {}
+"""The gates a generated module's hooks wait on before they proceed.
+
+Keyed by the module's ``label`` setting — the gate its ``activate()`` waits
+on before returning the handle — or by ``<label>.close`` for the gate a held
+``close()`` waits on; ``<label>.closing`` is the completion event that held
+close sets on entry, which a test awaits instead of polling. A generated
+module reaches its gate through :func:`handle_gate`, so the test that wrote
+it decides — after it has observed the entry point's completion, or its
+deadline — when the hook proceeds: the interleaving under test is an
+explicit event, never an elapsed sleep.
+"""
+
+
+def handle_gate(key: str) -> asyncio.Event:
+    """The gate registered under *key*; a generated module awaits it."""
+
+    return HANDLE_GATES[key]
+
+
+def _register_gate(monkeypatch, key: str) -> asyncio.Event:
+    """Register a fresh, closed gate under *key* for the running loop."""
+
+    gate = asyncio.Event()
+    monkeypatch.setitem(HANDLE_GATES, key, gate)
+    return gate
+
+
+GATED_RETURN_ON_CANCEL_SOURCE = PHASED_MODULE_SOURCE.replace(
+    "import json\n", "import asyncio\nimport json\n", 1
+).replace(
+    'record(settings, "activate")\n',
+    'record(settings, "activate")\n'
+    '    try:\n'
+    '        await asyncio.Future()\n'
+    '    except asyncio.CancelledError:\n'
+    '        pass\n'
+    '    # Cancelled, then still busy: the handle is returned only once the\n'
+    '    # test opens the gate, after it observed the caller being answered.\n'
+    '    from test_shutdown import handle_gate\n'
+    '    await handle_gate(settings["label"]).wait()\n'
+    '    record(settings, "returned")\n',
+)
+"""``activate()`` answering its cancellation by returning its handle late."""
+
+HELD_CLOSE_SOURCE_FRAGMENT = (
+    '        record(self.settings, "close")\n'
+    '        from test_shutdown import handle_gate\n'
+    '        handle_gate(self.settings["label"] + ".closing").set()\n'
+    '        try:\n'
+    '            await handle_gate(self.settings["label"] + ".close").wait()\n'
+    '        except asyncio.CancelledError:\n'
+    '            record(self.settings, "close-cancelled")\n'
+    '            # Resists the one cancellation its owner gives it: it ends\n'
+    '            # only when the test opens the gate, after the caller was\n'
+    '            # answered, which is what retained ownership must cover.\n'
+    '            await handle_gate(self.settings["label"] + ".close").wait()\n'
+    '        record(self.settings, "close-released")\n'
+)
+"""A ``close()`` held on its gate that observes, then resists, cancellation."""
 
 
 def _grant_brain_delivery(monkeypatch) -> None:
@@ -125,7 +187,7 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
             self.activations = []
             handles["bus"] = bus
 
-        async def activate_enabled(self, config):
+        async def activate_enabled(self, config, *, deadline_at=None):
             handles["brain"] = await brain.activate(
                 self.context.for_module("brain"),
                 {**BRAIN_SETTINGS, "_session_factory": lambda: model_session},
@@ -215,14 +277,20 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
         # The completion is traced once, on the bus, and the audit — an
         # observation service, flushed and closed after every ordinary
         # resource (R4) — still records the trace the brain's close
-        # published, so its records end with the cancelled completion.
+        # published, followed only by the ``module.stopped`` facts the
+        # coordinator reported for the two ordinary modules (R8): the brain
+        # first, whose close published the completion, then the input.
         bus_types = [event["type"] for event in handles["bus"].list_events()]
         assert bus_types.count("brain.run.started") == 1
         assert bus_types.count("brain.run.completed") == 1
         decoded = [json.loads(record) for record in records]
-        assert [r["type"] for r in decoded].count("brain.run.completed") == 1
-        assert decoded[-1]["type"] == "brain.run.completed"
-        assert decoded[-1]["payload"]["status"] == "cancelled"
+        types = [r["type"] for r in decoded]
+        assert types.count("brain.run.completed") == 1
+        completed_at = types.index("brain.run.completed")
+        assert decoded[completed_at]["payload"]["status"] == "cancelled"
+        assert [
+            (r["type"], r["payload"].get("module")) for r in decoded[completed_at + 1 :]
+        ] == [("module.stopped", "brain"), ("module.stopped", "twitch")]
         assert handles["audit"].losses == 0
         return
     release.set()
@@ -386,19 +454,24 @@ from core.loader import ModuleActivation
 from modules.audit import AuditModule
 
 app._SHUTDOWN_TIMEOUT_SECONDS = 0.3
-started = threading.Event()
 blocked = BLOCKED
+loop = None
+started = None
 
 def writer(line):
-    started.set()
+    # The writer runs in an executor thread: it signals its start to the
+    # loop thread-safely, so the coroutine awaits an event, never a poll.
+    loop.call_soon_threadsafe(started.set)
     if blocked:
         threading.Event().wait()
 
 async def run(config):
+    global loop, started
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
     handle = AuditModule(writer, close_timeout_seconds=0.02)
     handle.handle_event({"type": "test.event", "payload": {}})
-    while not started.is_set():
-        await asyncio.sleep(0.001)
+    await started.wait()
     # The declared observation role puts the writer in the flush and
     # observation-close phases; the coordinator never reads its name (R4).
     coordinator = app._coordinator(
@@ -477,6 +550,14 @@ raise SystemExit(app.main(["--config", "unused"]))
 async def test_cancellation_during_activation_closes_partial_startup(
     tmp_path, monkeypatch, close_mode: str,
 ) -> None:
+    """AC15: a cancellation during a real ``activate()``, end to end.
+
+    The entry point is cancelled while the fourth module's ``activate()`` is
+    still in flight. The module that was activating is named by a sanitised
+    diagnostic before the cancellation reaches the caller, the modules whose
+    activation already returned are closed through the ordinary sequence,
+    and however a close behaved, the cancellation is not swallowed.
+    """
     modules = tmp_path / "modules"
     modules.mkdir()
     names = ["twitch", "brain", "audit", "slow", "never"]
@@ -556,8 +637,15 @@ async def test_cancellation_during_activation_closes_partial_startup(
         assert asyncio.all_tasks() <= baseline
         assert readiness == []
         assert removed == [True]
+        # AC15: the cancelling module is named, after the cleanup diagnostics
+        # and before the cancellation itself reaches the caller.
         assert diagnostics == (
-            [] if close_mode == "normal" else ["module 'brain': shutdown failed"]
+            ["module 'slow': field 'activate': activation was cancelled"]
+            if close_mode == "normal"
+            else [
+                "module 'brain': shutdown failed",
+                "module 'slow': field 'activate': activation was cancelled",
+            ]
         )
         assert unhandled == []
     finally:
@@ -568,16 +656,416 @@ async def test_cancellation_during_activation_closes_partial_startup(
         loop.set_exception_handler(previous_handler)
 
 
+async def test_cancelled_activation_through_the_entry_point_names_the_module(
+    tmp_path, monkeypatch,
+) -> None:
+    """AC15: a ``CancelledError`` during a versioned ``activate()``, end to end.
+
+    The entry point is cancelled while the last module's ``activate()`` is
+    still in flight. The loader names the module it was activating, the
+    entry point reports that diagnostic before the cancellation reaches the
+    caller, and the modules whose activation already returned are unwound
+    through the ordinary shutdown sequence.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    _make_phased_module(modules, "source", roles=("input",))
+    _make_phased_module(
+        modules,
+        "slow",
+        source=PHASED_MODULE_SOURCE.replace(
+            "import json\n", "import asyncio\nimport json\n", 1
+        ).replace(
+            'record(settings, "activate")\n',
+            'record(settings, "activate")\n'
+            '    await asyncio.Future()\n',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        _phased_config("./modules", lifecycle_log, ("alpha", "source", "slow")),
+    )
+    readiness = []
+    diagnostics = []
+    removed = []
+    monkeypatch.setattr(
+        application, "_install_signal_handlers",
+        lambda stop: lambda: removed.append(True),
+    )
+
+    def log_lines() -> list[str]:
+        if not lifecycle_log.exists():
+            return []
+        return lifecycle_log.read_text(encoding="utf-8").splitlines()
+
+    task = asyncio.create_task(application.run(
+        config_path,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    ))
+    try:
+        await wait_until(lambda: "activate:slow" in log_lines())
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert done == {task}, "startup cancellation cleanup hung"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert readiness == []
+    assert removed == [True]
+    assert diagnostics == [
+        "module 'slow': field 'activate': activation was cancelled"
+    ]
+    assert log_lines() == [
+        "activate:alpha",
+        "activate:source",
+        "activate:slow",
+        # slow never returned a handle: only alpha and source are unwound.
+        "stop_inputs:source",
+        "drain:source",
+        "drain:alpha",
+        "close:source",
+        "flush:alpha",
+        "close:alpha",
+    ]
+
+
+@pytest.mark.parametrize("returned", ["within-grace", "after-grace"])
+async def test_a_handle_returned_to_a_cancelled_activation_is_closed_through_the_entry_point(
+    tmp_path, monkeypatch, returned: str,
+) -> None:
+    """AC15 (P24 N2): a handle returned from ``activate()``'s cancellation
+    handler is closed, end to end.
+
+    The entry point is cancelled while the last module's ``activate()`` is
+    in flight, and that hook answers its cancellation by returning the
+    handle it opened — immediately, or only after the loader's grace. Within
+    the grace the handle is registered before the cancellation propagates,
+    so the entry point's snapshot of the activations unwinds it with the
+    others; after the grace the loader is its cleanup owner and closes it
+    itself, bounded, since the snapshot has already been taken.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    if returned == "within-grace":
+        source = PHASED_MODULE_SOURCE.replace(
+            "import json\n", "import asyncio\nimport json\n", 1
+        ).replace(
+            'record(settings, "activate")\n',
+            'record(settings, "activate")\n'
+            '    try:\n'
+            '        await asyncio.Future()\n'
+            '    except asyncio.CancelledError:\n'
+            '        pass\n'
+            '    record(settings, "returned")\n',
+        )
+    else:
+        source = GATED_RETURN_ON_CANCEL_SOURCE
+    _make_phased_module(modules, "slow", source=source)
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("alpha", "slow"))
+    )
+    readiness = []
+    diagnostics = []
+    monkeypatch.setattr(
+        application, "_install_signal_handlers", lambda stop: lambda: None
+    )
+    gate = _register_gate(monkeypatch, "slow")
+
+    def log_lines() -> list[str]:
+        if not lifecycle_log.exists():
+            return []
+        return lifecycle_log.read_text(encoding="utf-8").splitlines()
+
+    task = asyncio.create_task(application.run(
+        config_path,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    ))
+    try:
+        await wait_until(lambda: "activate:slow" in log_lines())
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert done == {task}, "startup cancellation cleanup hung"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        if returned == "after-grace":
+            # The caller has been answered and the handle is still held:
+            # nothing has closed it. It is returned only now, so it arrives
+            # after the snapshot the entry point took, and the loader closes
+            # it, not that snapshot.
+            assert "returned:slow" not in log_lines()
+            assert "close:slow" not in log_lines()
+            gate.set()
+            await wait_until(lambda: "close:slow" in log_lines())
+    finally:
+        gate.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert readiness == []
+    assert diagnostics == [
+        "module 'slow': field 'activate': activation was cancelled"
+    ]
+    lines = log_lines()
+    assert lines[:2] == ["activate:alpha", "activate:slow"]
+    assert lines.count("close:slow") == 1
+    if returned == "within-grace":
+        # Registered in time: unwound through the ordinary sequence, as an
+        # ordinary resource ahead of the observation service.
+        assert lines[2:] == [
+            "returned:slow", "drain:slow", "drain:alpha", "close:slow",
+            "flush:alpha", "close:alpha",
+        ]
+    else:
+        # The snapshot unwound alpha alone; the handle returned afterwards is
+        # closed by the loader, once, after the caller was answered.
+        assert lines[2:] == [
+            "drain:alpha", "flush:alpha", "close:alpha", "returned:slow", "close:slow",
+        ]
+
+
+async def test_a_late_close_that_fails_after_the_entry_point_returned_is_reported(
+    tmp_path, monkeypatch,
+) -> None:
+    """AC15 (P24 N2): a late close is never a silent cleanup failure.
+
+    The last module's ``activate()`` returns its handle only after the
+    loader's grace, so the handle arrives once ``run()`` has already been
+    answered — after its settle of the closes under way found none. The
+    loader closes it, and that close fails: with nothing in the entry point
+    left to read the loader's record, the failure reaches the diagnostic
+    reporter ``run()`` was given, which outlives the call. It is reported
+    once, without the module's own message.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "alpha", roles=("observation",))
+    _make_phased_module(
+        modules,
+        "slow",
+        source=GATED_RETURN_ON_CANCEL_SOURCE.replace(
+            '        record(self.settings, "close")\n',
+            '        record(self.settings, "close")\n'
+            '        raise RuntimeError("secret-bearing refusal to close")\n',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("alpha", "slow"))
+    )
+    readiness = []
+    diagnostics = []
+    monkeypatch.setattr(
+        application, "_install_signal_handlers", lambda stop: lambda: None
+    )
+    gate = _register_gate(monkeypatch, "slow")
+
+    def log_lines() -> list[str]:
+        if not lifecycle_log.exists():
+            return []
+        return lifecycle_log.read_text(encoding="utf-8").splitlines()
+
+    task = asyncio.create_task(application.run(
+        config_path,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    ))
+    try:
+        await wait_until(lambda: "activate:slow" in log_lines())
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert done == {task}, "startup cancellation cleanup hung"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Answered before the handle arrived: the close is still to come, and
+        # so is its diagnostic. The handle is returned only now.
+        assert "returned:slow" not in log_lines()
+        assert "close:slow" not in log_lines()
+        assert diagnostics == [
+            "module 'slow': field 'activate': activation was cancelled"
+        ]
+        gate.set()
+        await wait_until(lambda: len(diagnostics) == 2)
+    finally:
+        gate.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert readiness == []
+    assert diagnostics == [
+        "module 'slow': field 'activate': activation was cancelled",
+        "module 'slow': field 'close': late handle close failed",
+    ]
+    assert "secret-bearing" not in "\n".join(diagnostics)
+    lines = log_lines()
+    assert lines[:2] == ["activate:alpha", "activate:slow"]
+    assert lines.count("close:slow") == 1
+    assert lines[2:] == [
+        "drain:alpha", "flush:alpha", "close:alpha", "returned:slow", "close:slow",
+    ]
+
+
+async def test_a_late_close_held_past_the_global_cleanup_deadline_does_not_extend_the_entry_point(
+    tmp_path, monkeypatch,
+) -> None:
+    """R4/AC15 (P24 N4): one absolute cleanup deadline bounds the whole unwind.
+
+    The entry point is cancelled while the last module's ``activate()`` is
+    in flight. Its cleanup takes the one global shutdown deadline, and the
+    coordinator's close of the first module is held while the abandoned
+    activation returns its handle — so the handle arrives while that
+    deadline is being spent, and its close is held for good. The loader's
+    late close takes no fresh budget: the settle ``run()`` awaits after the
+    coordinator is capped by what remains of the same deadline, at which
+    point the held close is cancelled, reported as having exceeded the
+    global shutdown deadline, and kept owned by the loader — which is
+    where its resisted cancellation ends, after the caller was answered.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(
+        modules,
+        "alpha",
+        roles=("observation",),
+        source=PHASED_MODULE_SOURCE.replace(
+            "import json\n", "import asyncio\nimport json\n", 1
+        ).replace(
+            '        record(self.settings, "close")\n',
+            '        record(self.settings, "close")\n'
+            '        from test_shutdown import handle_gate\n'
+            '        handle_gate(self.settings["label"] + ".closing").set()\n'
+            '        await handle_gate(self.settings["label"] + ".close").wait()\n',
+        ),
+    )
+    _make_phased_module(
+        modules,
+        "slow",
+        source=GATED_RETURN_ON_CANCEL_SOURCE.replace(
+            '        record(self.settings, "close")\n', HELD_CLOSE_SOURCE_FRAGMENT
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("alpha", "slow"))
+    )
+    readiness = []
+    diagnostics = []
+    loaders = []
+    real_loader = application.ModuleLoader
+
+    class Recording(real_loader):
+        def __init__(self, *args, **options):
+            super().__init__(*args, **options)
+            loaders.append(self)
+
+    monkeypatch.setattr(application, "ModuleLoader", Recording)
+    monkeypatch.setattr(
+        application, "_install_signal_handlers", lambda stop: lambda: None
+    )
+    # A short global shutdown deadline; the late close's own budget is left
+    # at its default, far beyond it, so only the shared deadline can bound
+    # the return below.
+    monkeypatch.setattr(application, "_SHUTDOWN_DEADLINE_SECONDS", 0.25)
+    monkeypatch.setattr(application, "_CANCEL_TIMEOUT_SECONDS", 0.01)
+    returned = _register_gate(monkeypatch, "slow")
+    alpha_closing = _register_gate(monkeypatch, "alpha.closing")
+    alpha_close = _register_gate(monkeypatch, "alpha.close")
+    slow_closing = _register_gate(monkeypatch, "slow.closing")
+    slow_close = _register_gate(monkeypatch, "slow.close")
+
+    def log_lines() -> list[str]:
+        if not lifecycle_log.exists():
+            return []
+        return lifecycle_log.read_text(encoding="utf-8").splitlines()
+
+    task = asyncio.create_task(application.run(
+        config_path,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    ))
+    try:
+        await wait_until(lambda: "activate:slow" in log_lines())
+        task.cancel()
+        # The cleanup deadline is running: the coordinator is inside the
+        # first module's held close when the abandoned activation returns
+        # its handle, so the loader's close of it begins under that deadline.
+        await asyncio.wait_for(alpha_closing.wait(), 2)
+        assert not task.done()
+        returned.set()
+        await asyncio.wait_for(slow_closing.wait(), 2)
+        # The coordinator finishes; the held late close is all that is left.
+        alpha_close.set()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done == {task}, "the late close extended the cleanup past its deadline"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        returned.set()
+        alpha_close.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert readiness == []
+    # The unfinished cleanup is named before the caller is answered; the
+    # interrupted activation is named last, just before the cancellation
+    # propagates (AC15).
+    assert diagnostics == [
+        "module 'slow': field 'close': late handle close exceeded the global "
+        "shutdown deadline",
+        "module 'slow': field 'activate': activation was cancelled",
+    ]
+    assert log_lines() == [
+        "activate:alpha",
+        "activate:slow",
+        "drain:alpha",
+        "flush:alpha",
+        "close:alpha",
+        "returned:slow",
+        "close:slow",
+        # The cancellation reached the held close before the caller returned.
+        "close-cancelled:slow",
+    ]
+    # Ownership is retained, not extended: the close that resisted its
+    # cancellation is still held by the loader after the caller was
+    # answered, and ends only when released — with nothing more reported.
+    (loader,) = loaders
+    assert len(loader.abandoned) == 1
+    slow_close.set()
+    await wait_until(lambda: loader.abandoned == ())
+    assert log_lines()[-1] == "close-released:slow"
+    assert log_lines().count("close:slow") == 1
+    assert len(diagnostics) == 2
+    assert await loader.settle_late_results() == []
+
+
 async def test_cancelled_preparation_through_the_entry_point_names_the_module(
     tmp_path, monkeypatch,
 ) -> None:
-    """AC15: a ``CancelledError`` during a versioned activation, end to end.
+    """AC15: a ``CancelledError`` during a versioned module's preparation.
 
     The coordinator is cancelled while the last module is still preparing.
     The entry point reports the phase the cancellation interrupted, against
     the module it interrupted, then unwinds every module already prepared
     through the ordinary shutdown sequence — the producer stopped and the
-    resources closed — before the cancellation reaches the caller.
+    resources closed — before the cancellation reaches the caller. The
+    ``activate()`` cancellation, which the loader names instead of the
+    coordinator, is covered separately.
     """
 
     modules = tmp_path / "modules"

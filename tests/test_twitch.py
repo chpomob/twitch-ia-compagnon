@@ -451,9 +451,13 @@ async def test_loader_refuses_settings_the_hook_rejects_before_activation() -> N
             {"enabled_modules": ["twitch"], "modules": {"twitch": invalid}}
         )
 
-    assert "'twitch'" in str(caught.value)
-    assert "validate_settings" in str(caught.value)
+    # The module's own diagnostic reaches the report, naming module and
+    # field, with 0 configured values (AC24).
+    assert caught.value.diagnostics == (
+        "module 'twitch': field 'companion_name': must be a non-empty string",
+    )
     assert_sanitized([str(caught.value)])
+    assert SETTINGS["access_token"] not in str(caught.value)
     assert activated == []
     assert loader.activations == []
 
@@ -538,8 +542,8 @@ async def test_notification_mapping_dedup_and_retry_reconnect() -> None:
 
         events = chat_events(bus)
         # Normalised once, at the boundary, into the schema-version-2 shape
-        # (R3). "first" names no companion, so the trigger refused it and the
-        # bus copy carries no ``viewer_id`` bridge for the v1 consumer (R1).
+        # (R3). "first" names no companion, so the trigger refused it; the
+        # bus copy is the normalised event and nothing more (R1).
         assert events[0] == {
             "type": "channel.chat.message",
             "payload": {
@@ -1329,27 +1333,20 @@ async def test_rejected_trigger_is_fed_traced_and_never_admitted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rejected_trigger_reaches_no_bus_driven_model_runner() -> None:
-    """R1/AC4: until the bus consumer of ``channel.chat.message`` is itself
-    scheduler-driven (P16), it runs a model for every event it can read. The
-    bus copy of an accepted event alone carries the ``viewer_id`` it reads;
-    a rejected event is published as a fact it cannot run, so a rejected
-    trigger calls no model even with that consumer on the bus. The scheduler
-    receives the normalised event itself, without the bridge."""
+async def test_accepted_and_rejected_events_share_one_normalised_shape_on_the_bus() -> None:
+    """R1/R3/AC4: the bus carries every trusted input in exactly one shape.
+
+    Normalisation happens once, at the boundary: an accepted event and a
+    rejected one are published with the same schema-version-2 keys and no
+    consumer-only field — the interim ``viewer_id`` bridge of the P14–P16
+    window is gone (P24) — so a consumer admitting from the bus cannot tell
+    them apart by shape and must read the recorded decision, which the
+    brain's own ingestion gate does. The scheduler receives only the
+    accepted event, as normalised."""
 
     scheduler = RecordingScheduler()
     context = module_context(scheduler=scheduler)
     bus = context.bus
-    model_runs: list[str] = []
-
-    def v1_consumer(event: dict[str, Any]) -> None:
-        # What the v1 consumer does with an input it can read: a model call.
-        payload = event["payload"]
-        viewer_id = payload.get("chatter_id", payload.get("viewer_id"))
-        if isinstance(viewer_id, str) and viewer_id:
-            model_runs.append(payload["message_id"])
-
-    bus.subscribe("channel.chat.message", v1_consumer)
     session = FakeSession([FakeWebSocket(welcome("one"))])
     handle, _, diagnostics = await activate_with(session, context=context)
     try:
@@ -1357,20 +1354,20 @@ async def test_rejected_trigger_reaches_no_bus_driven_model_runner() -> None:
         await _ingest(handle, notification("addressed-1", "Hello Companion"))
         await _ingest(handle, notification("plain-2", "still nothing"))
 
-        assert model_runs == ["addressed-1"]
         assert [e["type"] for e in bus.list_events()] == [
             "channel.chat.message", "input.trigger.rejected",
             "channel.chat.message", "input.trigger.accepted",
             "channel.chat.message", "input.trigger.rejected",
         ]
         plain_1, addressed, plain_2 = chat_events(bus)
-        assert "viewer_id" not in plain_1["payload"]
-        assert "viewer_id" not in plain_2["payload"]
-        assert addressed["payload"]["viewer_id"] == "viewer-7"
-        assert addressed["payload"]["author"]["id"] == "viewer-7"
+        expected_keys = {"platform", "channel_id", "author", "message_id", "text"}
+        for event in (plain_1, addressed, plain_2):
+            assert set(event["payload"]) == expected_keys
+            assert event["payload"]["author"]["id"] == "viewer-7"
+            assert event["metadata"] == {"source": "twitch", "schema_version": 2}
         ((_, work),) = scheduler.admissions
         assert work.source_event_id == "addressed-1"
-        assert "viewer_id" not in work.payload["payload"]
+        assert work.payload["payload"] == addressed["payload"]
         assert diagnostics == []
     finally:
         await handle.close()
@@ -1558,6 +1555,11 @@ async def test_chat_write_provider_reports_success_only_on_confirmation() -> Non
             "message": "Hello there",
             "reply_parent_message_id": "parent-1",
         }
+        # The outcome never waited for the trace (R8); the trace was handed
+        # to the loop through the invocation's completion hook and lands
+        # after the executor's own ``action.completed`` (AC27).
+        assert handle.send_record.confirmed == 1
+        await sent_traces_settled(handle)
         (sent,) = events_of(bus, "channel.chat.sent")
         assert sent["payload"] == {
             "platform": "twitch",
@@ -1571,14 +1573,15 @@ async def test_chat_write_provider_reports_success_only_on_confirmation() -> Non
             "source_event_id": "source-1",
             "source_message_id": "source-1",
         }
-        # The send fact was recorded before its trace, and the trace follows
-        # the executor's own action.started: it exists only once the transport
-        # confirmed (AC27). Its place against action.completed is not a
-        # contract — the send hands the trace to the loop and returns, so the
-        # executor's terminal trace never waits on it (R8).
+        # AC27's order: action.started, action.completed, then the send fact,
+        # which exists only once the transport confirmed.
         types = [e["type"] for e in bus.list_events()]
-        assert types.index("action.started") < types.index("channel.chat.sent")
         assert types.count("action.completed") == 1
+        assert (
+            types.index("action.started")
+            < types.index("action.completed")
+            < types.index("channel.chat.sent")
+        )
 
         unknown = await executor.invoke(chat_write_call("call-2"))
         assert unknown.status == "external_unknown"
@@ -1754,6 +1757,301 @@ async def test_confirmed_outcome_never_waits_for_the_sent_trace(route: str) -> N
     finally:
         release.set()
         await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_sent_traces_are_capped_and_close_is_bounded_under_a_held_subscriber() -> None:
+    """R6/R8 (P24 F4): with the ``channel.chat.sent`` subscriber held and a
+    cap of 2 pending traces, 5 confirmed sends leave exactly 2 traces pending
+    and drop 3 — counted in the send record and as ``lost_traces``, outside
+    the held path — while all 5 sends stay confirmed and recorded and the
+    transport was used exactly 5 times. ``close`` then finishes inside its
+    own budget with the subscriber still held, cancelling and counting the 2
+    traces it could not publish, and the set is empty afterwards."""
+
+    context = module_context()
+    grant_chat_write(context)
+    bus = context.bus
+    release = asyncio.Event()
+    held: list[dict[str, Any]] = []
+
+    async def slow_subscriber(event: dict[str, Any]) -> None:
+        held.append(event)
+        await release.wait()
+
+    bus.subscribe("channel.chat.sent", slow_subscriber)
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))], sends=[sent_response() for _ in range(5)]
+    )
+    diagnostics: list[str] = []
+    settings = {
+        **SETTINGS,
+        "_session_factory": lambda: session,
+        "_retry_delay": no_delay,
+        "diagnostic_reporter": diagnostics.append,
+        "_max_pending_sent_traces": 2,
+        "_sent_trace_close_seconds": 0.05,
+    }
+    handle = await start_module(settings, bus, context)
+    try:
+        for index in range(5):
+            observation = await asyncio.wait_for(
+                context.executor.invoke(chat_write_call(f"call-{index}")), timeout=1
+            )
+            assert observation.status == "success"
+            assert observation.result["message_id"] == "sent"
+
+        await wait_until(lambda: len(held) == 2)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # The set is bounded by the cap, not by how many sends were confirmed.
+        assert len(handle._sent_traces) == 2
+        assert len(held) == 2
+        assert not release.is_set()
+        # Every send is confirmed and recorded, independently of its trace.
+        assert handle.send_record.confirmed == 5
+        assert handle.send_record.emitted == 5
+        assert handle.send_record.last_message_id == "sent"
+        helix_calls = [c for c in session.post_calls if c["url"] == HELIX_CHAT_URL]
+        assert len(helix_calls) == 5
+        # The 3 dropped traces are counted outside the saturated path.
+        assert handle.send_record.dropped_traces == 3
+        assert context.supervision.snapshot()[COUNTER_LOST_TRACES] == 3
+        assert diagnostics == [
+            "twitch sent trace: dropped (pending traces saturated)"
+        ] * 3
+        assert events_of(bus, "channel.chat.sent") == []
+        assert len(events_of(bus, "action.completed")) == 5
+
+        # Bounded shutdown: the subscriber is still held, and close returns.
+        await asyncio.wait_for(handle.close(), timeout=1)
+        assert not release.is_set()
+        assert not handle._sent_traces
+        assert handle.send_record.confirmed == 5
+        assert handle.send_record.dropped_traces == 5
+        assert context.supervision.snapshot()[COUNTER_LOST_TRACES] == 5
+        assert diagnostics[-1] == "twitch sent trace: dropped (close budget exhausted)"
+        assert len(diagnostics) == 4
+        assert events_of(bus, "channel.chat.sent") == []
+        assert session.close_calls == 1
+        assert_sanitized(diagnostics)
+    finally:
+        release.set()
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_close_stays_bounded_when_a_sent_trace_subscriber_swallows_cancellation() -> None:
+    """R6 (P24 F4 review A1): a ``channel.chat.sent`` subscriber that catches
+    ``CancelledError`` and keeps waiting cannot hold ``close`` through the
+    cancellation settlement either. The trace is cancelled and counted at the
+    first budget, abandoned at the second, the set is empty, the send
+    transport is closed, and ``close`` returns well inside twice the budget."""
+
+    context = module_context()
+    grant_chat_write(context)
+    bus = context.bus
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stubborn_subscriber(event: dict[str, Any]) -> None:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Swallows the cancellation and keeps holding.
+            await release.wait()
+
+    bus.subscribe("channel.chat.sent", stubborn_subscriber)
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    diagnostics: list[str] = []
+    settings = {
+        **SETTINGS,
+        "_session_factory": lambda: session,
+        "_retry_delay": no_delay,
+        "diagnostic_reporter": diagnostics.append,
+        "_sent_trace_close_seconds": 0.05,
+    }
+    handle = await start_module(settings, bus, context)
+    try:
+        observation = await asyncio.wait_for(
+            context.executor.invoke(chat_write_call("call-0")), timeout=1
+        )
+        assert observation.status == "success"
+        await wait_until(lambda: len(handle._sent_traces) == 1)
+        (trace,) = tuple(handle._sent_traces)
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await asyncio.wait_for(handle.close(), timeout=1)
+        elapsed = loop.time() - started
+        assert elapsed < 0.5
+        assert cancelled.is_set()
+        assert not release.is_set()
+        # Cancelled and counted at the first budget, abandoned at the second.
+        assert not trace.done()
+        assert not handle._sent_traces
+        assert handle.send_record.confirmed == 1
+        assert handle.send_record.dropped_traces == 1
+        assert context.supervision.snapshot()[COUNTER_LOST_TRACES] == 1
+        assert diagnostics == [
+            "twitch sent trace: dropped (close budget exhausted)",
+            "twitch sent trace: cancellation abandoned (1 held past the close budget)",
+        ]
+        # The transport is closed regardless of the held subscriber.
+        assert session.close_calls == 1
+        assert_sanitized(diagnostics)
+        # Abandoned is not forgotten (R4/AC15): the supervised registry now
+        # owns the still-running trace, and the unfinished cancellation is a
+        # recorded failure, not a normal return.
+        registry = context._runtime.tasks
+        assert registry.abandoned == (trace,)
+        assert registry.failures == (
+            "module 'twitch': task 'sent trace' did not stop when cancelled",
+        )
+        assert handle._abandoned_sent_traces == []
+    finally:
+        release.set()
+        await handle.close()
+    await asyncio.gather(trace, return_exceptions=True)
+    assert registry.abandoned == ()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_reports_nonzero_when_a_sent_trace_resists_cancellation_at_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4/AC15 (P24 N3): through the real loader, coordinator and shared
+    supervised registry, a ``channel.chat.sent`` subscriber that swallows
+    its cancellation cannot turn the shutdown into a clean one. The module's
+    close budget is shorter than the phase budget, so ``close`` returns in
+    time and the transport is released — but the still-running publication
+    is owned by the registry, not dropped on the loop, and the lifecycle
+    report is non-zero and names the task that did not stop. The confirmed
+    send stays confirmed and counted."""
+
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "secret-value")
+    monkeypatch.setenv("TWITCH_ACCESS_TOKEN", "token-value")
+    websocket = FakeWebSocket(welcome("session-1"))
+    session = FakeSession([websocket], sends=[sent_response()])
+    diagnostics: list[str] = []
+    context = runtime_context(declare_triggers=False)
+    grant_chat_write(context)
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stubborn_subscriber(event: dict[str, Any]) -> None:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    context.bus.subscribe("channel.chat.sent", stubborn_subscriber)
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    settings = {
+        **SETTINGS,
+        "_session_factory": lambda: session,
+        "_retry_delay": no_delay,
+        "diagnostic_reporter": diagnostics.append,
+        "_sent_trace_close_seconds": 0.05,
+    }
+    activations = await loader.activate_enabled(
+        {"enabled_modules": ["twitch"], "modules": {"twitch": settings}}
+    )
+    (activation,) = activations
+    handle = activation.handle
+    coordinator = PhaseCoordinator(
+        activations,
+        tasks=context.tasks,
+        reporter=diagnostics.append,
+        hook_timeout_seconds=1.0,
+        shutdown_deadline_seconds=2.0,
+        drain_deadline_seconds=0.1,
+    )
+    assert (await coordinator.start()).status == 0
+    assert coordinator.ready
+
+    observation = await asyncio.wait_for(
+        context.executor.invoke(chat_write_call("call-0")), timeout=1
+    )
+    assert observation.status == "success"
+    assert observation.result["message_id"] == "sent"
+    await wait_until(lambda: len(handle._sent_traces) == 1)
+    (trace,) = tuple(handle._sent_traces)
+    try:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        report = await asyncio.wait_for(coordinator.stop(), timeout=1)
+        elapsed = loop.time() - started
+        assert elapsed < 0.5
+        assert cancelled.is_set()
+        assert not release.is_set()
+
+        # Non-zero, naming the task that did not stop (AC15).
+        assert report.status == 1
+        assert report.failures == (
+            "module 'twitch': task 'sent trace' did not stop when cancelled",
+        )
+        assert (
+            "twitch sent trace: cancellation abandoned (1 held past the close budget)"
+            in diagnostics
+        )
+        assert_sanitized(diagnostics)
+
+        # Ownership retained: the trace still runs and the registry holds it.
+        assert not trace.done()
+        assert context.tasks.abandoned == (trace,)
+        assert not handle._sent_traces
+        assert handle._abandoned_sent_traces == []
+
+        # The transport was still closed inside the deadline, and the send
+        # is confirmed and counted regardless of its trace.
+        assert websocket.close_calls == 1
+        assert session.close_calls == 1
+        assert handle.send_record.confirmed == 1
+        assert handle.send_record.dropped_traces == 1
+        assert context.supervision.snapshot()[COUNTER_LOST_TRACES] == 1
+        assert events_of(context.bus, "channel.chat.sent") == []
+        assert CHAT_WRITE_ACTION not in context.actions.registered_ready()
+    finally:
+        release.set()
+        await asyncio.gather(trace, return_exceptions=True)
+    assert context.tasks.abandoned == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("_max_pending_sent_traces", 0),
+        ("_max_pending_sent_traces", 2.5),
+        ("_max_pending_sent_traces", True),
+        ("_sent_trace_close_seconds", float("inf")),
+        ("_sent_trace_close_seconds", -1.0),
+        ("_sent_trace_close_seconds", "5"),
+    ],
+)
+async def test_sent_trace_bounds_are_validated_finite_at_activation(
+    field_name: str, value: Any
+) -> None:
+    """R6: a non-finite or non-positive bound on the detached sent traces is
+    refused at activation, naming module and field and never the value, with
+    0 sessions created."""
+
+    created: list[Any] = []
+
+    def factory() -> FakeSession:
+        session = FakeSession([FakeWebSocket(welcome("one"))])
+        created.append(session)
+        return session
+
+    settings = {**SETTINGS, "_session_factory": factory, field_name: value}
+    with pytest.raises(TwitchModuleError) as caught:
+        await activate(module_context(), settings, {})
+    assert f"module 'twitch': field {field_name!r}" in str(caught.value)
+    assert repr(value) not in str(caught.value)
+    assert created == []
 
 
 @pytest.mark.asyncio

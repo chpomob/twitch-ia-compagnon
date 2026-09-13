@@ -202,7 +202,14 @@ class Supervision:
         ``secrets`` are the configured credential values redacted from every
         trace and from every diagnostic this facade retains, so a publication
         failure carrying a payload fragment cannot leak one through the loss
-        report. ``counters`` is shared with the layers that count their own
+        report. The entry point supplies them from its ``secrets`` block —
+        resolved only where an enabled module's setting resolved them — when
+        it builds the one facade every module shares, and the loader adds,
+        through :meth:`redact`, the accepted value of every setting an enabled
+        module's manifest declares as a credential, literal or resolved,
+        before any module is activated, so no trace is ever published
+        unredacted (R8, AC29).
+        ``counters`` is shared with the layers that count their own
         rejections, so one snapshot reports the whole pipeline.
         """
 
@@ -235,6 +242,35 @@ class Supervision:
         self._secrets = tuple(str(secret) for secret in secrets)
         self._max_bytes = max_bytes
         self._losses: deque[str] = deque(maxlen=max_retained_losses)
+
+    def redact(self, secrets: Sequence[str]) -> int:
+        """Add credential values to redact from every later publication (R8).
+
+        The values a module's manifest declares as credentials are known only
+        once the loader has accepted that module's settings, after this
+        facade exists; they are added here before that module — or any
+        other — is activated, so the first trace any module publishes is
+        already redacted of them. Blank values are skipped, since redacting
+        an empty string would replace every position of every string, and a
+        value already known is not repeated. Returns how many values were
+        added. The values themselves are never readable back.
+        """
+
+        if isinstance(secrets, str) or not isinstance(secrets, Sequence):
+            raise RuntimeContextError(
+                "supervision.redact: field 'secrets': must be a sequence of strings"
+            )
+        added: list[str] = []
+        for index, secret in enumerate(secrets):
+            if not isinstance(secret, str):
+                raise RuntimeContextError(
+                    f"supervision.redact: field 'secrets[{index}]': must be a "
+                    f"string, got {type(secret).__name__}"
+                )
+            if secret and secret not in self._secrets and secret not in added:
+                added.append(secret)
+        self._secrets = self._secrets + tuple(added)
+        return len(added)
 
     # -- read-only surface --------------------------------------------------- #
 
@@ -744,6 +780,15 @@ class ModuleTasks:
         """Register *coro* as a detached task owned by this module."""
 
         return self._tasks.spawn(coro, name=name, owner=self._module)
+
+    def abandon(self, task: Any, *, name: str) -> Any:
+        """Hand the registry a task this module cancelled and could not stop.
+
+        The registry keeps owning it and records the unfinished cancellation
+        as this module's failure (R4/AC15).
+        """
+
+        return self._tasks.abandon(task, name=name, owner=self._module)
 
 
 class ModuleSupervision:

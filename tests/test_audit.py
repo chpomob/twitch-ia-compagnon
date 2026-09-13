@@ -5,6 +5,7 @@ import importlib
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -335,13 +336,24 @@ async def test_close_does_not_block_the_loop_on_a_stalled_file_sink(
     assert handle.losses == 0
 
     stalled = audit._FileSink(str(tmp_path / "stalled.log"))
-    stalled.open()
+    loop = asyncio.get_running_loop()
+    pings: asyncio.Queue[None] = asyncio.Queue()
+    pong = threading.Event()
     release = threading.Event()
 
     def blocking_close() -> None:
+        # Two round trips through the loop while this close is under way:
+        # each ping is answered by a coroutine, so the loop must be serving
+        # while the close is stalled — an inline close could answer none.
+        for _ in range(2):
+            pong.clear()
+            loop.call_soon_threadsafe(pings.put_nowait, None)
+            pong.wait(2.0)
         release.wait(2.0)
 
-    stalled._handle.close = blocking_close  # type: ignore[method-assign]
+    # The stalled file handle is a stand-in, not a patched file object: a
+    # real file's finalizer would call the patched close a second time.
+    stalled._handle = SimpleNamespace(close=blocking_close)
     handle = audit.AuditModule(stalled, close_timeout_seconds=0.05)
 
     ticks = 0
@@ -349,8 +361,9 @@ async def test_close_does_not_block_the_loop_on_a_stalled_file_sink(
     async def heartbeat() -> None:
         nonlocal ticks
         while True:
-            await asyncio.sleep(0.01)
+            await pings.get()
             ticks += 1
+            pong.set()
 
     beat = asyncio.create_task(heartbeat())
     await asyncio.wait_for(handle.close(), 1.0)
@@ -358,3 +371,84 @@ async def test_close_does_not_block_the_loop_on_a_stalled_file_sink(
     release.set()
 
     assert ticks >= 2
+
+
+# --------------------------------------------------------------------------- #
+# The accepted limits block against the owned queue bounds (R6, P24 F6)
+# --------------------------------------------------------------------------- #
+
+
+def test_settings_hook_accepts_a_queue_equal_to_the_accepted_observation_queue() -> None:
+    """R6: handed the accepted ``limits`` block, an equal ``queue`` passes;
+    without the block, or with a block that lacks the group, the ``queue``
+    settings are the only copy and pass on their own terms."""
+
+    accepted = {"observation_queue": dict(SETTINGS["queue"]), "dedup": {"max_entries": 1}}
+
+    assert audit.validate_settings({**SETTINGS, "limits": accepted}) == []
+    assert audit.validate_settings(SETTINGS) == []
+    assert audit.validate_settings({**SETTINGS, "limits": {"dedup": {"max_entries": 1}}}) == []
+
+
+@pytest.mark.parametrize(
+    ("queue", "expected"),
+    [
+        (
+            {"max_records": 999, "max_bytes": 4 * 1024 * 1024},
+            ["module 'audit': field 'queue.max_records': must equal limits.observation_queue.max_records"],
+        ),
+        (
+            {"max_records": 1000, "max_bytes": 1},
+            ["module 'audit': field 'queue.max_bytes': must equal limits.observation_queue.max_bytes"],
+        ),
+        (
+            {"max_records": 2, "max_bytes": 1},
+            [
+                "module 'audit': field 'queue.max_records': must equal limits.observation_queue.max_records",
+                "module 'audit': field 'queue.max_bytes': must equal limits.observation_queue.max_bytes",
+            ],
+        ),
+    ],
+)
+def test_settings_hook_refuses_a_queue_bound_that_differs_from_the_accepted_one(
+    queue: dict[str, int], expected: list[str]
+) -> None:
+    """R6 (P24 F6): a ``queue`` bound that differs from the accepted
+    ``limits.observation_queue`` is refused by field, value-free, so the queue
+    is never bounded by a mirror the entry point did not accept."""
+
+    settings = {**SETTINGS, "queue": queue, "limits": {"observation_queue": dict(SETTINGS["queue"])}}
+
+    diagnostics = audit.validate_settings(settings)
+
+    assert diagnostics == expected
+    for diagnostic in diagnostics:
+        for value in (*queue.values(), *SETTINGS["queue"].values()):
+            assert str(value) not in diagnostic
+
+
+def test_settings_hook_reports_a_malformed_accepted_block_by_field() -> None:
+    """A handed block that is not a mapping, or a group that is not, is a
+    defect of whoever built the settings and is named as such."""
+
+    assert audit.validate_settings({**SETTINGS, "limits": "1000"}) == [
+        "module 'audit': field 'limits': must be a mapping of limit groups"
+    ]
+    assert audit.validate_settings({**SETTINGS, "limits": {"observation_queue": [1000]}}) == [
+        "module 'audit': field 'limits.observation_queue': must be a mapping of limits"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_activation_refuses_a_queue_that_differs_from_the_accepted_bounds() -> None:
+    """R6: the same hook decides at activation, so a handle is never built on
+    a bound the configuration was not accepted with."""
+
+    bus = EventBus()
+    with pytest.raises(audit.AuditModuleError):
+        await audit.activate(
+            module_context(bus),
+            {**SETTINGS, "limits": {"observation_queue": {"max_records": 2, "max_bytes": 4096}}},
+            {},
+        )
+    assert bus.list_events() == []

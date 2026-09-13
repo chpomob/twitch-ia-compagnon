@@ -21,9 +21,9 @@ the state readable, the transport invoked exactly once and the loss counted
 (R8, AC28), while an owner whose own write raises publishes no trace at all.
 
 The ``module.*`` health facts are owned by :class:`~core.runtime.ModuleHealth`,
-which the coordinator's phase transitions drive; the harness hands it the
-same transitions the coordinator ran, in the coordinator's order, because
-``core/main.py`` wires no health owner onto the coordinator today.
+the context's own, which the coordinator's phase transitions drive through
+its observer — the same wiring ``core/main.py`` makes (P24) — so the harness
+reports nothing by hand.
 
 Nothing here sleeps: the clock is injected and every wait is a bounded number
 of bare loop turns. A strict global order over a concurrent pipeline is
@@ -70,9 +70,14 @@ from core.contracts import (
     TRACE_MODULE_STOPPED,
     Destination,
 )
-from core.lifecycle import PHASE_CLOSE, PHASE_PREPARE, PhaseCoordinator
+from core.lifecycle import PHASE_CLOSE, PhaseCoordinator
 from core.loader import ModuleLoader
-from core.runtime import MODULE_STATE_STOPPED, ModuleHealth, RuntimeContext
+from core.runtime import (
+    MODULE_STATE_READY,
+    MODULE_STATE_STOPPED,
+    ModuleHealth,
+    RuntimeContext,
+)
 from core.triggers import TriggerRegistry
 from conftest import (
     FakeResponse,
@@ -107,16 +112,17 @@ PIPELINE_TRACES = (
     TRACE_BRAIN_ADMISSION_ACCEPTED,
     TRACE_BRAIN_RUN_STARTED,
     TRACE_ACTION_STARTED,
-    TRACE_CHANNEL_CHAT_SENT,
     TRACE_ACTION_COMPLETED,
+    TRACE_CHANNEL_CHAT_SENT,
     TRACE_BRAIN_RUN_COMPLETED,
 )
 """One accepted message through the real pipeline, as the audit sees it.
 
-The confirmed-send fact is handed to the loop by the provider the instant the
-platform confirms, so it lands one turn before the executor's own
-``action.completed``; both sit between ``action.started`` and the run's
-completion, which is the order AC27 fixes.
+The order AC27 fixes: ``action.started`` with its matching
+``action.completed``, then ``channel.chat.sent``, then ``brain.run.completed``.
+The provider records the confirmed send the instant the platform confirms but
+hands the fact to the loop only through the invocation's completion hook, so
+the executor's own completion is published first and the fact after it.
 """
 
 
@@ -363,7 +369,9 @@ def assert_ac27_correlation(
     assert completed == len(run) - 1, "the run's completion is its last trace"
 
     # Each action start has exactly 1 matching completion, after it and
-    # before the run completes; the send fact matches one of them too.
+    # before the run completes; the send fact names one of those calls and
+    # follows that call's completion — AC27's order is start, completion,
+    # sent, run completed — never sits between the start and the completion.
     started_calls = {
         payload(run[index])["call_id"]: index for index in positions(TRACE_ACTION_STARTED)
     }
@@ -376,8 +384,12 @@ def assert_ac27_correlation(
     assert len(completed_calls) == kinds.count(TRACE_ACTION_COMPLETED)
     for call_id, begun in started_calls.items():
         assert begun < completed_calls[call_id] < completed
-    assert payload(run[sent])["call_id"] in started_calls
-    assert started_calls[payload(run[sent])["call_id"]] < sent < completed
+    sent_call = payload(run[sent])["call_id"]
+    assert sent_call in started_calls
+    assert started_calls[sent_call] < completed_calls[sent_call] < sent < completed, (
+        "the send fact follows its call's action.completed and precedes "
+        "brain.run.completed"
+    )
     return run_id
 
 
@@ -903,17 +915,10 @@ class Pipeline:
         await settle()
 
     async def stop(self) -> Any:
-        """Stop through the coordinator, then report each module stopped.
+        """Stop through the coordinator, whose close phases report each
+        module stopped through the health owner: recorded, then published."""
 
-        The coordinator ran the close phase for every module; the health
-        owner is handed that same transition, in the same order, so
-        ``module.stopped`` is recorded by its owner and then published.
-        """
-
-        report = await self.coordinator.stop()
-        for name in self.handles:
-            await self.health.observe_phase(PHASE_CLOSE, name)
-        return report
+        return await self.coordinator.stop()
 
 
 def suppressing(kind: str, suppressed: list[str]) -> Callable[[dict[str, Any]], None]:
@@ -940,9 +945,9 @@ async def start_pipeline(
     The context is ``conftest.runtime_context`` with the trigger registry the
     loader fills from the chat input's manifest, a bounded chat context and
     the one explicit delivery grant the example configuration ships. The
-    real loader validates every manifest and setting, the real coordinator
-    drives the phases, and the health owner is told of each preparation the
-    coordinator completed.
+    real loader validates every manifest and setting, and the real
+    coordinator drives the phases and, through its observer, the context's
+    health owner (R8).
     """
 
     clock = ManualClock()
@@ -1026,14 +1031,18 @@ async def start_pipeline(
     activations = await loader.activate_enabled(config)
     handles = {activation.name: activation.handle for activation in activations}
     assert tuple(handles) == MODULE_NAMES
+    health = context.health
     coordinator = PhaseCoordinator(
-        activations, tasks=context.tasks, reporter=diagnostics.append
+        activations,
+        tasks=context.tasks,
+        reporter=diagnostics.append,
+        observer=health.observe_phase,
     )
-    health = ModuleHealth(context.supervision, clock=clock)
     startup = await coordinator.start()
     assert startup.status == 0, diagnostics
-    for name in handles:
-        await health.observe_phase(PHASE_PREPARE, name)
+    assert {name: health.state(name) for name in handles} == {
+        name: MODULE_STATE_READY for name in handles
+    }
     return Pipeline(
         context=context,
         clock=clock,
@@ -1151,7 +1160,19 @@ async def test_ac28_failing_audit_writer_neither_cancels_nor_repeats_the_send() 
         pipeline.feed("incoming-one", f"{COMPANION}, hello")
         await pipeline.completed(1)
         await wait_until(lambda: pipeline.audit.pending == 0)
-        offered = len(pipeline.bus.list_events())
+        # Everything published since the audit's catch-all was routed: the
+        # readiness facts of the two modules prepared before it never
+        # reached it.
+        offered = len(
+            [
+                event
+                for event in pipeline.bus.list_events()
+                if not (
+                    event["type"] == TRACE_MODULE_READY
+                    and event["payload"]["module"] != "audit"
+                )
+            ]
+        )
         losses_before_stop = pipeline.audit.losses
         counted_before_stop = pipeline.snapshot()[COUNTER_AUDIT_RECORD_LOSSES]
     finally:
@@ -1343,7 +1364,7 @@ async def test_r8_owner_whose_state_write_raises_publishes_no_trace(
     assert pipeline.twitch.send_record.emitted == 1
 
     assert refusing_health.state("twitch") is None
-    # Only the pipeline's own health owner reported the 3 modules stopped.
+    # Only the coordinator-driven health owner reported the 3 modules stopped.
     assert len(pipeline.of(TRACE_MODULE_STOPPED)) == len(MODULE_NAMES)
     assert pipeline.snapshot()[COUNTER_LOST_TRACES] == 0
 
@@ -1392,10 +1413,19 @@ async def test_ac29_traces_carry_correlation_but_no_credential_and_no_prompt_bod
 
     bus_traces = pipeline.traces()
     audit_traces = traces_of(_audit_records(pipeline.audit_lines))
-    # The audit stage closes before the health owner reports the modules
-    # stopped, so the audit lines carry every trace but those 3.
+    # The audit's catch-all is routed at its own preparation, after the two
+    # other modules were reported ready, and the audit flushes after every
+    # ordinary close and closes last: its lines carry every trace but those
+    # 2 readiness facts and its own ``module.stopped``, which the coordinator
+    # reports only once the observation close phase returned.
+    def before_or_after_the_audit(trace: Mapping[str, Any]) -> bool:
+        module = trace["payload"].get("module")
+        return (trace["type"] == TRACE_MODULE_READY and module != "audit") or (
+            trace["type"] == TRACE_MODULE_STOPPED and module == "audit"
+        )
+
     assert [trace["type"] for trace in audit_traces] == [
-        trace["type"] for trace in bus_traces if trace["type"] != TRACE_MODULE_STOPPED
+        trace["type"] for trace in bus_traces if not before_or_after_the_audit(trace)
     ]
     assert len(audit_traces) > 0
     assert {trace["type"] for trace in bus_traces} >= {

@@ -74,7 +74,11 @@ EXPECTED_MANIFESTS = {
     },
 }
 # The declarations only the chat input carries (R1, R5).
-DECLARATION_KEYS = {"twitch": {"triggers", "actions"}, "brain": set(), "audit": set()}
+DECLARATION_KEYS = {
+    "twitch": {"triggers", "actions", "credentials"},
+    "brain": {"credentials"},
+    "audit": set(),
+}
 
 SECRET_SETTINGS = {
     "twitch": ("client_id", "client_secret", "access_token"),
@@ -132,6 +136,11 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
         assert isinstance(schema, Mapping) and schema.get("type") == "object"
         assert isinstance(schema.get("properties"), Mapping) and schema["properties"]
         assert set(schema.get("required", ())) <= set(schema["properties"])
+        # R8: every credential the module is configured with is declared, so
+        # the loader redacts it whether or not the configuration lists it.
+        assert tuple(manifest.get("credentials", ())) == SECRET_SETTINGS.get(module_name, ())
+        for setting_name in manifest.get("credentials", ()):
+            assert schema["properties"][setting_name]["type"] == "string"
 
         module = importlib.import_module(f"modules.{module_name}")
         assert callable(getattr(module, manifest["settings_validator"]))

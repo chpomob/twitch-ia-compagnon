@@ -145,3 +145,11 @@ settings_schema:
     - budget
     - conversation_memory
 settings_validator: validate_settings
+
+# The setting above that is a credential (R8). Its accepted value — literal
+# or resolved from `${NAME}` — is redacted from every supervision trace and
+# lost-trace diagnostic before this module is activated, whether or not the
+# configuration lists it under `secrets`. The endpoint is not a credential by
+# itself; a deployment whose backend URL embeds one lists it under `secrets`.
+credentials:
+  - api_key

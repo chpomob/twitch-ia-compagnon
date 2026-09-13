@@ -61,6 +61,17 @@ settings_schema:
     - companion_name
 settings_validator: validate_settings
 
+# The settings above that are credentials (R8). Their accepted values —
+# literal or resolved from `${NAME}` — are redacted from every supervision
+# trace and lost-trace diagnostic before this module is activated, whether or
+# not the configuration lists them under `secrets`. The identifiers traces
+# correlate by — the broadcaster, the bot account — are deliberately not
+# declared: a redacted channel would break correlation, not protect a secret.
+credentials:
+  - client_id
+  - client_secret
+  - access_token
+
 # Trigger declaration for the chat input (R1). Configuration may select only a
 # declared type, pass only parameters its schema accepts and combine rules
 # only with a declared operator; an explicitly configured policy replaces the

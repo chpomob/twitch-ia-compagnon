@@ -5,6 +5,7 @@ import json
 import math
 import re
 import signal
+import time
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -13,6 +14,24 @@ import pytest
 import yaml
 
 import core.main as application
+from core.contracts import (
+    COUNTER_AUDIT_RECORD_LOSSES,
+    COUNTER_LOST_TRACES,
+    COUNTER_TRIGGER_REJECTIONS,
+    TRACE_BRAIN_ADMISSION_ACCEPTED,
+    TRACE_BRAIN_ADMISSION_REJECTED,
+    TRACE_BRAIN_RUN_COMPLETED,
+)
+from core.runtime import Supervision
+from conftest import FakeResponse, FakeSession, completion, wait_until
+from test_integration import (
+    FakeTwitchSession,
+    FakeWebSocket,
+    _environment,
+    notification,
+    sent_response,
+    welcome,
+)
 
 
 MODULE_SOURCE = """
@@ -119,12 +138,36 @@ def validate_settings(settings):
 
 MISSING_FIELD_HOOK_SOURCE = PHASED_MODULE_SOURCE + """
 
+MODULE_NAME = Path(__file__).parent.name
+
+
 def validate_settings(settings):
-    # The module, not the core, knows which of its settings are required.
+    # The module, not the core, knows which of its settings are required:
+    # one diagnostic per offending field, naming module and field, as the
+    # shipped modules' hooks do (R7).
+    diagnostics = []
     for field_name in ("access_token", "api_key"):
         value = settings.get(field_name)
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{field_name} is required, got {settings!r}")
+            diagnostics.append(
+                f"module {MODULE_NAME!r}: field {field_name!r}: must be a non-empty string"
+            )
+    return diagnostics
+"""
+
+
+ECHOING_FIELD_HOOK_SOURCE = PHASED_MODULE_SOURCE + """
+
+MODULE_NAME = Path(__file__).parent.name
+
+
+def validate_settings(settings):
+    # A careless module-authored diagnostic that names the field and echoes
+    # the rejected credential: the field must reach the report, the value
+    # must not (R7, AC24).
+    return [
+        f"module {MODULE_NAME!r}: field 'api_key': rejected {settings.get('api_key')!r}"
+    ]
 """
 
 
@@ -158,6 +201,7 @@ def _make_phased_module(
     source: str = PHASED_MODULE_SOURCE,
     settings_schema: dict[str, Any] | None = None,
     settings_validator: str | None = None,
+    credentials: list[str] | None = None,
 ) -> None:
     """Write a ``manifest_version: 2`` module declaring *roles* and hooks."""
 
@@ -176,6 +220,8 @@ def _make_phased_module(
         manifest["settings_schema"] = settings_schema
     if settings_validator is not None:
         manifest["settings_validator"] = settings_validator
+    if credentials is not None:
+        manifest["credentials"] = credentials
     (directory / "module.yaml").write_text(
         yaml.safe_dump(manifest), encoding="utf-8"
     )
@@ -593,6 +639,86 @@ def test_entry_point_drives_the_coordinator_under_finite_global_deadlines(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_activation_is_unwound_under_one_shared_cleanup_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4 (P24 N4): both cleanup owners are given the same absolute deadline.
+
+    A partial startup has two cleanup owners: the coordinator unwinding the
+    handles already returned, and the loader closing a handle an abandoned
+    activation returns later. The entry point establishes one absolute
+    shutdown deadline on the runtime's clock, before the coordinator's
+    unwinding begins, and hands that same point to the coordinator's stop,
+    to the loader ahead of any late close, and to the settle it awaits — so
+    neither owner takes a budget of its own.
+    """
+
+    stops: list[dict[str, Any]] = []
+    settles: list[tuple[float | None, float | None]] = []
+    real_coordinator = application.PhaseCoordinator
+    real_loader = application.ModuleLoader
+
+    class RecordingCoordinator(real_coordinator):  # type: ignore[misc, valid-type]
+        async def stop(self, **options: Any) -> Any:
+            stops.append(dict(options))
+            return await super().stop(**options)
+
+    class RecordingLoader(real_loader):  # type: ignore[misc, valid-type]
+        async def settle_late_results(self, **options: Any) -> Any:
+            settles.append((options.get("deadline_at"), self.cleanup_deadline_at))
+            return await super().settle_late_results(**options)
+
+    monkeypatch.setattr(application, "PhaseCoordinator", RecordingCoordinator)
+    monkeypatch.setattr(application, "ModuleLoader", RecordingLoader)
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "relay")
+    _make_phased_module(
+        modules,
+        "boom",
+        source=PHASED_MODULE_SOURCE.replace(
+            'async def activate(context, settings, catalog):\n'
+            '    record(settings, "activate")\n',
+            'async def activate(context, settings, catalog):\n'
+            '    record(settings, "activate")\n'
+            '    raise RuntimeError(settings["label"])\n',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("relay", "boom"))
+    )
+    diagnostics: list[str] = []
+
+    before = time.monotonic()
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        ready_reporter=lambda _message: pytest.fail("became ready"),
+        diagnostic_reporter=diagnostics.append,
+    )
+    after = time.monotonic()
+
+    assert status == 1
+    assert diagnostics == ["module 'boom': field 'activate': activation failed"]
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
+        "activate:relay",
+        "activate:boom",
+        "drain:relay",
+        "close:relay",
+    ]
+    # One absolute point, taken when the failure was met and shared by both
+    # owners: the coordinator's stop, the loader before any late close could
+    # begin, and the settle the entry point awaits after the coordinator.
+    assert len(stops) == 1 and len(settles) == 1
+    deadline_at = stops[0]["deadline_at"]
+    assert settles[0] == (deadline_at, deadline_at)
+    budget = application._SHUTDOWN_DEADLINE_SECONDS
+    assert before + budget <= deadline_at <= after + budget
+
+
+@pytest.mark.asyncio
 async def test_failed_preparation_unwinds_partial_startup_without_readiness(
     tmp_path: Path,
 ) -> None:
@@ -639,6 +765,122 @@ async def test_failed_preparation_unwinds_partial_startup_without_readiness(
         "drain:source",
         "close:relay",
         "close:source",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_settings_validator_is_bounded_by_the_startup_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: the global startup deadline starts before enabled-module validation.
+
+    An enabled module whose declared settings hook never returns cannot
+    block startup indefinitely: the hook is cancelled under a bounded grace
+    at the deadline, and the refusal names the module and its hook, with no
+    module ever activated (AC24).
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "relay")
+    _make_phased_module(
+        modules,
+        "hang",
+        settings_validator="validate_settings",
+        source=(
+            PHASED_MODULE_SOURCE.replace("import json\n", "import asyncio\nimport json\n", 1)
+            + "\n\n"
+            + "async def validate_settings(settings):\n"
+            + "    await asyncio.Future()\n"
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("relay", "hang"))
+    )
+    monkeypatch.setattr(application, "_STARTUP_DEADLINE_SECONDS", 0.05)
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await asyncio.wait_for(
+        application.run(
+            config_path,
+            asyncio.Event(),
+            ready_reporter=readiness.append,
+            diagnostic_reporter=diagnostics.append,
+        ),
+        timeout=2,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert diagnostics == [
+        "module 'hang': field 'validate_settings': exceeded the global startup "
+        "deadline"
+    ]
+    # Refused before activation: no handle was ever returned to clean up.
+    assert not lifecycle_log.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_activation_is_bounded_by_the_startup_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: activation is inside the same global startup deadline (F2).
+
+    The second module's ``activate`` never returns. Loading is bounded by
+    the one deadline, the hanging activation is cancelled under a bounded
+    grace, the refusal names the module, and the handle the first module
+    already returned is closed through the ordinary shutdown sequence.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "relay")
+    _make_phased_module(
+        modules,
+        "hang",
+        source=PHASED_MODULE_SOURCE.replace(
+            "import json\n", "import asyncio\nimport json\n", 1
+        ).replace(
+            'async def activate(context, settings, catalog):\n'
+            '    record(settings, "activate")\n',
+            'async def activate(context, settings, catalog):\n'
+            '    record(settings, "activate")\n'
+            '    await asyncio.Future()\n',
+        ),
+    )
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _phased_config("./modules", lifecycle_log, ("relay", "hang"))
+    )
+    monkeypatch.setattr(application, "_STARTUP_DEADLINE_SECONDS", 0.05)
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+
+    status = await asyncio.wait_for(
+        application.run(
+            config_path,
+            asyncio.Event(),
+            ready_reporter=readiness.append,
+            diagnostic_reporter=diagnostics.append,
+        ),
+        timeout=2,
+    )
+
+    assert status != 0
+    assert readiness == []
+    assert diagnostics == [
+        "module 'hang': field 'activate': exceeded the global startup deadline"
+    ]
+    # The returned handle of the first module is cleaned up, not leaked.
+    assert lifecycle_log.read_text(encoding="utf-8").splitlines() == [
+        "activate:relay",
+        "activate:hang",
+        "drain:relay",
+        "close:relay",
     ]
 
 
@@ -879,8 +1121,8 @@ async def test_each_type_invalid_module_setting_is_rejected_by_the_module_hook(
     ``modules.<name>.<field>: must be a non-empty string`` from its own field
     table; R7 moves the knowledge of which settings are required into each
     module's declared ``settings_validator`` hook. The core no longer knows
-    the field, so the diagnostic names the module and the hook that refused,
-    and it never echoes the refused value — the hook's own message does.
+    the field: the module's own diagnostic names it, the entry point reports
+    it as the module wrote it, and 0 configured values are echoed (AC24).
     """
 
     modules = tmp_path / "modules"
@@ -910,10 +1152,13 @@ async def test_each_type_invalid_module_setting_is_rejected_by_the_module_hook(
     )
 
     assert status != 0
-    assert diagnostics == [
-        f"module {module_name!r}: field 'validate_settings': "
-        "settings were refused by the module"
-    ]
+    # Redaction is literal: the configured value ``["not", "a", "string"]``
+    # puts the word "string" among the configured values, so it is cut out
+    # of the module's own explanation too. Module and field still stand.
+    reason = "must be a non-empty string"
+    if isinstance(invalid_value, list):
+        reason = "must be a non-empty <redacted>"
+    assert diagnostics == [f"module {module_name!r}: field {field_name!r}: {reason}"]
     assert all(value not in diagnostics[0] for value in credentials)
     assert not lifecycle_log.exists()
 
@@ -975,12 +1220,12 @@ async def test_invalid_modules_are_refused_before_either_opens_a_transport(
 ) -> None:
     """AC24: every enabled module is validated before any is activated.
 
-    With both modules refusing their settings, startup stops naming the
-    refusing module and field and echoing 0 credential values; with only the
-    second refusing, the first — valid — module is still never activated, so
-    0 transports are opened either way. The loader stops at its first
-    refusal, so the second module's own diagnostic is not reported yet: that
-    half of AC24 needs the loader to collect refusals across modules.
+    With both modules refusing their settings, startup stops reporting
+    *both* diagnostics — the first module's, naming its module and field
+    with the credential it echoed redacted; the second's, whose hook raised,
+    naming the module and the hook — and echoing 0 credential values; with
+    only the second refusing, the first — valid — module is still never
+    activated, so 0 transports are opened either way.
     """
 
     modules = tmp_path / "modules"
@@ -989,7 +1234,7 @@ async def test_invalid_modules_are_refused_before_either_opens_a_transport(
         modules,
         "gateway",
         roles=("input",),
-        source=REFUSING_HOOK_SOURCE if invalid == "both" else ACCEPTING_HOOK_SOURCE,
+        source=ECHOING_FIELD_HOOK_SOURCE if invalid == "both" else ACCEPTING_HOOK_SOURCE,
         settings_validator="validate_settings",
     )
     _make_phased_module(
@@ -1012,13 +1257,16 @@ async def test_invalid_modules_are_refused_before_either_opens_a_transport(
         diagnostic_reporter=diagnostics.append,
     )
 
-    refused = "gateway" if invalid == "both" else "engine"
     assert status != 0
     assert readiness == []
-    assert diagnostics[0] == (
-        f"module {refused!r}: field 'validate_settings': "
-        "settings were refused by the module"
-    )
+    engine = "module 'engine': field 'validate_settings': settings were refused by the module"
+    if invalid == "both":
+        assert diagnostics == [
+            "module 'gateway': field 'api_key': rejected '<redacted>'",
+            engine,
+        ]
+    else:
+        assert diagnostics == [engine]
     assert all(
         value not in diagnostic for diagnostic in diagnostics for value in credentials
     )
@@ -1959,3 +2207,667 @@ def test_load_config_resolves_environment_references_in_mapping_keys(
         r"environment reference is unresolved$",
     ):
         application.load_config(config_path, environ={})
+
+
+# --------------------------------------------------------------------------- #
+# The accepted limits control their owners (R6, AC32 — P24 F6)
+# --------------------------------------------------------------------------- #
+
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE_CONFIG = ROOT / "config.yaml.example"
+
+
+def _example_config() -> dict[str, Any]:
+    """The shipped example, pointed at the shipped modules by absolute path."""
+
+    config = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    config["modules_directory"] = str(ROOT / "modules")
+    return config
+
+
+def _inject_real_module_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    twitch_session_factory: Callable[[], Any],
+    brain_session_factory: Callable[[], Any],
+    audit_writer: Callable[[str], Any],
+    diagnostics: list[str],
+) -> None:
+    """Point the shipped modules' transport seams at fakes, after the real load."""
+
+    real_load_config = application.load_config
+
+    def load_with_boundaries(
+        path: str | Path, *, environ: Mapping[str, str] | None = None
+    ) -> dict[str, Any]:
+        config = real_load_config(path, environ=environ)
+        config["modules"]["twitch"].update(
+            {"_session_factory": twitch_session_factory, "diagnostic_reporter": diagnostics.append}
+        )
+        config["modules"]["brain"].update(
+            {"_session_factory": brain_session_factory, "diagnostic_reporter": diagnostics.append}
+        )
+        config["modules"]["audit"]["_writer"] = audit_writer
+        return config
+
+    monkeypatch.setattr(application, "load_config", load_with_boundaries)
+
+
+def _capture_supervision(monkeypatch: pytest.MonkeyPatch) -> list[Supervision]:
+    """Every supervision facade the entry point builds, in construction order."""
+
+    built: list[Supervision] = []
+    real = application.Supervision
+
+    class Recording(real):  # type: ignore[misc, valid-type]
+        def __init__(self, bus: Any, **options: Any) -> None:
+            super().__init__(bus, **options)
+            built.append(self)
+
+    monkeypatch.setattr(application, "Supervision", Recording)
+    return built
+
+
+class _GatedModelSession(FakeSession):
+    """A model transport that holds its first request until released."""
+
+    def __init__(self, *results: Any) -> None:
+        super().__init__(*results)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.post_calls.append({"url": url, **kwargs})
+        result = self.results.pop(0)
+        if len(self.post_calls) == 1:
+            self.entered.set()
+            await self.release.wait()
+        return result
+
+
+def test_load_config_hands_the_accepted_limits_to_every_enabled_module(
+    tmp_path: Path,
+) -> None:
+    """R6 (P24 F6): the accepted block reaches each enabled module as its
+    reserved ``limits`` setting, as a copy of its own; a disabled module is
+    handed nothing; a module setting already named ``limits`` is refused."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    config = _phased_config("./modules", tmp_path / "unused.log", ("source", "sink"))
+    config["enabled_modules"] = ["source"]
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = application.load_config(config_path)
+
+    assert loaded["modules"]["source"]["limits"] == _finite_limits()
+    assert loaded["modules"]["source"]["limits"] is not loaded["limits"]
+    assert loaded["modules"]["source"]["limits"]["admission"] is not loaded["limits"]["admission"]
+    assert "limits" not in loaded["modules"]["sink"]
+    assert loaded["modules"]["source"]["label"] == "source"
+
+    config["modules"]["source"]["limits"] = {"admission": {"workers": 1}}
+    _write_config(config_path, config)
+    with pytest.raises(application.ConfigurationError) as caught:
+        application.load_config(config_path)
+    assert str(caught.value) == "modules.source.limits: is reserved for the accepted limits block"
+
+    del config["limits"]
+    del config["modules"]["source"]["limits"]
+    _write_config(config_path, config)
+    assert "limits" not in application.load_config(config_path)["modules"]["source"]
+
+
+@pytest.mark.asyncio
+async def test_a_module_copy_differing_from_the_accepted_limits_stops_startup_before_any_transport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R6 (P24 F6): with the shipped modules and deliberately different root
+    and module values for the scheduler, the memory and the audit queue,
+    startup stops naming each differing field, with 0 sessions created and
+    0 transports opened — no bound ever exists that the accepted block did
+    not set."""
+
+    environ = _environment()
+    config = _example_config()
+    config["limits"]["admission"]["workers"] = 2
+    config["modules"]["brain"]["admission"]["workers"] = 4
+    config["limits"]["conversation_memory"]["max_exchanges"] = 3
+    config["modules"]["brain"]["conversation_memory"]["max_exchanges"] = 20
+    config["limits"]["observation_queue"]["max_records"] = 10
+    config["modules"]["audit"]["queue"]["max_records"] = 1000
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    sessions: list[str] = []
+    diagnostics: list[str] = []
+    readiness: list[str] = []
+    _inject_real_module_boundaries(
+        monkeypatch,
+        twitch_session_factory=lambda: sessions.append("twitch"),
+        brain_session_factory=lambda: sessions.append("brain"),
+        audit_writer=lambda line: sessions.append("audit"),
+        diagnostics=diagnostics,
+    )
+
+    status = await application.run(
+        config_path,
+        asyncio.Event(),
+        environ=environ,
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status == 1
+    assert readiness == []
+    assert diagnostics == [
+        "module 'brain': field 'admission.workers': must equal limits.admission.workers",
+        "module 'brain': field 'conversation_memory.max_exchanges': "
+        "must equal limits.conversation_memory.max_exchanges",
+        "module 'audit': field 'queue.max_records': "
+        "must equal limits.observation_queue.max_records",
+    ]
+    assert sessions == []
+    rendered = "\n".join(diagnostics)
+    for value in ("2", "4", "3", "20", "10", "1000"):
+        assert value not in rendered.replace("'", "")
+
+
+@pytest.mark.asyncio
+async def test_the_accepted_limits_bound_the_real_scheduler_memory_and_audit_queue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R2/R6 (P24 F6): through ``core.main.run`` and the shipped modules, the
+    bounds observed in behaviour are the accepted ones — a session queue of
+    1 rejects the third message of a session at depth 1 while its first run
+    is held, a memory of 1 exchange leaves exactly 1 earlier exchange in the
+    next request, and an observation queue of 16 records admits exactly 14
+    more records behind a held writer and drops the 10 offered after that —
+    none of which the example's default values (4, 20, 1000) would produce."""
+
+    environ = _environment()
+    channel = environ["TWITCH_BROADCASTER_ID"]
+    admission = {
+        "session_queue_capacity": 1,
+        "global_pending_capacity": 8,
+        "max_sessions": 4,
+        "workers": 1,
+        "wait_seconds": 5,
+        "total_run_seconds": 20,
+    }
+    memory = {"max_sessions": 4, "max_exchanges": 1, "max_bytes": 65536, "max_age_seconds": 3600}
+    queue = {"max_records": 16, "max_bytes": 65536}
+    config = _example_config()
+    config["limits"]["admission"] = dict(admission)
+    config["limits"]["conversation_memory"] = dict(memory)
+    config["limits"]["observation_queue"] = dict(queue)
+    config["modules"]["brain"]["admission"] = dict(admission)
+    config["modules"]["brain"]["conversation_memory"] = dict(memory)
+    config["modules"]["audit"]["queue"] = dict(queue)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    websocket = FakeWebSocket(welcome())
+    twitch_session = FakeTwitchSession(
+        client_id=environ["TWITCH_CLIENT_ID"],
+        bot_user_id=environ["TWITCH_BOT_USER_ID"],
+        websocket=websocket,
+        sends=[sent_response(f"sent-{index}") for index in range(3)],
+    )
+    model = _GatedModelSession(
+        *(FakeResponse(200, completion(f"reply-{index}")) for index in range(1, 4))
+    )
+    audit_lines: list[str] = []
+    writer_blocked = asyncio.Event()
+    writer_release = asyncio.Event()
+
+    async def write_audit(line: str) -> None:
+        record = json.loads(line)
+        if record["type"] == "channel.chat.message" and record["payload"].get("message_id") == "marker":
+            writer_blocked.set()
+            await writer_release.wait()
+        audit_lines.append(line)
+
+    def records_of(event_type: str) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in (json.loads(line) for line in audit_lines)
+            if record["type"] == event_type
+        ]
+
+    diagnostics: list[str] = []
+    _inject_real_module_boundaries(
+        monkeypatch,
+        twitch_session_factory=lambda: twitch_session,
+        brain_session_factory=lambda: model,
+        audit_writer=write_audit,
+        diagnostics=diagnostics,
+    )
+    supervisions = _capture_supervision(monkeypatch)
+    stop = asyncio.Event()
+    ready = asyncio.Event()
+    task = asyncio.create_task(
+        application.run(
+            config_path,
+            stop,
+            environ=environ,
+            ready_reporter=lambda _message: ready.set(),
+            diagnostic_reporter=diagnostics.append,
+        )
+    )
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        (supervision,) = supervisions
+
+        # Scheduler: the first run of session A is held in its model call; the
+        # second message queues at depth 1; the third is refused at depth 1.
+        websocket.feed(notification(channel, "a-1", "!ask first question", viewer_id="viewer-a"))
+        await asyncio.wait_for(model.entered.wait(), timeout=1)
+        websocket.feed(notification(channel, "a-2", "!ask second question", viewer_id="viewer-a"))
+        await wait_until(lambda: len(records_of(TRACE_BRAIN_ADMISSION_ACCEPTED)) == 2)
+        websocket.feed(notification(channel, "a-3", "!ask third question", viewer_id="viewer-a"))
+        await wait_until(lambda: len(records_of(TRACE_BRAIN_ADMISSION_REJECTED)) == 1)
+        (rejected,) = records_of(TRACE_BRAIN_ADMISSION_REJECTED)
+        assert rejected["payload"]["source_event_id"] == "a-3"
+        assert rejected["payload"]["reason"] == "session_queue_full"
+        assert rejected["payload"]["queue_depth"] == 1
+        assert len(model.post_calls) == 1
+
+        # Memory: after 2 completed exchanges, the next request carries
+        # exactly 1 earlier exchange — the second, not the first.
+        model.release.set()
+        await wait_until(lambda: len(records_of(TRACE_BRAIN_RUN_COMPLETED)) == 2)
+        websocket.feed(notification(channel, "a-4", "!ask fourth question", viewer_id="viewer-a"))
+        await wait_until(lambda: len(records_of(TRACE_BRAIN_RUN_COMPLETED)) == 3)
+        assert len(model.post_calls) == 3
+        messages = model.post_calls[2]["json"]["messages"]
+        history = messages[1:-1]
+        assert len(history) == 2
+        assert [message["role"] for message in history] == ["user", "assistant"]
+        assert "source_message_id: a-2" in history[0]["content"]
+        assert history[1]["content"] == "reply-2"
+        assert "source_message_id: a-1" not in json.dumps(messages)
+        assert "source_message_id: a-4" in messages[-1]["content"]
+
+        # Audit queue: the writer holds the marker's first record and its
+        # second is admitted behind it; of the 24 records a burst of 12
+        # refused messages then offers (message and refusal each), the
+        # first 14 fill the queue of 16 and the 10 after that are dropped
+        # and counted — the newly offered record, never an admitted one.
+        assert supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 0
+        websocket.feed(notification(channel, "marker", "hello there", viewer_id="viewer-b"))
+        await asyncio.wait_for(writer_blocked.wait(), timeout=1)
+        for index in range(12):
+            websocket.feed(
+                notification(channel, f"burst-{index:02d}", "hello again", viewer_id="viewer-b")
+            )
+        await wait_until(lambda: supervision.snapshot()[COUNTER_TRIGGER_REJECTIONS] == 13)
+        assert supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 10
+        assert not any("burst-" in line for line in audit_lines)
+    finally:
+        # Whatever failed above, nothing stays held: the shutdown that
+        # follows must not wait on a writer or a model this test holds.
+        writer_release.set()
+        model.release.set()
+        stop.set()
+    assert await asyncio.wait_for(task, timeout=2) == 0
+
+    assert diagnostics == []
+    assert supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 10
+    records = [json.loads(line) for line in audit_lines]
+    assert [
+        record["type"]
+        for record in records
+        if record["payload"].get("message_id") == "marker"
+        or record["payload"].get("source_event_id") == "marker"
+    ] == ["channel.chat.message", "input.trigger.rejected"]
+    burst_records = [
+        (record["type"], record["payload"].get("message_id") or record["payload"].get("source_event_id"))
+        for record in records
+        if str(record["payload"].get("message_id", "")).startswith("burst-")
+        or str(record["payload"].get("source_event_id", "")).startswith("burst-")
+    ]
+    assert burst_records == [
+        (kind, f"burst-{index:02d}")
+        for index in range(7)
+        for kind in ("channel.chat.message", "input.trigger.rejected")
+    ]
+    assert [call["json"]["message"] for call in twitch_session.helix_calls] == [
+        "reply-1",
+        "reply-2",
+        "reply-3",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Configured secrets reach supervision before any module exists (R8 — P24 F7)
+# --------------------------------------------------------------------------- #
+
+LEAKING_PROBE_SOURCE = '''
+"""A module that puts its configured credential into a trace and a lost trace.
+
+At `prepare` it emits one diagnostic trace carrying the credential verbatim,
+nested and embedded; then it publishes a terminal-style trace whose handler
+raises with the credential in its message, so the publication is lost and
+its diagnostic is retained by supervision. What the bus delivered is logged.
+"""
+
+import json
+from pathlib import Path
+
+
+class Handle:
+    def __init__(self, context, settings):
+        self.context = context
+        self.settings = settings
+
+    def log(self, entry):
+        with Path(self.settings["log"]).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, sort_keys=True) + "\\n")
+
+    async def prepare(self):
+        token = self.settings["token"]
+        bus = self.context.bus
+        bus.subscribe("probe.diagnostic", lambda event: self.log({"trace": event}))
+
+        def explode(event):
+            raise RuntimeError("handler refused " + token)
+
+        bus.subscribe("probe.lost", explode)
+        await self.context.supervision.emit(
+            "probe.diagnostic",
+            {
+                "reason": "backend refused " + token,
+                "detail": {"nested": {"credential": token}},
+                "identifiers": [token, "id-" + token + "-suffix"],
+            },
+            metadata={"note": token},
+        )
+        await self.context.supervision.record_and_emit(
+            lambda: None, "probe.lost", {"reason": token}
+        )
+        self.log({"snapshot": dict(self.context.supervision.snapshot())})
+
+    async def close(self):
+        return None
+
+
+async def activate(context, settings, catalog):
+    return Handle(context, settings)
+'''
+
+
+class _RecordingEnviron(dict):
+    """An environment that records every variable looked up or tested."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        super().__init__(values)
+        self.queried: list[str] = []
+
+    def __contains__(self, key: object) -> bool:
+        self.queried.append(str(key))
+        return super().__contains__(key)
+
+    def __getitem__(self, key: str) -> str:
+        self.queried.append(key)
+        return super().__getitem__(key)
+
+
+@pytest.mark.asyncio
+async def test_configured_secrets_are_redacted_from_traces_and_loss_diagnostics_through_the_entry_point(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R8/AC29 (P24 F7): a credential the ``secrets`` block names reaches
+    the entry point's supervision before any module exists, so a diagnostic
+    trace carrying it verbatim, nested, embedded and in metadata is delivered
+    redacted, and the diagnostic of a lost trace whose failure text carried
+    it is retained redacted — while a disabled module's listed credential is
+    never looked up."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "probe", source=LEAKING_PROBE_SOURCE)
+    _make_phased_module(modules, "vault")
+    log = tmp_path / "probe.jsonl"
+    token = _opaque("credential")
+    config = _phased_config("./modules", tmp_path / "lifecycle.log", ("probe", "vault"))
+    config["enabled_modules"] = ["probe"]
+    config["modules"]["probe"].update({"token": "${PROBE_TOKEN}", "log": str(log)})
+    config["modules"]["vault"]["token"] = "${VAULT_TOKEN}"
+    config["secrets"] = ["${PROBE_TOKEN}", "${VAULT_TOKEN}"]
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    environ = _RecordingEnviron({"PROBE_TOKEN": token})
+    supervisions = _capture_supervision(monkeypatch)
+    stop = asyncio.Event()
+    stop.set()
+
+    status = await application.run(
+        config_path,
+        stop,
+        environ=environ,
+        ready_reporter=lambda _message: None,
+        diagnostic_reporter=lambda message: pytest.fail(message),
+    )
+
+    assert status == 0
+    assert "VAULT_TOKEN" not in environ.queried
+    entries = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [sorted(entry) for entry in entries] == [["trace"], ["snapshot"]]
+
+    delivered = entries[0]["trace"]
+    rendered = json.dumps(delivered)
+    assert token not in rendered
+    assert delivered["payload"]["reason"] != "backend refused " + token
+    assert token not in delivered["payload"]["reason"]
+    assert token not in delivered["payload"]["detail"]["nested"]["credential"]
+    assert all(token not in item for item in delivered["payload"]["identifiers"])
+    assert token not in delivered["metadata"]["note"]
+    assert "backend refused" in delivered["payload"]["reason"]
+    assert "id-" in delivered["payload"]["identifiers"][1]
+
+    (supervision,) = supervisions
+    assert entries[1]["snapshot"][COUNTER_LOST_TRACES] == 1
+    (loss,) = supervision.losses
+    assert loss.startswith("probe.lost: PublicationError")
+    assert "handler refused" in loss
+    assert token not in loss
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["list-absent", "list-incomplete", "literal-value", "literal-and-incomplete"]
+)
+async def test_declared_credentials_are_redacted_without_a_secrets_entry_through_the_entry_point(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """R8/AC29 (P24 F7): redaction is not opt-in. A credential the module's
+    manifest declares reaches supervision before the module is activated —
+    with the ``secrets`` block absent, with a block that lists another
+    reference but not this one, and when the credential is configured as a
+    literal value no reference could ever list — so the trace carrying it
+    verbatim, nested, embedded and in metadata is delivered redacted, and
+    the diagnostic of the lost trace whose failure text carried it is
+    retained redacted."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(
+        modules,
+        "probe",
+        source=LEAKING_PROBE_SOURCE,
+        settings_schema={
+            "type": "object",
+            "properties": {"token": {"type": "string"}, "other": {"type": "string"}},
+            "required": ["token"],
+        },
+        credentials=["token"],
+    )
+    log = tmp_path / "probe.jsonl"
+    token = _opaque("credential")
+    other = _opaque("other")
+    config = _phased_config("./modules", tmp_path / "lifecycle.log", ("probe",))
+    config["modules"]["probe"]["log"] = str(log)
+    config["modules"]["probe"]["other"] = "${OTHER_TOKEN}"
+    environ = {"OTHER_TOKEN": other}
+    if case.startswith("literal"):
+        config["modules"]["probe"]["token"] = token
+    else:
+        config["modules"]["probe"]["token"] = "${PROBE_TOKEN}"
+        environ["PROBE_TOKEN"] = token
+    if case.endswith("incomplete"):
+        config["secrets"] = ["${OTHER_TOKEN}"]
+    else:
+        assert "secrets" not in config
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    supervisions = _capture_supervision(monkeypatch)
+    stop = asyncio.Event()
+    stop.set()
+
+    status = await application.run(
+        config_path,
+        stop,
+        environ=environ,
+        ready_reporter=lambda _message: None,
+        diagnostic_reporter=lambda message: pytest.fail(message),
+    )
+
+    assert status == 0
+    entries = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [sorted(entry) for entry in entries] == [["trace"], ["snapshot"]]
+
+    delivered = entries[0]["trace"]
+    assert token not in json.dumps(delivered)
+    assert delivered["payload"]["reason"] != "backend refused " + token
+    assert token not in delivered["payload"]["reason"]
+    assert token not in delivered["payload"]["detail"]["nested"]["credential"]
+    assert all(token not in item for item in delivered["payload"]["identifiers"])
+    assert token not in delivered["metadata"]["note"]
+    assert "backend refused" in delivered["payload"]["reason"]
+    assert "id-" in delivered["payload"]["identifiers"][1]
+
+    (supervision,) = supervisions
+    assert entries[1]["snapshot"][COUNTER_LOST_TRACES] == 1
+    (loss,) = supervision.losses
+    assert loss.startswith("probe.lost: PublicationError")
+    assert "handler refused" in loss
+    assert token not in loss
+
+
+def test_load_config_resolves_listed_secrets_only_where_an_enabled_setting_resolved_them(
+    tmp_path: Path,
+) -> None:
+    """R7/R8: the block is replaced by the values its references resolved to
+    through enabled settings — in list order, top-level references included —
+    and a disabled module's listed credential stays unresolved. The block is
+    a complement, not the credential list: the credentials proper are the
+    settings each module's manifest declares, which the loader redacts from
+    their accepted values whether or not they are listed here (P24 F7), so
+    an absent block is accepted and hands the runtime an empty complement."""
+
+    config = _valid_config("./modules", tmp_path / "unused.log")
+    config["enabled_modules"] = ["twitch", "audit"]
+    config["modules"]["twitch"]["access_token"] = "${TWITCH_ACCESS_TOKEN}"
+    config["modules"]["twitch"]["broadcaster_id"] = "${TWITCH_BROADCASTER_ID}"
+    config["modules"]["brain"]["api_key"] = "${MODEL_API_KEY}"
+    config["secrets"] = ["${MODEL_API_KEY}", "${TWITCH_ACCESS_TOKEN}"]
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    environ = _RecordingEnviron(
+        {"TWITCH_ACCESS_TOKEN": _opaque("token"), "TWITCH_BROADCASTER_ID": _opaque("channel")}
+    )
+
+    loaded = application.load_config(config_path, environ=environ)
+
+    assert loaded["secrets"] == [environ["TWITCH_ACCESS_TOKEN"]]
+    assert "MODEL_API_KEY" not in environ.queried
+    assert loaded["modules"]["brain"]["api_key"] == "${MODEL_API_KEY}"
+
+    del config["secrets"]
+    _write_config(config_path, config)
+    loaded = application.load_config(config_path, environ=environ)
+    assert loaded["secrets"] == []
+    assert loaded["modules"]["twitch"]["access_token"] == environ["TWITCH_ACCESS_TOKEN"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secrets", "expected_diagnostic"),
+    [
+        pytest.param({"a": 1}, "secrets: must be a list", id="not-a-list"),
+        pytest.param(
+            ["${TWITCH_ACCESS_TOKEN}", "literal-value"],
+            "secrets[1]: must be an environment reference of the form ${NAME}",
+            id="not-a-reference",
+        ),
+        pytest.param(
+            ["${TWITCH_ACCESS_TOKEN}", "${TWITCH_ACCESS_TOKEN}"],
+            "secrets[1]: must be unique",
+            id="duplicate",
+        ),
+        pytest.param(
+            ["${TWITCH_ACCES_TOKEN}"],
+            "secrets[0]: is referenced by no setting",
+            id="misspelt",
+        ),
+    ],
+)
+async def test_each_invalid_secrets_block_fails_before_readiness(
+    tmp_path: Path, secrets: Any, expected_diagnostic: str
+) -> None:
+    """A malformed or misspelt secrets block stops startup naming the entry,
+    before any module is activated, so a credential is never left unredacted
+    by a typo."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    for name in ("twitch", "brain", "audit"):
+        _make_module(modules, name)
+    lifecycle_log = tmp_path / "lifecycle.log"
+    config = _valid_config("./modules", lifecycle_log)
+    config["modules"]["twitch"]["access_token"] = "${TWITCH_ACCESS_TOKEN}"
+    config["secrets"] = secrets
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    readiness: list[str] = []
+    diagnostics: list[str] = []
+    # Already set: a block that wrongly got past validation stops at once
+    # with status 0 and fails below, rather than running forever.
+    stop = asyncio.Event()
+    stop.set()
+
+    status = await application.run(
+        config_path,
+        stop,
+        environ={"TWITCH_ACCESS_TOKEN": _opaque("token")},
+        ready_reporter=readiness.append,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status == 2
+    assert readiness == []
+    assert diagnostics == [expected_diagnostic]
+    assert not lifecycle_log.exists()
+
+
+def test_example_config_names_its_credentials_and_nothing_traces_correlate_by() -> None:
+    """The shipped example lists every credential reference and no identifier."""
+
+    config = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+
+    assert config["secrets"] == [
+        "${TWITCH_CLIENT_SECRET}",
+        "${TWITCH_ACCESS_TOKEN}",
+        "${OPENAI_API_KEY}",
+        "${OPENAI_ENDPOINT}",
+    ]
+    environ = _environment()
+    loaded = application.load_config(EXAMPLE_CONFIG, environ=environ)
+    assert loaded["secrets"] == [
+        environ["TWITCH_CLIENT_SECRET"],
+        environ["TWITCH_ACCESS_TOKEN"],
+        environ["OPENAI_API_KEY"],
+        environ["OPENAI_ENDPOINT"],
+    ]
+    assert environ["TWITCH_BROADCASTER_ID"] not in loaded["secrets"]

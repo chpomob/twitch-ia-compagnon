@@ -40,6 +40,7 @@ and every wait is a bounded number of bare loop turns.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib
 import json
 from array import array
@@ -51,6 +52,7 @@ import yaml
 
 import core.main as application
 from core import attachments
+from core.actions import ActionRegistry, AuthorizationPolicy
 from core.attachments import (
     AttachmentExpired,
     AttachmentRef,
@@ -64,11 +66,14 @@ from core.context import ChatContext, ChatEntry
 from core.contracts import (
     COUNTER_AUDIT_RECORD_LOSSES,
     COUNTER_DEDUP_EVICTIONS,
+    TRACE_BRAIN_RUN_COMPLETED,
+    ActionObservation,
     ContractError,
     SessionKey,
 )
 from conftest import (
     FakeResponse,
+    FakeSession,
     ManualClock,
     RecordingScheduler,
     completion,
@@ -76,11 +81,19 @@ from conftest import (
     wait_until,
 )
 from test_brain import (
+    BRAIN_GRANT,
     CHANNEL as BRAIN_CHANNEL,
+    CHAT_WRITE_SPEC,
+    INPUT_EVENT as BRAIN_INPUT_EVENT,
+    MODULE_NAME as BRAIN_MODULE,
     PLATFORM as BRAIN_PLATFORM,
+    SENDER_MODULE,
     activate_with as activate_brain,
+    chat_payload,
+    merge_settings as brain_settings,
     rendered_history,
 )
+from modules.brain import activate as brain_activate
 from test_twitch import (
     PLATFORM as TWITCH_PLATFORM,
     SETTINGS as TWITCH_SETTINGS,
@@ -649,6 +662,171 @@ def test_releasing_an_unknown_run_frees_nothing() -> None:
     assert store.release("run-a") == RunUsage(objects=1, total_bytes=UNIT)
     assert store.release("run-a") == RunUsage(objects=0, total_bytes=0)
     assert store.total_bytes == 0
+
+
+# --------------------------------------------------------------------------- #
+# Attachment store: the run's end releases its leases, through the engine
+# (R6, AC23, AC31 — P24 F5)
+# --------------------------------------------------------------------------- #
+
+
+class _LeasingProvider:
+    """A ``chat.write`` provider that leases 2 attachments under the run's id.
+
+    It stands for any provider that stores bytes for the run that invoked it;
+    it never releases them itself — that is the run's end, not the send's —
+    and it can be told to hold after leasing so a run can be ended by the
+    engine's shutdown while its leases are live.
+    """
+
+    name = "leasing-send"
+
+    def __init__(self, store: AttachmentStore) -> None:
+        self.store = store
+        self.leased: dict[str, list[AttachmentRef]] = {}
+        self.hold: asyncio.Event | None = None
+        self.held = asyncio.Event()
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        invocation.mark_not_emitted()
+        run_id = invocation.call.run_id
+        self.leased[run_id] = [
+            self.store.put(run_id, _payload(1), content_type="image/png"),
+            self.store.put(run_id, _payload(1), content_type="image/png"),
+        ]
+        if self.hold is not None:
+            self.held.set()
+            await self.hold.wait()
+        invocation.mark_emitted()
+        return ActionObservation(
+            status="success",
+            provenance={"provider": self.name},
+            result={"message_id": f"sent-{len(self.leased)}"},
+        )
+
+
+async def _activate_brain_over(store: AttachmentStore, session: Any):
+    """The engine on a runtime whose context carries *store*, as ``main`` wires it."""
+
+    policy = AuthorizationPolicy([BRAIN_GRANT])
+    registry = ActionRegistry(authorization=policy)
+    provider = _LeasingProvider(store)
+    registry.register(CHAT_WRITE_SPEC, provider, module=SENDER_MODULE)
+    registry.mark_ready(SENDER_MODULE)
+    clock = ManualClock()
+    context = dataclasses.replace(
+        runtime_context(clock=clock, authorization=policy, actions=registry),
+        attachments=store,
+    )
+    diagnostics: list[str] = []
+    settings = brain_settings(None)
+    settings.update(
+        {
+            "_session_factory": lambda: session,
+            "_sleeper": clock.sleep,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    )
+    handle = await brain_activate(context.for_module(BRAIN_MODULE), settings, {})
+    await handle.prepare()
+    return handle, context, provider, diagnostics
+
+
+async def _send_to_brain(context: Any, text: str, message_id: str) -> None:
+    await context.bus.publish(
+        BRAIN_INPUT_EVENT,
+        chat_payload(text, message_id=message_id),
+        {"source": "test", "schema_version": 2},
+    )
+
+
+async def test_a_run_admitted_through_the_engine_releases_its_leases_when_it_ends() -> None:
+    """R6/AC23/AC31 (P24 F5): a run genuinely admitted through the engine,
+    whose provider leased 2 units under the run's identity, holds 0 units
+    once its terminal record is written — nothing in this test calls
+    ``release`` — while a bystander run's unit survives, the released
+    references read as explicit errors, and the run identity may lease its
+    quota again."""
+
+    store = _quota_store()
+    bystander = store.put("run-bystander", _payload(1), content_type="image/png")
+    session = FakeSession(FakeResponse(200, completion("a reply")))
+    handle, context, provider, diagnostics = await _activate_brain_over(store, session)
+    try:
+        await _send_to_brain(context, "hello there", "m1")
+        await wait_until(lambda: len(handle.scheduler.run_records()) == 1)
+        ((run_id, record),) = handle.scheduler.run_records().items()
+        assert record.status == "success"
+        assert record.sends == 1
+
+        # The provider leased exactly under this run, and the run's end freed it.
+        assert list(provider.leased) == [run_id]
+        assert len(provider.leased[run_id]) == 2
+        assert store.usage(run_id) == RunUsage(objects=0, total_bytes=0)
+        assert store.live_runs() == ("run-bystander",)
+        for ref in provider.leased[run_id]:
+            with pytest.raises(AttachmentUnknown):
+                store.get(ref)
+        # Exactly its own: the bystander's unit is untouched.
+        assert store.usage("run-bystander") == RunUsage(objects=1, total_bytes=UNIT)
+        assert store.get(bystander) == _payload(1)
+        assert store.total_bytes == UNIT
+
+        # AC31: the identity is clean and can lease its 2 units again.
+        store.put(run_id, _payload(1), content_type="image/png")
+        store.put(run_id, _payload(1), content_type="image/png")
+        assert store.usage(run_id) == RunUsage(objects=2, total_bytes=2 * UNIT)
+        store.release(run_id)
+
+        (completed,) = [
+            event
+            for event in context.bus.list_events()
+            if event["type"] == TRACE_BRAIN_RUN_COMPLETED
+        ]
+        assert completed["payload"]["run_id"] == run_id
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+async def test_a_run_ended_by_the_engine_shutdown_releases_its_leases() -> None:
+    """R6 (P24 F5): a run cancelled by the engine's close while its provider
+    holds 2 leased units is recorded and traced once, and its 2 units are
+    freed by that record — not by the test, not by a time-to-live — while
+    a bystander run's unit survives the shutdown."""
+
+    store = _quota_store()
+    bystander = store.put("run-bystander", _payload(1), content_type="image/png")
+    session = FakeSession(FakeResponse(200, completion("a reply")))
+    handle, context, provider, diagnostics = await _activate_brain_over(store, session)
+    provider.hold = asyncio.Event()
+    try:
+        await _send_to_brain(context, "hello there", "m1")
+        await asyncio.wait_for(provider.held.wait(), timeout=1)
+        (run_id,) = provider.leased
+        assert store.usage(run_id) == RunUsage(objects=2, total_bytes=2 * UNIT)
+        assert handle.scheduler.run_records() == {}
+        assert store.total_bytes == 3 * UNIT
+    finally:
+        await handle.close()
+
+    record = handle.scheduler.run_record(run_id)
+    assert record is not None
+    assert (record.status, record.reason) == ("cancelled", "cancelled")
+    completed = [
+        event
+        for event in context.bus.list_events()
+        if event["type"] == TRACE_BRAIN_RUN_COMPLETED
+    ]
+    assert [event["payload"]["run_id"] for event in completed] == [run_id]
+    assert store.usage(run_id) == RunUsage(objects=0, total_bytes=0)
+    for ref in provider.leased[run_id]:
+        with pytest.raises(AttachmentUnknown):
+            store.get(ref)
+    assert store.usage("run-bystander") == RunUsage(objects=1, total_bytes=UNIT)
+    assert store.get(bystander) == _payload(1)
+    assert store.live_runs() == ("run-bystander",)
+    assert store.total_bytes == UNIT
 
 
 # --------------------------------------------------------------------------- #

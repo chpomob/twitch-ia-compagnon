@@ -30,8 +30,11 @@ modules:
     # blocks below and its settings validator checks each value is finite and
     # positive before any transport opens; startup stops with a diagnostic
     # naming the field when one is absent, zero, negative or infinite. The
-    # admission and conversation_memory groups mirror the ones under `limits`
-    # until the core hands those over entirely.
+    # admission and conversation_memory groups are the same limits the entry
+    # point accepts under `limits` below: it hands its accepted block to every
+    # enabled module, and the brain's validator refuses a value here that
+    # differs from `limits.admission` or `limits.conversation_memory`, naming
+    # the field, before any module is activated (R6). Change both together.
     admission:
       session_queue_capacity: 4
       global_pending_capacity: 64
@@ -57,11 +60,34 @@ modules:
     # bounds and its settings validator checks each is a finite positive
     # integer before any transport opens. When either bound is reached the
     # newly offered record is dropped and the audit loss counter incremented;
-    # publication never waits. The values mirror `limits.observation_queue`
-    # below until the core hands that group over entirely.
+    # publication never waits. The values are the same bounds the entry point
+    # accepts as `limits.observation_queue` below: a value here that differs
+    # from the accepted one stops startup naming the field, so the queue is
+    # never bounded by a stale mirror. Change both together.
     queue:
       max_records: 1000
       max_bytes: 4194304
+
+# Redaction (R8). The credentials proper need no entry here: each module's
+# manifest declares which of its settings are credentials (`credentials:` in
+# modules/twitch/module.yaml and modules/brain/module.yaml), and their
+# accepted values — literal or resolved — are redacted from every supervision
+# trace and every lost-trace diagnostic before any module is activated,
+# whether or not this block exists. This optional block adds references the
+# modules do not declare; every reference listed is redacted, once resolved,
+# wherever it appears — verbatim, nested or embedded in a longer string. The
+# list is never resolved on its own: a reference takes the value an enabled
+# module's setting resolved it to, so listing a disabled module's credential
+# looks nothing up (R7). Identifiers that traces correlate by — the
+# broadcaster, the bot account — are deliberately not listed: a redacted
+# channel would break correlation, not protect a secret. The backend URL is
+# listed because such a URL may embed a credential; the declared credentials
+# are repeated for the reader, which redacts nothing twice.
+secrets:
+  - ${TWITCH_CLIENT_SECRET}
+  - ${TWITCH_ACCESS_TOKEN}
+  - ${OPENAI_API_KEY}
+  - ${OPENAI_ENDPOINT}
 
 # Trigger policies, selected per input and per channel (R1). The key under
 # `triggers` names the input module. An entry under `channels` selects the
@@ -116,6 +142,11 @@ actions:
 # such a module at startup. With the block present every limit below is
 # required and must be finite and positive; startup stops before any
 # transport opens when one is absent, negative, non-numeric or infinite.
+# The accepted block is handed to every enabled module as its reserved
+# `limits` setting: the module that owns a group (`observation_queue`,
+# `conversation_memory`, `admission`) validates its own copy above against
+# it and refuses a difference by field, so the bounds the runtime actually
+# runs under are exactly the ones accepted here (R6).
 limits:
   bus_history:
     max_events: 1000

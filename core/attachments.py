@@ -400,10 +400,14 @@ class AttachmentStore:
     def release(self, run_id: str) -> RunUsage:
         """Free everything *run_id* leases and return what was freed.
 
-        Called when a run ends or is cancelled. It frees exactly that run's
-        objects and bytes — never another run's — and leaves no accounting
-        behind, so the same run identity may afterwards store up to its full
-        quota again (AC31).
+        Called when a run ends or is cancelled: in production by the admission
+        scheduler's ``run_cleanup``, wired to this method by the engine that
+        owns the scheduler, when the run's terminal record is written on any
+        exit path — so no caller has to remember it. It frees exactly that
+        run's objects and bytes — never another run's — and leaves no
+        accounting behind, so the same run identity may afterwards store up
+        to its full quota again (AC31). Idempotent: a run with nothing leased
+        frees nothing.
 
         A reference already reaped by its time-to-live was accounted for at
         that moment and is not counted again here: every removal goes through

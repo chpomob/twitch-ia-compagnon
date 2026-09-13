@@ -314,15 +314,47 @@ class ActionInvocation:
     declared that the effect may have left, it cannot take that back, because
     the whole point is to stop a later layer from concluding "nothing happened"
     from a missing response.
+
+    The handle also carries the provider's *completion hooks*: work the
+    provider wants run once this call is terminal — its observation recorded
+    and ``action.completed`` offered to supervision — and not before. A
+    provider whose effect is confirmed inside ``invoke`` publishes the fact of
+    that effect through one, so the audit reads the executor's completion
+    first and the provider's fact after it, the order AC27 fixes.
     """
 
-    __slots__ = ("call", "spec", "provider_name", "_emission")
+    __slots__ = (
+        "call",
+        "spec",
+        "provider_name",
+        "_emission",
+        "_hooks",
+        "_completed",
+        "_provider_completed_at",
+    )
 
     def __init__(self, call: ActionCall, spec: ActionSpec, provider_name: str) -> None:
         self.call = call
         self.spec = spec
         self.provider_name = provider_name
         self._emission = EMISSION_UNKNOWN
+        self._hooks: list[Callable[[], Any]] = []
+        self._completed = False
+        self._provider_completed_at: float | None = None
+
+    @property
+    def provider_completed_at(self) -> float | None:
+        """When the provider's ``invoke`` ended, on the executor's clock.
+
+        Stamped by the executor on the provider's own task, the instant the
+        coroutine returns, raises or is cancelled — before any other task can
+        run. It is the time the confirmation (or failure) *arrived*, which is
+        the time the deadline is judged against; the instant the executor gets
+        around to adopting it is not, since the loop may resume it late.
+        ``None`` while the provider is still running.
+        """
+
+        return self._provider_completed_at
 
     @property
     def emission(self) -> str:
@@ -348,6 +380,47 @@ class ActionInvocation:
                 "cannot unsay an emission that was already declared",
             )
         self._emission = EMISSION_NOT_EMITTED
+
+    def after_completion(self, hook: Callable[[], Any]) -> None:
+        """Run *hook* once this call is terminal, never before (R8, AC27).
+
+        The executor calls it after the terminal observation is recorded and
+        its ``action.completed`` trace has been offered to supervision — on
+        every exit, a cancellation included — so a fact the provider defers
+        here is published after the executor's own completion. A hook
+        registered once the call is already terminal runs at once; each hook
+        runs exactly once. A hook is synchronous and hands any waiting to the
+        loop: it runs on the executor's path, and it must not spend the
+        caller's time. Whatever it raises is its own and never reaches the
+        recorded terminal state.
+        """
+
+        if not callable(hook):
+            raise ContractError(
+                "ActionInvocation.after_completion", "expects a callable hook"
+            )
+        if self._completed:
+            _run_hook(hook)
+            return
+        self._hooks.append(hook)
+
+    def _complete(self) -> None:
+        """Mark the call terminal and run the hooks registered so far."""
+
+        self._completed = True
+        hooks, self._hooks = self._hooks, []
+        for hook in hooks:
+            _run_hook(hook)
+
+
+def _run_hook(hook: Callable[[], Any]) -> None:
+    try:
+        hook()
+    except Exception:
+        # The hook is the provider's own work past the terminal state: its
+        # failure is the provider's to diagnose and cannot unwind an outcome
+        # that is already recorded.
+        return
 
 
 # --------------------------------------------------------------------------- #
@@ -1061,8 +1134,9 @@ class ActionExecutor:
         # ``action.started`` and validating the arguments can themselves consume
         # what was left of the deadline, and a budget measured from the entry
         # instant would then let the provider run — and emit — past expiry.
-        budget = self._budget(spec, call, self._clock())
-        if budget <= 0:
+        entered_at = self._clock()
+        expires_at = self._expiry(spec, call, entered_at)
+        if expires_at <= entered_at:
             # Expired before the provider was entered: nothing can have been
             # emitted, so this is a certain timeout.
             return await self._terminate(
@@ -1071,12 +1145,20 @@ class ActionExecutor:
                 message=f"deadline for {call.action_name!r} expired before invocation",
                 emission=EMISSION_NOT_EMITTED,
             )
-        return await self._run_provider(call, spec, binding, started_at, budget)
+        return await self._run_provider(
+            call, spec, binding, started_at, expires_at - entered_at, expires_at
+        )
 
-    def _budget(self, spec: ActionSpec, call: ActionCall, now: float) -> float:
-        """The shorter of the spec's timeout and what is left of the deadline."""
+    def _expiry(self, spec: ActionSpec, call: ActionCall, now: float) -> float:
+        """The instant this call expires: the earlier of the spec's timeout,
+        counted from the provider's door, and the call's own deadline.
 
-        return min(float(spec.timeout_seconds), float(call.deadline) - now)
+        Kept as an absolute instant on the executor's clock, so a provider's
+        completion is judged against the limit that actually applied — the
+        spec timeout when it is the shorter one, not only the call deadline.
+        """
+
+        return min(float(call.deadline), now + float(spec.timeout_seconds))
 
     async def _cancel(self, task: "asyncio.Future[Any]") -> bool:
         """Cancel *task* and wait at most the grace for it to actually end.
@@ -1111,10 +1193,31 @@ class ActionExecutor:
         binding: ActionBinding,
         started_at: float,
         budget: float,
+        expires_at: float,
     ) -> ActionObservation:
         invocation = ActionInvocation(call, spec, binding.provider_name)
+        try:
+            return await self._run_invocation(
+                call, spec, binding, started_at, budget, expires_at, invocation
+            )
+        finally:
+            # Every exit below has recorded the terminal observation and
+            # offered ``action.completed``; only now may the provider's
+            # deferred facts follow it (AC27).
+            invocation._complete()
+
+    async def _run_invocation(
+        self,
+        call: ActionCall,
+        spec: ActionSpec,
+        binding: ActionBinding,
+        started_at: float,
+        budget: float,
+        expires_at: float,
+        invocation: ActionInvocation,
+    ) -> ActionObservation:
         self._provider_invocations += 1
-        provider_task = asyncio.ensure_future(binding.provider.invoke(invocation))
+        provider_task = asyncio.ensure_future(self._observe(binding, invocation))
         timer_task = asyncio.ensure_future(self._sleep(budget))
 
         try:
@@ -1134,6 +1237,23 @@ class ActionExecutor:
 
         if provider_task in done:
             await self._cancel(timer_task)
+            completed_at = invocation.provider_completed_at
+            if completed_at is None or completed_at >= expires_at:
+                # The result *arrived* after the call expired — the spec's
+                # timeout or the call deadline, whichever applied — including
+                # the case where both futures were already ready when the wait
+                # returned, so the race itself cannot order a late confirmation
+                # first. The instant judged is the provider's own completion
+                # stamp, not the clock now: a confirmation that landed in time
+                # stays a confirmation however late the executor is resumed to
+                # adopt it (R5, design §3.3). Whatever a late provider says,
+                # even a confirmed success, the call was unconfirmed at expiry
+                # (R2/AC33): the result is not adopted, and the interruption is
+                # latched through the single emission rule instead.
+                _consume(provider_task)
+                return await self._terminate_uncertain(
+                    call, binding, started_at, invocation.emission, spec, certain="timeout"
+                )
             if provider_task.cancelled():
                 # The provider was cancelled from below; the executor's own task
                 # is untouched, so this is an outcome, not a propagation.
@@ -1169,6 +1289,20 @@ class ActionExecutor:
         return await self._terminate_uncertain(
             call, binding, started_at, invocation.emission, spec, certain="timeout"
         )
+
+    async def _observe(self, binding: ActionBinding, invocation: ActionInvocation) -> Any:
+        """Run the provider and stamp the instant its ``invoke`` ended.
+
+        The stamp is taken on the provider's task, in the same step as the
+        return, the raise or the cancellation — so it records when the
+        confirmation arrived, whatever the loop does to the executor's task
+        afterwards.
+        """
+
+        try:
+            return await binding.provider.invoke(invocation)
+        finally:
+            invocation._provider_completed_at = self._clock()
 
     async def _validate_observation(
         self,
