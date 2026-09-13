@@ -71,6 +71,24 @@ store's leases, R6) is released by the run's end itself rather than left to a
 time-to-live. It runs after the record and before the trace, never awaits, and
 a failure inside it can neither undo the record nor lose the trace.
 
+A ``stale_drop`` is the one terminal path where the owner may still want to act
+on the work — R3's fallback answers the viewer that nothing could be done in
+time — without the scheduler knowing what a fallback is. An optional
+``on_stale_drop`` hook is therefore called exactly once per stale item with the
+work, its session key and the **remaining total budget** (the total deadline
+minus the drop instant, never negative), after the ``stale_drop`` record is
+built and before ``brain.run.completed`` is published, so what the hook reports
+travels in that single trace. The hook runs inside the reaper, so it is bounded
+by that remaining budget exactly as a run body is: one that overruns it is
+abandoned and cancelled at the total deadline instead of stalling every other
+stale sweep — and the items of one sweep run their hooks side by side, at most
+``stale_drop_concurrency`` at once, so one hook holding its budget never
+spends another item's. A mapping it returns is merged into the record's
+correlation (``fallback``, ``deliveries``, …; ``delivery`` fills the record's
+own delivery field); an exception it raises is counted under
+:data:`COUNTER_STALE_DROP_HOOK_FAILURES` and diagnosed in the trace, never
+raised, and the ``stale_drop`` record stands either way.
+
 At most one run per session is active at a time, distinct sessions progress
 concurrently up to the worker limit, and a session whose queue is empty and
 which has no active run is evicted — queue and lock together, and only in that
@@ -121,10 +139,12 @@ from .contracts import (
 )
 
 __all__ = [
+    "COUNTER_STALE_DROP_HOOK_FAILURES",
     "DEFAULT_BOUNDARY_YIELDS",
     "DEFAULT_MAX_PENDING_TRACES",
     "DEFAULT_MAX_RECORDS",
     "DEFAULT_RUN_MODULE",
+    "DEFAULT_STALE_DROP_CONCURRENCY",
     "REASON_ADMITTED",
     "REASON_CANCELLED",
     "REASON_COMPLETED",
@@ -142,6 +162,7 @@ __all__ = [
     "RunLifecycleEmissionError",
     "RunOutcome",
     "RunRecord",
+    "StaleDropHook",
     "Supervision",
     "Work",
 ]
@@ -149,6 +170,24 @@ __all__ = [
 Clock = Callable[[], float]
 Sleeper = Callable[[float], Awaitable[None]]
 IdFactory = Callable[[], str]
+StaleDropHook = Callable[["Work", SessionKey, float], "Awaitable[Any] | Any"]
+"""``(work, session_key, remaining_seconds)`` → optional correlation mapping.
+
+The scheduler hands over the work, its session and the total budget left; it
+knows nothing about what the owner does with them (R3). The hook may answer
+synchronously or with an awaitable; an awaitable is bounded by the remaining
+budget and abandoned at the total deadline, so a hook that wants to report
+something when that budget is already zero answers synchronously.
+"""
+
+COUNTER_STALE_DROP_HOOK_FAILURES = "stale_drop_hook_failures"
+"""Diagnostic count of ``on_stale_drop`` calls that raised or overran the budget.
+
+Declared on the injected counters at construction when a hook is given, since
+the registry is closed (R8): a hook failure is contained in the stale-drop
+path, counted here and diagnosed in the ``brain.run.completed`` trace, and it
+is also readable as :attr:`AdmissionScheduler.stale_drop_hook_failures`.
+"""
 
 RUN_ID_BYTES = 8
 """Entropy of a generated ``run_id``; it correlates every trace of one run."""
@@ -181,6 +220,19 @@ finish classifying a call already in flight and let the body return its
 partial outcome. They consume no time on any clock — each is a bare reschedule
 — so the bound is on cooperation, not on duration. A body that ignores every
 one of them is abandoned, which is what the bound is for.
+"""
+
+DEFAULT_STALE_DROP_CONCURRENCY = 8
+"""How many stale items one reaper sweep completes side by side.
+
+Each item's ``on_stale_drop`` call is bounded by that item's own remaining
+budget, but a sweep that awaited its items one after another would let a hook
+holding its budget spend everyone else's too: the next item would reach its
+deadline still waiting for its turn and its fallback would be closed
+unexecuted. The sweep therefore completes its items on concurrent tasks, at
+most this many at once, so its wall time is the longest budget rather than the
+sum. The bound keeps a burst of stale work from fanning out into as many
+fallback sends at once; the owner's hook is the one that pays for each slot.
 """
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +463,13 @@ class RunRecord:
     started: bool = False
     admitted_at: float = 0.0
     completed_at: float = 0.0
+    correlation: Mapping[str, Any] = field(default_factory=dict)
+    """What the ``on_stale_drop`` hook reported for a ``stale_drop`` record.
+
+    Frozen, and carried into the run's ``brain.run.completed`` trace beside
+    the standard fields (``fallback``, ``deliveries``, …). Empty on every
+    other path: a run body's correlation travels in the trace only.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -587,6 +646,7 @@ class AdmissionScheduler:
         "_max_pending_traces",
         "_max_records",
         "_max_sessions",
+        "_on_stale_drop",
         "_pending",
         "_queues",
         "_reaper",
@@ -598,6 +658,8 @@ class AdmissionScheduler:
         "_running",
         "_session_queue_capacity",
         "_sleep",
+        "_stale_drop_concurrency",
+        "_stale_drop_hook_failures",
         "_supervision",
         "_total_run_seconds",
         "_traces",
@@ -626,11 +688,15 @@ class AdmissionScheduler:
         max_pending_traces: int = DEFAULT_MAX_PENDING_TRACES,
         boundary_yields: int = DEFAULT_BOUNDARY_YIELDS,
         run_cleanup: Callable[[str], Any] | None = None,
+        on_stale_drop: StaleDropHook | None = None,
+        stale_drop_concurrency: int = DEFAULT_STALE_DROP_CONCURRENCY,
     ) -> None:
         if not callable(run_body):
             raise ContractError("run_body", "must be callable")
         if run_cleanup is not None and not callable(run_cleanup):
             raise ContractError("run_cleanup", "must be callable")
+        if on_stale_drop is not None and not callable(on_stale_drop):
+            raise ContractError("on_stale_drop", "must be callable")
         if not callable(clock):
             raise ContractError("clock", "must be callable")
         if sleeper is not None and not callable(sleeper):
@@ -655,16 +721,27 @@ class AdmissionScheduler:
             max_pending_traces, "max_pending_traces"
         )
         self._boundary_yields = _validate_count_limit(boundary_yields, "boundary_yields")
+        self._stale_drop_concurrency = _validate_count_limit(
+            stale_drop_concurrency, "stale_drop_concurrency"
+        )
         self._run_module = _require_text(run_module, "run_module")
 
         self._run_body = run_body
         self._run_cleanup = run_cleanup
+        self._on_stale_drop = on_stale_drop
+        self._stale_drop_hook_failures = 0
         self._clock = clock
         self._sleep: Sleeper = sleeper if sleeper is not None else asyncio.sleep
         self._supervision: Any = (
             supervision if supervision is not None else _NullSupervision()
         )
         self._counters = counters
+        if on_stale_drop is not None and counters is not None:
+            # The registry is closed: the hook's failure count is declared
+            # here, at zero, where the hook itself is wired.
+            declare = getattr(counters, "declare", None)
+            if callable(declare):
+                declare(COUNTER_STALE_DROP_HOOK_FAILURES)
         self._id_factory: IdFactory = (
             id_factory if id_factory is not None else _default_run_id
         )
@@ -694,6 +771,12 @@ class AdmissionScheduler:
         """How many session queues and locks are currently retained (AC9)."""
 
         return len(self._queues)
+
+    @property
+    def stale_drop_hook_failures(self) -> int:
+        """How many ``on_stale_drop`` calls raised or overran their budget."""
+
+        return self._stale_drop_hook_failures
 
     @property
     def active_runs(self) -> int:
@@ -1236,12 +1319,115 @@ class AdmissionScheduler:
                 await self._publish_completion(item, record, {})
 
     async def _complete_stale(self, item: _Item, now: float) -> None:
-        """End an item whose wait deadline passed before any worker took it."""
+        """End an item whose wait deadline passed before any worker took it.
+
+        The record is built first, the hook runs on it second and the
+        publication comes last, so what the hook reports rides in the one
+        ``brain.run.completed`` of this work. A cancellation striking inside
+        the hook is the F9 case both callers already cover: the item is not
+        yet recorded, and :meth:`_terminate_orphans` finishes it. The drop is
+        counted where it is recorded — after the hook, with no await between
+        the count and the record — so an item finished by that handler is
+        counted there and only there, never once here and once again.
+        """
 
         await self._settled(item.trace)
-        self._count(COUNTER_STALE_DROP)
         record = self._unstarted_record(item, "timeout", REASON_STALE_DROP, now)
-        await self._publish_completion(item, record, {})
+        extra = await self._apply_stale_drop_hook(item, record, now)
+        self._count(COUNTER_STALE_DROP)
+        await self._publish_completion(item, record, extra)
+
+    async def _apply_stale_drop_hook(
+        self, item: _Item, record: RunRecord, now: float
+    ) -> dict[str, Any]:
+        """Call ``on_stale_drop`` once, bounded by the budget left, and merge.
+
+        The hook is handed ``total_deadline - now`` (never negative) and is
+        held to it through :meth:`_bounded_by`: it runs inside the reaper,
+        where an unbounded call would stall every other stale sweep. Whatever
+        it does — return a mapping, return nothing, raise, overrun — the
+        ``stale_drop`` record stands; a failure is counted and lands in the
+        trace as a diagnosis instead of propagating.
+        """
+
+        hook = self._on_stale_drop
+        if hook is None:
+            return {}
+        remaining = max(0.0, item.total_deadline - now)
+        try:
+            value = hook(item.work, item.session_key, remaining)
+        except Exception as failure:
+            return self._stale_drop_hook_failed(record, "failed", failure)
+        if inspect.isawaitable(value):
+            settled: dict[str, Any] = {}
+
+            async def settle() -> None:
+                try:
+                    settled["value"] = await value
+                except asyncio.CancelledError:
+                    raise
+                except Exception as failure:
+                    settled["error"] = failure
+
+            finished = await self._bounded_by(settle(), item.total_deadline)
+            if not finished:
+                # Abandoned at the total deadline: ``_bounded_by`` cancelled
+                # the wait and, through it, the hook's own awaitable; a
+                # coroutine the deadline never let start is closed here so
+                # nothing warns about it.
+                if (
+                    inspect.iscoroutine(value)
+                    and inspect.getcoroutinestate(value) == inspect.CORO_CREATED
+                ):
+                    value.close()
+                return self._stale_drop_hook_failed(record, "abandoned", None)
+            if "error" in settled:
+                return self._stale_drop_hook_failed(record, "failed", settled["error"])
+            value = settled.get("value")
+        try:
+            return self._merge_stale_drop_result(record, value)
+        except ContractError as invalid:
+            return self._stale_drop_hook_failed(record, "failed", invalid)
+
+    def _merge_stale_drop_result(self, record: RunRecord, value: Any) -> dict[str, Any]:
+        """Adopt a mapping the hook returned; anything else reports nothing.
+
+        ``delivery`` is the record's own field and fills it when it is a text;
+        the other keys join the record's correlation and the trace, minus the
+        standard fields a hook may not overwrite, exactly as a run body's
+        correlation is merged in :meth:`_complete`.
+        """
+
+        if not isinstance(value, Mapping):
+            return {}
+        extra: dict[str, Any] = {}
+        for key, entry in value.items():
+            if key == "delivery":
+                if isinstance(entry, str) and entry.strip():
+                    record.delivery = entry
+                continue
+            if key in _RESERVED_TRACE_FIELDS:
+                continue
+            extra[key] = entry
+        record.correlation = _frozen_copy(extra, "on_stale_drop result")
+        return dict(record.correlation)
+
+    def _stale_drop_hook_failed(
+        self, record: RunRecord, outcome: str, failure: BaseException | None
+    ) -> dict[str, Any]:
+        """Count and diagnose a hook that raised or overran; the record stands."""
+
+        self._stale_drop_hook_failures += 1
+        # The count is a diagnosis of the owner's hook, never a reason to lose
+        # the record or its trace: a counter registry that does not know the
+        # name (an owner that could not declare it) is contained here too.
+        with contextlib.suppress(Exception):
+            self._count(COUNTER_STALE_DROP_HOOK_FAILURES)
+        extra: dict[str, Any] = {"stale_drop_hook": outcome}
+        if failure is not None:
+            extra["stale_drop_hook_error"] = f"{type(failure).__name__}: {failure}"
+        record.correlation = MappingProxyType(dict(extra))
+        return extra
 
     async def _complete_cancelled(self, item: _Item) -> None:
         """End a still-queued item at shutdown: it never started, and says so."""
@@ -1419,20 +1605,56 @@ class AdmissionScheduler:
             if delay > 0:
                 await self._sleep_or_change(delay)
             stale = self._expired_items()
-            try:
-                for item in stale:
-                    await self._complete_stale(item, self._clock())
-            except asyncio.CancelledError:
-                # F9: the batch already removed these from their queues; the
-                # ones whose record was not yet written are finished here
-                # before the cancellation leaves the reaper.
-                await self._terminate_orphans(stale)
-                raise
-            if not stale:
+            if stale:
+                await self._complete_stale_batch(stale)
+            else:
                 # Woken by an admission, or by a deadline a worker got to
                 # first: yield rather than spin, so a reaper that finds
                 # nothing to do can never starve the loop it shares.
                 await asyncio.sleep(0)
+
+    async def _complete_stale_batch(self, stale: Sequence[_Item]) -> None:
+        """Complete one sweep's expired items, their hooks side by side.
+
+        Each item is completed on its own task, at most
+        ``stale_drop_concurrency`` at once, and takes its drop instant when
+        its turn comes — a hook holding its budget delays the items behind it
+        only past the bound, never the ones running beside it. Cancellation
+        (F9) cancels every task first, then writes the records: a cancelled
+        task can no longer reach its own record, so the ones still missing are
+        the orphans, and they are finished before the cancellation leaves the
+        reaper. The unwound tasks are awaited so nothing outlives the sweep.
+        """
+
+        slots = asyncio.Semaphore(self._stale_drop_concurrency)
+
+        async def complete(item: _Item) -> None:
+            async with slots:
+                await self._complete_stale(item, self._clock())
+
+        tasks = [asyncio.ensure_future(complete(item)) for item in stale]
+        try:
+            await asyncio.wait(tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            try:
+                await self._terminate_orphans(stale)
+            finally:
+                await asyncio.wait(tasks)
+                for task in tasks:
+                    if not task.cancelled():
+                        task.exception()
+            raise
+        for task in tasks:
+            # An exception escaping a completion is a programming error; it
+            # leaves the reaper exactly as it did when the items were awaited
+            # in turn, but only once every item of the batch had its turn.
+            if task.cancelled():
+                continue
+            failure = task.exception()
+            if failure is not None:
+                raise failure
 
     def _earliest_wait_deadline(self) -> float | None:
         earliest: float | None = None

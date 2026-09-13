@@ -14,6 +14,11 @@ budget runs out, and the point of the test is that the scheduler does **not**
 decide what happened to it: it stops the run at the next boundary and the
 executor (P7) classifies the call as ``external_unknown``, with the request
 emitted exactly once and never retried.
+
+The last section is phase 1's R3 groundwork for AC19: the optional stale-drop
+hook is called exactly once per stale item with the work, the session key and
+the total budget left, bounded by that budget, and whatever it does the
+``stale_drop`` record and its one trace stand.
 """
 
 import asyncio
@@ -29,6 +34,7 @@ from core.actions import (
 )
 from core.attachments import AttachmentStore, AttachmentUnknown, RunUsage
 from core.admission import (
+    COUNTER_STALE_DROP_HOOK_FAILURES,
     REASON_ADMITTED,
     REASON_CANCELLED,
     REASON_COMPLETED,
@@ -1645,3 +1651,476 @@ def test_a_non_callable_run_cleanup_is_refused_by_name():
     with pytest.raises(ContractError) as caught:
         AdmissionScheduler(lambda _context: None, run_cleanup="release")  # type: ignore[arg-type]
     assert "run_cleanup" in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# R3 — the stale-drop hook (AC19 groundwork)
+# --------------------------------------------------------------------------- #
+#
+# The four constructors above run unchanged: ``on_stale_drop`` is optional and
+# the scheduler without it drops stale work exactly as before. With it, the
+# scheduler hands over the work, the session key and the budget left — and
+# nothing else: it never learns what a fallback is.
+
+
+class StaleDropHook:
+    """Records every call, can answer, raise or hold, sync or async."""
+
+    def __init__(
+        self,
+        result=None,
+        *,
+        raises: BaseException | None = None,
+        hold: bool = False,
+        synchronous: bool = False,
+    ) -> None:
+        self.result = result
+        self.raises = raises
+        self.hold = hold
+        self.synchronous = synchronous
+        self.calls: list[tuple[Work, SessionKey, float]] = []
+        self.completed_at_call: list[list[dict]] = []
+        self.cancelled = 0
+        self.bus: FakeBus | None = None
+
+    def _observe(self, work, session_key, remaining) -> None:
+        self.calls.append((work, session_key, remaining))
+        if self.bus is not None:
+            self.completed_at_call.append(self.bus.of_type(TRACE_BRAIN_RUN_COMPLETED))
+
+    def _answer(self):
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+    def __call__(self, work, session_key, remaining):
+        self._observe(work, session_key, remaining)
+        if self.synchronous:
+            return self._answer()
+        return self._settle()
+
+    async def _settle(self):
+        if self.hold:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        return self._answer()
+
+
+def _hooked_harness(hook: StaleDropHook, **settings) -> Harness:
+    body = RunSpy(FakeModel())
+    options = {"workers": 1, "wait_seconds": 5.0, "total_run_seconds": 60.0}
+    options.update(settings)
+    harness = Harness(body, on_stale_drop=hook, **options)
+    hook.bus = harness.bus
+    return harness
+
+
+async def test_the_stale_drop_hook_gets_the_work_session_and_remaining_budget_once():
+    """R3/AC19 groundwork: exactly one call per stale item with ``(work,
+    session_key, remaining)``, the remaining budget being the total budget
+    minus the wait already spent; the call precedes the item's single
+    ``brain.run.completed``, and the mapping it returns rides in that trace
+    and in the record."""
+
+    hook = StaleDropHook(
+        {
+            "fallback": "sent",
+            "delivery": "fallback:success",
+            "deliveries": [{"name": "chat.send", "status": "success"}],
+        }
+    )
+    async with _hooked_harness(hook) as harness:
+        holder = harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        stale_a = message("stale-a")
+        stale_b = message("stale-b")
+        queued_a = harness.scheduler.admit(SESSION_A, stale_a)
+        harness.clock.advance(2.0)
+        queued_b = harness.scheduler.admit(SESSION_B, stale_b)
+        await settle()
+        assert hook.calls == []
+
+        # 6 units after A was admitted, 4 after B: only A expired its wait.
+        harness.clock.advance(4.0)
+        await settle()
+        assert len(hook.calls) == 1
+        work, session_key, remaining = hook.calls[0]
+        assert work is stale_a
+        assert session_key == SESSION_A
+        # 60 units of total budget, 6 of them already spent waiting.
+        assert remaining == pytest.approx(54.0)
+        # Hook before publication: the trace was not out when it ran.
+        assert not any(
+            payload["run_id"] == queued_a.run_id for payload in hook.completed_at_call[0]
+        )
+
+        record = harness.scheduler.run_record(queued_a.run_id)
+        assert record is not None
+        assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+        assert record.started is False
+        assert record.delivery == "fallback:success"
+        assert record.correlation["fallback"] == "sent"
+        assert record.correlation["deliveries"] == (
+            {"name": "chat.send", "status": "success"},
+        )
+        completed = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued_a.run_id)
+        assert len(completed) == 1
+        assert completed[0]["status"] == "timeout"
+        assert completed[0]["reason"] == REASON_STALE_DROP
+        assert completed[0]["fallback"] == "sent"
+        assert completed[0]["delivery"] == "fallback:success"
+        assert completed[0]["deliveries"] == ({"name": "chat.send", "status": "success"},)
+        assert completed[0]["model_calls"] == 0
+        assert completed[0]["sends"] == 0
+
+        # B expires in its turn: one more call, with its own budget.
+        harness.clock.advance(2.0)
+        await settle()
+        assert len(hook.calls) == 2
+        assert hook.calls[1][0] is stale_b
+        assert hook.calls[1][1] == SESSION_B
+        assert hook.calls[1][2] == pytest.approx(54.0)
+        assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued_b.run_id)) == 1
+
+        # The run that did start never reaches the hook.
+        harness.scheduler._run_body.model.release()
+        await settle()
+        assert harness.scheduler.run_record(holder.run_id).status == "success"
+        assert len(hook.calls) == 2
+        assert harness.counters.get(COUNTER_STALE_DROP) == 2
+        assert harness.counters.get(COUNTER_STALE_DROP_HOOK_FAILURES) == 0
+        assert harness.scheduler.stale_drop_hook_failures == 0
+
+
+@pytest.mark.parametrize("synchronous", [False, True], ids=["async", "sync"])
+async def test_a_raising_stale_drop_hook_leaves_the_record_and_trace_intact_and_counts_once(
+    synchronous,
+):
+    """R3: an exception in the hook is counted and diagnosed, never raised —
+    the ``stale_drop`` record and its one ``brain.run.completed`` stand, the
+    reaper survives, and the next stale item is still dropped."""
+
+    hook = StaleDropHook(raises=RuntimeError("fallback exploded"), synchronous=synchronous)
+    async with _hooked_harness(hook) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued = harness.scheduler.admit(SESSION_A, message("stale"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+
+        assert len(hook.calls) == 1
+        record = harness.scheduler.run_record(queued.run_id)
+        assert record is not None
+        assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+        assert record.waited_seconds == pytest.approx(6.0)
+        assert record.delivery is None
+        assert record.correlation["stale_drop_hook"] == "failed"
+        completed = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued.run_id)
+        assert len(completed) == 1
+        assert completed[0]["status"] == "timeout"
+        assert completed[0]["reason"] == REASON_STALE_DROP
+        assert completed[0]["stale_drop_hook"] == "failed"
+        assert completed[0]["stale_drop_hook_error"] == "RuntimeError: fallback exploded"
+        assert harness.counters.get(COUNTER_STALE_DROP) == 1
+        assert harness.counters.get(COUNTER_STALE_DROP_HOOK_FAILURES) == 1
+        assert harness.scheduler.stale_drop_hook_failures == 1
+
+        # The reaper is still sweeping: a second stale item is dropped too.
+        later = harness.scheduler.admit(SESSION_B, message("later"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+        assert len(hook.calls) == 2
+        assert harness.scheduler.run_record(later.run_id).reason == REASON_STALE_DROP
+        assert harness.counters.get(COUNTER_STALE_DROP_HOOK_FAILURES) == 2
+    assert harness.scheduler.stale_drop_hook_failures == 2
+
+
+async def test_a_stale_drop_hook_overrunning_its_budget_is_abandoned_at_the_total_deadline():
+    """R3: the hook runs inside the reaper and is bounded by the remaining
+    total budget — one that never returns is cancelled at the total deadline,
+    diagnosed and counted, the record is published, and the sweep goes on."""
+
+    hook = StaleDropHook({"fallback": "sent"}, hold=True)
+    async with _hooked_harness(hook, wait_seconds=5.0, total_run_seconds=10.0) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued = harness.scheduler.admit(SESSION_A, message("stale"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+
+        assert len(hook.calls) == 1
+        assert hook.calls[0][2] == pytest.approx(4.0)
+        # Held inside the hook: not yet recorded, not yet published.
+        assert harness.scheduler.run_record(queued.run_id) is None
+        assert harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued.run_id) == []
+
+        # The total deadline: the hook is let go, cancelled, and the record
+        # is written and published without what it never answered.
+        harness.clock.advance(4.0)
+        await settle()
+        assert hook.cancelled == 1
+        record = harness.scheduler.run_record(queued.run_id)
+        assert record is not None
+        assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+        assert record.correlation["stale_drop_hook"] == "abandoned"
+        assert "fallback" not in record.correlation
+        completed = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued.run_id)
+        assert len(completed) == 1
+        assert completed[0]["stale_drop_hook"] == "abandoned"
+        assert "fallback" not in completed[0]
+        assert harness.counters.get(COUNTER_STALE_DROP_HOOK_FAILURES) == 1
+
+        # The sweep was stalled by nothing: the next stale item is reached.
+        # (The first holder met its own total deadline at 10; a fresh one
+        # keeps the single worker busy so ``later`` has to wait.)
+        hook.hold = False
+        harness.scheduler.admit(HOLDER, message("holder-2"))
+        await settle()
+        assert harness.scheduler.active_runs == 1
+        later = harness.scheduler.admit(SESSION_B, message("later"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+        assert len(hook.calls) == 2
+        record = harness.scheduler.run_record(later.run_id)
+        assert record.reason == REASON_STALE_DROP
+        assert record.correlation["fallback"] == "sent"
+
+
+class GatedStaleDropHook:
+    """Answers at once, except for the sessions it holds until ``release``."""
+
+    def __init__(self, *held: SessionKey) -> None:
+        self.held = set(held)
+        self.gate = asyncio.Event()
+        self.calls: list[tuple[Work, SessionKey, float]] = []
+        self.cancelled: list[SessionKey] = []
+
+    def release(self) -> None:
+        self.gate.set()
+
+    async def __call__(self, work, session_key, remaining):
+        self.calls.append((work, session_key, remaining))
+        if session_key in self.held:
+            try:
+                await self.gate.wait()
+            except asyncio.CancelledError:
+                self.cancelled.append(session_key)
+                raise
+        return {"fallback": f"sent:{session_key.viewer_id}"}
+
+
+async def test_stale_items_of_one_sweep_run_their_hooks_side_by_side():
+    """R3 review: one sweep's hooks are bounded by their own budgets, not by
+    each other's — a hook holding item A's whole budget neither delays item
+    B's call nor spends B's budget, and B is recorded while A is still held."""
+
+    hook = GatedStaleDropHook(SESSION_A)
+    async with _hooked_harness(hook, wait_seconds=5.0, total_run_seconds=10.0) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued_a = harness.scheduler.admit(SESSION_A, message("stale-a"))
+        queued_b = harness.scheduler.admit(SESSION_B, message("stale-b"))
+        await settle()
+
+        # Both expire in the same sweep, with the same 5 units left.
+        harness.clock.advance(6.0)
+        await settle()
+        assert [(key, remaining) for _work, key, remaining in hook.calls] == [
+            (SESSION_A, pytest.approx(4.0)),
+            (SESSION_B, pytest.approx(4.0)),
+        ]
+        # A is held; B is already through, with its answer.
+        assert harness.scheduler.run_record(queued_a.run_id) is None
+        record_b = harness.scheduler.run_record(queued_b.run_id)
+        assert record_b is not None
+        assert record_b.reason == REASON_STALE_DROP
+        assert record_b.correlation["fallback"] == "sent:viewer-b"
+        assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued_b.run_id)) == 1
+
+        # A is let go at its own total deadline, exactly as before.
+        harness.clock.advance(4.0)
+        await settle()
+        assert hook.cancelled == [SESSION_A]
+        record_a = harness.scheduler.run_record(queued_a.run_id)
+        assert record_a is not None
+        assert record_a.correlation["stale_drop_hook"] == "abandoned"
+        assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued_a.run_id)) == 1
+        assert harness.counters.get(COUNTER_STALE_DROP) == 2
+        assert harness.counters.get(COUNTER_STALE_DROP_HOOK_FAILURES) == 1
+
+
+async def test_a_sweep_runs_at_most_stale_drop_concurrency_hooks_at_once():
+    """R3 review: the fan-out is bounded — with two slots and two hooks held,
+    the third item waits for a slot, and takes its budget from the instant
+    its turn comes rather than from the sweep that claimed it."""
+
+    hook = GatedStaleDropHook(SESSION_A, SESSION_B)
+    async with _hooked_harness(
+        hook, wait_seconds=5.0, total_run_seconds=10.0, stale_drop_concurrency=2
+    ) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued = [
+            harness.scheduler.admit(session, message(f"stale-{session.viewer_id}"))
+            for session in (SESSION_A, SESSION_B, SESSION_C)
+        ]
+        await settle()
+
+        harness.clock.advance(6.0)
+        await settle()
+        assert [key for _work, key, _remaining in hook.calls] == [SESSION_A, SESSION_B]
+        assert all(harness.scheduler.run_record(item.run_id) is None for item in queued)
+
+        # Two units later both slots free up: C is called with what is left
+        # of *its* budget at that instant, and everything is recorded once.
+        harness.clock.advance(2.0)
+        hook.release()
+        await settle()
+        assert [key for _work, key, _remaining in hook.calls] == [
+            SESSION_A,
+            SESSION_B,
+            SESSION_C,
+        ]
+        assert hook.calls[2][2] == pytest.approx(2.0)
+        assert hook.cancelled == []
+        for item, session in zip(queued, (SESSION_A, SESSION_B, SESSION_C)):
+            record = harness.scheduler.run_record(item.run_id)
+            assert record is not None
+            assert record.reason == REASON_STALE_DROP
+            assert record.correlation["fallback"] == f"sent:{session.viewer_id}"
+            assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, item.run_id)) == 1
+        assert harness.counters.get(COUNTER_STALE_DROP) == 3
+        assert harness.counters.get(COUNTER_STALE_DROP_HOOK_FAILURES) == 0
+
+
+@pytest.mark.parametrize("stale_drop_concurrency", [0, None, 1.5, True])
+def test_a_stale_drop_concurrency_that_is_not_a_positive_count_is_refused_by_name(
+    stale_drop_concurrency,
+):
+    with pytest.raises(ContractError) as caught:
+        Harness(lambda _context: None, stale_drop_concurrency=stale_drop_concurrency)
+    assert "stale_drop_concurrency" in str(caught.value)
+
+
+async def test_shutdown_inside_a_held_stale_drop_hook_counts_the_drop_once():
+    """F9 review: shutdown landing inside the hook finishes the item through
+    the orphan path — one ``stale_drop`` record, one trace, and the drop
+    counted there and only there, never once before the hook and once again."""
+
+    hook = StaleDropHook({"fallback": "sent"}, hold=True)
+    harness = _hooked_harness(hook, wait_seconds=5.0, total_run_seconds=60.0)
+    await harness.scheduler.start()
+    harness.scheduler.admit(HOLDER, message("holder"))
+    await settle()
+    queued = harness.scheduler.admit(SESSION_A, message("stale"))
+    await settle()
+    harness.clock.advance(6.0)
+    await settle()
+    assert len(hook.calls) == 1
+    assert harness.scheduler.run_record(queued.run_id) is None
+
+    await harness.scheduler.aclose()
+
+    assert hook.cancelled == 1
+    record = harness.scheduler.run_record(queued.run_id)
+    assert record is not None
+    assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+    assert record.started is False
+    assert "fallback" not in record.correlation
+    assert len(harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued.run_id)) == 1
+    assert harness.counters.get(COUNTER_STALE_DROP) == 1
+    assert harness.counters.get(COUNTER_STALE_DROP_HOOK_FAILURES) == 0
+    assert harness.scheduler.stale_drop_hook_failures == 0
+
+
+async def test_a_stale_drop_at_a_spent_total_budget_hands_the_hook_zero_seconds():
+    """R2/R3: the wait is clamped to the total, so a drop can meet a budget of
+    exactly 0; the hook is still called once, with ``0.0``, and a synchronous
+    answer is merged — nothing can be awaited past the total deadline."""
+
+    hook = StaleDropHook({"fallback": "skipped:deadline_exceeded"}, synchronous=True)
+    async with _hooked_harness(hook, wait_seconds=10.0, total_run_seconds=10.0) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued = harness.scheduler.admit(SESSION_A, message("stale"))
+        await settle()
+        harness.clock.advance(11.0)
+        await settle()
+
+        assert len(hook.calls) == 1
+        assert hook.calls[0][2] == 0.0
+        record = harness.scheduler.run_record(queued.run_id)
+        assert record is not None
+        assert record.reason == REASON_STALE_DROP
+        assert record.correlation["fallback"] == "skipped:deadline_exceeded"
+        assert harness.scheduler.stale_drop_hook_failures == 0
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, "sent", {"status": "success", "run_id": "forged", "delivery": 7, "sends": 3}],
+    ids=["none", "text", "reserved-fields"],
+)
+async def test_a_stale_drop_hook_result_that_is_not_a_correlation_changes_nothing(result):
+    """R8: only a mapping is merged, and the scheduler's own trace fields
+    (status, run_id, sends, …) can no more be overwritten by the hook than by
+    a run body; a non-text ``delivery`` is ignored rather than recorded."""
+
+    hook = StaleDropHook(result)
+    async with _hooked_harness(hook) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued = harness.scheduler.admit(SESSION_A, message("stale"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+
+        assert len(hook.calls) == 1
+        record = harness.scheduler.run_record(queued.run_id)
+        assert record is not None
+        assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+        assert record.delivery is None
+        assert dict(record.correlation) == {}
+        completed = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued.run_id)
+        assert len(completed) == 1
+        assert completed[0]["status"] == "timeout"
+        assert completed[0]["run_id"] == queued.run_id
+        assert completed[0]["sends"] == 0
+        assert completed[0]["delivery"] is None
+        assert harness.scheduler.stale_drop_hook_failures == 0
+
+
+async def test_without_a_hook_a_stale_drop_reports_nothing_extra():
+    """The default: no hook, an empty correlation, and no hook counter declared
+    on the registry — the phase-0 stale drop (AC8) is untouched."""
+
+    body = RunSpy(FakeModel())
+    async with Harness(body, workers=1, wait_seconds=5.0) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued = harness.scheduler.admit(SESSION_A, message("stale"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+
+        record = harness.scheduler.run_record(queued.run_id)
+        assert record is not None
+        assert record.reason == REASON_STALE_DROP
+        assert dict(record.correlation) == {}
+        assert COUNTER_STALE_DROP_HOOK_FAILURES not in harness.counters
+        assert harness.scheduler.stale_drop_hook_failures == 0
+        (completed,) = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued.run_id)
+        assert "stale_drop_hook" not in completed
+
+
+def test_a_non_callable_stale_drop_hook_is_refused_by_name():
+    with pytest.raises(ContractError) as caught:
+        AdmissionScheduler(lambda _context: None, on_stale_drop="fallback")  # type: ignore[arg-type]
+    assert "on_stale_drop" in str(caught.value)
