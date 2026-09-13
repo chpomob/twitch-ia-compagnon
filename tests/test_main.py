@@ -6,6 +6,7 @@ import math
 import os
 import re
 import signal
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,11 @@ from uuid import uuid4
 
 import pytest
 import yaml
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised on the 3.10 floor only
+    import tomli as tomllib
 
 import core.main as application
 from core.bus import EventBus
@@ -3305,3 +3311,52 @@ def test_main_help_exits_zero_and_documents_the_check(
     usage = capsys.readouterr().out
     assert "--config PATH" in usage
     assert "--check-config" in usage
+
+
+def _pyproject() -> dict[str, Any]:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+def test_pyproject_ships_core_and_modules_with_every_manifest() -> None:
+    """R8 (AC43): the distribution declares both package globs and the
+    package-data glob that carries every shipped ``module.yaml`` (plus one
+    per subpackage), so a clean install discovers the same manifests as the
+    checkout; every shipped module directory is a package."""
+
+    project = _pyproject()
+    setuptools = project["tool"]["setuptools"]
+
+    assert setuptools["packages"]["find"]["include"] == ["core*", "modules*"]
+    package_data = setuptools["package-data"]
+    assert package_data["modules"] == ["*/module.yaml"]
+
+    shipped = sorted(
+        child.name for child in (ROOT / "modules").iterdir()
+        if (child / "module.yaml").is_file()
+    )
+    assert shipped
+    for name in shipped:
+        assert (ROOT / "modules" / name / "__init__.py").is_file(), name
+        assert package_data[f"modules.{name}"] == ["module.yaml"], name
+    assert (ROOT / "modules" / "__init__.py").is_file()
+
+
+def test_pyproject_declares_the_console_script_and_the_build_backend_for_tests() -> None:
+    """R8 (AC43): the console script points at ``core.main:main``; the
+    runtime dependencies stay ``aiohttp`` and ``PyYAML``; the ``test`` extra
+    carries the declared build backend (``setuptools>=69``) so the install
+    test can build without isolation or network and a missing backend is an
+    environment error, never a skip."""
+
+    project = _pyproject()
+
+    assert project["project"]["scripts"] == {
+        "twitch-ia-compagnon": "core.main:main"
+    }
+    assert project["build-system"]["build-backend"] == "setuptools.build_meta"
+    assert sorted(
+        re.match(r"[A-Za-z0-9_.-]+", spec).group(0).lower()
+        for spec in project["project"]["dependencies"]
+    ) == ["aiohttp", "pyyaml"]
+    assert "setuptools>=69" in project["project"]["optional-dependencies"]["test"]
+    assert "setuptools>=69" in project["build-system"]["requires"]

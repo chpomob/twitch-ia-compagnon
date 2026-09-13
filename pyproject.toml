@@ -16,10 +16,28 @@ dependencies = [
 test = [
     "pytest>=8,<9",
     "pytest-asyncio>=0.23,<2",
+    # The declared build backend: the AC43 install test builds the
+    # distribution without build isolation (no network), so a missing backend
+    # is an environment error rather than a reason to skip.
+    "setuptools>=69",
+    # ``tomllib`` is 3.11+; the pyproject tests read this file on the 3.10
+    # floor through its backport.
+    "tomli>=2,<3; python_version < '3.11'",
 ]
 
+[project.scripts]
+twitch-ia-compagnon = "core.main:main"
+
 [tool.setuptools.packages.find]
-include = ["core*"]
+include = ["core*", "modules*"]
+
+[tool.setuptools.package-data]
+# Globs are relative to the package: every shipped manifest travels with the
+# ``modules`` package so ``modules_directory: builtin`` discovers it installed.
+modules = ["*/module.yaml"]
+"modules.twitch" = ["module.yaml"]
+"modules.brain" = ["module.yaml"]
+"modules.audit" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
