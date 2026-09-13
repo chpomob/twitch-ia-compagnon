@@ -1712,6 +1712,10 @@ def _declared_chat_write_spec() -> ActionSpec:
             ),
             timeout_seconds=entry["timeout_seconds"],
             idempotency=entry["idempotency"],
+            # The delivery capability (R1 decision 1) is part of the contract
+            # the loader discovered; omitting it would make this a different
+            # specification and the registry would refuse the redeclaration.
+            delivery=entry.get("delivery"),
         )
     except Exception:
         raise TwitchModuleError(

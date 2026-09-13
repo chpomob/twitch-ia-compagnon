@@ -289,7 +289,8 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     a settings schema and the hook this package implements, the three trigger
     types with their parameter schemas, the combination operators, exactly
     one default policy that names the companion only by token, and the
-    ``chat.write`` action contract.
+    ``chat.write`` action contract carrying the delivery capability under
+    ``text`` (R1 decision 1, AC58) and nothing else.
     """
 
     from core.runtime import RUNTIME_API
@@ -338,6 +339,34 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     assert set(action["result_schema"]["required"]) == {"message_id", "destination"}
     assert action["timeout_seconds"] == 10
     assert action["idempotency"] == "none"
+    assert action["delivery"] == {"text_argument": "text"}
+    assert set(action) == {
+        "name",
+        "version",
+        "description",
+        "argument_schema",
+        "result_schema",
+        "nature",
+        "required_permissions",
+        "supported_destinations",
+        "timeout_seconds",
+        "idempotency",
+        "delivery",
+    }
+    assert set(manifest) == {
+        "name",
+        "manifest_version",
+        "runtime_api",
+        "produces",
+        "consumes",
+        "middleware",
+        "lifecycle",
+        "settings_schema",
+        "settings_validator",
+        "credentials",
+        "triggers",
+        "actions",
+    }
 
 
 def test_settings_hook_names_module_and_field_without_values() -> None:
@@ -412,6 +441,13 @@ async def test_loader_activates_the_v2_manifest_and_coordinator_drives_the_phase
     assert binding.module == "twitch"
     assert binding.destination == Destination(PLATFORM, SETTINGS["broadcaster_id"], "chat")
     assert CHAT_WRITE_ACTION in context.actions.registered_ready()
+    # The bound spec is the discovered one, field for field — the delivery
+    # capability included (R1 decision 1): any drift between the module's
+    # reading of the manifest and the loader's would have refused the binding.
+    discovered = context.actions.discovered()[CHAT_WRITE_ACTION]
+    assert binding.spec == discovered
+    assert discovered.delivery == {"text_argument": "text"}
+    assert discovered.delivery_text_argument == "text"
 
     websocket.feed(notification("loaded-1"))
     await wait_until(lambda: len(chat_events(context.bus)) == 1)

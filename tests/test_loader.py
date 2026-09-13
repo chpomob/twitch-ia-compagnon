@@ -2234,6 +2234,105 @@ async def test_invalid_v2_declaration_stops_startup(
 
 
 @pytest.mark.asyncio
+async def test_delivery_on_a_read_action_is_refused_at_manifest_validation(
+    tmp_path: Path,
+) -> None:
+    """AC58: a ``read`` action declaring ``delivery`` fails discovery.
+
+    The diagnostic names the module and the action's ``delivery`` field, so
+    the manifest author sees which declaration is refused; no module is
+    activated.
+    """
+
+    chat_read = {
+        **CHAT_WRITE_ACTION,
+        "name": "chat.read",
+        "nature": "read",
+        "delivery": {"text_argument": "text"},
+    }
+    make_module(
+        tmp_path,
+        "reader",
+        manifest=v2_manifest("reader", actions=[CHAT_WRITE_ACTION, chat_read]),
+        source=V2_MODULE_SOURCE,
+    )
+    context = runtime_context()
+    settings = v2_settings("reader")
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["reader"], "modules": {"reader": settings}}
+        )
+
+    assert str(caught.value).startswith(
+        "module 'reader': field 'actions[1].delivery': "
+    )
+    assert "read" in str(caught.value)
+    assert settings["calls"] == []
+    assert context.actions.discovered() == {}
+
+
+@pytest.mark.asyncio
+async def test_delivery_declaration_is_parsed_into_the_action_spec(
+    tmp_path: Path,
+) -> None:
+    """R1 decision 1: the manifest's ``delivery`` reaches the discovered spec."""
+
+    effect = {
+        **CHAT_WRITE_ACTION,
+        "name": "stream.set_scene",
+        "delivery": {"text_argument": "none"},
+    }
+    make_module(
+        tmp_path,
+        "chat",
+        manifest=v2_manifest(
+            "chat",
+            actions=[
+                {**CHAT_WRITE_ACTION, "delivery": {"text_argument": "text"}},
+                effect,
+            ],
+        ),
+        source=V2_MODULE_SOURCE,
+    )
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context)
+
+    await loader.activate_enabled(
+        {"enabled_modules": ["chat"], "modules": {"chat": v2_settings("chat")}}
+    )
+
+    discovered = context.actions.discovered()
+    assert discovered["chat.write"].delivery == {"text_argument": "text"}
+    assert discovered["chat.write"].delivery_text_argument == "text"
+    assert discovered["stream.set_scene"].delivery == {"text_argument": "none"}
+    assert discovered["stream.set_scene"].delivery_text_argument is None
+
+
+@pytest.mark.asyncio
+async def test_shipped_twitch_manifest_declares_chat_write_as_a_text_delivery() -> None:
+    """AC58: ``chat.write`` in the shipped twitch manifest delivers under ``text``.
+
+    Discovery validates every manifest under the shipped ``modules/`` tree
+    whether or not it is enabled, so no module is activated here.
+    """
+
+    context = runtime_context()
+    loader = ModuleLoader(
+        context.bus, Path(__file__).parents[1] / "modules", context=context
+    )
+
+    await loader.activate_enabled({"enabled_modules": [], "modules": {}})
+
+    declaration = loader.discovered["twitch"].declaration
+    assert declaration is not None
+    specs = {spec.name: spec for spec in declaration.actions}
+    assert specs["chat.write"].nature == "write"
+    assert specs["chat.write"].delivery == {"text_argument": "text"}
+    assert specs["chat.write"].delivery_text_argument == "text"
+
+
+@pytest.mark.asyncio
 async def test_v1_manifest_may_not_declare_a_v2_key(tmp_path: Path) -> None:
     """A manifest belongs to exactly one contract, so the fork is never ambiguous."""
 

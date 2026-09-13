@@ -185,3 +185,8 @@ actions:
     # The platform offers no replay key: a repeated call may duplicate the
     # message, so no blind retry follows an uncertain outcome.
     idempotency: none
+    # Delivery capability (R1 decision 1): this action may close a run as a
+    # configured terminal delivery, the final answer text arriving under
+    # `text`. The model is never offered it; configuration selects it.
+    delivery:
+      text_argument: text

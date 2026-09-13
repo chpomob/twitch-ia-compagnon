@@ -194,6 +194,7 @@ _ACTION_KEYS: frozenset[str] = frozenset(
         "supported_destinations",
         "timeout_seconds",
         "idempotency",
+        "delivery",
     }
 )
 
@@ -1723,10 +1724,18 @@ def _manifest_actions(name: str, manifest: Mapping[str, Any]) -> tuple[ActionSpe
                 ),
                 timeout_seconds=entry.get("timeout_seconds"),
                 idempotency=entry.get("idempotency"),
+                delivery=entry.get("delivery"),
             )
         except ModuleLoadError:
             raise
-        except (ContractError, TypeError, ValueError) as exc:
+        except ContractError as exc:
+            # The contract names the field it refused (``ActionSpec.delivery``
+            # on a ``read`` action, AC58): the diagnostic names that field of
+            # this very action rather than the whole entry.
+            raise _field_error(
+                name, _action_field(field_name, exc), _sanitised_reason(exc.reason)
+            ) from None
+        except (TypeError, ValueError) as exc:
             raise _field_error(name, field_name, _sanitised_reason(str(exc))) from None
         if spec.name in seen:
             raise _field_error(
@@ -1735,6 +1744,22 @@ def _manifest_actions(name: str, manifest: Mapping[str, Any]) -> tuple[ActionSpe
         seen.add(spec.name)
         specs.append(spec)
     return tuple(specs)
+
+
+_ACTION_SPEC_FIELD_PREFIX = "ActionSpec."
+
+
+def _action_field(field_name: str, exc: ContractError) -> str:
+    """The manifest field a refused ``ActionSpec`` field corresponds to.
+
+    ``ActionSpec.delivery`` on ``actions[2]`` reads ``actions[2].delivery``;
+    a contract field named otherwise leaves the entry named as a whole.
+    """
+
+    field = getattr(exc, "field", None)
+    if isinstance(field, str) and field.startswith(_ACTION_SPEC_FIELD_PREFIX):
+        return f"{field_name}.{field[len(_ACTION_SPEC_FIELD_PREFIX):]}"
+    return field_name
 
 
 def _destination(name: str, field_name: str, value: Any) -> Destination:

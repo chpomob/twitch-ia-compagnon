@@ -43,6 +43,11 @@ TERMINAL_STATUSES = frozenset(
 ACTION_NATURES = frozenset({"read", "write"})
 """An action either observes (``read``) or engages an effect (``write``)."""
 
+DELIVERY_TEXT_ARGUMENT_KEY = "text_argument"
+DELIVERY_NO_TEXT_ARGUMENT = "none"
+"""The one key of an action's ``delivery`` capability, and the literal that
+declares an effect-only delivery receiving no answer text (R1 decision 1)."""
+
 IDEMPOTENCY_POLICIES = frozenset({"none", "key", "natural"})
 """How a provider behaves when the same call is replayed.
 
@@ -978,6 +983,12 @@ class ActionSpec:
     supported_destinations: tuple[Destination, ...]
     timeout_seconds: float
     idempotency: str
+    #: The optional delivery capability (R1 decision 1): ``{text_argument:
+    #: <name> | "none"}``. Declaring it marks the action as a candidate for
+    #: the configured terminal delivery step and states how the answer text
+    #: maps into its arguments; it is never offered to the model. A ``read``
+    #: action cannot deliver anything, so the field is refused on one.
+    delivery: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _validate_action_name(self.name, "ActionSpec.name")
@@ -1035,6 +1046,27 @@ class ActionSpec:
                 f"must be one of {allowed}, got {self.idempotency!r}",
             )
 
+        if self.delivery is not None:
+            object.__setattr__(
+                self,
+                "delivery",
+                _validate_delivery(self.delivery, self.nature, self.argument_schema),
+            )
+
+    @property
+    def delivery_text_argument(self) -> str | None:
+        """The argument the answer text is delivered under, ``None`` for none.
+
+        ``None`` both for an action without the delivery capability and for
+        an effect-only delivery (``text_argument: none``); ``delivery`` tells
+        the two apart.
+        """
+
+        if self.delivery is None:
+            return None
+        name = self.delivery[DELIVERY_TEXT_ARGUMENT_KEY]
+        return None if name == DELIVERY_NO_TEXT_ARGUMENT else name
+
     def supports(self, destination: Destination) -> bool:
         """Whether *destination* falls inside a declared supported destination."""
 
@@ -1051,6 +1083,46 @@ class ActionSpec:
         """Raise :class:`ContractError` unless *result* matches the schema."""
 
         validate_against_schema(result, self.result_schema, label="result")
+
+
+def _validate_delivery(
+    value: Any, nature: str, argument_schema: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Validate and freeze a delivery capability declaration (R1 decision 1).
+
+    The declaration is ``{text_argument: <name> | "none"}``: the named
+    argument must exist in *argument_schema* as a ``string`` property so the
+    runtime can put the answer text there without guessing; ``"none"``
+    declares an effect-only delivery. Only an action that acts on the world
+    can deliver, so nature ``read`` is refused.
+    """
+
+    field = "ActionSpec.delivery"
+    if nature == "read":
+        raise ContractError(field, "is not allowed on an action of nature 'read'")
+    _require_mapping(value, field)
+    unknown = sorted(set(value) - {DELIVERY_TEXT_ARGUMENT_KEY})
+    if unknown:
+        raise ContractError(field, f"declares unknown keys: {', '.join(unknown)}")
+    if DELIVERY_TEXT_ARGUMENT_KEY not in value:
+        raise ContractError(field, f"must declare {DELIVERY_TEXT_ARGUMENT_KEY!r}")
+    name = _require_text(
+        value[DELIVERY_TEXT_ARGUMENT_KEY], f"{field}.{DELIVERY_TEXT_ARGUMENT_KEY}"
+    )
+    if name != DELIVERY_NO_TEXT_ARGUMENT:
+        properties = argument_schema.get("properties")
+        property_schema = (
+            properties.get(name) if isinstance(properties, Mapping) else None
+        )
+        if not isinstance(property_schema, Mapping):
+            raise ContractError(
+                field, f"names text_argument {name!r}, absent from argument_schema"
+            )
+        if property_schema.get("type") != "string":
+            raise ContractError(
+                field, f"names text_argument {name!r}, which is not of type 'string'"
+            )
+    return _frozen_mapping({DELIVERY_TEXT_ARGUMENT_KEY: name}, field)
 
 
 def _validate_dotted_name(value: Any, field: str, *, minimum_segments: int) -> None:

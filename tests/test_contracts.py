@@ -240,3 +240,99 @@ def test_parts_refuse_unexpected_fields_and_non_mappings() -> None:
     with pytest.raises(ContractError) as not_sequence:
         _observation({"type": "text", "text": "x"})
     assert not_sequence.value.field == "ActionObservation.parts"
+
+
+# --------------------------------------------------------------------------- #
+# ActionSpec.delivery (R1 decision 1, R5)
+# --------------------------------------------------------------------------- #
+
+_TEXT_ARGUMENTS = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}, "count": {"type": "integer"}},
+    "required": ["text"],
+    "additionalProperties": False,
+}
+
+
+def _write_spec(delivery: object = None, *, nature: str = "write") -> ActionSpec:
+    return ActionSpec(
+        name="chat.write",
+        version=1,
+        description="send text",
+        argument_schema=_TEXT_ARGUMENTS,
+        result_schema={"type": "object"},
+        nature=nature,
+        required_permissions=("chat.write",),
+        supported_destinations=(Destination("twitch", "*", "chat"),),
+        timeout_seconds=1.0,
+        idempotency="none",
+        delivery=delivery,
+    )
+
+
+def test_spec_without_delivery_is_unchanged() -> None:
+    # The field is appended last and defaulted, so every existing constructor
+    # keeps its meaning and declares no delivery capability.
+    spec = _write_spec()
+    assert spec.delivery is None
+    assert spec.delivery_text_argument is None
+    assert _spec({"type": "object"}).delivery is None
+
+
+def test_delivery_on_a_write_spec_is_accepted_frozen_and_part_of_equality() -> None:
+    spec = _write_spec({"text_argument": "text"})
+
+    assert spec.delivery == {"text_argument": "text"}
+    assert spec.delivery_text_argument == "text"
+    with pytest.raises(TypeError):
+        spec.delivery["text_argument"] = "count"  # type: ignore[index]
+
+    # Two specs differing only by ``delivery`` are unequal: the proxy's
+    # ``hello`` comparison and the registry's redeclaration check see it.
+    assert spec == _write_spec({"text_argument": "text"})
+    assert spec != _write_spec()
+    assert spec != _write_spec({"text_argument": "none"})
+
+
+def test_effect_only_delivery_declares_no_text_argument() -> None:
+    spec = _write_spec({"text_argument": "none"})
+
+    assert spec.delivery == {"text_argument": "none"}
+    assert spec.delivery_text_argument is None
+
+
+@pytest.mark.parametrize(
+    ("delivery", "nature"),
+    [
+        ({"text_argument": "text"}, "read"),
+        ({"text_argument": "none"}, "read"),
+        ({"text_argument": "text", "mode": "fixed"}, "write"),
+        ({}, "write"),
+        ({"text_argument": "missing"}, "write"),
+        ({"text_argument": "count"}, "write"),
+        ("text", "write"),
+        (["text"], "write"),
+    ],
+    ids=[
+        "read-with-text",
+        "read-effect-only",
+        "unknown-key",
+        "missing-text-argument",
+        "argument-absent-from-schema",
+        "argument-not-a-string",
+        "not-a-mapping",
+        "a-list",
+    ],
+)
+def test_invalid_delivery_names_the_field(delivery: object, nature: str) -> None:
+    """AC58 (contract half): a ``read`` action cannot declare a delivery."""
+
+    with pytest.raises(ContractError) as caught:
+        _write_spec(delivery, nature=nature)
+    assert caught.value.field == "ActionSpec.delivery"
+
+
+def test_delivery_text_argument_value_must_be_a_name() -> None:
+    with pytest.raises(ContractError) as caught:
+        _write_spec({"text_argument": 1})
+    assert caught.value.field == "ActionSpec.delivery.text_argument"
