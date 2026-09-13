@@ -14,6 +14,11 @@ in a module of their own because ``core/triggers.py``, ``core/admission.py``,
 ``core/actions.py`` and ``core/runtime.py`` all need them while ``core/runtime.py``
 already imports the contracts, so hosting them there would close an import cycle.
 Nothing else belongs here: this module stays pure data plus those two utilities.
+
+Phase 1 adds, on the same grounds, the typed observation parts of R4 and the
+vocabulary shared by the brain, the proxy and the agent link (synthetic codes,
+run failures, probe reasons, delivery resolution reasons, proxy protocol v1):
+declared once here so every side spells each code identically.
 """
 
 from __future__ import annotations
@@ -169,8 +174,236 @@ TRACE_MAX_BYTES = 2048
 TRACE_MIN_MAX_BYTES = 64
 """Smallest budget that can still hold the truncation marker."""
 
+# --------------------------------------------------------------------------- #
+# Observation parts (phase 1, R4)
+# --------------------------------------------------------------------------- #
+
+PART_TYPE_TEXT = "text"
+PART_TYPE_IMAGE_REF = "image_ref"
+PART_TYPES = frozenset({PART_TYPE_TEXT, PART_TYPE_IMAGE_REF})
+"""The two part types an :class:`ActionObservation` may carry (R4)."""
+
+IMAGE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg"})
+"""Content types an ``image_ref`` part may declare (R4)."""
+
+IMAGE_REF_FIELDS = (
+    "attachment_id",
+    "content_type",
+    "size",
+    "width",
+    "height",
+    "captured_at",
+    "provider_id",
+)
+"""The seven fields every ``image_ref`` part must carry (R4, AC21)."""
+
+# --------------------------------------------------------------------------- #
+# Brain vocabulary shared with the executor and the modules (phase 1, R1–R4)
+# --------------------------------------------------------------------------- #
+
+# Codes of the synthetic observations the brain builds without an executor
+# call (R1) and of the observation errors R4 defines. ``unknown_action`` and
+# ``invalid_result`` deliberately reuse the executor's literals so a reader of
+# the traces sees one code per situation, whoever produced it.
+BRAIN_ERROR_NOT_A_READ_ACTION = "not_a_read_action"
+BRAIN_ERROR_UNKNOWN_ACTION = "unknown_action"
+BRAIN_ERROR_MALFORMED_ARGUMENTS = "malformed_arguments"
+BRAIN_ERROR_OBSERVATION_TOO_LARGE = "observation_too_large"
+BRAIN_ERROR_ATTACHMENT_REFUSED = "attachment_refused"
+BRAIN_ERROR_ATTACHMENT_EXPIRED = "attachment_expired"
+BRAIN_ERROR_INVALID_RESULT = "invalid_result"
+
+BRAIN_ERROR_CODES = frozenset(
+    {
+        BRAIN_ERROR_NOT_A_READ_ACTION,
+        BRAIN_ERROR_UNKNOWN_ACTION,
+        BRAIN_ERROR_MALFORMED_ARGUMENTS,
+        BRAIN_ERROR_OBSERVATION_TOO_LARGE,
+        BRAIN_ERROR_ATTACHMENT_REFUSED,
+        BRAIN_ERROR_ATTACHMENT_EXPIRED,
+        BRAIN_ERROR_INVALID_RESULT,
+    }
+)
+
+# Failures that end a run ``error`` before any delivery (R1, R2, R3).
+RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE = "unsupported_response_shape"
+RUN_FAILURE_CAPABILITY_MISSING = "capability_missing"
+RUN_FAILURE_BUDGET_EXHAUSTED = "budget_exhausted"
+
+RUN_FAILURES = frozenset(
+    {
+        RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
+        RUN_FAILURE_CAPABILITY_MISSING,
+        RUN_FAILURE_BUDGET_EXHAUSTED,
+    }
+)
+
+PROBE_TOOL = "runtime.probe"
+"""Name of the tool the prepare-time capability probe forces (R2, decision 3).
+
+A runtime constant, not a model name: the brain and the test harness import
+this one symbol so the forced call and its recognition never drift apart.
+"""
+
+# Reasons a capability probe fails, spelled in the startup diagnostic (R2).
+PROBE_REASON_NON_SUCCESS_STATUS = "non_success_status"
+PROBE_REASON_NO_TOOL_CALL = "no_tool_call"
+PROBE_REASON_MULTIPLE_TOOL_CALLS = "multiple_tool_calls"
+PROBE_REASON_MALFORMED_ARGUMENTS = "malformed_arguments"
+PROBE_REASON_IMAGE_REJECTED = "image_rejected"
+PROBE_REASON_TIMED_OUT = "timed_out"
+PROBE_REASON_TRANSPORT_FAILED = "transport_failed"
+
+PROBE_REASONS = frozenset(
+    {
+        PROBE_REASON_NON_SUCCESS_STATUS,
+        PROBE_REASON_NO_TOOL_CALL,
+        PROBE_REASON_MULTIPLE_TOOL_CALLS,
+        PROBE_REASON_MALFORMED_ARGUMENTS,
+        PROBE_REASON_IMAGE_REJECTED,
+        PROBE_REASON_TIMED_OUT,
+        PROBE_REASON_TRANSPORT_FAILED,
+    }
+)
+
+# Reasons the resolution of a delivery list fails preparation (R1, decision 1).
+DELIVERY_REASON_UNKNOWN_ACTION = "unknown_action"
+DELIVERY_REASON_NOT_A_DELIVERY = "not_a_delivery"
+DELIVERY_REASON_TEXT_MAPPING_MISSING = "text_mapping_missing"
+DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS = "text_mapping_ambiguous"
+DELIVERY_REASON_EMPTY = "empty"
+
+DELIVERY_RESOLUTION_REASONS = frozenset(
+    {
+        DELIVERY_REASON_UNKNOWN_ACTION,
+        DELIVERY_REASON_NOT_A_DELIVERY,
+        DELIVERY_REASON_TEXT_MAPPING_MISSING,
+        DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS,
+        DELIVERY_REASON_EMPTY,
+    }
+)
+
+# --------------------------------------------------------------------------- #
+# Proxy protocol v1 (phase 1, R6, decision 8)
+# --------------------------------------------------------------------------- #
+# Declared once here so ``modules/proxy``, ``modules/agent_link`` and
+# ``docs/proxy-protocol.md`` spell every code identically.
+
+PROXY_PROTOCOL_VERSION = 1
+"""Value of the ``v`` field of every text frame (R6)."""
+
+PROXY_DEFAULT_MAX_FRAME_BYTES = 1_048_576
+"""Default bound on one text frame; a larger one is ``frame_too_large`` (R6)."""
+
+FRAME_HELLO = "hello"
+FRAME_WELCOME = "welcome"
+FRAME_ERROR = "error"
+FRAME_CALL = "call"
+FRAME_OBSERVATION = "observation"
+FRAME_CANCEL = "cancel"
+FRAME_ATTACHMENT = "attachment"
+FRAME_ATTACHMENT_ACK = "attachment_ack"
+FRAME_EVENT = "event"
+FRAME_PING = "ping"
+FRAME_PONG = "pong"
+
+PROXY_FRAME_TYPES = frozenset(
+    {
+        FRAME_HELLO,
+        FRAME_WELCOME,
+        FRAME_ERROR,
+        FRAME_CALL,
+        FRAME_OBSERVATION,
+        FRAME_CANCEL,
+        FRAME_ATTACHMENT,
+        FRAME_ATTACHMENT_ACK,
+        FRAME_EVENT,
+        FRAME_PING,
+        FRAME_PONG,
+    }
+)
+"""Every ``type`` a text frame may carry; anything else is ``unknown_frame``."""
+
+PROXY_SESSION_FRAME_TYPES = frozenset(
+    {FRAME_PING, FRAME_PONG, FRAME_EVENT, FRAME_ATTACHMENT, FRAME_ATTACHMENT_ACK}
+)
+"""Frames whose ``id`` is the ``session_id`` issued by ``welcome`` (R6)."""
+
+PROXY_CALL_FRAME_TYPES = frozenset({FRAME_CALL, FRAME_OBSERVATION, FRAME_CANCEL})
+"""Frames whose ``id`` is the ``call_id`` they concern (R6)."""
+
+# Codes of the ``error`` frame (R6).
+PROXY_ERROR_AUTH_FAILED = "auth_failed"
+PROXY_ERROR_AGENT_LIMIT = "agent_limit"
+PROXY_ERROR_UNSUPPORTED_PROTOCOL_VERSION = "unsupported_protocol_version"
+PROXY_ERROR_FRAME_TOO_LARGE = "frame_too_large"
+PROXY_ERROR_UNKNOWN_FRAME = "unknown_frame"
+PROXY_ERROR_UNKNOWN_SESSION = "unknown_session"
+PROXY_ERROR_INVALID_FRAME = "invalid_frame"
+PROXY_ERROR_DUPLICATE_CALL_UNKNOWN = "duplicate_call_unknown"
+PROXY_ERROR_ACTION_MISMATCH = "action_mismatch"
+PROXY_ERROR_PROXY_DISCONNECTED = "proxy_disconnected"
+PROXY_ERROR_EVENT_NOT_ALLOWED = "event_not_allowed"
+
+PROXY_ERROR_CODES = frozenset(
+    {
+        PROXY_ERROR_AUTH_FAILED,
+        PROXY_ERROR_AGENT_LIMIT,
+        PROXY_ERROR_UNSUPPORTED_PROTOCOL_VERSION,
+        PROXY_ERROR_FRAME_TOO_LARGE,
+        PROXY_ERROR_UNKNOWN_FRAME,
+        PROXY_ERROR_UNKNOWN_SESSION,
+        PROXY_ERROR_INVALID_FRAME,
+        PROXY_ERROR_DUPLICATE_CALL_UNKNOWN,
+        PROXY_ERROR_ACTION_MISMATCH,
+        PROXY_ERROR_PROXY_DISCONNECTED,
+        PROXY_ERROR_EVENT_NOT_ALLOWED,
+    }
+)
+
+# Refusal codes of the ``attachment_ack`` frame (R6); an accepted transfer
+# carries ``accepted: true`` and no code.
+ATTACHMENT_ACK_TOO_LARGE = "attachment_too_large"
+ATTACHMENT_ACK_STORE_FULL = "store_full"
+ATTACHMENT_ACK_UNEXPECTED_BINARY = "unexpected_binary"
+
+ATTACHMENT_ACK_CODES = frozenset(
+    {ATTACHMENT_ACK_TOO_LARGE, ATTACHMENT_ACK_STORE_FULL, ATTACHMENT_ACK_UNEXPECTED_BINARY}
+)
+
+# WebSocket close codes sent with the terminal ``error`` frame (R6). Mirrors
+# the HTTP status the situation would map to, in the 4000–4999 application
+# range the WebSocket RFC reserves for private use.
+PROXY_CLOSE_BAD_REQUEST = 4400
+"""Unsupported protocol version or invalid ``hello`` (R6, AC32, AC48)."""
+PROXY_CLOSE_AUTH_FAILED = 4401
+PROXY_CLOSE_AGENT_LIMIT = 4409
+PROXY_CLOSE_FRAME_TOO_LARGE = 4413
+
+PROXY_CLOSE_CODES = frozenset(
+    {
+        PROXY_CLOSE_BAD_REQUEST,
+        PROXY_CLOSE_AUTH_FAILED,
+        PROXY_CLOSE_AGENT_LIMIT,
+        PROXY_CLOSE_FRAME_TOO_LARGE,
+    }
+)
+
+
 __all__ = [
     "ACTION_NATURES",
+    "ATTACHMENT_ACK_CODES",
+    "ATTACHMENT_ACK_STORE_FULL",
+    "ATTACHMENT_ACK_TOO_LARGE",
+    "ATTACHMENT_ACK_UNEXPECTED_BINARY",
+    "BRAIN_ERROR_ATTACHMENT_EXPIRED",
+    "BRAIN_ERROR_ATTACHMENT_REFUSED",
+    "BRAIN_ERROR_CODES",
+    "BRAIN_ERROR_INVALID_RESULT",
+    "BRAIN_ERROR_MALFORMED_ARGUMENTS",
+    "BRAIN_ERROR_NOT_A_READ_ACTION",
+    "BRAIN_ERROR_OBSERVATION_TOO_LARGE",
+    "BRAIN_ERROR_UNKNOWN_ACTION",
     "COMBINATION_OPERATORS",
     "CONTRACT_VERSION",
     "COUNTER_ACTION_TIMEOUTS",
@@ -181,13 +414,70 @@ __all__ = [
     "COUNTER_RUN_DEADLINE_EXPIRIES",
     "COUNTER_STALE_DROP",
     "COUNTER_TRIGGER_REJECTIONS",
+    "DELIVERY_REASON_EMPTY",
+    "DELIVERY_REASON_NOT_A_DELIVERY",
+    "DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS",
+    "DELIVERY_REASON_TEXT_MAPPING_MISSING",
+    "DELIVERY_REASON_UNKNOWN_ACTION",
+    "DELIVERY_RESOLUTION_REASONS",
     "DIAGNOSTIC_COUNTERS",
+    "FRAME_ATTACHMENT",
+    "FRAME_ATTACHMENT_ACK",
+    "FRAME_CALL",
+    "FRAME_CANCEL",
+    "FRAME_ERROR",
+    "FRAME_EVENT",
+    "FRAME_HELLO",
+    "FRAME_OBSERVATION",
+    "FRAME_PING",
+    "FRAME_PONG",
+    "FRAME_WELCOME",
     "IDEMPOTENCY_POLICIES",
+    "IMAGE_CONTENT_TYPES",
+    "IMAGE_REF_FIELDS",
     "INTERNAL_TRACE_TYPES",
+    "PART_TYPES",
+    "PART_TYPE_IMAGE_REF",
+    "PART_TYPE_TEXT",
     "POLICY_VERSION_LENGTH",
+    "PROBE_REASONS",
+    "PROBE_REASON_IMAGE_REJECTED",
+    "PROBE_REASON_MALFORMED_ARGUMENTS",
+    "PROBE_REASON_MULTIPLE_TOOL_CALLS",
+    "PROBE_REASON_NON_SUCCESS_STATUS",
+    "PROBE_REASON_NO_TOOL_CALL",
+    "PROBE_REASON_TIMED_OUT",
+    "PROBE_REASON_TRANSPORT_FAILED",
+    "PROBE_TOOL",
+    "PROXY_CALL_FRAME_TYPES",
+    "PROXY_CLOSE_AGENT_LIMIT",
+    "PROXY_CLOSE_AUTH_FAILED",
+    "PROXY_CLOSE_BAD_REQUEST",
+    "PROXY_CLOSE_CODES",
+    "PROXY_CLOSE_FRAME_TOO_LARGE",
+    "PROXY_DEFAULT_MAX_FRAME_BYTES",
+    "PROXY_ERROR_ACTION_MISMATCH",
+    "PROXY_ERROR_AGENT_LIMIT",
+    "PROXY_ERROR_AUTH_FAILED",
+    "PROXY_ERROR_CODES",
+    "PROXY_ERROR_DUPLICATE_CALL_UNKNOWN",
+    "PROXY_ERROR_EVENT_NOT_ALLOWED",
+    "PROXY_ERROR_FRAME_TOO_LARGE",
+    "PROXY_ERROR_INVALID_FRAME",
+    "PROXY_ERROR_PROXY_DISCONNECTED",
+    "PROXY_ERROR_UNKNOWN_FRAME",
+    "PROXY_ERROR_UNKNOWN_SESSION",
+    "PROXY_ERROR_UNSUPPORTED_PROTOCOL_VERSION",
+    "PROXY_FRAME_TYPES",
+    "PROXY_PROTOCOL_VERSION",
+    "PROXY_SESSION_FRAME_TYPES",
     "REDACTION_PLACEHOLDER",
     "REQUIRED_COUNTERS",
     "RESERVED_TRACE_KEYS",
+    "RUN_FAILURES",
+    "RUN_FAILURE_BUDGET_EXHAUSTED",
+    "RUN_FAILURE_CAPABILITY_MISSING",
+    "RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE",
     "SUPPORTED_CONTRACT_VERSIONS",
     "TERMINAL_STATUSES",
     "TERMINAL_TRACE_TYPES",
@@ -220,9 +510,11 @@ __all__ = [
     "TriggerRule",
     "TriggerSpec",
     "TriggerTypeDeclaration",
+    "observation_size",
     "sanitize_trace",
     "trace_size",
     "validate_against_schema",
+    "validate_parts",
     "validate_schema",
 ]
 
@@ -864,12 +1156,20 @@ class ActionObservation:
     ``status`` is constrained to :data:`TERMINAL_STATUSES`. A result is only
     carried by a ``success``; every other status carries a normalised error so
     an absent status can never be read as a delivery.
+
+    ``parts`` (phase 1, R4) is the typed content fed back to the model: a
+    tuple of ``text`` parts (``{"type": "text", "text": str}``) and
+    ``image_ref`` parts carrying the seven :data:`IMAGE_REF_FIELDS`. Parts
+    are validated for shape at construction by :func:`validate_parts` and
+    frozen; an observation built without ``parts`` carries ``()``. Images
+    travel by reference only: no payload, no filesystem path.
     """
 
     status: str
     provenance: Mapping[str, Any]
     result: Mapping[str, Any] | None = None
     error: Mapping[str, Any] | None = None
+    parts: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if self.status not in TERMINAL_STATUSES:
@@ -878,6 +1178,10 @@ class ActionObservation:
                 "ActionObservation.status",
                 f"must be one of {allowed}, got {self.status!r}",
             )
+
+        # Shape only: the byte bound and the lease checks belong to the
+        # executor, which knows the store and the configured budget (R4).
+        object.__setattr__(self, "parts", validate_parts(self.parts))
 
         provenance = _frozen_mapping(self.provenance, "ActionObservation.provenance")
         if not provenance:
@@ -922,6 +1226,117 @@ def _normalised_error(value: Any, field: str) -> Mapping[str, Any]:
     if "retryable" in error and not isinstance(error["retryable"], bool):
         raise ContractError(f"{field}.retryable", "must be a boolean")
     return error
+
+
+def validate_parts(
+    parts: Any,
+    *,
+    max_text_bytes: int | None = None,
+    field: str = "ActionObservation.parts",
+) -> tuple[Mapping[str, Any], ...]:
+    """Return *parts* as a frozen tuple, or raise naming the offending field.
+
+    Every part is a mapping whose ``type`` is one of :data:`PART_TYPES`; a
+    ``text`` part carries a string ``text`` (at most *max_text_bytes* UTF-8
+    bytes when a bound is given), an ``image_ref`` part carries exactly the
+    seven :data:`IMAGE_REF_FIELDS` with their declared types. A missing,
+    mistyped or unexpected field raises :class:`ContractError` with
+    ``<field>[<i>].<name>`` (R4, AC21). The executor calls this with the
+    configured bound; construction calls it without one.
+    """
+
+    if isinstance(parts, (str, bytes, Mapping)) or not isinstance(parts, Sequence):
+        raise ContractError(field, f"must be a sequence of parts, got {type(parts).__name__}")
+    if max_text_bytes is not None and (
+        not isinstance(max_text_bytes, int)
+        or isinstance(max_text_bytes, bool)
+        or max_text_bytes <= 0
+    ):
+        raise ContractError("max_text_bytes", "must be a strictly positive integer")
+
+    frozen: list[Mapping[str, Any]] = []
+    for index, part in enumerate(parts):
+        label = f"{field}[{index}]"
+        _require_mapping(part, label)
+        kind = part.get("type")
+        if not isinstance(kind, str) or kind not in PART_TYPES:
+            allowed = ", ".join(sorted(PART_TYPES))
+            raise ContractError(f"{label}.type", f"must be one of {allowed}, got {kind!r}")
+        if kind == PART_TYPE_TEXT:
+            _validate_text_part(part, label, max_text_bytes)
+        else:
+            _validate_image_ref_part(part, label)
+        frozen.append(_freeze(part, label))
+    return tuple(frozen)
+
+
+def _validate_text_part(part: Mapping[str, Any], label: str, max_text_bytes: int | None) -> None:
+    for name in part:
+        if name not in ("type", "text"):
+            raise ContractError(f"{label}.{name}", "is not a field of a text part")
+    if "text" not in part:
+        raise ContractError(f"{label}.text", "is required and missing")
+    text = part["text"]
+    if not isinstance(text, str):
+        raise ContractError(f"{label}.text", f"must be a string, got {type(text).__name__}")
+    if max_text_bytes is not None:
+        size = len(text.encode("utf-8"))
+        if size > max_text_bytes:
+            raise ContractError(
+                f"{label}.text", f"is {size} UTF-8 bytes, above the bound of {max_text_bytes}"
+            )
+
+
+def _validate_image_ref_part(part: Mapping[str, Any], label: str) -> None:
+    for name in part:
+        if name != "type" and name not in IMAGE_REF_FIELDS:
+            raise ContractError(f"{label}.{name}", "is not a field of an image_ref part")
+    for name in IMAGE_REF_FIELDS:
+        if name not in part:
+            raise ContractError(f"{label}.{name}", "is required and missing")
+
+    _require_text(part["attachment_id"], f"{label}.attachment_id")
+    _require_text(part["provider_id"], f"{label}.provider_id")
+    content_type = part["content_type"]
+    if not isinstance(content_type, str) or content_type not in IMAGE_CONTENT_TYPES:
+        allowed = ", ".join(sorted(IMAGE_CONTENT_TYPES))
+        raise ContractError(
+            f"{label}.content_type", f"must be one of {allowed}, got {content_type!r}"
+        )
+    for name in ("size", "width", "height"):
+        value = part[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ContractError(
+                f"{label}.{name}", f"must be an integer, got {type(value).__name__}"
+            )
+        if value <= 0:
+            raise ContractError(f"{label}.{name}", "must be strictly positive")
+    _require_finite_number(part["captured_at"], f"{label}.captured_at")
+
+
+def observation_size(parts: Sequence[Mapping[str, Any]]) -> int:
+    """Return the size of an observation as R4 defines it.
+
+    The sum, over *parts*, of the UTF-8 byte length of each ``text`` part's
+    ``text`` and of the ``size`` of each ``image_ref`` part. The envelope, the
+    ``result`` mapping and the part metadata (dimensions, timestamps, ids)
+    are not counted (R4, AC47). *parts* must already satisfy
+    :func:`validate_parts`; an unknown part type raises rather than being
+    silently skipped.
+    """
+
+    total = 0
+    for index, part in enumerate(parts):
+        kind = part.get("type") if isinstance(part, Mapping) else None
+        if kind == PART_TYPE_TEXT:
+            total += len(part["text"].encode("utf-8"))
+        elif kind == PART_TYPE_IMAGE_REF:
+            total += part["size"]
+        else:
+            raise ContractError(
+                f"ActionObservation.parts[{index}].type", f"is not a known part type: {kind!r}"
+            )
+    return total
 
 
 # --------------------------------------------------------------------------- #
