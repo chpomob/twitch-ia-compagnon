@@ -587,12 +587,22 @@ def _assemble_runtime(config: Mapping[str, Any]) -> _Runtime:
     # never authorizes it (R5, R7).
     authorization = AuthorizationPolicy(_authorization_rules(config))
     registry = ActionRegistry(authorization=authorization)
+    # The executor checks every ``image_ref`` part against the same store the
+    # modules lease from, so a provider naming an attachment of another run,
+    # expired or of the wrong size is refused before the model sees it (R4).
+    # ``max_observation_bytes`` stays unset here: the observation-size rule
+    # is enforced per run by the module that owns the run budget, through
+    # its own ``budget.max_observation_bytes`` setting; the executor's bound
+    # is a runtime-wide guard an embedder may set — one rule, two enforcement
+    # points, the same ``observation_too_large`` code.
     executor = ActionExecutor(
         registry,
         authorization,
         supervision=supervision,
         counters=counters,
         clock=clock,
+        attachments=attachments,
+        max_observation_bytes=None,
     )
     context = RuntimeContext(
         bus=bus,

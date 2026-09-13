@@ -1309,8 +1309,9 @@ def validate_parts(
     """Return *parts* as a frozen tuple, or raise naming the offending field.
 
     Every part is a mapping whose ``type`` is one of :data:`PART_TYPES`; a
-    ``text`` part carries a string ``text`` (at most *max_text_bytes* UTF-8
-    bytes when a bound is given), an ``image_ref`` part carries exactly the
+    ``text`` part carries a UTF-8 encodable string ``text`` — a lone
+    surrogate is rejected — of at most *max_text_bytes* UTF-8 bytes when a
+    bound is given, an ``image_ref`` part carries exactly the
     seven :data:`IMAGE_REF_FIELDS` with their declared types. A missing,
     mistyped or unexpected field raises :class:`ContractError` with
     ``<field>[<i>].<name>`` (R4, AC21). The executor calls this with the
@@ -1351,12 +1352,19 @@ def _validate_text_part(part: Mapping[str, Any], label: str, max_text_bytes: int
     text = part["text"]
     if not isinstance(text, str):
         raise ContractError(f"{label}.text", f"must be a string, got {type(text).__name__}")
-    if max_text_bytes is not None:
+    # A lone surrogate is a ``str`` that has no UTF-8 form: it cannot be
+    # sized under R4 nor rendered to the model, so it is a shape failure
+    # here, not a ``UnicodeEncodeError`` escaping from a size check later.
+    try:
         size = len(text.encode("utf-8"))
-        if size > max_text_bytes:
-            raise ContractError(
-                f"{label}.text", f"is {size} UTF-8 bytes, above the bound of {max_text_bytes}"
-            )
+    except UnicodeEncodeError as exc:
+        raise ContractError(
+            f"{label}.text", f"is not encodable as UTF-8 ({exc.reason} at index {exc.start})"
+        ) from None
+    if max_text_bytes is not None and size > max_text_bytes:
+        raise ContractError(
+            f"{label}.text", f"is {size} UTF-8 bytes, above the bound of {max_text_bytes}"
+        )
 
 
 def _validate_image_ref_part(part: Mapping[str, Any], label: str) -> None:

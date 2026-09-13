@@ -393,6 +393,25 @@ class AttachmentStore:
             )
         return entry.data
 
+
+    def lookup(self, attachment_id: str) -> AttachmentRef | None:
+        """Return the reference retained under *attachment_id*, or ``None``.
+
+        A pure read for a consumer that must judge a lease itself — the
+        executor validating an ``image_ref`` part checks the run, the stored
+        size and the deadline it carries against the call (R4, AC22, AC47).
+        Nothing is reaped, extended or refreshed: a reference past its
+        deadline that the reaper has not reached yet is returned as stored,
+        with the ``expires_at`` that lets the caller see it expired, so
+        looking a lease up can neither prolong it nor shorten another. An
+        identifier this store does not hold — released, reaped or never
+        issued — reads ``None``.
+        """
+
+        attachment_id = _require_text(attachment_id, "AttachmentStore.lookup.attachment_id")
+        entry = self._entries.get(attachment_id)
+        return entry.ref if entry is not None else None
+
     # ----------------------------------------------------------------- #
     # Releasing and accounting
     # ----------------------------------------------------------------- #
@@ -428,6 +447,26 @@ class AttachmentStore:
         # somehow kept an empty state is cleared here too.
         self._runs.pop(run, None)
         return freed
+
+    def discard(self, attachment_id: str) -> bool:
+        """Drop the one object retained under *attachment_id*, if any.
+
+        The release path of a rejected observation: an ``image_ref`` the
+        executor refuses — wrong run, expired, stored size mismatch, or an
+        observation over its byte bound — is dropped here at once rather
+        than left leased until the run's terminal record releases it (R4).
+        Idempotent, and idempotent with :meth:`release`: both go through the
+        single accounting path, so an object discarded here is not freed a
+        second time when its run ends, and discarding an identifier the
+        store no longer holds does nothing. Returns whether an object was
+        actually dropped.
+        """
+
+        attachment_id = _require_text(attachment_id, "AttachmentStore.discard.attachment_id")
+        if attachment_id not in self._entries:
+            return False
+        self._drop(attachment_id)
+        return True
 
     def usage(self, run_id: str) -> RunUsage:
         """Return what *run_id* currently leases, expiry applied first."""

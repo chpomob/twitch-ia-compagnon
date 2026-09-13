@@ -185,6 +185,21 @@ def test_text_part_over_the_bound_is_refused_through_validate_parts() -> None:
     validate_parts([{"type": "text", "text": "éé"}], max_text_bytes=4)
 
 
+def test_text_part_that_cannot_be_encoded_as_utf8_is_a_shape_failure() -> None:
+    # A lone surrogate is a ``str`` with no UTF-8 form: it cannot be sized
+    # under R4, so it is refused at construction and under a bound alike —
+    # as a ContractError naming the field, never a UnicodeEncodeError.
+    parts = [{"type": "text", "text": "ok\ud800"}]
+    with pytest.raises(ContractError) as at_construction:
+        _observation(parts)
+    assert at_construction.value.field == "ActionObservation.parts[0].text"
+
+    with pytest.raises(ContractError) as under_bound:
+        validate_parts(parts, max_text_bytes=1024)
+    assert under_bound.value.field == "ActionObservation.parts[0].text"
+    assert "UTF-8" in str(under_bound.value)
+
+
 @pytest.mark.parametrize("name", IMAGE_REF_FIELDS)
 def test_image_ref_missing_any_of_its_seven_fields_names_it(name: str) -> None:
     part = _image_ref()

@@ -36,6 +36,7 @@ from core.actions import (
     ActionRegistry,
     AuthorizationPolicy,
 )
+from core.attachments import AttachmentStore
 from core.bus import EventBus
 from core.contracts import ActionObservation, Counters, SessionKey
 from core.lifecycle import SupervisedTasks
@@ -245,6 +246,7 @@ def runtime_context(
     chat: Any = None,
     authorization: AuthorizationPolicy | None = None,
     actions: ActionRegistry | None = None,
+    attachments: AttachmentStore | None = None,
 ) -> RuntimeContext:
     """The versioned runtime every suite builds identically (P19).
 
@@ -258,7 +260,11 @@ def runtime_context(
     feeds the executor's default-deny check (R5). ``scheduler`` is the
     shared admission scheduler — when ``None``, a module that owns one
     (the brain engine) builds the real :class:`AdmissionScheduler` itself
-    onto the same context.
+    onto the same context. ``attachments`` is the one store both the modules
+    lease from (through the context) and the executor validates every
+    ``image_ref`` part against (R4): a suite exercising images passes a
+    store built on the same ``clock``, and the default ``None`` keeps a
+    suite without images exactly as before.
     """
 
     target_bus = bus if bus is not None else EventBus()
@@ -282,10 +288,16 @@ def runtime_context(
         supervision=supervision,
         tasks=SupervisedTasks(),
         executor=ActionExecutor(
-            registry, policy, supervision=supervision, counters=counters, clock=target_clock
+            registry,
+            policy,
+            supervision=supervision,
+            counters=counters,
+            clock=target_clock,
+            attachments=attachments,
         ),
         triggers=engine,
         chat=chat,
+        attachments=attachments,
         scheduler=scheduler,
         clock=target_clock,
     )

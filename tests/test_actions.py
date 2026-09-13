@@ -8,9 +8,16 @@ The last section carries the P1 contract assertions the plan attaches to this
 step: a length-prefixed :class:`~core.contracts.SessionKey` serialisation that
 adversarial separators cannot collide, and the terminal-status and nature
 constraints that keep an unknown status out of an observation (R3, R5).
+
+Phase 1 (R4) adds the executor-side checks on observation ``parts``: an
+``image_ref`` must be leased to the call's run, unexpired on the injected
+clock and of the stored size, the observation must fit the executor's byte
+bound, and a rejected observation releases every image it named (AC22, AC47);
+and the not-ready provider outcome becomes ``refused`` (R6, AC35).
 """
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -22,6 +29,9 @@ from core.actions import (
     ERROR_INVALID_ARGUMENTS,
     ERROR_INVALID_RESULT,
     ERROR_NOT_AUTHORIZED,
+    ERROR_OBSERVATION_TOO_LARGE,
+    ERROR_PROVIDER_NOT_READY,
+    ERROR_UNKNOWN_ACTION,
     REASON_NO_RULE,
     ActionExecutor,
     ActionRegistry,
@@ -29,6 +39,7 @@ from core.actions import (
     AuthorizationPolicy,
     AuthorizationRule,
 )
+from core.attachments import AttachmentRef, AttachmentStore
 from core.contracts import (
     TERMINAL_STATUSES,
     TRACE_ACTION_COMPLETED,
@@ -206,13 +217,22 @@ class Provider:
 class Harness:
     """A registry, a policy and an executor wired onto the doubles."""
 
-    def __init__(self, *, sleeper=never_sleep, cancel_grace: float = 0.05) -> None:
+    def __init__(
+        self,
+        *,
+        sleeper=never_sleep,
+        cancel_grace: float = 0.05,
+        clock: ManualClock | None = None,
+        attachments: AttachmentStore | None = None,
+        max_observation_bytes: int | None = None,
+    ) -> None:
         self.bus = FakeBus()
         self.counters = Counters()
         self.supervision = FakeSupervision(self.bus, self.counters)
         self.policy = AuthorizationPolicy()
         self.registry = ActionRegistry(authorization=self.policy)
-        self.clock = ManualClock()
+        self.clock = clock if clock is not None else ManualClock()
+        self.attachments = attachments
         self.executor = ActionExecutor(
             self.registry,
             self.policy,
@@ -221,6 +241,8 @@ class Harness:
             clock=self.clock,
             sleeper=sleeper,
             cancel_grace_seconds=cancel_grace,
+            attachments=attachments,
+            max_observation_bytes=max_observation_bytes,
         )
 
     def declare(self, *specs: ActionSpec, module: str = MODULE) -> None:
@@ -854,8 +876,15 @@ async def test_a_provider_failure_that_never_emitted_is_an_error():
     assert "transport refused the frame" in observation.error["message"]
 
 
-async def test_an_unready_module_is_an_error_with_zero_invocations():
-    """R5: the readiness barrier gates invocation, not only the view."""
+async def test_an_unready_module_is_refused_with_zero_invocations():
+    """R5/R6: the readiness barrier gates invocation, not only the view.
+
+    Replaces the phase-0 assertion that a not-ready provider was an ``error``:
+    phase 1 (plan step P3, R6/AC35) classifies it as ``refused`` with the
+    same ``provider_not_ready`` code, so an action whose provider disconnected
+    mid-run reads to the model as a capability that declined, never as a
+    broken action. The guarantees kept: 0 provider invocations, the code.
+    """
 
     harness = Harness()
     harness.declare(READ_SPEC)
@@ -864,9 +893,42 @@ async def test_an_unready_module_is_an_error_with_zero_invocations():
     harness.allow(READ_SPEC)  # authorized, but the module never became ready
 
     observation = await harness.executor.invoke(make_call(READ_SPEC))
-    assert observation.status == "error"
-    assert observation.error["code"] == "provider_not_ready"
+    assert observation.status == "refused"
+    assert observation.error["code"] == ERROR_PROVIDER_NOT_READY == "provider_not_ready"
+    assert observation.result is None
+    assert observation.parts == ()
     assert provider.calls == []
+    assert harness.executor.provider_invocations == 0
+    completed = harness.bus.of_type(TRACE_ACTION_COMPLETED)
+    assert [(p["status"], p["error_code"]) for p in completed] == [
+        ("refused", "provider_not_ready")
+    ]
+
+
+async def test_a_module_losing_readiness_mid_run_is_refused_from_then_on():
+    """R6/AC35: a provider that disconnects between two calls of one run.
+
+    The first call reaches the provider; after ``mark_not_ready`` the second
+    is refused with ``provider_not_ready`` and adds no invocation, and the
+    outcome is a refusal — not an error — so the run continues with it.
+    """
+
+    harness = Harness()
+    harness.declare(READ_SPEC)
+    provider = Provider("reader", read_success)
+    harness.bind(READ_SPEC, provider)
+    harness.ready()
+    harness.allow(READ_SPEC)
+
+    first = await harness.executor.invoke(make_call(READ_SPEC, run_id="run-9"))
+    assert first.status == "success"
+    harness.registry.mark_not_ready(MODULE)
+
+    second = await harness.executor.invoke(make_call(READ_SPEC, run_id="run-9"))
+    assert second.status == "refused"
+    assert second.error["code"] == ERROR_PROVIDER_NOT_READY
+    assert len(provider.calls) == 1
+    assert harness.executor.provider_invocations == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1246,6 +1308,525 @@ async def test_a_completion_hook_still_runs_when_the_call_is_cancelled_from_abov
         await task
 
     assert seen == [("external_unknown", 1)]
+
+
+# --------------------------------------------------------------------------- #
+# R4 — observation parts: image leases, stored size, byte bound (AC22, AC47)
+# --------------------------------------------------------------------------- #
+
+MIB = 1024 * 1024
+MAX_OBSERVATION_BYTES = 5 * MIB
+"""AC47's bound: 5 242 880 bytes."""
+
+_ATTACHMENT_LIMITS = {
+    "max_object_bytes": 8 * MIB,
+    "max_objects": 16,
+    "max_total_bytes": 32 * MIB,
+    "max_bytes_per_run": 16 * MIB,
+    "ttl_seconds": 60.0,
+}
+
+
+def _store(clock: ManualClock, **overrides) -> AttachmentStore:
+    """A generous store on the executor's own clock, so expiry is judged once."""
+
+    return AttachmentStore(clock=clock, **{**_ATTACHMENT_LIMITS, **overrides})
+
+
+def _image_harness(**overrides) -> tuple[Harness, AttachmentStore]:
+    """A ready, authorized reader whose observations may carry images."""
+
+    clock = ManualClock()
+    store = AttachmentStore(clock=clock, **{**_ATTACHMENT_LIMITS, **overrides})
+    # One injected clock for the store and the executor: expiry is judged once.
+    harness = Harness(
+        clock=clock, attachments=store, max_observation_bytes=MAX_OBSERVATION_BYTES
+    )
+    harness.declare(READ_SPEC)
+    harness.provider = Provider("capture")
+    harness.bind(READ_SPEC, harness.provider)
+    harness.ready()
+    harness.allow(READ_SPEC)
+    return harness, store
+
+
+def _image_ref(ref: AttachmentRef, **overrides) -> dict:
+    part = {
+        "type": "image_ref",
+        "attachment_id": ref.attachment_id,
+        "content_type": ref.content_type,
+        "size": ref.size,
+        "width": 1920,
+        "height": 1080,
+        "captured_at": ref.created_at,
+        "provider_id": "capture",
+    }
+    part.update(overrides)
+    return part
+
+
+def _text(size: int) -> dict:
+    return {"type": "text", "text": "a" * size}
+
+
+def _observing(parts, *, status: str = "success"):
+    """A read provider behaviour returning the given parts on *status*."""
+
+    def behaviour(_invocation) -> ActionObservation:
+        if status == "success":
+            return ActionObservation(
+                status="success",
+                provenance={"transport": "fake"},
+                result={"lines": []},
+                parts=parts,
+            )
+        return ActionObservation(
+            status=status,
+            provenance={"transport": "fake"},
+            error={"code": "upstream", "message": "the source failed", "retryable": False},
+            parts=parts,
+        )
+
+    return behaviour
+
+
+async def _observe(harness: Harness, parts, *, status: str = "success", run_id: str = "run-1"):
+    """Have the harness's bound provider answer the next call with *parts*."""
+
+    provider = harness.provider
+    provider.behaviour = _observing(parts, status=status)
+    observation = await harness.executor.invoke(make_call(READ_SPEC, run_id=run_id))
+    return provider, observation
+
+
+def _assert_rejected(observation: ActionObservation, code: str) -> None:
+    """The invariant: a rejected observation adopts nothing of the provider's."""
+
+    assert observation.status == "error"
+    assert observation.error["code"] == code
+    assert observation.result is None
+    assert observation.parts == ()
+    assert observation.provenance.get("transport") is None
+    assert observation.provenance["provider_entered"] is True
+
+
+async def test_a_valid_image_ref_leased_to_the_run_is_adopted_with_parts_intact():
+    """AC22 (positive): a lease held by this run, unexpired, of the stored size."""
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x89PNG" + b"\x00" * 60, content_type="image/png")
+    parts = [_text(12), _image_ref(ref)]
+
+    provider, observation = await _observe(harness, parts)
+
+    assert observation.status == "success"
+    assert observation.result["lines"] == ()
+    assert observation.parts == tuple(parts)
+    assert observation.parts[1]["attachment_id"] == ref.attachment_id
+    assert observation.provenance["transport"] == "fake"
+    assert len(provider.calls) == 1
+    # Adopting neither releases nor touches the lease: it is the run's until
+    # its terminal record releases it.
+    assert store.usage("run-1").objects == 1
+    assert store.lookup(ref.attachment_id) == ref
+
+
+def _leased_to_another_run(store: AttachmentStore, clock: ManualClock) -> dict:
+    ref = store.put("run-2", b"\x00" * 64, content_type="image/png")
+    return _image_ref(ref)
+
+
+def _expired_on_the_clock(store: AttachmentStore, clock: ManualClock) -> dict:
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+    clock.advance(_ATTACHMENT_LIMITS["ttl_seconds"])  # exactly at the deadline: expired
+    return _image_ref(ref)
+
+
+def _size_off_by_one(store: AttachmentStore, clock: ManualClock) -> dict:
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+    return _image_ref(ref, size=ref.size + 1)
+
+
+def _size_under_by_one(store: AttachmentStore, clock: ManualClock) -> dict:
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+    return _image_ref(ref, size=ref.size - 1)
+
+
+def _never_issued(store: AttachmentStore, clock: ManualClock) -> dict:
+    # Nothing is stored: the observation names an identifier this store never
+    # handed out, and the discard of an unknown identifier is a no-op.
+    ref = AttachmentRef("0" * 32, "run-1", "image/png", 64, clock(), clock() + 60.0)
+    return _image_ref(ref)
+
+
+@pytest.mark.parametrize(
+    "make_part",
+    [
+        _leased_to_another_run,
+        _expired_on_the_clock,
+        _size_off_by_one,
+        _size_under_by_one,
+        _never_issued,
+    ],
+    ids=["another_run", "expired", "size_plus_one", "size_minus_one", "never_issued"],
+)
+async def test_a_bad_image_lease_is_invalid_result_and_releases_the_object(make_part):
+    """AC22, AC47 tail: wrong run, expired, or a size 1 byte off the stored one.
+
+    The observation becomes ``error invalid_result``, nothing of the provider's
+    result or parts is adopted, and every object the observation named is
+    released at once: the store holds 0 objects for either run before any
+    model request could carry the image.
+    """
+
+    harness, store = _image_harness()
+    part = make_part(store, harness.clock)
+
+    provider, observation = await _observe(harness, [_text(3), part])
+
+    _assert_rejected(observation, ERROR_INVALID_RESULT)
+    assert "parts[1]" in observation.error["message"]
+    assert len(provider.calls) == 1
+    assert store.object_count == 0
+    assert store.usage("run-1").objects == 0
+    assert store.usage("run-2").objects == 0
+    assert store.total_bytes == 0
+    # Idempotent with the run-end release: nothing is freed twice.
+    assert store.release("run-1").objects == 0
+    assert store.release("run-2").objects == 0
+    completed = harness.bus.of_type(TRACE_ACTION_COMPLETED)
+    assert [(p["status"], p["error_code"]) for p in completed] == [("error", "invalid_result")]
+
+
+async def test_a_lease_of_the_run_that_expired_is_judged_on_the_executor_clock():
+    """AC22: one second before the deadline is a lease; at the deadline it is not."""
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+    harness.clock.advance(_ATTACHMENT_LIMITS["ttl_seconds"] - 1.0)
+
+    _provider, observation = await _observe(harness, [_image_ref(ref)])
+    assert observation.status == "success"
+    assert len(observation.parts) == 1
+
+    harness.clock.advance(1.0)
+    _provider, late = await _observe(harness, [_image_ref(ref)])
+    _assert_rejected(late, ERROR_INVALID_RESULT)
+    assert "expired" in late.error["message"]
+    assert store.object_count == 0
+
+
+async def test_one_bad_lease_rejects_the_whole_observation_and_releases_every_image():
+    """R4 invariant: no partially adopted observation.
+
+    Two images, the first a valid lease of this run, the second leased to
+    another run: the observation is rejected whole and **both** objects are
+    released — the valid one is not kept leased behind an error.
+    """
+
+    harness, store = _image_harness()
+    mine = store.put("run-1", b"\x00" * 64, content_type="image/png")
+    theirs = store.put("run-2", b"\x00" * 64, content_type="image/jpeg")
+
+    _provider, observation = await _observe(harness, [_image_ref(mine), _image_ref(theirs)])
+
+    _assert_rejected(observation, ERROR_INVALID_RESULT)
+    assert store.lookup(mine.attachment_id) is None
+    assert store.lookup(theirs.attachment_id) is None
+    assert store.object_count == 0
+
+
+@pytest.mark.parametrize("status", ["error", "timeout", "cancelled", "refused"])
+async def test_every_terminal_status_has_its_image_leases_validated(status):
+    """R4: the parts are validated on every terminal observation, not only a success."""
+
+    harness, store = _image_harness()
+    foreign = store.put("run-2", b"\x00" * 64, content_type="image/png")
+
+    _provider, observation = await _observe(harness, [_image_ref(foreign)], status=status)
+
+    _assert_rejected(observation, ERROR_INVALID_RESULT)
+    assert store.object_count == 0
+
+
+async def test_a_non_success_observation_with_a_valid_image_is_adopted_as_it_stands():
+    """R4: a provider's own ``error`` may carry an image the model will see."""
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+
+    _provider, observation = await _observe(harness, [_image_ref(ref)], status="error")
+
+    assert observation.status == "error"
+    assert observation.error["code"] == "upstream"
+    assert len(observation.parts) == 1
+    assert store.usage("run-1").objects == 1
+
+
+async def test_an_observation_over_the_bound_is_too_large_and_releases_its_images():
+    """AC47 head: 3 145 728 text bytes + a 3 145 728-byte image, each alone
+    under 5 242 880, are 6 291 456 together: ``error observation_too_large``,
+    0 objects for the run afterwards, nothing of the provider's adopted.
+    """
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x00" * (3 * MIB), content_type="image/jpeg")
+    assert ref.size == 3_145_728
+
+    provider, observation = await _observe(harness, [_text(3_145_728), _image_ref(ref)])
+
+    _assert_rejected(observation, ERROR_OBSERVATION_TOO_LARGE)
+    assert observation.error["code"] == "observation_too_large"
+    assert "6291456" in observation.error["message"]
+    assert len(provider.calls) == 1
+    assert store.usage("run-1").objects == 0
+    assert store.total_bytes == 0
+    assert store.release("run-1").objects == 0
+
+
+async def test_an_observation_exactly_at_the_bound_is_adopted_with_its_image():
+    """AC47 middle: 3 145 728 + 2 097 152 = 5 242 880 is accepted, image kept."""
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x00" * (2 * MIB), content_type="image/jpeg")
+    assert ref.size == 2_097_152
+
+    _provider, observation = await _observe(harness, [_text(3_145_728), _image_ref(ref)])
+
+    assert observation.status == "success"
+    assert len(observation.parts) == 2
+    assert observation.parts[1]["attachment_id"] == ref.attachment_id
+    assert store.usage("run-1").objects == 1
+
+
+async def test_a_single_text_part_over_the_bound_is_observation_too_large():
+    """R4: the per-part text bound is the same rule as the observation bound,
+    so it carries the same code — one code for one situation."""
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+
+    _provider, observation = await _observe(
+        harness, [_text(MAX_OBSERVATION_BYTES + 1), _image_ref(ref)]
+    )
+
+    _assert_rejected(observation, ERROR_OBSERVATION_TOO_LARGE)
+    assert "parts[0].text" in observation.error["message"]
+    assert store.object_count == 0
+
+
+async def test_without_a_bound_only_the_leases_are_checked():
+    """``max_observation_bytes=None`` sets no size bound (the brain's is P12)."""
+
+    clock = ManualClock()
+    store = _store(clock)
+    harness = Harness(clock=clock, attachments=store)
+    harness.declare(READ_SPEC)
+    harness.provider = Provider("capture")
+    harness.bind(READ_SPEC, harness.provider)
+    harness.ready()
+    harness.allow(READ_SPEC)
+    ref = store.put("run-1", b"\x00" * (3 * MIB), content_type="image/jpeg")
+
+    _provider, observation = await _observe(harness, [_text(3 * MIB), _image_ref(ref)])
+    assert observation.status == "success"
+    assert len(observation.parts) == 2
+
+    foreign = store.put("run-2", b"\x00" * 64, content_type="image/png")
+    _provider, rejected = await _observe(harness, [_image_ref(foreign)])
+    _assert_rejected(rejected, ERROR_INVALID_RESULT)
+    assert store.lookup(foreign.attachment_id) is None
+
+
+async def test_an_image_ref_without_a_store_cannot_be_validated_and_is_invalid_result():
+    """R4: no store, no lease to check — an image is never adopted on trust."""
+
+    harness = Harness()
+    harness.declare(READ_SPEC)
+    harness.provider = Provider("capture")
+    harness.bind(READ_SPEC, harness.provider)
+    harness.ready()
+    harness.allow(READ_SPEC)
+    orphan = {
+        "type": "image_ref",
+        "attachment_id": "a" * 32,
+        "content_type": "image/png",
+        "size": 64,
+        "width": 8,
+        "height": 8,
+        "captured_at": 0.0,
+        "provider_id": "capture",
+    }
+
+    _provider, observation = await _observe(harness, [orphan])
+    _assert_rejected(observation, ERROR_INVALID_RESULT)
+    assert "no attachment store" in observation.error["message"]
+
+    # Text-only parts need no store and are adopted as they stand.
+    _provider, texty = await _observe(harness, [_text(5)])
+    assert texty.status == "success"
+    assert texty.parts == (_text(5),)
+
+
+async def test_a_result_failing_its_schema_releases_the_images_it_carried():
+    """R4/AC18: a rejected success adopts nothing — parts included."""
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+
+    def malformed(_invocation) -> ActionObservation:
+        return ActionObservation(
+            status="success",
+            provenance={"transport": "fake"},
+            result={"lines": "not-a-list"},
+            parts=[_image_ref(ref)],
+        )
+
+    harness.provider.behaviour = malformed
+    observation = await harness.executor.invoke(make_call(READ_SPEC))
+
+    _assert_rejected(observation, ERROR_INVALID_RESULT)
+    assert store.object_count == 0
+
+
+def _writer_with_images() -> tuple[Harness, AttachmentStore]:
+    """A ready, authorized writer whose observations may carry images."""
+
+    clock = ManualClock()
+    store = _store(clock)
+    harness = Harness(
+        clock=clock, attachments=store, max_observation_bytes=MAX_OBSERVATION_BYTES
+    )
+    harness.declare(WRITE_SPEC)
+    harness.provider = Provider("sender")
+    harness.bind(WRITE_SPEC, harness.provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+    return harness, store
+
+
+def _interrupted(status: str, parts, *, emit: bool):
+    def behaviour(invocation) -> ActionObservation:
+        if emit:
+            invocation.mark_emitted()
+        return ActionObservation(
+            status=status,
+            provenance={"transport": "fake"},
+            error={"code": "timed_out", "message": "no ack", "retryable": True},
+            parts=parts,
+        )
+
+    return behaviour
+
+
+@pytest.mark.parametrize("status", ["timeout", "cancelled"])
+async def test_rejected_parts_do_not_erase_the_uncertainty_of_an_emitted_write(status):
+    """R4 × R5: discarding invalid parts must not lose an emitted write.
+
+    The provider signalled an emission, then returned ``timeout`` (or
+    ``cancelled``) carrying an image leased to another run. The parts are
+    rejected and the foreign object released, but the terminal status stays
+    ``external_unknown`` — as it would have with sound parts — never
+    ``error``, which a caller would read as licence to send again.
+    """
+
+    harness, store = _writer_with_images()
+    foreign = store.put("run-2", b"\x00" * 64, content_type="image/png")
+    harness.provider.behaviour = _interrupted(status, [_image_ref(foreign)], emit=True)
+
+    observation = await harness.executor.invoke(make_call(WRITE_SPEC))
+
+    assert observation.status == "external_unknown"
+    assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
+    assert observation.provenance["emission"] == EMISSION_EMITTED
+    assert observation.parts == ()
+    assert observation.provenance.get("transport") is None
+    # The rejection is still on record, inside the message.
+    assert ERROR_INVALID_RESULT in observation.error["message"]
+    assert "run-2" in observation.error["message"]
+    assert store.lookup(foreign.attachment_id) is None
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+    completed = harness.bus.of_type(TRACE_ACTION_COMPLETED)
+    assert [(p["status"], p["error_code"]) for p in completed] == [
+        ("external_unknown", ERROR_EXTERNAL_UNKNOWN)
+    ]
+
+
+async def test_a_silent_write_interrupted_with_bad_parts_is_still_external_unknown():
+    """R5: emission unknown on a write is uncertain whatever the parts say."""
+
+    harness, store = _writer_with_images()
+    foreign = store.put("run-2", b"\x00" * 64, content_type="image/png")
+    harness.provider.behaviour = _interrupted("timeout", [_image_ref(foreign)], emit=False)
+
+    observation = await harness.executor.invoke(make_call(WRITE_SPEC))
+
+    assert observation.status == "external_unknown"
+    assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
+    assert observation.parts == ()
+    assert store.lookup(foreign.attachment_id) is None
+
+
+async def test_a_read_interrupted_with_bad_parts_is_a_certain_error():
+    """R5: nothing to duplicate on a read, so the rejection's own code stands."""
+
+    harness, store = _image_harness()
+    foreign = store.put("run-2", b"\x00" * 64, content_type="image/png")
+    harness.provider.behaviour = _interrupted("timeout", [_image_ref(foreign)], emit=False)
+
+    observation = await harness.executor.invoke(make_call(READ_SPEC))
+
+    _assert_rejected(observation, ERROR_INVALID_RESULT)
+    assert store.lookup(foreign.attachment_id) is None
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+
+
+async def test_synthetic_observations_carry_no_parts():
+    """R4: what the executor synthesises itself never carries parts."""
+
+    harness, store = _image_harness()
+    ref = store.put("run-1", b"\x00" * 64, content_type="image/png")
+
+    # Not authorized at another principal, unknown action, bad arguments:
+    # three synthetic paths, none reaches the provider.
+    provider = harness.provider
+    provider.behaviour = _observing([_image_ref(ref)])
+    unauthorized = await harness.executor.invoke(make_call(READ_SPEC, principal="viewer:x"))
+    unknown = await harness.executor.invoke(make_call(replace(READ_SPEC, name="chat.missing")))
+    malformed = await harness.executor.invoke(make_call(READ_SPEC, arguments={"limit": 0}))
+
+    assert unauthorized.status == "refused" and unauthorized.parts == ()
+    assert unknown.error["code"] == ERROR_UNKNOWN_ACTION and unknown.parts == ()
+    assert malformed.error["code"] == ERROR_INVALID_ARGUMENTS and malformed.parts == ()
+    assert provider.calls == []
+
+    # The executor-detected interruptions and the uncertain effect as well.
+    for spec, behaviour, sleeper in (
+        (READ_SPEC, hang, immediate_sleep),
+        (WRITE_SPEC, write_success, never_sleep),
+    ):
+        _h, _p, observation = await _terminal(spec, behaviour, sleeper=sleeper)
+        assert observation.parts == ()
+    _h, _p, refused = await _terminal(WRITE_SPEC, write_success, grant=False)
+    assert refused.status == "refused" and refused.parts == ()
+
+
+@pytest.mark.parametrize("bound", [0, -1, True, 1.5, "5"])
+def test_the_observation_bound_must_be_a_positive_integer_or_none(bound):
+    harness = Harness()
+    with pytest.raises(ContractError) as refused:
+        ActionExecutor(harness.registry, harness.policy, max_observation_bytes=bound)
+    assert refused.value.field == "ActionExecutor.max_observation_bytes"
+
+    assert ActionExecutor(harness.registry, harness.policy, max_observation_bytes=None)
+    assert ActionExecutor(harness.registry, harness.policy, max_observation_bytes=1)
+
+
+def test_the_attachment_store_must_be_a_store_or_none():
+    harness = Harness()
+    with pytest.raises(ContractError) as refused:
+        ActionExecutor(harness.registry, harness.policy, attachments=object())
+    assert refused.value.field == "ActionExecutor.attachments"
 
 
 # --------------------------------------------------------------------------- #

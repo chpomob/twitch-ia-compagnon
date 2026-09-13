@@ -1,12 +1,17 @@
 """Observation size and the phase-1 shared vocabulary (R4, AC47 arithmetic).
 
 Created by step P1; the executor-side checks (lease, stored size, byte
-bound) are added by P3 and the model-side ones by P12.
+bound) are added by P3 — exercised here through the shared
+``runtime_context(attachments=...)`` every suite builds, with the one store
+both the modules lease from and the executor validates against — and the
+model-side ones by P12.
 """
 
 import pytest
 
 from core import contracts
+from core.actions import ERROR_INVALID_RESULT, AuthorizationPolicy, AuthorizationRule
+from core.attachments import AttachmentStore
 from core.contracts import (
     ATTACHMENT_ACK_CODES,
     BRAIN_ERROR_CODES,
@@ -20,10 +25,15 @@ from core.contracts import (
     PROXY_FRAME_TYPES,
     PROXY_PROTOCOL_VERSION,
     RUN_FAILURES,
+    WILDCARD,
+    ActionCall,
     ActionObservation,
+    ActionSpec,
     ContractError,
+    Destination,
     observation_size,
 )
+from tests.conftest import ManualClock, runtime_context
 
 MAX_OBSERVATION_BYTES = 5_242_880
 """The default ``budget.max_observation_bytes`` of R3, used by AC47."""
@@ -241,3 +251,231 @@ def test_vocabulary_is_exported_and_carries_no_platform_or_vendor_name() -> None
     text = " ".join(str(value) for value in values).lower()
     for forbidden in ("twitch", "gpt", "openai", "claude", "anthropic"):
         assert forbidden not in text
+
+
+# --------------------------------------------------------------------------- #
+# Executor-side validation through the shared runtime context (P3, AC22)
+# --------------------------------------------------------------------------- #
+
+PLATFORM = "fake-platform"
+MODULE = "capture-module"
+OPERATOR = "operator:companion"
+CAPTURE_SCOPE = Destination(PLATFORM, WILDCARD, "screen")
+
+CAPTURE_SPEC = ActionSpec(
+    name="screen.capture",
+    version=1,
+    description="Capture the screen as an image reference.",
+    argument_schema={"type": "object", "properties": {}, "additionalProperties": False},
+    result_schema={
+        "type": "object",
+        "properties": {"content_type": {"type": "string"}},
+        "required": ["content_type"],
+    },
+    nature="read",
+    required_permissions=("screen.read",),
+    supported_destinations=(CAPTURE_SCOPE,),
+    timeout_seconds=5.0,
+    idempotency="natural",
+)
+
+ATTACHMENT_LIMITS = {
+    "max_object_bytes": 1024,
+    "max_objects": 8,
+    "max_total_bytes": 8192,
+    "max_bytes_per_run": 4096,
+    "ttl_seconds": 30.0,
+}
+
+
+class CaptureProvider:
+    """Answers each call with the parts the test scripted, in order."""
+
+    name = "capture"
+
+    def __init__(self) -> None:
+        self.scripted: list[tuple] = []
+        self.calls: list = []
+
+    async def invoke(self, invocation):
+        self.calls.append(invocation)
+        parts = self.scripted.pop(0)
+        return ActionObservation(
+            status="success",
+            provenance={"transport": "fake"},
+            result={"content_type": "image/png"},
+            parts=parts,
+        )
+
+
+def _image_part(ref, **overrides) -> dict:
+    part = {
+        "type": "image_ref",
+        "attachment_id": ref.attachment_id,
+        "content_type": ref.content_type,
+        "size": ref.size,
+        "width": 640,
+        "height": 480,
+        "captured_at": ref.created_at,
+        "provider_id": "capture",
+    }
+    part.update(overrides)
+    return part
+
+
+def _capture_call(run_id: str, call_id: str, deadline: float) -> ActionCall:
+    return ActionCall(
+        action_name=CAPTURE_SPEC.name,
+        action_version=1,
+        arguments={},
+        conversation_id="conv-1",
+        run_id=run_id,
+        call_id=call_id,
+        source_event_id="evt-1",
+        destination=Destination(PLATFORM, "room-1", "screen"),
+        principal=OPERATOR,
+        deadline=deadline,
+    )
+
+
+def _context_with_store():
+    """The shared fixture with a store on its clock, one ready capture provider."""
+
+    clock = ManualClock()
+    store = AttachmentStore(clock=clock, **ATTACHMENT_LIMITS)
+    policy = AuthorizationPolicy(
+        [
+            AuthorizationRule(
+                rule_id="capture",
+                action_name=CAPTURE_SPEC.name,
+                destination=CAPTURE_SCOPE,
+                principals=(OPERATOR,),
+                natures=("read",),
+                granted_permissions=("screen.read",),
+            )
+        ]
+    )
+    context = runtime_context(clock=clock, attachments=store, authorization=policy)
+    provider = CaptureProvider()
+    context.actions.declare(CAPTURE_SPEC, module=MODULE)
+    context.actions.bind(CAPTURE_SPEC.name, provider, module=MODULE)
+    context.actions.mark_ready(MODULE)
+    return context, clock, store, provider
+
+
+async def test_the_shared_context_carries_one_store_for_modules_and_executor() -> None:
+    """P3: ``runtime_context(attachments=...)`` hands the same store to both."""
+
+    context, clock, store, provider = _context_with_store()
+    assert context.attachments is store
+
+    # A module leases through the context; the executor validates against it.
+    ref = context.attachments.put("run-1", b"\x00" * 512, content_type="image/png")
+    provider.scripted.append([_image_part(ref)])
+    observation = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+
+    assert observation.status == "success"
+    assert observation.parts == (_image_part(ref),)
+    assert store.usage("run-1").objects == 1
+
+
+async def test_an_image_leased_to_another_run_is_invalid_result_through_the_context() -> None:
+    """AC22 through the shared fixture: leased to another run, or expired on
+    the injected clock, the observation is ``invalid_result`` and the store
+    holds 0 objects before any model request could carry the image.
+    """
+
+    context, clock, store, provider = _context_with_store()
+
+    foreign = store.put("run-2", b"\x00" * 256, content_type="image/png")
+    provider.scripted.append([_image_part(foreign)])
+    rejected = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+    assert rejected.status == "error"
+    assert rejected.error["code"] == ERROR_INVALID_RESULT
+    assert rejected.parts == ()
+    assert rejected.result is None
+    assert store.object_count == 0
+
+    stale = store.put("run-1", b"\x00" * 256, content_type="image/png")
+    clock.advance(ATTACHMENT_LIMITS["ttl_seconds"])
+    provider.scripted.append([_image_part(stale)])
+    expired = await context.executor.invoke(_capture_call("run-1", "run-1/call-2", clock() + 5))
+    assert expired.status == "error"
+    assert expired.error["code"] == ERROR_INVALID_RESULT
+    assert store.object_count == 0
+    assert len(provider.calls) == 2
+
+
+async def test_a_stored_size_off_by_one_byte_is_invalid_result_through_the_context() -> None:
+    """AC47 tail through the shared fixture."""
+
+    context, clock, store, provider = _context_with_store()
+    ref = store.put("run-1", b"\x00" * 300, content_type="image/jpeg")
+    provider.scripted.append([_image_part(ref, size=301)])
+
+    observation = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+
+    assert observation.error["code"] == ERROR_INVALID_RESULT
+    assert store.usage("run-1").objects == 0
+    assert store.release("run-1").objects == 0
+
+
+# --------------------------------------------------------------------------- #
+# The two store accessors the executor relies on (P3)
+# --------------------------------------------------------------------------- #
+
+
+def test_lookup_reads_the_lease_without_touching_its_time_to_live() -> None:
+    """The store's lookup neither extends nor reaps a lease.
+
+    A reference past its deadline that the reaper has not reached is returned
+    as stored — its ``expires_at`` tells the caller it expired — and looking
+    it up again returns it still: no side effect on the store. The next
+    reaping accessor drops it, after which lookup reads ``None``.
+    """
+
+    clock = ManualClock()
+    store = AttachmentStore(clock=clock, **ATTACHMENT_LIMITS)
+    ref = store.put("run-1", b"\x00" * 16, content_type="image/png")
+
+    assert store.lookup(ref.attachment_id) == ref
+    clock.advance(10.0)
+    assert store.lookup(ref.attachment_id) == ref  # unchanged: not refreshed
+    assert store.lookup(ref.attachment_id).expires_at == ref.expires_at
+
+    clock.advance(ATTACHMENT_LIMITS["ttl_seconds"])
+    stale = store.lookup(ref.attachment_id)
+    assert stale == ref and stale.expires_at <= clock()
+    assert store.lookup(ref.attachment_id) == ref  # still there: lookup reaps nothing
+
+    assert store.usage("run-1").objects == 0  # a reaping accessor
+    assert store.lookup(ref.attachment_id) is None
+    assert store.lookup("never-issued") is None
+    with pytest.raises(ContractError):
+        store.lookup("")
+
+
+def test_discard_drops_one_object_and_is_idempotent_with_release() -> None:
+    clock = ManualClock()
+    store = AttachmentStore(clock=clock, **ATTACHMENT_LIMITS)
+    first = store.put("run-1", b"\x00" * 16, content_type="image/png")
+    second = store.put("run-1", b"\x00" * 32, content_type="image/png")
+    other = store.put("run-2", b"\x00" * 8, content_type="image/png")
+
+    assert store.discard(first.attachment_id) is True
+    assert store.discard(first.attachment_id) is False  # already gone: no-op
+    assert store.discard("never-issued") is False
+    assert store.lookup(first.attachment_id) is None
+    assert store.lookup(second.attachment_id) == second  # only the named one
+    assert store.usage("run-1").objects == 1
+    assert store.usage("run-1").total_bytes == 32
+    assert store.usage("run-2").objects == 1
+    assert store.total_bytes == 40
+
+    # Run-end release frees what is left, and nothing twice.
+    freed = store.release("run-1")
+    assert freed.objects == 1 and freed.total_bytes == 32
+    assert store.total_bytes == 8
+    assert store.discard(other.attachment_id) is True
+    assert store.total_bytes == 0 and store.object_count == 0
+    assert store.release("run-2").objects == 0

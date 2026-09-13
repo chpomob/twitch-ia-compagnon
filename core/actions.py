@@ -31,7 +31,29 @@ one run refuses the second.
 provider invocation under the spec's timeout, result validation. Anything that
 fails before the provider is reached performs 0 provider invocations, and a
 result failing the result schema is reported as ``error`` — never as a success
-with an unchecked payload (AC18).
+with an unchecked payload (AC18). A bound provider whose module is not ready —
+never became ready, or lost its readiness mid-run when a remote agent
+disconnected — is ``refused`` with ``provider_not_ready`` and 0 invocations,
+so the model reads it as a refusal to act rather than a broken action (R6,
+AC35).
+
+Result validation covers the observation's typed ``parts`` (phase 1, R4) on
+**every** terminal observation a provider returns, whatever its status: the
+parts must have the contract's shape, every ``image_ref`` must name an
+attachment the injected :class:`~core.attachments.AttachmentStore` holds
+leased to the call's ``run_id``, unexpired on the executor clock at
+validation and of the stored size, and the observation's size — text bytes
+plus image sizes, see :func:`~core.contracts.observation_size` — must not
+exceed the executor's ``max_observation_bytes``. A lease failure is
+``error invalid_result``, an oversized observation ``error
+observation_too_large``; in both cases nothing of the provider's observation
+is adopted and every ``image_ref`` it named is discarded from the store at
+once, so a rejected observation leaves no partially adopted parts and no
+bytes leased until the run ends (AC22, AC47). The size rule is one rule with
+two enforcement points: the brain enforces its own ``budget.max_observation_bytes``
+per run, the executor's bound is a runtime-wide guard a caller may set and
+``core.main`` leaves unset. Observations the executor synthesises itself carry
+no parts.
 
 Two properties are structural rather than conventional.
 
@@ -74,10 +96,13 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Protocol
 
+from .attachments import AttachmentStore
 from .contracts import (
     ACTION_NATURES,
+    BRAIN_ERROR_OBSERVATION_TOO_LARGE,
     COUNTER_ACTION_TIMEOUTS,
     COUNTER_LOST_TRACES,
+    PART_TYPE_IMAGE_REF,
     TRACE_ACTION_COMPLETED,
     TRACE_ACTION_STARTED,
     WILDCARD,
@@ -87,6 +112,8 @@ from .contracts import (
     ContractError,
     Counters,
     Destination,
+    observation_size,
+    validate_parts,
 )
 
 __all__ = [
@@ -101,6 +128,7 @@ __all__ = [
     "ERROR_INVALID_RESULT",
     "ERROR_NOT_AUTHORIZED",
     "ERROR_NO_PROVIDER",
+    "ERROR_OBSERVATION_TOO_LARGE",
     "ERROR_PROVIDER_FAILED",
     "ERROR_PROVIDER_NOT_READY",
     "ERROR_UNKNOWN_ACTION",
@@ -177,6 +205,12 @@ ERROR_NOT_AUTHORIZED = "not_authorized"
 ERROR_INVALID_ARGUMENTS = "invalid_arguments"
 ERROR_INVALID_RESULT = "invalid_result"
 ERROR_INVALID_OBSERVATION = "invalid_observation"
+ERROR_OBSERVATION_TOO_LARGE = BRAIN_ERROR_OBSERVATION_TOO_LARGE
+"""An observation whose parts exceed the executor's byte bound (R4, AC47).
+
+The same literal the brain uses for its own per-run budget: one rule, two
+enforcement points, one code in the traces.
+"""
 ERROR_NO_PROVIDER = "no_provider"
 ERROR_PROVIDER_NOT_READY = "provider_not_ready"
 ERROR_PROVIDER_FAILED = "provider_failed"
@@ -896,10 +930,12 @@ class ActionExecutor:
     """
 
     __slots__ = (
+        "_attachments",
         "_authorization",
         "_cancel_grace",
         "_clock",
         "_counters",
+        "_max_observation_bytes",
         "_max_outcomes",
         "_outcomes",
         "_provider_invocations",
@@ -919,7 +955,19 @@ class ActionExecutor:
         sleeper: Sleeper | None = None,
         max_outcomes: int = DEFAULT_MAX_OUTCOMES,
         cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
+        attachments: AttachmentStore | None = None,
+        max_observation_bytes: int | None = None,
     ) -> None:
+        """Wire the executor onto its registry, policy and optional store.
+
+        ``attachments`` is the store every ``image_ref`` part is checked
+        against; without one, an observation naming an image cannot be
+        validated and is ``invalid_result``. ``max_observation_bytes`` bounds
+        the size of every observation's parts (R4); ``None`` sets no bound
+        here, leaving the brain's own ``budget.max_observation_bytes`` as the
+        single enforcement point in production.
+        """
+
         if not isinstance(registry, ActionRegistry):
             raise ContractError("ActionExecutor.registry", "must be an ActionRegistry")
         if not isinstance(authorization, AuthorizationPolicy):
@@ -940,6 +988,21 @@ class ActionExecutor:
             raise ContractError(
                 "ActionExecutor.cancel_grace_seconds", "must not be negative"
             )
+        if attachments is not None and not isinstance(attachments, AttachmentStore):
+            raise ContractError(
+                "ActionExecutor.attachments", "must be an AttachmentStore or None"
+            )
+        if max_observation_bytes is not None:
+            if isinstance(max_observation_bytes, bool) or not isinstance(
+                max_observation_bytes, int
+            ):
+                raise ContractError(
+                    "ActionExecutor.max_observation_bytes", "must be an integer or None"
+                )
+            if max_observation_bytes < 1:
+                raise ContractError(
+                    "ActionExecutor.max_observation_bytes", "must be strictly positive"
+                )
 
         self._registry = registry
         self._authorization = authorization
@@ -949,6 +1012,8 @@ class ActionExecutor:
         self._sleep: Sleeper = sleeper if sleeper is not None else asyncio.sleep
         self._max_outcomes = max_outcomes
         self._cancel_grace = float(cancel_grace_seconds)
+        self._attachments = attachments
+        self._max_observation_bytes = max_observation_bytes
         self._outcomes: "OrderedDict[str, ActionObservation]" = OrderedDict()
         self._provider_invocations = 0
 
@@ -1040,22 +1105,33 @@ class ActionExecutor:
         spec = self._registry.discovered().get(call.action_name)
 
         binding: ActionBinding | None = None
-        pending: tuple[str, str] | None = None
+        # A failure to reach a provider, resolved here but reported only after
+        # authorization and argument validation have had their say: status,
+        # code and message.
+        pending: tuple[str, str, str] | None = None
         if spec is not None and spec.supports(call.destination):
             try:
                 binding = self._registry.resolve(call.action_name, call.destination)
             except AmbiguousBindingError as exc:
-                pending = (ERROR_NO_PROVIDER, str(exc))
+                pending = ("error", ERROR_NO_PROVIDER, str(exc))
             else:
                 if binding is None:
                     pending = (
+                        "error",
                         ERROR_NO_PROVIDER,
                         f"no provider is bound to {call.action_name!r} at {call.destination}",
                     )
                 elif not self._registry.is_ready(binding.module):
+                    # A bound provider that is not ready — never became ready,
+                    # or a remote agent that disconnected mid-run — reads as a
+                    # refusal to act, not as a broken action: the model is told
+                    # the capability declined, the provider is never entered
+                    # (R6, AC35).
                     pending = (
+                        "refused",
                         ERROR_PROVIDER_NOT_READY,
-                        f"module {binding.module!r} has not passed the readiness barrier",
+                        f"module {binding.module!r} is not ready to provide "
+                        f"{call.action_name!r}",
                     )
 
         await self._emit(
@@ -1123,9 +1199,9 @@ class ActionExecutor:
             )
 
         if pending is not None:
-            code, message = pending
+            status, code, message = pending
             return await self._terminate(
-                call, binding, started_at, "error", code=code, message=message
+                call, binding, started_at, status, code=code, message=message
             )
         assert binding is not None  # implied by pending being None
 
@@ -1313,7 +1389,19 @@ class ActionExecutor:
         invocation: ActionInvocation,
         observation: Any,
     ) -> ActionObservation:
-        """Adopt the provider's observation, validating a success's result."""
+        """Adopt the provider's observation, or replace it whole.
+
+        The parts are validated first, on every status (R4): a provider's
+        ``error`` may carry a text part the model will read, and an
+        ``image_ref`` on any status is a lease the store must hold for this
+        run. Then a success's result is checked against the spec's schema,
+        and an interruption the provider reported itself against the
+        emission rule. Whatever fails, nothing of the provider's observation
+        survives into the terminal one — no partially adopted parts — and
+        every ``image_ref`` it named is discarded from the store at once.
+        A rejection replaces the observation, never the emission rule: see
+        :meth:`_reject`.
+        """
 
         if not isinstance(observation, ActionObservation):
             return await self._terminate(
@@ -1327,17 +1415,23 @@ class ActionExecutor:
                 invoked=True,
             )
 
+        # 4a. Parts: shape, text bound, image leases, observation size.
+        rejection = self._reject_parts(call, observation)
+        if rejection is not None:
+            code, message = rejection
+            return await self._reject(
+                call, spec, binding, started_at, invocation, observation,
+                code=code, message=message,
+            )
+
         if observation.status == "success":
-            # 4. Result validation, before anything is reported as a success.
+            # 4b. Result validation, before anything is reported as a success.
             try:
                 spec.validate_result(observation.result)
             except ContractError as exc:
-                return await self._terminate(
-                    call, binding, started_at, "error",
-                    code=ERROR_INVALID_RESULT,
-                    message=str(exc),
-                    emission=invocation.emission,
-                    invoked=True,
+                return await self._reject(
+                    call, spec, binding, started_at, invocation, observation,
+                    code=ERROR_INVALID_RESULT, message=str(exc),
                 )
         elif observation.status in ("timeout", "cancelled"):
             # An interruption the provider caught itself — its own transport
@@ -1347,6 +1441,7 @@ class ActionExecutor:
             # possibly-sent write past the uncertainty barrier.
             status, code = _uncertain_status(invocation.emission, spec, observation.status)
             if status != observation.status:
+                self._discard_images(observation.parts)
                 return await self._terminate(
                     call, binding, started_at, status,
                     code=code,
@@ -1365,6 +1460,166 @@ class ActionExecutor:
         provenance.update(dict(observation.provenance))
         final = replace(observation, provenance=provenance)
         return await self._publish(call, final, started_at)
+
+    async def _reject(
+        self,
+        call: ActionCall,
+        spec: ActionSpec,
+        binding: ActionBinding,
+        started_at: float,
+        invocation: ActionInvocation,
+        observation: ActionObservation,
+        *,
+        code: str,
+        message: str,
+    ) -> ActionObservation:
+        """Replace a provider observation the executor cannot adopt.
+
+        The images it named are discarded and none of its parts survive.
+        Its *status*, though, is not simply ``error``: a rejection says the
+        observation is unusable, not that the effect did not happen. An
+        interruption the provider reported (``timeout``, ``cancelled``) is
+        first resolved by the emission rule, exactly as it would be with
+        sound parts (4c); when that rule says ``external_unknown`` — an
+        emitted write, or a write with emission unknown — the terminal
+        status is ``external_unknown``, so a caller never reads an invalid
+        observation as licence to retry a write that may already have gone
+        out. Every other rejection is ``error`` with the rejection's own
+        code (a schema-invalid ``success`` stays ``invalid_result``, AC18);
+        the rejection is kept in the message either way.
+        """
+
+        self._discard_images(observation.parts)
+        status = "error"
+        if observation.status in ("timeout", "cancelled"):
+            status, _ = _uncertain_status(invocation.emission, spec, observation.status)
+        if status == "external_unknown":
+            return await self._terminate(
+                call, binding, started_at, "external_unknown",
+                code=ERROR_EXTERNAL_UNKNOWN,
+                message=(
+                    f"provider {binding.provider_name!r} reported "
+                    f"{observation.status!r} with emission {invocation.emission!r}, "
+                    f"and its observation was rejected ({code}: {message}); "
+                    "reported as 'external_unknown'"
+                ),
+                emission=invocation.emission,
+                invoked=True,
+            )
+        return await self._terminate(
+            call, binding, started_at, "error",
+            code=code,
+            message=message,
+            emission=invocation.emission,
+            invoked=True,
+        )
+
+    def _reject_parts(
+        self, call: ActionCall, observation: ActionObservation
+    ) -> tuple[str, str] | None:
+        """Why the observation's parts cannot be adopted, or ``None`` (R4).
+
+        Checked in this order, the first failure deciding the code:
+
+        1. shape — :func:`~core.contracts.validate_parts` again, as a
+           provider's observation is not trusted to have kept the contract
+           it was constructed under — ``invalid_result``;
+        2. the per-part text bound, ``observation_too_large``: a single text
+           part above ``max_observation_bytes`` is the same oversize the
+           whole-observation rule below reports, one code for one rule;
+        3. every ``image_ref`` must be an attachment the store holds, leased
+           to this call's ``run_id``, unexpired on the executor clock **now**
+           and of the recorded stored size — ``invalid_result`` (AC22, AC47);
+           without a store, no image can be validated at all;
+        4. the observation's size — text bytes plus image sizes — must not
+           exceed ``max_observation_bytes`` — ``observation_too_large``
+           (AC47); ``None`` sets no bound.
+
+        An observation carrying no parts has nothing to reject.
+        """
+
+        parts = observation.parts
+        if not parts:
+            return None
+        bound = self._max_observation_bytes
+
+        try:
+            validate_parts(parts)
+        except ContractError as exc:
+            return ERROR_INVALID_RESULT, str(exc)
+        if bound is not None:
+            try:
+                validate_parts(parts, max_text_bytes=bound)
+            except ContractError as exc:
+                return ERROR_OBSERVATION_TOO_LARGE, str(exc)
+
+        now = self._clock()
+        for index, part in enumerate(parts):
+            if part["type"] != PART_TYPE_IMAGE_REF:
+                continue
+            label = f"ActionObservation.parts[{index}]"
+            attachment_id = part["attachment_id"]
+            if self._attachments is None:
+                return (
+                    ERROR_INVALID_RESULT,
+                    f"{label} names attachment {attachment_id!r}, but the executor "
+                    "has no attachment store to validate it against",
+                )
+            ref = self._attachments.lookup(attachment_id)
+            if ref is None:
+                return (
+                    ERROR_INVALID_RESULT,
+                    f"{label} names attachment {attachment_id!r}, which the store "
+                    "does not hold",
+                )
+            if ref.run_id != call.run_id:
+                return (
+                    ERROR_INVALID_RESULT,
+                    f"{label} names attachment {attachment_id!r}, which is leased to "
+                    f"run {ref.run_id!r}, not to this call's run {call.run_id!r}",
+                )
+            if now >= ref.expires_at:
+                return (
+                    ERROR_INVALID_RESULT,
+                    f"{label} names attachment {attachment_id!r}, whose lease expired "
+                    f"at {ref.expires_at!r} (clock at {now!r})",
+                )
+            if part["size"] != ref.size:
+                return (
+                    ERROR_INVALID_RESULT,
+                    f"{label}.size is {part['size']}, but the store holds "
+                    f"{ref.size} bytes for attachment {attachment_id!r}",
+                )
+
+        if bound is not None:
+            size = observation_size(parts)
+            if size > bound:
+                return (
+                    ERROR_OBSERVATION_TOO_LARGE,
+                    f"observation is {size} bytes of parts, above the bound of {bound}",
+                )
+        return None
+
+    def _discard_images(self, parts: Sequence[Mapping[str, Any]]) -> None:
+        """Drop from the store every attachment the rejected *parts* name.
+
+        A rejected observation adopts nothing, so an image it named would
+        otherwise stay leased until the run's terminal record releases it.
+        Discarding is idempotent with that release — the store drops an
+        object exactly once — and an identifier the store does not hold is
+        a no-op, so a lease that was already unknown costs nothing here. The
+        identifiers are unguessable, so any one a provider names is one the
+        store handed out: dropping it prevents a leak, never reaches bytes
+        the provider was not given.
+        """
+
+        if self._attachments is None:
+            return
+        for part in parts:
+            if isinstance(part, Mapping) and part.get("type") == PART_TYPE_IMAGE_REF:
+                attachment_id = part.get("attachment_id")
+                if isinstance(attachment_id, str) and attachment_id.strip():
+                    self._attachments.discard(attachment_id)
 
     async def _terminate_uncertain(
         self,
