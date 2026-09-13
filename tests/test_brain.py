@@ -17,6 +17,7 @@ is injected and every wait is a bounded number of bare loop turns.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ from core.actions import (
 from core.admission import REASON_CANCELLED, REASON_RUN_DEADLINE
 from core.bus import EventBus
 from core.contracts import (
+    PROBE_TOOL,
     TRACE_ACTION_COMPLETED,
     TRACE_ACTION_STARTED,
     TRACE_BRAIN_ADMISSION_ACCEPTED,
@@ -63,13 +65,16 @@ from conftest import (
     FakeSession,
     FakeTransport,
     ManualClock,
+    MemoryWebSocketPair,
     SENT,
     TIMEOUT_BEFORE_EMISSION,
     RecordingScheduler,
+    WSMsgType,
     completion,
     events_of,
     runtime_context as build_context,
     settle,
+    tool_call,
     wait_until,
 )
 from modules.brain import _Settings as brain_settings
@@ -1605,3 +1610,104 @@ def test_memory_refuses_absent_or_non_finite_bounds(limits: dict[str, Any], fiel
     settings = {"max_sessions": 2, "max_exchanges": 3, "max_bytes": 200, "max_age_seconds": 10, **limits}
     with pytest.raises(BrainModuleError, match=f"conversation_memory.{field_name}"):
         ConversationMemory(**settings)
+
+
+# --------------------------------------------------------------------------- #
+# The shared harness (P7): the doubles every brain suite reads
+# --------------------------------------------------------------------------- #
+
+
+def test_tool_call_builder_yields_one_call_with_json_encoded_arguments() -> None:
+    """R2 support: ``tool_call`` is one Chat Completions tool call whose
+    arguments travel JSON-encoded, as the backend sends them."""
+
+    body = tool_call("chat.read", {"limit": 3, "channel_id": CHANNEL}, usage={"total_tokens": 7})
+
+    (choice,) = body["choices"]
+    (entry,) = choice["message"]["tool_calls"]
+    assert entry["type"] == "function"
+    assert entry["function"]["name"] == "chat.read"
+    assert isinstance(entry["function"]["arguments"], str)
+    assert json.loads(entry["function"]["arguments"]) == {"limit": 3, "channel_id": CHANNEL}
+    assert body["usage"] == {"total_tokens": 7}
+    assert completion("Hello") == {"choices": [{"message": {"content": "Hello"}}]}
+
+
+@pytest.mark.asyncio
+async def test_session_without_probe_traffic_records_no_probe_and_keeps_post_calls() -> None:
+    """R2 support: probe detection keys on the request body, not on call
+    order — a scenario request is never mistaken for a probe, so
+    ``probe_calls`` stays empty and ``post_calls`` counts every scenario
+    request; a forced call on the probe tool is answered from
+    ``probe_results`` without consuming ``results``."""
+
+    session = FakeSession(FakeResponse(200, completion("One")), FakeResponse(200, completion("Two")))
+
+    first = await session.post("endpoint", json={"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert (await first.json()) == completion("One")
+    assert session.probe_calls == []
+    assert len(session.post_calls) == 1
+    assert len(session.results) == 1
+
+    probe = await session.post(
+        "endpoint",
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "probe"}],
+            "tools": [{"type": "function", "function": {"name": PROBE_TOOL, "parameters": {}}}],
+            "tool_choice": {"type": "function", "function": {"name": PROBE_TOOL}},
+        },
+    )
+    (entry,) = (await probe.json())["choices"][0]["message"]["tool_calls"]
+    assert entry["function"]["name"] == PROBE_TOOL
+    assert len(session.probe_calls) == 1
+    assert len(session.post_calls) == 1
+    assert len(session.results) == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_websocket_pair_delivers_frames_in_order_and_propagates_close_code() -> None:
+    """R6 support: frames cross the pair in the order they were sent, text
+    and binary alike; a ``close(code)`` reaches the peer as a ``CLOSE``
+    message carrying that code, after which the peer reports it as its own
+    ``close_code`` and every further receive is ``CLOSED``."""
+
+    pair = MemoryWebSocketPair()
+    await pair.client.send_str('{"v": 1, "type": "hello", "id": "h1"}')
+    await pair.client.send_bytes(b"\x89PNG")
+    await pair.client.send_str("second")
+    assert not pair.server.closed
+
+    received = [await pair.server.receive() for _ in range(3)]
+    assert [message.type for message in received] == [WSMsgType.TEXT, WSMsgType.BINARY, WSMsgType.TEXT]
+    assert [message.data for message in received] == [
+        '{"v": 1, "type": "hello", "id": "h1"}',
+        b"\x89PNG",
+        "second",
+    ]
+
+    assert await pair.server.close(code=4401) is True
+    assert pair.server.closed and pair.server.close_code == 4401
+    closing = await pair.client.receive()
+    assert closing.type == WSMsgType.CLOSE and closing.data == 4401
+    assert pair.client.closed and pair.client.close_code == 4401
+    assert (await pair.client.receive()).type == WSMsgType.CLOSED
+    with pytest.raises(ConnectionResetError):
+        await pair.client.send_str("late")
+
+    # Closing an end wakes its own receiver already parked on the inbox, so a
+    # receive loop on the closing side terminates during shutdown.
+    parked = MemoryWebSocketPair()
+    waiting = asyncio.ensure_future(parked.server.receive())
+    await settle()
+    assert not waiting.done()
+    assert await parked.server.close() is True
+    assert (await asyncio.wait_for(waiting, 1)).type == WSMsgType.CLOSED
+    assert (await parked.server.receive()).type == WSMsgType.CLOSED
+
+    dropped = MemoryWebSocketPair()
+    await dropped.server.send_str("in flight")
+    dropped.drop()
+    assert (dropped.server.close_code, dropped.client.close_code) == (1006, 1006)
+    assert (await dropped.client.receive()).data == "in flight"
+    assert (await dropped.client.receive()).type == WSMsgType.CLOSED

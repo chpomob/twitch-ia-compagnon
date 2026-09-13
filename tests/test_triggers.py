@@ -15,6 +15,8 @@ from dataclasses import fields
 
 import pytest
 
+from conftest import runtime_context
+
 from core.contracts import (
     COUNTER_DEDUP_EVICTIONS,
     COUNTER_TRIGGER_REJECTIONS,
@@ -535,6 +537,25 @@ def test_probability_policy_replays_identically_over_the_same_sequence() -> None
     # Not vacuous: the sequence must actually contain both verdicts.
     assert first.count(True) == 5
     assert first.count(False) == 15
+
+
+def test_runtime_context_builds_its_trigger_engine_on_the_injected_rng() -> None:
+    """AC3 via the shared fixture: the engine ``runtime_context`` builds from a
+    registry draws probability rules from the ``rng`` the suite injected, so
+    a replay through the fixture is as deterministic as one built by hand."""
+
+    events = _twenty_events()
+    accepted = []
+    for _ in range(2):
+        registry = _registry()
+        registry.configure(CHAT_INPUT, _probability_policy(0.1))
+        rng = _Rng(_DRAWS)
+        context = runtime_context(trigger_registry=registry, rng=rng)
+        accepted.append([context.triggers.evaluate(event).accepted for event in events])
+        assert rng.draws == 20
+
+    assert accepted[0] == accepted[1]
+    assert accepted[0].count(True) == 5
 
 
 def test_redelivery_inside_the_window_redraws_nothing() -> None:
