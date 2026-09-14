@@ -20,6 +20,20 @@ mirror of it. A handle built with no accepted block (a harness, the
 compatibility runtime) runs on its own settings, which are then the only
 copy.
 
+**Loop policy groups** (R1, R2, R3). Beside the limits, the settings carry
+the three groups the agentic loop is configured by, parsed into
+:class:`_Settings` by the same hook: ``budget`` gains the action-call cap,
+the repeated-proposal cap and the delivery reserve; ``fallback`` says whether
+and with what text a run that ends without an answer still delivers;
+``capabilities.required`` lists the backend capabilities to verify at
+``prepare`` (``structured_output`` mandatory, ``vision`` optional); and
+``delivery`` holds the configured terminal step — a default delivery list
+(``mode: fixed`` with its ``actions``, or ``mode: modules`` with a
+``preference`` order) and per-destination ``overrides`` of the same shape.
+The hook checks their shape only; what needs the discovered catalog — whether
+an entry names a delivery-capable action and maps the text onto an existing
+argument — is resolved at ``prepare``.
+
 **Ingestion** (R2). :meth:`BrainModule.handle_chat_message` is the bus consumer
 of ``channel.chat.message``. It validates the normalised event — platform,
 channel, trusted ``author.id``, message identifier and text — copies it into a
@@ -98,6 +112,7 @@ from urllib.parse import urlsplit
 
 from core.admission import AdmissionScheduler, RunOutcome, Work
 from core.contracts import (
+    DELIVERY_NO_TEXT_ARGUMENT,
     TERMINAL_STATUSES,
     ActionCall,
     ActionObservation,
@@ -166,6 +181,28 @@ _SECONDS = "seconds"
 _ENDPOINT_SCHEMES = frozenset({"http", "https"})
 _ENV_REFERENCE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
 
+CAPABILITY_STRUCTURED_OUTPUT = "structured_output"
+CAPABILITY_VISION = "vision"
+KNOWN_CAPABILITIES = frozenset({CAPABILITY_STRUCTURED_OUTPUT, CAPABILITY_VISION})
+"""The backend capabilities ``capabilities.required`` may name (R2).
+
+``structured_output`` is mandatory: the loop needs one tool call or a final
+text per turn, so a list without it is refused at validation (AC10).
+"""
+
+DELIVERY_MODE_FIXED = "fixed"
+DELIVERY_MODE_MODULES = "modules"
+DELIVERY_MODES = frozenset({DELIVERY_MODE_FIXED, DELIVERY_MODE_MODULES})
+"""How a configured delivery list is built (R1, decision 1): ``fixed`` takes
+the configured ``actions``; ``modules`` derives the list from the enabled
+modules' delivery-capable actions, ordered by ``preference``."""
+
+_DELIVERY_ENTRY_KEYS = frozenset({"action", "text_argument", "arguments"})
+_DELIVERY_LIST_KEYS = frozenset({"mode", "actions", "preference"})
+_DELIVERY_GROUP_KEYS = _DELIVERY_LIST_KEYS | {"overrides"}
+_FALLBACK_KEYS = frozenset({"enabled", "text"})
+_CAPABILITIES_KEYS = frozenset({"required"})
+
 #: The reserved setting the entry point hands its accepted ``limits`` block
 #: over in (``core.main.LIMITS_KEY``): the groups it carries are the values
 #: the configuration was accepted with, and the owned copies must equal them.
@@ -191,6 +228,9 @@ _OWNED_LIMITS: Mapping[str, Mapping[str, str]] = {
         "action_seconds": _SECONDS,
         "max_tokens": _COUNT,
         "max_observation_bytes": _COUNT,
+        "max_action_calls": _COUNT,
+        "max_repeated_actions": _COUNT,
+        "delivery_reserve_seconds": _SECONDS,
     },
     "conversation_memory": {
         "max_sessions": _COUNT,
@@ -214,10 +254,22 @@ def validate_settings(settings: Any) -> list[str]:
     a well-formed ``http(s)`` URL, that the model name is non-empty, that the
     key resolved to a non-empty string rather than a still-unresolved
     ``${NAME}`` reference, and that every owned limit is present, numeric,
-    finite and positive. When the entry point handed the accepted ``limits``
-    block over, every owned limit must also equal the accepted one (R6): a
-    copy that differs is refused by field, so no bound this module builds
-    can disagree with the configuration that was accepted.
+    finite and positive (AC20), the admission wait never exceeding the total
+    run deadline it is part of. When the entry point handed the accepted
+    ``limits`` block over, every owned limit must also equal the accepted one
+    (R6): a copy that differs is refused by field, so no bound this module
+    builds can disagree with the configuration that was accepted.
+
+    The three groups added by the agentic loop are checked here too, each
+    field with one diagnostic naming it: ``fallback`` (``enabled`` a boolean,
+    ``text`` a non-empty string), ``capabilities.required`` (a list of known
+    capability names that contains ``structured_output``, AC10) and
+    ``delivery`` (a known ``mode``, every fixed entry a mapping with a
+    non-empty ``action`` and a well-typed text mapping, ``preference`` a
+    list of names, every override keyed ``<platform>/<channel_id>`` and of
+    the same shape, AC53). What only the discovered catalog can decide —
+    whether an entry names a delivery-capable action, whether its text
+    argument exists — is resolved at ``prepare``, not here.
     """
 
     if not isinstance(settings, Mapping):
@@ -282,7 +334,215 @@ def validate_settings(settings: Any) -> list[str]:
                         f"must equal {_ACCEPTED_LIMITS_SETTING}.{group}.{field_name}",
                     )
                 )
+    _validate_admission_window(settings.get("admission"), diagnostics)
+    _validate_fallback(settings.get("fallback"), diagnostics)
+    _validate_capabilities(settings.get("capabilities"), diagnostics)
+    _validate_delivery(settings.get("delivery"), diagnostics)
     return diagnostics
+
+
+def _validate_admission_window(section: Any, diagnostics: list[str]) -> None:
+    """The queued wait is part of the total run deadline, so it cannot exceed it (R3).
+
+    Compared only once both values are acceptable limits: an unevaluable one
+    already has its own diagnostic, and a second on the same field would
+    break the one-diagnostic-per-field rule (AC20).
+    """
+
+    if not isinstance(section, Mapping):
+        return
+    wait = section.get("wait_seconds")
+    total = section.get("total_run_seconds")
+    if _limit_reason(wait, _SECONDS) is not None or _limit_reason(total, _SECONDS) is not None:
+        return
+    if wait > total:
+        diagnostics.append(
+            _setting_diagnostic(
+                "admission.wait_seconds", "must not exceed admission.total_run_seconds"
+            )
+        )
+
+
+def _validate_fallback(section: Any, diagnostics: list[str]) -> None:
+    """The generic fallback (R3): an explicit switch and a non-empty text."""
+
+    if section is None:
+        diagnostics.append(_setting_diagnostic("fallback", "is required"))
+        return
+    if not isinstance(section, Mapping):
+        diagnostics.append(_setting_diagnostic("fallback", "must be a mapping"))
+        return
+    _refuse_unknown_keys(section, _FALLBACK_KEYS, "fallback", diagnostics)
+    enabled = section.get("enabled")
+    if enabled is None:
+        diagnostics.append(_setting_diagnostic("fallback.enabled", "is required"))
+    elif not isinstance(enabled, bool):
+        diagnostics.append(_setting_diagnostic("fallback.enabled", "must be a boolean"))
+    text = section.get("text")
+    if text is None:
+        diagnostics.append(_setting_diagnostic("fallback.text", "is required"))
+    elif not isinstance(text, str) or not text.strip():
+        diagnostics.append(
+            _setting_diagnostic("fallback.text", "must be a non-empty string")
+        )
+
+
+def _validate_capabilities(section: Any, diagnostics: list[str]) -> None:
+    """``capabilities.required``: known names only, ``structured_output`` among them (AC10)."""
+
+    if section is None:
+        diagnostics.append(_setting_diagnostic("capabilities", "is required"))
+        return
+    if not isinstance(section, Mapping):
+        diagnostics.append(_setting_diagnostic("capabilities", "must be a mapping"))
+        return
+    _refuse_unknown_keys(section, _CAPABILITIES_KEYS, "capabilities", diagnostics)
+    field_name = "capabilities.required"
+    required = section.get("required")
+    if required is None:
+        diagnostics.append(_setting_diagnostic(field_name, "is required"))
+    elif not _is_name_list(required):
+        diagnostics.append(
+            _setting_diagnostic(field_name, "must be a list of capability names")
+        )
+    elif CAPABILITY_STRUCTURED_OUTPUT not in required:
+        diagnostics.append(
+            _setting_diagnostic(field_name, f"must name {CAPABILITY_STRUCTURED_OUTPUT!r}")
+        )
+    elif not set(required) <= KNOWN_CAPABILITIES:
+        diagnostics.append(
+            _setting_diagnostic(
+                field_name,
+                "names a capability this module does not know "
+                f"(known: {', '.join(sorted(KNOWN_CAPABILITIES))})",
+            )
+        )
+
+
+def _validate_delivery(section: Any, diagnostics: list[str]) -> None:
+    """The ``delivery`` group (R1, decision 1): a default list and its overrides.
+
+    The shape is checked here, one diagnostic per offending field (AC53);
+    whether the named actions exist, deliver and accept the text mapping is
+    the catalog's to say and is resolved at ``prepare``. An empty fixed list
+    is a resolution failure (reason ``empty``), not a shape defect.
+    """
+
+    if section is None:
+        diagnostics.append(_setting_diagnostic("delivery", "is required"))
+        return
+    if not isinstance(section, Mapping):
+        diagnostics.append(_setting_diagnostic("delivery", "must be a mapping"))
+        return
+    _refuse_unknown_keys(section, _DELIVERY_GROUP_KEYS, "delivery", diagnostics)
+    _validate_delivery_list(section, "delivery", diagnostics)
+    overrides = section.get("overrides")
+    if overrides is None:
+        return
+    if not isinstance(overrides, Mapping):
+        diagnostics.append(
+            _setting_diagnostic("delivery.overrides", "must be a mapping keyed by destination")
+        )
+        return
+    for key, override in overrides.items():
+        prefix = f'delivery.overrides["{key}"]'
+        if not _is_destination_key(key):
+            diagnostics.append(
+                _setting_diagnostic(prefix, "must be keyed '<platform>/<channel_id>'")
+            )
+        if not isinstance(override, Mapping):
+            diagnostics.append(_setting_diagnostic(prefix, "must be a mapping"))
+            continue
+        _refuse_unknown_keys(override, _DELIVERY_LIST_KEYS, prefix, diagnostics)
+        _validate_delivery_list(override, prefix, diagnostics)
+
+
+def _validate_delivery_list(section: Mapping[str, Any], prefix: str, diagnostics: list[str]) -> None:
+    """One configured delivery list: ``mode``, the fixed ``actions``, ``preference``."""
+
+    mode = section.get("mode")
+    if mode is None:
+        diagnostics.append(_setting_diagnostic(f"{prefix}.mode", "is required"))
+    elif not isinstance(mode, str) or mode not in DELIVERY_MODES:
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{prefix}.mode", f"must be one of {', '.join(sorted(DELIVERY_MODES))}"
+            )
+        )
+    actions = section.get("actions")
+    if actions is None:
+        if mode == DELIVERY_MODE_FIXED:
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{prefix}.actions", f"is required for mode {DELIVERY_MODE_FIXED!r}"
+                )
+            )
+    elif not isinstance(actions, Sequence) or isinstance(actions, (str, bytes)):
+        diagnostics.append(
+            _setting_diagnostic(f"{prefix}.actions", "must be a list of delivery entries")
+        )
+    else:
+        for index, entry in enumerate(actions):
+            _validate_delivery_entry(entry, f"{prefix}.actions[{index}]", diagnostics)
+    preference = section.get("preference")
+    if preference is not None and not _is_name_list(preference):
+        diagnostics.append(
+            _setting_diagnostic(f"{prefix}.preference", "must be a list of action names")
+        )
+
+
+def _validate_delivery_entry(entry: Any, prefix: str, diagnostics: list[str]) -> None:
+    """One fixed entry ``{action, text_argument?, arguments?}``."""
+
+    if not isinstance(entry, Mapping):
+        diagnostics.append(_setting_diagnostic(prefix, "must be a mapping"))
+        return
+    _refuse_unknown_keys(entry, _DELIVERY_ENTRY_KEYS, prefix, diagnostics)
+    action = entry.get("action")
+    if action is None:
+        diagnostics.append(_setting_diagnostic(f"{prefix}.action", "is required"))
+    elif not isinstance(action, str) or not action.strip():
+        diagnostics.append(
+            _setting_diagnostic(f"{prefix}.action", "must be a non-empty action name")
+        )
+    if "text_argument" in entry:
+        text_argument = entry["text_argument"]
+        if not isinstance(text_argument, str) or not text_argument.strip():
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{prefix}.text_argument",
+                    f"must be an argument name or {DELIVERY_NO_TEXT_ARGUMENT!r}",
+                )
+            )
+    if "arguments" in entry and not isinstance(entry["arguments"], Mapping):
+        diagnostics.append(
+            _setting_diagnostic(f"{prefix}.arguments", "must be a mapping of arguments")
+        )
+
+
+def _refuse_unknown_keys(
+    section: Mapping[str, Any], known: frozenset[str], prefix: str, diagnostics: list[str]
+) -> None:
+    for key in section:
+        if key not in known:
+            diagnostics.append(
+                _setting_diagnostic(f"{prefix}.{key}", "is not a setting this module knows")
+            )
+
+
+def _is_name_list(value: Any) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes))
+        and all(isinstance(item, str) and item.strip() for item in value)
+    )
+
+
+def _is_destination_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    platform, separator, channel_id = key.partition("/")
+    return bool(separator) and bool(platform.strip()) and bool(channel_id.strip())
 
 
 def _accepted_limits(
@@ -408,13 +668,16 @@ class _AdmissionLimits:
 
 @dataclass(frozen=True, slots=True)
 class _Budget:
-    """Per-run budgets (design §3.4). One model turn is spent per run here."""
+    """Per-run budgets (R3). One model turn is spent per run here."""
 
     model_turns: int
     model_call_seconds: float
     action_seconds: float
     max_tokens: int
     max_observation_bytes: int
+    max_action_calls: int
+    max_repeated_actions: int
+    delivery_reserve_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +688,88 @@ class _MemoryLimits:
     max_age_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class _Fallback:
+    """The generic fallback (R3): whether it is delivered, and what text."""
+
+    enabled: bool
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliveryEntry:
+    """One configured entry of a fixed delivery list (R1, decision 1).
+
+    ``text_argument`` is the argument the answer text is put under,
+    :data:`~core.contracts.DELIVERY_NO_TEXT_ARGUMENT` for an effect-only
+    entry, or ``None`` when the configuration says nothing and the action's
+    declaration decides at resolution. ``arguments`` are the constants the
+    entry always carries.
+    """
+
+    action: str
+    text_argument: str | None
+    arguments: Mapping[str, Any]
+
+    @classmethod
+    def from_mapping(cls, entry: Mapping[str, Any]) -> "_DeliveryEntry":
+        text_argument = entry.get("text_argument")
+        return cls(
+            action=entry["action"].strip(),
+            text_argument=None if text_argument is None else text_argument.strip(),
+            arguments=dict(entry.get("arguments") or {}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliveryList:
+    """One configured delivery list: how it is built and what it names.
+
+    ``actions`` are the fixed entries (``mode: fixed``); ``preference`` the
+    action names placed first by ``mode: modules``. Both are kept whatever
+    the mode: resolution at ``prepare`` reads the one the mode calls for.
+    """
+
+    mode: str
+    actions: tuple[_DeliveryEntry, ...]
+    preference: tuple[str, ...]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "_DeliveryList":
+        return cls(
+            mode=section["mode"],
+            actions=tuple(
+                _DeliveryEntry.from_mapping(entry) for entry in section.get("actions") or ()
+            ),
+            preference=tuple(name.strip() for name in section.get("preference") or ()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliveryConfig:
+    """The ``delivery`` group: a default list and per-destination overrides.
+
+    Overrides are keyed ``<platform>/<channel_id>``; a run uses the override
+    of its destination when one is configured, else the default (R1).
+    """
+
+    default: _DeliveryList
+    overrides: Mapping[str, _DeliveryList]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "_DeliveryConfig":
+        return cls(
+            default=_DeliveryList.from_mapping(section),
+            overrides={
+                key: _DeliveryList.from_mapping(override)
+                for key, override in (section.get("overrides") or {}).items()
+            },
+        )
+
+    def for_destination(self, platform: str, channel_id: str) -> _DeliveryList:
+        return self.overrides.get(f"{platform}/{channel_id}", self.default)
+
+
 @dataclass(frozen=True, repr=False, slots=True)
 class _Settings:
     endpoint: str
@@ -433,6 +778,9 @@ class _Settings:
     admission: _AdmissionLimits
     budget: _Budget
     conversation_memory: _MemoryLimits
+    fallback: _Fallback
+    capabilities: frozenset[str]
+    delivery: _DeliveryConfig
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
@@ -453,6 +801,12 @@ class _Settings:
             admission=_group(_AdmissionLimits, settings["admission"]),
             budget=_group(_Budget, settings["budget"]),
             conversation_memory=_group(_MemoryLimits, settings["conversation_memory"]),
+            fallback=_Fallback(
+                enabled=settings["fallback"]["enabled"],
+                text=settings["fallback"]["text"].strip(),
+            ),
+            capabilities=frozenset(settings["capabilities"]["required"]),
+            delivery=_DeliveryConfig.from_mapping(settings["delivery"]),
         )
 
 

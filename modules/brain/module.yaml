@@ -81,10 +81,12 @@ settings_schema:
         - workers
         - wait_seconds
         - total_run_seconds
-    # Per-run budgets the engine owns (design §3.4): model turns, the delay of
-    # one model call, the delay of one action call (delivery included), the
-    # cumulated token budget and the largest observation the transcript
-    # accepts.
+    # Per-run budgets the engine owns (R3): model turns, the delay of one
+    # model call, the delay of one action call (delivery included), the
+    # cumulated token budget, the largest observation the transcript accepts,
+    # the action calls a run may make (every delivery entry and the fallback
+    # included), the repetitions of one identical proposal, and the time kept
+    # back before the total deadline for the whole terminal step.
     budget:
       type: object
       properties:
@@ -106,12 +108,33 @@ settings_schema:
           type: integer
           minimum: 1
           description: Largest observation or medium admitted into a transcript.
+        max_action_calls:
+          type: integer
+          minimum: 1
+          description: >-
+            Maximum action calls per run, every delivery entry and the
+            fallback included.
+        max_repeated_actions:
+          type: integer
+          minimum: 1
+          description: >-
+            Executions of one identical proposal (same action name and
+            canonical arguments) within one run; the next one is not executed.
+        delivery_reserve_seconds:
+          type: number
+          description: >-
+            Time kept back before the total run deadline for the whole
+            terminal delivery step; no model turn or non-delivery action
+            starts inside it.
       required:
         - model_turns
         - model_call_seconds
         - action_seconds
         - max_tokens
         - max_observation_bytes
+        - max_action_calls
+        - max_repeated_actions
+        - delivery_reserve_seconds
     # Conversation memory the engine owns, bounded in sessions, exchanges,
     # bytes and age (R6).
     conversation_memory:
@@ -137,6 +160,89 @@ settings_schema:
         - max_exchanges
         - max_bytes
         - max_age_seconds
+    # The generic fallback (R3): what the engine delivers, through the same
+    # delivery list as a final response, when a run ends without one because
+    # of budget exhaustion, deadline expiry or a stale drop.
+    fallback:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          description: Whether the fallback text is delivered at all.
+        text:
+          type: string
+          description: The text delivered in place of the missing answer.
+      required:
+        - enabled
+        - text
+    # The backend capabilities the adapter verifies at `prepare`, before the
+    # readiness barrier (R2). `structured_output` is mandatory — the loop
+    # needs one tool call or a final text per turn — and `vision` is the only
+    # other name known; the settings hook holds the list to that vocabulary
+    # as a whole, naming this field.
+    capabilities:
+      type: object
+      properties:
+        required:
+          type: array
+          items:
+            type: string
+          description: Capabilities that must be verified before readiness.
+      required:
+        - required
+    # The terminal delivery step (R1, decision 1): a configured, ordered list
+    # of delivery actions the final response (or the fallback text) is handed
+    # to, one executor call per entry, resolved at `prepare`. `mode: fixed`
+    # takes `actions`; `mode: modules` derives the list from the enabled
+    # modules' actions that declare a delivery capability, ordered by
+    # `preference`. An entry says how the text maps into its arguments:
+    # `text_argument` names the argument, `none` declares an effect-only
+    # delivery, and an absent key inherits the action's declaration. The
+    # model never selects a delivery; `overrides` selects another list per
+    # `<platform>/<channel_id>` destination.
+    delivery:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum:
+            - fixed
+            - modules
+          description: How the delivery list is built.
+        actions:
+          type: array
+          items:
+            type: object
+            properties:
+              action:
+                type: string
+                description: Name of a delivery-capable action of the catalog.
+              text_argument:
+                type: string
+                description: >-
+                  Argument the answer text is put under, or `none` for an
+                  effect-only entry; absent inherits the declaration.
+              arguments:
+                type: object
+                description: Constant arguments the entry always carries.
+            required:
+              - action
+          description: The ordered list mode `fixed` delivers through.
+        preference:
+          type: array
+          items:
+            type: string
+          description: >-
+            Action names placed first, in this order, by `mode: modules`.
+        # Keyed by destination, so the values cannot be declared here: the
+        # settings hook holds each one to the shape of the group above.
+        overrides:
+          type: object
+          description: >-
+            Delivery lists of the same shape (`mode`, `actions`, `preference`)
+            selected per destination, keyed by `<platform>/<channel_id>`.
+      required:
+        - mode
   required:
     - endpoint
     - model
@@ -144,6 +250,9 @@ settings_schema:
     - admission
     - budget
     - conversation_memory
+    - fallback
+    - capabilities
+    - delivery
 settings_validator: validate_settings
 
 # The setting above that is a credential (R8). Its accepted value — literal

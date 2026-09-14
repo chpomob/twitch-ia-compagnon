@@ -26,8 +26,8 @@ modules:
     endpoint: ${OPENAI_ENDPOINT}
     model: ${OPENAI_MODEL}
     api_key: ${OPENAI_API_KEY}
-    # The limits the brain owns (design §3.4). Its manifest requires the three
-    # blocks below and its settings validator checks each value is finite and
+    # The limits the brain owns (R3). Its manifest requires the three blocks
+    # below and its settings validator checks each value is finite and
     # positive before any transport opens; startup stops with a diagnostic
     # naming the field when one is absent, zero, negative or infinite. The
     # admission and conversation_memory groups are the same limits the entry
@@ -35,24 +35,63 @@ modules:
     # enabled module, and the brain's validator refuses a value here that
     # differs from `limits.admission` or `limits.conversation_memory`, naming
     # the field, before any module is activated (R6). Change both together.
+    # The queued wait is part of the total run deadline and may not exceed it.
     admission:
       session_queue_capacity: 4
       global_pending_capacity: 64
       max_sessions: 32
       workers: 4
       wait_seconds: 30
-      total_run_seconds: 120
+      total_run_seconds: 60
+    # Per-run budgets, every one acted on: model turns, the deadline of one
+    # model call, the deadline of one action call (delivery included), the
+    # cumulated token budget, the largest observation admitted, the action
+    # calls a run may make (every delivery entry and the fallback included),
+    # how many times one identical proposal is executed, and the time kept
+    # back before the total deadline for the whole terminal delivery step.
     budget:
       model_turns: 5
       model_call_seconds: 30
       action_seconds: 10
       max_tokens: 8192
       max_observation_bytes: 5242880
+      max_action_calls: 6
+      max_repeated_actions: 2
+      delivery_reserve_seconds: 10
     conversation_memory:
       max_sessions: 64
       max_exchanges: 20
       max_bytes: 65536
       max_age_seconds: 3600
+    # What is delivered, through the same delivery list as an answer, when a
+    # run ends without one — budgets exhausted, deadline reached or the
+    # message dropped stale (R3). Disable it to send nothing in those cases.
+    fallback:
+      enabled: true
+      text: "I could not answer in time."
+    # The backend capabilities verified at startup, before the brain reports
+    # ready (R2): `structured_output` (mandatory — the loop needs one tool
+    # call or a final text per turn) and `vision` (the model accepts image
+    # observations, such as a screen capture). A capability the backend does
+    # not verify stops startup naming it.
+    capabilities:
+      required:
+        - structured_output
+        - vision
+    # The terminal delivery step (R1): the ordered list of actions the final
+    # answer is handed to, one authorized executor call per entry, resolved
+    # against the enabled modules at startup. `mode: fixed` lists the entries
+    # here; `text_argument` names the argument the answer text is put under
+    # (`none` for an effect-only entry such as a scene change). The model
+    # never selects a delivery. `mode: modules` derives the list from every
+    # enabled action that declares a delivery capability, ordered by an
+    # optional `preference` list; `overrides` keyed `<platform>/<channel_id>`
+    # select another list per destination.
+    delivery:
+      mode: fixed
+      actions:
+        - action: chat.write
+          text_argument: text
 
   audit:
     output: stdout
@@ -180,4 +219,4 @@ limits:
     max_sessions: 32
     workers: 4
     wait_seconds: 30
-    total_run_seconds: 120
+    total_run_seconds: 60

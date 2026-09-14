@@ -17,6 +17,7 @@ is injected and every wait is a bounded number of bare loop turns.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 from dataclasses import dataclass, field
@@ -82,6 +83,7 @@ from modules.brain import (
     CHAT_SCOPE,
     DELIVERY_ACTION,
     DELIVERY_NOT_ATTEMPTED,
+    KNOWN_CAPABILITIES,
     MODULE_NAME,
     PRINCIPAL,
     BrainModuleError,
@@ -116,6 +118,9 @@ LIMITS = {
         "action_seconds": 10,
         "max_tokens": 8192,
         "max_observation_bytes": 5_242_880,
+        "max_action_calls": 6,
+        "max_repeated_actions": 2,
+        "delivery_reserve_seconds": 10,
     },
     "conversation_memory": {
         "max_sessions": 64,
@@ -125,7 +130,20 @@ LIMITS = {
     },
 }
 
-VALID_SETTINGS = {**SETTINGS, **LIMITS}
+# The loop's policy groups (R1, R2, R3), required by the manifest's schema and
+# checked for shape by the hook: the generic fallback, the backend
+# capabilities verified at prepare, and the configured delivery list — the
+# single-entry list of both example brain profiles (decision 1).
+POLICY = {
+    "fallback": {"enabled": True, "text": "I could not answer in time."},
+    "capabilities": {"required": ["structured_output", "vision"]},
+    "delivery": {
+        "mode": "fixed",
+        "actions": [{"action": "chat.write", "text_argument": "text"}],
+    },
+}
+
+VALID_SETTINGS = {**SETTINGS, **LIMITS, **POLICY}
 
 PLATFORM = "twitch"
 OTHER_PLATFORM = "other-platform"
@@ -419,10 +437,9 @@ def merge_settings(overrides: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def copy_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: dict(value) if isinstance(value, dict) else value
-        for key, value in settings.items()
-    }
+    """A copy a test may mutate at any depth without touching the constants."""
+
+    return copy.deepcopy(settings)
 
 
 def assert_sanitized(diagnostics: list[str]) -> None:
@@ -478,6 +495,26 @@ def test_manifest_declares_v2_shape_settings_hook_and_no_grant() -> None:
         for name in limits:
             declared = group_schema["properties"][name]["type"]
             assert declared == ("number" if name.endswith("_seconds") else "integer")
+    fallback_schema = schema["properties"]["fallback"]
+    assert fallback_schema["type"] == "object"
+    assert set(fallback_schema["required"]) == set(POLICY["fallback"]) == {"enabled", "text"}
+    assert fallback_schema["properties"]["enabled"]["type"] == "boolean"
+    assert fallback_schema["properties"]["text"]["type"] == "string"
+    capabilities_schema = schema["properties"]["capabilities"]
+    assert capabilities_schema["type"] == "object"
+    assert capabilities_schema["required"] == ["required"]
+    assert capabilities_schema["properties"]["required"]["type"] == "array"
+    assert capabilities_schema["properties"]["required"]["items"]["type"] == "string"
+    delivery_schema = schema["properties"]["delivery"]
+    assert delivery_schema["type"] == "object"
+    assert delivery_schema["required"] == ["mode"]
+    assert set(delivery_schema["properties"]) == {"mode", "actions", "preference", "overrides"}
+    assert set(delivery_schema["properties"]["mode"]["enum"]) == {"fixed", "modules"}
+    entry_schema = delivery_schema["properties"]["actions"]["items"]
+    assert entry_schema["required"] == ["action"]
+    assert set(entry_schema["properties"]) == {"action", "text_argument", "arguments"}
+    assert delivery_schema["properties"]["preference"]["items"]["type"] == "string"
+    assert delivery_schema["properties"]["overrides"]["type"] == "object"
     assert manifest["settings_validator"] == "validate_settings"
     assert callable(validate_settings)
     for value in SETTINGS.values():
@@ -555,6 +592,360 @@ def test_settings_hook_refuses_each_unevaluable_field_with_one_diagnostic(
     assert f"module 'brain': {expected}" in diagnostics
     assert len(diagnostics) == 1
     assert_sanitized(diagnostics)
+
+
+# The 10 budget/admission values of R3, with the wording each kind refuses.
+ACTED_LIMITS = [
+    ("budget", "model_turns", "must be a positive integer"),
+    ("budget", "model_call_seconds", "must be a finite positive number"),
+    ("budget", "action_seconds", "must be a finite positive number"),
+    ("budget", "max_tokens", "must be a positive integer"),
+    ("budget", "max_observation_bytes", "must be a positive integer"),
+    ("budget", "max_action_calls", "must be a positive integer"),
+    ("budget", "max_repeated_actions", "must be a positive integer"),
+    ("budget", "delivery_reserve_seconds", "must be a finite positive number"),
+    ("admission", "wait_seconds", "must be a finite positive number"),
+    ("admission", "total_run_seconds", "must be a finite positive number"),
+]
+UNEVALUABLE = [
+    pytest.param(None, id="absent"),
+    pytest.param(0, id="zero"),
+    pytest.param(-1, id="negative"),
+    pytest.param(float("inf"), id="infinite"),
+]
+
+
+@pytest.mark.parametrize(("group", "field_name", "wording"), ACTED_LIMITS)
+@pytest.mark.parametrize("value", UNEVALUABLE)
+def test_ac20_each_acted_limit_is_refused_when_absent_zero_negative_or_infinite(
+    group: str, field_name: str, wording: str, value: Any
+) -> None:
+    """R3/AC20: the 10 budget/admission values, one diagnostic naming the field."""
+
+    assert validate_settings(VALID_SETTINGS) == []
+    invalid = copy_settings(VALID_SETTINGS)
+    if value is None:
+        del invalid[group][field_name]
+    else:
+        invalid[group][field_name] = value
+
+    diagnostics = validate_settings(invalid)
+
+    reason = "is required" if value is None else wording
+    assert diagnostics == [f"module 'brain': field '{group}.{field_name}': {reason}"]
+    assert_sanitized(diagnostics)
+    with pytest.raises(BrainModuleError) as refused:
+        brain_settings.from_mapping(invalid)
+    assert str(refused.value) == diagnostics[0]
+
+
+def test_ac20_the_queued_wait_may_not_exceed_the_total_run_deadline() -> None:
+    """R3/AC20: ``admission.wait_seconds`` is part of ``admission.total_run_seconds``."""
+
+    settings = copy_settings(VALID_SETTINGS)
+    settings["admission"]["wait_seconds"] = 61
+    settings["admission"]["total_run_seconds"] = 60
+
+    assert validate_settings(settings) == [
+        "module 'brain': field 'admission.wait_seconds': "
+        "must not exceed admission.total_run_seconds"
+    ]
+
+    equal = copy_settings(VALID_SETTINGS)
+    equal["admission"]["wait_seconds"] = 60
+    equal["admission"]["total_run_seconds"] = 60
+    assert validate_settings(equal) == []
+
+    # An unevaluable total is its own single diagnostic; the comparison never
+    # adds a second one on the wait.
+    infinite = copy_settings(VALID_SETTINGS)
+    infinite["admission"]["total_run_seconds"] = float("inf")
+    assert validate_settings(infinite) == [
+        "module 'brain': field 'admission.total_run_seconds': must be a finite positive number"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("required", "expected"),
+    [
+        (["vision"], "must name 'structured_output'"),
+        (
+            ["structured_output", "audio"],
+            "names a capability this module does not know (known: structured_output, vision)",
+        ),
+    ],
+)
+def test_ac10_capabilities_required_needs_structured_output_and_only_known_names(
+    required: list[str], expected: str
+) -> None:
+    """R2/AC10: both refusals, one diagnostic naming ``capabilities.required``."""
+
+    assert KNOWN_CAPABILITIES == frozenset({"structured_output", "vision"})
+    invalid = copy_settings(VALID_SETTINGS)
+    invalid["capabilities"]["required"] = required
+
+    diagnostics = validate_settings(invalid)
+
+    assert diagnostics == [f"module 'brain': field 'capabilities.required': {expected}"]
+    assert_sanitized(diagnostics)
+
+    accepted = copy_settings(VALID_SETTINGS)
+    accepted["capabilities"]["required"] = ["structured_output"]
+    assert validate_settings(accepted) == []
+    assert brain_settings.from_mapping(accepted).capabilities == frozenset({"structured_output"})
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "expected"),
+    [
+        (("capabilities",), None, "field 'capabilities': is required"),
+        (("capabilities",), ["structured_output"], "field 'capabilities': must be a mapping"),
+        (("capabilities", "required"), None, "field 'capabilities.required': is required"),
+        (("capabilities", "required"), "structured_output", "field 'capabilities.required': must be a list of capability names"),
+        (("capabilities", "required"), ["structured_output", 3], "field 'capabilities.required': must be a list of capability names"),
+        (("capabilities", "optional"), [], "field 'capabilities.optional': is not a setting this module knows"),
+        (("fallback",), None, "field 'fallback': is required"),
+        (("fallback",), "I could not answer in time.", "field 'fallback': must be a mapping"),
+        (("fallback", "enabled"), None, "field 'fallback.enabled': is required"),
+        (("fallback", "enabled"), "yes", "field 'fallback.enabled': must be a boolean"),
+        (("fallback", "text"), None, "field 'fallback.text': is required"),
+        (("fallback", "text"), "   ", "field 'fallback.text': must be a non-empty string"),
+        (("fallback", "text"), 7, "field 'fallback.text': must be a non-empty string"),
+        (("fallback", "retries"), 1, "field 'fallback.retries': is not a setting this module knows"),
+    ],
+)
+def test_settings_hook_refuses_each_malformed_fallback_or_capability_field(
+    path: tuple[str, ...], value: Any, expected: str
+) -> None:
+    """R2/R3: the ``fallback`` and ``capabilities`` groups, one diagnostic per field."""
+
+    invalid = copy_settings(VALID_SETTINGS)
+    target: Any = invalid
+    for component in path[:-1]:
+        target = target[component]
+    if value is None:
+        del target[path[-1]]
+    else:
+        target[path[-1]] = value
+
+    diagnostics = validate_settings(invalid)
+
+    assert diagnostics == [f"module 'brain': {expected}"]
+    assert_sanitized(diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("delivery", "expected"),
+    [
+        pytest.param(
+            {"mode": "teleport", "actions": [{"action": "chat.write"}]},
+            "field 'delivery.mode': must be one of fixed, modules",
+            id="ac53-unknown-mode",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": [{"text_argument": "text"}]},
+            "field 'delivery.actions[0].action': is required",
+            id="ac53-entry-without-action",
+        ),
+        pytest.param(
+            {"actions": [{"action": "chat.write"}]},
+            "field 'delivery.mode': is required",
+            id="mode-absent",
+        ),
+        pytest.param(
+            {"mode": "fixed"},
+            "field 'delivery.actions': is required for mode 'fixed'",
+            id="fixed-without-list",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": {"action": "chat.write"}},
+            "field 'delivery.actions': must be a list of delivery entries",
+            id="list-not-a-list",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": [{"action": "chat.write"}, "audio.say"]},
+            "field 'delivery.actions[1]': must be a mapping",
+            id="entry-not-a-mapping",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": [{"action": "  "}]},
+            "field 'delivery.actions[0].action': must be a non-empty action name",
+            id="entry-blank-action",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": [{"action": "chat.write", "text_argument": None}]},
+            "field 'delivery.actions[0].text_argument': must be an argument name or 'none'",
+            id="entry-null-text-argument",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": [{"action": "chat.write", "text_argument": 3}]},
+            "field 'delivery.actions[0].text_argument': must be an argument name or 'none'",
+            id="entry-numeric-text-argument",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": [{"action": "chat.write", "arguments": ["x"]}]},
+            "field 'delivery.actions[0].arguments': must be a mapping of arguments",
+            id="entry-arguments-not-a-mapping",
+        ),
+        pytest.param(
+            {"mode": "fixed", "actions": [{"action": "chat.write", "text": "x"}]},
+            "field 'delivery.actions[0].text': is not a setting this module knows",
+            id="entry-unknown-key",
+        ),
+        pytest.param(
+            {"mode": "modules", "preference": "audio.say"},
+            "field 'delivery.preference': must be a list of action names",
+            id="preference-not-a-list",
+        ),
+        pytest.param(
+            {"mode": "modules", "preference": ["audio.say", 1]},
+            "field 'delivery.preference': must be a list of action names",
+            id="preference-with-a-non-name",
+        ),
+        pytest.param(
+            {"mode": "modules", "retries": 2},
+            "field 'delivery.retries': is not a setting this module knows",
+            id="group-unknown-key",
+        ),
+        pytest.param(
+            {"mode": "modules", "overrides": [{"mode": "fixed", "actions": []}]},
+            "field 'delivery.overrides': must be a mapping keyed by destination",
+            id="overrides-not-a-mapping",
+        ),
+        pytest.param(
+            {"mode": "modules", "overrides": {"chan-b": {"mode": "fixed", "actions": []}}},
+            """field 'delivery.overrides["chan-b"]': must be keyed '<platform>/<channel_id>'""",
+            id="override-key-without-platform",
+        ),
+        pytest.param(
+            {"mode": "modules", "overrides": {"fake/chan-b": ["chat.write"]}},
+            """field 'delivery.overrides["fake/chan-b"]': must be a mapping""",
+            id="override-not-a-mapping",
+        ),
+        pytest.param(
+            {"mode": "modules", "overrides": {"fake/chan-b": {"mode": "teleport"}}},
+            """field 'delivery.overrides["fake/chan-b"].mode': must be one of fixed, modules""",
+            id="override-unknown-mode",
+        ),
+        pytest.param(
+            {"mode": "modules", "overrides": {"fake/chan-b": {"mode": "fixed", "actions": [{}]}}},
+            """field 'delivery.overrides["fake/chan-b"].actions[0].action': is required""",
+            id="override-entry-without-action",
+        ),
+        pytest.param(
+            {
+                "mode": "modules",
+                "overrides": {"fake/chan-b": {"mode": "fixed", "actions": [], "overrides": {}}},
+            },
+            """field 'delivery.overrides["fake/chan-b"].overrides': is not a setting this module knows""",
+            id="override-nesting-overrides",
+        ),
+    ],
+)
+def test_ac53_settings_hook_refuses_each_malformed_delivery_field_with_one_diagnostic(
+    delivery: dict[str, Any], expected: str
+) -> None:
+    """R1/AC53 (validation part): ``delivery.mode: teleport`` and a fixed entry
+    lacking ``action`` are refused with one diagnostic naming the field; so is
+    every other shape defect of the group, its entries and its overrides."""
+
+    invalid = copy_settings(VALID_SETTINGS)
+    invalid["delivery"] = delivery
+
+    diagnostics = validate_settings(invalid)
+
+    assert diagnostics == [f"module 'brain': {expected}"]
+    assert_sanitized(diagnostics)
+
+
+def test_settings_hook_leaves_catalog_questions_to_prepare() -> None:
+    """R1/AC53: the shape is the hook's; existence, nature and text mapping are
+    resolved against the discovered catalog at ``prepare``, so an empty fixed
+    list, an unknown action name, a read action or an effect-only entry pass
+    validation as shaped settings."""
+
+    for delivery in (
+        {"mode": "fixed", "actions": []},
+        {"mode": "fixed", "actions": [{"action": "nope.action"}]},
+        {"mode": "fixed", "actions": [{"action": "chat.read", "text_argument": "text"}]},
+        {"mode": "fixed", "actions": [{"action": "stream.set_scene", "text_argument": "none"}]},
+        {
+            "mode": "fixed",
+            "actions": [{"action": "chat.write", "text_argument": "text", "arguments": {"text": "x"}}],
+        },
+        {"mode": "modules"},
+        {"mode": "modules", "preference": ["audio.say", "chat.write", "nope.action"]},
+        {"mode": "modules", "actions": [{"action": "chat.write"}], "preference": []},
+        {"mode": "fixed", "actions": [{"action": "chat.write"}], "overrides": {}},
+    ):
+        settings = copy_settings(VALID_SETTINGS)
+        settings["delivery"] = delivery
+        assert validate_settings(settings) == [], delivery
+
+
+def test_settings_parse_the_loop_groups_into_typed_values() -> None:
+    """R1/R2/R3: ``_Settings.from_mapping`` carries the budgets, the fallback,
+    the verified-capability set and the delivery lists as typed values."""
+
+    settings = copy_settings(VALID_SETTINGS)
+    settings["delivery"] = {
+        "mode": "fixed",
+        "actions": [
+            {"action": " chat.write ", "text_argument": "text"},
+            {"action": "stream.set_scene", "text_argument": "none", "arguments": {"scene": "answering"}},
+            {"action": "audio.say"},
+        ],
+        "preference": ["audio.say"],
+        "overrides": {
+            "fake/chan-b": {
+                "mode": "modules",
+                "preference": ["stream.set_scene", "chat.write"],
+            },
+        },
+    }
+
+    parsed = brain_settings.from_mapping(settings)
+
+    assert (
+        parsed.budget.model_turns,
+        parsed.budget.model_call_seconds,
+        parsed.budget.action_seconds,
+        parsed.budget.max_tokens,
+        parsed.budget.max_observation_bytes,
+        parsed.budget.max_action_calls,
+        parsed.budget.max_repeated_actions,
+        parsed.budget.delivery_reserve_seconds,
+        parsed.admission.wait_seconds,
+        parsed.admission.total_run_seconds,
+    ) == (5, 30, 10, 8192, 5_242_880, 6, 2, 10, 30, 120)
+    assert parsed.fallback.enabled is True
+    assert parsed.fallback.text == "I could not answer in time."
+    assert parsed.capabilities == frozenset({"structured_output", "vision"})
+    assert isinstance(parsed.capabilities, frozenset)
+
+    default = parsed.delivery.default
+    assert default.mode == "fixed"
+    assert [(entry.action, entry.text_argument, dict(entry.arguments)) for entry in default.actions] == [
+        ("chat.write", "text", {}),
+        ("stream.set_scene", "none", {"scene": "answering"}),
+        ("audio.say", None, {}),
+    ]
+    assert default.preference == ("audio.say",)
+    assert set(parsed.delivery.overrides) == {"fake/chan-b"}
+    override = parsed.delivery.overrides["fake/chan-b"]
+    assert override.mode == "modules"
+    assert override.actions == ()
+    assert override.preference == ("stream.set_scene", "chat.write")
+    assert parsed.delivery.for_destination("fake", "chan-b") is override
+    assert parsed.delivery.for_destination("fake", "chan-a") is default
+    assert parsed.delivery.for_destination(PLATFORM, CHANNEL) is default
+
+    # The constant's own default list, as both example brain profiles carry it.
+    example = brain_settings.from_mapping(VALID_SETTINGS).delivery
+    assert example.overrides == {}
+    assert [(entry.action, entry.text_argument) for entry in example.default.actions] == [
+        ("chat.write", "text")
+    ]
 
 
 @pytest.mark.asyncio
@@ -1377,7 +1768,12 @@ async def test_a_confirmation_released_after_the_deadline_never_becomes_memory()
         clock=clock,
     )
     diagnostics: list[str] = []
-    settings = merge_settings({"admission": {"total_run_seconds": 10.0}})
+    # The queued wait may not exceed the total it is part of (R3, AC20), so
+    # the short total takes a shorter wait with it; the run starts at once,
+    # so the wait itself is never reached here.
+    settings = merge_settings(
+        {"admission": {"total_run_seconds": 10.0, "wait_seconds": 5.0}}
+    )
     settings.update(
         {
             "_session_factory": lambda: FakeSession(

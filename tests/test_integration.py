@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -835,12 +836,23 @@ BUDGET = {
     "action_seconds": 10,
     "max_tokens": 8192,
     "max_observation_bytes": 5_242_880,
+    "max_action_calls": 6,
+    "max_repeated_actions": 2,
+    "delivery_reserve_seconds": 10,
 }
 MEMORY = {
     "max_sessions": 64,
     "max_exchanges": 20,
     "max_bytes": 65_536,
     "max_age_seconds": 3600.5,
+}
+# The loop's policy groups the brain manifest requires (R1, R2, R3): the
+# single-entry delivery list of the example profiles (decision 1).
+FALLBACK = {"enabled": True, "text": "I could not answer in time."}
+CAPABILITIES = {"required": ["structured_output", "vision"]}
+DELIVERY = {
+    "mode": "fixed",
+    "actions": [{"action": "chat.write", "text_argument": "text"}],
 }
 
 
@@ -1016,6 +1028,9 @@ async def start_pipeline(
                 "admission": {**ADMISSION, **(admission or {})},
                 "budget": dict(BUDGET),
                 "conversation_memory": dict(MEMORY),
+                "fallback": dict(FALLBACK),
+                "capabilities": deepcopy(CAPABILITIES),
+                "delivery": deepcopy(DELIVERY),
                 "_session_factory": lambda: model,
                 "_sleeper": clock.sleep,
                 "diagnostic_reporter": diagnostics.append,
