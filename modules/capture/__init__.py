@@ -539,7 +539,12 @@ class CommandSource:
         return data
 
 
-async def run_command(argv: Sequence[str], *, limit: int) -> tuple[int | None, bytes]:
+async def run_command(
+    argv: Sequence[str],
+    *,
+    limit: int,
+    spawn: Callable[..., Awaitable[asyncio.subprocess.Process]] = asyncio.create_subprocess_exec,
+) -> tuple[int | None, bytes]:
     """The default runner: spawn *argv*, read stdout up to *limit* + 1 bytes.
 
     stdin is closed and stderr discarded, so nothing the program prints —
@@ -548,14 +553,16 @@ async def run_command(argv: Sequence[str], *, limit: int) -> tuple[int | None, b
     reads the oversize buffer as the refusal. A cancellation kills the child
     before propagating, so no process outlives the call that spawned it.
 
-    The program is started in its own session, hence its own process group
-    (``start_new_session``), and a kill is delivered to the whole group: a
-    configured wrapper script that launches the real capture tool does not
-    leave that tool running past a timeout — nor holding the inherited
-    stdout open, which would keep the wait on the pipe from returning.
+    The program is started in its own session, hence its own isolated
+    process group (``start_new_session``), and a kill is delivered to the
+    whole group by :func:`_kill`: a configured wrapper script that launches
+    the real capture tool does not leave that tool running past a timeout —
+    nor holding the inherited stdout open, which would keep the wait on the
+    pipe from returning. *spawn* is the ``create_subprocess_exec`` seam, for
+    tests that stand in a transport of their own.
     """
 
-    process = await asyncio.create_subprocess_exec(
+    process = await spawn(
         *argv,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
@@ -581,31 +588,53 @@ async def run_command(argv: Sequence[str], *, limit: int) -> tuple[int | None, b
 
 
 async def _kill(process: asyncio.subprocess.Process) -> None:
-    """Kill *process* and every descendant in its process group, then reap it.
+    """Terminate *process* and every descendant in its process group, then reap it.
 
-    The group is the session started for it in :func:`run_command`; on a
-    platform without ``killpg`` (or when the group is already gone) the
-    process alone is killed. A descendant that keeps the stdout pipe open
-    would otherwise block ``wait`` past ``command_timeout_seconds``.
+    The group is the session :func:`run_command` started for the process,
+    so its id is the process's own pid. It is signalled whether or not the
+    process itself has already exited: a wrapper script that returned while
+    its background child kept running would otherwise leave that child
+    behind. The stdout pipe is then closed *before* the wait, so the wait
+    ends when the process is reaped — not when the last holder of the
+    inherited write end lets go of it, which a descendant the signal could
+    not reach (one that started a session of its own, say) might never do.
+    That keeps a timed-out capture within ``command_timeout_seconds`` and a
+    cancelled one prompt. On a platform without ``killpg`` (or when the
+    group is already gone) the process alone is killed.
     """
 
-    if process.returncode is None:
-        killpg = getattr(os, "killpg", None)
-        killed_group = False
-        if killpg is not None:
-            try:
-                killpg(process.pid, signal.SIGKILL)
-                killed_group = True
-            except OSError:
-                # The group is already gone, or the signal could not be
-                # delivered to it as a whole: fall back to the child alone.
-                pass
-        if not killed_group:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
+    _terminate_group(process)
+    _close_stdout(process)
     await process.wait()
+
+
+def _terminate_group(process: asyncio.subprocess.Process) -> None:
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        try:
+            killpg(process.pid, signal.SIGKILL)
+            return
+        except OSError:
+            # The group is already gone, or the signal could not be
+            # delivered to it as a whole: fall back to the process alone.
+            pass
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
+def _close_stdout(process: asyncio.subprocess.Process) -> None:
+    # asyncio exposes no public handle on a subprocess's pipe transports:
+    # the subprocess transport is reached through ``Process._transport``,
+    # whose ``get_pipe_transport`` is public. Absent either (another loop
+    # implementation), the wait that follows depends on the pipe closing.
+    transport = getattr(process, "_transport", None)
+    get_pipe_transport = getattr(transport, "get_pipe_transport", None)
+    pipe = get_pipe_transport(1) if callable(get_pipe_transport) else None
+    if pipe is not None:
+        pipe.close()
 
 
 async def _settle(task: "asyncio.Future[Any]") -> None:

@@ -26,6 +26,7 @@ executor's, not mocked.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import struct
 import os
@@ -54,7 +55,15 @@ from core.contracts import (
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext
-from conftest import FakeCaptureSource, ManualClock, events_of, png_bytes, runtime_context, settle
+from conftest import (
+    FakeCaptureSource,
+    ManualClock,
+    events_of,
+    png_bytes,
+    runtime_context,
+    settle,
+    wait_until,
+)
 
 from modules.capture import (
     CONTENT_TYPE_JPEG,
@@ -539,17 +548,261 @@ async def test_run_command_reads_bounded_stdout_and_kills_a_flooding_child() -> 
     assert status is not None
 
 
-# A wrapper that starts a long-lived grandchild sharing its stdout, reports the
-# grandchild's pid, then floods stdout past the limit so the runner kills it.
-_WRAPPER_WITH_GRANDCHILD = """
-import subprocess, sys, time
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-sys.stdout.write(f"{child.pid:>10}")
-sys.stdout.flush()
-sys.stdout.buffer.write(b"z" * 4096)
-sys.stdout.flush()
+# --------------------------------------------------------------------------- #
+# P16F finding 1: a command's whole process group is terminated on timeout and
+# on cancellation, and the child is reaped without waiting on an inherited pipe
+# --------------------------------------------------------------------------- #
+
+
+class FakeProcess:
+    """A stand-in for ``asyncio.subprocess.Process`` with the wait semantics
+    of asyncio on Python 3.12: ``wait`` returns at once when the exit is
+    already known, otherwise only once the exit is known *and* stdout is
+    disconnected — the stall a descendant that inherited the pipe causes.
+    A kill (of the process, or of its group through ``os.killpg``) reports
+    the exit a loop turn later, as the child watcher would; nothing ever
+    closes the pipe but the module."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, *, pid: int, exited: bool = False) -> None:
+        self.pid = pid
+        self.returncode: int | None = 0 if exited else None
+        self.stdout = asyncio.StreamReader()
+        self.events: list[str] = []
+        self.argv: tuple[str, ...] = ()
+        self.options: dict[str, Any] = {}
+        self._loop = loop
+        self._pipe_closed = False
+        self._finished: asyncio.Future[None] = loop.create_future()
+        self._transport = _FakeSubprocessTransport(self)
+
+    def kill(self) -> None:
+        self.events.append("kill")
+        self._loop.call_soon(self._exit, -9)
+
+    def signal_group(self, sig: int) -> None:
+        self.events.append(f"killpg:{sig}")
+        self._loop.call_soon(self._exit, -sig)
+
+    def close_pipe(self) -> None:
+        self.events.append("close_pipe")
+        self._pipe_closed = True
+        self.stdout.feed_eof()
+        self._try_finish()
+
+    async def wait(self) -> int | None:
+        self.events.append("wait")
+        if self.returncode is None:
+            await self._finished
+        self.events.append("reaped")
+        return self.returncode
+
+    def _exit(self, code: int) -> None:
+        if self.returncode is None:
+            self.returncode = code
+        self._try_finish()
+
+    def _try_finish(self) -> None:
+        if self.returncode is not None and self._pipe_closed and not self._finished.done():
+            self._finished.set_result(None)
+
+
+class _FakeSubprocessTransport:
+    def __init__(self, process: FakeProcess) -> None:
+        self._process = process
+
+    def get_pipe_transport(self, fd: int) -> Any:
+        return _FakePipeTransport(self._process) if fd == 1 else None
+
+
+class _FakePipeTransport:
+    def __init__(self, process: FakeProcess) -> None:
+        self._process = process
+
+    def close(self) -> None:
+        self._process.close_pipe()
+
+
+def fake_subprocesses(
+    monkeypatch: pytest.MonkeyPatch, *, exited: bool = False, killpg_fails: bool = False
+) -> tuple[Any, dict[int, FakeProcess]]:
+    """A ``create_subprocess_exec`` seam returning :class:`FakeProcess`
+    objects, with ``os.killpg`` routed to the fake group of the same id."""
+
+    loop = asyncio.get_running_loop()
+    processes: dict[int, FakeProcess] = {}
+
+    async def spawn(*argv: str, **options: Any) -> FakeProcess:
+        process = FakeProcess(loop, pid=4000 + len(processes), exited=exited)
+        process.argv = argv
+        process.options = options
+        processes[process.pid] = process
+        return process
+
+    def killpg(pgid: int, sig: int) -> None:
+        if killpg_fails or pgid not in processes:
+            raise ProcessLookupError(pgid)
+        processes[pgid].signal_group(sig)
+
+    monkeypatch.setattr(os, "killpg", killpg, raising=False)
+    return spawn, processes
+
+
+def fake_command_source(spawn: Any, sleeper: Any, timeout: float = 2.0) -> CommandSource:
+    return CommandSource(
+        SourceSpec(
+            "tool", "command", argv=("/opt/capture/wrapper.sh",), command_timeout_seconds=timeout
+        ),
+        runner=functools.partial(run_command, spawn=spawn),
+        sleeper=sleeper,
+    )
+
+
+async def test_a_timeout_terminates_the_process_group_and_reaps_without_waiting_on_the_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1, the timeout path on an injected clock and transport: the
+    program is spawned in its own session (an isolated process group), the
+    timer firing kills the *group* (``os.killpg`` with ``SIGKILL`` on the
+    pid, never ``process.kill`` alone), the stdout pipe is closed *before*
+    the wait — which would otherwise never return, since nothing but the
+    module lets go of it — the child is reaped, and ``CaptureTimedOut``
+    arrives on the same turn budget with no real time elapsing."""
+
+    clock = ManualClock()
+    spawn, processes = fake_subprocesses(monkeypatch)
+    source = fake_command_source(spawn, clock.sleep, timeout=2.0)
+
+    pending = asyncio.ensure_future(source.read(max_bytes=4096))
+    try:
+        await wait_until(lambda: processes)
+        (process,) = processes.values()
+        assert process.argv == ("/opt/capture/wrapper.sh",)
+        assert process.options["start_new_session"] is True
+        assert process.options["stdin"] is asyncio.subprocess.DEVNULL
+        assert process.options["stderr"] is asyncio.subprocess.DEVNULL
+        clock.advance(1.99)
+        await settle()
+        assert not pending.done()
+        assert process.events == []
+
+        clock.advance(0.01)
+        await settle()
+        assert pending.done()
+        with pytest.raises(CaptureTimedOut):
+            pending.result()
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.wait({pending})
+
+    assert process.events == ["killpg:9", "close_pipe", "wait", "reaped"]
+    assert process.returncode == -9
+
+
+async def test_a_cancellation_terminates_the_process_group_and_reaps_without_waiting_on_the_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1, the cancellation path: cancelling the read (the executor's
+    own deadline or a run cancellation) kills the group, closes the pipe
+    before the wait, reaps the child and only then propagates — the timer
+    never fires."""
+
+    clock = ManualClock()
+    spawn, processes = fake_subprocesses(monkeypatch)
+    source = fake_command_source(spawn, clock.sleep, timeout=2.0)
+
+    pending = asyncio.ensure_future(source.read(max_bytes=4096))
+    await wait_until(lambda: processes)
+    (process,) = processes.values()
+    await settle()
+    assert not pending.done()
+
+    pending.cancel()
+    await settle()
+    assert pending.cancelled()
+    assert process.events == ["killpg:9", "close_pipe", "wait", "reaped"]
+    assert process.returncode == -9
+    assert clock._waiters == []
+
+
+async def test_the_group_is_terminated_even_when_the_wrapper_itself_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1: a wrapper script that returned while its background child
+    kept stdout open is a known exit with a pipe still held. The group is
+    signalled all the same — the child is what is left running — the pipe
+    closed, and the wrapper's own status kept."""
+
+    clock = ManualClock()
+    spawn, processes = fake_subprocesses(monkeypatch, exited=True)
+    source = fake_command_source(spawn, clock.sleep, timeout=2.0)
+
+    pending = asyncio.ensure_future(source.read(max_bytes=4096))
+    await wait_until(lambda: processes)
+    (process,) = processes.values()
+    await settle()
+    assert not pending.done()
+
+    clock.advance(2.0)
+    await settle()
+    assert pending.done()
+    with pytest.raises(CaptureTimedOut):
+        pending.result()
+    assert process.events == ["killpg:9", "close_pipe", "wait", "reaped"]
+    assert process.returncode == 0
+
+
+async def test_a_group_that_cannot_be_signalled_falls_back_to_killing_the_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``os.killpg`` refuses the group the process alone is killed, the
+    pipe still closed before the wait, and the outcome is the same."""
+
+    clock = ManualClock()
+    spawn, processes = fake_subprocesses(monkeypatch, killpg_fails=True)
+    source = fake_command_source(spawn, clock.sleep, timeout=2.0)
+
+    pending = asyncio.ensure_future(source.read(max_bytes=4096))
+    await wait_until(lambda: processes)
+    (process,) = processes.values()
+    pending.cancel()
+    await settle()
+    assert pending.cancelled()
+    assert process.events == ["kill", "close_pipe", "wait", "reaped"]
+
+
+# The real thing, on Linux: a shell script launching a long-lived capture
+# program that inherits stdout. The program reports its pid to the test over
+# loopback, then idles; the script either waits on it or returns at once,
+# leaving it behind in the group. Nothing in the test sleeps: the program's
+# start is awaited on the socket, its end on a pidfd.
+
+_CAPTURE_PROGRAM = """
+import os, socket, sys, time
+with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as link:
+    link.sendall(str(os.getpid()).encode())
 time.sleep(120)
 """
+
+_PIDFD = sys.platform.startswith("linux") and hasattr(os, "pidfd_open")
+
+
+async def wait_for_termination(pid: int) -> None:
+    """Event-driven: a pidfd becomes readable when its process terminates."""
+
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return  # already reaped
+    loop = asyncio.get_running_loop()
+    terminated: asyncio.Future[None] = loop.create_future()
+    loop.add_reader(pidfd, lambda: terminated.done() or terminated.set_result(None))
+    try:
+        done, _pending = await asyncio.wait({terminated}, timeout=15.0)
+        assert terminated in done, "the capture program is still running"
+    finally:
+        loop.remove_reader(pidfd)
+        os.close(pidfd)
 
 
 def _is_gone(pid: int) -> bool:
@@ -566,7 +819,120 @@ def _is_gone(pid: int) -> bool:
         return True
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+def zombie_children() -> list[int]:
+    """Children of this process that exited and were never reaped."""
+
+    zombies: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as handle:
+                state, ppid = handle.read().rsplit(")", 1)[1].split()[:2]
+        except OSError:
+            continue
+        if state == "Z" and int(ppid) == os.getpid():
+            zombies.append(int(entry))
+    return zombies
+
+
+async def shell_script_with_background_program(
+    tmp_path: Path, ending: str
+) -> tuple[Path, Any, "asyncio.Future[int]"]:
+    """Write the script and the program; serve the program's pid report."""
+
+    program = tmp_path / "program.py"
+    program.write_text(_CAPTURE_PROGRAM)
+    loop = asyncio.get_running_loop()
+    reported: asyncio.Future[int] = loop.create_future()
+
+    async def on_report(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        pid = int(await reader.read(32))
+        writer.close()
+        if not reported.done():
+            reported.set_result(pid)
+
+    server = await asyncio.start_server(on_report, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    script = tmp_path / "wrapper.sh"
+    script.write_text(f"#!/bin/sh\n{sys.executable} {program} {port} &\n{ending}\n")
+    script.chmod(0o755)
+    return script, server, reported
+
+
+@pytest.mark.skipif(not _PIDFD, reason="needs Linux process groups, /proc and pidfd")
+@pytest.mark.parametrize("ending", ["wait", "exit 0"], ids=["wrapper-waits", "wrapper-returns"])
+@pytest.mark.parametrize("interruption", ["timeout", "cancellation"])
+async def test_a_shell_script_s_background_capture_program_is_terminated_and_reaped_promptly(
+    tmp_path: Path, ending: str, interruption: str
+) -> None:
+    """Finding 1 end to end: the configured shell script starts the capture
+    program in the background — it inherits stdout and never writes — and
+    either waits on it or returns at once. On the timeout (the injected
+    clock reaching ``command_timeout_seconds``) and on a cancellation, (a)
+    the program is gone: the group was terminated; (b) the terminal outcome
+    arrives at once, not when the program would have let go of the pipe;
+    (c) no zombie of ours survives — the wrapper was reaped."""
+
+    script, server, reported = await shell_script_with_background_program(tmp_path, ending)
+    clock = ManualClock()
+    source = CommandSource(
+        SourceSpec("tool", "command", argv=(str(script),), command_timeout_seconds=2.0),
+        runner=run_command,
+        sleeper=clock.sleep,
+    )
+    program_pid: int | None = None
+    pending = asyncio.ensure_future(source.read(max_bytes=4096))
+    try:
+        done, _ = await asyncio.wait(
+            {reported, pending}, return_when=asyncio.FIRST_COMPLETED, timeout=15.0
+        )
+        assert reported in done, "the capture program never started"
+        program_pid = reported.result()
+        assert not pending.done()
+        assert not _is_gone(program_pid)
+
+        started = time.monotonic()
+        if interruption == "timeout":
+            clock.advance(2.0)
+        else:
+            pending.cancel()
+        done, _ = await asyncio.wait({pending}, timeout=15.0)
+        assert pending in done, "the outcome waited on the inherited pipe"
+        assert time.monotonic() - started < 5.0
+        if interruption == "timeout":
+            with pytest.raises(CaptureTimedOut):
+                pending.result()
+        else:
+            assert pending.cancelled()
+
+        await wait_for_termination(program_pid)
+        assert _is_gone(program_pid)
+        assert zombie_children() == []
+    finally:
+        server.close()
+        await server.wait_closed()
+        if not pending.done():
+            pending.cancel()
+            await asyncio.wait({pending})
+        if program_pid is not None and not _is_gone(program_pid):
+            os.kill(program_pid, 9)
+
+
+# A wrapper that starts a long-lived grandchild sharing its stdout, reports the
+# grandchild's pid, then floods stdout past the limit so the runner kills it.
+_WRAPPER_WITH_GRANDCHILD = """
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+sys.stdout.write(f"{child.pid:>10}")
+sys.stdout.flush()
+sys.stdout.buffer.write(b"z" * 4096)
+sys.stdout.flush()
+time.sleep(120)
+"""
+
+
+@pytest.mark.skipif(not _PIDFD, reason="needs Linux process groups, /proc and pidfd")
 async def test_run_command_kills_the_whole_process_group_of_a_wrapper_script() -> None:
     """A configured wrapper that launches the real capture program must not
     leave that program running past a kill — nor holding the inherited stdout
@@ -578,70 +944,13 @@ async def test_run_command_kills_the_whole_process_group_of_a_wrapper_script() -
     )
     assert status is not None
     grandchild = int(output[:10])
-    for _ in range(100):
-        if _is_gone(grandchild):
-            break
-        await asyncio.sleep(0.05)
-    else:
-        os.kill(grandchild, 9)
-        pytest.fail("grandchild outlived the killed wrapper")
-
-
-# A wrapper that starts a long-lived grandchild sharing its stdout, reports the
-# grandchild's pid, then idles: nothing more arrives and nothing exits, so only
-# ``command_timeout_seconds`` ends the capture.
-_IDLE_WRAPPER_WITH_GRANDCHILD = """
-import subprocess, sys, time
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-sys.stdout.write(f"{child.pid:>10}")
-sys.stdout.flush()
-time.sleep(120)
-"""
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
-async def test_a_command_timeout_kills_the_wrapper_and_the_grandchild_holding_stdout(
-    tmp_path: Path,
-) -> None:
-    """The timeout path of a real command source: the timer wins, the runner
-    is cancelled and the kill reaches the grandchild that inherited stdout —
-    so ``CaptureTimedOut`` arrives close to ``command_timeout_seconds`` rather
-    than when the grandchild would have let go of the pipe, and no process
-    outlives the capture."""
-
-    pid_file = tmp_path / "grandchild.pid"
-    script = _IDLE_WRAPPER_WITH_GRANDCHILD.replace(
-        'sys.stdout.write(f"{child.pid:>10}")',
-        f'open({str(pid_file)!r}, "w").write(str(child.pid)); sys.stdout.write("x")',
-    )
-    source = CommandSource(
-        SourceSpec(
-            "tool",
-            "command",
-            argv=(sys.executable, "-c", script),
-            command_timeout_seconds=0.5,
-        ),
-        runner=run_command,
-        sleeper=asyncio.sleep,
-    )
-
-    started = time.monotonic()
-    with pytest.raises(CaptureTimedOut):
-        await asyncio.wait_for(source.read(max_bytes=4096), timeout=15.0)
-    assert time.monotonic() - started < 5.0
-
-    for _ in range(100):
-        if pid_file.exists() and pid_file.read_text():
-            break
-        await asyncio.sleep(0.05)
-    grandchild = int(pid_file.read_text())
-    for _ in range(100):
-        if _is_gone(grandchild):
-            break
-        await asyncio.sleep(0.05)
-    else:
-        os.kill(grandchild, 9)
-        pytest.fail("grandchild outlived the timed-out wrapper")
+    try:
+        await wait_for_termination(grandchild)
+        assert _is_gone(grandchild)
+        assert zombie_children() == []
+    finally:
+        if not _is_gone(grandchild):
+            os.kill(grandchild, 9)
 
 
 # --------------------------------------------------------------------------- #
@@ -1198,6 +1507,39 @@ def test_settings_hook_checks_source_shapes_and_names_fields_without_values(tmp_
     assert fields({"sources": good["sources"], "default_source": "shot", "max_bytes": 7.5})["max_bytes"]
     for line in validate_settings({"sources": {"s": {"kind": "file", "path": "/secret/frame.png"}}, "default_source": "nope", "max_bytes": -5}):
         assert "/secret" not in line and "nope" not in line and "-5" not in line
+
+
+@pytest.mark.parametrize("kind", [[], {}, 12], ids=["list", "mapping", "int"])
+def test_a_non_string_source_kind_is_the_kind_diagnostic_not_a_type_error(kind: Any) -> None:
+    """Finding 2: ``kind: []`` and ``kind: {}`` are unhashable, ``kind: 12``
+    is not a string — each is reported as ``sources.<name>.kind`` exactly
+    like an unknown string kind, the validator never raises, and the other
+    offending fields of the same settings block are reported alongside."""
+
+    settings = {
+        "sources": {
+            "cam": {"kind": kind, "path": "/frames/cam.png"},
+            "tool": {"kind": "command", "argv": []},
+        },
+        "default_source": "nobody",
+        "max_bytes": 0,
+    }
+    diagnostics = validate_settings(settings)
+
+    kind_diagnostic = "module 'capture': field 'sources.cam.kind': must be 'file' or 'command'"
+    assert diagnostics.count(kind_diagnostic) == 1
+    unknown = dict(
+        settings,
+        sources={**settings["sources"], "cam": {"kind": "socket", "path": "/frames/cam.png"}},
+    )
+    assert diagnostics == validate_settings(unknown)
+    assert (
+        "module 'capture': field 'sources.tool.argv': must be a non-empty list of strings"
+        in diagnostics
+    )
+    assert "module 'capture': field 'default_source': must name a configured source" in diagnostics
+    assert "module 'capture': field 'max_bytes': must be a positive integer" in diagnostics
+    assert not any("/frames" in line or "nobody" in line for line in diagnostics)
 
 
 async def test_activation_refuses_bad_settings_and_a_runtime_without_a_store_or_clock(
