@@ -14,7 +14,7 @@ from conftest import wait_until
 from core.loader import ModuleActivation
 from modules import audit, brain, twitch
 from modules.twitch import HELIX_CHAT_URL
-from test_brain import VALID_SETTINGS as BRAIN_SETTINGS, chat_payload, completion
+from test_brain import CHAT_WRITE, VALID_SETTINGS as BRAIN_SETTINGS, chat_payload, completion
 from test_brain import FakeResponse as ModelResponse
 from test_brain import FakeSession as ModelSession
 from test_brain import runtime_context as brain_runtime_context
@@ -131,9 +131,9 @@ def _grant_brain_delivery(monkeypatch) -> None:
             "actions": [
                 {
                     "rule_id": "brain-chat-write",
-                    "action_name": brain.DELIVERY_ACTION,
+                    "action_name": CHAT_WRITE,
                     "principals": [brain.PRINCIPAL],
-                    "granted_permissions": ["chat.write"],
+                    "granted_permissions": [CHAT_WRITE],
                 }
             ],
         },
@@ -228,12 +228,16 @@ async def test_shutdown_drains_real_pipeline(monkeypatch, phase: str) -> None:
             ]
             if phase == "startup":
                 # The coordinator never starts here, so the harness prepares
-                # both versioned modules and opens the producer itself to hold
-                # a run in flight; the coordinator's own calls, if any, are
-                # idempotent no-ops.
+                # the three modules in the coordinator's own order — the
+                # activation order above — and opens the producer itself to
+                # hold a run in flight; the coordinator's own calls, if any,
+                # are idempotent no-ops. The input prepares first: with the
+                # loader stubbed, its binding is what declares ``chat.write``
+                # in the catalog the brain resolves its delivery list against
+                # at its own prepare (R1).
+                await handles["twitch"].prepare()
                 await handles["brain"].prepare()
                 await handles["audit"].prepare()
-                await handles["twitch"].prepare()
                 await handles["twitch"].start_inputs()
                 await asyncio.Future()
             return self.activations

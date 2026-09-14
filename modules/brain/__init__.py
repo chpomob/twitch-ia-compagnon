@@ -51,7 +51,7 @@ the context carries one; otherwise the engine builds its own from the
 :meth:`BrainModule.run` as its run body, starts it at ``prepare`` and closes it
 at ``close``. The two cases differ in who admits: a scheduler shared through
 the context is the producers' admission target — the input that decided the
-trigger admits the normalised event itself (the twitch module does) — so the
+trigger admits the normalised event itself (the shipped input does) — so the
 bus copy is a fact for other consumers and this handler admits nothing into it,
 which is what keeps every accepted message at exactly 1 admission (AC27). A
 scheduler this module owns is reached through this handler alone. Whoever
@@ -80,15 +80,17 @@ verified set is :attr:`BrainModule.verified_capabilities`. An ``image_ref``
 part is read from the attachment store and encoded only while a request body
 is built: the bytes exist in that body and nowhere else (AC12).
 
-**The run** (R5, R8). One admitted work is exactly one model call and exactly
-one delivery through the :class:`~core.actions.ActionExecutor`: the model's
-final text becomes a single ``chat.write`` call whose explicit
-:class:`~core.contracts.ActionObservation` is the delivery outcome (AC19). The
-model is offered only the registry's *authorized* action view for the reply's
-destination, read afresh for every run and sent as tools; a proposal is
-classified but not executed by this single-turn body, which ends the run
-explicitly (the agentic loop that executes proposals is the next step's).
-The ``budget.max_tokens`` limit is the
+**The run** (R1, R5, R8). One admitted work is exactly one model call and
+one terminal delivery step through the :class:`~core.actions.ActionExecutor`:
+the model's final text is handed to every entry of the run's resolved
+delivery list, in order, one executor call per entry, each with its own
+explicit :class:`~core.contracts.ActionObservation` (AC19, AC50). The model
+is offered only the ``read`` actions of the registry's *authorized* view for
+the reply's destination, read afresh for every run and sent as tools — a
+delivery action is never offered, whatever the grants (decision 1); a
+proposal is classified but not executed by this single-turn body, which ends
+the run explicitly (the agentic loop that executes proposals is the next
+step's). The ``budget.max_tokens`` limit is the
 run's cumulative input + output bound (design §3.4): the prompt is composed
 inside it — history is dropped oldest-first to fit, and a prompt that leaves no
 room for a reply ends the run before the model is reached — the remaining room
@@ -104,15 +106,36 @@ correlation — and publishes **neither** ``brain.run.started`` **nor**
 and merges the outcome into its traced payload. The delivery's terminal trace
 (``action.completed``) is the executor's.
 
+**Delivery list** (R1, decision 1). Which actions deliver is policy, not
+code: the ``delivery`` settings group names them, and :func:`_resolve_delivery`
+turns the default list and every override into resolved entries at
+``prepare``, against the discovered catalog — the manifest declarations the
+loader recorded before any module prepares — and before the readiness
+barrier. A ``fixed`` entry must name a discovered action carrying the
+delivery capability and map the answer text onto the declared argument (or
+onto none, for an effect-only entry); a ``modules`` list is every
+delivery-capable action of the catalog, the ``preference`` names first, the
+rest in catalog order, unknown preference names ignored. A list that does
+not resolve stops startup with ``module 'brain': delivery: <entry>:
+<reason>`` and no scenario runs; the resolved lists are published once as
+``brain.delivery.resolved``. At the terminal step every entry is invoked
+whatever the outcome of the previous ones, each counting one action call
+under the run's own call ids, and the record carries one outcome per entry
+(``deliveries``) beside their summary (``delivery``): the single entry's
+status, else ``success`` when all succeeded, else the first non-success in
+list order. Nothing here names a platform or a delivery module (AC56).
+
 **Conversation memory** (R3, R6). Keyed by
 :class:`~core.contracts.SessionKey` ``(platform, channel_id, viewer_id)``, so
 one viewer on two platforms or in two channels holds two memories and two
 viewers in one channel never share one (AC10). It is bounded in sessions,
 exchanges per session, bytes per session and age against the injected clock,
-evicting oldest first on every axis (AC30). Only a ``success`` observation
-writes an exchange back: a refused, failed, timed-out or ``external_unknown``
-delivery leaves the memory untouched, so the model is never told it said
-something it did not (R5).
+evicting oldest first on every axis (AC30). Only a confirmed delivery of the
+text writes an exchange back: memory is written when at least one entry
+received the answer text and every entry that did ended ``success``; a
+refused, failed, timed-out or ``external_unknown`` text delivery leaves the
+memory untouched, so the model is never told it said something it did not
+(R5, AC7).
 """
 
 from __future__ import annotations
@@ -137,6 +160,11 @@ from core.attachments import AttachmentExpired
 from core.contracts import (
     BRAIN_ERROR_ATTACHMENT_EXPIRED,
     DELIVERY_NO_TEXT_ARGUMENT,
+    DELIVERY_REASON_EMPTY,
+    DELIVERY_REASON_NOT_A_DELIVERY,
+    DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS,
+    DELIVERY_REASON_TEXT_MAPPING_MISSING,
+    DELIVERY_REASON_UNKNOWN_ACTION,
     PROBE_REASON_IMAGE_REJECTED,
     PROBE_REASON_MALFORMED_ARGUMENTS,
     PROBE_REASON_MULTIPLE_TOOL_CALLS,
@@ -147,6 +175,7 @@ from core.contracts import (
     PROBE_TOOL,
     RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
     TERMINAL_STATUSES,
+    WILDCARD,
     ActionCall,
     ActionObservation,
     Destination,
@@ -168,15 +197,18 @@ The reply is the companion's act, so the rule that authorizes it names this
 module — never the viewer, whose identity keys the session and grants nothing.
 """
 
-DELIVERY_ACTION = "chat.write"
-"""The action a reply is delivered through, at scope :data:`CHAT_SCOPE`."""
-
 CHAT_SCOPE = "chat"
+"""The scope the single-turn body reads the authorized view for: the reply's
+destination. Which actions deliver the reply is the resolved delivery list's
+(R1, decision 1), never a name held here."""
 
 DELIVERY_NOT_ATTEMPTED = "not_attempted"
 """The delivery outcome of a run that ended before any executor call."""
 
 WORK_KIND = "chat.message"
+
+TRACE_DELIVERY_RESOLVED = "brain.delivery.resolved"
+"""The one trace ``prepare`` publishes: the resolved delivery lists (R1)."""
 
 _INPUT_EVENT = "channel.chat.message"
 _STATUS_SUCCESS = "success"
@@ -730,14 +762,15 @@ class _Fallback:
 
 
 @dataclass(frozen=True, slots=True)
-class _DeliveryEntry:
+class _ConfiguredEntry:
     """One configured entry of a fixed delivery list (R1, decision 1).
 
     ``text_argument`` is the argument the answer text is put under,
     :data:`~core.contracts.DELIVERY_NO_TEXT_ARGUMENT` for an effect-only
     entry, or ``None`` when the configuration says nothing and the action's
     declaration decides at resolution. ``arguments`` are the constants the
-    entry always carries.
+    entry always carries. What the catalog makes of it is a
+    :class:`_DeliveryEntry`, built by :func:`_resolve_delivery`.
     """
 
     action: str
@@ -745,7 +778,7 @@ class _DeliveryEntry:
     arguments: Mapping[str, Any]
 
     @classmethod
-    def from_mapping(cls, entry: Mapping[str, Any]) -> "_DeliveryEntry":
+    def from_mapping(cls, entry: Mapping[str, Any]) -> "_ConfiguredEntry":
         text_argument = entry.get("text_argument")
         return cls(
             action=entry["action"].strip(),
@@ -764,7 +797,7 @@ class _DeliveryList:
     """
 
     mode: str
-    actions: tuple[_DeliveryEntry, ...]
+    actions: tuple[_ConfiguredEntry, ...]
     preference: tuple[str, ...]
 
     @classmethod
@@ -772,7 +805,7 @@ class _DeliveryList:
         return cls(
             mode=section["mode"],
             actions=tuple(
-                _DeliveryEntry.from_mapping(entry) for entry in section.get("actions") or ()
+                _ConfiguredEntry.from_mapping(entry) for entry in section.get("actions") or ()
             ),
             preference=tuple(name.strip() for name in section.get("preference") or ()),
         )
@@ -800,7 +833,249 @@ class _DeliveryConfig:
         )
 
     def for_destination(self, platform: str, channel_id: str) -> _DeliveryList:
-        return self.overrides.get(f"{platform}/{channel_id}", self.default)
+        return self.overrides.get(_destination_key(platform, channel_id), self.default)
+
+
+def _destination_key(platform: str, channel_id: str) -> str:
+    """The ``overrides`` key of a destination: ``<platform>/<channel_id>``.
+
+    Built from the run's :class:`~core.contracts.SessionKey` components and
+    nothing platform-specific, so an override on a second platform's channel
+    is matched by the same rule.
+    """
+
+    return f"{platform}/{channel_id}"
+
+
+# --------------------------------------------------------------------------- #
+# Delivery resolution (R1, decision 1)
+# --------------------------------------------------------------------------- #
+
+_DELIVERY_PATH = "delivery"
+_NATURE_READ = "read"
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliveryEntry:
+    """One resolved entry of a delivery list: what the terminal step invokes.
+
+    Built at ``prepare`` from a configured entry (or a catalog declaration in
+    ``modules`` mode) checked against the discovered spec: ``version`` and
+    ``destinations`` are the declaration's, ``text_argument`` is the argument
+    the answer text travels under — ``None`` for an effect-only entry, which
+    receives no text — and ``arguments`` are the constants every call
+    carries. The scope a call is addressed to is chosen per run by
+    :meth:`destination_for`, since one declaration may support different
+    scopes on different platforms.
+    """
+
+    action: str
+    version: int
+    destinations: tuple[Destination, ...]
+    text_argument: str | None
+    arguments: Mapping[str, Any]
+
+    @property
+    def receives_text(self) -> bool:
+        return self.text_argument is not None
+
+    def destination_for(self, platform: str, channel_id: str) -> Destination:
+        """The concrete destination of a call to the run's channel.
+
+        The scope is the one of the first declaration that covers the run's
+        platform and channel, so an action declared for ``a/*/chat`` and
+        ``b/*/audio`` is addressed as ``audio`` on ``b``. A declaration open
+        to every scope is addressed as :data:`CHAT_SCOPE`, the reply's own.
+        When no declaration covers the channel, the first declaration's
+        scope stands: the executor then classifies the call as an
+        unsupported destination, keeping the entry's accounting explicit.
+        """
+
+        for declared in self.destinations:
+            if _component_contains(declared.platform, platform) and _component_contains(
+                declared.channel_id, channel_id
+            ):
+                return Destination(
+                    platform=platform, channel_id=channel_id, scope=_concrete_scope(declared)
+                )
+        return Destination(
+            platform=platform,
+            channel_id=channel_id,
+            scope=_concrete_scope(self.destinations[0]),
+        )
+
+    def arguments_for(self, text: str) -> dict[str, Any]:
+        """The call's arguments: the constants, plus the text where declared."""
+
+        arguments = dict(self.arguments)
+        if self.text_argument is not None:
+            arguments[self.text_argument] = text
+        return arguments
+
+
+def _component_contains(declared: str, actual: str) -> bool:
+    return declared == WILDCARD or declared == actual
+
+
+def _concrete_scope(declared: Destination) -> str:
+    return CHAT_SCOPE if declared.scope == WILDCARD else declared.scope
+
+
+class _DeliveryResolutionError(BrainModuleError):
+    """A delivery list that does not resolve against the catalog (R1).
+
+    The text is the startup diagnostic: ``module 'brain': delivery: <entry
+    path>: <reason>``, the path naming ``delivery.actions[<i>]``,
+    ``delivery.overrides["<k>"].actions[<i>]``, the derived action name or
+    the list itself, and the reason one of
+    :data:`~core.contracts.DELIVERY_RESOLUTION_REASONS`.
+    """
+
+    def __init__(self, path: str, reason: str) -> None:
+        super().__init__(f"module {MODULE_NAME!r}: {_DELIVERY_PATH}: {path}: {reason}")
+        self.path = path
+        self.reason = reason
+
+
+def _resolve_delivery(
+    config: _DeliveryList, catalog: Mapping[str, Any], *, path: str = _DELIVERY_PATH
+) -> tuple[_DeliveryEntry, ...]:
+    """Resolve one configured list against the discovered *catalog* (R1).
+
+    ``fixed``: every configured entry, in order, each checked in turn —
+    the action is discovered (``unknown_action``); its declaration carries
+    the delivery capability and its nature is not ``read``
+    (``not_a_delivery``); the text mapping is unambiguous — an absent
+    ``text_argument`` inherits the declaration's, a named one must be an
+    argument of the schema and must not be given while the declaration says
+    ``none`` (``text_mapping_missing``), must equal the declaration's and
+    must not also be a constant argument (``text_mapping_ambiguous``); an
+    empty list is ``empty``. ``modules``: every delivery-capable action of
+    the catalog with its declared mapping, the ``preference`` names first in
+    that order, the rest in catalog order, a preference name matching no
+    delivery-capable action ignored (see :func:`_ignored_preferences`), and
+    ``empty`` when no such action exists. Raises
+    :class:`_DeliveryResolutionError` naming the entry and the reason.
+    """
+
+    if config.mode == DELIVERY_MODE_MODULES:
+        candidates = _delivery_candidates(catalog)
+        preferred = [name for name in dict.fromkeys(config.preference) if name in candidates]
+        ordered = preferred + [name for name in candidates if name not in preferred]
+        if not ordered:
+            raise _DeliveryResolutionError(path, DELIVERY_REASON_EMPTY)
+        return tuple(
+            _resolve_entry(
+                _ConfiguredEntry(action=name, text_argument=None, arguments={}),
+                catalog,
+                path=name,
+            )
+            for name in ordered
+        )
+    if not config.actions:
+        raise _DeliveryResolutionError(path, DELIVERY_REASON_EMPTY)
+    return tuple(
+        _resolve_entry(entry, catalog, path=f"{path}.actions[{index}]")
+        for index, entry in enumerate(config.actions)
+    )
+
+
+def _ignored_preferences(config: _DeliveryList, catalog: Mapping[str, Any]) -> tuple[str, ...]:
+    """The ``preference`` names a ``modules`` list ignored: no such candidate."""
+
+    if config.mode != DELIVERY_MODE_MODULES:
+        return ()
+    candidates = _delivery_candidates(catalog)
+    return tuple(name for name in dict.fromkeys(config.preference) if name not in candidates)
+
+
+def _delivery_candidates(catalog: Mapping[str, Any]) -> list[str]:
+    """The delivery-capable actions of *catalog*, in catalog order."""
+
+    return [name for name, spec in catalog.items() if _is_delivery_capable(spec)]
+
+
+def _is_delivery_capable(spec: Any) -> bool:
+    return (
+        getattr(spec, "delivery", None) is not None
+        and getattr(spec, "nature", None) != _NATURE_READ
+    )
+
+
+def _resolve_entry(
+    entry: _ConfiguredEntry, catalog: Mapping[str, Any], *, path: str
+) -> _DeliveryEntry:
+    spec = catalog.get(entry.action)
+    if spec is None:
+        raise _DeliveryResolutionError(path, DELIVERY_REASON_UNKNOWN_ACTION)
+    if not _is_delivery_capable(spec):
+        raise _DeliveryResolutionError(path, DELIVERY_REASON_NOT_A_DELIVERY)
+    declared = spec.delivery_text_argument
+    configured = entry.text_argument
+    if configured is not None and configured != DELIVERY_NO_TEXT_ARGUMENT:
+        # A named text argument: it must exist in the schema and the
+        # declaration must expect the text at all, else the mapping is
+        # missing; and it must be the declared one, else ambiguous.
+        if declared is None or configured not in _schema_properties(spec):
+            raise _DeliveryResolutionError(path, DELIVERY_REASON_TEXT_MAPPING_MISSING)
+        if configured != declared:
+            raise _DeliveryResolutionError(path, DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS)
+    elif configured == DELIVERY_NO_TEXT_ARGUMENT and declared is not None:
+        raise _DeliveryResolutionError(path, DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS)
+    if declared is not None and declared in entry.arguments:
+        raise _DeliveryResolutionError(path, DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS)
+    return _DeliveryEntry(
+        action=spec.name,
+        version=spec.version,
+        destinations=tuple(spec.supported_destinations),
+        text_argument=declared,
+        arguments=dict(entry.arguments),
+    )
+
+
+def _schema_properties(spec: Any) -> Mapping[str, Any]:
+    properties = spec.argument_schema.get("properties")
+    return properties if isinstance(properties, Mapping) else {}
+
+
+@dataclass(frozen=True, slots=True)
+class _Delivery:
+    """One invoked entry of the terminal step and its explicit outcome."""
+
+    entry: _DeliveryEntry
+    call_id: str
+    observation: ActionObservation
+
+    @property
+    def status(self) -> str:
+        return self.observation.status
+
+    def record(self) -> dict[str, Any]:
+        """The ``deliveries[]`` item: action, call id, text received, status."""
+
+        return {
+            "action": self.entry.action,
+            "call_id": self.call_id,
+            "text": self.entry.receives_text,
+            "status": self.status,
+        }
+
+
+def _delivery_summary(statuses: Sequence[str]) -> str:
+    """The run's ``delivery`` value over its entries' statuses (R1).
+
+    The single entry's status when the list has one entry; otherwise
+    ``success`` when every entry succeeded, else the first non-``success``
+    status in list order — so a list of one reads exactly as the single
+    delivery of phase 0 did.
+    """
+
+    if len(statuses) == 1:
+        return statuses[0]
+    for status in statuses:
+        if status != _STATUS_SUCCESS:
+            return status
+    return _STATUS_SUCCESS
 
 
 @dataclass(frozen=True, repr=False, slots=True)
@@ -1080,7 +1355,7 @@ _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # so a facade with no such read cannot host this engine (R5).
     ("actions", ("authorized", "discovered", "mark_ready", "mark_not_ready")),
     ("supervision", ("emit", "record_and_emit")),
-    # Delivery is one executor call and nothing else, so a runtime without an
+    # Delivery is executor calls and nothing else, so a runtime without an
     # executor cannot run this engine (R5).
     ("executor", ("invoke",)),
 )
@@ -1150,6 +1425,10 @@ class BrainModule:
         #: The backend capabilities the prepare-time probe verified (R2);
         #: empty until ``prepare`` succeeded.
         self.verified_capabilities: frozenset[str] = frozenset()
+        #: The delivery lists resolved at ``prepare`` (R1, decision 1): the
+        #: default and every override, by destination key; empty until then.
+        self._delivery_default: tuple[_DeliveryEntry, ...] = ()
+        self._delivery_overrides: dict[str, tuple[_DeliveryEntry, ...]] = {}
         self._memory = ConversationMemory(
             clock=runtime.clock,
             **{
@@ -1211,30 +1490,103 @@ class BrainModule:
     # -- startup phases ---------------------------------------------------- #
 
     async def prepare(self) -> None:
-        """Probe the backend, start the owned scheduler, register the consumer.
+        """Resolve the delivery lists, probe the backend, start, route, mark ready.
 
-        The required capabilities are verified first (R2, decision 3): a
-        capability the backend does not verify raises, reports the module
-        ``degraded`` with the same value-free reason and leaves everything
-        else untouched — no scheduler started, no consumer routed, no
-        ``mark_ready`` — so startup stops naming the capability and no
-        scenario runs. A scheduler shared through the context is started and
-        closed by its owner. The consumer is routed before any producer may
-        publish into it, and only then is the module marked past the barrier.
+        The delivery lists are resolved first (R1, decision 1), against the
+        catalog every enabled manifest declared before any module prepares:
+        a list that does not resolve raises, reports the module ``degraded``
+        with the same value-free diagnostic and leaves everything else
+        untouched — no probe, no scheduler started, no consumer routed, no
+        ``mark_ready`` — so startup stops naming the entry and no scenario
+        runs. The required capabilities are verified next (R2, decision 3)
+        on the same terms. A scheduler shared through the context is started
+        and closed by its owner. The consumer is routed before any producer
+        may publish into it, and only then is the module marked past the
+        barrier; the resolved lists are published once, as
+        ``brain.delivery.resolved``, before that.
         """
 
         if self._prepared or self._closed:
             return
         try:
+            default, overrides, ignored = self._resolve_deliveries()
             self.verified_capabilities = await self._adapter.probe(self._settings.capabilities)
         except BrainModuleError as failure:
             await self._report_degraded(str(failure))
             raise
+        self._delivery_default = default
+        self._delivery_overrides = overrides
         if self._owns_scheduler:
             await self._scheduler.start()
         self._bus.subscribe(_INPUT_EVENT, self.handle_chat_message)
+        await self._publish_resolved_delivery(default, overrides, ignored)
         self._actions.mark_ready()
         self._prepared = True
+
+    def _resolve_deliveries(
+        self,
+    ) -> tuple[tuple[_DeliveryEntry, ...], dict[str, tuple[_DeliveryEntry, ...]], tuple[str, ...]]:
+        """Every configured list against the discovered catalog (R1).
+
+        The default list first, then each override in configuration order,
+        so the first list that does not resolve is the one reported. A
+        catalog that cannot be read is reported as a resolution failure of
+        the default list rather than guessed at.
+        """
+
+        try:
+            catalog = dict(self._actions.discovered())
+        except Exception:
+            self._diagnose("brain actions: discovered catalog unavailable")
+            raise _DeliveryResolutionError(
+                _DELIVERY_PATH, DELIVERY_REASON_UNKNOWN_ACTION
+            ) from None
+        config = self._settings.delivery
+        default = _resolve_delivery(config.default, catalog)
+        ignored = list(_ignored_preferences(config.default, catalog))
+        overrides: dict[str, tuple[_DeliveryEntry, ...]] = {}
+        for key, override in config.overrides.items():
+            path = f'{_DELIVERY_PATH}.overrides["{key}"]'
+            overrides[key] = _resolve_delivery(override, catalog, path=path)
+            ignored.extend(
+                name for name in _ignored_preferences(override, catalog) if name not in ignored
+            )
+        return default, overrides, tuple(ignored)
+
+    async def _publish_resolved_delivery(
+        self,
+        default: tuple[_DeliveryEntry, ...],
+        overrides: Mapping[str, tuple[_DeliveryEntry, ...]],
+        ignored: tuple[str, ...],
+    ) -> None:
+        """The one ``brain.delivery.resolved`` trace of this activation (R1).
+
+        Action names only — what will be invoked, in order, per list — and
+        the preference names that matched nothing. A lost trace is diagnosed
+        and changes nothing: the resolution stands whether or not it was
+        announced.
+        """
+
+        payload = {
+            "default": [entry.action for entry in default],
+            "overrides": {
+                key: [entry.action for entry in entries] for key, entries in overrides.items()
+            },
+            "ignored": list(ignored),
+        }
+        try:
+            await _resolve(self._supervision.emit(TRACE_DELIVERY_RESOLVED, payload))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._diagnose("brain delivery: resolved trace lost")
+
+    def _delivery_for(self, platform: str, channel_id: str) -> tuple[_DeliveryEntry, ...]:
+        """The run's resolved list: its destination's override, else the default."""
+
+        return self._delivery_overrides.get(
+            _destination_key(platform, channel_id), self._delivery_default
+        )
 
     async def _report_degraded(self, reason: str) -> None:
         """Report the module ``degraded`` with *reason* when the surface has it."""
@@ -1314,7 +1666,7 @@ class BrainModule:
     async def run(self, run: Any) -> RunOutcome:
         """Take one admitted work to its :class:`~core.admission.RunOutcome`.
 
-        Exactly one model call and exactly one executor call, each behind a
+        Exactly one model call and one terminal delivery step, each behind a
         boundary the run's budget is checked at: an expired budget ends the
         run before the model is reached, or before the delivery is started,
         with 0 further work. The token budget is checked at the same first
@@ -1324,11 +1676,15 @@ class BrainModule:
         estimate standing in for it, puts the run over the bound (§3.4). The
         model call is counted before it is awaited, so a run the shutdown
         cancels while its request is pending is recorded with the call it
-        already issued. The reply is delivered through one ``chat.write``
-        call carrying the run's identity and its deadline, so a call still in
-        flight at the total deadline is classified by the executor, never here
-        (AC33). The memory write-back happens here, before the outcome is
-        returned, and only for a ``success`` observation (AC19).
+        already issued. The reply is delivered through every entry of the
+        run's resolved delivery list (R1, decision 1) — the override of its
+        destination, else the default — one executor call per entry carrying
+        the run's identity and its own deadline, so a call still in flight at
+        the total deadline is classified by the executor, never here (AC33).
+        Each confirmed send is noted on the run as it is observed, so a run
+        cancelled between two entries keeps the sends it already made. The
+        memory write-back happens here, before the outcome is returned,
+        and only when the text was confirmed delivered (AC7, AC19).
 
         Publishes neither ``brain.run.started`` nor ``brain.run.completed``:
         the scheduler owns both and merges what is returned into its trace.
@@ -1398,28 +1754,36 @@ class BrainModule:
         reply = classification.text
 
         run.checkpoint()
-        call = self._delivery_call(run, message, destination, reply)
-        observation = await self._deliver(call)
-        delivered = observation.status == _STATUS_SUCCESS
+        entries = self._delivery_for(key.platform, key.channel_id)
+        deliveries = await self._deliver_all(run, reply, entries, next_call_index=1)
+        summary = _delivery_summary([delivery.status for delivery in deliveries])
+        text_deliveries = [delivery for delivery in deliveries if delivery.entry.receives_text]
+        sends = sum(1 for delivery in text_deliveries if delivery.status == _STATUS_SUCCESS)
+        # The text is memorised only once confirmed: at least one entry
+        # received it and none of those ended other than ``success`` — an
+        # ``external_unknown`` entry is never a confirmed send (AC7).
+        delivered = bool(text_deliveries) and sends == len(text_deliveries)
         if delivered and not self._closed:
             self._memory.remember(key, user_content, reply)
-        if delivered:
-            run.note_send()
 
         correlation: dict[str, Any] = {
-            "action": call.action_name,
-            "action_version": call.action_version,
-            "call_id": call.call_id,
+            "deliveries": [delivery.record() for delivery in deliveries],
+            "delivery": summary,
+            "action_calls": len(deliveries),
             **result.usage(),
         }
-        error = observation.error
-        if isinstance(error, Mapping) and isinstance(error.get("code"), str):
-            correlation["delivery_error"] = error["code"]
+        for delivery in deliveries:
+            error = delivery.observation.error
+            if delivery.status != _STATUS_SUCCESS and isinstance(error, Mapping):
+                code = error.get("code")
+                if isinstance(code, str):
+                    correlation["delivery_error"] = code
+                break
         return RunOutcome(
-            status=observation.status,
-            delivery=observation.status,
+            status=summary,
+            delivery=summary,
             model_calls=1,
-            sends=1 if delivered else 0,
+            sends=sends,
             correlation=correlation,
         )
 
@@ -1486,15 +1850,17 @@ class BrainModule:
         )
 
     def _offered_tools(self, destination: Destination) -> tuple[Any, ...]:
-        """The registry's authorized view for this destination, as specs.
+        """The read actions of the registry's authorized view, as specs.
 
         Read through the scoped facade the runtime hands every module, so the
         rules in force reach the model in production and not only under an
         injected registry, and afresh every run: an action authorized at the
         start of a previous run is no permission now (R5). A view that cannot
         be read offers nothing: default deny expressed as a surface rather
-        than a guess about the rules. The specs become the request's tool
-        definitions at request time.
+        than a guess about the rules. Only actions of nature ``read`` are
+        kept (R1, decision 1): the model observes through tools and never
+        selects a delivery. The specs become the request's tool definitions
+        at request time.
         """
 
         try:
@@ -1502,30 +1868,74 @@ class BrainModule:
         except Exception:
             self._diagnose("brain actions: authorized view unavailable")
             return ()
+        # Read actions only (R1): a delivery action is never offered, whatever
+        # the grants — the configured list invokes it at the terminal step,
+        # and the contracts refuse the delivery capability on a read action,
+        # so the nature check covers both.
         offered = [
             spec
             for _name, spec in sorted(dict(view).items(), key=lambda item: str(item[0]))
             if _is_text(getattr(spec, "name", None))
             and isinstance(getattr(spec, "argument_schema", None), Mapping)
+            and getattr(spec, "nature", None) == _NATURE_READ
         ]
         return tuple(offered)
 
-    def _delivery_call(
-        self, run: Any, message: _Message, destination: Destination, reply: str
-    ) -> ActionCall:
-        """The single delivery call of this run, bounded by the run's budget."""
+    async def _deliver_all(
+        self,
+        run: Any,
+        text: str,
+        entries: Sequence[_DeliveryEntry],
+        *,
+        next_call_index: int,
+    ) -> tuple[_Delivery, ...]:
+        """The terminal step: every entry, in order, whatever the previous outcomes.
 
-        spec = dict(self._actions.discovered()).get(DELIVERY_ACTION)
-        version = getattr(spec, "version", 1) if spec is not None else 1
+        One executor call per entry — destination ``(run platform, run
+        channel_id, the scope the entry declares for that channel)``, read
+        from the run's message, principal :data:`PRINCIPAL`, the run's identities,
+        ``call_id`` continuing the run's counter from *next_call_index*,
+        deadline ``min(now + action_seconds, total deadline)`` taken when
+        that entry starts — with its own explicit observation. An entry that
+        fails, is refused or stays uncertain never drops the ones after it
+        (R1); a call that cannot even be built is an ``error`` entry, so the
+        list's accounting stays complete. Each confirmed send — a text entry
+        ended ``success`` — is noted on the run as soon as it is observed,
+        so a cancellation that lands on a later entry (the shutdown ending
+        the run) still leaves the sends already made in the run's record.
+        Cancellation propagates.
+        """
+
+        message = _message_of_work(run.work)
+        deliveries: list[_Delivery] = []
+        for offset, entry in enumerate(entries):
+            call_id = f"{run.run_id}/call-{next_call_index + offset}"
+            try:
+                call = self._delivery_call(run, message, entry, text, call_id)
+            except Exception:
+                self._diagnose("brain delivery: call could not be built")
+                observation = _failed_delivery("malformed_call")
+            else:
+                observation = await self._deliver(call)
+            if entry.receives_text and observation.status == _STATUS_SUCCESS:
+                run.note_send()
+            deliveries.append(_Delivery(entry=entry, call_id=call_id, observation=observation))
+        return tuple(deliveries)
+
+    def _delivery_call(
+        self, run: Any, message: _Message, entry: _DeliveryEntry, text: str, call_id: str
+    ) -> ActionCall:
+        """One delivery entry's call, bounded by the run's budget."""
+
         return ActionCall(
-            action_name=DELIVERY_ACTION,
-            action_version=version,
-            arguments={"text": reply},
+            action_name=entry.action,
+            action_version=entry.version,
+            arguments=entry.arguments_for(text),
             conversation_id=run.conversation_id,
             run_id=run.run_id,
-            call_id=f"{run.run_id}/call-1",
+            call_id=call_id,
             source_event_id=run.work.source_event_id,
-            destination=destination,
+            destination=entry.destination_for(message.platform, message.channel_id),
             principal=PRINCIPAL,
             deadline=min(run.now + self._budget.action_seconds, run.total_deadline),
             message_id=message.message_id,
@@ -2482,7 +2892,6 @@ def _default_reporter(message: str) -> None:
 
 __all__ = [
     "CHAT_SCOPE",
-    "DELIVERY_ACTION",
     "DELIVERY_NOT_ATTEMPTED",
     "MODULE_NAME",
     "PRINCIPAL",

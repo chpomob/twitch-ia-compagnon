@@ -91,6 +91,7 @@ from conftest import (
     settle,
     wait_until,
 )
+from modules.brain import TRACE_DELIVERY_RESOLVED
 from modules.twitch import (
     EVENTSUB_SUBSCRIPTIONS_URL,
     EVENTSUB_URL,
@@ -1176,8 +1177,9 @@ async def test_ac28_failing_audit_writer_neither_cancels_nor_repeats_the_send() 
         await pipeline.completed(1)
         await wait_until(lambda: pipeline.audit.pending == 0)
         # Everything published since the audit's catch-all was routed: the
-        # readiness facts of the two modules prepared before it never
-        # reached it.
+        # readiness facts of the two modules prepared before it, and the
+        # brain's ``brain.delivery.resolved`` its own prepare published (R1),
+        # never reached it.
         offered = len(
             [
                 event
@@ -1186,6 +1188,7 @@ async def test_ac28_failing_audit_writer_neither_cancels_nor_repeats_the_send() 
                     event["type"] == TRACE_MODULE_READY
                     and event["payload"]["module"] != "audit"
                 )
+                and event["type"] != TRACE_DELIVERY_RESOLVED
             ]
         )
         losses_before_stop = pipeline.audit.losses

@@ -81,8 +81,8 @@ from conftest import (
 from modules.brain import _Settings as brain_settings
 from modules.brain import (
     CHAT_SCOPE,
-    DELIVERY_ACTION,
     DELIVERY_NOT_ATTEMPTED,
+    TRACE_DELIVERY_RESOLVED,
     KNOWN_CAPABILITIES,
     MODULE_NAME,
     PRINCIPAL,
@@ -157,6 +157,15 @@ COMPATIBILITY_ROUTE = "channel.chat.send"
 SENDER_MODULE = "sender"
 PERMISSION = "chat.write"
 
+# The delivery action of this harness (R1, decision 1): a name the brain
+# holds nowhere — it comes from the ``delivery`` settings group, and the
+# send edge below declares it with the delivery capability as an input
+# module's manifest does. ``CHAT_READ`` is a read action the model may be
+# offered as a tool; its provider is never reached by the single-turn body.
+CHAT_WRITE = "chat.write"
+CHAT_READ = "chat.read"
+READ_PERMISSION = "chat.read"
+
 # Outcomes the fake send edge can be told to produce for one delivery.
 SENT = "sent"
 FAIL_BEFORE_EMISSION = "fail_before_emission"
@@ -166,7 +175,7 @@ TIMEOUT_BEFORE_EMISSION = "timeout_before_emission"
 RUN_TRACES = (TRACE_BRAIN_RUN_STARTED, TRACE_BRAIN_RUN_COMPLETED)
 
 CHAT_WRITE_SPEC = ActionSpec(
-    name=DELIVERY_ACTION,
+    name=CHAT_WRITE,
     version=1,
     description="Send one chat message to the channel.",
     argument_schema={
@@ -188,14 +197,52 @@ CHAT_WRITE_SPEC = ActionSpec(
     ),
     timeout_seconds=10.0,
     idempotency="key",
+    delivery={"text_argument": "text"},
+)
+
+CHAT_READ_SPEC = ActionSpec(
+    name=CHAT_READ,
+    version=1,
+    description="Read the last chat messages of the channel.",
+    argument_schema={
+        "type": "object",
+        "properties": {"limit": {"type": "integer", "minimum": 1}},
+        "required": [],
+        "additionalProperties": False,
+    },
+    result_schema={"type": "object", "properties": {"messages": {"type": "array"}}},
+    nature="read",
+    required_permissions=(READ_PERMISSION,),
+    supported_destinations=(
+        Destination(PLATFORM, WILDCARD, CHAT_SCOPE),
+        Destination(OTHER_PLATFORM, WILDCARD, CHAT_SCOPE),
+    ),
+    timeout_seconds=5.0,
+    idempotency="none",
 )
 
 BRAIN_GRANT = AuthorizationRule(
     rule_id="brain-chat-write",
-    action_name=DELIVERY_ACTION,
+    action_name=CHAT_WRITE,
     principals=(PRINCIPAL,),
     granted_permissions=(PERMISSION,),
 )
+
+READ_GRANT = AuthorizationRule(
+    rule_id="brain-chat-read",
+    action_name=CHAT_READ,
+    principals=(PRINCIPAL,),
+    granted_permissions=(READ_PERMISSION,),
+)
+
+
+class FakeReadProvider:
+    """A ``chat.read`` provider the single-turn body never reaches."""
+
+    name = "fake-read"
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        raise AssertionError("the single-turn body executes no proposal")
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +323,7 @@ def runtime_context(
     clock: Any = None,
     transport: FakeTransport | None = None,
     grant: bool = True,
+    read: bool = False,
     triggers: Any = None,
     scheduler: Any = None,
 ) -> RuntimeContext:
@@ -284,17 +332,25 @@ def runtime_context(
     send edge, registered and ready under another module's name as the input
     module's would be, and the policy carrying the one explicit grant the
     engine's principal needs — or none, so a test can watch default deny
-    refuse the delivery (R5). The engine builds its own real scheduler
-    unless one is shared through the context.
+    refuse the delivery (R5). With ``read`` a ``chat.read`` action is
+    registered beside it (granted on the same flag) so a test can watch a
+    read action reach the tools while the delivery action never does (R1).
+    The engine builds its own real scheduler unless one is shared through
+    the context.
     """
 
-    policy = AuthorizationPolicy([BRAIN_GRANT] if grant else [])
+    rules = [BRAIN_GRANT] if grant else []
+    if read and grant:
+        rules.append(READ_GRANT)
+    policy = AuthorizationPolicy(rules)
     actions = ActionRegistry(authorization=policy)
     actions.register(
         CHAT_WRITE_SPEC,
         FakeSendProvider(transport if transport is not None else FakeTransport()),
         module=SENDER_MODULE,
     )
+    if read:
+        actions.register(CHAT_READ_SPEC, FakeReadProvider(), module=SENDER_MODULE)
     actions.mark_ready(SENDER_MODULE)
     return build_context(
         bus,
@@ -408,6 +464,7 @@ async def activate_with(
     *results: Any,
     settings_overrides: dict[str, Any] | None = None,
     grant: bool = True,
+    read: bool = False,
     transport: FakeTransport | None = None,
     session: FakeSession | None = None,
     triggers: Any = None,
@@ -430,6 +487,7 @@ async def activate_with(
         clock=clock,
         transport=target_transport,
         grant=grant,
+        read=read,
         triggers=triggers,
         scheduler=scheduler,
     )
@@ -999,8 +1057,8 @@ async def test_loader_resolves_the_declared_hook_and_grants_nothing_from_produce
     assert activation.roles == frozenset()
     assert type(activation.handle).__name__ == "BrainModule"
     assert diagnostics == []
-    assert set(context.actions.discovered()) == {DELIVERY_ACTION}
-    assert set(context.actions.registered_ready()) == {DELIVERY_ACTION}
+    assert set(context.actions.discovered()) == {CHAT_WRITE}
+    assert set(context.actions.registered_ready()) == {CHAT_WRITE}
     assert dict(context.actions.authorized(principal="viewer")) == {}
     assert all(binding.module == SENDER_MODULE for binding in context.actions.bindings())
 
@@ -1227,16 +1285,17 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
     The request is observed once the admitted run has completed, not when the
     publication returns; the viewer identity is the attested ``author.id``
     of the normalised event, never a ``chatter_id``; and the request offers
-    the model the registry's *authorized* view — the one action the engine's
-    principal holds a grant for — and nothing else (R5), as Chat Completions
-    tool definitions carrying the spec's name, description and argument
-    schema with ``tool_choice: auto`` (R2) rather than as prompt text. The
-    single-turn body of this step offers the authorized view as it stands;
-    the read-only filter and the ``chat.write``-never-offered guarantee (R1,
-    AC6) are the agentic loop's and are asserted with it.
+    the model the ``read`` actions of the registry's *authorized* view — the
+    one read action the engine's principal holds a grant for — and nothing
+    else (R5), as Chat Completions tool definitions carrying the spec's name,
+    description and argument schema with ``tool_choice: auto`` (R2) rather
+    than as prompt text. The delivery action is granted too and is never
+    offered (R1, decision 1: the model never selects the delivery); which
+    read actions reach the tools per declared scope (AC6) is the agentic
+    loop's and is asserted with it.
     """
 
-    harness = await activate_with(FakeResponse(200, completion("Hello")))
+    harness = await activate_with(FakeResponse(200, completion("Hello")), read=True)
     try:
         await harness.send()
         (record,) = await harness.completed()
@@ -1247,14 +1306,19 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
         assert request["url"] == SETTINGS["endpoint"]
         assert request["json"]["model"] == SETTINGS["model"]
         assert request["headers"]["Authorization"] == f"Bearer {SETTINGS['api_key']}"
-        assert harness.tools(0) == [DELIVERY_ACTION]
+        assert harness.tools(0) == [CHAT_READ]
+        # Granted and bound, so in the authorized view — and still not offered.
+        authorized = harness.context.actions.authorized(
+            principal=PRINCIPAL, destination=Destination(PLATFORM, CHANNEL, CHAT_SCOPE)
+        )
+        assert set(authorized) == {CHAT_WRITE, CHAT_READ}
         (tool,) = request["json"]["tools"]
         assert tool["type"] == "function"
-        assert tool["function"]["description"] == CHAT_WRITE_SPEC.description
+        assert tool["function"]["description"] == CHAT_READ_SPEC.description
         assert tool["function"]["parameters"] == {
             "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
+            "properties": {"limit": {"type": "integer", "minimum": 1}},
+            "required": [],
             "additionalProperties": False,
         }
         json.dumps(request["json"])  # the body is plain JSON, frozen mappings unwrapped
@@ -1263,7 +1327,7 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
         assert messages[0]["role"] == "system"
         system = messages[0]["content"]
         assert "[send:" not in system
-        assert DELIVERY_ACTION not in system
+        assert CHAT_WRITE not in system
         assert messages[-1]["role"] == "user"
         assert "What is up?" in messages[-1]["content"]
         assert VIEWER in messages[-1]["content"]
@@ -1276,20 +1340,22 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
 
 @pytest.mark.asyncio
 async def test_request_offers_no_action_without_a_grant_and_reads_the_view_afresh() -> None:
-    """R5: the offered tools are the authorized view, read for every run.
+    """R5: the offered tools are the authorized read view, read for every run.
 
     With no rule the model is offered nothing — the request carries no
-    ``tools`` and no ``tool_choice`` (default deny as a surface); a grant
-    added between two runs reaches the next request's tools, so a policy
-    change is never cached across runs. The tools replace the former prompt
-    listing (R2); which grants may reach the tools at all (read actions
-    only, AC6) is the agentic loop's guarantee, asserted with it.
+    ``tools`` and no ``tool_choice`` (default deny as a surface); a read
+    grant added between two runs reaches the next request's tools, so a
+    policy change is never cached across runs, while the delivery grant
+    added with it reaches no request (R1, decision 1). The tools replace the
+    former prompt listing (R2); the per-scope view (AC6) is the agentic
+    loop's guarantee, asserted with it.
     """
 
     harness = await activate_with(
         FakeResponse(200, completion("First")),
         FakeResponse(200, completion("Second")),
         grant=False,
+        read=True,
     )
     try:
         await harness.send(message_id="one")
@@ -1297,13 +1363,15 @@ async def test_request_offers_no_action_without_a_grant_and_reads_the_view_afres
         assert harness.tools(0) == []
         assert "tools" not in harness.requests()[0]["json"]
         assert "tool_choice" not in harness.requests()[0]["json"]
-        assert DELIVERY_ACTION not in harness.prompt(0)[0]["content"]
+        assert CHAT_WRITE not in harness.prompt(0)[0]["content"]
 
         harness.executor._authorization.grant(BRAIN_GRANT)
+        harness.executor._authorization.grant(READ_GRANT)
         await harness.send(message_id="two")
         await harness.completed(2)
-        assert harness.tools(1) == [DELIVERY_ACTION]
-        assert DELIVERY_ACTION not in harness.prompt(1)[0]["content"]
+        assert harness.tools(1) == [CHAT_READ]
+        assert CHAT_WRITE not in harness.prompt(1)[0]["content"]
+        assert harness.transport.sends[-1]["text"] == "Second"
     finally:
         await harness.close()
 
@@ -1619,17 +1687,17 @@ async def test_offered_tool_definitions_count_toward_the_prompt_token_budget() -
     weigh on the prompt's estimate as the action listing did when it was
     system text. With nothing authorized, and so nothing offered, a budget
     composes and the request's output cap is what the text alone leaves;
-    under the same budget, offering ``chat.write`` — name, description,
-    schema — is what puts the prompt over: no request is sent.
+    under the same budget, offering ``chat.read`` — name, description,
+    schema — is what puts the prompt over: no request is sent. The delivery
+    action, granted in both cases, weighs nothing: it is never offered (R1).
     """
 
-    tool_tokens = _estimate_tool_tokens((CHAT_WRITE_SPEC,))
+    tool_tokens = _estimate_tool_tokens((CHAT_READ_SPEC,))
     assert tool_tokens > _estimate_tokens("")
 
     bare = await activate_with(
         FakeResponse(200, completion("fits")),
         settings_overrides={"budget": {"max_tokens": 200}},
-        grant=False,
     )
     try:
         await bare.send()
@@ -1645,7 +1713,9 @@ async def test_offered_tool_definitions_count_toward_the_prompt_token_budget() -
     # Room for the text, none once the tool definition is counted with it.
     limit = text_tokens + tool_tokens // 2
     offered = await activate_with(
-        FakeResponse(200, completion("never")), settings_overrides={"budget": {"max_tokens": limit}}
+        FakeResponse(200, completion("never")),
+        settings_overrides={"budget": {"max_tokens": limit}},
+        read=True,
     )
     try:
         await offered.send()
@@ -1712,7 +1782,9 @@ async def test_only_a_success_observation_writes_back_to_memory(
 async def test_run_lifecycle_traces_are_published_by_the_scheduler_only() -> None:
     """R8: one admitted message, exactly 1 ``brain.run.started`` and exactly 1
     ``brain.run.completed``, both published by the scheduler; the engine
-    itself publishes 0 events of either type and 0 events of its own.
+    itself publishes 0 events of either type, and its only publication of
+    its own is the one ``brain.delivery.resolved`` of ``prepare`` (R1),
+    before any run.
     """
 
     bus = PublisherRecordingBus()
@@ -1728,18 +1800,27 @@ async def test_run_lifecycle_traces_are_published_by_the_scheduler_only() -> Non
             publisher for event_type, publisher in bus.publishers if event_type in RUN_TRACES
         ]
         assert run_publishers == ["core.admission", "core.admission"]
-        assert all(
-            not publisher.startswith("modules.brain")
-            for _event_type, publisher in bus.publishers
-        )
+        assert [
+            event_type
+            for event_type, publisher in bus.publishers
+            if publisher.startswith("modules.brain")
+        ] == [TRACE_DELIVERY_RESOLVED]
+        assert bus.publishers[0][0] == TRACE_DELIVERY_RESOLVED
         (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
         assert completed["payload"]["run_id"] == record.run_id
         assert completed["payload"]["status"] == "success"
         assert completed["payload"]["delivery"] == "success"
         assert completed["payload"]["model_calls"] == 1
         assert completed["payload"]["sends"] == 1
-        assert completed["payload"]["action"] == DELIVERY_ACTION
-        assert completed["payload"]["call_id"] == f"{record.run_id}/call-1"
+        assert completed["payload"]["action_calls"] == 1
+        assert completed["payload"]["deliveries"] == [
+            {
+                "action": CHAT_WRITE,
+                "call_id": f"{record.run_id}/call-1",
+                "text": True,
+                "status": "success",
+            }
+        ]
     finally:
         await harness.close()
 
