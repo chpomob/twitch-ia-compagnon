@@ -479,3 +479,103 @@ def test_discard_drops_one_object_and_is_idempotent_with_release() -> None:
     assert store.discard(other.attachment_id) is True
     assert store.total_bytes == 0 and store.object_count == 0
     assert store.release("run-2").objects == 0
+
+
+# --------------------------------------------------------------------------- #
+# Expired and foreign leases through the whole brain path (P12; AC22, AC24)
+# --------------------------------------------------------------------------- #
+
+# The agentic-loop harness: the shipped brain on the real executor, scheduler
+# and store, with the capture double leasing into the run's store.
+from test_agentic_loop import (  # noqa: E402
+    SCREEN_CAPTURE,
+    STORE_LIMITS,
+    activate_loop,
+    image_parts,
+    observation_envelope,
+    tool_messages,
+)
+from conftest import final, tool_call  # noqa: E402
+
+
+async def test_a_foreign_lease_is_invalid_result_for_the_model_and_the_run_goes_on() -> None:
+    """AC22 through the brain: a capture returning an ``image_ref`` leased to
+    another run is ``invalid_result`` at the executor; the model receives
+    that error observation, the request that follows carries 0 image
+    parts, the foreign object is discarded and the run ends ``success``
+    on the scripted final response."""
+
+    harness = await activate_loop(tool_call(SCREEN_CAPTURE, {}), final("Nothing to see."))
+    harness.capture.lease_run = "another-run"
+    try:
+        record = await harness.ask()
+        assert record.status == "success"
+        rejected = harness.executor.outcome(f"{record.run_id}/call-1")
+        assert rejected.status == "error"
+        assert rejected.error["code"] == ERROR_INVALID_RESULT
+        assert rejected.parts == ()
+        (result,) = tool_messages(harness.requests()[1])
+        assert observation_envelope(result) == {"status": "error", "error": {"code": ERROR_INVALID_RESULT}}
+        assert image_parts(harness.requests()[1]) == []
+        assert harness.store.object_count == 0
+        assert harness.store.usage("another-run").objects == 0
+        assert harness.observations()[0]["parts"] == []
+    finally:
+        await harness.close()
+
+
+async def test_a_lease_expired_at_validation_is_invalid_result_and_one_expired_later_ends_the_run() -> None:
+    """AC22 and AC24 through the brain, told apart by *when* the lease
+    expires. Expired on the injected clock before the executor validates
+    the observation (the capture held across the time-to-live): the
+    executor's ``invalid_result`` reaches the model, the next request has 0
+    image parts and the run goes on. Expired after the observation was
+    adopted and before the model turn that would use it: the brain's own
+    lookup ends the run ``error`` / ``attachment_expired`` with 0 further
+    requests, nothing sent stale."""
+
+    import asyncio
+
+    # A time-to-live shorter than ``action_seconds``, so the lease expires
+    # while the capture is still inside its deadline.
+    short_lived = {**STORE_LIMITS, "ttl_seconds": 5.0}
+    early = await activate_loop(
+        tool_call(SCREEN_CAPTURE, {}), final("Nothing to see."), store_limits=short_lived
+    )
+    early.capture.hold = asyncio.get_running_loop().create_future()
+    try:
+        await early.send()
+        await asyncio.wait_for(early.capture.entered.wait(), 1)
+        assert early.store.object_count == 1
+        early.clock.advance(short_lived["ttl_seconds"] + 1.0)
+        early.capture.hold.set_result(None)
+        record = await early.completed()
+        observation = early.executor.outcome(f"{record.run_id}/call-1")
+        assert observation.status == "error"
+        assert observation.error["code"] == ERROR_INVALID_RESULT
+        assert observation.parts == ()
+        (result,) = tool_messages(early.requests()[1])
+        assert observation_envelope(result) == {"status": "error", "error": {"code": ERROR_INVALID_RESULT}}
+        assert image_parts(early.requests()[1]) == []
+        assert record.status == "success"
+        assert early.store.object_count == 0
+    finally:
+        await early.close()
+
+    late = await activate_loop(tool_call(SCREEN_CAPTURE, {}), final("never"))
+    late.bus.subscribe(
+        contracts.TRACE_ACTION_COMPLETED,
+        lambda event: late.clock.advance(STORE_LIMITS["ttl_seconds"] + 1.0)
+        if event["payload"]["action"] == SCREEN_CAPTURE
+        else None,
+    )
+    try:
+        record = await late.ask()
+        assert record.status == "error"
+        assert late.run_completed()["failure"] == contracts.BRAIN_ERROR_ATTACHMENT_EXPIRED
+        assert len(late.requests()) == 1
+        assert late.executor.outcome(f"{record.run_id}/call-1").status == "success"
+        assert late.store.object_count == 0
+        assert late.sender.sends == []
+    finally:
+        await late.close()

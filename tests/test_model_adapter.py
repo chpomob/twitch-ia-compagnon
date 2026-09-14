@@ -44,6 +44,7 @@ from conftest import (
     tool_calls,
 )
 from modules.brain import (
+    BRAIN_ERROR_NOT_A_READ_ACTION,
     MODULE_NAME,
     BrainModuleError,
     _Final,
@@ -671,9 +672,9 @@ async def test_ac12_image_ref_parts_are_encoded_from_the_store_at_request_time_o
             {"role": "system", "content": "s"},
             {"role": "user", "content": "u"},
             {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "captured"},
             {
-                "role": "tool",
-                "tool_call_id": "c1",
+                "role": "user",
                 "content": [{"type": "text", "text": "captured"}, dict(image_ref)],
             },
         ],
@@ -687,14 +688,22 @@ async def test_ac12_image_ref_parts_are_encoded_from_the_store_at_request_time_o
 
     assert reply.classification == _Final("I see a pixel.")
     (call,) = session.post_calls
-    tool_message = call["json"]["messages"][3]
-    assert tool_message["content"] == [
+    # The tool result stays text; the image travels in a ``user`` message,
+    # the only role whose content the Chat Completions schema lets carry it.
+    assert call["json"]["messages"][3] == {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "captured",
+    }
+    image_message = call["json"]["messages"][4]
+    assert image_message["role"] == "user"
+    assert image_message["content"] == [
         {"type": "text", "text": "captured"},
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
     ]
     assert len(image_parts(call["json"])) == 1
     # The prompt object is untouched: the reference, never the bytes.
-    assert prompt.messages[3]["content"][1] == image_ref
+    assert prompt.messages[4]["content"][1] == image_ref
     assert encoded not in json.dumps(prompt.messages)
     assert encoded not in "\n".join(diagnostics)
     assert diagnostics == []
@@ -734,8 +743,7 @@ async def test_an_image_ref_the_store_cannot_serve_fails_before_any_request(
         messages=[
             {"role": "user", "content": "u"},
             {
-                "role": "tool",
-                "tool_call_id": "c1",
+                "role": "user",
                 "content": [
                     {
                         "type": "image_ref",
@@ -799,24 +807,40 @@ def test_classification_of_the_response_shapes(body: Any, expected: Any) -> None
 @pytest.mark.asyncio
 async def test_a_scenario_request_answered_with_a_proposal_is_classified_not_delivered() -> None:
     """R2: a single tool call in a run is a ``_Proposal`` — the reply is the
-    classification, no text is delivered; the single-turn body of this step
-    ends the run explicitly and the loop that executes proposals is the
-    next step's."""
+    classification, never a text to deliver. The loop feeds the proposal
+    back as an observation and asks the model again: a ``chat.write``
+    proposal is refused by the runtime itself (``not_a_read_action``), so
+    nothing reaches the executor for it, and only the final response of
+    the next turn is delivered — the proposal's ``text`` never is."""
 
     harness = await activate_with(
         FakeResponse(200, tool_call("chat.write", {"text": "hi"}, usage={"total_tokens": 42})),
+        FakeResponse(200, final("Hello there.")),
         settings_overrides=STRUCTURED_ONLY,
     )
     try:
         await harness.send()
         (record,) = await harness.completed()
-        assert record.status == "error"
-        assert record.sends == 0
-        assert harness.transport.sends == []
-        assert harness.executor.provider_invocations == 0
-        assert harness.diagnostics == [
-            "brain model response: proposal not executed by the single-turn body"
+        assert record.status == "success"
+        assert record.sends == 1
+        assert [send["text"] for send in harness.transport.sends] == ["Hello there."]
+        # The proposal was classified, not executed: the executor saw the
+        # final delivery only.
+        assert harness.executor.provider_invocations == 1
+        assert harness.diagnostics == []
+        _first, second = harness.requests()
+        (assistant_call,) = [
+            message for message in second["json"]["messages"] if message["role"] == "assistant"
         ]
+        assert assistant_call["tool_calls"][0]["function"]["name"] == "chat.write"
+        (tool_result,) = [
+            message for message in second["json"]["messages"] if message["role"] == "tool"
+        ]
+        assert isinstance(tool_result["content"], str)
+        assert json.loads(tool_result["content"].splitlines()[0]) == {
+            "status": "refused",
+            "error": {"code": BRAIN_ERROR_NOT_A_READ_ACTION},
+        }
     finally:
         await harness.close()
 

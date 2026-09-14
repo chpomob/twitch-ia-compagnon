@@ -80,31 +80,58 @@ verified set is :attr:`BrainModule.verified_capabilities`. An ``image_ref``
 part is read from the attachment store and encoded only while a request body
 is built: the bytes exist in that body and nowhere else (AC12).
 
-**The run** (R1, R5, R8). One admitted work is exactly one model call and
-one terminal delivery step through the :class:`~core.actions.ActionExecutor`:
-the model's final text is handed to every entry of the run's resolved
-delivery list, in order, one executor call per entry, each with its own
-explicit :class:`~core.contracts.ActionObservation` (AC19, AC50). The model
-is offered only the ``read`` actions of the registry's *authorized* view for
-the reply's destination, read afresh for every run and sent as tools — a
-delivery action is never offered, whatever the grants (decision 1); a
-proposal is classified but not executed by this single-turn body, which ends
-the run explicitly (the agentic loop that executes proposals is the next
-step's). The ``budget.max_tokens`` limit is the
-run's cumulative input + output bound (design §3.4): the prompt is composed
-inside it — history is dropped oldest-first to fit, and a prompt that leaves no
-room for a reply ends the run before the model is reached — the remaining room
-is sent as the request's output cap, and a reply the backend's usage (or, when
-it reports none, a conservative estimate flagged as such) puts over the bound
-is discarded rather than delivered. There is no tagged output, no bus
-republication and no second path: the compatibility ``channel.chat.send`` route
-stays available to other producers on the same send service, and this module
-never uses it. The run body returns a :class:`~core.admission.RunOutcome` —
-terminal state, delivery outcome reported separately, model-call count and
-correlation — and publishes **neither** ``brain.run.started`` **nor**
-``brain.run.completed``: the scheduler is the single emission owner of both
-and merges the outcome into its traced payload. The delivery's terminal trace
-(``action.completed``) is the executor's.
+**The run** (R1, R2, R3, R4, R5, R8). One admitted work is one agentic
+loop and one terminal delivery step through the
+:class:`~core.actions.ActionExecutor`. Each turn offers the model a bounded
+:class:`_Transcript` — instructions, the viewer's message, the retained
+memory, then one assistant tool call and one text tool result per
+previous proposal, an observation's ``image_ref`` parts following their
+tool result in a ``user`` message since a ``tool`` message carries text
+only — and, as tools, the ``read`` actions of the registry's
+*authorized* view for the run's destination, re-read every turn, **per
+action and per declared scope** (:meth:`BrainModule._offered_tools`): a
+capture bound on ``*/*/capture`` is offered by its own scope, a delivery
+action is never offered, whatever the grants (decision 1). The model
+answers with one proposal or a final response (decision 2). A proposal
+naming an action absent from the catalog, or of any nature but ``read``
+— the delivery action included — is refused by this module itself
+(``unknown_action``, ``not_a_read_action``), and one whose arguments are
+not a JSON object is a synthetic ``malformed_arguments`` error, each with
+0 executor calls; every other proposal becomes one
+:class:`~core.contracts.ActionCall` — destination ``(run platform, run
+channel_id, the action's declared scope)``, principal :data:`PRINCIPAL`,
+identities and deadline set here — whose observation, text parts and
+``image_ref`` parts alike, is appended to the transcript and traced as
+``brain.run.observation`` (references and dimensions only, AC12). The
+budgets of R3 are acted at their own boundaries — ``model_turns`` before
+a model call, ``max_repeated_actions`` and ``max_action_calls`` before a
+proposal is executed, ``max_tokens`` cumulatively on every reply and on
+the prompt, ``max_observation_bytes`` on every adopted observation — each
+ending the run ``error`` with ``failure: budget_exhausted`` and
+``budget: <name>``; a model call over ``model_call_seconds`` ends the run
+``timeout``; an action over ``action_seconds`` is the executor's own
+observation fed back to the model. An ``image_ref`` in a run whose
+verified capabilities lack ``vision`` ends the run ``capability_missing``
+before any request; one whose lease expired before its model turn ends it
+``attachment_expired``. The final response is the terminal step: the
+text is handed to every entry of the run's resolved delivery list, in
+order, one executor call per entry with call ids continuing the run's
+counter (``<run_id>/call-<n>``), each with its own explicit
+:class:`~core.contracts.ActionObservation` (AC19, AC50). Every image the
+run leased is released at its end on every exit path — the loop discards
+what the transcript references, and the scheduler's ``run_cleanup``
+releases the run — and the transcript is a local of the run. There is no
+tagged output, no bus republication and no second path: the compatibility
+``channel.chat.send`` route stays available to other producers on the
+same send service, and this module never uses it. The run body returns a
+:class:`~core.admission.RunOutcome` — terminal state, delivery outcome
+reported separately, model-call count and correlation (``turns``,
+``action_calls``, ``tokens``, ``tokens_estimated``, ``fallback``,
+``deliveries``, ``delivery``, ``failure``, ``budget``, ``capability``) —
+and publishes **neither** ``brain.run.started`` **nor**
+``brain.run.completed``: the scheduler is the single emission owner of
+both and merges the outcome into its traced payload. The per-call
+terminal trace (``action.completed``) is the executor's.
 
 **Delivery list** (R1, decision 1). Which actions deliver is policy, not
 code: the ``delivery`` settings group names them, and :func:`_resolve_delivery`
@@ -151,7 +178,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -159,6 +186,10 @@ from core.admission import AdmissionScheduler, RunOutcome, Work
 from core.attachments import AttachmentExpired
 from core.contracts import (
     BRAIN_ERROR_ATTACHMENT_EXPIRED,
+    BRAIN_ERROR_MALFORMED_ARGUMENTS,
+    BRAIN_ERROR_NOT_A_READ_ACTION,
+    BRAIN_ERROR_OBSERVATION_TOO_LARGE,
+    BRAIN_ERROR_UNKNOWN_ACTION,
     DELIVERY_NO_TEXT_ARGUMENT,
     DELIVERY_REASON_EMPTY,
     DELIVERY_REASON_NOT_A_DELIVERY,
@@ -173,6 +204,8 @@ from core.contracts import (
     PROBE_REASON_TIMED_OUT,
     PROBE_REASON_TRANSPORT_FAILED,
     PROBE_TOOL,
+    RUN_FAILURE_BUDGET_EXHAUSTED,
+    RUN_FAILURE_CAPABILITY_MISSING,
     RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
     TERMINAL_STATUSES,
     WILDCARD,
@@ -180,7 +213,12 @@ from core.contracts import (
     ActionObservation,
     Destination,
     SessionKey,
+    observation_size,
 )
+# The canonical rendering the policy content hash and the trace size run on:
+# a repeated proposal is judged on the same unambiguous rendering of its
+# arguments (R3), never on a serialiser's insertion order.
+from core.contracts import _canonical_text
 
 try:  # Keep the module importable for transport-injected contract tests.
     import aiohttp
@@ -198,20 +236,35 @@ module — never the viewer, whose identity keys the session and grants nothing.
 """
 
 CHAT_SCOPE = "chat"
-"""The scope the single-turn body reads the authorized view for: the reply's
-destination. Which actions deliver the reply is the resolved delivery list's
-(R1, decision 1), never a name held here."""
+"""The scope a declaration open to every scope (``*``) is addressed as: the
+reply's own. Every other destination the loop builds takes its scope from
+the action's declaration (R1) — the offered tools per declared scope, the
+proposal's call, the delivery entries — never from a literal held here."""
 
 DELIVERY_NOT_ATTEMPTED = "not_attempted"
 """The delivery outcome of a run that ended before any executor call."""
+
+FALLBACK_NONE = "none"
+"""The ``fallback`` value of a run that delivered no fallback text (R3)."""
 
 WORK_KIND = "chat.message"
 
 TRACE_DELIVERY_RESOLVED = "brain.delivery.resolved"
 """The one trace ``prepare`` publishes: the resolved delivery lists (R1)."""
 
+TRACE_OBSERVATION = "brain.run.observation"
+"""The trace the loop publishes for every proposal it classified (R1, R4).
+
+Correlation, the action, the call id (``null`` for a synthetic observation
+the executor never saw), the observation's status and error code, and one
+summary per part: a ``text`` part as its byte count, an ``image_ref`` part
+as ``attachment_id``, ``content_type``, ``size``, ``width`` and ``height``
+(AC12). Never the text itself, never a payload, never a path.
+"""
+
 _INPUT_EVENT = "channel.chat.message"
 _STATUS_SUCCESS = "success"
+_STATUS_REFUSED = "refused"
 _STATUS_ERROR = "error"
 _STATUS_TIMEOUT = "timeout"
 
@@ -228,10 +281,21 @@ _DRAIN_MAX_POLLS = 10_000
 _TOKEN_CHARS = 3
 _TOKEN_MESSAGE_OVERHEAD = 4
 
+# What one ``image_ref`` part is estimated to cost when the backend reports
+# no usage: a flat, deliberately high count, since nothing in the bytes says
+# how a backend accounts for an image — an estimate flagged as such (§3.4).
+_TOKEN_IMAGE_ESTIMATE = 512
+
 # The share of ``budget.max_tokens`` retained history may fill: whatever the
 # input leaves is the reply's room, so at least this much is reserved for the
 # output whenever the mandatory messages alone fit inside it.
 _HISTORY_TOKEN_SHARE = 0.5
+
+# The budgets a run reports in ``budget: <name>`` when it exhausts one (R3).
+_BUDGET_MODEL_TURNS = "model_turns"
+_BUDGET_MAX_TOKENS = "max_tokens"
+_BUDGET_MAX_ACTION_CALLS = "max_action_calls"
+_BUDGET_MAX_REPEATED_ACTIONS = "max_repeated_actions"
 
 # --------------------------------------------------------------------------- #
 # Module-owned settings validation (R7)
@@ -733,7 +797,7 @@ class _AdmissionLimits:
 
 @dataclass(frozen=True, slots=True)
 class _Budget:
-    """Per-run budgets (R3). One model turn is spent per run here."""
+    """Per-run budgets (R3), each acted by the loop at its own boundary."""
 
     model_turns: int
     model_call_seconds: float
@@ -880,29 +944,10 @@ class _DeliveryEntry:
         return self.text_argument is not None
 
     def destination_for(self, platform: str, channel_id: str) -> Destination:
-        """The concrete destination of a call to the run's channel.
+        """The concrete destination of a call to the run's channel; see
+        :func:`_declared_destination`."""
 
-        The scope is the one of the first declaration that covers the run's
-        platform and channel, so an action declared for ``a/*/chat`` and
-        ``b/*/audio`` is addressed as ``audio`` on ``b``. A declaration open
-        to every scope is addressed as :data:`CHAT_SCOPE`, the reply's own.
-        When no declaration covers the channel, the first declaration's
-        scope stands: the executor then classifies the call as an
-        unsupported destination, keeping the entry's accounting explicit.
-        """
-
-        for declared in self.destinations:
-            if _component_contains(declared.platform, platform) and _component_contains(
-                declared.channel_id, channel_id
-            ):
-                return Destination(
-                    platform=platform, channel_id=channel_id, scope=_concrete_scope(declared)
-                )
-        return Destination(
-            platform=platform,
-            channel_id=channel_id,
-            scope=_concrete_scope(self.destinations[0]),
-        )
+        return _declared_destination(self.destinations, platform, channel_id)
 
     def arguments_for(self, text: str) -> dict[str, Any]:
         """The call's arguments: the constants, plus the text where declared."""
@@ -911,6 +956,51 @@ class _DeliveryEntry:
         if self.text_argument is not None:
             arguments[self.text_argument] = text
         return arguments
+
+
+def _declared_destination(
+    destinations: Sequence[Destination], platform: str, channel_id: str
+) -> Destination:
+    """The concrete destination of a call to the run's channel (R1).
+
+    The scope is the one of the first declaration that covers the run's
+    platform and channel, so an action declared for ``a/*/chat`` and
+    ``b/*/audio`` is addressed as ``audio`` on ``b``. A declaration open to
+    every scope is addressed as :data:`CHAT_SCOPE`, the reply's own. When no
+    declaration covers the channel, the first declaration's scope stands:
+    the executor then classifies the call as an unsupported destination,
+    keeping the call's accounting explicit. The one place, with
+    :func:`_declared_scopes`, where the brain derives a destination from a
+    spec — always from the declaration, never from a scope literal.
+    """
+
+    for declared in destinations:
+        if _component_contains(declared.platform, platform) and _component_contains(
+            declared.channel_id, channel_id
+        ):
+            return Destination(
+                platform=platform, channel_id=channel_id, scope=_concrete_scope(declared)
+            )
+    return Destination(
+        platform=platform, channel_id=channel_id, scope=_concrete_scope(destinations[0])
+    )
+
+
+def _declared_scopes(spec: Any) -> tuple[str, ...]:
+    """The distinct concrete scopes a spec declares, in declaration order.
+
+    ``chat`` for an action declared on ``*/*/chat``, ``capture`` for one on
+    ``*/*/capture``; a spec declaring several scopes yields each once, so
+    the offer is evaluated once per scope (R1, AC6).
+    """
+
+    return tuple(
+        dict.fromkeys(
+            _concrete_scope(declared)
+            for declared in getattr(spec, "supported_destinations", ())
+            if isinstance(declared, Destination)
+        )
+    )
 
 
 def _component_contains(declared: str, actual: str) -> bool:
@@ -1381,6 +1471,236 @@ class _SupervisionCounters:
         return self._supervision.count(name, amount)
 
 
+# --------------------------------------------------------------------------- #
+# The transcript and the run's accounting (R1, R3, R4)
+# --------------------------------------------------------------------------- #
+
+_ROLE_SYSTEM = "system"
+_ROLE_USER = "user"
+_ROLE_ASSISTANT = "assistant"
+_ROLE_TOOL = "tool"
+# The text that precedes the image parts of an observation in the ``user``
+# message following its tool result, naming the call the images answer.
+_IMAGE_MESSAGE_TEXT = "Image captured by tool call {key}:"
+
+_ROUTE_SYNTHETIC = "synthetic"
+_ROUTE_EXECUTOR = "executor"
+
+
+@dataclass(frozen=True, slots=True)
+class _TurnEntry:
+    """One classified proposal and the observation it earned (R1).
+
+    Rendered as the alternating pair a Chat Completions transcript carries:
+    an assistant message holding the tool call — the name and the arguments
+    exactly as the backend sent them, so a malformed string is echoed back
+    as the string it was — and a ``tool`` message holding the observation
+    as text. ``key`` correlates the two: the call id of an executed
+    proposal, a per-turn key for a synthetic observation the executor never
+    saw. An observation carrying ``image_ref`` parts adds a third message:
+    a ``user`` message that names the call and carries the references — a
+    ``tool`` message accepts text only in the Chat Completions schema, so
+    an image placed there would be rejected by a backend enforcing it while
+    the vision probe, sent as ``user``, had passed.
+    """
+
+    key: str
+    name: str
+    arguments: str
+    observation: ActionObservation
+
+    def messages(self) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": _ROLE_ASSISTANT,
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": self.key,
+                        "type": "function",
+                        "function": {"name": self.name, "arguments": self.arguments},
+                    }
+                ],
+            },
+            {
+                "role": _ROLE_TOOL,
+                "tool_call_id": self.key,
+                "content": _observation_content(self.observation),
+            },
+        ]
+        images = _observation_images(self.observation)
+        if images:
+            messages.append(
+                {
+                    "role": _ROLE_USER,
+                    "content": [
+                        {"type": _PART_TEXT, "text": _IMAGE_MESSAGE_TEXT.format(key=self.key)},
+                        *images,
+                    ],
+                }
+            )
+        return messages
+
+
+@dataclass(slots=True)
+class _Transcript:
+    """The bounded transcript one run offers the model, turn after turn (R1).
+
+    The instructions, the viewer's message and the retained memory come
+    first; then, in order, one :class:`_TurnEntry` per classified proposal.
+    A ``text`` part is rendered into the tool result; an ``image_ref`` part
+    is kept as the reference it is, in a ``user`` message that follows the
+    tool result — the adapter resolves and encodes it while a request body
+    is built and nowhere else (R2, AC12). The object is
+    a local of the run: it exists from the first turn to the terminal
+    outcome and is never retained past it.
+    """
+
+    system: str
+    user: str
+    history: tuple[Exchange, ...]
+    entries: list[_TurnEntry] = field(default_factory=list)
+
+    def append(self, entry: _TurnEntry) -> None:
+        self.entries.append(entry)
+
+    def turn_messages(self) -> list[dict[str, Any]]:
+        return [message for entry in self.entries for message in entry.messages()]
+
+    def image_parts(self) -> tuple[Mapping[str, Any], ...]:
+        """Every ``image_ref`` part the transcript still references."""
+
+        return tuple(
+            part
+            for entry in self.entries
+            for part in entry.observation.parts
+            if part.get("type") == _PART_IMAGE_REF
+        )
+
+
+@dataclass(slots=True)
+class _RunState:
+    """What one run has spent so far, reported in its outcome (R1, R3).
+
+    ``turns`` counts model calls — every proposal, synthetic or executed,
+    and the final response each cost one; ``action_calls`` counts executor
+    calls, delivery entries included; ``tokens`` is the cumulative input +
+    output over every call, the backend's usage when it reported one and an
+    estimate — flagged by ``tokens_estimated`` — when it did not;
+    ``next_call`` numbers the run's call ids in invocation order;
+    ``repeats`` counts the executed proposals per ``(name, canonical
+    arguments)`` for the repeated-action budget.
+    """
+
+    turns: int = 0
+    action_calls: int = 0
+    model_calls: int = 0
+    tokens: int = 0
+    tokens_estimated: bool = False
+    next_call: int = 1
+    repeats: dict[tuple[str, str], int] = field(default_factory=dict)
+
+    def correlation(self) -> dict[str, Any]:
+        return {
+            "turns": self.turns,
+            "action_calls": self.action_calls,
+            "tokens": self.tokens,
+            "tokens_estimated": self.tokens_estimated,
+            "fallback": FALLBACK_NONE,
+        }
+
+    def spend(self, reply: "_ModelReply") -> None:
+        if reply.tokens is not None:
+            self.tokens += reply.tokens
+            self.tokens_estimated = self.tokens_estimated or reply.estimated
+
+
+@dataclass(frozen=True, slots=True)
+class _Offer:
+    """One read action offered as a tool, and the scope it was authorized on."""
+
+    spec: Any
+    scope: str
+
+
+def _synthetic_observation(status: str, code: str, *, route: str) -> ActionObservation:
+    """An observation this module wrote itself: a refusal or an error the
+    executor never saw (``synthetic``), or the stand-in for an executor
+    call whose outcome could not be adopted (``executor``). No parts."""
+
+    return ActionObservation(
+        status=status,
+        provenance={"source": MODULE_NAME, "route": route},
+        error={"code": code, "message": "", "retryable": False},
+    )
+
+
+def _observation_content(observation: ActionObservation) -> str:
+    """The tool result the model reads: status, error code, result, text.
+
+    The envelope is one JSON object — ``status``, the error's ``code`` when
+    there is one, the ``result`` mapping of a success — followed by every
+    ``text`` part's text. The content is always a string: a ``tool``
+    message carries text only, and the ``image_ref`` parts of the
+    observation travel in the ``user`` message
+    :func:`_observation_images` feeds, the references kept as references
+    for the adapter to encode at request time (R2). The error's message is
+    not rendered: it is the executor's diagnostic, not an observation the
+    model needs.
+    """
+
+    envelope: dict[str, Any] = {"status": observation.status}
+    if observation.error is not None:
+        envelope["error"] = {"code": observation.error.get("code")}
+    if observation.result is not None:
+        envelope["result"] = _json_plain(observation.result)
+    rendered = json.dumps(envelope, ensure_ascii=False, sort_keys=True, default=str)
+    texts = [
+        part["text"]
+        for part in observation.parts
+        if part.get("type") == _PART_TEXT and isinstance(part.get("text"), str)
+    ]
+    return "\n".join([rendered, *texts])
+
+
+def _observation_images(observation: ActionObservation) -> list[dict[str, Any]]:
+    """The ``image_ref`` parts of an observation, copied as the references
+    they are, for the ``user`` message that follows its tool result."""
+
+    return [dict(part) for part in observation.parts if part.get("type") == _PART_IMAGE_REF]
+
+
+def _part_summaries(parts: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """What a trace says about the parts: sizes and dimensions only (AC12)."""
+
+    summaries: list[dict[str, Any]] = []
+    for part in parts:
+        if part.get("type") == _PART_IMAGE_REF:
+            summaries.append(
+                {
+                    "type": _PART_IMAGE_REF,
+                    "attachment_id": part["attachment_id"],
+                    "content_type": part["content_type"],
+                    "size": part["size"],
+                    "width": part["width"],
+                    "height": part["height"],
+                }
+            )
+        elif part.get("type") == _PART_TEXT:
+            summaries.append({"type": _PART_TEXT, "bytes": _utf8_size(part["text"])})
+    return summaries
+
+
+def _raw_arguments_text(raw: Any) -> str:
+    """The arguments as the backend sent them, as the transcript echoes them."""
+
+    if isinstance(raw, str):
+        return raw
+    if raw is None:
+        return ""
+    return json.dumps(_json_plain(raw), ensure_ascii=False, default=str)
+
+
 class BrainModule:
     """The v2 handle: the run body, its memory, one HTTP session, phase hooks.
 
@@ -1661,30 +1981,20 @@ class BrainModule:
             return False
         return bool(getattr(decision, "accepted", False))
 
-    # -- the run body (R5, R8) --------------------------------------------- #
+    # -- the run body: the agentic loop (R1, R2, R3, R4) -------------------- #
 
     async def run(self, run: Any) -> RunOutcome:
-        """Take one admitted work to its :class:`~core.admission.RunOutcome`.
+        """Take one admitted work through the loop to its :class:`~core.admission.RunOutcome`.
 
-        Exactly one model call and one terminal delivery step, each behind a
-        boundary the run's budget is checked at: an expired budget ends the
-        run before the model is reached, or before the delivery is started,
-        with 0 further work. The token budget is checked at the same first
-        boundary — a prompt that leaves the reply no room inside
-        ``budget.max_tokens`` ends the run with 0 model calls — and again on
-        the reply, which is discarded when the backend's usage, or the
-        estimate standing in for it, puts the run over the bound (§3.4). The
-        model call is counted before it is awaited, so a run the shutdown
-        cancels while its request is pending is recorded with the call it
-        already issued. The reply is delivered through every entry of the
-        run's resolved delivery list (R1, decision 1) — the override of its
-        destination, else the default — one executor call per entry carrying
-        the run's identity and its own deadline, so a call still in flight at
-        the total deadline is classified by the executor, never here (AC33).
-        Each confirmed send is noted on the run as it is observed, so a run
-        cancelled between two entries keeps the sends it already made. The
-        memory write-back happens here, before the outcome is returned,
-        and only when the text was confirmed delivered (AC7, AC19).
+        The transcript is built once — instructions, the viewer's message,
+        the retained memory — and grows by one :class:`_TurnEntry` per
+        classified proposal; it is a local of this call, gone with it. The
+        loop itself is :meth:`_loop`; whatever way it ends — an outcome, the
+        deadline raised at a checkpoint, a cancellation during a capture, a
+        model call or a delivery — every image the transcript still
+        references is discarded here first, idempotently with the release
+        the scheduler performs when it writes the terminal record (R4,
+        AC25), and only then does the exit propagate.
 
         Publishes neither ``brain.run.started`` nor ``brain.run.completed``:
         the scheduler owns both and merges what is returned into its trace.
@@ -1701,61 +2011,346 @@ class BrainModule:
             )
 
         key: SessionKey = run.session_key
-        destination = Destination(
-            platform=key.platform, channel_id=key.channel_id, scope=CHAT_SCOPE
+        transcript = _Transcript(
+            system=self._system_prompt(),
+            user=_format_user_context(message),
+            history=self._memory.recall(key),
         )
-        user_content = _format_user_context(message)
-        prompt = self._compose(destination, self._memory.recall(key), user_content)
-        if prompt is None:
-            self._diagnose("brain run: prompt exceeds the token budget")
-            return RunOutcome(
-                status=_STATUS_ERROR,
-                delivery=DELIVERY_NOT_ATTEMPTED,
-                correlation={"failure": "token_budget_exceeded"},
-            )
+        state = _RunState()
+        try:
+            return await self._loop(run, message, key, transcript, state)
+        finally:
+            self._discard_images(transcript.image_parts())
 
-        run.checkpoint()
-        run.note_model_call()
-        result = await self._adapter._request_model(
-            prompt, budget_seconds=min(self._budget.model_call_seconds, run.remaining)
+    async def _loop(
+        self,
+        run: Any,
+        message: _Message,
+        key: SessionKey,
+        transcript: _Transcript,
+        state: _RunState,
+    ) -> RunOutcome:
+        """Model turns until a final response, a failure or a spent budget.
+
+        Each turn, in this order: an ``image_ref`` the transcript carries
+        whose lease expired on the clock ends the run ``attachment_expired``
+        before any request (R4, AC24); ``turns == model_turns`` ends it
+        ``budget_exhausted`` (AC13); the run's deadline is checked; the
+        authorized read view is read afresh, per action and per declared
+        scope (AC6); the prompt is composed inside the token room the run
+        has left, and one that leaves the reply no room ends the run on
+        ``max_tokens`` with 0 further calls; the model call is counted on
+        the run before it is awaited — a shutdown that cancels a pending
+        request still records the call it issued — and bounded by
+        ``min(model_call_seconds, remaining)``. The reply is then classified
+        (decision 2): unsupported shape → ``error`` with 0 actions; final →
+        the terminal step; proposal → :meth:`_propose`, and the loop
+        continues if it did not end the run.
+        """
+
+        budget = self._budget
+        while True:
+            if self._expired_image(transcript):
+                self._diagnose("brain run: image attachment expired before the model turn")
+                return self._failed(state, _STATUS_ERROR, BRAIN_ERROR_ATTACHMENT_EXPIRED)
+            if state.turns >= budget.model_turns:
+                return self._exhausted(state, _BUDGET_MODEL_TURNS)
+
+            run.checkpoint()
+            offered = self._offered_tools(key.platform, key.channel_id)
+            room = budget.max_tokens - state.tokens
+            prompt = self._compose(transcript, tuple(offer.spec for offer in offered), room)
+            if prompt.output_tokens <= 0:
+                self._diagnose("brain run: prompt exceeds the token budget")
+                return self._exhausted(
+                    state,
+                    _BUDGET_MAX_TOKENS,
+                    quiet=True,
+                    tokens=state.tokens + prompt.input_tokens,
+                    tokens_estimated=True,
+                )
+
+            run.note_model_call()
+            state.model_calls += 1
+            state.turns += 1
+            reply = await self._adapter._request_model(
+                prompt,
+                budget_seconds=min(budget.model_call_seconds, run.remaining),
+                token_room=room,
+            )
+            state.spend(reply)
+            if reply.failure is not None:
+                if reply.failure == _FAILURE_TIMED_OUT:
+                    return self._failed(state, _STATUS_TIMEOUT, reply.failure)
+                if reply.failure == _FAILURE_TOKEN_BUDGET_EXCEEDED:
+                    return self._exhausted(state, _BUDGET_MAX_TOKENS, quiet=True)
+                return self._failed(state, _STATUS_ERROR, reply.failure)
+            if state.tokens > budget.max_tokens:
+                self._diagnose("brain model response: token budget exceeded")
+                return self._exhausted(state, _BUDGET_MAX_TOKENS, quiet=True)
+
+            classification = reply.classification
+            if isinstance(classification, _Unsupported):
+                self._diagnose(
+                    f"brain model response: unsupported shape: {classification.reason}"
+                )
+                return self._failed(
+                    state,
+                    _STATUS_ERROR,
+                    RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
+                    shape=classification.reason,
+                )
+            if isinstance(classification, _Final):
+                return await self._finish(run, key, transcript, classification.text, state)
+            ended = await self._propose(run, message, transcript, state, classification, offered)
+            if ended is not None:
+                return ended
+
+    async def _propose(
+        self,
+        run: Any,
+        message: _Message,
+        transcript: _Transcript,
+        state: _RunState,
+        proposal: _Proposal,
+        offered: Sequence[_Offer],
+    ) -> RunOutcome | None:
+        """One proposal to its observation, or to the outcome that ends the run.
+
+        In this order (R1, R3, R4): a name absent from the discovered catalog
+        is a synthetic ``refused`` (``unknown_action``); a catalog action of
+        any nature but ``read`` — the delivery action included, whatever
+        the grants — a synthetic ``refused`` (``not_a_read_action``);
+        arguments that are not a JSON object a synthetic ``error``
+        (``malformed_arguments``); each with 0 executor calls. Then the
+        budgets: the ``(n+1)``-th proposal of the same name and canonical
+        arguments with ``n == max_repeated_actions`` is not executed and
+        ends the run; so does a proposal with no action call left. Else one
+        :class:`~core.contracts.ActionCall` — destination ``(run platform,
+        run channel_id, the scope the action was offered on, or its
+        declared scope when it was not offered)``, principal
+        :data:`PRINCIPAL`, the run's identities, ``call_id`` next in the
+        run's counter, deadline ``min(now + action_seconds, total
+        deadline)`` — goes to the executor, which refuses by default what no
+        rule permits and validates the arguments against the spec. The
+        observation is bounded by ``max_observation_bytes`` here as well
+        (``observation_too_large``, its images released) for a runtime whose
+        executor bound is ``None``; an ``image_ref`` in a run whose verified
+        capabilities lack ``vision`` ends the run ``capability_missing``
+        without a request and with the image released (R2, AC11). Every
+        proposal is traced as ``brain.run.observation`` and appended to the
+        transcript; every proposal counts one turn, which the model call
+        already did.
+        """
+
+        budget = self._budget
+        name = proposal.name
+        call_id: str | None = None
+        key = f"{run.run_id}/turn-{state.turns}"
+        spec = self._catalog().get(name)
+        if spec is None:
+            observation = _synthetic_observation(
+                _STATUS_REFUSED, BRAIN_ERROR_UNKNOWN_ACTION, route=_ROUTE_SYNTHETIC
+            )
+        elif getattr(spec, "nature", None) != _NATURE_READ:
+            observation = _synthetic_observation(
+                _STATUS_REFUSED, BRAIN_ERROR_NOT_A_READ_ACTION, route=_ROUTE_SYNTHETIC
+            )
+        else:
+            arguments = _decode_arguments(proposal.raw_arguments)
+            if arguments is None:
+                observation = _synthetic_observation(
+                    _STATUS_ERROR, BRAIN_ERROR_MALFORMED_ARGUMENTS, route=_ROUTE_SYNTHETIC
+                )
+            else:
+                repeat_key = (name, _canonical_text(arguments))
+                repeated = state.repeats.get(repeat_key, 0)
+                if repeated >= budget.max_repeated_actions:
+                    return self._exhausted(state, _BUDGET_MAX_REPEATED_ACTIONS)
+                if state.action_calls >= budget.max_action_calls:
+                    return self._exhausted(state, _BUDGET_MAX_ACTION_CALLS)
+                state.repeats[repeat_key] = repeated + 1
+                call_id = f"{run.run_id}/call-{state.next_call}"
+                try:
+                    call = self._action_call(
+                        run, message, spec, arguments, call_id, offered
+                    )
+                except Exception:
+                    # The contract refused what the schema-free decode let
+                    # through: the arguments are malformed for this action.
+                    call_id = None
+                    observation = _synthetic_observation(
+                        _STATUS_ERROR, BRAIN_ERROR_MALFORMED_ARGUMENTS, route=_ROUTE_SYNTHETIC
+                    )
+                else:
+                    state.next_call += 1
+                    state.action_calls += 1
+                    key = call_id
+                    observation = self._bounded_observation(
+                        await self._invoke(call, step="action")
+                    )
+
+        await self._trace_observation(run, state, name, call_id, observation)
+        if any(part.get("type") == _PART_IMAGE_REF for part in observation.parts) and (
+            CAPABILITY_VISION not in self.verified_capabilities
+        ):
+            self._discard_images(observation.parts)
+            self._diagnose("brain run: image observation without a verified vision capability")
+            return self._failed(
+                state,
+                _STATUS_ERROR,
+                RUN_FAILURE_CAPABILITY_MISSING,
+                capability=CAPABILITY_VISION,
+            )
+        transcript.append(
+            _TurnEntry(
+                key=key,
+                name=name,
+                arguments=_raw_arguments_text(proposal.raw_arguments),
+                observation=observation,
+            )
         )
-        if result.failure is not None:
-            return RunOutcome(
-                status=_STATUS_TIMEOUT if result.failure == "timed_out" else _STATUS_ERROR,
-                delivery=DELIVERY_NOT_ATTEMPTED,
-                model_calls=1,
-                correlation={"failure": result.failure, **result.usage()},
+        return None
+
+    def _action_call(
+        self,
+        run: Any,
+        message: _Message,
+        spec: Any,
+        arguments: Mapping[str, Any],
+        call_id: str,
+        offered: Sequence[_Offer],
+    ) -> ActionCall:
+        """One read proposal's call, its identities and deadline the runtime's."""
+
+        scope = next((offer.scope for offer in offered if offer.spec.name == spec.name), None)
+        if scope is None:
+            destination = _declared_destination(
+                spec.supported_destinations, message.platform, message.channel_id
             )
-        classification = result.classification
-        if isinstance(classification, _Unsupported):
-            self._diagnose(f"brain model response: unsupported shape: {classification.reason}")
-            return RunOutcome(
-                status=_STATUS_ERROR,
-                delivery=DELIVERY_NOT_ATTEMPTED,
-                model_calls=1,
-                correlation={
-                    "failure": RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
-                    "shape": classification.reason,
-                    **result.usage(),
-                },
+        else:
+            destination = Destination(
+                platform=message.platform, channel_id=message.channel_id, scope=scope
             )
-        if not isinstance(classification, _Final):
-            # A proposal is classified here and executed by the agentic loop
-            # (P12); this single-turn body has no turn to feed the observation
-            # back into, so it ends the run explicitly rather than delivering
-            # a tool call as text or dropping it silently.
-            self._diagnose("brain model response: proposal not executed by the single-turn body")
-            return RunOutcome(
-                status=_STATUS_ERROR,
-                delivery=DELIVERY_NOT_ATTEMPTED,
-                model_calls=1,
-                correlation={"failure": "proposal_not_executed", **result.usage()},
-            )
-        reply = classification.text
+        return ActionCall(
+            action_name=spec.name,
+            action_version=spec.version,
+            arguments=arguments,
+            conversation_id=run.conversation_id,
+            run_id=run.run_id,
+            call_id=call_id,
+            source_event_id=run.work.source_event_id,
+            destination=destination,
+            principal=PRINCIPAL,
+            deadline=min(run.now + self._budget.action_seconds, run.total_deadline),
+            message_id=message.message_id,
+        )
+
+    def _bounded_observation(self, observation: ActionObservation) -> ActionObservation:
+        """Enforce ``budget.max_observation_bytes`` on an adopted observation (R4).
+
+        The executor enforces its own bound when it was given one; the
+        production runtime leaves it ``None`` and the budget is applied
+        here, one rule at two possible points. Over the bound, the
+        observation becomes a synthetic ``error`` (``observation_too_large``)
+        and every ``image_ref`` it named is released at once (AC47).
+        """
+
+        parts = observation.parts
+        if not parts:
+            return observation
+        try:
+            size = observation_size(parts)
+        except Exception:
+            size = self._budget.max_observation_bytes + 1
+        if size <= self._budget.max_observation_bytes:
+            return observation
+        self._discard_images(parts)
+        self._diagnose("brain run: observation exceeds the observation byte budget")
+        return _synthetic_observation(
+            _STATUS_ERROR, BRAIN_ERROR_OBSERVATION_TOO_LARGE, route=_ROUTE_EXECUTOR
+        )
+
+    def _expired_image(self, transcript: _Transcript) -> bool:
+        """Whether an ``image_ref`` the transcript carries is no longer leased.
+
+        Looked up on the clock, now, before the request is built (R4, AC24):
+        a lease past its deadline, or one the store already reaped, ends the
+        run rather than being sent stale or dropped silently. Without a
+        store nothing can be judged here; the adapter reports what it cannot
+        resolve.
+        """
+
+        store = self._attachments
+        if store is None:
+            return False
+        now = self._clock()
+        for part in transcript.image_parts():
+            try:
+                ref = store.lookup(part["attachment_id"])
+            except Exception:
+                continue
+            if ref is None or now >= ref.expires_at:
+                return True
+        return False
+
+    async def _trace_observation(
+        self,
+        run: Any,
+        state: _RunState,
+        action: str,
+        call_id: str | None,
+        observation: ActionObservation,
+    ) -> None:
+        """Publish one ``brain.run.observation``; a lost trace changes nothing."""
+
+        try:
+            size = observation_size(observation.parts)
+        except Exception:
+            size = None
+        payload = {
+            "run_id": run.run_id,
+            "conversation_id": run.conversation_id,
+            "turn": state.turns,
+            "action": action,
+            "call_id": call_id,
+            "status": observation.status,
+            "error_code": (observation.error or {}).get("code"),
+            "observation_bytes": size,
+            "parts": _part_summaries(observation.parts),
+        }
+        try:
+            await _resolve(run.emit(TRACE_OBSERVATION, payload))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._diagnose("brain run: observation trace lost")
+
+    async def _finish(
+        self,
+        run: Any,
+        key: SessionKey,
+        transcript: _Transcript,
+        reply: str,
+        state: _RunState,
+    ) -> RunOutcome:
+        """The terminal step: deliver the final text, memorise, account (R1).
+
+        The reply is delivered through every entry of the run's resolved
+        delivery list (decision 1) — the override of its destination, else
+        the default — one executor call per entry carrying the run's
+        identity, call ids continuing the run's counter and each its own
+        deadline, so a call still in flight at the total deadline is
+        classified by the executor, never here (AC33). Each confirmed send
+        is noted on the run as it is observed. The memory write-back
+        happens here, only when the text was confirmed delivered (AC7).
+        """
 
         run.checkpoint()
         entries = self._delivery_for(key.platform, key.channel_id)
-        deliveries = await self._deliver_all(run, reply, entries, next_call_index=1)
+        deliveries = await self._deliver_all(run, reply, entries, next_call_index=state.next_call)
+        state.next_call += len(deliveries)
+        state.action_calls += len(deliveries)
         summary = _delivery_summary([delivery.status for delivery in deliveries])
         text_deliveries = [delivery for delivery in deliveries if delivery.entry.receives_text]
         sends = sum(1 for delivery in text_deliveries if delivery.status == _STATUS_SUCCESS)
@@ -1764,13 +2359,12 @@ class BrainModule:
         # ``external_unknown`` entry is never a confirmed send (AC7).
         delivered = bool(text_deliveries) and sends == len(text_deliveries)
         if delivered and not self._closed:
-            self._memory.remember(key, user_content, reply)
+            self._memory.remember(key, transcript.user, reply)
 
         correlation: dict[str, Any] = {
             "deliveries": [delivery.record() for delivery in deliveries],
             "delivery": summary,
-            "action_calls": len(deliveries),
-            **result.usage(),
+            **state.correlation(),
         }
         for delivery in deliveries:
             error = delivery.observation.error
@@ -1782,53 +2376,89 @@ class BrainModule:
         return RunOutcome(
             status=summary,
             delivery=summary,
-            model_calls=1,
+            model_calls=state.model_calls,
             sends=sends,
             correlation=correlation,
         )
 
-    def _compose(
-        self,
-        destination: Destination,
-        history: Sequence[Exchange],
-        user_content: str,
-    ) -> _Prompt | None:
-        """The request messages inside the token budget, or ``None`` (§3.4).
+    def _failed(self, state: _RunState, status: str, failure: str, **extra: Any) -> RunOutcome:
+        """The outcome of a run that ended before any delivery."""
 
-        The instructions, the offered tool definitions and the viewer's
-        message are mandatory; when their estimate alone leaves the reply no
-        room the prompt is not composed. The tools count as input because the
-        backend reads them as such: a listing that used to be system text is
-        no lighter for travelling as ``tools``. History is then added
-        newest-first while the input stays within its share of the budget, so
-        an old exchange is dropped before the reply's room is — and what the
-        input leaves is the output cap the request carries.
+        return RunOutcome(
+            status=status,
+            delivery=DELIVERY_NOT_ATTEMPTED,
+            model_calls=state.model_calls,
+            correlation={
+                "failure": failure,
+                **extra,
+                "deliveries": [],
+                **state.correlation(),
+            },
+        )
+
+    def _exhausted(
+        self, state: _RunState, budget: str, *, quiet: bool = False, **extra: Any
+    ) -> RunOutcome:
+        """The outcome of a run that spent *budget* (R3): ``error``, named.
+
+        One diagnostic per exhaustion: *quiet* is passed by the token paths,
+        whose boundary already reported the overrun.
         """
 
-        system = {"role": "system", "content": self._system_prompt()}
-        user = {"role": "user", "content": user_content}
-        tools = self._offered_tools(destination)
-        limit = self._budget.max_tokens
-        input_tokens = (
-            _estimate_tokens(system["content"])
-            + _estimate_tokens(user_content)
-            + _estimate_tool_tokens(tools)
+        if not quiet:
+            self._diagnose(f"brain run: budget exhausted: {budget}")
+        outcome = self._failed(state, _STATUS_ERROR, RUN_FAILURE_BUDGET_EXHAUSTED, budget=budget)
+        if not extra:
+            return outcome
+        return RunOutcome(
+            status=outcome.status,
+            delivery=outcome.delivery,
+            model_calls=outcome.model_calls,
+            correlation={**outcome.correlation, **extra},
         )
-        if input_tokens >= limit:
-            return None
-        history_limit = int(limit * _HISTORY_TOKEN_SHARE)
+
+    def _compose(
+        self,
+        transcript: _Transcript,
+        tools: Sequence[Any],
+        limit: int,
+    ) -> _Prompt:
+        """The request messages inside the token room *limit* (§3.4).
+
+        The instructions, the offered tool definitions, the viewer's message
+        and every turn entry are mandatory: an observation is never dropped
+        from under the proposal that earned it. The tools count as input
+        because the backend reads them as such. History is then added
+        newest-first while the input stays within its share of the room, so
+        an old exchange is dropped before the reply's room is — and what the
+        input leaves is the output cap the request carries. A prompt whose
+        mandatory messages leave no room is returned with ``output_tokens``
+        at or below 0: the caller ends the run rather than sending it.
+        """
+
+        system = {"role": _ROLE_SYSTEM, "content": transcript.system}
+        user = {"role": _ROLE_USER, "content": transcript.user}
+        turns = transcript.turn_messages()
+        input_tokens = (
+            _estimate_tokens(transcript.system)
+            + _estimate_tokens(transcript.user)
+            + _estimate_tool_tokens(tools)
+            + sum(_estimate_message_tokens(message) for message in turns)
+        )
         kept: list[dict[str, str]] = []
-        for exchange in reversed(history):
-            cost = _estimate_tokens(exchange.user) + _estimate_tokens(exchange.assistant)
-            if input_tokens + cost > history_limit:
-                break
-            input_tokens += cost
-            kept.append({"role": "assistant", "content": exchange.assistant})
-            kept.append({"role": "user", "content": exchange.user})
-        kept.reverse()
+        if input_tokens < limit:
+            history_limit = int(limit * _HISTORY_TOKEN_SHARE)
+            for exchange in reversed(transcript.history):
+                cost = _estimate_tokens(exchange.user) + _estimate_tokens(exchange.assistant)
+                if input_tokens + cost > history_limit:
+                    break
+                input_tokens += cost
+                kept.append({"role": _ROLE_ASSISTANT, "content": exchange.assistant})
+                kept.append({"role": _ROLE_USER, "content": exchange.user})
+            kept.reverse()
         return _Prompt(
-            messages=[system, *kept, user],
-            tools=tools,
+            messages=[system, *kept, user, *turns],
+            tools=tuple(tools),
             input_tokens=input_tokens,
             output_tokens=limit - input_tokens,
         )
@@ -1838,48 +2468,74 @@ class BrainModule:
 
         No ``[send:`` tag and no action listing: what the model may call is
         the request's ``tools`` list (R2), and the reply is delivered by the
-        runtime, never by an encoding of the text.
+        runtime, never by an encoding of the text. No action is named here,
+        so a new read action needs no new wording.
         """
 
         return "\n".join(
             (
                 "You are a live-stream chat companion.",
+                "You may call the offered tools to observe before answering;"
+                " each tool result is returned to you.",
                 "Reply to the viewer's message with one short plain-text chat message.",
                 "Write the message body only: no tags, no markup, no instructions.",
             )
         )
 
-    def _offered_tools(self, destination: Destination) -> tuple[Any, ...]:
-        """The read actions of the registry's authorized view, as specs.
-
-        Read through the scoped facade the runtime hands every module, so the
-        rules in force reach the model in production and not only under an
-        injected registry, and afresh every run: an action authorized at the
-        start of a previous run is no permission now (R5). A view that cannot
-        be read offers nothing: default deny expressed as a surface rather
-        than a guess about the rules. Only actions of nature ``read`` are
-        kept (R1, decision 1): the model observes through tools and never
-        selects a delivery. The specs become the request's tool definitions
-        at request time.
-        """
+    def _catalog(self) -> Mapping[str, Any]:
+        """The discovered catalog, read afresh; empty when it cannot be read."""
 
         try:
-            view = self._actions.authorized(principal=PRINCIPAL, destination=destination)
+            catalog = self._actions.discovered()
         except Exception:
-            self._diagnose("brain actions: authorized view unavailable")
-            return ()
-        # Read actions only (R1): a delivery action is never offered, whatever
-        # the grants — the configured list invokes it at the terminal step,
-        # and the contracts refuse the delivery capability on a read action,
-        # so the nature check covers both.
-        offered = [
-            spec
-            for _name, spec in sorted(dict(view).items(), key=lambda item: str(item[0]))
-            if _is_text(getattr(spec, "name", None))
-            and isinstance(getattr(spec, "argument_schema", None), Mapping)
-            and getattr(spec, "nature", None) == _NATURE_READ
-        ]
-        return tuple(offered)
+            self._diagnose("brain actions: discovered catalog unavailable")
+            return {}
+        return catalog if isinstance(catalog, Mapping) else {}
+
+    def _offered_tools(self, platform: str, channel_id: str) -> tuple[_Offer, ...]:
+        """The read actions of the authorized view, per action and per declared scope (R1, AC6).
+
+        Read through the scoped facade the runtime hands every module, and
+        afresh every turn: an action authorized at the start of a previous
+        turn is no permission now (R5). Every discovered spec of nature
+        ``read`` is evaluated once per scope its ``supported_destinations``
+        declare — ``chat`` for a chat reader, ``capture`` for a screen
+        capture — and offered iff the view for ``(platform, channel_id,
+        that scope)`` contains it, so a capture bound on ``*/*/capture`` is
+        offered by its own scope and a single ``chat``-scoped query would
+        never see it. The scope stays with the offer: it is the one the
+        proposal's call is addressed to. A view that cannot be read offers
+        nothing: default deny expressed as a surface rather than a guess
+        about the rules. A delivery action is never offered, whatever the
+        grants — the contracts refuse the delivery capability on a read
+        action, so the nature check covers both (decision 1). The specs
+        become the request's tool definitions at request time, in name
+        order.
+        """
+
+        offered: dict[str, _Offer] = {}
+        for name, spec in sorted(self._catalog().items(), key=lambda item: str(item[0])):
+            if (
+                not _is_text(getattr(spec, "name", None))
+                or not isinstance(getattr(spec, "argument_schema", None), Mapping)
+                or getattr(spec, "nature", None) != _NATURE_READ
+            ):
+                continue
+            for scope in _declared_scopes(spec):
+                try:
+                    view = self._actions.authorized(
+                        principal=PRINCIPAL,
+                        destination=Destination(
+                            platform=platform, channel_id=channel_id, scope=scope
+                        ),
+                    )
+                except Exception:
+                    self._diagnose("brain actions: authorized view unavailable")
+                    continue
+                if name in view:
+                    offered[name] = _Offer(spec=spec, scope=scope)
+                    break
+        return tuple(offered.values())
 
     async def _deliver_all(
         self,
@@ -1914,9 +2570,11 @@ class BrainModule:
                 call = self._delivery_call(run, message, entry, text, call_id)
             except Exception:
                 self._diagnose("brain delivery: call could not be built")
-                observation = _failed_delivery("malformed_call")
+                observation = _synthetic_observation(
+                    _STATUS_ERROR, "malformed_call", route=_ROUTE_EXECUTOR
+                )
             else:
-                observation = await self._deliver(call)
+                observation = await self._invoke(call, step="delivery")
             if entry.receives_text and observation.status == _STATUS_SUCCESS:
                 run.note_send()
             deliveries.append(_Delivery(entry=entry, call_id=call_id, observation=observation))
@@ -1941,12 +2599,14 @@ class BrainModule:
             message_id=message.message_id,
         )
 
-    async def _deliver(self, call: ActionCall) -> ActionObservation:
+    async def _invoke(self, call: ActionCall, *, step: str) -> ActionObservation:
         """One executor call, whose explicit observation is the outcome (R5).
 
         The executor normalises every expected failure into an observation.
         What still escapes — a defect in the executor itself — is reported as
-        a certain ``error`` delivery, never as a success and never retried.
+        a certain ``error``, never as a success and never retried; *step*
+        names the boundary (``action`` or ``delivery``) in the diagnostic.
+        Cancellation propagates.
         """
 
         try:
@@ -1954,8 +2614,8 @@ class BrainModule:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self._diagnose("brain delivery: executor call failed")
-            return _failed_delivery("executor_failed")
+            self._diagnose(f"brain {step}: executor call failed")
+            return _synthetic_observation(_STATUS_ERROR, "executor_failed", route=_ROUTE_EXECUTOR)
         if (
             getattr(observation, "status", None) not in TERMINAL_STATUSES
             or (
@@ -1963,9 +2623,32 @@ class BrainModule:
                 and not isinstance(getattr(observation, "error", None), Mapping)
             )
         ):
-            self._diagnose("brain delivery: malformed observation")
-            return _failed_delivery("malformed_observation")
+            self._diagnose(f"brain {step}: malformed observation")
+            return _synthetic_observation(
+                _STATUS_ERROR, "malformed_observation", route=_ROUTE_EXECUTOR
+            )
         return observation
+
+    def _discard_images(self, parts: Sequence[Mapping[str, Any]]) -> None:
+        """Release every ``image_ref`` of *parts* from the store, if any.
+
+        Idempotent with the run-end release — the store drops an object
+        exactly once — and a no-op for a reference it no longer holds. A
+        store that refuses is diagnosed and nothing else: the lease it could
+        not free still falls to the run-end release, then to the store's
+        time-to-live.
+        """
+
+        store = self._attachments
+        if store is None:
+            return
+        for part in parts:
+            if part.get("type") != _PART_IMAGE_REF:
+                continue
+            try:
+                store.discard(part["attachment_id"])
+            except Exception:
+                self._diagnose("brain attachments: image release failed")
 
     # -- shutdown phases --------------------------------------------------- #
 
@@ -2086,6 +2769,9 @@ _UNSUPPORTED_MALFORMED_BODY = "malformed_body"
 
 # Failures of a request whose image part could not be read from the store.
 _FAILURE_ATTACHMENT_UNAVAILABLE = "attachment_unavailable"
+# The request failures the loop maps onto a run status or a budget (R3).
+_FAILURE_TIMED_OUT = "timed_out"
+_FAILURE_TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2138,10 +2824,11 @@ class _Prompt:
 class _ModelReply:
     """One model call's result: a classified reply or a failure, with usage.
 
-    ``tokens`` is the run's total as the backend reported it, or as it was
-    estimated when the backend reported none — ``estimated`` says which, so a
-    trace never presents an estimate as a measurement. It is ``None`` when the
-    call ended with nothing to count.
+    ``tokens`` is the call's total — input and output — as the backend
+    reported it, or as it was estimated when the backend reported none —
+    ``estimated`` says which, so a trace never presents an estimate as a
+    measurement. It is ``None`` when the call ended with nothing to count.
+    The run sums the calls into its cumulative total (R3).
     """
 
     classification: _Proposal | _Final | _Unsupported | None = None
@@ -2321,18 +3008,22 @@ class _ModelAdapter:
 
     # -- the run's model call ---------------------------------------------- #
 
-    async def _request_model(self, prompt: _Prompt, *, budget_seconds: float) -> _ModelReply:
+    async def _request_model(
+        self, prompt: _Prompt, *, budget_seconds: float, token_room: int | None = None
+    ) -> _ModelReply:
         """One request bounded in time and in tokens (§3.4).
 
-        The room the prompt leaves inside ``budget.max_tokens`` is sent as the
-        request's ``max_tokens``; the run's total is then read from the
+        The room the prompt leaves inside the call's token room is sent as
+        the request's ``max_tokens``; the call's total is then read from the
         backend's ``usage`` when it reports one and estimated — and reported
-        as estimated — when it does not. A reply that puts the total over the
-        bound is a failure, not a longer answer. The time bound runs on the
-        injected sleeper, so a held backend times out on the clock the run
-        is scheduled by.
+        as estimated — when it does not. A reply that puts the total over
+        *token_room* — what the run has left of ``budget.max_tokens``, the
+        whole budget by default — is a failure, not a longer answer. The
+        time bound runs on the injected sleeper, so a held backend times out
+        on the clock the run is scheduled by.
         """
 
+        room = self._budget.max_tokens if token_room is None else token_room
         try:
             body = self._request_body(prompt)
         except _ImageUnavailable as unavailable:
@@ -2344,7 +3035,7 @@ class _ModelAdapter:
             raise
         except (asyncio.TimeoutError, TimeoutError):
             self._diagnose("brain model request: timed out")
-            return _ModelReply(failure="timed_out")
+            return _ModelReply(failure=_FAILURE_TIMED_OUT)
         except _NonSuccessResponse:
             self._diagnose("brain model response: non-success status")
             return _ModelReply(failure="non_success_status")
@@ -2371,10 +3062,10 @@ class _ModelAdapter:
             if reported is None
             else reported
         )
-        if tokens > self._budget.max_tokens:
+        if tokens > room:
             self._diagnose("brain model response: token budget exceeded")
             return _ModelReply(
-                failure="token_budget_exceeded", tokens=tokens, estimated=estimated
+                failure=_FAILURE_TOKEN_BUDGET_EXCEEDED, tokens=tokens, estimated=estimated
             )
         return _ModelReply(classification=classification, tokens=tokens, estimated=estimated)
 
@@ -2629,14 +3320,6 @@ def _data_url(content_type: str, data: bytes) -> str:
     return f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _failed_delivery(code: str) -> ActionObservation:
-    return ActionObservation(
-        status=_STATUS_ERROR,
-        provenance={"source": MODULE_NAME, "route": "executor"},
-        error={"code": code, "message": "", "retryable": False},
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Activation
 # --------------------------------------------------------------------------- #
@@ -2817,6 +3500,38 @@ def _estimate_tokens(text: str) -> int:
     return _TOKEN_MESSAGE_OVERHEAD + math.ceil(len(text) / _TOKEN_CHARS)
 
 
+def _estimate_message_tokens(message: Mapping[str, Any]) -> int:
+    """A conservative token count of one transcript message.
+
+    String content is measured as text; list content part by part — a
+    ``text`` part as its text, an ``image_ref`` part as the flat
+    :data:`_TOKEN_IMAGE_ESTIMATE`; an assistant tool call as its name and
+    the arguments it echoes. Nothing in the transcript costs nothing.
+    """
+
+    content = message.get("content")
+    if isinstance(content, str):
+        tokens = _estimate_tokens(content)
+    elif isinstance(content, (list, tuple)):
+        tokens = _TOKEN_MESSAGE_OVERHEAD
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("type") == _PART_IMAGE_REF:
+                tokens += _TOKEN_IMAGE_ESTIMATE
+            else:
+                tokens += _estimate_tokens(str(part.get("text", "")))
+    else:
+        tokens = _TOKEN_MESSAGE_OVERHEAD
+    for call in message.get("tool_calls") or ():
+        function = call.get("function") if isinstance(call, Mapping) else None
+        if isinstance(function, Mapping):
+            tokens += _estimate_tokens(
+                str(function.get("name", "")) + str(function.get("arguments", ""))
+            )
+    return tokens
+
+
 def _estimate_tool_tokens(tools: Sequence[Any]) -> int:
     """A conservative token count of the offered tool definitions.
 
@@ -2893,8 +3608,11 @@ def _default_reporter(message: str) -> None:
 __all__ = [
     "CHAT_SCOPE",
     "DELIVERY_NOT_ATTEMPTED",
+    "FALLBACK_NONE",
     "MODULE_NAME",
     "PRINCIPAL",
+    "TRACE_DELIVERY_RESOLVED",
+    "TRACE_OBSERVATION",
     "WORK_KIND",
     "BrainModule",
     "BrainModuleError",

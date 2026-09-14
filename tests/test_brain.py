@@ -161,7 +161,9 @@ PERMISSION = "chat.write"
 # holds nowhere — it comes from the ``delivery`` settings group, and the
 # send edge below declares it with the delivery capability as an input
 # module's manifest does. ``CHAT_READ`` is a read action the model may be
-# offered as a tool; its provider is never reached by the single-turn body.
+# offered as a tool and propose; the agentic loop executes the proposal
+# through the executor (the loop's own guarantees live in
+# ``tests/test_agentic_loop.py``).
 CHAT_WRITE = "chat.write"
 CHAT_READ = "chat.read"
 READ_PERMISSION = "chat.read"
@@ -237,12 +239,22 @@ READ_GRANT = AuthorizationRule(
 
 
 class FakeReadProvider:
-    """A ``chat.read`` provider the single-turn body never reaches."""
+    """A ``chat.read`` provider answering every call with two chat lines."""
 
     name = "fake-read"
 
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
     async def invoke(self, invocation: Any) -> ActionObservation:
-        raise AssertionError("the single-turn body executes no proposal")
+        self.calls.append(invocation.call)
+        invocation.mark_not_emitted()
+        return ActionObservation(
+            status="success",
+            provenance={"provider": self.name},
+            result={"messages": [{"text": "one"}, {"text": "two"}]},
+            parts=[{"type": "text", "text": "one\ntwo"}],
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -324,6 +336,7 @@ def runtime_context(
     transport: FakeTransport | None = None,
     grant: bool = True,
     read: bool = False,
+    read_grant: bool | None = None,
     triggers: Any = None,
     scheduler: Any = None,
 ) -> RuntimeContext:
@@ -333,14 +346,14 @@ def runtime_context(
     module's would be, and the policy carrying the one explicit grant the
     engine's principal needs — or none, so a test can watch default deny
     refuse the delivery (R5). With ``read`` a ``chat.read`` action is
-    registered beside it (granted on the same flag) so a test can watch a
-    read action reach the tools while the delivery action never does (R1).
-    The engine builds its own real scheduler unless one is shared through
-    the context.
+    registered beside it — granted on the same flag, or as ``read_grant``
+    says when given — so a test can watch a read action reach the tools
+    while the delivery action never does (R1). The engine builds its own
+    real scheduler unless one is shared through the context.
     """
 
     rules = [BRAIN_GRANT] if grant else []
-    if read and grant:
+    if read and (grant if read_grant is None else read_grant):
         rules.append(READ_GRANT)
     policy = AuthorizationPolicy(rules)
     actions = ActionRegistry(authorization=policy)
@@ -465,6 +478,7 @@ async def activate_with(
     settings_overrides: dict[str, Any] | None = None,
     grant: bool = True,
     read: bool = False,
+    read_grant: bool | None = None,
     transport: FakeTransport | None = None,
     session: FakeSession | None = None,
     triggers: Any = None,
@@ -488,6 +502,7 @@ async def activate_with(
         transport=target_transport,
         grant=grant,
         read=read,
+        read_grant=read_grant,
         triggers=triggers,
         scheduler=scheduler,
     )
@@ -1291,8 +1306,8 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
     description and argument schema with ``tool_choice: auto`` (R2) rather
     than as prompt text. The delivery action is granted too and is never
     offered (R1, decision 1: the model never selects the delivery); which
-    read actions reach the tools per declared scope (AC6) is the agentic
-    loop's and is asserted with it.
+    read actions reach the tools per declared scope (AC6) is asserted with
+    the agentic loop, in ``tests/test_agentic_loop.py``.
     """
 
     harness = await activate_with(FakeResponse(200, completion("Hello")), read=True)
@@ -1340,15 +1355,19 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
 
 @pytest.mark.asyncio
 async def test_request_offers_no_action_without_a_grant_and_reads_the_view_afresh() -> None:
-    """R5: the offered tools are the authorized read view, read for every run.
+    """R5: the offered tools are the authorized read view, read for every turn.
 
-    With no rule the model is offered nothing — the request carries no
-    ``tools`` and no ``tool_choice`` (default deny as a surface); a read
-    grant added between two runs reaches the next request's tools, so a
-    policy change is never cached across runs, while the delivery grant
-    added with it reaches no request (R1, decision 1). The tools replace the
-    former prompt listing (R2); the per-scope view (AC6) is the agentic
-    loop's guarantee, asserted with it.
+    Replaces the allowlisted assertion that a ``chat.write`` grant reached
+    the prompt: a ``chat.write`` grant changes deliverability, never the
+    offered tools (R1/AC6). With no rule the model is offered nothing — the
+    request carries no ``tools`` and no ``tool_choice`` (default deny as a
+    surface); a read grant added between two runs reaches the next
+    request's tools, so a policy change is never cached across runs, while
+    the delivery grant added with it reaches no request (R1, decision 1).
+    The view is re-read every *turn*, not every run: within one run, a
+    ``chat.read`` grant appearing after turn 1 — whose proposal the
+    executor refused, default deny — is in turn 2's tools. The per-scope
+    view (AC6) is asserted with the loop, in ``tests/test_agentic_loop.py``.
     """
 
     harness = await activate_with(
@@ -1374,6 +1393,38 @@ async def test_request_offers_no_action_without_a_grant_and_reads_the_view_afres
         assert harness.transport.sends[-1]["text"] == "Second"
     finally:
         await harness.close()
+
+    per_turn = await activate_with(
+        FakeResponse(200, tool_call(CHAT_READ, {"limit": 2})),
+        FakeResponse(200, completion("Now I know")),
+        read=True,
+        read_grant=False,
+    )
+
+    def grant_once_refused(event: dict[str, Any]) -> None:
+        # The grant appears once turn 1's call has terminated — after the
+        # executor refused it — and before turn 2's offer is read.
+        if event["payload"]["action"] == CHAT_READ:
+            per_turn.executor._authorization.grant(READ_GRANT)
+
+    per_turn.bus.subscribe(TRACE_ACTION_COMPLETED, grant_once_refused)
+    try:
+        await per_turn.send(message_id="three")
+        (record,) = await per_turn.completed(1)
+        assert record.status == "success"
+        assert per_turn.tools(0) == []
+        assert per_turn.tools(1) == [CHAT_READ]
+        # Turn 1's proposal reached the executor and was refused there, the
+        # provider uninvoked; the grant changed the next turn's offer only.
+        refused = per_turn.executor.outcome(f"{record.run_id}/call-1")
+        assert refused.status == "refused"
+        assert refused.error["code"] == ERROR_NOT_AUTHORIZED
+        assert per_turn.executor.provider_invocations == 1  # the delivery
+        assert CHAT_WRITE not in per_turn.prompt(1)[0]["content"]
+        assert per_turn.transport.sends[-1]["text"] == "Now I know"
+        assert per_turn.transport.sends[-1]["call_id"] == f"{record.run_id}/call-2"
+    finally:
+        await per_turn.close()
 
 
 @pytest.mark.asyncio
@@ -1645,6 +1696,10 @@ async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
     A prompt that leaves the reply no room ends the run with 0 model calls;
     the request carries the room the prompt leaves as its output cap; and a
     reply whose reported usage puts the run over the bound is discarded.
+    The failure is named as R3 names every spent budget — ``failure:
+    budget_exhausted``, ``budget: max_tokens`` with the ``tokens`` and
+    ``tokens_estimated`` the run counted (AC15) — which supersedes the
+    phase-0 ``token_budget_exceeded`` failure name this test asserted.
     """
 
     harness = await activate_with(
@@ -1658,7 +1713,8 @@ async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
         assert over.delivery == DELIVERY_NOT_ATTEMPTED
         assert harness.transport.sends == []
         (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
-        assert completed["payload"]["failure"] == "token_budget_exceeded"
+        assert completed["payload"]["failure"] == "budget_exhausted"
+        assert completed["payload"]["budget"] == "max_tokens"
         assert completed["payload"]["tokens"] == 9000
         assert completed["payload"]["tokens_estimated"] is False
         request = harness.requests()[0]
@@ -1677,6 +1733,9 @@ async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
         assert record.model_calls == 0
         assert tiny.requests() == []
         assert tiny.diagnostics == ["brain run: prompt exceeds the token budget"]
+        completed = tiny.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
+        assert (completed["failure"], completed["budget"]) == ("budget_exhausted", "max_tokens")
+        assert completed["tokens"] > 8 and completed["tokens_estimated"] is True
     finally:
         await tiny.close()
 
