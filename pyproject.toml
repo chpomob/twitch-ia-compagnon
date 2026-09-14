@@ -39,6 +39,7 @@ modules = ["*/module.yaml"]
 "modules.brain" = ["module.yaml"]
 "modules.audit" = ["module.yaml"]
 "modules.chat_context" = ["module.yaml"]
+"modules.users" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

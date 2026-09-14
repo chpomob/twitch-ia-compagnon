@@ -1,0 +1,213 @@
+# Bounded directory of observed chat authors — manifest v2 (R5, R7).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no grant lives here. Declaring
+# `users.read` records the action in the loader's *discovered* view; only an
+# explicit authorization rule ever offers it (R5, AC30). The action is a
+# `read` on the chat scope of any platform and any channel: the directory it
+# pages through is built from the normalised `channel.chat.message` events of
+# every input, keyed by `(platform, channel_id)`, so no platform name appears
+# in this module.
+
+name: users
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# The directory is fed by the one normalised chat event every input publishes
+# (R5). The module publishes nothing: a read is served on demand through the
+# executor, never as an event.
+produces: []
+consumes:
+  - channel.chat.message
+middleware: false
+
+# No lifecycle role: the handle takes part in `prepare` (subscribe to the chat
+# event, bind the provider, mark ready) and in `close` (withdraw readiness)
+# and in nothing else (R4). The subscription is passive: the handler is
+# synchronous, never awaits and never alters the event.
+lifecycle:
+  roles: []
+
+# The three bounds of the directory this module owns (R5, R6). All three are
+# required — a deployment never relies on a default — finite and positive;
+# the declared hook checks them, one diagnostic per field, value-free. The
+# reserved `limits` block the entry point hands every enabled module is
+# accepted and not read: this module owns its own bounds.
+settings_schema:
+  type: object
+  properties:
+    max_channels:
+      type: integer
+      minimum: 1
+      description: >-
+        How many `(platform, channel_id)` directories are retained; beyond
+        it the least recently updated channel is dropped whole.
+    max_users_per_channel:
+      type: integer
+      minimum: 1
+      description: >-
+        How many authors one channel retains; beyond it the author with the
+        oldest `last_seen` is evicted and counted in `coverage.evicted`.
+    max_age_seconds:
+      type: number
+      description: >-
+        How long an author stays listed after its last message; an older
+        author is dropped at read. Reported as `freshness.window_seconds`.
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point to every
+        enabled module. Not read here: this module owns its own bounds.
+  required:
+    - max_channels
+    - max_users_per_channel
+    - max_age_seconds
+  additionalProperties: false
+settings_validator: validate_settings
+
+# Nothing here is a credential.
+credentials: []
+
+# The `users.read` contract (R5). `limit` is the page size; `cursor` is the
+# opaque token the previous page handed back, valid for the same destination
+# only. The result is one page of the authors observed on the destination's
+# channel, most recently seen first, with the freshness and the coverage the
+# caller needs: the directory lists who *spoke*, never the whole audience, so
+# `coverage.complete` is always `false`. A `read` carries no delivery
+# capability.
+actions:
+  - name: users.read
+    version: 1
+    description: >-
+      Read one page of the chat authors observed on the destination's
+      channel, most recently seen first, with the freshness and coverage of
+      the bounded directory. The page is never the whole audience.
+    argument_schema:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: How many authors to return in this page.
+        cursor:
+          type: string
+          description: >-
+            The `page.next_cursor` of the previous page on the same
+            destination; omit it for the first page.
+      required:
+        - limit
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        users:
+          type: array
+          description: The returned authors, most recently seen first.
+          items:
+            type: object
+            properties:
+              user_id:
+                type: string
+              display_name:
+                type: string
+                description: >-
+                  The display name the last event carried, or the identifier
+                  when the platform carried none.
+              roles:
+                type: array
+                description: >-
+                  The roles the platform attested for this author; present
+                  only with `roles_provenance`, never empty in its place.
+                items:
+                  type: string
+              roles_provenance:
+                type: string
+                description: Which platform attestation the roles come from.
+              first_seen:
+                type: number
+                description: When the author was first observed, on the runtime clock.
+              last_seen:
+                type: number
+                description: When the author was last observed, on the runtime clock.
+            required:
+              - user_id
+              - display_name
+              - first_seen
+              - last_seen
+            additionalProperties: false
+        page:
+          type: object
+          properties:
+            returned:
+              type: integer
+              description: Authors in this page.
+            has_more:
+              type: boolean
+              description: Whether an author later in the order was retained at read.
+            next_cursor:
+              description: >-
+                The opaque cursor of the next page — a string when
+                `has_more`, `null` otherwise. Valid for this destination only.
+          required:
+            - returned
+            - has_more
+            - next_cursor
+          additionalProperties: false
+        freshness:
+          type: object
+          properties:
+            observed_at:
+              type: number
+              description: When this page was read, on the runtime clock.
+            window_seconds:
+              type: number
+              description: How long an author stays listed after its last message.
+          required:
+            - observed_at
+            - window_seconds
+          additionalProperties: false
+        coverage:
+          type: object
+          properties:
+            kind:
+              type: string
+              enum:
+                - observed_authors
+              description: What the directory lists — the authors who spoke, not the audience.
+            complete:
+              type: boolean
+              enum:
+                - false
+              description: Always false — an observed-author list is never the whole audience.
+            retained_users:
+              type: integer
+              description: Authors the channel's directory retained at read, inside the window.
+            evicted:
+              type: integer
+              description: Authors this channel evicted at its count bound since it was first observed.
+          required:
+            - kind
+            - complete
+            - retained_users
+            - evicted
+          additionalProperties: false
+      required:
+        - users
+        - page
+        - freshness
+        - coverage
+      additionalProperties: false
+    nature: read
+    required_permissions:
+      - users.read
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: chat
+    # An in-memory read; the budget only bounds a starved event loop.
+    timeout_seconds: 5
+    # Reading has no external effect: repeating a call is always safe.
+    idempotency: natural
