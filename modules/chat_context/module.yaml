@@ -1,0 +1,138 @@
+# Bounded chat-transcript reader — manifest v2 (R5, R7).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no limit value and no grant lives here.
+# Declaring `chat.read` records the action in the loader's *discovered* view;
+# only an explicit authorization rule ever offers it (R5, AC30). The action is
+# a `read` on the chat scope of any platform and any channel: the transcript
+# it pages through is the core's own, keyed by `(platform, channel_id)`, so
+# no platform name appears in this module.
+
+name: chat_context
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# The module produces and consumes no event: the transcript is fed by the
+# ingestion path of every input, before trigger evaluation (AC11), and read
+# here on demand through the runtime context.
+produces: []
+consumes: []
+middleware: false
+
+# No lifecycle role: the handle takes part in `prepare` (bind the provider,
+# mark ready) and in `close` (withdraw readiness) and in nothing else (R4).
+lifecycle:
+  roles: []
+
+# This module has no business setting of its own (R7). The only key it
+# accepts is the reserved `limits` block the entry point hands every enabled
+# module: the `chat_context` group of it is the retention the transcript was
+# built with, and the coverage this action reports is stated in those terms
+# (plan decision 4). The declared hook requires that group and checks its
+# values are finite and positive, one diagnostic per field, value-free.
+settings_schema:
+  type: object
+  properties:
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point. The
+        `chat_context` group is required: `max_messages` bounds the retained
+        count `coverage.retained` is read against, `max_age_seconds` is the
+        window `coverage.window_seconds` reports.
+  additionalProperties: false
+settings_validator: validate_settings
+
+# Nothing here is a credential.
+credentials: []
+
+# The `chat.read` contract (R5). `limit` is the page size the caller asks for;
+# the result is the newest `limit` retained messages of the destination's
+# channel, oldest first, with the retention coverage the caller needs to know
+# whether it saw everything. A `read` carries no delivery capability.
+actions:
+  - name: chat.read
+    version: 1
+    description: >-
+      Read the newest retained chat messages of the destination's channel,
+      oldest first, with the coverage of the retained transcript.
+    argument_schema:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: How many of the newest retained messages to return.
+      required:
+        - limit
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        messages:
+          type: array
+          description: The returned messages, oldest first.
+          items:
+            type: object
+            properties:
+              author_id:
+                type: string
+              message_id:
+                type: string
+              text:
+                type: string
+              observed_at:
+                type: number
+                description: When the transcript recorded the message, on the runtime clock.
+            required:
+              - author_id
+              - message_id
+              - text
+              - observed_at
+            additionalProperties: false
+        observed_at:
+          type: number
+          description: When this page was read, on the runtime clock.
+        coverage:
+          type: object
+          properties:
+            returned:
+              type: integer
+              description: Messages in this page.
+            retained:
+              type: integer
+              description: Messages the transcript retained for the channel at read.
+            window_seconds:
+              type: number
+              description: The retention age bound the transcript applies.
+            complete:
+              type: boolean
+              description: >-
+                True only when every retained message was returned and the
+                retention count bound was not reached, so nothing older can
+                have been evicted unseen.
+          required:
+            - returned
+            - retained
+            - window_seconds
+            - complete
+          additionalProperties: false
+      required:
+        - messages
+        - observed_at
+        - coverage
+      additionalProperties: false
+    nature: read
+    required_permissions:
+      - chat.read
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: chat
+    # An in-memory read; the budget only bounds a starved event loop.
+    timeout_seconds: 5
+    # Reading has no external effect: repeating a call is always safe.
+    idempotency: natural
