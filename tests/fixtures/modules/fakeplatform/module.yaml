@@ -1,0 +1,202 @@
+# Fictional second chat platform — test fixture, manifest v2 (R5, R1; AC31).
+#
+# The same declarations the shipped twitch manifest makes, on platform `fake`:
+# an `input` producing normalised chat events, a `chat.write` provider with
+# the delivery capability, and a keyword trigger on the companion name. It
+# obeys every rule a shipped module obeys — the loader discovers it as an
+# immediate child directory, validates this manifest and activates it through
+# the runtime context — so the scenario that runs on twitch runs here with
+# `core/` and the brain unchanged. Declaring `chat.write` authorizes nothing:
+# only an explicit rule grants it (R5).
+
+name: fakeplatform
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+produces:
+  - channel.chat.message
+consumes:
+  - channel.chat.send
+middleware: false
+
+# An `input`: `prepare`, held at the readiness barrier, then `start_inputs`,
+# `stop_inputs` and `close` (R4).
+lifecycle:
+  roles:
+    - input
+
+# Business settings (R7). No credential: the platform is in-process. The
+# declared hook checks what the schema cannot — non-empty unique channels, a
+# feed whose messages name configured channels, an author whose roles carry
+# a provenance — and reports one diagnostic per field, value-free.
+settings_schema:
+  type: object
+  properties:
+    channel_ids:
+      type: array
+      items:
+        type: string
+      description: >-
+        The channels this platform serves: `chat.write` is bound over each,
+        and a fed message must name one of them.
+    companion_name:
+      type: string
+      description: >-
+        The name viewers use to address the companion; the default trigger
+        policy refers to it by token only.
+    feed:
+      type: object
+      description: >-
+        Scripted messages driven into the runtime without a network input
+        (plan decision 6): published at `start_inputs` when `after_event` is
+        null, otherwise on every occurrence of that bus event type. A replay
+        (the second occurrence onwards) suffixes each message identifier with
+        `#<occurrence>`, so the trigger engine's dedup window does not swallow
+        it.
+      properties:
+        messages:
+          type: array
+          items:
+            type: object
+            properties:
+              channel_id:
+                type: string
+              author:
+                description: >-
+                  The viewer identifier, or an object `{id, display_name?,
+                  roles?, roles_provenance?}`; roles are published on the
+                  event and offered to the trigger engine as provenance-tagged
+                  claims only together with `roles_provenance`.
+              message_id:
+                type: string
+              text:
+                type: string
+            required:
+              - channel_id
+              - author
+              - message_id
+              - text
+            additionalProperties: false
+        after_event:
+          description: >-
+            A bus event type (null to publish at `start_inputs`); never the
+            event this module produces itself.
+      required:
+        - messages
+      additionalProperties: false
+  required:
+    - channel_ids
+    - companion_name
+settings_validator: validate_settings
+
+# Nothing here is a credential.
+credentials: []
+
+# The same trigger vocabulary as twitch (R1): the default policy is the
+# keyword mention of the configured companion name, resolved by token.
+triggers:
+  types:
+    - name: probability
+      parameter_schema:
+        type: object
+        properties:
+          probability:
+            type: number
+            minimum: 0
+            maximum: 1
+        required:
+          - probability
+        additionalProperties: false
+    - name: audience
+      parameter_schema:
+        type: object
+        properties:
+          audience:
+            type: string
+            enum:
+              - broadcaster
+              - everyone
+              - moderators
+              - subscribers
+              - vips
+        required:
+          - audience
+        additionalProperties: false
+    - name: keyword
+      parameter_schema:
+        type: object
+        properties:
+          keywords:
+            type: array
+            items:
+              type: string
+        required:
+          - keywords
+        additionalProperties: false
+  combinations:
+    - all_of
+    - any_of
+    - none_of
+  default_policy:
+    combination: all_of
+    rules:
+      - type: keyword
+        parameters:
+          keywords:
+            - "${companion_name}"
+
+# The `chat.write` contract, identical to twitch's except for the platform of
+# its destinations (R5). Two declarations coexist only because their
+# destinations do not overlap; the two modules are never enabled together.
+actions:
+  - name: chat.write
+    version: 1
+    description: Send one chat message to a channel, optionally as a reply.
+    argument_schema:
+      type: object
+      properties:
+        text:
+          type: string
+          description: Message body; must not be blank.
+        parent_message_id:
+          type: string
+          description: Identifier of the message being replied to, when any.
+      required:
+        - text
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        message_id:
+          type: string
+          description: Identifier the platform assigned to the delivered message.
+        destination:
+          type: object
+          properties:
+            platform:
+              type: string
+            channel_id:
+              type: string
+          required:
+            - platform
+            - channel_id
+          additionalProperties: false
+      required:
+        - message_id
+        - destination
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - chat.write
+    supported_destinations:
+      - platform: fake
+        channel_id: "*"
+        scope: chat
+    timeout_seconds: 10
+    idempotency: none
+    # Delivery capability (R1 decision 1): the answer text arrives under
+    # `text`. The model is never offered it; configuration selects it.
+    delivery:
+      text_argument: text

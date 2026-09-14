@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
-from conftest import ManualClock, settle, wait_until
+from conftest import (
+    ManualClock,
+    RecordingScheduler,
+    events_of,
+    runtime_context as build_context,
+    settle,
+    wait_until,
+)
 
 from core.actions import ActionRegistry, AuthorizationPolicy, AuthorizationRule
 from core.bus import EventBus
-from core.contracts import ContractError, TriggerPolicy, TriggerRule
-from core.lifecycle import SupervisedTasks, module_roles
+from core.context import ChatContext
+from core.contracts import (
+    ActionCall,
+    ContractError,
+    Destination,
+    SessionKey,
+    TriggerPolicy,
+    TriggerRule,
+)
+from core.lifecycle import PhaseCoordinator, SupervisedTasks, module_roles
 from core.loader import ModuleLoadError, ModuleLoader
 from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext, Supervision
 from core.triggers import TriggerEngine, TriggerRegistry
@@ -2678,3 +2695,720 @@ async def test_an_invalid_configured_trigger_policy_stops_startup(
             }
         )
     assert loader.activations == []
+
+
+# --------------------------------------------------------------------------- #
+# Fixture modules: `fakeplatform` and `fakeeffects` (R5, R1 — AC31, AC50–AC57
+# support). Loaded from `tests/fixtures/modules` by the same loader, under the
+# same rules, as the shipped modules.
+# --------------------------------------------------------------------------- #
+
+FIXTURE_MODULES = Path(__file__).parent / "fixtures" / "modules"
+SHIPPED_MODULES = Path(__file__).parents[1] / "modules"
+
+FAKE_SETTINGS = {
+    "channel_ids": ["chan-a", "chan-b"],
+    "companion_name": "companion",
+}
+
+
+def fixture_context(**overrides: object) -> RuntimeContext:
+    """The shared assembly (real executor, real supervision) the fixtures run on.
+
+    A trigger registry so the loader can register the fake platform's
+    declaration, a chat context to feed and a recording scheduler to admit to.
+    """
+
+    clock = overrides.pop("clock", None) or ManualClock()
+    options: dict = {
+        "clock": clock,
+        "trigger_registry": TriggerRegistry(companion_name="companion"),
+        "chat": ChatContext(
+            max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=clock
+        ),
+        "scheduler": RecordingScheduler(),
+    }
+    options.update(overrides)
+    return build_context(**options)
+
+
+async def load_fixtures(
+    context: RuntimeContext,
+    *,
+    enabled: list[str],
+    settings: dict[str, dict] | None = None,
+) -> dict[str, object]:
+    """Activate *enabled* fixture modules and run their `prepare`; handles by name."""
+
+    loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    configured = {"fakeplatform": dict(FAKE_SETTINGS), "fakeeffects": {}}
+    if settings:
+        for name, value in settings.items():
+            configured[name] = value
+    activations = await loader.activate_enabled(
+        {"enabled_modules": enabled, "modules": {name: configured[name] for name in enabled}}
+    )
+    handles = {activation.name: activation.handle for activation in activations}
+    for activation in activations:
+        await activation.handle.prepare()
+    return handles
+
+
+def fixture_call(
+    action: str,
+    arguments: dict,
+    *,
+    scope: str,
+    channel: str = "chan-a",
+    call_id: str,
+    principal: str = "brain",
+    version: int = 1,
+) -> ActionCall:
+    return ActionCall(
+        action_name=action,
+        action_version=version,
+        arguments=arguments,
+        conversation_id="conv-1",
+        run_id="run-1",
+        call_id=call_id,
+        source_event_id="evt-1",
+        destination=Destination("fake", channel, scope),
+        principal=principal,
+        deadline=2000.0,
+    )
+
+
+def grant(context: RuntimeContext, action: str, *permissions: str) -> None:
+    context.executor._authorization.grant(
+        AuthorizationRule(
+            rule_id=f"grant-{action}",
+            action_name=action,
+            principals=("brain",),
+            granted_permissions=tuple(permissions) or (action,),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixture_modules_directory_discovers_exactly_the_two_fixtures() -> None:
+    """R5/R1: `tests/fixtures/modules` holds two v2 manifests and nothing else.
+
+    Discovery validates both — enabled or not — under the shipped rules
+    (immediate child directories, no symlink), with 0 modules activated.
+    """
+
+    context = fixture_context()
+    loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+
+    activations = await loader.activate_enabled({"enabled_modules": [], "modules": {}})
+
+    assert activations == []
+    assert set(loader.discovered) == {"fakeplatform", "fakeeffects"}
+    platform = loader.discovered["fakeplatform"].declaration
+    effects = loader.discovered["fakeeffects"].declaration
+    assert platform is not None and effects is not None
+    assert platform.manifest_version == 2 and effects.manifest_version == 2
+    assert platform.roles == frozenset({"input"})
+    assert effects.roles == frozenset()
+    assert platform.manifest["produces"] == ["channel.chat.message"]
+    assert platform.manifest["consumes"] == ["channel.chat.send"]
+    assert platform.credentials == ()
+    assert platform.triggers is not None
+    assert platform.triggers.default_policy.rules[0].parameters["keywords"] == (
+        "${companion_name}",
+    )
+    assert effects.credentials == ()
+    assert effects.triggers is None
+
+
+@pytest.mark.asyncio
+async def test_fakeplatform_chat_write_equals_twitch_except_for_the_platform() -> None:
+    """R5: the second platform serves the very same `chat.write` contract.
+
+    Field for field the spec is twitch's; only the destination platform
+    differs (`fake`), and the delivery mapping is `text` on both (AC58).
+    """
+
+    context = fixture_context()
+    shipped = ModuleLoader(context.bus, SHIPPED_MODULES, context=context, environ={})
+    fixtures = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    await shipped.activate_enabled({"enabled_modules": [], "modules": {}})
+    await fixtures.activate_enabled({"enabled_modules": [], "modules": {}})
+
+    twitch = {s.name: s for s in shipped.discovered["twitch"].declaration.actions}
+    fake = {s.name: s for s in fixtures.discovered["fakeplatform"].declaration.actions}
+    assert set(fake) == {"chat.write"}
+    fake_spec, twitch_spec = fake["chat.write"], twitch["chat.write"]
+
+    assert fake_spec != twitch_spec
+    assert fake_spec.supported_destinations == (Destination("fake", "*", "chat"),)
+    assert twitch_spec.supported_destinations == (Destination("twitch", "*", "chat"),)
+    assert (
+        dataclasses.replace(
+            fake_spec, supported_destinations=twitch_spec.supported_destinations
+        )
+        == twitch_spec
+    )
+    assert fake_spec.delivery == {"text_argument": "text"}
+    assert fake_spec.delivery_text_argument == "text"
+
+
+@pytest.mark.asyncio
+async def test_fakeeffects_declares_three_write_actions_two_with_delivery() -> None:
+    """R1 decision 1: two delivery capabilities (text and effect-only), one none."""
+
+    context = fixture_context()
+    loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    await loader.activate_enabled({"enabled_modules": [], "modules": {}})
+
+    specs = loader.discovered["fakeeffects"].declaration.actions
+    assert [spec.name for spec in specs] == ["audio.say", "stream.set_scene", "overlay.raw"]
+    assert {spec.nature for spec in specs} == {"write"}
+    by_name = {spec.name: spec for spec in specs}
+    assert by_name["audio.say"].delivery == {"text_argument": "text"}
+    assert by_name["audio.say"].delivery_text_argument == "text"
+    assert by_name["stream.set_scene"].delivery == {"text_argument": "none"}
+    assert by_name["stream.set_scene"].delivery_text_argument is None
+    assert by_name["overlay.raw"].delivery is None
+    assert by_name["audio.say"].supported_destinations == (Destination("*", "*", "audio"),)
+    assert by_name["stream.set_scene"].supported_destinations == (
+        Destination("*", "*", "stream"),
+    )
+    assert by_name["overlay.raw"].supported_destinations == (
+        Destination("*", "*", "overlay"),
+    )
+    # The scene entry takes no text: `text` is not an argument it accepts,
+    # which is what keeps the answer text out of an effect-only delivery.
+    assert by_name["stream.set_scene"].argument_schema["additionalProperties"] is False
+    assert "text" not in by_name["stream.set_scene"].argument_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_activating_the_fixtures_binds_their_declared_providers() -> None:
+    """R5/R4: activated on the runtime context, each fixture binds at `prepare`.
+
+    Both are driven by the coordinator through the declared phases, exactly
+    as the entry point would: nothing is bound at activation, every declared
+    provider is bound and ready after the barrier, and `close` withdraws
+    readiness. The two `chat.write` bindings the fake platform makes cover
+    its configured channels only; the three effect providers cover the
+    wildcard destinations their declarations name.
+    """
+
+    context = fixture_context()
+    diagnostics: list[str] = []
+    loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    activations = await loader.activate_enabled(
+        {
+            "enabled_modules": ["fakeplatform", "fakeeffects"],
+            "modules": {
+                "fakeplatform": {**FAKE_SETTINGS, "diagnostic_reporter": diagnostics.append},
+                "fakeeffects": {},
+            },
+        }
+    )
+
+    assert [a.name for a in activations] == ["fakeplatform", "fakeeffects"]
+    assert set(context.actions.discovered()) == {
+        "chat.write", "audio.say", "stream.set_scene", "overlay.raw"
+    }
+    assert context.actions.bindings() == ()
+    assert context.triggers.registry.spec("fakeplatform") is not None
+
+    coordinator = PhaseCoordinator(
+        activations, tasks=context.tasks, reporter=diagnostics.append
+    )
+    assert (await coordinator.start()).status == 0
+
+    chat_bindings = context.actions.bindings("chat.write")
+    assert [b.destination for b in chat_bindings] == [
+        Destination("fake", "chan-a", "chat"), Destination("fake", "chan-b", "chat")
+    ]
+    assert {b.module for b in chat_bindings} == {"fakeplatform"}
+    assert chat_bindings[0].spec == context.actions.discovered()["chat.write"]
+    for action, scope in (
+        ("audio.say", "audio"), ("stream.set_scene", "stream"), ("overlay.raw", "overlay")
+    ):
+        (binding,) = context.actions.bindings(action)
+        assert binding.module == "fakeeffects"
+        assert binding.destination == Destination("*", "*", scope)
+        assert binding.spec == context.actions.discovered()[action]
+    assert set(context.actions.registered_ready()) == {
+        "chat.write", "audio.say", "stream.set_scene", "overlay.raw"
+    }
+    # Declaring and binding authorized nothing (R5): the brain's view is empty.
+    assert context.actions.authorized(principal="brain") == {}
+
+    assert (await coordinator.stop()).status == 0
+    assert diagnostics == []
+    assert context.actions.registered_ready() == {}
+    assert context.tasks.active == 0
+
+
+@pytest.mark.asyncio
+async def test_fakeplatform_inject_publishes_one_normalised_fake_event() -> None:
+    """AC31 support: `inject` drives one message through the platform's reception.
+
+    Exactly one `channel.chat.message` with `platform == "fake"` and
+    `metadata.schema_version == 2` reaches the bus, sourced from the input
+    the trigger registry knows; the chat context is fed, the trigger decides
+    on the companion mention and the accepted event is admitted under the
+    fake session key. Roles fed with a provenance are published on the event
+    and offered as trusted claims (plan decision 5); a redelivery inside the
+    dedup window publishes nothing.
+    """
+
+    context = fixture_context()
+    handles = await load_fixtures(context, enabled=["fakeplatform"])
+    platform = handles["fakeplatform"]
+
+    published = await platform.inject(
+        {
+            "channel_id": "chan-a",
+            "author": {
+                "id": "viewer-1",
+                "display_name": "Viewer",
+                "roles": ["moderator"],
+                "roles_provenance": "fake.roles",
+            },
+            "message_id": "m-1",
+            "text": "companion, what is on screen?",
+        }
+    )
+
+    events = events_of(context.bus, "channel.chat.message")
+    assert len(events) == 1
+    (event,) = events
+    assert published == event
+    assert event["payload"] == {
+        "platform": "fake",
+        "channel_id": "chan-a",
+        "author": {
+            "id": "viewer-1",
+            "display_name": "Viewer",
+            "roles": ["moderator"],
+            "roles_provenance": "fake.roles",
+        },
+        "message_id": "m-1",
+        "text": "companion, what is on screen?",
+    }
+    assert event["metadata"] == {"source": "fakeplatform", "schema_version": 2}
+    assert [r.message_id for r in context.chat.read("fake", "chan-a", limit=5)] == ["m-1"]
+    (accepted,) = events_of(context.bus, "input.trigger.accepted")
+    assert accepted["payload"]["input"] == "fakeplatform"
+    assert accepted["payload"]["platform"] == "fake"
+    assert accepted["payload"]["source_event_id"] == "m-1"
+    ((session_key, work),) = context.scheduler.admissions
+    assert session_key == SessionKey("fake", "chan-a", "viewer-1")
+    assert work.source_event_id == "m-1"
+    assert work.payload["payload"]["author"]["roles"] == ("moderator",)
+
+    # Roles without a provenance are neither published nor trusted, and a
+    # message with no companion mention is a traced rejection, not admitted.
+    await platform.inject(
+        {
+            "channel_id": "chan-b",
+            "author": "viewer-2",
+            "message_id": "m-2",
+            "text": "hello everyone",
+        }
+    )
+    second = events_of(context.bus, "channel.chat.message")[1]
+    assert second["payload"]["author"] == {"id": "viewer-2"}
+    assert len(events_of(context.bus, "input.trigger.rejected")) == 1
+    assert len(context.scheduler.admissions) == 1
+
+    # Redelivery inside the dedup window: nothing is repeated (R6).
+    assert await platform.inject(
+        {"channel_id": "chan-a", "author": "viewer-1", "message_id": "m-1", "text": "companion"}
+    ) is None
+    assert len(events_of(context.bus, "channel.chat.message")) == 2
+    assert len(context.scheduler.admissions) == 1
+    assert len(platform.injected) == 2
+
+
+@pytest.mark.asyncio
+async def test_scripted_feed_publishes_at_start_inputs_when_no_after_event() -> None:
+    """Plan decision 6: with `after_event: null` the feed goes out at `start_inputs`.
+
+    Nothing is published before the barrier; every fed message is published
+    once, in order, through the same reception as an injected one.
+    """
+
+    context = fixture_context()
+    settings = {
+        **FAKE_SETTINGS,
+        "feed": {
+            "messages": [
+                {"channel_id": "chan-a", "author": "v1", "message_id": "f-1", "text": "companion hi"},
+                {"channel_id": "chan-b", "author": "v2", "message_id": "f-2", "text": "no mention"},
+            ],
+            "after_event": None,
+        },
+    }
+    handles = await load_fixtures(
+        context, enabled=["fakeplatform"], settings={"fakeplatform": settings}
+    )
+    platform = handles["fakeplatform"]
+    assert events_of(context.bus, "channel.chat.message") == []
+
+    await platform.start_inputs()
+
+    events = events_of(context.bus, "channel.chat.message")
+    assert [e["payload"]["message_id"] for e in events] == ["f-1", "f-2"]
+    assert {e["payload"]["platform"] for e in events} == {"fake"}
+    assert platform.feed_occurrences == 1
+    assert [key.viewer_id for key, _ in context.scheduler.admissions] == ["v1"]
+    # Idempotent: a second `start_inputs` does not replay the feed.
+    await platform.start_inputs()
+    assert len(events_of(context.bus, "channel.chat.message")) == 2
+    await platform.stop_inputs()
+    await platform.close()
+    assert context.tasks.active == 0
+
+
+@pytest.mark.asyncio
+async def test_scripted_feed_publishes_again_on_every_after_event() -> None:
+    """Plan decision 6: with `after_event` the feed follows every occurrence.
+
+    Nothing goes out at `start_inputs`; each publication of the configured
+    event type publishes the feed once more — replays carry a suffixed
+    message id so the dedup window does not swallow them — and an occurrence
+    after `stop_inputs` publishes nothing.
+    """
+
+    context = fixture_context()
+    settings = {
+        **FAKE_SETTINGS,
+        "feed": {
+            "messages": [
+                {"channel_id": "chan-a", "author": "v1", "message_id": "f-1", "text": "companion?"}
+            ],
+            "after_event": "agent.status",
+        },
+    }
+    handles = await load_fixtures(
+        context, enabled=["fakeplatform"], settings={"fakeplatform": settings}
+    )
+    platform = handles["fakeplatform"]
+    await platform.start_inputs()
+    assert events_of(context.bus, "channel.chat.message") == []
+
+    await context.bus.publish("agent.status", {"paired": True}, {"source": "test"})
+    await wait_until(lambda: len(events_of(context.bus, "channel.chat.message")) == 1)
+    await context.bus.publish("agent.status", {"paired": True}, {"source": "test"})
+    await wait_until(lambda: len(events_of(context.bus, "channel.chat.message")) == 2)
+
+    events = events_of(context.bus, "channel.chat.message")
+    assert [e["payload"]["message_id"] for e in events] == ["f-1", "f-1#2"]
+    assert platform.feed_occurrences == 2
+    assert len(context.scheduler.admissions) == 2
+    # An unrelated event type does not feed.
+    await context.bus.publish("agent.other", {}, {"source": "test"})
+    await settle()
+    assert len(events_of(context.bus, "channel.chat.message")) == 2
+
+    await platform.stop_inputs()
+    await context.bus.publish("agent.status", {"paired": True}, {"source": "test"})
+    await settle()
+    assert len(events_of(context.bus, "channel.chat.message")) == 2
+    await platform.close()
+    assert context.tasks.active == 0
+
+
+@pytest.mark.asyncio
+async def test_fake_chat_write_follows_its_scripted_outcomes_through_the_executor() -> None:
+    """AC54/AC57 support: the fake `chat.write` reports what the script says.
+
+    Through the real executor and a `chat.write` grant: `FAIL_BEFORE_EMISSION`
+    is an `error` with nothing sent, `FAIL_AFTER_EMISSION` an
+    `external_unknown` with nothing confirmed, and the default a `success`
+    whose result matches the declared schema and whose send is recorded with
+    the call's correlation. The transport is the module-level registry's
+    object for that channel, reachable from the handle; a call on a channel
+    the platform does not serve reaches no provider.
+    """
+
+    context = fixture_context()
+    handles = await load_fixtures(context, enabled=["fakeplatform"])
+    platform = handles["fakeplatform"]
+    grant(context, "chat.write")
+    transport = platform.transport("chan-a")
+    module = sys.modules[type(platform).__module__]
+    assert module.TRANSPORTS["chan-a"] is transport
+    assert platform.transports["chan-b"] is module.TRANSPORTS["chan-b"]
+    transport.script(module.FAIL_BEFORE_EMISSION, module.FAIL_AFTER_EMISSION)
+
+    def send(call_id: str, channel: str = "chan-a") -> Any:
+        return context.executor.invoke(
+            fixture_call(
+                "chat.write", {"text": "answer"}, scope="chat", channel=channel, call_id=call_id
+            )
+        )
+
+    before = await send("call-1")
+    assert (before.status, before.error["code"]) == ("error", "provider_failed")
+    after = await send("call-2")
+    assert (after.status, after.error["code"]) == ("external_unknown", "external_effect_unknown")
+    assert transport.sends == []
+    assert transport.attempts == 2
+
+    sent = await send("call-3")
+    assert sent.status == "success"
+    assert sent.result == {
+        "message_id": "fake-chan-a-1",
+        "destination": {"platform": "fake", "channel_id": "chan-a"},
+    }
+    (record,) = transport.sends
+    assert record["text"] == "answer"
+    assert record["call_id"] == "call-3"
+    assert record["run_id"] == "run-1"
+    assert record["principal"] == "brain"
+    assert record["destination"] == Destination("fake", "chan-a", "chat")
+    assert platform.sends == [record]
+    assert platform.transport("chan-b").sends == []
+
+    unserved = await send("call-4", channel="chan-z")
+    assert (unserved.status, unserved.error["code"]) == ("error", "no_provider")
+    assert context.executor.provider_invocations == 3
+
+
+@pytest.mark.asyncio
+async def test_fake_chat_write_transport_seam_replaces_the_registry_entry() -> None:
+    """The `transport` setting is the send edge for every configured channel."""
+
+    context = fixture_context()
+    loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    await loader.activate_enabled({"enabled_modules": [], "modules": {}})
+    # A transport built by the test, before the module is imported.
+    entry = loader._load_entry_point(loader.discovered["fakeplatform"])
+    module = sys.modules[entry.activate.__module__]
+    shared = module.FakeChatTransport()
+
+    handles = await load_fixtures(
+        context,
+        enabled=["fakeplatform"],
+        settings={"fakeplatform": {**FAKE_SETTINGS, "transport": shared}},
+    )
+    platform = handles["fakeplatform"]
+    grant(context, "chat.write")
+    assert platform.transport("chan-a") is shared
+    assert platform.transport("chan-b") is shared
+
+    for channel in ("chan-a", "chan-b"):
+        observation = await context.executor.invoke(
+            fixture_call(
+                "chat.write", {"text": "t"}, scope="chat", channel=channel, call_id=f"c-{channel}"
+            )
+        )
+        assert observation.status == "success"
+    assert [s["destination"].channel_id for s in shared.sends] == ["chan-a", "chan-b"]
+    # The handle's log sees each send once, in send order, even though both
+    # channels resolve to the same transport.
+    assert [s["destination"].channel_id for s in platform.sends] == ["chan-a", "chan-b"]
+
+
+@pytest.mark.asyncio
+async def test_fake_platform_sends_preserve_cross_channel_order() -> None:
+    """`platform.sends` is one ordered log, not a per-channel gather."""
+
+    context = fixture_context()
+    handles = await load_fixtures(context, enabled=["fakeplatform"])
+    platform = handles["fakeplatform"]
+    grant(context, "chat.write")
+
+    for index, channel in enumerate(("chan-b", "chan-a", "chan-b")):
+        observation = await context.executor.invoke(
+            fixture_call(
+                "chat.write", {"text": str(index)}, scope="chat", channel=channel, call_id=f"c-{index}"
+            )
+        )
+        assert observation.status == "success"
+    assert [(s["destination"].channel_id, s["text"]) for s in platform.sends] == [
+        ("chan-b", "0"),
+        ("chan-a", "1"),
+        ("chan-b", "2"),
+    ]
+    assert [s["text"] for s in platform.transport("chan-b").sends] == ["0", "2"]
+
+
+@pytest.mark.asyncio
+async def test_fake_effects_record_calls_and_follow_their_scripts_through_the_executor() -> None:
+    """AC50/AC54 support: every effect provider records and obeys its script.
+
+    Through the real executor with grants for two of the three actions:
+    `audio.say` records the exact arguments; `stream.set_scene` scripted to
+    raise is an `error` (`provider_failed`), scripted `refused`/`error`
+    returns those statuses, scripted `FAIL_AFTER_EMISSION` is
+    `external_unknown`, and unscripted it succeeds with the declared result.
+    `overlay.raw`, ungranted, is refused by the executor with its provider
+    invoked 0 times (default-deny, reads and writes alike).
+    """
+
+    context = fixture_context()
+    handles = await load_fixtures(context, enabled=["fakeeffects"])
+    effects = handles["fakeeffects"]
+    module = sys.modules[type(effects).__module__]
+    assert effects.scripts is module.SCRIPTS
+    grant(context, "audio.say")
+    grant(context, "stream.set_scene")
+
+    async def invoke(action: str, arguments: dict, scope: str, call_id: str) -> Any:
+        return await context.executor.invoke(
+            fixture_call(action, arguments, scope=scope, call_id=call_id)
+        )
+
+    said = await invoke("audio.say", {"text": "answer"}, "audio", "c-1")
+    assert said.status == "success"
+    assert said.result == {"utterance_id": "utterance-1"}
+    assert effects.calls["audio.say"] == [
+        {
+            "action": "audio.say",
+            "arguments": {"text": "answer"},
+            "call_id": "c-1",
+            "run_id": "run-1",
+            "destination": Destination("fake", "chan-a", "audio"),
+            "principal": "brain",
+        }
+    ]
+
+    module.script(
+        "stream.set_scene", module.RAISE, module.REFUSED, module.ERROR, module.FAIL_AFTER_EMISSION
+    )
+    scene = {"scene": "answering"}
+    raised = await invoke("stream.set_scene", scene, "stream", "c-2")
+    assert (raised.status, raised.error["code"]) == ("error", "provider_failed")
+    refused = await invoke("stream.set_scene", scene, "stream", "c-3")
+    assert (refused.status, refused.error["code"]) == ("refused", "scripted_refusal")
+    errored = await invoke("stream.set_scene", scene, "stream", "c-4")
+    assert (errored.status, errored.error["code"]) == ("error", "scripted_error")
+    unknown = await invoke("stream.set_scene", scene, "stream", "c-5")
+    assert (unknown.status, unknown.error["code"]) == (
+        "external_unknown", "external_effect_unknown"
+    )
+    switched = await invoke("stream.set_scene", scene, "stream", "c-6")
+    assert switched.status == "success"
+    assert switched.result == {"scene": "answering"}
+    assert [c["arguments"] for c in effects.calls["stream.set_scene"]] == [scene] * 5
+    assert effects.provider("stream.set_scene").invocations == 5
+    assert module.SCRIPTS["stream.set_scene"] == []
+
+    # The scene entry accepts no text: the executor refuses it before the
+    # provider, which is what an effect-only delivery relies on (AC50).
+    with_text = await invoke("stream.set_scene", {"scene": "x", "text": "T"}, "stream", "c-7")
+    assert (with_text.status, with_text.error["code"]) == ("error", "invalid_arguments")
+    assert effects.provider("stream.set_scene").invocations == 5
+
+    overlay = await invoke("overlay.raw", {"payload": {"k": 1}}, "overlay", "c-8")
+    assert (overlay.status, overlay.error["code"]) == ("refused", "not_authorized")
+    assert effects.calls["overlay.raw"] == []
+    grant(context, "overlay.raw")
+    pushed = await invoke("overlay.raw", {"payload": {"k": 1}}, "overlay", "c-9")
+    assert pushed.status == "success" and pushed.result == {"accepted": True}
+    assert effects.calls["overlay.raw"][0]["arguments"] == {"payload": {"k": 1}}
+    module.reset()
+    assert module.SCRIPTS == {}
+
+    await effects.close()
+    assert context.actions.registered_ready() == {}
+
+
+@pytest.mark.asyncio
+async def test_fake_effects_scripts_seam_is_used_instead_of_the_registry() -> None:
+    """The `scripts` setting hands a handle its own queues; `{}` is accepted."""
+
+    context = fixture_context()
+    scripts: dict = {"stream.set_scene": ["refused"]}
+    handles = await load_fixtures(
+        context, enabled=["fakeeffects"], settings={"fakeeffects": {"scripts": scripts}}
+    )
+    effects = handles["fakeeffects"]
+    module = sys.modules[type(effects).__module__]
+    assert effects.scripts is scripts
+    assert module.SCRIPTS == {}
+    assert module.validate_settings({}) == []
+    grant(context, "stream.set_scene")
+
+    refused = await context.executor.invoke(
+        fixture_call("stream.set_scene", {"scene": "b"}, scope="stream", call_id="c-1")
+    )
+    assert refused.status == "refused"
+    effects.script("stream.set_scene", "error")
+    assert scripts == {"stream.set_scene": ["error"]}
+
+
+@pytest.mark.asyncio
+async def test_fixture_settings_hooks_refuse_by_field_without_values() -> None:
+    """R7/AC24: the fixtures' hooks name module and field, never a value.
+
+    Run through the loader so the refusal stops startup with 0 activations,
+    exactly as a shipped module's would.
+    """
+
+    context = fixture_context()
+
+    async def refusal(name: str, settings: dict) -> str:
+        loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+        with pytest.raises(ModuleLoadError) as caught:
+            await loader.activate_enabled(
+                {"enabled_modules": [name], "modules": {name: settings}}
+            )
+        assert loader.activations == []
+        return str(caught.value)
+
+    unknown_channel = {
+        **FAKE_SETTINGS,
+        "feed": {
+            "messages": [
+                {"channel_id": "chan-secret", "author": "v", "message_id": "m", "text": "t"}
+            ]
+        },
+    }
+    diagnostic = await refusal("fakeplatform", unknown_channel)
+    assert diagnostic == (
+        "module 'fakeplatform': field 'feed.messages[0].channel_id': "
+        "must name a configured channel"
+    )
+    assert "chan-secret" not in diagnostic
+
+    untagged_roles = {
+        **FAKE_SETTINGS,
+        "feed": {
+            "messages": [
+                {
+                    "channel_id": "chan-a",
+                    "author": {"id": "v", "roles": ["moderator"]},
+                    "message_id": "m",
+                    "text": "t",
+                }
+            ]
+        },
+    }
+    assert (await refusal("fakeplatform", untagged_roles)).startswith(
+        "module 'fakeplatform': field 'feed.messages[0].author.roles_provenance': "
+    )
+
+    self_feeding = {
+        **FAKE_SETTINGS,
+        "feed": {"messages": [], "after_event": "channel.chat.message"},
+    }
+    assert "field 'feed.after_event'" in await refusal("fakeplatform", self_feeding)
+
+    # The declared schema refuses first, naming the field; the hook, next.
+    assert (await refusal("fakeplatform", {"companion_name": "c"})).startswith(
+        "module 'fakeplatform': field 'settings.channel_ids': "
+    )
+    assert (await refusal("fakeplatform", {**FAKE_SETTINGS, "channel_ids": []})) == (
+        "module 'fakeplatform': field 'channel_ids': "
+        "must be a non-empty list of channel identifiers"
+    )
+    assert (await refusal("fakeplatform", {**FAKE_SETTINGS, "channel_ids": ["a", "a"]})) == (
+        "module 'fakeplatform': field 'channel_ids': must be unique"
+    )
+
+    assert (await refusal("fakeeffects", {"scripts": {"nope.action": []}})) == (
+        "module 'fakeeffects': field 'scripts.nope.action': is not a declared action"
+    )
+    assert "field 'scripts.audio.say'" in await refusal(
+        "fakeeffects", {"scripts": {"audio.say": ["teleport"]}}
+    )

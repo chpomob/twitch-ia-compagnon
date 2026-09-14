@@ -1,0 +1,131 @@
+# Fictional effect providers — test fixture, manifest v2 (R1 decision 1).
+#
+# Three write actions on wildcard destinations, so a delivery list can be
+# configured beyond `chat.write` without any change to the agentic loop: two
+# carry the delivery capability (one taking the answer text, one taking no
+# text at all) and one carries none, which keeps it out of every `mode:
+# modules` list (AC52). Declaring authorizes nothing: an explicit rule must
+# grant each action (R5). The module plays no lifecycle role; it takes part
+# in `prepare`, the readiness barrier and `close` only.
+
+name: fakeeffects
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+produces: []
+consumes: []
+middleware: false
+
+lifecycle:
+  roles: []
+
+# No business setting: `{}` is accepted. The `scripts` seam a test may pass is
+# not configuration and is not declared here.
+settings_schema:
+  type: object
+  properties: {}
+settings_validator: validate_settings
+
+credentials: []
+
+actions:
+  # Speaks the answer: a text delivery on the `audio` scope of any channel.
+  - name: audio.say
+    version: 1
+    description: Speak one utterance on the audio output.
+    argument_schema:
+      type: object
+      properties:
+        text:
+          type: string
+          description: The utterance; must not be blank.
+      required:
+        - text
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        utterance_id:
+          type: string
+      required:
+        - utterance_id
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - audio.say
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: audio
+    timeout_seconds: 5
+    idempotency: none
+    delivery:
+      text_argument: text
+
+  # Switches the stream scene: an effect-only delivery, the answer text is
+  # passed under no argument (`additionalProperties: false` enforces it).
+  - name: stream.set_scene
+    version: 1
+    description: Switch the stream to a named scene.
+    argument_schema:
+      type: object
+      properties:
+        scene:
+          type: string
+          description: The scene to switch to.
+      required:
+        - scene
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        scene:
+          type: string
+      required:
+        - scene
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - stream.set_scene
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: stream
+    timeout_seconds: 5
+    idempotency: natural
+    delivery:
+      text_argument: none
+
+  # A write with no delivery capability: never a delivery candidate, so a
+  # fixed list naming it is refused (`not_a_delivery`, AC53) and a `modules`
+  # list omits it (AC52).
+  - name: overlay.raw
+    version: 1
+    description: Push one raw payload to the overlay.
+    argument_schema:
+      type: object
+      properties:
+        payload:
+          type: object
+      required:
+        - payload
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        accepted:
+          type: boolean
+      required:
+        - accepted
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - overlay.raw
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: overlay
+    timeout_seconds: 5
+    idempotency: none
