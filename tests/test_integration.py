@@ -1494,12 +1494,14 @@ async def test_ac11_rejected_saturated_and_stale_messages_all_reach_the_channel_
     then dropped stale when the wait deadline passes. A bounded read of the
     chat context for that channel returns all 3 in ingestion order, each
     with the timestamp it was recorded at; the same read for the other
-    channel returns 0 of them.
+    channel returns 0 of them. The stale drop's one send is its fallback
+    (R3, AC19), not an answer.
     """
 
     model = HeldSession(FakeResponse(200, completion("Held reply")))
     pipeline = await start_pipeline(
         model=model,
+        sends=[sent_response("fallback-sent")],
         admission={
             "workers": 1,
             "session_queue_capacity": 1,
@@ -1551,9 +1553,23 @@ async def test_ac11_rejected_saturated_and_stale_messages_all_reach_the_channel_
     assert snapshot[COUNTER_TRIGGER_REJECTIONS] == 1
     assert snapshot[COUNTER_ADMISSION_REJECTIONS] == 1
     assert snapshot[COUNTER_STALE_DROP] == 1
-    # Only the holder ever reached the model; nothing was sent anywhere.
+    # Only the holder ever reached the model. The stale drop is answered by
+    # the generic fallback (R3, AC19): exactly 1 send, of ``fallback.text``,
+    # to the served channel — which supersedes the phase-0 "nothing is sent"
+    # this test asserted before the fallback existed. The stale text itself
+    # is never answered: 0 model requests for it.
     assert len(model.post_calls) == 1
-    assert pipeline.twitch_session.helix_calls == []
+    assert (stale["payload"]["delivery"], stale["payload"]["fallback"]) == (
+        "fallback:success",
+        "sent",
+    )
+    assert stale["payload"]["sends"] == 1
+    (helix,) = pipeline.twitch_session.helix_calls
+    assert helix["json"] == {
+        "broadcaster_id": BROADCASTER,
+        "sender_id": BOT_USER,
+        "message": FALLBACK["text"],
+    }
 
     chat = pipeline.context.chat
     records = chat.read(PLATFORM, BROADCASTER, limit=10)

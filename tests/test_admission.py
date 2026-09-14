@@ -2065,13 +2065,19 @@ async def test_a_stale_drop_at_a_spent_total_budget_hands_the_hook_zero_seconds(
 
 @pytest.mark.parametrize(
     "result",
-    [None, "sent", {"status": "success", "run_id": "forged", "delivery": 7, "sends": 3}],
-    ids=["none", "text", "reserved-fields"],
+    [
+        None,
+        "sent",
+        {"status": "success", "run_id": "forged", "delivery": 7, "sends": -3},
+        {"status": "success", "run_id": "forged", "delivery": "", "sends": True},
+    ],
+    ids=["none", "text", "reserved-fields", "malformed-own-fields"],
 )
 async def test_a_stale_drop_hook_result_that_is_not_a_correlation_changes_nothing(result):
     """R8: only a mapping is merged, and the scheduler's own trace fields
-    (status, run_id, sends, …) can no more be overwritten by the hook than by
-    a run body; a non-text ``delivery`` is ignored rather than recorded."""
+    (status, run_id, …) can no more be overwritten by the hook than by a run
+    body; a non-text ``delivery`` and a ``sends`` that is not a non-negative
+    integer are ignored rather than recorded."""
 
     hook = StaleDropHook(result)
     async with _hooked_harness(hook) as harness:
@@ -2094,6 +2100,37 @@ async def test_a_stale_drop_hook_result_that_is_not_a_correlation_changes_nothin
         assert completed[0]["run_id"] == queued.run_id
         assert completed[0]["sends"] == 0
         assert completed[0]["delivery"] is None
+        assert harness.scheduler.stale_drop_hook_failures == 0
+
+
+async def test_a_stale_drop_hook_reports_its_confirmed_sends_into_the_record():
+    """R3/AC19: the fallback a hook sends is a send like any other — a
+    non-negative ``sends`` it returns fills the ``stale_drop`` record's own
+    field (written with 0 before the hook ran) and the trace, without
+    joining the correlation as an extra key."""
+
+    hook = StaleDropHook({"fallback": "sent", "delivery": "fallback:success", "sends": 1})
+    async with _hooked_harness(hook) as harness:
+        harness.scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        queued = harness.scheduler.admit(SESSION_A, message("stale"))
+        await settle()
+        harness.clock.advance(6.0)
+        await settle()
+
+        assert len(hook.calls) == 1
+        record = harness.scheduler.run_record(queued.run_id)
+        assert record is not None
+        assert (record.status, record.reason) == ("timeout", REASON_STALE_DROP)
+        assert (record.model_calls, record.sends) == (0, 1)
+        assert record.delivery == "fallback:success"
+        assert dict(record.correlation) == {"fallback": "sent"}
+        completed = harness.bus.for_run(TRACE_BRAIN_RUN_COMPLETED, queued.run_id)
+        assert len(completed) == 1
+        assert completed[0]["sends"] == 1
+        assert completed[0]["model_calls"] == 0
+        assert completed[0]["delivery"] == "fallback:success"
+        assert completed[0]["fallback"] == "sent"
         assert harness.scheduler.stale_drop_hook_failures == 0
 
 

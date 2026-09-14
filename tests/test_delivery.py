@@ -1,4 +1,4 @@
-"""The delivery list contract (R1, decision 1; AC49–AC54, AC56, AC57, AC58).
+"""The delivery list contract (R1, decision 1; AC49–AC58).
 
 Delivery is a configured, pluggable terminal step: the brain's ``delivery``
 settings group names an ordered list of delivery actions — ``mode: fixed``
@@ -9,7 +9,9 @@ invoked once, in order, when the final answer exists: one executor call per
 entry, the answer text passed only where the entry declares it, every entry
 invoked whatever the outcome of the previous ones, one explicit outcome per
 entry in the run's accounting. The model never selects a delivery action and
-is never offered one.
+is never offered one. The generic fallback (R3, AC55) takes the same list:
+``fallback.text`` in place of the answer, one call per entry, each entry
+counted against ``max_action_calls`` and skipped by name when none is left.
 
 Every scenario runs the **shipped** ``modules/brain/`` — no monkeypatch, no
 subclass — on the versioned runtime the shared fixture builds, with the two
@@ -69,9 +71,15 @@ from conftest import (
     events_of,
     final,
     runtime_context as build_context,
+    tool_call,
     wait_until,
 )
+from core.contracts import RUN_FAILURE_BUDGET_EXHAUSTED
 from modules.brain import (
+    DELIVERY_NOT_ATTEMPTED,
+    FALLBACK_SENT,
+    FALLBACK_SKIPPED_BUDGET_EXHAUSTED,
+    FALLBACK_SKIPPED_NOT_AUTHORIZED,
     MODULE_NAME,
     PRINCIPAL,
     TRACE_DELIVERY_RESOLVED,
@@ -119,6 +127,28 @@ AC50_DELIVERY = {
 }
 
 T = "Here is my answer."
+FALLBACK_TEXT = VALID_SETTINGS["fallback"]["text"]
+
+# The AC13 run under the profile's own budgets (AC56 lets a scenario change
+# ``delivery`` alone): ``model_turns`` reads are proposed, each with its own
+# ``limit`` so the repeated-action budget is not what stops the run, and the
+# ``model_turns + 1``-th request is never built. A proposal whose arguments
+# are not a JSON object is answered by the runtime itself (``malformed_
+# arguments``) and costs no executor call, which is how the two scripts
+# leave a different number of action calls to the terminal step.
+MODEL_TURNS = VALID_SETTINGS["budget"]["model_turns"]
+MAX_ACTION_CALLS = VALID_SETTINGS["budget"]["max_action_calls"]
+assert (MODEL_TURNS, MAX_ACTION_CALLS) == (5, 6)
+AC13_ONE_CALL_LEFT = tuple(
+    tool_call(CHAT_READ, {"limit": index + 1}) for index in range(MODEL_TURNS)
+) + (final("never"),)
+"""Every turn a read that is executed: ``MODEL_TURNS`` action calls spent,
+exactly one left for the terminal step."""
+AC13_TWO_CALLS_LEFT = tuple(
+    tool_call(CHAT_READ, {"limit": index + 1}) for index in range(MODEL_TURNS - 1)
+) + (tool_call(CHAT_READ, "[1, 2]"), final("never"))
+"""The last proposal malformed and refused by the runtime: one action call
+fewer spent, two left for the two entries of the AC50 list."""
 
 FORBIDDEN_IN_BRAIN = (CHAT_WRITE, AUDIO_SAY, STREAM_SET_SCENE, "fakeeffects", "twitch")
 """The literals ``grep -rn`` over ``modules/brain/`` must not match (AC56)."""
@@ -150,6 +180,30 @@ class NeverInvokedReadProvider:
 
     async def invoke(self, invocation: Any) -> ActionObservation:
         raise AssertionError("the single-turn body executes no proposal")
+
+
+class AnsweringReadProvider:
+    """A ``chat.read`` provider confirming every call with one text part.
+
+    Bound in place of :class:`NeverInvokedReadProvider` by the scenarios
+    whose model proposes reads until a budget is spent (AC55): each call is
+    recorded, and none of them is a delivery.
+    """
+
+    name = "fake-read"
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        self.calls.append(invocation.call)
+        invocation.mark_not_emitted()
+        return ActionObservation(
+            status="success",
+            provenance={"provider": self.name},
+            result={"messages": []},
+            parts=[{"type": "text", "text": "no messages"}],
+        )
 
 
 def grant_rule(action: str) -> AuthorizationRule:
@@ -280,6 +334,7 @@ async def activate_delivery(
     scripts: dict[str, list[str]] | None = None,
     outcomes: Sequence[str] = (),
     prepare: bool = True,
+    reader: Any | None = None,
 ) -> DeliveryHarness:
     """Load the fixtures and the shipped brain on one runtime; prepare them.
 
@@ -288,7 +343,9 @@ async def activate_delivery(
     the ``prepare`` order; the fixtures are prepared first so their providers
     are bound and ready when the first run delivers. The brain's settings are
     the AC49 settings with only ``delivery`` replaced (AC56). ``scripts``
-    scripts the effect providers, ``outcomes`` the fake chat transport.
+    scripts the effect providers, ``outcomes`` the fake chat transport;
+    ``reader`` replaces the never-invoked ``chat.read`` provider for a
+    scenario whose model proposes reads.
     """
 
     clock = ManualClock()
@@ -299,7 +356,11 @@ async def activate_delivery(
         chat=ChatContext(max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=clock),
         authorization=policy,
     )
-    context.actions.register(CHAT_READ_SPEC, NeverInvokedReadProvider(), module=READER_MODULE)
+    context.actions.register(
+        CHAT_READ_SPEC,
+        reader if reader is not None else NeverInvokedReadProvider(),
+        module=READER_MODULE,
+    )
     context.actions.mark_ready(READER_MODULE)
 
     diagnostics: list[str] = []
@@ -908,6 +969,151 @@ async def test_a_refused_text_entry_leaves_memory_untouched_while_the_effect_sti
         assert harness.platform.sends == []
         assert len(harness.effect_calls(STREAM_SET_SCENE)) == 1
         assert harness.memory() == []
+    finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC55 — the generic fallback takes the same list (R3)
+# --------------------------------------------------------------------------- #
+
+
+def assert_ac13_exhausted(harness: DeliveryHarness, record: Any, reads: int) -> dict[str, Any]:
+    """The AC13 shape under the profile's budgets: ``model_turns`` requests,
+    *reads* executed, the run ``error`` / ``budget_exhausted`` / ``model_turns``."""
+
+    assert record.status == "error"
+    assert len(harness.session.requests()) == MODEL_TURNS
+    assert harness.tools() == [[CHAT_READ]] * MODEL_TURNS
+    completed = harness.completed()
+    assert completed["failure"] == RUN_FAILURE_BUDGET_EXHAUSTED
+    assert completed["budget"] == "model_turns"
+    assert completed["turns"] == MODEL_TURNS
+    read_calls = [call for call in harness.executor_calls() if call[0] == CHAT_READ]
+    assert read_calls == [(CHAT_READ, f"{record.run_id}/call-{n}") for n in range(1, reads + 1)]
+    assert harness.memory() == []
+    return completed
+
+
+@pytest.mark.asyncio
+async def test_ac55_the_fallback_goes_through_both_entries_of_the_list() -> None:
+    """AC55 (R3): the AC13 run with the AC50 list delivers ``fallback.text``
+    by exactly 1 chat send and invokes the scene provider exactly once with
+    ``{"scene": "answering"}``; ``deliveries`` has 2 entries both
+    ``success``, ``fallback == "sent"``, ``delivery == "fallback:success"``,
+    the call ids continue the run's counter, and the run's status stays
+    ``error``."""
+
+    reader = AnsweringReadProvider()
+    harness = await activate_delivery(*AC13_TWO_CALLS_LEFT, delivery=AC50_DELIVERY, reader=reader)
+    try:
+        record = await harness.ask()
+        run = record.run_id
+        reads = MODEL_TURNS - 1
+        completed = assert_ac13_exhausted(harness, record, reads)
+        assert len(reader.calls) == reads
+
+        chat_call = f"{run}/call-{reads + 1}"
+        scene_call = f"{run}/call-{reads + 2}"
+        assert harness.deliveries() == [
+            delivery_entry(CHAT_WRITE, chat_call, True, "success"),
+            delivery_entry(STREAM_SET_SCENE, scene_call, False, "success"),
+        ]
+        assert completed["fallback"] == FALLBACK_SENT
+        assert completed["delivery"] == "fallback:success"
+        assert completed["action_calls"] == reads + 2
+        assert (record.status, record.delivery, record.sends) == ("error", "fallback:success", 1)
+        (send,) = harness.platform.sends
+        assert send["text"] == FALLBACK_TEXT
+        assert send["call_id"] == chat_call
+        assert send["principal"] == PRINCIPAL
+        assert send["destination"] == Destination(PLATFORM, CHANNEL_A, "chat")
+        (scene,) = harness.effect_calls(STREAM_SET_SCENE)
+        assert scene["arguments"] == {"scene": "answering"}
+        assert FALLBACK_TEXT not in str(scene["arguments"])
+        assert scene["call_id"] == scene_call
+        assert scene["principal"] == PRINCIPAL
+        assert harness.effect_calls(AUDIO_SAY) == []
+        assert harness.executor.provider_invocations == reads + 2
+        # The fallback is the configured text, never anything the model said.
+        assert "never" not in [send["text"] for send in harness.platform.sends]
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac55_one_action_call_left_invokes_the_first_entry_and_skips_the_second_by_name() -> None:
+    """AC55 (R3): with ``max_action_calls`` leaving exactly 1 call at the
+    terminal step, ``deliveries`` statuses are ``["success",
+    "skipped:budget_exhausted"]`` — the chat send made, the scene provider
+    invoked 0 times, the skipped entry with no call id — and ``delivery ==
+    "fallback:skipped:budget_exhausted"`` with ``fallback == "sent"``."""
+
+    reader = AnsweringReadProvider()
+    harness = await activate_delivery(*AC13_ONE_CALL_LEFT, delivery=AC50_DELIVERY, reader=reader)
+    try:
+        record = await harness.ask()
+        run = record.run_id
+        completed = assert_ac13_exhausted(harness, record, MODEL_TURNS)
+        assert MAX_ACTION_CALLS - MODEL_TURNS == 1
+
+        chat_call = f"{run}/call-{MODEL_TURNS + 1}"
+        assert [entry["status"] for entry in harness.deliveries()] == [
+            "success", FALLBACK_SKIPPED_BUDGET_EXHAUSTED
+        ]
+        assert harness.deliveries() == [
+            delivery_entry(CHAT_WRITE, chat_call, True, "success"),
+            delivery_entry(STREAM_SET_SCENE, None, False, FALLBACK_SKIPPED_BUDGET_EXHAUSTED),
+        ]
+        assert completed["fallback"] == FALLBACK_SENT
+        assert completed["delivery"] == f"fallback:{FALLBACK_SKIPPED_BUDGET_EXHAUSTED}"
+        assert "delivery_error" not in completed
+        assert completed["action_calls"] == MAX_ACTION_CALLS
+        assert record.delivery == f"fallback:{FALLBACK_SKIPPED_BUDGET_EXHAUSTED}"
+        assert record.sends == 1
+        (send,) = harness.platform.sends
+        assert send["text"] == FALLBACK_TEXT
+        assert send["call_id"] == chat_call
+        assert harness.effect_calls(STREAM_SET_SCENE) == []
+        assert harness.executor.provider_invocations == MAX_ACTION_CALLS
+        assert [call for call in harness.executor_calls() if call[0] == STREAM_SET_SCENE] == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac55_no_applicable_rule_for_either_entry_costs_no_executor_call() -> None:
+    """AC55 (R3): with no applicable rule for either entry, 0 sends, 0
+    delivery provider invocations, 0 executor calls for the fallback and
+    ``fallback == "skipped:not_authorized"`` — each entry evaluated on the
+    authorized view of its own scope, the read calls untouched."""
+
+    reader = AnsweringReadProvider()
+    harness = await activate_delivery(
+        *AC13_TWO_CALLS_LEFT,
+        delivery=AC50_DELIVERY,
+        grants=(CHAT_READ, AUDIO_SAY),
+        reader=reader,
+    )
+    try:
+        record = await harness.ask()
+        reads = MODEL_TURNS - 1
+        completed = assert_ac13_exhausted(harness, record, reads)
+
+        assert completed["fallback"] == FALLBACK_SKIPPED_NOT_AUTHORIZED
+        assert completed["deliveries"] == []
+        assert completed["delivery"] == DELIVERY_NOT_ATTEMPTED
+        assert completed["action_calls"] == reads
+        assert (record.status, record.delivery, record.sends) == ("error", DELIVERY_NOT_ATTEMPTED, 0)
+        assert harness.platform.sends == []
+        assert harness.effect_calls(STREAM_SET_SCENE) == []
+        assert harness.effect_calls(AUDIO_SAY) == []
+        assert harness.executor.provider_invocations == reads
+        assert len(harness.executor_calls()) == reads
+        assert (
+            f"brain fallback: {FALLBACK_SKIPPED_NOT_AUTHORIZED} after {RUN_FAILURE_BUDGET_EXHAUSTED}"
+            in harness.diagnostics
+        )
     finally:
         await harness.close()
 

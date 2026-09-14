@@ -133,6 +133,33 @@ and publishes **neither** ``brain.run.started`` **nor**
 both and merges the outcome into its traced payload. The per-call
 terminal trace (``action.completed``) is the executor's.
 
+**Reserve and fallback** (R3). The last ``delivery_reserve_seconds`` before
+the total deadline belong to the terminal step, every entry included: no
+model turn and no non-delivery action starts inside them, and a run that
+reaches them ends ``error`` with ``failure: deadline_reserve``. Such a run,
+like one that spent a budget, has no delivered final response, so the
+fallback policy runs through the same delivery list — ``fallback.text`` in
+place of the answer, the same principal, call ids continuing the run's
+counter, each entry counted against ``max_action_calls`` — and the run
+reports ``fallback: sent`` with ``delivery: fallback:<summary>`` while its
+status stays the failure it ended with. Nothing is sent when the policy is
+disabled, when no entry has an applicable rule on its own scope, when no
+action call is left or when the total deadline has passed: the run then
+reports ``fallback: skipped:<reason>`` and 0 executor calls for it. At any
+terminal step an entry with no action call left records
+``skipped:budget_exhausted`` and one reached at or after the total deadline
+``skipped:deadline_exceeded``, uninvoked, the entries before it keeping their
+outcomes; a final response whose summary is such a skip ends the run
+``error`` with ``failure: budget_exhausted`` or ``timeout`` with ``failure:
+deadline_exceeded``, ``delivery`` keeping the summary, and no fallback
+follows it — none could be sent under the same spent budget or passed
+deadline. A queued work the scheduler drops stale gets the same policy
+through the scheduler's ``on_stale_drop`` hook (:meth:`BrainModule._on_stale_drop`),
+under a deadline built from the budget the scheduler hands over and with no
+run context to checkpoint; the stale text is never answered, and the sends
+the fallback confirms are reported as ``sends`` for the scheduler to adopt
+into the drop's record and trace.
+
 **Delivery list** (R1, decision 1). Which actions deliver is policy, not
 code: the ``delivery`` settings group names them, and :func:`_resolve_delivery`
 turns the default list and every override into resolved entries at
@@ -182,7 +209,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 from urllib.parse import urlsplit
 
-from core.admission import AdmissionScheduler, RunOutcome, Work
+from core.admission import REASON_STALE_DROP, AdmissionScheduler, RunOutcome, Work
 from core.attachments import AttachmentExpired
 from core.contracts import (
     BRAIN_ERROR_ATTACHMENT_EXPIRED,
@@ -245,7 +272,46 @@ DELIVERY_NOT_ATTEMPTED = "not_attempted"
 """The delivery outcome of a run that ended before any executor call."""
 
 FALLBACK_NONE = "none"
-"""The ``fallback`` value of a run that delivered no fallback text (R3)."""
+"""The ``fallback`` value of a run that needed no fallback (R3): it delivered
+its final response, or ended on a failure the fallback does not answer."""
+
+FALLBACK_SENT = "sent"
+"""The ``fallback`` value of a run whose fallback text went through the
+delivery list (R3); ``delivery`` then reads ``fallback:<summary>``."""
+
+FALLBACK_SKIPPED_DISABLED = "skipped:disabled"
+FALLBACK_SKIPPED_NOT_AUTHORIZED = "skipped:not_authorized"
+FALLBACK_SKIPPED_BUDGET_EXHAUSTED = "skipped:budget_exhausted"
+FALLBACK_SKIPPED_DEADLINE_EXCEEDED = "skipped:deadline_exceeded"
+"""The ``fallback`` values of a run that needed a fallback and sent nothing
+(R3): the policy is disabled; no entry of the list has an applicable rule;
+no action call is left; the total deadline has passed."""
+
+FALLBACK_DELIVERY_PREFIX = "fallback:"
+"""What the ``delivery`` of a run that delivered the fallback text starts
+with, so a fallback outcome is never read as a delivered answer (R3)."""
+
+DELIVERY_SKIPPED_BUDGET_EXHAUSTED = FALLBACK_SKIPPED_BUDGET_EXHAUSTED
+DELIVERY_SKIPPED_DEADLINE_EXCEEDED = FALLBACK_SKIPPED_DEADLINE_EXCEEDED
+"""The status of a delivery entry the terminal step did not invoke (R3): no
+action call was left for it, or it was reached at or after the total
+deadline. The entries before it keep their own outcomes."""
+
+RUN_FAILURE_DEADLINE_RESERVE = "deadline_reserve"
+"""The ``failure`` of a run stopped because the time left before the total
+deadline fell below ``budget.delivery_reserve_seconds`` (R3): no new model
+turn and no non-delivery action starts inside the reserve, which covers the
+whole terminal step; the fallback follows."""
+
+RUN_FAILURE_DEADLINE_EXCEEDED = "deadline_exceeded"
+"""The ``failure`` of a run whose terminal step reached its total deadline
+before its delivery list was through (R3): the run ends ``timeout``, the
+entries reached at or after the deadline recorded ``skipped:deadline_exceeded``
+and the ones before them keeping their outcomes."""
+
+FALLBACK_REASON_STALE_DROP = REASON_STALE_DROP
+"""The reason a fallback runs for a queued work the scheduler dropped stale
+(R3, AC19): the same word the scheduler's record carries."""
 
 WORK_KIND = "chat.message"
 
@@ -1130,15 +1196,40 @@ def _schema_properties(spec: Any) -> Mapping[str, Any]:
 
 @dataclass(frozen=True, slots=True)
 class _Delivery:
-    """One invoked entry of the terminal step and its explicit outcome."""
+    """One entry of the terminal step and its explicit outcome (R1, R3).
+
+    An invoked entry carries its call id and the executor's observation,
+    whose status is its own. An entry the step did not invoke — no action
+    call left for it, or reached at or after the total deadline — carries
+    neither: its ``status`` is the ``skipped:<reason>`` the step recorded,
+    so the list's accounting stays complete without an executor call that
+    never happened.
+    """
 
     entry: _DeliveryEntry
-    call_id: str
-    observation: ActionObservation
+    status: str
+    call_id: str | None = None
+    observation: ActionObservation | None = None
 
     @property
-    def status(self) -> str:
-        return self.observation.status
+    def invoked(self) -> bool:
+        return self.call_id is not None
+
+    @property
+    def confirmed_text(self) -> bool:
+        """Whether this entry received the text and the executor confirmed it."""
+
+        return self.entry.receives_text and self.status == _STATUS_SUCCESS
+
+    @property
+    def error_code(self) -> str | None:
+        """The observation's error code, for an invoked entry that did not succeed."""
+
+        error = getattr(self.observation, "error", None)
+        if self.status == _STATUS_SUCCESS or not isinstance(error, Mapping):
+            return None
+        code = error.get("code")
+        return code if isinstance(code, str) else None
 
     def record(self) -> dict[str, Any]:
         """The ``deliveries[]`` item: action, call id, text received, status."""
@@ -1149,6 +1240,18 @@ class _Delivery:
             "text": self.entry.receives_text,
             "status": self.status,
         }
+
+
+def _invoked_count(deliveries: Sequence[_Delivery]) -> int:
+    """How many entries of a terminal step reached the executor."""
+
+    return sum(1 for delivery in deliveries if delivery.invoked)
+
+
+def _confirmed_sends(deliveries: Sequence[_Delivery]) -> int:
+    """How many text entries the executor confirmed ``success``."""
+
+    return sum(1 for delivery in deliveries if delivery.confirmed_text)
 
 
 def _delivery_summary(statuses: Sequence[str]) -> str:
@@ -1166,6 +1269,46 @@ def _delivery_summary(statuses: Sequence[str]) -> str:
         if status != _STATUS_SUCCESS:
             return status
     return _STATUS_SUCCESS
+
+
+def _run_status_of(summary: str) -> tuple[str, dict[str, Any]]:
+    """The terminal ``status`` a delivery *summary* ends the run with (R1, R3).
+
+    An invoked entry's status is a terminal status and stands as the run's,
+    exactly as phase 0's single delivery did. A skipped entry's is not: a
+    step that could not invoke an entry for want of an action call ends
+    the run ``error`` with ``failure: budget_exhausted`` and ``budget:
+    max_action_calls``, and one that reached an entry at or after the total
+    deadline ends it ``timeout`` with ``failure: deadline_exceeded`` — the
+    ``delivery`` keeps the summary either way, so the entries before the
+    skipped one keep their outcomes and their accounting.
+    """
+
+    if summary == DELIVERY_SKIPPED_BUDGET_EXHAUSTED:
+        return _STATUS_ERROR, {
+            "failure": RUN_FAILURE_BUDGET_EXHAUSTED,
+            "budget": _BUDGET_MAX_ACTION_CALLS,
+        }
+    if summary == DELIVERY_SKIPPED_DEADLINE_EXCEEDED:
+        return _STATUS_TIMEOUT, {"failure": RUN_FAILURE_DEADLINE_EXCEEDED}
+    return summary, {}
+
+
+def _note_delivery_error(correlation: dict[str, Any], deliveries: Sequence[_Delivery]) -> None:
+    """Record the first non-success entry's error code as ``delivery_error``.
+
+    The first entry in list order that did not succeed names the code, an
+    invoked one through its observation; a skipped entry carries no
+    observation and names none — its status already says why.
+    """
+
+    for delivery in deliveries:
+        if delivery.status == _STATUS_SUCCESS:
+            continue
+        code = delivery.error_code
+        if code is not None:
+            correlation["delivery_error"] = code
+        break
 
 
 @dataclass(frozen=True, repr=False, slots=True)
@@ -1420,6 +1563,40 @@ class _Message:
             platform=self.platform, channel_id=self.channel_id, viewer_id=self.viewer_id
         )
 
+    @property
+    def recipient(self) -> "_Recipient":
+        return _Recipient(
+            platform=self.platform, channel_id=self.channel_id, message_id=self.message_id
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _Recipient:
+    """Where a terminal step is addressed (R1, R3).
+
+    The platform and channel every delivery entry's destination is built
+    from, and the message the calls answer when one is known. A run reads
+    it from its admitted message; the stale-drop fallback builds it from
+    the session key the scheduler hands over, since it runs for a work no
+    run ever read — the message identity then comes from the queued copy
+    when that copy still reads as a chat message, and is left out otherwise.
+    """
+
+    platform: str
+    channel_id: str
+    message_id: str | None
+
+
+def _recipient_of(work: Any, key: SessionKey) -> _Recipient:
+    """The stale-drop recipient: the session's channel, the work's message id."""
+
+    message_id: str | None = None
+    try:
+        message_id = _message_of_work(work).message_id
+    except ValueError:
+        pass
+    return _Recipient(platform=key.platform, channel_id=key.channel_id, message_id=message_id)
+
 
 class _NoTrustedIdentity(ValueError):
     """The event names no ``author.id``: refused, never admitted (R3)."""
@@ -1589,7 +1766,10 @@ class _RunState:
     estimate — flagged by ``tokens_estimated`` — when it did not;
     ``next_call`` numbers the run's call ids in invocation order;
     ``repeats`` counts the executed proposals per ``(name, canonical
-    arguments)`` for the repeated-action budget.
+    arguments)`` for the repeated-action budget; ``fallback`` is what the
+    run reports under that name, and ``fallback_reason`` the failure that
+    calls for a fallback — a spent budget or the delivery reserve — set by
+    the boundary that ended the loop and read once the loop has returned.
     """
 
     turns: int = 0
@@ -1599,6 +1779,8 @@ class _RunState:
     tokens_estimated: bool = False
     next_call: int = 1
     repeats: dict[tuple[str, str], int] = field(default_factory=dict)
+    fallback: str = FALLBACK_NONE
+    fallback_reason: str | None = None
 
     def correlation(self) -> dict[str, Any]:
         return {
@@ -1606,13 +1788,72 @@ class _RunState:
             "action_calls": self.action_calls,
             "tokens": self.tokens,
             "tokens_estimated": self.tokens_estimated,
-            "fallback": FALLBACK_NONE,
+            "fallback": self.fallback,
         }
 
     def spend(self, reply: "_ModelReply") -> None:
         if reply.tokens is not None:
             self.tokens += reply.tokens
             self.tokens_estimated = self.tokens_estimated or reply.estimated
+
+    def account(self, deliveries: Sequence[_Delivery]) -> None:
+        """Count one terminal step: every invoked entry is one action call."""
+
+        invoked = _invoked_count(deliveries)
+        self.next_call += invoked
+        self.action_calls += invoked
+
+    def calls_left(self, budget: _Budget) -> int:
+        """Action calls still allowed under ``max_action_calls``; never negative."""
+
+        return max(0, budget.max_action_calls - self.action_calls)
+
+
+class _StaleRun:
+    """The run handle a stale-drop fallback delivers under (R3, AC19).
+
+    No :class:`~core.admission.RunContext` exists for a work the scheduler
+    dropped before any worker took it, so the hook builds this one from what
+    the scheduler hands over: the work, its session and the total budget
+    left. It offers a delivery call what a run context offers — an identity,
+    a conversation, the source event, the clock and a total deadline — and
+    no ``checkpoint``: the scheduler already wrote the ``stale_drop``
+    record, so there is no boundary left to raise at, only a deadline after
+    which nothing is sent. The hook is not handed the scheduler's run id,
+    so the calls run under ``stale_drop/<source event id>``: the drop's own
+    ``brain.run.completed`` carries that same ``source_event_id``, which is
+    how the two correlate. Confirmed sends are counted here as the terminal
+    step notes them and reported as ``sends`` in the returned correlation,
+    which the scheduler adopts into the record it owns — the ``stale_drop``
+    record was written with 0 sends before the hook ran.
+    """
+
+    __slots__ = ("_clock", "conversation_id", "run_id", "sends", "total_deadline", "work")
+
+    def __init__(
+        self, *, work: Any, key: SessionKey, remaining: float, clock: Callable[[], float]
+    ) -> None:
+        source_event_id = getattr(work, "source_event_id", None)
+        self.run_id = f"{REASON_STALE_DROP}/{source_event_id}"
+        self.work = work
+        conversation_id = getattr(work, "conversation_id", None)
+        self.conversation_id = conversation_id if _is_text(conversation_id) else key.serialize()
+        self._clock = clock
+        self.total_deadline = clock() + max(0.0, float(remaining))
+        self.sends = 0
+
+    @property
+    def now(self) -> float:
+        return self._clock()
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.total_deadline - self._clock())
+
+    def note_send(self, count: int = 1) -> None:
+        """Count a confirmed send; it travels in the returned correlation."""
+
+        self.sends += max(0, int(count))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1780,6 +2021,10 @@ class BrainModule:
                 # The run's end releases what it leased (R6): the scheduler
                 # owns the terminal record, so it owns this call too.
                 run_cleanup=self._release_run,
+                # A queued work dropped stale still gets the fallback policy
+                # (R3, AC19): the scheduler hands over the work, its session
+                # and the budget left, and knows nothing of what is sent.
+                on_stale_drop=self._on_stale_drop,
             )
         else:
             self._scheduler = runtime.scheduler
@@ -1806,6 +2051,17 @@ class BrainModule:
         """Whether the scheduler was built here rather than taken from the context."""
 
         return self._owns_scheduler
+
+    @property
+    def on_stale_drop(self) -> Callable[[Any, SessionKey, float], Any]:
+        """The stale-drop hook (R3, AC19), for whoever builds a shared scheduler.
+
+        The owner of a scheduler taken from the context binds this beside
+        :meth:`run`, the way this module binds both on the scheduler it
+        owns; see :meth:`_on_stale_drop`.
+        """
+
+        return self._on_stale_drop
 
     # -- startup phases ---------------------------------------------------- #
 
@@ -1996,6 +2252,13 @@ class BrainModule:
         the scheduler performs when it writes the terminal record (R4,
         AC25), and only then does the exit propagate.
 
+        A loop that ends on a spent budget or inside the delivery reserve
+        ends without a delivered final response: the fallback policy (R3)
+        runs then, after the loop and before the exit, through the same
+        terminal step the final response would have taken, and the outcome
+        it returns keeps the loop's failure status with the fallback's own
+        accounting merged in (:meth:`_fallback_outcome`).
+
         Publishes neither ``brain.run.started`` nor ``brain.run.completed``:
         the scheduler owns both and merges what is returned into its trace.
         """
@@ -2018,7 +2281,10 @@ class BrainModule:
         )
         state = _RunState()
         try:
-            return await self._loop(run, message, key, transcript, state)
+            outcome = await self._loop(run, message, key, transcript, state)
+            if state.fallback_reason is not None:
+                outcome = await self._fallback_outcome(run, message, state, outcome)
+            return outcome
         finally:
             self._discard_images(transcript.image_parts())
 
@@ -2035,7 +2301,10 @@ class BrainModule:
         Each turn, in this order: an ``image_ref`` the transcript carries
         whose lease expired on the clock ends the run ``attachment_expired``
         before any request (R4, AC24); ``turns == model_turns`` ends it
-        ``budget_exhausted`` (AC13); the run's deadline is checked; the
+        ``budget_exhausted`` (AC13); less than ``delivery_reserve_seconds``
+        left before the total deadline ends it ``deadline_reserve`` — the
+        reserve is the terminal step's, every entry included, and no model
+        turn starts inside it (R3, AC17); the run's deadline is checked; the
         authorized read view is read afresh, per action and per declared
         scope (AC6); the prompt is composed inside the token room the run
         has left, and one that leaves the reply no room ends the run on
@@ -2055,20 +2324,20 @@ class BrainModule:
                 return self._failed(state, _STATUS_ERROR, BRAIN_ERROR_ATTACHMENT_EXPIRED)
             if state.turns >= budget.model_turns:
                 return self._exhausted(state, _BUDGET_MODEL_TURNS)
+            if self._inside_reserve(run):
+                return self._reserve_reached(state, "model turn")
 
             run.checkpoint()
             offered = self._offered_tools(key.platform, key.channel_id)
             room = budget.max_tokens - state.tokens
             prompt = self._compose(transcript, tuple(offer.spec for offer in offered), room)
             if prompt.output_tokens <= 0:
+                # The prompt is counted on the state, estimated, so the
+                # accounting survives the fallback's re-read of the state.
                 self._diagnose("brain run: prompt exceeds the token budget")
-                return self._exhausted(
-                    state,
-                    _BUDGET_MAX_TOKENS,
-                    quiet=True,
-                    tokens=state.tokens + prompt.input_tokens,
-                    tokens_estimated=True,
-                )
+                state.tokens += prompt.input_tokens
+                state.tokens_estimated = True
+                return self._exhausted(state, _BUDGET_MAX_TOKENS, quiet=True)
 
             run.note_model_call()
             state.model_calls += 1
@@ -2101,7 +2370,9 @@ class BrainModule:
                     shape=classification.reason,
                 )
             if isinstance(classification, _Final):
-                return await self._finish(run, key, transcript, classification.text, state)
+                return await self._finish(
+                    run, message, key, transcript, classification.text, state
+                )
             ended = await self._propose(run, message, transcript, state, classification, offered)
             if ended is not None:
                 return ended
@@ -2125,7 +2396,10 @@ class BrainModule:
         (``malformed_arguments``); each with 0 executor calls. Then the
         budgets: the ``(n+1)``-th proposal of the same name and canonical
         arguments with ``n == max_repeated_actions`` is not executed and
-        ends the run; so does a proposal with no action call left. Else one
+        ends the run; so does a proposal with no action call left, and one
+        reached with less than ``delivery_reserve_seconds`` before the total
+        deadline (``deadline_reserve``: the reserve is the terminal step's,
+        and no non-delivery action starts inside it, R3, AC17). Else one
         :class:`~core.contracts.ActionCall` — destination ``(run platform,
         run channel_id, the scope the action was offered on, or its
         declared scope when it was not offered)``, principal
@@ -2169,6 +2443,8 @@ class BrainModule:
                     return self._exhausted(state, _BUDGET_MAX_REPEATED_ACTIONS)
                 if state.action_calls >= budget.max_action_calls:
                     return self._exhausted(state, _BUDGET_MAX_ACTION_CALLS)
+                if self._inside_reserve(run):
+                    return self._reserve_reached(state, "action")
                 state.repeats[repeat_key] = repeated + 1
                 call_id = f"{run.run_id}/call-{state.next_call}"
                 try:
@@ -2329,6 +2605,7 @@ class BrainModule:
     async def _finish(
         self,
         run: Any,
+        message: _Message,
         key: SessionKey,
         transcript: _Transcript,
         reply: str,
@@ -2341,19 +2618,33 @@ class BrainModule:
         the default — one executor call per entry carrying the run's
         identity, call ids continuing the run's counter and each its own
         deadline, so a call still in flight at the total deadline is
-        classified by the executor, never here (AC33). Each confirmed send
-        is noted on the run as it is observed. The memory write-back
-        happens here, only when the text was confirmed delivered (AC7).
+        classified by the executor, never here (AC33). An entry with no
+        action call left, or reached at or after the total deadline, is
+        not invoked and recorded ``skipped:<reason>`` (R3); the run then
+        ends ``error`` (``failure: budget_exhausted``) or ``timeout``
+        (``failure: deadline_exceeded``) with ``delivery`` keeping the
+        summary, since a skipped status is no terminal state
+        (:func:`_run_status_of`) — and no fallback follows, as none could
+        be sent under the same spent budget or passed deadline. Each
+        confirmed send is noted on the run as it is observed. The memory
+        write-back happens here, only when the text was confirmed
+        delivered (AC7).
         """
 
         run.checkpoint()
         entries = self._delivery_for(key.platform, key.channel_id)
-        deliveries = await self._deliver_all(run, reply, entries, next_call_index=state.next_call)
-        state.next_call += len(deliveries)
-        state.action_calls += len(deliveries)
+        deliveries = await self._deliver_all(
+            run,
+            reply,
+            entries,
+            recipient=message.recipient,
+            next_call_index=state.next_call,
+            calls_left=state.calls_left(self._budget),
+        )
+        state.account(deliveries)
         summary = _delivery_summary([delivery.status for delivery in deliveries])
         text_deliveries = [delivery for delivery in deliveries if delivery.entry.receives_text]
-        sends = sum(1 for delivery in text_deliveries if delivery.status == _STATUS_SUCCESS)
+        sends = _confirmed_sends(deliveries)
         # The text is memorised only once confirmed: at least one entry
         # received it and none of those ended other than ``success`` — an
         # ``external_unknown`` entry is never a confirmed send (AC7).
@@ -2361,20 +2652,16 @@ class BrainModule:
         if delivered and not self._closed:
             self._memory.remember(key, transcript.user, reply)
 
+        status, failure = _run_status_of(summary)
         correlation: dict[str, Any] = {
+            **failure,
             "deliveries": [delivery.record() for delivery in deliveries],
             "delivery": summary,
             **state.correlation(),
         }
-        for delivery in deliveries:
-            error = delivery.observation.error
-            if delivery.status != _STATUS_SUCCESS and isinstance(error, Mapping):
-                code = error.get("code")
-                if isinstance(code, str):
-                    correlation["delivery_error"] = code
-                break
+        _note_delivery_error(correlation, deliveries)
         return RunOutcome(
-            status=summary,
+            status=status,
             delivery=summary,
             model_calls=state.model_calls,
             sends=sends,
@@ -2396,26 +2683,219 @@ class BrainModule:
             },
         )
 
-    def _exhausted(
-        self, state: _RunState, budget: str, *, quiet: bool = False, **extra: Any
-    ) -> RunOutcome:
+    def _exhausted(self, state: _RunState, budget: str, *, quiet: bool = False) -> RunOutcome:
         """The outcome of a run that spent *budget* (R3): ``error``, named.
 
         One diagnostic per exhaustion: *quiet* is passed by the token paths,
-        whose boundary already reported the overrun.
+        whose boundary already reported the overrun. A spent budget is one
+        of the two loop endings the fallback answers (R3): the run reads it
+        back once the loop has returned, and re-reads the state's accounting
+        with it — which is why every count the outcome reports lives on the
+        state, never in an extra of this outcome alone.
         """
 
         if not quiet:
             self._diagnose(f"brain run: budget exhausted: {budget}")
-        outcome = self._failed(state, _STATUS_ERROR, RUN_FAILURE_BUDGET_EXHAUSTED, budget=budget)
-        if not extra:
-            return outcome
+        state.fallback_reason = RUN_FAILURE_BUDGET_EXHAUSTED
+        return self._failed(state, _STATUS_ERROR, RUN_FAILURE_BUDGET_EXHAUSTED, budget=budget)
+
+    def _inside_reserve(self, run: Any) -> bool:
+        """Whether less than the delivery reserve is left before the total deadline (R3)."""
+
+        return run.remaining < self._budget.delivery_reserve_seconds
+
+    def _reserve_reached(self, state: _RunState, boundary: str) -> RunOutcome:
+        """The outcome of a run stopped at *boundary* inside the reserve (R3, AC17).
+
+        ``error`` with ``failure: deadline_reserve``: the time left is the
+        terminal step's, so no model turn and no non-delivery action starts
+        in it, and the fallback follows once the loop has returned.
+        """
+
+        self._diagnose(f"brain run: delivery reserve reached before the next {boundary}")
+        state.fallback_reason = RUN_FAILURE_DEADLINE_RESERVE
+        return self._failed(state, _STATUS_ERROR, RUN_FAILURE_DEADLINE_RESERVE)
+
+    # -- the generic fallback (R3) ----------------------------------------- #
+
+    async def _fallback_outcome(
+        self, run: Any, message: _Message, state: _RunState, outcome: RunOutcome
+    ) -> RunOutcome:
+        """Apply the fallback policy to a loop that ended on *outcome* (R3).
+
+        The run's ``status`` stays the failure status the loop ended with;
+        ``fallback`` reports what the policy did (``sent``, or the
+        ``skipped:<reason>`` that kept it from sending), ``deliveries``
+        carries one outcome per entry when the text went through the list,
+        and ``delivery`` then reads ``fallback:<summary>`` so a fallback is
+        never mistaken for a delivered answer. A skipped fallback leaves
+        ``delivery`` at ``not_attempted`` and ``deliveries`` empty: no entry
+        was reached.
+        """
+
+        entries = self._delivery_for(message.platform, message.channel_id)
+        deliveries = await self._fallback(
+            run, entries, state, message.recipient, state.fallback_reason or ""
+        )
+        correlation: dict[str, Any] = {**outcome.correlation, **state.correlation()}
+        delivery = outcome.delivery
+        if deliveries:
+            summary = _delivery_summary([item.status for item in deliveries])
+            delivery = f"{FALLBACK_DELIVERY_PREFIX}{summary}"
+            correlation["deliveries"] = [item.record() for item in deliveries]
+            correlation["delivery"] = delivery
+            _note_delivery_error(correlation, deliveries)
         return RunOutcome(
             status=outcome.status,
-            delivery=outcome.delivery,
-            model_calls=outcome.model_calls,
-            correlation={**outcome.correlation, **extra},
+            delivery=delivery,
+            model_calls=state.model_calls,
+            sends=_confirmed_sends(deliveries),
+            correlation=correlation,
         )
+
+    async def _fallback(
+        self,
+        run: Any,
+        entries: Sequence[_DeliveryEntry],
+        state: _RunState,
+        recipient: _Recipient,
+        reason: str,
+    ) -> tuple[_Delivery, ...]:
+        """Deliver ``fallback.text`` through *entries*, or skip for a named reason (R3).
+
+        Runs when a run ends without a delivered final response because of
+        *reason* — a spent budget, the delivery reserve or a queued
+        ``stale_drop``. :meth:`_fallback_skip_reason` decides first, without
+        an executor call, whether anything may be sent; when it may, the text
+        goes through :meth:`_deliver_all` exactly as a final response would —
+        same principal, call ids continuing the run's counter, each entry
+        counted against ``max_action_calls`` and skipped by name when the
+        calls or the deadline run out midway — and ``fallback`` reads
+        ``sent``. The entries are returned; a skipped fallback returns none,
+        with ``state.fallback`` naming why. *run* is the run's context, or
+        the :class:`_StaleRun` the stale-drop hook builds: neither is
+        checkpointed here, since the fallback is what a spent budget is
+        answered with.
+        """
+
+        skip = self._fallback_skip_reason(run, entries, state, recipient)
+        if skip is not None:
+            state.fallback = skip
+            self._diagnose(f"brain fallback: {skip} after {reason}")
+            return ()
+        deliveries = await self._deliver_all(
+            run,
+            self._settings.fallback.text,
+            entries,
+            recipient=recipient,
+            next_call_index=state.next_call,
+            calls_left=state.calls_left(self._budget),
+        )
+        state.account(deliveries)
+        state.fallback = FALLBACK_SENT
+        return deliveries
+
+    def _fallback_skip_reason(
+        self,
+        run: Any,
+        entries: Sequence[_DeliveryEntry],
+        state: _RunState,
+        recipient: _Recipient,
+    ) -> str | None:
+        """Why nothing is sent, or ``None`` when the fallback may go out (R3).
+
+        In this order: the policy is disabled; no entry of the list has an
+        applicable rule — each evaluated on its own scope through the
+        authorized view, exactly as the offered tools are, so a list none of
+        whose entries a rule permits costs 0 executor calls; the total
+        deadline has passed, after which nothing is sent; no action call is
+        left. Synchronous on purpose: the stale-drop hook answers with it
+        when the budget it was handed is already spent, since an awaitable
+        would be abandoned before it could report.
+        """
+
+        if not self._settings.fallback.enabled:
+            return FALLBACK_SKIPPED_DISABLED
+        if not self._any_authorized(entries, recipient):
+            return FALLBACK_SKIPPED_NOT_AUTHORIZED
+        if run.remaining <= 0:
+            return FALLBACK_SKIPPED_DEADLINE_EXCEEDED
+        if state.calls_left(self._budget) <= 0:
+            return FALLBACK_SKIPPED_BUDGET_EXHAUSTED
+        return None
+
+    def _any_authorized(self, entries: Sequence[_DeliveryEntry], recipient: _Recipient) -> bool:
+        """Whether at least one entry is in the authorized view of its own scope (R5)."""
+
+        for entry in entries:
+            destination = entry.destination_for(recipient.platform, recipient.channel_id)
+            try:
+                view = self._actions.authorized(principal=PRINCIPAL, destination=destination)
+            except Exception:
+                self._diagnose("brain actions: authorized view unavailable")
+                continue
+            if entry.action in view:
+                return True
+        return False
+
+    def _on_stale_drop(self, work: Any, session_key: Any, remaining: float) -> Any:
+        """The scheduler's stale-drop hook: the fallback for a work no run took (R3, AC19).
+
+        Called by the scheduler exactly once per ``stale_drop``, with the
+        work, its session and the total budget left, after it wrote the
+        record and before it publishes ``brain.run.completed``; what is
+        returned rides in that trace. The destination is the session's
+        channel, the list its resolved delivery list, the budget a
+        :class:`_StaleRun` deadline built from *remaining* — never a run
+        context, since none exists. The stale text is never answered: only
+        ``fallback.text`` goes out, under the same conditions as any
+        fallback. A budget already spent, a disabled policy or a list no
+        rule permits is answered synchronously, so the report lands even
+        when the scheduler would abandon an awaitable at once.
+        """
+
+        key = session_key if isinstance(session_key, SessionKey) else None
+        if key is None:
+            self._diagnose("brain fallback: stale drop without a session key")
+            return {"fallback": FALLBACK_SKIPPED_NOT_AUTHORIZED, "deliveries": []}
+        stale = _StaleRun(work=work, key=key, remaining=remaining, clock=self._clock)
+        entries = self._delivery_for(key.platform, key.channel_id)
+        recipient = _recipient_of(work, key)
+        state = _RunState()
+        skip = self._fallback_skip_reason(stale, entries, state, recipient)
+        if skip is not None:
+            state.fallback = skip
+            self._diagnose(f"brain fallback: {skip} after {FALLBACK_REASON_STALE_DROP}")
+            return {**state.correlation(), "sends": 0, "deliveries": []}
+        return self._stale_fallback(stale, entries, state, recipient)
+
+    async def _stale_fallback(
+        self,
+        stale: _StaleRun,
+        entries: Sequence[_DeliveryEntry],
+        state: _RunState,
+        recipient: _Recipient,
+    ) -> dict[str, Any]:
+        """Deliver the stale-drop fallback; the correlation the scheduler merges.
+
+        ``sends`` carries the confirmed sends the handle counted, so the
+        drop's record and ``brain.run.completed`` report them exactly as a
+        run's would; ``delivery`` fills the record's own field.
+        """
+
+        deliveries = await self._fallback(
+            stale, entries, state, recipient, FALLBACK_REASON_STALE_DROP
+        )
+        correlation: dict[str, Any] = {
+            **state.correlation(),
+            "sends": stale.sends,
+            "deliveries": [item.record() for item in deliveries],
+        }
+        if deliveries:
+            summary = _delivery_summary([item.status for item in deliveries])
+            correlation["delivery"] = f"{FALLBACK_DELIVERY_PREFIX}{summary}"
+            _note_delivery_error(correlation, deliveries)
+        return correlation
 
     def _compose(
         self,
@@ -2543,31 +3023,49 @@ class BrainModule:
         text: str,
         entries: Sequence[_DeliveryEntry],
         *,
+        recipient: _Recipient,
         next_call_index: int,
+        calls_left: int,
     ) -> tuple[_Delivery, ...]:
         """The terminal step: every entry, in order, whatever the previous outcomes.
 
-        One executor call per entry — destination ``(run platform, run
-        channel_id, the scope the entry declares for that channel)``, read
-        from the run's message, principal :data:`PRINCIPAL`, the run's identities,
+        One executor call per entry — destination ``(recipient platform,
+        recipient channel_id, the scope the entry declares for that
+        channel)``, principal :data:`PRINCIPAL`, the run's identities,
         ``call_id`` continuing the run's counter from *next_call_index*,
         deadline ``min(now + action_seconds, total deadline)`` taken when
         that entry starts — with its own explicit observation. An entry that
         fails, is refused or stays uncertain never drops the ones after it
         (R1); a call that cannot even be built is an ``error`` entry, so the
-        list's accounting stays complete. Each confirmed send — a text entry
-        ended ``success`` — is noted on the run as soon as it is observed,
-        so a cancellation that lands on a later entry (the shutdown ending
-        the run) still leaves the sends already made in the run's record.
-        Cancellation propagates.
+        list's accounting stays complete. An entry reached at or after the
+        total deadline is not invoked and recorded
+        ``skipped:deadline_exceeded`` — nothing is sent after the deadline
+        — and one for which none of *calls_left* action calls remains is
+        recorded ``skipped:budget_exhausted`` (R3); neither takes a call id,
+        and the entries before them keep their own outcomes. Each confirmed
+        send — a text entry ended ``success`` — is noted on the run as soon
+        as it is observed, so a cancellation that lands on a later entry
+        (the shutdown ending the run) still leaves the sends already made in
+        the run's record. Cancellation propagates.
         """
 
-        message = _message_of_work(run.work)
         deliveries: list[_Delivery] = []
-        for offset, entry in enumerate(entries):
-            call_id = f"{run.run_id}/call-{next_call_index + offset}"
+        invoked = 0
+        for entry in entries:
+            if run.now >= run.total_deadline:
+                deliveries.append(
+                    _Delivery(entry=entry, status=DELIVERY_SKIPPED_DEADLINE_EXCEEDED)
+                )
+                continue
+            if invoked >= calls_left:
+                deliveries.append(
+                    _Delivery(entry=entry, status=DELIVERY_SKIPPED_BUDGET_EXHAUSTED)
+                )
+                continue
+            call_id = f"{run.run_id}/call-{next_call_index + invoked}"
+            invoked += 1
             try:
-                call = self._delivery_call(run, message, entry, text, call_id)
+                call = self._delivery_call(run, recipient, entry, text, call_id)
             except Exception:
                 self._diagnose("brain delivery: call could not be built")
                 observation = _synthetic_observation(
@@ -2577,11 +3075,18 @@ class BrainModule:
                 observation = await self._invoke(call, step="delivery")
             if entry.receives_text and observation.status == _STATUS_SUCCESS:
                 run.note_send()
-            deliveries.append(_Delivery(entry=entry, call_id=call_id, observation=observation))
+            deliveries.append(
+                _Delivery(
+                    entry=entry,
+                    status=observation.status,
+                    call_id=call_id,
+                    observation=observation,
+                )
+            )
         return tuple(deliveries)
 
     def _delivery_call(
-        self, run: Any, message: _Message, entry: _DeliveryEntry, text: str, call_id: str
+        self, run: Any, recipient: _Recipient, entry: _DeliveryEntry, text: str, call_id: str
     ) -> ActionCall:
         """One delivery entry's call, bounded by the run's budget."""
 
@@ -2593,10 +3098,10 @@ class BrainModule:
             run_id=run.run_id,
             call_id=call_id,
             source_event_id=run.work.source_event_id,
-            destination=entry.destination_for(message.platform, message.channel_id),
+            destination=entry.destination_for(recipient.platform, recipient.channel_id),
             principal=PRINCIPAL,
             deadline=min(run.now + self._budget.action_seconds, run.total_deadline),
-            message_id=message.message_id,
+            message_id=recipient.message_id,
         )
 
     async def _invoke(self, call: ActionCall, *, step: str) -> ActionObservation:

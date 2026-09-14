@@ -82,6 +82,8 @@ from modules.brain import _Settings as brain_settings
 from modules.brain import (
     CHAT_SCOPE,
     DELIVERY_NOT_ATTEMPTED,
+    FALLBACK_DELIVERY_PREFIX,
+    FALLBACK_SENT,
     TRACE_DELIVERY_RESOLVED,
     KNOWN_CAPABILITIES,
     MODULE_NAME,
@@ -1700,6 +1702,12 @@ async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
     budget_exhausted``, ``budget: max_tokens`` with the ``tokens`` and
     ``tokens_estimated`` the run counted (AC15) — which supersedes the
     phase-0 ``token_budget_exceeded`` failure name this test asserted.
+    A spent token budget is a run ending without a delivered final
+    response because of budget exhaustion, so the generic fallback follows
+    (R3, AC13): ``fallback.text`` is the run's one send, ``fallback ==
+    "sent"``, ``delivery == "fallback:success"`` and the ``status`` stays
+    ``error`` — which supersedes the phase-0 ``not_attempted`` delivery and
+    0 sends this test asserted before the fallback existed.
     """
 
     harness = await activate_with(
@@ -1710,13 +1718,19 @@ async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
         await harness.send(message_id="over")
         (over,) = await harness.completed(1)
         assert over.status == "error"
-        assert over.delivery == DELIVERY_NOT_ATTEMPTED
-        assert harness.transport.sends == []
+        assert over.delivery == FALLBACK_DELIVERY_PREFIX + "success"
+        assert over.sends == 1
+        (send,) = harness.transport.sends
+        assert send["text"] == POLICY["fallback"]["text"]
+        assert send["source_event_id"] == "over"
         (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["status"] == "error"
         assert completed["payload"]["failure"] == "budget_exhausted"
         assert completed["payload"]["budget"] == "max_tokens"
         assert completed["payload"]["tokens"] == 9000
         assert completed["payload"]["tokens_estimated"] is False
+        assert completed["payload"]["fallback"] == FALLBACK_SENT
+        assert completed["payload"]["delivery"] == FALLBACK_DELIVERY_PREFIX + "success"
         request = harness.requests()[0]
         assert 0 < request["json"]["max_tokens"] < LIMITS["budget"]["max_tokens"]
         assert harness.diagnostics == ["brain model response: token budget exceeded"]
@@ -1731,11 +1745,15 @@ async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
         (record,) = await tiny.completed()
         assert record.status == "error"
         assert record.model_calls == 0
+        assert record.sends == 1
+        assert record.delivery == FALLBACK_DELIVERY_PREFIX + "success"
+        assert [send["text"] for send in tiny.transport.sends] == [POLICY["fallback"]["text"]]
         assert tiny.requests() == []
         assert tiny.diagnostics == ["brain run: prompt exceeds the token budget"]
         completed = tiny.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
         assert (completed["failure"], completed["budget"]) == ("budget_exhausted", "max_tokens")
         assert completed["tokens"] > 8 and completed["tokens_estimated"] is True
+        assert completed["fallback"] == FALLBACK_SENT
     finally:
         await tiny.close()
 

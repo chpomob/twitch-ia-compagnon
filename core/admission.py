@@ -29,7 +29,9 @@ to.
 
 A wait deadline reached before a worker picks the work up ends it in terminal
 status ``timeout`` with reason ``stale_drop``, traced with its waited duration
-and counted, having produced 0 model calls and 0 sends (AC8). Expiry is
+and counted, having produced 0 model calls and 0 sends of its own (AC8) — the
+sends its ``on_stale_drop`` hook confirms, below, are the only ones such a
+record ever carries. Expiry is
 detected by a reaper rather than at dequeue, because with every worker busy the
 work would otherwise sit in the queue unexamined and outlive its own deadline.
 
@@ -85,7 +87,10 @@ stale sweep — and the items of one sweep run their hooks side by side, at most
 ``stale_drop_concurrency`` at once, so one hook holding its budget never
 spends another item's. A mapping it returns is merged into the record's
 correlation (``fallback``, ``deliveries``, …; ``delivery`` fills the record's
-own delivery field); an exception it raises is counted under
+own delivery field and ``sends``, a non-negative count of confirmed sends,
+its own sends field — the record was written with 0 before the hook ran, and
+a fallback that went out is a send like any other); an exception it raises
+is counted under
 :data:`COUNTER_STALE_DROP_HOOK_FAILURES` and diagnosed in the trace, never
 raised, and the ``stale_drop`` record stands either way.
 
@@ -1392,10 +1397,13 @@ class AdmissionScheduler:
     def _merge_stale_drop_result(self, record: RunRecord, value: Any) -> dict[str, Any]:
         """Adopt a mapping the hook returned; anything else reports nothing.
 
-        ``delivery`` is the record's own field and fills it when it is a text;
-        the other keys join the record's correlation and the trace, minus the
-        standard fields a hook may not overwrite, exactly as a run body's
-        correlation is merged in :meth:`_complete`.
+        ``delivery`` and ``sends`` are the record's own fields: the first
+        fills it when it is a text, the second — the confirmed sends the
+        hook's fallback made — when it is a non-negative integer, since the
+        ``stale_drop`` record was written with 0 sends before the hook ran.
+        The other keys join the record's correlation and the trace, minus
+        the standard fields a hook may not overwrite, exactly as a run
+        body's correlation is merged in :meth:`_complete`.
         """
 
         if not isinstance(value, Mapping):
@@ -1405,6 +1413,10 @@ class AdmissionScheduler:
             if key == "delivery":
                 if isinstance(entry, str) and entry.strip():
                     record.delivery = entry
+                continue
+            if key == "sends":
+                if isinstance(entry, int) and not isinstance(entry, bool) and entry >= 0:
+                    record.sends = entry
                 continue
             if key in _RESERVED_TRACE_FIELDS:
                 continue
