@@ -1,0 +1,143 @@
+# Screen capture into the run-leased attachment store — manifest v2 (R5, R4).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no grant lives here. Declaring
+# `screen.capture` records the action in the loader's *discovered* view; only
+# an explicit authorization rule ever offers it (R5, AC30): without one, no
+# capture takes place and no process is spawned. The action is a `read` on
+# the `capture` scope of any platform and any channel: which screen, window
+# or region is captured is the business of the configured *source*, never of
+# the brain and never of a platform, so no platform name appears here.
+
+name: capture
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# A capture is action-driven: the brain asks for one observation when it needs
+# it, the module acquires it and returns a reference. Nothing is captured in
+# the background and nothing is published: the module produces and consumes
+# no event.
+produces: []
+consumes: []
+middleware: false
+
+# No lifecycle role: the handle takes part in `prepare` (check every
+# configured source, bind the provider, mark ready) and in `close` (withdraw
+# readiness) and in nothing else (R4). A source that is not readable or
+# executable at `prepare` leaves the module not ready and is reported as
+# `module.degraded` naming the source (AC29).
+lifecycle:
+  roles: []
+
+# The sources this module may capture from, which one is used when the call
+# names none, and the byte bound every capture is held to (R5, R6). The
+# shapes inside `sources` — `{kind: file, path}` or `{kind: command, argv[],
+# command_timeout_seconds}` — are checked by the declared hook, one
+# diagnostic per field, value-free: no path and no argv is ever echoed. The
+# reserved `limits` block the entry point hands every enabled module is
+# accepted and not read: this module owns its own bound.
+settings_schema:
+  type: object
+  properties:
+    sources:
+      type: object
+      description: >-
+        The named capture sources. A `file` source (`kind: file`, `path`) is
+        re-read at each call; a `command` source (`kind: command`, `argv`,
+        optional `command_timeout_seconds`, default 5) runs the configured
+        program and takes the PNG or JPEG it writes on stdout, killed once
+        the timeout expires.
+    default_source:
+      type: string
+      description: The source a call that names none captures from.
+    max_bytes:
+      type: integer
+      minimum: 1
+      description: >-
+        The most bytes one capture may weigh; a larger one is refused
+        `attachment_refused` with nothing stored. Default 5242880.
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point to every
+        enabled module. Not read here: this module owns its own bound.
+  required:
+    - sources
+    - default_source
+settings_validator: validate_settings
+
+# Nothing here is a credential.
+credentials: []
+
+# The `screen.capture` contract (R5, R4). The optional `source` names a
+# configured source; the result states which source served, what was stored
+# and when, and the observation carries exactly one `image_ref` part — a
+# reference into the run-leased store, never bytes and never a path. A
+# `read` carries no delivery capability.
+actions:
+  - name: screen.capture
+    version: 1
+    description: >-
+      Capture one image from a configured source into the run's attachment
+      store and return its reference with the content type and dimensions
+      sniffed from the bytes.
+    argument_schema:
+      type: object
+      properties:
+        source:
+          type: string
+          description: >-
+            The configured source to capture from; omit it for the
+            configured default.
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        source:
+          type: string
+          description: The name of the source that served the capture.
+        content_type:
+          type: string
+          enum:
+            - image/png
+            - image/jpeg
+          description: The content type sniffed from the captured bytes.
+        width:
+          type: integer
+          minimum: 1
+          description: The image width read from its header, in pixels.
+        height:
+          type: integer
+          minimum: 1
+          description: The image height read from its header, in pixels.
+        size:
+          type: integer
+          minimum: 1
+          description: The bytes the store retains for this capture.
+        captured_at:
+          type: number
+          description: When the bytes were acquired, on the runtime clock.
+      required:
+        - source
+        - content_type
+        - width
+        - height
+        - size
+        - captured_at
+      additionalProperties: false
+    nature: read
+    required_permissions:
+      - screen.capture
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: capture
+    # A file read or one bounded command, plus the store. A `command` source
+    # declaring a longer `command_timeout_seconds` is cut by this budget
+    # first, as an executor `timeout` rather than a `capture_timed_out`.
+    timeout_seconds: 10
+    # Two captures are two observations of a moving screen: neither a key
+    # nor nature makes a repeat equivalent to the first.
+    idempotency: none

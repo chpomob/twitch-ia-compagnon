@@ -40,6 +40,7 @@ modules = ["*/module.yaml"]
 "modules.audit" = ["module.yaml"]
 "modules.chat_context" = ["module.yaml"]
 "modules.users" = ["module.yaml"]
+"modules.capture" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
