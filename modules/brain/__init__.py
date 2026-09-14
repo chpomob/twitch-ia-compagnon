@@ -63,12 +63,32 @@ provider allocated under a run identity are released when the scheduler
 writes that run's terminal record — success, error, expiry or cancellation —
 rather than surviving until a time-to-live (R6, AC23, AC31).
 
+**Backend adapter** (R2). One :class:`_ModelAdapter` speaks the Chat
+Completions format to the configured ``endpoint``, ``model`` and ``api_key``
+and nothing else. The offered actions are sent as tool definitions (name,
+description, argument schema); the answer is classified per decision 2 —
+exactly one tool call is a proposal, text with no tool call the final
+response, anything else an unsupported shape that ends the run ``error``
+with 0 actions — and never guessed from prose. At ``prepare``, before the
+readiness barrier, the adapter probes each capability of
+``capabilities.required`` with one bounded request (decision 3): a forced
+call on :data:`~core.contracts.PROBE_TOOL`, and the same with one 1×1 PNG
+image part for ``vision``; a capability not verified stops startup with
+``module 'brain': backend capability '<name>' not verified: <reason>`` —
+never the key, the endpoint or a body — and leaves the module not ready. The
+verified set is :attr:`BrainModule.verified_capabilities`. An ``image_ref``
+part is read from the attachment store and encoded only while a request body
+is built: the bytes exist in that body and nowhere else (AC12).
+
 **The run** (R5, R8). One admitted work is exactly one model call and exactly
 one delivery through the :class:`~core.actions.ActionExecutor`: the model's
-plain-text reply becomes a single ``chat.write`` call whose explicit
+final text becomes a single ``chat.write`` call whose explicit
 :class:`~core.contracts.ActionObservation` is the delivery outcome (AC19). The
 model is offered only the registry's *authorized* action view for the reply's
-destination, read afresh for every run. The ``budget.max_tokens`` limit is the
+destination, read afresh for every run and sent as tools; a proposal is
+classified but not executed by this single-turn body, which ends the run
+explicitly (the agentic loop that executes proposals is the next step's).
+The ``budget.max_tokens`` limit is the
 run's cumulative input + output bound (design §3.4): the prompt is composed
 inside it — history is dropped oldest-first to fit, and a prompt that leaves no
 room for a reply ends the run before the model is reached — the remaining room
@@ -98,7 +118,9 @@ something it did not (R5).
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
+import json
 import math
 import re
 import sys
@@ -111,8 +133,19 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from core.admission import AdmissionScheduler, RunOutcome, Work
+from core.attachments import AttachmentExpired
 from core.contracts import (
+    BRAIN_ERROR_ATTACHMENT_EXPIRED,
     DELIVERY_NO_TEXT_ARGUMENT,
+    PROBE_REASON_IMAGE_REJECTED,
+    PROBE_REASON_MALFORMED_ARGUMENTS,
+    PROBE_REASON_MULTIPLE_TOOL_CALLS,
+    PROBE_REASON_NO_TOOL_CALL,
+    PROBE_REASON_NON_SUCCESS_STATUS,
+    PROBE_REASON_TIMED_OUT,
+    PROBE_REASON_TRANSPORT_FAILED,
+    PROBE_TOOL,
+    RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
     TERMINAL_STATUSES,
     ActionCall,
     ActionObservation,
@@ -1106,6 +1139,17 @@ class BrainModule:
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleeper if sleeper is not None else asyncio.sleep
         )
+        self._adapter = _ModelAdapter(
+            session,
+            settings,
+            runtime.clock,
+            runtime.attachments,
+            reporter,
+            sleeper=self._sleep,
+        )
+        #: The backend capabilities the prepare-time probe verified (R2);
+        #: empty until ``prepare`` succeeded.
+        self.verified_capabilities: frozenset[str] = frozenset()
         self._memory = ConversationMemory(
             clock=runtime.clock,
             **{
@@ -1167,20 +1211,43 @@ class BrainModule:
     # -- startup phases ---------------------------------------------------- #
 
     async def prepare(self) -> None:
-        """Start the owned scheduler and register the consumer. No input yet.
+        """Probe the backend, start the owned scheduler, register the consumer.
 
-        A scheduler shared through the context is started and closed by its
-        owner. The consumer is routed before any producer may publish into it,
-        and only then is the module marked past the barrier.
+        The required capabilities are verified first (R2, decision 3): a
+        capability the backend does not verify raises, reports the module
+        ``degraded`` with the same value-free reason and leaves everything
+        else untouched — no scheduler started, no consumer routed, no
+        ``mark_ready`` — so startup stops naming the capability and no
+        scenario runs. A scheduler shared through the context is started and
+        closed by its owner. The consumer is routed before any producer may
+        publish into it, and only then is the module marked past the barrier.
         """
 
         if self._prepared or self._closed:
             return
+        try:
+            self.verified_capabilities = await self._adapter.probe(self._settings.capabilities)
+        except BrainModuleError as failure:
+            await self._report_degraded(str(failure))
+            raise
         if self._owns_scheduler:
             await self._scheduler.start()
         self._bus.subscribe(_INPUT_EVENT, self.handle_chat_message)
         self._actions.mark_ready()
         self._prepared = True
+
+    async def _report_degraded(self, reason: str) -> None:
+        """Report the module ``degraded`` with *reason* when the surface has it."""
+
+        degraded = getattr(self._supervision, "degraded", None)
+        if not callable(degraded):
+            return
+        try:
+            await _resolve(degraded(reason=reason))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._diagnose("brain health: degraded report failed")
 
     # -- ingestion: validate, copy, admit, return (R2) --------------------- #
 
@@ -1293,17 +1360,42 @@ class BrainModule:
 
         run.checkpoint()
         run.note_model_call()
-        result = await self._request_model(
+        result = await self._adapter._request_model(
             prompt, budget_seconds=min(self._budget.model_call_seconds, run.remaining)
         )
-        reply = result.content
-        if reply is None:
+        if result.failure is not None:
             return RunOutcome(
                 status=_STATUS_TIMEOUT if result.failure == "timed_out" else _STATUS_ERROR,
                 delivery=DELIVERY_NOT_ATTEMPTED,
                 model_calls=1,
                 correlation={"failure": result.failure, **result.usage()},
             )
+        classification = result.classification
+        if isinstance(classification, _Unsupported):
+            self._diagnose(f"brain model response: unsupported shape: {classification.reason}")
+            return RunOutcome(
+                status=_STATUS_ERROR,
+                delivery=DELIVERY_NOT_ATTEMPTED,
+                model_calls=1,
+                correlation={
+                    "failure": RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
+                    "shape": classification.reason,
+                    **result.usage(),
+                },
+            )
+        if not isinstance(classification, _Final):
+            # A proposal is classified here and executed by the agentic loop
+            # (P12); this single-turn body has no turn to feed the observation
+            # back into, so it ends the run explicitly rather than delivering
+            # a tool call as text or dropping it silently.
+            self._diagnose("brain model response: proposal not executed by the single-turn body")
+            return RunOutcome(
+                status=_STATUS_ERROR,
+                delivery=DELIVERY_NOT_ATTEMPTED,
+                model_calls=1,
+                correlation={"failure": "proposal_not_executed", **result.usage()},
+            )
+        reply = classification.text
 
         run.checkpoint()
         call = self._delivery_call(run, message, destination, reply)
@@ -1339,18 +1431,25 @@ class BrainModule:
     ) -> _Prompt | None:
         """The request messages inside the token budget, or ``None`` (§3.4).
 
-        The instructions and the viewer's message are mandatory; when their
-        estimate alone leaves the reply no room the prompt is not composed.
-        History is then added newest-first while the input stays within its
-        share of the budget, so an old exchange is dropped before the reply's
-        room is — and what the input leaves is the output cap the request
-        carries.
+        The instructions, the offered tool definitions and the viewer's
+        message are mandatory; when their estimate alone leaves the reply no
+        room the prompt is not composed. The tools count as input because the
+        backend reads them as such: a listing that used to be system text is
+        no lighter for travelling as ``tools``. History is then added
+        newest-first while the input stays within its share of the budget, so
+        an old exchange is dropped before the reply's room is — and what the
+        input leaves is the output cap the request carries.
         """
 
-        system = {"role": "system", "content": self._system_prompt(destination)}
+        system = {"role": "system", "content": self._system_prompt()}
         user = {"role": "user", "content": user_content}
+        tools = self._offered_tools(destination)
         limit = self._budget.max_tokens
-        input_tokens = _estimate_tokens(system["content"]) + _estimate_tokens(user_content)
+        input_tokens = (
+            _estimate_tokens(system["content"])
+            + _estimate_tokens(user_content)
+            + _estimate_tool_tokens(tools)
+        )
         if input_tokens >= limit:
             return None
         history_limit = int(limit * _HISTORY_TOKEN_SHARE)
@@ -1365,41 +1464,37 @@ class BrainModule:
         kept.reverse()
         return _Prompt(
             messages=[system, *kept, user],
+            tools=tools,
             input_tokens=input_tokens,
             output_tokens=limit - input_tokens,
         )
 
-    def _system_prompt(self, destination: Destination) -> str:
-        """The instructions, with the *authorized* action view and nothing more.
+    def _system_prompt(self) -> str:
+        """The instructions. The offered actions travel as tools, not as text.
 
-        The view is read for this run's destination and this module's
-        principal, afresh every run: an action authorized at the start of a
-        previous run is no permission now (R5). Declared or bound actions with
-        no applicable rule are not offered.
+        No ``[send:`` tag and no action listing: what the model may call is
+        the request's ``tools`` list (R2), and the reply is delivered by the
+        runtime, never by an encoding of the text.
         """
 
-        lines = [
-            "You are a live-stream chat companion.",
-            "Reply to the viewer's message with one short plain-text chat message.",
-            "Write the message body only: no tags, no markup, no instructions.",
-        ]
-        offered = self._authorized_actions(destination)
-        if offered:
-            lines.append("Actions authorized for this reply:")
-            lines.extend(
-                f"- {name}: {description}" for name, description in offered
+        return "\n".join(
+            (
+                "You are a live-stream chat companion.",
+                "Reply to the viewer's message with one short plain-text chat message.",
+                "Write the message body only: no tags, no markup, no instructions.",
             )
-        else:
-            lines.append("No action is authorized for this reply.")
-        return "\n".join(lines)
+        )
 
-    def _authorized_actions(self, destination: Destination) -> tuple[tuple[str, str], ...]:
-        """The registry's authorized view for this destination, by name.
+    def _offered_tools(self, destination: Destination) -> tuple[Any, ...]:
+        """The registry's authorized view for this destination, as specs.
 
         Read through the scoped facade the runtime hands every module, so the
         rules in force reach the model in production and not only under an
-        injected registry. A view that cannot be read offers nothing: default
-        deny expressed as a surface rather than a guess about the rules (R5).
+        injected registry, and afresh every run: an action authorized at the
+        start of a previous run is no permission now (R5). A view that cannot
+        be read offers nothing: default deny expressed as a surface rather
+        than a guess about the rules. The specs become the request's tool
+        definitions at request time.
         """
 
         try:
@@ -1407,13 +1502,13 @@ class BrainModule:
         except Exception:
             self._diagnose("brain actions: authorized view unavailable")
             return ()
-        offered: list[tuple[str, str]] = []
-        for name, spec in dict(view).items():
-            description = getattr(spec, "description", "")
-            if not isinstance(description, str):
-                description = ""
-            offered.append((str(name), description))
-        return tuple(sorted(offered))
+        offered = [
+            spec
+            for _name, spec in sorted(dict(view).items(), key=lambda item: str(item[0]))
+            if _is_text(getattr(spec, "name", None))
+            and isinstance(getattr(spec, "argument_schema", None), Mapping)
+        ]
+        return tuple(offered)
 
     def _delivery_call(
         self, run: Any, message: _Message, destination: Destination, reply: str
@@ -1512,91 +1607,6 @@ class BrainModule:
             self._memory.clear()
             await _close_session(self._session)
 
-    # -- the model call ---------------------------------------------------- #
-
-    async def _request_model(
-        self, prompt: _Prompt, *, budget_seconds: float
-    ) -> _ModelReply:
-        """One request bounded in time and in tokens (§3.4).
-
-        The room the prompt leaves inside ``budget.max_tokens`` is sent as the
-        request's ``max_tokens``; the run's total is then read from the
-        backend's ``usage`` when it reports one and estimated — and reported
-        as estimated — when it does not. A reply that puts the total over the
-        bound is a failure, not a longer answer. Exception text and response
-        bodies can contain credentials or prompt content, so neither is copied
-        into diagnostics or into the outcome.
-        """
-
-        async def perform() -> _ModelReply:
-            response: Any | None = None
-            try:
-                response = await _resolve(
-                    self._session.post(
-                        self._settings.endpoint,
-                        headers={
-                            "Authorization": f"Bearer {self._settings.api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": self._settings.model,
-                            "messages": prompt.messages,
-                            "max_tokens": prompt.output_tokens,
-                        },
-                    )
-                )
-                status = getattr(response, "status", None)
-                if (
-                    not isinstance(status, int)
-                    or isinstance(status, bool)
-                    or not 200 <= status < 300
-                ):
-                    raise _NonSuccessResponse
-                try:
-                    body = await _resolve(response.json())
-                except asyncio.CancelledError:
-                    raise
-                except (asyncio.TimeoutError, TimeoutError):
-                    raise
-                except Exception:
-                    raise _MalformedResponse from None
-                content = _response_content(body)
-                reported = _response_usage(body)
-                estimated = reported is None
-                tokens = (
-                    prompt.input_tokens + _estimate_tokens(content)
-                    if reported is None
-                    else reported
-                )
-                if tokens > self._budget.max_tokens:
-                    raise _OverBudgetResponse(tokens, estimated)
-                return _ModelReply(content=content, tokens=tokens, estimated=estimated)
-            finally:
-                if response is not None:
-                    await _release_response(response)
-
-        try:
-            return await asyncio.wait_for(perform(), timeout=max(budget_seconds, 0.0))
-        except asyncio.CancelledError:
-            raise
-        except (asyncio.TimeoutError, TimeoutError):
-            self._diagnose("brain model request: timed out")
-            return _ModelReply(failure="timed_out")
-        except _NonSuccessResponse:
-            self._diagnose("brain model response: non-success status")
-            return _ModelReply(failure="non_success_status")
-        except _MalformedResponse:
-            self._diagnose("brain model response: malformed data")
-            return _ModelReply(failure="malformed_response")
-        except _OverBudgetResponse as over:
-            self._diagnose("brain model response: token budget exceeded")
-            return _ModelReply(
-                failure="token_budget_exceeded", tokens=over.tokens, estimated=over.estimated
-            )
-        except Exception:
-            self._diagnose("brain model request: transport failed")
-            return _ModelReply(failure="transport_failed")
-
     def _release_run(self, run_id: str) -> None:
         """Free every attachment leased under *run_id*; idempotent (R6).
 
@@ -1618,6 +1628,125 @@ class BrainModule:
         _safe_report(self._reporter, message)
 
 
+# --------------------------------------------------------------------------- #
+# The model adapter (R2)
+# --------------------------------------------------------------------------- #
+
+_PART_TEXT = "text"
+_PART_IMAGE_REF = "image_ref"
+_PART_IMAGE_URL = "image_url"
+
+_TOOL_CHOICE_AUTO = "auto"
+
+# The 1×1 opaque PNG the image probe carries (decision 3): constant bytes, so
+# the probe needs no store and no capture, and the one image part it sends is
+# the same on every activation.
+_PROBE_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
+    "de0000000c49444154789c63606060000000040001f61738550000000049454e"
+    "44ae426082"
+)
+_PROBE_MAX_TOKENS = 256
+_PROBE_INSTRUCTION = f"Call the {PROBE_TOOL} tool with ok set to true."
+_PROBE_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": PROBE_TOOL,
+        "description": "Confirms that the backend performs a forced tool call.",
+        "parameters": {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        },
+    },
+}
+_PROBE_TOOL_CHOICE: dict[str, Any] = {
+    "type": "function",
+    "function": {"name": PROBE_TOOL},
+}
+
+# Why a response shape is unsupported (decision 2). ``malformed_body`` covers a
+# 2xx body that is not a Chat Completions message at all — no choice, no
+# message — which is "neither a tool call nor text" as much as an empty one.
+_UNSUPPORTED_MULTIPLE_TOOL_CALLS = "multiple_tool_calls"
+_UNSUPPORTED_TOOL_CALL_WITH_TEXT = "tool_call_with_text"
+_UNSUPPORTED_MALFORMED_TOOL_CALL = "malformed_tool_call"
+_UNSUPPORTED_NO_CONTENT = "no_content"
+_UNSUPPORTED_MALFORMED_BODY = "malformed_body"
+
+# Failures of a request whose image part could not be read from the store.
+_FAILURE_ATTACHMENT_UNAVAILABLE = "attachment_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class _Proposal:
+    """Exactly one tool call: an action proposal (decision 2).
+
+    ``raw_arguments`` is what the backend sent — a JSON string as the format
+    specifies, or whatever else it put there — decoded by the consumer, so a
+    proposal whose arguments are not a JSON object is still a proposal here
+    and a ``malformed_arguments`` observation there.
+    """
+
+    name: str
+    raw_arguments: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _Final:
+    """Text content and no tool call: the final response (decision 2)."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Unsupported:
+    """Anything else: ≥ 2 tool calls, a tool call with text, neither."""
+
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Prompt:
+    """The composed request: messages, offered tools, the token room left.
+
+    ``messages`` may carry list content whose parts are ``text`` or
+    ``image_ref`` (an :class:`~core.contracts.ActionObservation` part, by
+    ``attachment_id``); the reference is all this object ever holds — the
+    bytes are read and encoded by the adapter for the request and nowhere
+    else (R2, AC12). ``tools`` are the offered action specs, rendered as tool
+    definitions at request time.
+    """
+
+    messages: list[dict[str, Any]]
+    tools: tuple[Any, ...] = ()
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelReply:
+    """One model call's result: a classified reply or a failure, with usage.
+
+    ``tokens`` is the run's total as the backend reported it, or as it was
+    estimated when the backend reported none — ``estimated`` says which, so a
+    trace never presents an estimate as a measurement. It is ``None`` when the
+    call ended with nothing to count.
+    """
+
+    classification: _Proposal | _Final | _Unsupported | None = None
+    tokens: int | None = None
+    estimated: bool = False
+    failure: str | None = None
+
+    def usage(self) -> dict[str, Any]:
+        """The correlation entries this result contributes to the outcome."""
+
+        if self.tokens is None:
+            return {}
+        return {"tokens": self.tokens, "tokens_estimated": self.estimated}
+
+
 class _NonSuccessResponse(Exception):
     pass
 
@@ -1635,36 +1764,459 @@ class _OverBudgetResponse(Exception):
         self.estimated = estimated
 
 
-@dataclass(frozen=True, slots=True)
-class _Prompt:
-    """The composed request and the token room it leaves for the reply."""
+class _ImageUnavailable(Exception):
+    """An ``image_ref`` part the store could not serve at request time."""
 
-    messages: list[dict[str, str]]
-    input_tokens: int
-    output_tokens: int
+    def __init__(self, failure: str) -> None:
+        super().__init__(failure)
+        self.failure = failure
 
 
-@dataclass(frozen=True, slots=True)
-class _ModelReply:
-    """One model call's result: a reply or a failure, with its token usage.
+class _ModelAdapter:
+    """The one Chat Completions adapter (R2): requests, probe, classification.
 
-    ``tokens`` is the run's total as the backend reported it, or as it was
-    estimated when the backend reported none — ``estimated`` says which, so a
-    trace never presents an estimate as a measurement. It is ``None`` when the
-    call ended with nothing to count.
+    It speaks to the configured endpoint and nothing else. A request is
+    ``{model, messages, tools[], tool_choice, max_tokens}``: the offered
+    actions become function tools, an ``image_ref`` part is resolved from the
+    attachment store and encoded as a data URL **while the request body is
+    built** — the encoded string is a local of that request, never copied
+    into a trace, an event, a diagnostic or the prompt object (AC12). The
+    answer is classified per decision 2 and never falls back: a backend that
+    ignored a forced ``tool_choice`` and answered in prose is ``no_tool_call``
+    at the probe and ``_Final`` in a run, not a proposal guessed from text.
+
+    Every failure path is value-free: exception text and response bodies can
+    contain the key or prompt content, so neither is copied anywhere.
     """
 
-    content: str | None = None
-    failure: str | None = None
-    tokens: int | None = None
-    estimated: bool = False
+    __slots__ = (
+        "_attachments",
+        "_budget",
+        "_clock",
+        "_reporter",
+        "_session",
+        "_settings",
+        "_sleep",
+    )
 
-    def usage(self) -> dict[str, Any]:
-        """The correlation entries this result contributes to the outcome."""
+    def __init__(
+        self,
+        session: Any,
+        settings: _Settings,
+        clock: Callable[[], float],
+        attachments: Any | None,
+        reporter: Callable[[str], None],
+        *,
+        sleeper: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        self._session = session
+        self._settings = settings
+        self._budget = settings.budget
+        self._clock = clock
+        self._attachments = attachments
+        self._reporter = reporter
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleeper if sleeper is not None else asyncio.sleep
+        )
 
-        if self.tokens is None:
-            return {}
-        return {"tokens": self.tokens, "tokens_estimated": self.estimated}
+    # -- classification (decision 2) --------------------------------------- #
+
+    @staticmethod
+    def classify(body: Any) -> _Proposal | _Final | _Unsupported:
+        """Classify one 2xx body; see :func:`_classify`."""
+
+        return _classify(body)
+
+    # -- the prepare-time probe (decision 3) ------------------------------- #
+
+    async def probe(self, required: Any) -> frozenset[str]:
+        """Verify every *required* capability with one bounded request each.
+
+        The forced call on :data:`~core.contracts.PROBE_TOOL` verifies
+        ``structured_output``; the same request carrying one 1×1 PNG image
+        part verifies ``vision``, and is only sent once the text probe
+        passed. The first capability not verified raises
+        :class:`BrainModuleError` naming it and the reason (R2), a message
+        built from constants alone — never the key, the endpoint or a body.
+        Returns the verified set.
+        """
+
+        verified: set[str] = set()
+        if CAPABILITY_STRUCTURED_OUTPUT in required:
+            await self._verify(CAPABILITY_STRUCTURED_OUTPUT, image=False)
+            verified.add(CAPABILITY_STRUCTURED_OUTPUT)
+        if CAPABILITY_VISION in required:
+            await self._verify(CAPABILITY_VISION, image=True)
+            verified.add(CAPABILITY_VISION)
+        return frozenset(verified)
+
+    async def _verify(self, capability: str, *, image: bool) -> None:
+        reason = await self._probe_reason(image=image)
+        if reason is not None:
+            self._diagnose(f"brain probe: capability '{capability}' not verified: {reason}")
+            raise BrainModuleError(
+                f"module '{MODULE_NAME}': backend capability '{capability}' "
+                f"not verified: {reason}"
+            )
+
+    async def _probe_reason(self, *, image: bool) -> str | None:
+        """One probe request; ``None`` when it verified, else the R2 reason."""
+
+        content: Any = _PROBE_INSTRUCTION
+        if image:
+            content = [
+                {"type": _PART_TEXT, "text": _PROBE_INSTRUCTION},
+                {"type": _PART_IMAGE_URL, "image_url": {"url": _data_url("image/png", _PROBE_PNG)}},
+            ]
+        body = {
+            "model": self._settings.model,
+            "messages": [{"role": "user", "content": content}],
+            "tools": [_PROBE_TOOL_SPEC],
+            "tool_choice": _PROBE_TOOL_CHOICE,
+            "max_tokens": _PROBE_MAX_TOKENS,
+        }
+        try:
+            answer = await self._bounded(self._post(body), self._budget.model_call_seconds)
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, TimeoutError):
+            return PROBE_REASON_TIMED_OUT
+        except _NonSuccessResponse:
+            return PROBE_REASON_NON_SUCCESS_STATUS
+        except _MalformedResponse:
+            # A 2xx that is not JSON is not the expected shape: no tool call.
+            return PROBE_REASON_NO_TOOL_CALL
+        except Exception:
+            return PROBE_REASON_TRANSPORT_FAILED
+
+        rejected = PROBE_REASON_IMAGE_REJECTED if image else PROBE_REASON_NO_TOOL_CALL
+        if image and _names_image_input(answer):
+            return PROBE_REASON_IMAGE_REJECTED
+        classification = _classify(answer)
+        if isinstance(classification, _Proposal):
+            if classification.name != PROBE_TOOL:
+                return rejected
+            if _decode_arguments(classification.raw_arguments) is None:
+                return PROBE_REASON_MALFORMED_ARGUMENTS
+            return None
+        if (
+            isinstance(classification, _Unsupported)
+            and classification.reason == _UNSUPPORTED_MULTIPLE_TOOL_CALLS
+        ):
+            return PROBE_REASON_MULTIPLE_TOOL_CALLS
+        # Prose, nothing, a call with text: the forced call was not honoured.
+        # For the image probe, sent only after the text probe passed, the
+        # image part is the one thing that changed, so it is what was refused.
+        return rejected
+
+    # -- the run's model call ---------------------------------------------- #
+
+    async def _request_model(self, prompt: _Prompt, *, budget_seconds: float) -> _ModelReply:
+        """One request bounded in time and in tokens (§3.4).
+
+        The room the prompt leaves inside ``budget.max_tokens`` is sent as the
+        request's ``max_tokens``; the run's total is then read from the
+        backend's ``usage`` when it reports one and estimated — and reported
+        as estimated — when it does not. A reply that puts the total over the
+        bound is a failure, not a longer answer. The time bound runs on the
+        injected sleeper, so a held backend times out on the clock the run
+        is scheduled by.
+        """
+
+        try:
+            body = self._request_body(prompt)
+        except _ImageUnavailable as unavailable:
+            self._diagnose("brain model request: image attachment unavailable")
+            return _ModelReply(failure=unavailable.failure)
+        try:
+            answer = await self._bounded(self._post(body), budget_seconds)
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, TimeoutError):
+            self._diagnose("brain model request: timed out")
+            return _ModelReply(failure="timed_out")
+        except _NonSuccessResponse:
+            self._diagnose("brain model response: non-success status")
+            return _ModelReply(failure="non_success_status")
+        except _MalformedResponse:
+            self._diagnose("brain model response: malformed data")
+            return _ModelReply(failure="malformed_response")
+        except Exception:
+            self._diagnose("brain model request: transport failed")
+            return _ModelReply(failure="transport_failed")
+        finally:
+            # The encoded image, if any, lived in this body and nowhere else.
+            del body
+
+        classification = _classify(answer)
+        if isinstance(classification, _Unsupported) and (
+            classification.reason == _UNSUPPORTED_MALFORMED_BODY
+        ):
+            self._diagnose("brain model response: malformed data")
+            return _ModelReply(failure="malformed_response")
+        reported = _response_usage(answer)
+        estimated = reported is None
+        tokens = (
+            prompt.input_tokens + _estimate_tokens(_classification_text(classification))
+            if reported is None
+            else reported
+        )
+        if tokens > self._budget.max_tokens:
+            self._diagnose("brain model response: token budget exceeded")
+            return _ModelReply(
+                failure="token_budget_exceeded", tokens=tokens, estimated=estimated
+            )
+        return _ModelReply(classification=classification, tokens=tokens, estimated=estimated)
+
+    def _request_body(self, prompt: _Prompt) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self._settings.model,
+            "messages": [self._encode_message(message) for message in prompt.messages],
+            "max_tokens": prompt.output_tokens,
+        }
+        if prompt.tools:
+            body["tools"] = [_tool_definition(spec) for spec in prompt.tools]
+            body["tool_choice"] = _TOOL_CHOICE_AUTO
+        return body
+
+    def _encode_message(self, message: Mapping[str, Any]) -> dict[str, Any]:
+        content = message.get("content")
+        if not isinstance(content, (list, tuple)):
+            return dict(message)
+        return {**message, "content": [self._encode_part(part) for part in content]}
+
+    def _encode_part(self, part: Any) -> Any:
+        if not isinstance(part, Mapping):
+            return part
+        kind = part.get("type")
+        if kind == _PART_TEXT:
+            return {"type": _PART_TEXT, "text": part.get("text", "")}
+        if kind == _PART_IMAGE_REF:
+            content_type, data = self._resolve_image(part.get("attachment_id"))
+            return {"type": _PART_IMAGE_URL, "image_url": {"url": _data_url(content_type, data)}}
+        return dict(part)
+
+    def _resolve_image(self, attachment_id: Any) -> tuple[str, bytes]:
+        """The bytes behind an ``image_ref``, read from the store now (R2).
+
+        Read at request time and never earlier: a lease that expired since
+        the observation was appended is ``attachment_expired`` here, not a
+        stale copy sent anyway. A store that does not hold the reference —
+        no store, released, never issued — is ``attachment_unavailable``.
+        """
+
+        store = self._attachments
+        if store is None or not isinstance(attachment_id, str):
+            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE)
+        try:
+            ref = store.lookup(attachment_id)
+        except Exception:
+            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE) from None
+        if ref is None:
+            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE)
+        if self._clock() >= ref.expires_at:
+            raise _ImageUnavailable(BRAIN_ERROR_ATTACHMENT_EXPIRED)
+        try:
+            data = store.get(ref)
+        except AttachmentExpired:
+            raise _ImageUnavailable(BRAIN_ERROR_ATTACHMENT_EXPIRED) from None
+        except Exception:
+            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE) from None
+        if not isinstance(data, (bytes, bytearray)):
+            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE)
+        return str(ref.content_type), bytes(data)
+
+    # -- the wire ---------------------------------------------------------- #
+
+    async def _post(self, body: Mapping[str, Any]) -> Any:
+        """POST *body*; the decoded 2xx answer, else a typed failure.
+
+        The response is released whatever happens — a cancellation mid-read
+        included — so a held connection never outlives the request.
+        """
+
+        response: Any | None = None
+        try:
+            response = await _resolve(
+                self._session.post(
+                    self._settings.endpoint,
+                    headers={
+                        "Authorization": f"Bearer {self._settings.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+            )
+            status = getattr(response, "status", None)
+            if (
+                not isinstance(status, int)
+                or isinstance(status, bool)
+                or not 200 <= status < 300
+            ):
+                raise _NonSuccessResponse
+            try:
+                return await _resolve(response.json())
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, TimeoutError):
+                raise
+            except Exception:
+                raise _MalformedResponse from None
+        finally:
+            if response is not None:
+                await _release_response(response)
+
+    async def _bounded(self, request: Awaitable[Any], seconds: float) -> Any:
+        """Await *request* for at most *seconds* on the injected sleeper.
+
+        The request runs as its own task and is cancelled when the timer
+        wins, so its ``finally`` releases the response; a cancellation of
+        the caller cancels both and propagates. A cancellation only schedules
+        that cleanup, so the cancelled tasks are drained before this returns
+        or raises: the request's release has run — and its outcome has been
+        retrieved — by the time the adapter reports a timeout or unwinds, and
+        a shutdown that follows never closes the session under a request that
+        still owns its response.
+        """
+
+        task = asyncio.ensure_future(request)
+        timer = asyncio.ensure_future(self._sleep(max(float(seconds), 0.0)))
+        try:
+            done, _pending = await asyncio.wait(
+                {task, timer}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            await _drain(task, timer)
+            raise
+        if task in done:
+            await _drain(timer)
+            return task.result()
+        await _drain(task, timer)
+        raise TimeoutError
+
+    def _diagnose(self, message: str) -> None:
+        _safe_report(self._reporter, message)
+
+
+def _classify(body: Any) -> _Proposal | _Final | _Unsupported:
+    """Classify one 2xx Chat Completions body (decision 2).
+
+    Exactly one tool call and no text → :class:`_Proposal`; text and no
+    tool call → :class:`_Final`; two or more tool calls, a tool call with
+    text, or neither → :class:`_Unsupported` naming which. Blank text is no
+    text and a ``null`` or empty ``tool_calls`` is no call. Nothing here
+    guesses: a body that is not a message is unsupported, not a reply.
+    """
+
+    try:
+        message = body["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return _Unsupported(_UNSUPPORTED_MALFORMED_BODY)
+    if not isinstance(message, Mapping):
+        return _Unsupported(_UNSUPPORTED_MALFORMED_BODY)
+    raw_calls = message.get("tool_calls")
+    calls = list(raw_calls) if isinstance(raw_calls, (list, tuple)) else []
+    text = _message_text(message.get("content"))
+    if len(calls) >= 2:
+        return _Unsupported(_UNSUPPORTED_MULTIPLE_TOOL_CALLS)
+    if len(calls) == 1:
+        if text.strip():
+            return _Unsupported(_UNSUPPORTED_TOOL_CALL_WITH_TEXT)
+        call = calls[0]
+        function = call.get("function") if isinstance(call, Mapping) else None
+        name = function.get("name") if isinstance(function, Mapping) else None
+        if not _is_text(name):
+            return _Unsupported(_UNSUPPORTED_MALFORMED_TOOL_CALL)
+        return _Proposal(name=name.strip(), raw_arguments=function.get("arguments"))
+    if text.strip():
+        return _Final(text=text)
+    return _Unsupported(_UNSUPPORTED_NO_CONTENT)
+
+
+def _message_text(content: Any) -> str:
+    """The text of a message: a string, or the text parts of a list."""
+
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "".join(
+            part["text"]
+            for part in content
+            if isinstance(part, Mapping)
+            and part.get("type") == _PART_TEXT
+            and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _classification_text(classification: _Proposal | _Final | _Unsupported) -> str:
+    """What the reply cost, for the estimate a missing ``usage`` falls to."""
+
+    if isinstance(classification, _Final):
+        return classification.text
+    if isinstance(classification, _Proposal):
+        raw = classification.raw_arguments
+        return classification.name + (raw if isinstance(raw, str) else json.dumps(raw, default=str))
+    return ""
+
+
+def _decode_arguments(raw: Any) -> Mapping[str, Any] | None:
+    """The JSON object a tool call's arguments decode to, else ``None``."""
+
+    if isinstance(raw, Mapping):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    return decoded if isinstance(decoded, Mapping) else None
+
+
+def _names_image_input(answer: Any) -> bool:
+    """Whether a 2xx body's ``error`` names the image input (R2)."""
+
+    error = answer.get("error") if isinstance(answer, Mapping) else None
+    if error is None:
+        return False
+    if isinstance(error, Mapping):
+        rendered = " ".join(
+            str(value) for value in (error.get("message"), error.get("code"), error.get("type"))
+            if value is not None
+        )
+    else:
+        rendered = str(error)
+    lowered = rendered.lower()
+    return "image" in lowered or "vision" in lowered
+
+
+def _tool_definition(spec: Any) -> dict[str, Any]:
+    """One offered action as a Chat Completions function tool."""
+
+    description = getattr(spec, "description", "")
+    return {
+        "type": "function",
+        "function": {
+            "name": str(spec.name),
+            "description": description if isinstance(description, str) else "",
+            "parameters": _json_plain(getattr(spec, "argument_schema", {})),
+        },
+    }
+
+
+def _json_plain(value: Any) -> Any:
+    """A JSON-serialisable copy of a frozen contract mapping."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _json_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_plain(item) for item in value]
+    return value
+
+
+def _data_url(content_type: str, data: bytes) -> str:
+    return f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _failed_delivery(code: str) -> ActionObservation:
@@ -1824,19 +2376,6 @@ def _format_user_context(message: _Message) -> str:
     )
 
 
-def _response_content(body: Any) -> str:
-    try:
-        choices = body["choices"]
-        choice = choices[0]
-        message = choice["message"]
-        content = message["content"]
-    except (KeyError, IndexError, TypeError):
-        raise _MalformedResponse from None
-    if not isinstance(content, str) or not content.strip():
-        raise _MalformedResponse
-    return content
-
-
 def _response_usage(body: Any) -> int | None:
     """The run total the backend reports, or ``None`` when it reports none.
 
@@ -1868,9 +2407,46 @@ def _estimate_tokens(text: str) -> int:
     return _TOKEN_MESSAGE_OVERHEAD + math.ceil(len(text) / _TOKEN_CHARS)
 
 
+def _estimate_tool_tokens(tools: Sequence[Any]) -> int:
+    """A conservative token count of the offered tool definitions.
+
+    Each definition is measured as the backend receives it — name,
+    description and argument schema serialised — so a large schema weighs
+    on the input estimate the way it weighs on the request. Nothing offered
+    costs nothing.
+    """
+
+    return sum(
+        _estimate_tokens(
+            json.dumps(_tool_definition(spec), ensure_ascii=False, sort_keys=True, default=str)
+        )
+        for spec in tools
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+
+
+async def _drain(*tasks: asyncio.Future[Any]) -> None:
+    """Cancel *tasks* and wait until each has finished unwinding.
+
+    ``cancel()`` schedules the cancellation; the task's ``finally`` runs on
+    a later loop turn. Waiting for it here is what makes a cancelled request
+    finished — its response released — rather than merely doomed. The
+    results are retrieved so an exception raised during cleanup is not left
+    as an unretrieved-exception warning at garbage collection.
+    """
+
+    for task in tasks:
+        task.cancel()
+    pending = [task for task in tasks if not task.done()]
+    if pending:
+        await asyncio.wait(pending)
+    for task in tasks:
+        if not task.cancelled():
+            task.exception()
 
 
 async def _release_response(response: Any) -> None:

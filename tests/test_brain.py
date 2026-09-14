@@ -88,6 +88,8 @@ from modules.brain import (
     PRINCIPAL,
     BrainModuleError,
     ConversationMemory,
+    _estimate_tokens,
+    _estimate_tool_tokens,
     activate,
     validate_settings,
 )
@@ -358,10 +360,26 @@ class Harness:
         return events_of(self.bus, event_type)
 
     def requests(self) -> list[dict[str, Any]]:
+        """The scenario requests, in order; the prepare-time probes excluded.
+
+        ``FakeSession`` tells a probe from a scenario request by its body
+        (R2), so a per-run count here keeps its meaning whatever ``prepare``
+        sent; the probes are read from :meth:`probes`.
+        """
+
         return self.session.post_calls
+
+    def probes(self) -> list[dict[str, Any]]:
+        return self.session.probe_calls
 
     def prompt(self, index: int = -1) -> list[dict[str, str]]:
         return self.session.post_calls[index]["json"]["messages"]
+
+    def tools(self, index: int = -1) -> list[str]:
+        """The tool names a scenario request offered, ``[]`` when it offered none."""
+
+        body = self.session.post_calls[index]["json"]
+        return [tool["function"]["name"] for tool in body.get("tools", [])]
 
     async def close(self) -> None:
         await self.handle.close()
@@ -397,7 +415,12 @@ async def activate_with(
     bus: EventBus | None = None,
     prepare: bool = True,
 ) -> Harness:
-    """Activate the engine on a fresh runtime and run its ``prepare`` phase."""
+    """Activate the engine on a fresh runtime and run its ``prepare`` phase.
+
+    ``prepare`` probes the backend (R2): the shared ``FakeSession`` answers
+    each probe with one valid forced tool call unless the caller scripted
+    ``probe_results``, and records it apart from the scenario requests.
+    """
 
     target_session = session if session is not None else FakeSession(*results)
     target_transport = transport if transport is not None else FakeTransport()
@@ -1203,9 +1226,14 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
 
     The request is observed once the admitted run has completed, not when the
     publication returns; the viewer identity is the attested ``author.id``
-    of the normalised event, never a ``chatter_id``; and the instructions
-    offer the model the registry's *authorized* view — the one action the
-    engine's principal holds a grant for — and nothing else (R5).
+    of the normalised event, never a ``chatter_id``; and the request offers
+    the model the registry's *authorized* view — the one action the engine's
+    principal holds a grant for — and nothing else (R5), as Chat Completions
+    tool definitions carrying the spec's name, description and argument
+    schema with ``tool_choice: auto`` (R2) rather than as prompt text. The
+    single-turn body of this step offers the authorized view as it stands;
+    the read-only filter and the ``chat.write``-never-offered guarantee (R1,
+    AC6) are the agentic loop's and are asserted with it.
     """
 
     harness = await activate_with(FakeResponse(200, completion("Hello")))
@@ -1219,12 +1247,23 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
         assert request["url"] == SETTINGS["endpoint"]
         assert request["json"]["model"] == SETTINGS["model"]
         assert request["headers"]["Authorization"] == f"Bearer {SETTINGS['api_key']}"
+        assert harness.tools(0) == [DELIVERY_ACTION]
+        (tool,) = request["json"]["tools"]
+        assert tool["type"] == "function"
+        assert tool["function"]["description"] == CHAT_WRITE_SPEC.description
+        assert tool["function"]["parameters"] == {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+        json.dumps(request["json"])  # the body is plain JSON, frozen mappings unwrapped
+        assert request["json"]["tool_choice"] == "auto"
         messages = request["json"]["messages"]
         assert messages[0]["role"] == "system"
         system = messages[0]["content"]
-        assert DELIVERY_ACTION in system
-        assert CHAT_WRITE_SPEC.description in system
         assert "[send:" not in system
+        assert DELIVERY_ACTION not in system
         assert messages[-1]["role"] == "user"
         assert "What is up?" in messages[-1]["content"]
         assert VIEWER in messages[-1]["content"]
@@ -1237,11 +1276,14 @@ async def test_admitted_message_drives_one_configured_request_with_viewer_contex
 
 @pytest.mark.asyncio
 async def test_request_offers_no_action_without_a_grant_and_reads_the_view_afresh() -> None:
-    """R5: the capability prompt is the authorized view, read for every run.
+    """R5: the offered tools are the authorized view, read for every run.
 
-    With no rule the model is offered nothing (default deny as a surface); a
-    grant added between two runs reaches the next prompt, so a policy change
-    is never cached across runs.
+    With no rule the model is offered nothing — the request carries no
+    ``tools`` and no ``tool_choice`` (default deny as a surface); a grant
+    added between two runs reaches the next request's tools, so a policy
+    change is never cached across runs. The tools replace the former prompt
+    listing (R2); which grants may reach the tools at all (read actions
+    only, AC6) is the agentic loop's guarantee, asserted with it.
     """
 
     harness = await activate_with(
@@ -1252,13 +1294,16 @@ async def test_request_offers_no_action_without_a_grant_and_reads_the_view_afres
     try:
         await harness.send(message_id="one")
         await harness.completed(1)
+        assert harness.tools(0) == []
+        assert "tools" not in harness.requests()[0]["json"]
+        assert "tool_choice" not in harness.requests()[0]["json"]
         assert DELIVERY_ACTION not in harness.prompt(0)[0]["content"]
-        assert "No action is authorized" in harness.prompt(0)[0]["content"]
 
         harness.executor._authorization.grant(BRAIN_GRANT)
         await harness.send(message_id="two")
         await harness.completed(2)
-        assert DELIVERY_ACTION in harness.prompt(1)[0]["content"]
+        assert harness.tools(1) == [DELIVERY_ACTION]
+        assert DELIVERY_ACTION not in harness.prompt(1)[0]["content"]
     finally:
         await harness.close()
 
@@ -1485,7 +1530,7 @@ async def test_reply_text_is_delivered_verbatim_with_no_tag_parsing(content: str
     [
         (FakeResponse(500, {"api_key": SETTINGS["api_key"]}), "non-success", "error"),
         (FakeResponse(200, {}), "malformed", "error"),
-        (FakeResponse(200, completion("   ")), "malformed", "error"),
+        (FakeResponse(200, completion("   ")), "unsupported shape", "error"),
         (asyncio.TimeoutError(SETTINGS["api_key"]), "timed out", "timeout"),
         (RuntimeError(SETTINGS["api_key"]), "transport failed", "error"),
     ],
@@ -1497,7 +1542,11 @@ async def test_model_failures_deliver_nothing_and_are_sanitized(
 
     The failure is the run's terminal state, read from its record and its
     one ``brain.run.completed``: delivery not attempted, 0 executor calls,
-    0 sends, and one value-free diagnostic.
+    0 sends, and one value-free diagnostic. A body that is no message at all
+    is malformed data; a message carrying blank text and no tool call is
+    "neither" under decision 2 — an unsupported shape, ``failure:
+    unsupported_response_shape`` — which supersedes the former "malformed"
+    reading of a blank reply (R2, decision 2).
     """
 
     harness = await activate_with(result)
@@ -1562,6 +1611,51 @@ async def test_token_budget_bounds_the_prompt_and_the_reply() -> None:
         assert tiny.diagnostics == ["brain run: prompt exceeds the token budget"]
     finally:
         await tiny.close()
+
+
+@pytest.mark.asyncio
+async def test_offered_tool_definitions_count_toward_the_prompt_token_budget() -> None:
+    """Design §3.4: the tool definitions are input the backend reads, so they
+    weigh on the prompt's estimate as the action listing did when it was
+    system text. With nothing authorized, and so nothing offered, a budget
+    composes and the request's output cap is what the text alone leaves;
+    under the same budget, offering ``chat.write`` — name, description,
+    schema — is what puts the prompt over: no request is sent.
+    """
+
+    tool_tokens = _estimate_tool_tokens((CHAT_WRITE_SPEC,))
+    assert tool_tokens > _estimate_tokens("")
+
+    bare = await activate_with(
+        FakeResponse(200, completion("fits")),
+        settings_overrides={"budget": {"max_tokens": 200}},
+        grant=False,
+    )
+    try:
+        await bare.send()
+        await bare.completed()
+        (request,) = bare.requests()
+        body = request["json"]
+        assert "tools" not in body
+        text_tokens = sum(_estimate_tokens(message["content"]) for message in body["messages"])
+        assert body["max_tokens"] == 200 - text_tokens
+    finally:
+        await bare.close()
+
+    # Room for the text, none once the tool definition is counted with it.
+    limit = text_tokens + tool_tokens // 2
+    offered = await activate_with(
+        FakeResponse(200, completion("never")), settings_overrides={"budget": {"max_tokens": limit}}
+    )
+    try:
+        await offered.send()
+        (record,) = await offered.completed()
+        assert record.status == "error"
+        assert record.model_calls == 0
+        assert offered.requests() == []
+        assert offered.diagnostics == ["brain run: prompt exceeds the token budget"]
+    finally:
+        await offered.close()
 
 
 @pytest.mark.asyncio

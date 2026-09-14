@@ -2280,14 +2280,18 @@ def _capture_supervision(monkeypatch: pytest.MonkeyPatch) -> list[Supervision]:
 
 
 class _GatedModelSession(FakeSession):
-    """A model transport that holds its first request until released."""
+    """A model transport that holds its first scenario request until released.
+
+    Probes are answered at once by the base class: they belong to ``prepare``,
+    and holding one would hold the readiness barrier the test waits on.
+    """
 
     def __init__(self, *results: Any) -> None:
         super().__init__(*results)
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def post(self, url: str, **kwargs: Any) -> Any:
+    async def _answer(self, url: str, kwargs: dict[str, Any]) -> Any:
         self.post_calls.append({"url": url, **kwargs})
         result = self.results.pop(0)
         if len(self.post_calls) == 1:
