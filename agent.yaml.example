@@ -1,0 +1,166 @@
+# The PC-agent profile (R7, decision 6): the same entry point runs, on the
+# streaming PC, only the local `capture` module and the `agent_link` module
+# that dials the brain's `proxy` (config.server.yaml.example), pairs with the
+# shared token and lends it `screen.capture`. No brain, no chat input and no
+# model call happen here. Copy this file to agent.yaml, export the referenced
+# environment variables, then run:
+#   python -m core.main --config agent.yaml
+# or, once installed, `twitch-ia-compagnon --config agent.yaml`; validate it
+# first without opening any transport with `--check-config`.
+# Environment references must remain in the exact ${NAME} form shown below.
+#
+# The two other shipped profiles run the same entry point:
+#   config.yaml.example        — the PC profile, everything in one process;
+#   config.server.yaml.example — the brain this agent pairs with.
+
+# The directory the module manifests are discovered in, relative to this
+# file; the reserved value `builtin` names the modules shipped with the
+# installed distribution instead (R8).
+modules_directory: ./modules
+
+# Every module enabled here is activated, in this order, through its
+# manifest; the pair below is what makes this the agent profile.
+enabled_modules:
+  - capture
+  - agent_link
+
+modules:
+  # The local screen capture the brain reads, through the proxy, as
+  # `screen.capture` (R5). A `command` source runs `argv` and takes its
+  # standard output — one PNG or JPEG — bounded in time by
+  # `command_timeout_seconds` and in size by `max_bytes`; a `file` source
+  # (`kind: file`, `path: <image>`) reads one image file instead.
+  capture:
+    sources:
+      screen:
+        kind: command
+        # PLACEHOLDER — replace the shell line with the screenshot tool of
+        # your desktop writing one PNG or JPEG to standard output, e.g.
+        # `grim -` (wlroots), `spectacle -bno /dev/stdout` (KDE) or
+        # `import -window root png:-` (ImageMagick, X11). Running it through
+        # `sh` lets startup pass on a machine without the tool — the tool is
+        # then checked at the first capture, which returns an explicit error
+        # observation when it is missing; point `argv` at the tool itself
+        # (`argv: [grim, "-"]`) to have startup refuse a missing tool instead.
+        argv: [sh, -c, "grim -"]
+        command_timeout_seconds: 5
+    default_source: screen
+    # The largest capture admitted, in bytes; it may not exceed
+    # `limits.attachments.max_object_bytes` below, which the store enforces
+    # on every object it retains.
+    max_bytes: 1048576
+
+  # The agent side of the remote capture (R6). The module dials `brain_url`,
+  # presents the pairing token in `hello`, declares the actions listed under
+  # `actions` — each one a local manifest declares and this process serves —
+  # and executes the calls the brain forwards through this process's own
+  # default-deny executor, so the rule under `actions` below is what
+  # authorizes them (the brain's grant does not reach this process). The
+  # connection is retried forever with exponential backoff and full jitter
+  # (decision 9); every forwarded call is executed at most once through the
+  # bounded call table.
+  agent_link:
+    # `wss://<host>:<port>` for a brain on another machine — a `ws://` URL is
+    # accepted on loopback only (`ws://127.0.0.1:8765`), matching the
+    # server's `listen` and `tls` settings. Export it as, for example,
+    # BRAIN_URL=wss://brain.example:8765
+    brain_url: ${BRAIN_URL}
+    # The same secret the server's `proxy.pairing_token` resolves to; the
+    # manifest declares it as a credential, so it is redacted from every trace.
+    pairing_token: ${PROXY_PAIRING_TOKEN}
+    # How this agent names itself in `hello` and in the brain's traces.
+    agent_id: pc-agent
+    # The actions lent to the brain; each must be declared by an enabled
+    # local manifest — here `screen.capture` by `capture` above.
+    actions:
+      - screen.capture
+    # Backoff between dial attempts: initial delay, multiplier and cap, in
+    # seconds; the delay drawn is uniform in [0, current] and the sequence
+    # resets on a successful pairing.
+    reconnect:
+      initial_seconds: 1
+      multiplier: 2
+      max_seconds: 30
+    # The de-duplication table of forwarded calls, per session: a call the
+    # brain reissues after a drop is answered from it rather than executed
+    # again. Bounded in entries and in age; reset on every `welcome`.
+    call_table:
+      max_entries: 1024
+      ttl_seconds: 300
+
+# Redaction (R8). The pairing token needs no entry here: the `agent_link`
+# manifest declares it as a credential (`credentials:` in
+# modules/agent_link/module.yaml), so its resolved value is redacted from
+# every supervision trace and every lost-trace diagnostic whether or not this
+# block exists. Listing it again redacts nothing twice; the brain URL is not
+# listed because it is what traces correlate the pairing by, and it embeds
+# no secret.
+secrets:
+  - ${PROXY_PAIRING_TOKEN}
+
+# Explicit action authorization rules (R5). Authorization is default-deny in
+# this process exactly as in the brain's: a call the brain forwards is
+# executed only when a rule here applies, and the provider is never invoked
+# for a refused call. The one rule grants exactly the provided-action set of
+# this profile — `screen.capture`, declared by `capture` — to principal
+# `brain`, the principal the forwarded calls carry, on every platform and
+# channel of the `capture` scope, which is the scope the brain addresses a
+# capture on (`*/*/capture`). Removing it refuses the very next capture.
+actions:
+  - rule_id: brain-captures-screen
+    action_name: screen.capture
+    destination:
+      platform: "*"
+      channel_id: "*"
+      scope: capture
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - screen.capture
+
+# Retention and admission limits (R6). The block is required as a whole for
+# a module built against the versioned runtime, every limit below being
+# finite and positive; startup stops before any transport opens when one is
+# absent, negative, non-numeric or infinite. The group this process acts
+# on is `attachments`: the store every capture is put in before it is
+# transferred to the brain by reference, bounded per object, in objects, in
+# total bytes, per run and in age — `max_object_bytes` is the ceiling
+# `capture.max_bytes` above stays under. The other groups bound surfaces
+# this profile keeps idle (no chat input, no brain runs) and are accepted as
+# the runtime's own bounds.
+limits:
+  bus_history:
+    max_events: 1000
+    max_bytes: 4194304
+    max_age_seconds: 600
+  observation_queue:
+    max_records: 1000
+    max_bytes: 4194304
+  dedup:
+    max_entries: 4096
+    ttl_seconds: 600
+  attachments:
+    max_object_bytes: 1048576
+    max_objects: 256
+    max_total_bytes: 67108864
+    max_bytes_per_run: 8388608
+    ttl_seconds: 900
+  conversation_memory:
+    max_sessions: 64
+    max_exchanges: 20
+    max_bytes: 65536
+    max_age_seconds: 3600
+  chat_context:
+    max_messages: 50
+    max_bytes: 65536
+    max_age_seconds: 900
+    max_channels: 8
+  admission:
+    session_queue_capacity: 4
+    global_pending_capacity: 64
+    max_sessions: 32
+    workers: 4
+    wait_seconds: 30
+    total_run_seconds: 60

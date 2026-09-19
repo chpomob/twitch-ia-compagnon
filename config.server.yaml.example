@@ -1,6 +1,8 @@
-# The PC profile (R7): one process on the streaming PC runs the chat input,
-# the brain, the local capture and the observation modules. Copy this file
-# to config.yaml, export the referenced environment variables, then run:
+# The server profile (R7): the brain, the chat input and the observation
+# modules run on a server; the screen is captured on the streaming PC by the
+# agent profile (agent.yaml.example), which dials the `proxy` module below
+# and lends it `screen.capture`. Copy this file to config.yaml, export the
+# referenced environment variables, then run:
 #   python -m core.main --config config.yaml
 # or, once installed, `twitch-ia-compagnon --config config.yaml`; validate
 # it first without opening any transport with `--check-config`.
@@ -8,9 +10,9 @@
 # and resolve in values and in mapping keys alike.
 #
 # The two other shipped profiles run the same entry point:
-#   config.server.yaml.example — the brain on a server, the screen captured
-#                                on the PC through the `proxy` module;
-#   agent.yaml.example         — the PC agent that pairs with that server.
+#   config.yaml.example — the PC profile, everything in one process with a
+#                         local `capture` module in place of `proxy`;
+#   agent.yaml.example  — the PC agent pairing with this server.
 
 # The directory the module manifests are discovered in, relative to this
 # file; the reserved value `builtin` names the modules shipped with the
@@ -18,14 +20,15 @@
 modules_directory: ./modules
 
 # Every module enabled here is activated, in this order, through its
-# manifest; the set below is what makes this the PC profile.
+# manifest; the set below is what makes this the server profile: no
+# `capture`, and `proxy` serving `screen.capture` from the paired agent.
 enabled_modules:
   - twitch
   - chat_context
   - users
-  - capture
   - brain
   - audit
+  - proxy
 
 modules:
   twitch:
@@ -53,31 +56,6 @@ modules:
     max_channels: 8
     max_users_per_channel: 500
     max_age_seconds: 3600
-
-  # The local screen capture the brain reads through `screen.capture` (R5).
-  # A `command` source runs `argv` and takes its standard output — one PNG or
-  # JPEG — bounded in time by `command_timeout_seconds` and in size by
-  # `max_bytes`; a `file` source (`kind: file`, `path: <image>`) reads one
-  # image file instead.
-  capture:
-    sources:
-      screen:
-        kind: command
-        # PLACEHOLDER — replace the shell line with the screenshot tool of
-        # your desktop writing one PNG or JPEG to standard output, e.g.
-        # `grim -` (wlroots), `spectacle -bno /dev/stdout` (KDE) or
-        # `import -window root png:-` (ImageMagick, X11). Running it through
-        # `sh` lets startup pass on a machine without the tool — the tool is
-        # then checked at the first capture, which returns an explicit error
-        # observation when it is missing; point `argv` at the tool itself
-        # (`argv: [grim, "-"]`) to have startup refuse a missing tool instead.
-        argv: [sh, -c, "grim -"]
-        command_timeout_seconds: 5
-    default_source: screen
-    # The largest capture admitted, in bytes; it may not exceed
-    # `limits.attachments.max_object_bytes` below, which the store enforces
-    # on every object it retains.
-    max_bytes: 1048576
 
   brain:
     endpoint: ${OPENAI_ENDPOINT}
@@ -164,11 +142,36 @@ modules:
       max_records: 1000
       max_bytes: 4194304
 
+  # The brain side of the remote capture (R6, decision 7). The module listens
+  # for exactly one agent, which pairs with the token below and lends the
+  # actions the `actions` allowlist names: the spec of each comes from the
+  # manifest catalog (here `modules/capture/module.yaml`, discovered but not
+  # enabled), the provider is the paired agent, and the brain calls the
+  # executor exactly as it does for a local provider — enabling `capture`
+  # together with this allowlist fails startup with the ambiguity diagnostic
+  # naming both providers (AC41). A listener on a non-loopback host must be
+  # TLS: `tls` names the certificate and key files; `ws://` is accepted on
+  # loopback only (`host: 127.0.0.1`, `tls` removed).
+  proxy:
+    listen:
+      host: 0.0.0.0
+      port: 8765
+    tls:
+      certfile: ${PROXY_TLS_CERT}
+      keyfile: ${PROXY_TLS_KEY}
+    # The shared secret the agent presents in `hello`; the manifest declares
+    # it as a credential, so it is redacted from every trace.
+    pairing_token: ${PROXY_PAIRING_TOKEN}
+    # The actions the paired agent may lend, and the only ones bound to it.
+    actions:
+      - screen.capture
+
 # Redaction (R8). The credentials proper need no entry here: each module's
 # manifest declares which of its settings are credentials (`credentials:` in
-# modules/twitch/module.yaml and modules/brain/module.yaml), and their
-# accepted values — literal or resolved — are redacted from every supervision
-# trace and every lost-trace diagnostic before any module is activated,
+# modules/twitch/module.yaml, modules/brain/module.yaml and
+# modules/proxy/module.yaml), and their accepted values — literal or
+# resolved — are redacted from every supervision trace and every lost-trace
+# diagnostic before any module is activated,
 # whether or not this block exists. This optional block adds references the
 # modules do not declare; every reference listed is redacted, once resolved,
 # wherever it appears — verbatim, nested or embedded in a longer string. The
@@ -184,6 +187,7 @@ secrets:
   - ${TWITCH_ACCESS_TOKEN}
   - ${OPENAI_API_KEY}
   - ${OPENAI_ENDPOINT}
+  - ${PROXY_PAIRING_TOKEN}
 
 # Trigger policies, selected per input and per channel (R1). The key under
 # `triggers` names the input module. An entry under `channels` selects the
@@ -218,9 +222,12 @@ triggers:
 # re-evaluates these rules on every call, so removing a rule below refuses
 # the very next call of its action. The four rules grant exactly the
 # provided-action set of this profile — the actions the enabled manifests
-# declare — to the brain's principal on the served channel: the reads on the
+# declare, plus the ones the `proxy` allowlist names — to the brain's principal on the served channel: the reads on the
 # channel's `chat` scope, the capture on its `capture` scope, the reply
-# delivery on `chat` (R7).
+# delivery on `chat` (R7). `screen.capture` is provided here by `proxy`,
+# from its allowlist, and by no enabled manifest; the rule is the same as
+# the PC profile's — which module serves the action is not the rule's
+# concern (decision 7).
 actions:
   # The retained transcript of the served channel.
   - rule_id: brain-reads-chat

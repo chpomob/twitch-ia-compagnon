@@ -351,25 +351,27 @@ async def test_a_handle_returned_after_the_grace_is_closed_by_the_loader(
     its bounded close and reports that close's diagnostics on request.
     """
 
+    clock = ManualClock()
     make_module(tmp_path, "late", source=HANDLE_AFTER_GRACE_SOURCE)
     settings = _after_grace_settings()
-    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+    loader = ModuleLoader(
+        object(), tmp_path, clock=clock, sleeper=clock.sleep, cancel_grace_seconds=1.0
+    )
     config = {"enabled_modules": ["late"], "modules": {"late": settings}}
 
     if interruption == "deadline":
-        with pytest.raises(ModuleLoadError) as raised:
-            await loader.activate_enabled(
-                config, deadline_at=time.monotonic() + 0.01
-            )
-        assert raised.value.diagnostics == (
-            "module 'late': field 'activate': exceeded the global startup deadline",
-        )
+        await _abandon_activation_on_the_clock(loader, clock, settings)
     else:
         task = asyncio.ensure_future(loader.activate_enabled(config))
         await wait_until(lambda: settings["calls"])
+        await settle()
         task.cancel()
+        await settle()
+        assert not task.done()
+        clock.advance(1.0)  # the grace after the cancellation: the caller is answered
+        await wait_until(task.done)
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 1)
+            task.result()
         assert loader.cancellation_diagnostics == [
             "module 'late': field 'activate': activation was cancelled"
         ]
@@ -399,15 +401,14 @@ async def test_a_failed_late_close_is_reported_by_module_without_its_message(
 ) -> None:
     """The loader's late close is bounded and its failure is a named diagnostic."""
 
+    clock = ManualClock()
     make_module(tmp_path, "late", source=LATE_CLOSE_FAILS_SOURCE)
     settings = _after_grace_settings()
-    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+    loader = ModuleLoader(
+        object(), tmp_path, clock=clock, sleeper=clock.sleep, cancel_grace_seconds=1.0
+    )
 
-    with pytest.raises(ModuleLoadError):
-        await loader.activate_enabled(
-            {"enabled_modules": ["late"], "modules": {"late": settings}},
-            deadline_at=time.monotonic() + 0.01,
-        )
+    await _abandon_activation_on_the_clock(loader, clock, settings)
     settings["gate"].set()
     await wait_until(lambda: settings["closes"] == ["late"])
 
@@ -432,17 +433,16 @@ async def test_a_late_close_that_finishes_after_settling_reports_through_the_rep
     not repeat what the reporter already received.
     """
 
+    clock = ManualClock()
     make_module(tmp_path, "late", source=LATE_CLOSE_FAILS_SOURCE)
     settings = _after_grace_settings()
     reported: list[str] = []
-    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+    loader = ModuleLoader(
+        object(), tmp_path, clock=clock, sleeper=clock.sleep, cancel_grace_seconds=1.0
+    )
     loader.late_reporter = reported.append
 
-    with pytest.raises(ModuleLoadError):
-        await loader.activate_enabled(
-            {"enabled_modules": ["late"], "modules": {"late": settings}},
-            deadline_at=time.monotonic() + 0.01,
-        )
+    await _abandon_activation_on_the_clock(loader, clock, settings)
     # Settled before the handle arrived: no close is under way yet.
     assert settings["closes"] == []
     assert await loader.settle_late_results() == []
@@ -464,20 +464,19 @@ async def test_a_failing_late_reporter_keeps_the_diagnostic_for_the_next_settle(
 ) -> None:
     """A reporter that raises loses nothing: the settle hands the diagnostic over."""
 
+    clock = ManualClock()
     make_module(tmp_path, "late", source=LATE_CLOSE_FAILS_SOURCE)
     settings = _after_grace_settings()
-    loader = ModuleLoader(object(), tmp_path, cancel_grace_seconds=0.005)
+    loader = ModuleLoader(
+        object(), tmp_path, clock=clock, sleeper=clock.sleep, cancel_grace_seconds=1.0
+    )
 
     def refuse(diagnostic: str) -> None:
         raise RuntimeError("reporter unavailable")
 
     loader.late_reporter = refuse
 
-    with pytest.raises(ModuleLoadError):
-        await loader.activate_enabled(
-            {"enabled_modules": ["late"], "modules": {"late": settings}},
-            deadline_at=time.monotonic() + 0.01,
-        )
+    await _abandon_activation_on_the_clock(loader, clock, settings)
     settings["gate"].set()
     await wait_until(lambda: settings["closes"] == ["late"])
     await wait_until(lambda: loader.late_diagnostics)
