@@ -774,10 +774,10 @@ async def close_modules(
     """Close *modules* in reverse order, bounded, collecting every failure.
 
     This is ``core/main.py::_close_activations`` moved here, with one
-    deliberate change required by R4: the name map that sorted ``twitch``
-    first and ``audit`` last is gone. Ordering now comes from the declared
-    observation role — observation services close after ordinary resources —
-    and otherwise from reverse activation order.
+    deliberate change required by R4: the name map that sorted the platform
+    module first and ``audit`` last is gone. Ordering now comes from the
+    declared observation role — observation services close after ordinary
+    resources — and otherwise from reverse activation order.
 
     A close that overruns its budget is cancelled explicitly, given a short
     cancellation window — capped, like the budget, by what remains of

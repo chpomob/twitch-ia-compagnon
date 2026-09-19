@@ -1,4 +1,4 @@
-"""The multi-turn agentic loop (R1, R2, R4; AC1–AC7, AC11, AC12, AC24, AC25, AC46, AC47).
+"""The multi-turn agentic loop (R1, R2, R4, R5; AC1–AC7, AC11, AC12, AC24, AC25, AC31, AC41, AC46, AC47).
 
 An admitted run iterates model turns: each turn offers the model a bounded
 transcript and the *authorized* read actions of the run's destination, read
@@ -15,18 +15,29 @@ the shared fixture builds — the real executor, the real scheduler the
 engine builds for itself, the real attachment store on the injected clock —
 with the four capabilities bound in the test as read doubles and a fake
 send edge, under the names and scopes the real modules declare (``chat``
-for ``chat.read``/``users.read``, ``capture`` for ``screen.capture``); the
-real modules join in a later step. Nothing here sleeps: the clock is
+for ``chat.read``/``users.read``, ``capture`` for ``screen.capture``). The
+**vertical** harness at the end of this file (P17) replaces those doubles
+with the shipped ``chat_context``, ``users`` and ``capture`` modules and the
+platform module itself — the shipped ``twitch`` on a fake socket and a fake
+Helix, or the ``fakeplatform`` fixture on platform ``fake`` — every one of
+them discovered and activated by the real loader from one temporary
+``modules_directory`` holding copies of the shipped packages plus the
+fixture (R5, AC1, AC2, AC25, AC31, AC41). Nothing here sleeps: the clock is
 injected and every wait is a bounded number of bare loop turns.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
+import shutil
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -39,6 +50,7 @@ from core.actions import (
 )
 from core.attachments import AttachmentStore
 from core.bus import EventBus
+from core.context import ChatContext
 from core.contracts import (
     BRAIN_ERROR_ATTACHMENT_EXPIRED,
     BRAIN_ERROR_MALFORMED_ARGUMENTS,
@@ -49,17 +61,27 @@ from core.contracts import (
     RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE,
     TRACE_ACTION_COMPLETED,
     TRACE_ACTION_STARTED,
+    TRACE_BRAIN_ADMISSION_ACCEPTED,
     TRACE_BRAIN_RUN_COMPLETED,
     TRACE_BRAIN_RUN_STARTED,
+    TRACE_CHANNEL_CHAT_SENT,
+    TRACE_EVENT_TYPES,
+    TRACE_INPUT_TRIGGER_ACCEPTED,
+    TRACE_MODULE_DEGRADED,
+    TRACE_MODULE_READY,
+    TRACE_MODULE_STOPPED,
     WILDCARD,
     ActionObservation,
     ActionSpec,
     Destination,
     SessionKey,
 )
+from core.loader import ModuleLoader
 from core.runtime import RuntimeContext
+from core.triggers import TriggerRegistry
 from conftest import (
     FAIL_AFTER_EMISSION,
+    FakeCaptureSource,
     FakeResponse,
     HeldSession,
     ManualClock,
@@ -83,6 +105,8 @@ from modules.brain import (
     activate,
 )
 from modules import audit
+from modules.twitch import CHAT_WRITE_PROVIDER as TWITCH_CHAT_WRITE_PROVIDER
+from modules.twitch import EVENTSUB_SUBSCRIPTIONS_URL, HELIX_CHAT_URL
 from test_brain import VALID_SETTINGS, chat_payload, merge_settings
 
 
@@ -1199,3 +1223,968 @@ async def test_ac25_cancellation_during_a_capture_a_model_call_or_a_delivery_rel
     assert delivery.context.tasks.active == delivery.tasks_before
     assert delivery.sender.sends == []
     assert delivery.memory() == []
+
+
+# --------------------------------------------------------------------------- #
+# The vertical harness (P17): the shipped modules through the real loader,
+# on twitch and on the fake platform
+# --------------------------------------------------------------------------- #
+
+ROOT = Path(__file__).parents[1]
+SHIPPED_MODULES = ROOT / "modules"
+FIXTURE_MODULES = ROOT / "tests" / "fixtures" / "modules"
+
+# The shipped packages copied into the temporary ``modules_directory`` beside
+# the ``fakeplatform`` fixture: what a deployment's directory holds, plus the
+# second platform, so one loader discovers both platforms and every
+# capability module and activates only the enabled ones.
+SHIPPED_COPIES = ("twitch", "brain", "audit", "chat_context", "users", "capture")
+FAKE_MODULE = "fakeplatform"
+FAKE_PLATFORM = "fake"
+CAPABILITY_MODULES = ("chat_context", "users", "capture")
+
+# The shipped modules' own names for what they bind (their constants are
+# not imported here: the harness reads them back from the registry).
+CHAT_READ_PROVIDER = "chat-context"
+USERS_READ_PROVIDER = "users-directory"
+CAPTURE_PROVIDER = "capture"
+
+COMPANION = "Companion"
+BROADCASTER = "broadcaster-42"
+BOT_USER = "bot-24"
+CLIENT_ID = "configured-client"
+FAKE_CHANNEL = "fake-channel-1"
+CAPTURE_SOURCE = "screen"
+ASK = f"{COMPANION}, what is happening on stream?"
+# Two lines fed to the transcript before the question, so the real
+# ``chat.read`` has retained messages to page (AC2).
+CONTEXT_LINES = ("first observed line", "second observed line")
+
+# The core-owned transcript bounds, handed to ``chat_context`` under the
+# reserved ``limits`` key exactly as the entry point hands its accepted block.
+CHAT_LIMITS = {"max_messages": 16, "max_bytes": 8192, "max_age_seconds": 600.0, "max_channels": 8}
+USERS_SETTINGS = {"max_channels": 8, "max_users_per_channel": 100, "max_age_seconds": 600.0}
+TWITCH_SETTINGS = {
+    "client_id": CLIENT_ID,
+    "client_secret": "never-show-client-secret",
+    "access_token": "never-show-access-token",
+    "broadcaster_id": BROADCASTER,
+    "bot_user_id": BOT_USER,
+    "companion_name": COMPANION,
+}
+
+# The traces AC31 compares between the two platforms: every type the core's
+# supervision vocabulary and the brain publish for a run. Left out, by
+# construction rather than by platform: the lifecycle traces (the enabled
+# module sets differ by the platform module's name) and the platform module's
+# own send confirmation (``channel.chat.sent`` is the shipped twitch module's
+# fact about its transport, published by that module, not by the brain path
+# AC31 pins; the fixture publishes none). What the core and the brain publish
+# is compared in full, as (type, action, status, call) tuples.
+COMPARED_TRACE_TYPES = (set(TRACE_EVENT_TYPES) | {TRACE_OBSERVATION}) - {
+    TRACE_MODULE_READY,
+    TRACE_MODULE_DEGRADED,
+    TRACE_MODULE_STOPPED,
+    TRACE_CHANNEL_CHAT_SENT,
+}
+
+
+@pytest.fixture(scope="session")
+def vertical_modules(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One temporary ``modules_directory`` for the whole session: copies of
+    the shipped packages plus the ``fakeplatform`` fixture, caches excluded.
+    Session-scoped because the copy is the slow part and nothing writes to it."""
+
+    directory = tmp_path_factory.mktemp("modules")
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    for name in SHIPPED_COPIES:
+        shutil.copytree(SHIPPED_MODULES / name, directory / name, ignore=ignore)
+    shutil.copytree(FIXTURE_MODULES / FAKE_MODULE, directory / FAKE_MODULE, ignore=ignore)
+    assert sorted(path.name for path in directory.iterdir()) == sorted((*SHIPPED_COPIES, FAKE_MODULE))
+    return directory
+
+
+class VerticalWebSocket:
+    """The EventSub socket behind the shipped twitch module: frames fed by
+    the test, the welcome first; ``close`` counts and never blocks."""
+
+    def __init__(self) -> None:
+        self._frames: asyncio.Queue[Any] = asyncio.Queue()
+        self._frames.put_nowait(
+            {"metadata": {"message_type": "session_welcome"}, "payload": {"session": {"id": "vertical"}}}
+        )
+        self.close_calls = 0
+
+    async def receive(self) -> Any:
+        return await self._frames.get()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    def feed(self, frame: Mapping[str, Any]) -> None:
+        self._frames.put_nowait(frame)
+
+
+class VerticalTwitchSession:
+    """The platform's HTTP session: token validation, the EventSub
+    subscription and the Helix sends — the fake transport of AC1 — with no
+    network. ``sends`` keeps every confirmed Helix body; ``hold`` (a future
+    the test resolves) keeps the next send pending so a delivery can be
+    cancelled mid-flight (AC25)."""
+
+    def __init__(self, websocket: VerticalWebSocket) -> None:
+        self._websocket = websocket
+        self.sends: list[dict[str, Any]] = []
+        self.hold: asyncio.Future[Any] | None = None
+        self.entered = asyncio.Event()
+        self.get_calls: list[str] = []
+        self.post_calls: list[str] = []
+        self.ws_calls: list[str] = []
+        self.close_calls = 0
+
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.get_calls.append(url)
+        return FakeResponse(200, {"client_id": CLIENT_ID, "user_id": BOT_USER})
+
+    async def post(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.post_calls.append(url)
+        if url == EVENTSUB_SUBSCRIPTIONS_URL:
+            return FakeResponse(202, {"data": [{"id": "subscription"}]})
+        if url == HELIX_CHAT_URL:
+            self.entered.set()
+            if self.hold is not None:
+                await self.hold
+            self.sends.append(dict(kwargs["json"]))
+            return FakeResponse(
+                200, {"data": [{"message_id": f"sent-{len(self.sends)}", "is_sent": True}]}
+            )
+        raise AssertionError(f"unexpected platform request: {url}")
+
+    async def ws_connect(self, url: str) -> VerticalWebSocket:
+        self.ws_calls.append(url)
+        return self._websocket
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+def twitch_notification(message_id: str, text: str, *, viewer_id: str = VIEWER) -> dict[str, Any]:
+    """One EventSub ``channel.chat.message`` notification on the served channel."""
+
+    return {
+        "metadata": {"message_type": "notification", "subscription_type": INPUT_EVENT},
+        "payload": {
+            "subscription": {"type": INPUT_EVENT},
+            "event": {
+                "broadcaster_user_id": BROADCASTER,
+                "chatter_user_id": viewer_id,
+                "chatter_user_name": "Viewer",
+                "message_id": message_id,
+                "message": {"text": text},
+            },
+        },
+    }
+
+
+@dataclass
+class VerticalHarness:
+    """The activated modules of one platform and every edge a scenario reads.
+
+    ``handles`` is the loader's activation order; ``source`` is the screen
+    behind the shipped capture module (the ``_source_factory`` seam); the
+    twitch edges are ``twitch_session``/``websocket``, the fake platform's
+    is its own handle (``platform_handle``). ``tasks_before`` is the
+    supervised task count once every input is started and before any run.
+    """
+
+    platform: str
+    channel: str
+    context: RuntimeContext
+    clock: ManualClock
+    store: AttachmentStore
+    session: ScriptedModel
+    source: FakeCaptureSource
+    handles: dict[str, Any]
+    diagnostics: list[str]
+    tasks_before: int
+    twitch_session: VerticalTwitchSession | None = None
+    websocket: VerticalWebSocket | None = None
+    fake_transport: Any = None
+    _next_message: int = 0
+
+    @property
+    def bus(self) -> EventBus:
+        return self.context.bus
+
+    @property
+    def executor(self) -> Any:
+        return self.context.executor
+
+    @property
+    def brain(self) -> Any:
+        return self.handles[MODULE_NAME]
+
+    @property
+    def platform_handle(self) -> Any:
+        return self.handles["twitch" if self.platform == PLATFORM else FAKE_MODULE]
+
+    def scope(self, action: str) -> str:
+        return f"{self.platform}/{self.channel}/{SCOPE_OF[action]}"
+
+    async def send(self, text: str = ASK, *, message_id: str | None = None) -> None:
+        """Drive one viewer message through the platform module's reception."""
+
+        self._next_message += 1
+        target = message_id or f"message-{self._next_message}"
+        if self.platform == PLATFORM:
+            assert self.websocket is not None
+            self.websocket.feed(twitch_notification(target, text))
+            before = len(events_of(self.bus, INPUT_EVENT))
+            await wait_until(lambda: len(events_of(self.bus, INPUT_EVENT)) > before)
+            return
+        published = await self.platform_handle.inject(
+            {
+                "channel_id": self.channel,
+                "author": {"id": VIEWER, "display_name": "Viewer"},
+                "message_id": target,
+                "text": text,
+            }
+        )
+        assert published is not None
+
+    async def observe(self, *lines: str) -> None:
+        """Feed lines that trigger nothing, so the transcript has history."""
+
+        for line in lines:
+            assert COMPANION.casefold() not in line.casefold()
+            await self.send(line)
+        await settle()
+
+    async def completed(self, count: int = 1) -> Any:
+        await wait_until(lambda: len(self.brain.scheduler.run_records()) >= count)
+        await wait_until(lambda: len(events_of(self.bus, TRACE_BRAIN_RUN_COMPLETED)) >= count)
+        return list(self.brain.scheduler.run_records().values())[-1]
+
+    async def ask(self, text: str = ASK) -> Any:
+        before = len(self.brain.scheduler.run_records())
+        await self.send(text)
+        return await self.completed(before + 1)
+
+    async def started(self) -> str:
+        """The run id of the one run started so far, once its trace exists."""
+
+        await wait_until(lambda: len(self.traces(TRACE_BRAIN_RUN_STARTED)) == 1)
+        (started,) = self.traces(TRACE_BRAIN_RUN_STARTED)
+        return started["payload"]["run_id"]
+
+    def requests(self) -> list[dict[str, Any]]:
+        return self.session.requests()
+
+    def tools(self, index: int) -> list[str]:
+        return [tool["function"]["name"] for tool in self.requests()[index].get("tools", [])]
+
+    def traces(self, event_type: str) -> list[dict[str, Any]]:
+        return events_of(self.bus, event_type)
+
+    def run_completed(self) -> dict[str, Any]:
+        return self.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
+
+    def executor_calls(self) -> list[tuple[str, str]]:
+        return [
+            (event["payload"]["action"], event["payload"]["call_id"])
+            for event in self.traces(TRACE_ACTION_STARTED)
+        ]
+
+    def observations(self) -> list[dict[str, Any]]:
+        return [event["payload"] for event in self.traces(TRACE_OBSERVATION)]
+
+    def sends(self) -> list[str]:
+        """The texts that left at the platform's transport, in send order."""
+
+        if self.twitch_session is not None:
+            return [body["message"] for body in self.twitch_session.sends]
+        return [send["text"] for send in self.platform_handle.sends]
+
+    def memory(self) -> list[tuple[str, str]]:
+        key = SessionKey(platform=self.platform, channel_id=self.channel, viewer_id=VIEWER)
+        return [(exchange.user, exchange.assistant) for exchange in self.brain.memory.recall(key)]
+
+    async def close_brain(self) -> None:
+        """Close the brain alone: its runs end ``cancelled`` (AC25)."""
+
+        await self.brain.close()
+
+    async def close(self) -> None:
+        """Shut down in the coordinator's order: the brain's runs first, then
+        every input stopped and every handle closed in reverse activation
+        order. Idempotent."""
+
+        await self.close_brain()
+        for name, handle in reversed(list(self.handles.items())):
+            if name == MODULE_NAME:
+                continue
+            stop_inputs = getattr(handle, "stop_inputs", None)
+            if stop_inputs is not None:
+                await stop_inputs()
+            await handle.close()
+
+
+async def activate_vertical(
+    *bodies: Any,
+    modules_directory: Path,
+    platform: str = PLATFORM,
+    grants: Sequence[str | AuthorizationRule] = ALL_GRANTS,
+    settings_overrides: dict[str, Any] | None = None,
+    session: ScriptedModel | None = None,
+    store_limits: Mapping[str, Any] | None = None,
+    enabled_capabilities: Sequence[str] = CAPABILITY_MODULES,
+) -> VerticalHarness:
+    """Load and prepare the platform module, the enabled capability modules
+    and the shipped brain from *modules_directory* through the real loader
+    on the shared runtime — real executor, real trigger engine, real chat
+    transcript, real store on the injected clock — then start the platform's
+    input. *grants* are action names (granted on the scope the module
+    declares) or explicit rules. The screen behind the capture module is a
+    :class:`FakeCaptureSource` handed in through the module's file-source
+    seam; the model is a :class:`ScriptedModel` answering every probe."""
+
+    clock = ManualClock()
+    store = AttachmentStore(clock=clock, **(dict(store_limits) if store_limits else STORE_LIMITS))
+    policy = AuthorizationPolicy(
+        [rule if isinstance(rule, AuthorizationRule) else grant(rule) for rule in grants]
+    )
+    context = build_context(
+        clock=clock,
+        authorization=policy,
+        attachments=store,
+        trigger_registry=TriggerRegistry(companion_name=COMPANION),
+        chat=ChatContext(clock=clock, **CHAT_LIMITS),
+    )
+    diagnostics: list[str] = []
+    source = FakeCaptureSource(data=PNG, width=IMAGE_WIDTH, height=IMAGE_HEIGHT)
+    target_session = session if session is not None else ScriptedModel(*bodies)
+
+    twitch_session: VerticalTwitchSession | None = None
+    websocket: VerticalWebSocket | None = None
+    fake_transport: Any = None
+    modules: dict[str, dict[str, Any]] = {}
+    if platform == PLATFORM:
+        websocket = VerticalWebSocket()
+        twitch_session = VerticalTwitchSession(websocket)
+        channel = BROADCASTER
+        platform_module = "twitch"
+
+        async def no_delay(_: float) -> None:
+            await asyncio.sleep(0)
+
+        modules["twitch"] = {
+            **TWITCH_SETTINGS,
+            "_session_factory": lambda: twitch_session,
+            "_retry_delay": no_delay,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    elif platform == FAKE_PLATFORM:
+        channel = FAKE_CHANNEL
+        platform_module = FAKE_MODULE
+        fake_transport = SimpleNamespace(outcomes=[], sends=[])
+        modules[FAKE_MODULE] = {
+            "channel_ids": [FAKE_CHANNEL],
+            "companion_name": COMPANION,
+            "transport": fake_transport,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    else:
+        raise ValueError(f"unknown platform {platform!r}")
+
+    capability_settings: dict[str, dict[str, Any]] = {
+        "chat_context": {"limits": {"chat_context": dict(CHAT_LIMITS)}},
+        "users": dict(USERS_SETTINGS),
+        "capture": {
+            "sources": {CAPTURE_SOURCE: {"kind": "file", "path": "/nonexistent/never-read.png"}},
+            "default_source": CAPTURE_SOURCE,
+            "_source_factory": lambda spec: source,
+        },
+    }
+    for name in enabled_capabilities:
+        modules[name] = capability_settings[name]
+
+    brain_settings = merge_settings(settings_overrides)
+    brain_settings.update(
+        {
+            "_session_factory": lambda: target_session,
+            "_sleeper": clock.sleep,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    )
+    modules[MODULE_NAME] = brain_settings
+
+    loader = ModuleLoader(context.bus, modules_directory, context=context, environ={})
+    activations = await loader.activate_enabled(
+        {"enabled_modules": list(modules), "modules": modules}
+    )
+    handles = {activation.name: activation.handle for activation in activations}
+    assert list(handles) == list(modules)
+
+    harness = VerticalHarness(
+        platform=platform,
+        channel=channel,
+        context=context,
+        clock=clock,
+        store=store,
+        session=target_session,
+        source=source,
+        handles=handles,
+        diagnostics=diagnostics,
+        tasks_before=0,
+        twitch_session=twitch_session,
+        websocket=websocket,
+        fake_transport=fake_transport,
+    )
+    try:
+        for handle in handles.values():
+            await handle.prepare()
+        await handles[platform_module].start_inputs()
+        if twitch_session is not None:
+            await wait_until(lambda: EVENTSUB_SUBSCRIPTIONS_URL in twitch_session.post_calls)
+    except BaseException:
+        await harness.close()
+        raise
+    harness.tasks_before = context.tasks.active
+    return harness
+
+
+def trace_set(harness: VerticalHarness, run_id: str) -> set[tuple[str, Any, Any, Any]]:
+    """The compared trace set of a scenario: ``(type, action, status, call)``
+    for every published trace of :data:`COMPARED_TRACE_TYPES`, the call id
+    stripped of the run id it is prefixed with — no platform value, no
+    payload beyond those four fields."""
+
+    compared: set[tuple[str, Any, Any, Any]] = set()
+    for event in harness.bus.list_events():
+        if event["type"] not in COMPARED_TRACE_TYPES:
+            continue
+        payload = event["payload"]
+        call_id = payload.get("call_id")
+        if isinstance(call_id, str) and call_id.startswith(f"{run_id}/"):
+            call_id = call_id[len(run_id) + 1 :]
+        compared.add((event["type"], payload.get("action"), payload.get("status"), call_id))
+    return compared
+
+
+def call_suffixes(harness: VerticalHarness, run_id: str) -> list[tuple[str, str]]:
+    """The executor call sequence with the run id stripped from the call ids."""
+
+    return [
+        (action, call_id[len(run_id) + 1 :] if call_id.startswith(f"{run_id}/") else call_id)
+        for action, call_id in harness.executor_calls()
+    ]
+
+
+def brain_package_lines() -> list[tuple[str, int, str]]:
+    """Every line of every source file of the shipped brain package."""
+
+    lines: list[tuple[str, int, str]] = []
+    for path in sorted((SHIPPED_MODULES / "brain").rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            lines.append((str(path.relative_to(ROOT)), number, line))
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# AC1, AC2 with the real providers (R1, R5)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac1_vertical_one_twitch_message_drives_the_real_modules_in_order(
+    vertical_modules: Path,
+) -> None:
+    """AC1 (R1, R5) with the shipped ``twitch``, ``chat_context``, ``users``,
+    ``capture`` and ``brain`` modules activated by the real loader from one
+    temporary ``modules_directory``: one EventSub notification admitted on
+    the served channel yields exactly 3 executor calls ``call-1..3`` served
+    by the real providers (``chat-context``, ``capture``, the twitch
+    ``chat.write``), exactly 1 Helix send — the final text as ``call-3`` —
+    with 0 sends before it, ``brain.run.completed`` with ``status:
+    success``, ``turns: 3``, ``action_calls: 3``, and one ``run_id`` and
+    one ``conversation_id`` across every correlated trace."""
+
+    session = SnapshotModel(*AC1_SCRIPT)
+    harness = await activate_vertical(session=session, modules_directory=vertical_modules)
+    sends_at_request: list[int] = []
+    session.on_request = lambda body: sends_at_request.append(len(harness.sends()))
+    try:
+        # The loader discovered both platforms and every capability, and the
+        # enabled set bound exactly one provider per action (R5).
+        registry = harness.context.actions
+        assert set(registry.discovered()) == {CHAT_READ, USERS_READ, SCREEN_CAPTURE, CHAT_WRITE}
+        bound = {
+            name: [(binding.module, binding.provider_name) for binding in registry.bindings(name)]
+            for name in registry.discovered()
+        }
+        assert bound == {
+            CHAT_READ: [("chat_context", CHAT_READ_PROVIDER)],
+            USERS_READ: [("users", USERS_READ_PROVIDER)],
+            SCREEN_CAPTURE: [("capture", CAPTURE_PROVIDER)],
+            CHAT_WRITE: [("twitch", TWITCH_CHAT_WRITE_PROVIDER)],
+        }
+
+        await harness.observe(*CONTEXT_LINES)
+        record = await harness.ask()
+        run_id = record.run_id
+
+        assert record.status == "success"
+        assert harness.executor_calls() == [
+            (CHAT_READ, f"{run_id}/call-1"),
+            (SCREEN_CAPTURE, f"{run_id}/call-2"),
+            (CHAT_WRITE, f"{run_id}/call-3"),
+        ]
+        chat_read = harness.executor.outcome(f"{run_id}/call-1")
+        assert chat_read.status == "success"
+        assert chat_read.provenance["provider"] == CHAT_READ_PROVIDER
+        capture = harness.executor.outcome(f"{run_id}/call-2")
+        assert capture.status == "success"
+        assert capture.provenance["provider"] == CAPTURE_PROVIDER
+        assert len(harness.source.calls) == 1
+        assert harness.executor.outcome(f"{run_id}/call-3").status == "success"
+
+        assert harness.sends() == [FINAL_TEXT]
+        assert harness.twitch_session is not None
+        (helix,) = harness.twitch_session.sends
+        assert helix["broadcaster_id"] == BROADCASTER and helix["sender_id"] == BOT_USER
+        assert sends_at_request == [0, 0, 0]
+        assert len(harness.requests()) == 3
+
+        completed = harness.run_completed()
+        assert completed["status"] == "success"
+        assert completed["turns"] == 3
+        assert completed["action_calls"] == 3
+        assert completed["sends"] == 1
+        assert completed["delivery"] == "success"
+        assert completed["fallback"] == FALLBACK_NONE
+        assert completed["deliveries"] == [
+            {"action": CHAT_WRITE, "call_id": f"{run_id}/call-3", "text": True, "status": "success"}
+        ]
+
+        correlated = [event for event in harness.bus.list_events() if "run_id" in event["payload"]]
+        assert {event["payload"]["run_id"] for event in correlated} == {run_id}
+        conversations = {
+            event["payload"]["conversation_id"]
+            for event in correlated
+            if "conversation_id" in event["payload"]
+        }
+        assert len(conversations) == 1
+        assert {event["type"] for event in correlated} >= {
+            TRACE_BRAIN_ADMISSION_ACCEPTED,
+            TRACE_BRAIN_RUN_STARTED,
+            TRACE_BRAIN_RUN_COMPLETED,
+            TRACE_ACTION_STARTED,
+            TRACE_ACTION_COMPLETED,
+            TRACE_OBSERVATION,
+            TRACE_CHANNEL_CHAT_SENT,
+        }
+        (sent,) = harness.traces(TRACE_CHANNEL_CHAT_SENT)
+        assert sent["payload"]["call_id"] == f"{run_id}/call-3"
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac2_vertical_the_transcript_and_the_captured_image_return_to_the_model(
+    vertical_modules: Path,
+) -> None:
+    """AC2 (R1, R5) with the real providers: the second request carries the
+    messages the shipped ``chat.read`` paged from the core transcript — the
+    two lines the platform ingested before the question and the question
+    itself — as text; the third carries exactly one image input, the PNG
+    the shipped capture module read from its source and leased into the
+    run's store, with the sniffed dimensions on its ``image_ref`` part; the
+    store's usage for the run is 0 objects after ``brain.run.completed``."""
+
+    harness = await activate_vertical(*AC1_SCRIPT, modules_directory=vertical_modules)
+    try:
+        await harness.observe(*CONTEXT_LINES)
+        record = await harness.ask()
+        run_id = record.run_id
+        first, second, third = harness.requests()
+
+        assert tool_messages(first) == [] and image_parts(first) == []
+        (result,) = tool_messages(second)
+        assert observation_envelope(result)["status"] == "success"
+        for line in (*CONTEXT_LINES, ASK):
+            assert line in message_text(result)
+        assert image_parts(second) == []
+        chat_read = harness.executor.outcome(f"{run_id}/call-1")
+        assert [message["text"] for message in chat_read.result["messages"]] == [*CONTEXT_LINES, ASK]
+        assert chat_read.result["coverage"] == {
+            "returned": 3,
+            "retained": 3,
+            "window_seconds": CHAT_LIMITS["max_age_seconds"],
+            "complete": True,
+        }
+
+        assert len(tool_messages(third)) == 2
+        (image,) = image_parts(third)
+        assert image["image_url"]["url"] == (
+            f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
+        )
+        capture = harness.executor.outcome(f"{run_id}/call-2")
+        (part,) = capture.parts
+        assert part["type"] == "image_ref"
+        assert (part["width"], part["height"], part["size"]) == (IMAGE_WIDTH, IMAGE_HEIGHT, len(PNG))
+        assert part["content_type"] == "image/png"
+        assert part["provider_id"] == CAPTURE_PROVIDER
+        assert capture.result["source"] == CAPTURE_SOURCE
+        assert harness.store.lookup(part["attachment_id"]) is None  # released with the run
+        assert harness.store.usage(run_id).objects == 0
+        assert harness.store.object_count == 0
+    finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC31: the same scenario on the fake platform, call for call (R5)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac31_the_scenario_on_the_fake_platform_matches_twitch_call_for_call(
+    vertical_modules: Path,
+) -> None:
+    """AC31 (R5): the AC1 scenario run entirely on platform ``fake`` — a
+    fake chat event, the real ``chat.read`` and ``screen.capture``, the
+    final response delivered through the fake ``chat.write`` — produces the
+    same executor call sequence, the same trace set (type, action, status,
+    call), the same tools offered per request and the same completion
+    record as on twitch; only the destinations' platform and channel differ,
+    and the ``chat.write`` provider is the enabled platform module's. The
+    core and the brain are the same packages, loaded from the same
+    directory, for both runs."""
+
+    twitch = await activate_vertical(*AC1_SCRIPT, modules_directory=vertical_modules)
+    fake = await activate_vertical(
+        *AC1_SCRIPT, platform=FAKE_PLATFORM, modules_directory=vertical_modules
+    )
+    try:
+        records = {}
+        for harness in (twitch, fake):
+            await harness.observe(*CONTEXT_LINES)
+            records[harness.platform] = await harness.ask()
+            assert records[harness.platform].status == "success"
+            assert harness.diagnostics == []
+        twitch_run = records[PLATFORM].run_id
+        fake_run = records[FAKE_PLATFORM].run_id
+
+        # The same call sequence.
+        expected_calls = [(CHAT_READ, "call-1"), (SCREEN_CAPTURE, "call-2"), (CHAT_WRITE, "call-3")]
+        assert call_suffixes(twitch, twitch_run) == expected_calls
+        assert call_suffixes(fake, fake_run) == expected_calls
+        for harness, run_id in ((twitch, twitch_run), (fake, fake_run)):
+            assert [
+                harness.executor.outcome(f"{run_id}/call-{index}").status for index in (1, 2, 3)
+            ] == ["success", "success", "success"]
+
+        # The same trace set, and a set that covers the whole brain path.
+        assert trace_set(twitch, twitch_run) == trace_set(fake, fake_run)
+        assert {entry[0] for entry in trace_set(fake, fake_run)} >= {
+            TRACE_INPUT_TRIGGER_ACCEPTED,
+            TRACE_BRAIN_ADMISSION_ACCEPTED,
+            TRACE_BRAIN_RUN_STARTED,
+            TRACE_ACTION_STARTED,
+            TRACE_ACTION_COMPLETED,
+            TRACE_OBSERVATION,
+            TRACE_BRAIN_RUN_COMPLETED,
+        }
+        assert (TRACE_ACTION_COMPLETED, CHAT_WRITE, "success", "call-3") in trace_set(fake, fake_run)
+
+        # The same model-side sequence, and the same delivery.
+        assert [twitch.tools(index) for index in range(3)] == [fake.tools(index) for index in range(3)]
+        assert twitch.tools(0) == [CHAT_READ, SCREEN_CAPTURE, USERS_READ]
+        assert twitch.sends() == fake.sends() == [FINAL_TEXT]
+        compared = ("status", "turns", "action_calls", "model_calls", "sends", "delivery", "fallback")
+        assert {key: twitch.run_completed()[key] for key in compared} == {
+            key: fake.run_completed()[key] for key in compared
+        }
+        assert [
+            (entry["action"], entry["text"], entry["status"]) for entry in fake.run_completed()["deliveries"]
+        ] == [(CHAT_WRITE, True, "success")]
+
+        # Only the destinations' platform values differ: the scopes are the
+        # actions' declared ones on both.
+        for harness in (twitch, fake):
+            destinations = [
+                str(event["payload"]["destination"]) for event in harness.traces(TRACE_ACTION_STARTED)
+            ]
+            assert destinations == [
+                harness.scope(CHAT_READ),
+                harness.scope(SCREEN_CAPTURE),
+                harness.scope(CHAT_WRITE),
+            ]
+        (fake_binding,) = fake.context.actions.bindings(CHAT_WRITE)
+        assert fake_binding.module == FAKE_MODULE
+        assert fake_binding.destination.platform == FAKE_PLATFORM
+        (twitch_binding,) = twitch.context.actions.bindings(CHAT_WRITE)
+        assert twitch_binding.module == "twitch"
+        assert fake.store.object_count == 0 and twitch.store.object_count == 0
+    finally:
+        await twitch.close()
+        await fake.close()
+
+
+@pytest.mark.parametrize(
+    "directory",
+    ["core", "modules/brain", "modules/chat_context", "modules/users", "modules/capture"],
+)
+def test_ac31_the_core_and_the_neutral_modules_name_no_platform(directory: str) -> None:
+    """AC31 (R5): ``grep -r twitch`` over ``core/``, ``modules/brain``,
+    ``modules/chat_context``, ``modules/users`` and ``modules/capture``
+    matches 0 lines — the platform is a runtime value of the destination
+    and of the event, never a name in the neutral code (``modules/proxy``
+    and ``modules/agent_link`` join this grep when they exist)."""
+
+    completed = subprocess.run(
+        ["grep", "-r", "--exclude-dir=__pycache__", "twitch", str(ROOT / directory)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    matches = [line for line in completed.stdout.splitlines() if line]
+    assert completed.returncode in (0, 1), completed.stderr
+    assert matches == [], "\n".join(matches)
+
+
+# --------------------------------------------------------------------------- #
+# AC41 (local half): only ``capture`` enabled offers ``screen.capture`` (R7)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac41_local_with_only_capture_enabled_the_model_is_offered_screen_capture(
+    vertical_modules: Path,
+) -> None:
+    """AC41 (R7), local half: with the ``capture`` module enabled and no
+    other provider of ``screen.capture``, the action is bound by exactly one
+    provider (``capture``, module ``capture``), the model is offered
+    ``screen.capture`` on every request and a proposal reaches that
+    provider; without ``capture`` enabled nothing binds the action and it
+    is offered to nobody — the brain reads the registry's authorized view
+    and names no provider."""
+
+    harness = await activate_vertical(*AC1_SCRIPT, modules_directory=vertical_modules)
+    try:
+        (binding,) = harness.context.actions.bindings(SCREEN_CAPTURE)
+        assert (binding.module, binding.provider_name) == ("capture", CAPTURE_PROVIDER)
+        assert str(binding.destination) == f"{WILDCARD}/{WILDCARD}/{CAPTURE_SCOPE}"
+        record = await harness.ask()
+        assert record.status == "success"
+        for index in range(3):
+            assert SCREEN_CAPTURE in harness.tools(index)
+        assert len(harness.source.calls) == 1
+        assert harness.executor.outcome(f"{record.run_id}/call-2").provenance["provider"] == CAPTURE_PROVIDER
+    finally:
+        await harness.close()
+
+    without = await activate_vertical(
+        final("ok"),
+        modules_directory=vertical_modules,
+        enabled_capabilities=("chat_context", "users"),
+    )
+    try:
+        assert SCREEN_CAPTURE not in without.context.actions.discovered()
+        assert without.context.actions.bindings(SCREEN_CAPTURE) == ()
+        record = await without.ask()
+        assert record.status == "success"
+        assert without.tools(0) == [CHAT_READ, USERS_READ]
+        assert without.diagnostics == []
+    finally:
+        await without.close()
+
+
+def test_ac41_local_the_brain_package_references_neither_capture_nor_proxy() -> None:
+    """AC41 (R7): the brain code path is identical whichever module serves
+    ``screen.capture`` — ``modules/brain/`` holds 0 references to the
+    ``capture`` or ``proxy`` modules: no import of any ``modules`` package
+    at all (checked on the syntax tree), no module name as a string
+    literal, no ``modules.capture``/``modules/proxy`` path, no
+    ``screen.capture`` action literal, and the word ``proxy`` nowhere."""
+
+    forbidden = (
+        '"capture"',
+        "'capture'",
+        '"proxy"',
+        "'proxy'",
+        "modules.capture",
+        "modules/capture",
+        "modules.proxy",
+        "modules/proxy",
+        "screen.capture",
+        "proxy",
+    )
+    matches = [
+        f"{path}:{number}:{line}"
+        for path, number, line in brain_package_lines()
+        if any(literal in line for literal in forbidden)
+    ]
+    assert matches == []
+
+    for path in sorted((SHIPPED_MODULES / "brain").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            for name in names:
+                assert not (name == "modules" or name.startswith("modules.")), (path, name)
+
+
+# --------------------------------------------------------------------------- #
+# AC25 with the real capture provider on every terminal path (R4, R5)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac25_vertical_success_error_and_timeout_release_the_real_captures(
+    vertical_modules: Path,
+) -> None:
+    """AC25 (R4) with the shipped capture module leasing into the run's
+    store: success, error (an unsupported response shape after a capture)
+    and timeout (the model call outrunning ``model_call_seconds`` with a
+    capture leased) — for each, the store reports 0 objects for the run
+    once ``brain.run.completed`` is published and the supervised task
+    count is back to its pre-run value."""
+
+    success = await activate_vertical(*AC1_SCRIPT, modules_directory=vertical_modules)
+    try:
+        record = await success.ask()
+        assert record.status == "success"
+        assert len(success.source.calls) == 1
+        assert success.store.usage(record.run_id).objects == 0
+        assert success.store.object_count == 0
+        assert success.context.tasks.active == success.tasks_before
+    finally:
+        await success.close()
+
+    error = await activate_vertical(
+        tool_call(SCREEN_CAPTURE, {}),
+        tool_calls([(CHAT_READ, {"limit": 1}), (USERS_READ, {"limit": 1})]),
+        modules_directory=vertical_modules,
+    )
+    try:
+        record = await error.ask()
+        assert record.status == "error"
+        assert error.run_completed()["failure"] == RUN_FAILURE_UNSUPPORTED_RESPONSE_SHAPE
+        assert error.executor.outcome(f"{record.run_id}/call-1").status == "success"
+        assert error.store.usage(record.run_id).objects == 0
+        assert error.store.object_count == 0
+        assert error.context.tasks.active == error.tasks_before
+        assert error.sends() == []
+    finally:
+        await error.close()
+
+    held = HeldSession(
+        FakeResponse(200, tool_call(SCREEN_CAPTURE, {})), FakeResponse(200, final("late"))
+    )
+    timeout = await activate_vertical(session=held, modules_directory=vertical_modules)  # type: ignore[arg-type]
+    try:
+        await timeout.send()
+        await asyncio.wait_for(held.entered.wait(), 1)
+        held.entered.clear()
+        held.release.set()
+        await wait_until(lambda: timeout.store.object_count == 1)
+        held.release.clear()
+        await asyncio.wait_for(held.entered.wait(), 1)
+        run_id = await timeout.started()
+        assert timeout.store.usage(run_id).objects == 1
+        timeout.clock.advance(VALID_SETTINGS["budget"]["model_call_seconds"] + 1.0)
+        record = await timeout.completed()
+        assert record.status == "timeout"
+        assert timeout.store.usage(record.run_id).objects == 0
+        assert timeout.store.object_count == 0
+        assert timeout.context.tasks.active == timeout.tasks_before
+        assert timeout.sends() == []
+        held.release.set()
+    finally:
+        await timeout.close()
+
+
+@pytest.mark.asyncio
+async def test_ac25_vertical_cancellation_during_a_capture_a_model_call_or_a_delivery(
+    vertical_modules: Path,
+) -> None:
+    """AC25 (R4) with the shipped capture module and the shipped twitch
+    send: cancellation during a capture (a second capture held inside the
+    source while the first is leased), during the model call and during
+    the delivery (the Helix request held) — closing the brain ends the run
+    ``cancelled`` with its one ``brain.run.completed``, the store reports 0
+    objects for the run once it is published, the supervised task count is
+    back to its pre-run value, nothing was sent and memory is unchanged."""
+
+    capture = await activate_vertical(
+        tool_call(SCREEN_CAPTURE, {}),
+        tool_call(SCREEN_CAPTURE, {}),
+        final("never"),
+        modules_directory=vertical_modules,
+    )
+    await capture.send()
+    await wait_until(lambda: len(capture.source.calls) == 1)
+    capture.source.hold = asyncio.get_running_loop().create_future()
+    await wait_until(lambda: len(capture.source.calls) == 2)
+    run_id = await capture.started()
+    assert capture.store.usage(run_id).objects == 1
+    await capture.close_brain()
+    record = capture.brain.scheduler.run_records()[run_id]
+    assert record.status == "cancelled"
+    assert capture.run_completed()["status"] == "cancelled"
+    assert capture.store.usage(run_id).objects == 0 and capture.store.object_count == 0
+    assert capture.context.tasks.active == capture.tasks_before
+    assert capture.executor.outcome(f"{run_id}/call-1").status == "success"
+    assert capture.executor.outcome(f"{run_id}/call-2").status == "cancelled"
+    assert capture.sends() == []
+    await capture.close()
+
+    held = HeldSession(
+        FakeResponse(200, tool_call(SCREEN_CAPTURE, {})), FakeResponse(200, final("never"))
+    )
+    model = await activate_vertical(session=held, modules_directory=vertical_modules)  # type: ignore[arg-type]
+    await model.send()
+    await asyncio.wait_for(held.entered.wait(), 1)
+    held.entered.clear()
+    held.release.set()
+    await wait_until(lambda: model.store.object_count == 1)
+    held.release.clear()
+    await asyncio.wait_for(held.entered.wait(), 1)
+    run_id = await model.started()
+    assert model.store.usage(run_id).objects == 1
+    await model.close_brain()
+    assert model.brain.scheduler.run_records()[run_id].status == "cancelled"
+    assert model.run_completed()["status"] == "cancelled"
+    assert model.store.usage(run_id).objects == 0 and model.store.object_count == 0
+    assert model.context.tasks.active == model.tasks_before
+    assert model.sends() == []
+    await model.close()
+
+    delivery = await activate_vertical(
+        tool_call(SCREEN_CAPTURE, {}), final(FINAL_TEXT), modules_directory=vertical_modules
+    )
+    assert delivery.twitch_session is not None
+    delivery.twitch_session.hold = asyncio.get_running_loop().create_future()
+    await delivery.send()
+    await asyncio.wait_for(delivery.twitch_session.entered.wait(), 1)
+    await settle()
+    run_id = await delivery.started()
+    assert delivery.store.usage(run_id).objects == 1
+    assert delivery.executor_calls()[-1] == (CHAT_WRITE, f"{run_id}/call-2")
+    await delivery.close_brain()
+    assert delivery.brain.scheduler.run_records()[run_id].status == "cancelled"
+    assert delivery.run_completed()["status"] == "cancelled"
+    assert delivery.store.usage(run_id).objects == 0 and delivery.store.object_count == 0
+    assert delivery.context.tasks.active == delivery.tasks_before
+    assert delivery.sends() == []
+    assert delivery.memory() == []
+    await delivery.close()

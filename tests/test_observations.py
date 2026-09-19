@@ -3,8 +3,11 @@
 Created by step P1; the executor-side checks (lease, stored size, byte
 bound) are added by P3 — exercised here through the shared
 ``runtime_context(attachments=...)`` every suite builds, with the one store
-both the modules lease from and the executor validates against — and the
-model-side ones by P12.
+both the modules lease from and the executor validates against — the
+model-side ones by P12, and the same lease rules through the **shipped**
+capture module by P17 (the vertical harness of ``test_agentic_loop``: the
+real provider leases into the one store the executor validates against and
+the brain releases from).
 """
 
 import pytest
@@ -579,3 +582,95 @@ async def test_a_lease_expired_at_validation_is_invalid_result_and_one_expired_l
         assert late.sender.sends == []
     finally:
         await late.close()
+
+
+# --------------------------------------------------------------------------- #
+# The real capture provider through the whole brain path (P17; AC2, AC24, AC25)
+# --------------------------------------------------------------------------- #
+
+from pathlib import Path  # noqa: E402
+
+from test_agentic_loop import (  # noqa: E402
+    CAPTURE_PROVIDER,
+    IMAGE_HEIGHT,
+    IMAGE_WIDTH,
+    PNG,
+    SnapshotModel,
+    activate_vertical,
+    vertical_modules,  # noqa: F401  (the session-scoped modules_directory fixture)
+)
+
+
+async def test_the_real_capture_provider_leases_into_the_one_store_the_executor_validates(
+    vertical_modules: Path,
+) -> None:
+    """P17 (R4, R5): the shipped capture module — loaded by the real loader
+    beside the shipped brain — leases its image into the same store the
+    executor validates every ``image_ref`` against: the part the model
+    receives names an attachment leased under the run, of exactly the
+    stored size and the sniffed dimensions, held by the store at the
+    request that carries the image (1 object) and by nobody once
+    ``brain.run.completed`` is published (0 objects)."""
+
+    session = SnapshotModel(tool_call(SCREEN_CAPTURE, {}), final("Nothing to see."))
+    harness = await activate_vertical(session=session, modules_directory=vertical_modules)
+    objects_at_request: list[int] = []
+    session.on_request = lambda body: objects_at_request.append(harness.store.object_count)
+    try:
+        record = await harness.ask()
+        assert record.status == "success"
+        assert objects_at_request == [0, 1]
+        observation = harness.executor.outcome(f"{record.run_id}/call-1")
+        assert observation.status == "success"
+        (part,) = observation.parts
+        assert part["provider_id"] == CAPTURE_PROVIDER
+        assert (part["size"], part["width"], part["height"]) == (len(PNG), IMAGE_WIDTH, IMAGE_HEIGHT)
+        assert len(image_parts(harness.requests()[1])) == 1
+        assert harness.observations()[0]["parts"] == [
+            {
+                "type": "image_ref",
+                "attachment_id": part["attachment_id"],
+                "content_type": "image/png",
+                "size": len(PNG),
+                "width": IMAGE_WIDTH,
+                "height": IMAGE_HEIGHT,
+            }
+        ]
+        assert harness.store.lookup(part["attachment_id"]) is None
+        assert harness.store.usage(record.run_id).objects == 0
+        assert harness.store.object_count == 0
+    finally:
+        await harness.close()
+
+
+async def test_a_real_lease_expired_after_adoption_ends_the_run_with_nothing_sent(
+    vertical_modules: Path,
+) -> None:
+    """AC24 through the shipped capture module: the lease it made expires
+    on the injected clock after the executor adopted the observation and
+    before the model turn that would carry it — the brain's own lookup ends
+    the run ``error`` / ``attachment_expired`` with 1 model request, 0
+    image parts anywhere, 0 sends at the platform and the store at 0."""
+
+    harness = await activate_vertical(
+        tool_call(SCREEN_CAPTURE, {}), final("never"), modules_directory=vertical_modules
+    )
+    harness.bus.subscribe(
+        contracts.TRACE_ACTION_COMPLETED,
+        lambda event: harness.clock.advance(STORE_LIMITS["ttl_seconds"] + 1.0)
+        if event["payload"]["action"] == SCREEN_CAPTURE
+        else None,
+    )
+    try:
+        record = await harness.ask()
+        assert record.status == "error"
+        assert harness.run_completed()["failure"] == contracts.BRAIN_ERROR_ATTACHMENT_EXPIRED
+        assert len(harness.requests()) == 1
+        assert image_parts(harness.requests()[0]) == []
+        assert harness.executor.outcome(f"{record.run_id}/call-1").status == "success"
+        assert harness.store.usage(record.run_id).objects == 0
+        assert harness.store.object_count == 0
+        assert harness.sends() == []
+        assert harness.context.tasks.active == harness.tasks_before
+    finally:
+        await harness.close()

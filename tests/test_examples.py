@@ -26,7 +26,7 @@ from core.lifecycle import ROLE_INPUT, ROLE_OBSERVATION
 from core.loader import ModuleLoader
 from core.main import LIMITS_KEY, load_config
 from core.runtime import RUNTIME_API
-from conftest import FakeResponse, FakeSession
+from conftest import FakeCaptureSource, FakeResponse, FakeSession
 
 
 ROOT = Path(__file__).parents[1]
@@ -326,6 +326,48 @@ class _TwitchSession:
         self.close_calls += 1
 
 
+class _ModelSession(FakeSession):
+    """The brain's model transport, probe-aware and nothing beyond.
+
+    Every capability probe the brain makes at ``prepare`` (R2) is answered
+    by the shared fake with one valid forced tool call, so a prepared brain
+    becomes ready; a scenario request is never expected by these tests and
+    is refused rather than answered.
+    """
+
+    async def _answer(self, url: str, kwargs: dict[str, Any]) -> Any:
+        raise AssertionError(f"unexpected model request beyond preparation: {url}")
+
+
+def _point_seams_at_fakes(
+    config: dict[str, Any], environ: Mapping[str, str], diagnostics: list[str]
+) -> None:
+    """Point every transport seam of the example's modules at fakes.
+
+    One entry per shipped module that owns an edge the process cannot own
+    in a test: the chat input's session, the brain's model session (probe-
+    aware), the audit writer and the capture module's screen (a
+    :class:`FakeCaptureSource` handed in through its file-source seam, so
+    no path is read). A module the example does not enable is left alone —
+    the seams are applied to the modules the example configures, whatever
+    the profile lists — and a module without an edge (``chat_context``,
+    ``users``) needs none.
+    """
+
+    seams: dict[str, dict[str, Any]] = {
+        "twitch": {
+            "_session_factory": lambda: _TwitchSession(environ),
+            "diagnostic_reporter": diagnostics.append,
+        },
+        "brain": {"_session_factory": _ModelSession, "diagnostic_reporter": diagnostics.append},
+        "audit": {"_writer": lambda line: None},
+        "capture": {"_source_factory": lambda spec: FakeCaptureSource()},
+    }
+    for module_name, extra in seams.items():
+        if module_name in config["modules"]:
+            config["modules"][module_name].update(extra)
+
+
 async def _activate_example(
     environ: Mapping[str, str],
 ) -> tuple[Any, list[Any], list[str]]:
@@ -338,16 +380,7 @@ async def _activate_example(
     config = load_config(EXAMPLE_PATH, environ=environ)
     runtime = application._assemble_runtime(config)
     diagnostics: list[str] = []
-    config["modules"]["twitch"].update(
-        {
-            "_session_factory": lambda: _TwitchSession(environ),
-            "diagnostic_reporter": diagnostics.append,
-        }
-    )
-    config["modules"]["brain"].update(
-        {"_session_factory": FakeSession, "diagnostic_reporter": diagnostics.append}
-    )
-    config["modules"]["audit"]["_writer"] = lambda line: None
+    _point_seams_at_fakes(config, environ, diagnostics)
 
     loader = ModuleLoader(runtime.bus, config["modules_directory"])
     loader.context = runtime.context
