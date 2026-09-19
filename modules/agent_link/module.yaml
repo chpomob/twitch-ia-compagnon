@@ -1,0 +1,143 @@
+# Agent-side link: WebSocket JSON client dialing the brain's proxy — manifest
+# v2 (R6, decisions 6–9).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no token, no grant and **no action**
+# lives here. The link lends actions it does not declare: at `prepare` it
+# resolves every name of its `actions` list from the agent's own discovered
+# catalog — the specs the colocated modules (`capture` in phase 1) declared —
+# and at pairing it sends them to the brain in `hello`. Every `call` the brain
+# forwards is executed through the agent's own default-deny executor with the
+# forwarded principal: only an explicit agent-side authorization rule ever
+# lets a forwarded call reach a provider (R5, R6).
+
+name: agent_link
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# Nothing is produced or consumed on the agent's local bus: the bus is not
+# distributed (R6). The `agent.status` event the link sends after every
+# `welcome` is a wire frame the brain's proxy publishes on *its* bus.
+produces: []
+consumes: []
+middleware: false
+
+# Lifecycle role, never the module name, decides what each phase asks of this
+# module (R4). An `input` is a producer: its handle exposes `prepare` (resolve
+# the served actions, nothing dialed yet), is held at the readiness barrier,
+# then `start_inputs` (spawn the dial loop), `stop_inputs` (close the
+# connection, stop reconnecting) and `close` (cancel what still runs).
+lifecycle:
+  roles:
+    - input
+
+# Business settings belong to the module (R7). The schema states the shape;
+# the declared hook, defined by the module package, checks each field and
+# reports one diagnostic per offending field naming module and field, with
+# no configured value echoed back. The reserved `limits` block the entry
+# point hands every enabled module is accepted and not read: the attachment
+# bound applied to a transfer is the one the brain announces in each `call`.
+settings_schema:
+  type: object
+  properties:
+    brain_url:
+      type: string
+      description: >-
+        The WebSocket URL of the brain's proxy, `ws://` or `wss://`. A
+        non-loopback host is refused at validation unless the scheme is
+        `wss` (R6); loopback may use plain `ws`.
+    pairing_token:
+      type: string
+      description: >-
+        The shared secret presented in `hello`; resolved from an environment
+        reference, never logged, never echoed.
+    agent_id:
+      type: string
+      description: >-
+        The stable identifier of this agent; the brain records it as the
+        `provider_id` of the events it forwards.
+    actions:
+      type: array
+      items:
+        type: string
+      description: >-
+        The action names this agent lends to the brain; each must be
+        declared by a manifest enabled on this agent.
+    reconnect:
+      type: object
+      description: >-
+        Exponential backoff with full jitter between dial attempts, reset
+        by every `welcome`; attempts are unlimited while the agent runs
+        (decision 9).
+      properties:
+        initial_seconds:
+          type: number
+          minimum: 0
+          description: The base of the first delay. Default 1.
+        multiplier:
+          type: number
+          minimum: 1
+          description: The growth factor per consecutive failure. Default 2.
+        max_seconds:
+          type: number
+          minimum: 0
+          description: The cap every delay is drawn under. Default 30.
+    heartbeat_seconds:
+      type: number
+      minimum: 0
+      description: Interval between the `ping` frames sent to the brain. Default 15.
+    heartbeat_timeout_seconds:
+      type: number
+      minimum: 0
+      description: >-
+        How long a `pong` may take before the connection is treated as
+        dropped. Default 10.
+    call_table:
+      type: object
+      description: >-
+        The bounded call identity state kept per session so a re-sent
+        `call` never executes twice (R6): at most `max_entries` retained
+        observations, each evicted after `ttl_seconds` or when displaced.
+      properties:
+        max_entries:
+          type: integer
+          minimum: 1
+          description: How many retained observations the table holds. Default 1024.
+        ttl_seconds:
+          type: number
+          minimum: 0
+          description: How long an entry is retained on the agent's clock. Default 300.
+    max_frame_bytes:
+      type: integer
+      minimum: 1
+      description: >-
+        The largest text frame accepted from the brain, announced in
+        `hello`; a larger one is refused `frame_too_large` and the
+        connection closed 4413. Default 1048576.
+    action_seconds:
+      type: number
+      minimum: 0
+      description: >-
+        The agent's own bound on one forwarded call; the executed deadline
+        is `min(remaining_ms, action_seconds)` on the agent's monotonic
+        clock, never `deadline_utc`. Default 10.
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point to every
+        enabled module. Not read here.
+  required:
+    - brain_url
+    - pairing_token
+    - agent_id
+    - actions
+settings_validator: validate_settings
+
+# The pairing token is a credential (R8): its accepted value — literal or
+# resolved from `${NAME}` — is redacted from every supervision trace and
+# lost-trace diagnostic before this module is activated, and it never
+# appears in an `error` frame.
+credentials:
+  - pairing_token

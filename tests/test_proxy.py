@@ -2322,3 +2322,1801 @@ def test_the_proxy_package_names_no_platform() -> None:
     for path in (ROOT / "modules" / MODULE_NAME).glob("*"):
         if path.suffix in (".py", ".yaml"):
             assert "twitch" not in path.read_text(encoding="utf-8").lower(), path
+
+
+# =========================================================================== #
+# P20 — the agent side: ``modules/agent_link`` over the in-memory pair
+# =========================================================================== #
+#
+# Every test below activates ``modules/agent_link`` on its own runtime
+# context — the PC agent's process: its own clock, its own random source, its
+# own attachment store and its own default-deny executor with a rule granting
+# ``screen.capture`` to principal ``brain`` only — and lets the dial loop
+# reach the scripted brain end of a ``MemoryWebSocketPair`` through the
+# ``_connector`` seam. The AC33 tests put the real ``modules/proxy`` on the
+# other end, the two modules and the two runtimes in one process, and the
+# closing vertical test drives the whole AC1 scenario through the real loader
+# on both sides. No positive-duration sleep anywhere.
+
+import shutil
+import subprocess
+
+from core.actions import ERROR_CANCELLED, ERROR_NOT_AUTHORIZED, AuthorizationRule
+from core.contracts import (
+    PROXY_ERROR_DUPLICATE_CALL_UNKNOWN,
+    TRACE_ACTION_COMPLETED,
+    TRACE_ACTION_STARTED,
+    TRACE_MODULE_READY,
+    WILDCARD,
+    ActionObservation,
+)
+from core.context import ChatContext
+from core.triggers import TriggerRegistry
+from conftest import FakeCaptureSource, ScriptedModel
+from modules import agent_link
+from modules import capture as capture_module
+from modules.agent_link import (
+    AgentLinkError,
+    AgentLinkModule,
+    ERROR_ATTACHMENT_REFUSED,
+    STATE_PAIRED,
+)
+from modules.brain import MODULE_NAME as BRAIN_MODULE
+from test_agentic_loop import (
+    AC1_SCRIPT,
+    image_parts,
+    CAPTURE_SOURCE,
+    CHAT_LIMITS,
+    CHAT_READ,
+    CHAT_WRITE,
+    COMPANION,
+    CONTEXT_LINES,
+    FAKE_CHANNEL,
+    FAKE_MODULE,
+    FAKE_PLATFORM,
+    FINAL_TEXT,
+    FIXTURE_MODULES,
+    IMAGE_HEIGHT,
+    IMAGE_WIDTH,
+    PNG,
+    SHIPPED_MODULES,
+    USERS_READ,
+    USERS_SETTINGS,
+    VerticalHarness,
+    activate_vertical,
+    call_suffixes,
+    grant,
+    trace_set,
+)
+from test_agentic_loop import STORE_LIMITS as VERTICAL_STORE_LIMITS
+from test_brain import merge_settings
+
+
+AGENT_MODULE = agent_link.MODULE_NAME
+BRAIN_URL = "ws://127.0.0.1:8765/agent"
+AGENT_SETTINGS: dict[str, Any] = {
+    "brain_url": BRAIN_URL,
+    "pairing_token": TOKEN,
+    "agent_id": AGENT_ID,
+}
+#: The brain's limits as ``welcome`` announces them to the agent.
+BRAIN_LIMITS: dict[str, Any] = {
+    "max_frame_bytes": 1_048_576,
+    "max_attachment_bytes": STORE_LIMITS["max_object_bytes"],
+    "heartbeat_seconds": 15.0,
+    "heartbeat_timeout_seconds": 10.0,
+}
+#: A brain wall clock and an agent wall clock 3 h ahead of it (AC34).
+BRAIN_WALL_CLOCK = WALL_CLOCK
+AGENT_WALL_CLOCK = WALL_CLOCK + 3 * 3600
+
+
+class ConstantRandom:
+    """The injected random source of AC37: every draw is *value*."""
+
+    def __init__(self, value: float = 0.5) -> None:
+        self.value = value
+        self.draws = 0
+
+    def random(self) -> float:
+        self.draws += 1
+        return self.value
+
+
+def agent_policy(*principals: str) -> AuthorizationPolicy:
+    """The agent profile's one rule: ``screen.capture`` to principal ``brain`` (P21)."""
+
+    return AuthorizationPolicy(
+        [
+            AuthorizationRule(
+                rule_id="agent-capture",
+                action_name=SCREEN_CAPTURE,
+                destination=Destination(WILDCARD, WILDCARD, "capture"),
+                principals=principals or (PRINCIPAL,),
+                granted_permissions=("screen.capture",),
+            )
+        ]
+    )
+
+
+class RecordingCapture:
+    """The ``screen.capture`` provider behind the agent's executor.
+
+    Stores ``image`` in the agent's store under the call's run and answers
+    with the matching ``image_ref`` part; ``hold`` (a future the test
+    resolves) keeps an invocation pending; ``calls`` records every call.
+    """
+
+    name = "capture"
+
+    def __init__(self, host: "AgentHost", image: bytes | None) -> None:
+        self.host = host
+        self.image = image
+        self.calls: list[ActionCall] = []
+        self.hold: asyncio.Future[Any] | None = None
+        self.entered = asyncio.Event()
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        call = invocation.call
+        self.calls.append(call)
+        self.entered.set()
+        if self.hold is not None:
+            await self.hold
+        provenance = {"provider": self.name, "module": "capture"}
+        if self.image is None:
+            return ActionObservation(
+                status="success", provenance=provenance, result=capture_result(4)
+            )
+        ref = self.host.store.put(call.run_id, self.image, content_type="image/png")
+        return ActionObservation(
+            status="success",
+            provenance=provenance,
+            result=capture_result(len(self.image)),
+            parts=(image_ref(ref.attachment_id, len(self.image)),),
+        )
+
+
+class AgentHost:
+    """One activated agent link on its own runtime context, plus its dials.
+
+    ``dials`` scripts what the ``_connector`` seam answers, in order: a
+    :class:`MemoryWebSocketPair` (the client end is handed to the module)
+    or an exception (the dial fails). ``delays`` records every sleep the
+    module asked for — backoff and heartbeat alike — and ``backoffs`` the
+    ones asked while unpaired, which are the reconnection delays (a
+    heartbeat sleeps only while paired). Sleeps park on the manual clock;
+    with ``immediate_sleeper`` a backoff returns at once so a failure
+    sequence runs without moving the clock.
+    """
+
+    def __init__(
+        self,
+        *,
+        actions: tuple[str, ...] = (SCREEN_CAPTURE,),
+        clock: ManualClock | None = None,
+        rng: Any = None,
+        policy: AuthorizationPolicy | None = None,
+        image: bytes | None = None,
+        immediate_sleeper: bool = False,
+        register_provider: bool = True,
+        **extra_settings: Any,
+    ) -> None:
+        self.clock = clock if clock is not None else ManualClock()
+        self.rng = rng if rng is not None else ConstantRandom(0.5)
+        self.store = AttachmentStore(clock=self.clock, **STORE_LIMITS)
+        self.context: RuntimeContext = runtime_context(
+            clock=self.clock,
+            attachments=self.store,
+            authorization=policy if policy is not None else agent_policy(),
+            rng=self.rng,
+        )
+        self.provider = RecordingCapture(self, image)
+        if register_provider:
+            self.context.actions.register(
+                screen_capture_spec(), self.provider, module="capture", provider_name="capture"
+            )
+            self.context.actions.mark_ready("capture")
+            self.context.actions.declare(fake_write_spec(), module="fakeplatform")
+        self.dials: asyncio.Queue[Any] = asyncio.Queue()
+        self.dial_urls: list[str] = []
+        self.delays: list[float] = []
+        self.backoffs: list[float] = []
+        self.diagnostics: list[str] = []
+        self._immediate = immediate_sleeper
+        self.settings: dict[str, Any] = {
+            **AGENT_SETTINGS,
+            "actions": list(actions),
+            "_connector": self._connector,
+            "_sleeper": self._sleeper,
+            "diagnostic_reporter": self.diagnostics.append,
+            **extra_settings,
+        }
+        self.module: AgentLinkModule | None = None
+
+    async def _connector(self, url: str, **kwargs: Any) -> Any:
+        self.dial_urls.append(url)
+        outcome = await self.dials.get()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome.client
+
+    async def _sleeper(self, delay: float) -> None:
+        self.delays.append(delay)
+        paired = self.module is not None and self.module.paired
+        if not paired:
+            self.backoffs.append(delay)
+        if self._immediate and not paired:
+            await asyncio.sleep(0)
+        else:
+            await self.clock.sleep(delay)
+
+    async def activate(self, *, prepare: bool = True, start: bool = True) -> AgentLinkModule:
+        self.module = await agent_link.activate(
+            self.context.for_module(AGENT_MODULE), self.settings, {}
+        )
+        if prepare:
+            await self.module.prepare()
+        if start:
+            await self.module.start_inputs()
+        return self.module
+
+    def fail_dial(self, count: int = 1) -> None:
+        for _ in range(count):
+            self.dials.put_nowait(ConnectionRefusedError("dial refused"))
+
+    def connect(self) -> "BrainEnd":
+        """Queue one pair for the next dial and return its scripted brain end."""
+
+        pair = MemoryWebSocketPair()
+        self.dials.put_nowait(pair)
+        return BrainEnd(self, pair)
+
+    @property
+    def bus(self) -> Any:
+        return self.context.bus
+
+    @property
+    def executor(self) -> Any:
+        return self.context.executor
+
+    async def close(self) -> None:
+        if self.module is not None:
+            await self.module.close()
+
+
+class BrainEnd:
+    """The scripted brain end of one connection the agent dialed."""
+
+    def __init__(self, host: AgentHost, pair: MemoryWebSocketPair) -> None:
+        self.host = host
+        self.pair = pair
+        self.ws = pair.server
+        self.session_id: str | None = None
+        self.hello: dict[str, Any] | None = None
+
+    async def send(self, frame: dict[str, Any], *, v: int = 1) -> None:
+        await self.ws.send_str(json.dumps({"v": v, **frame}))
+
+    async def send_raw(self, text: str) -> None:
+        await self.ws.send_str(text)
+
+    async def frame(self) -> dict[str, Any]:
+        message = await self.ws.receive()
+        assert message.type == WSMsgType.TEXT, message
+        return json.loads(message.data)
+
+    async def binary(self) -> bytes:
+        message = await self.ws.receive()
+        assert message.type == WSMsgType.BINARY, message
+        return message.data
+
+    async def close_frame(self) -> int:
+        message = await self.ws.receive()
+        assert message.type == WSMsgType.CLOSE, message
+        return int(message.data)
+
+    async def expect_hello(self) -> dict[str, Any]:
+        frame = await self.frame()
+        assert frame["type"] == FRAME_HELLO, frame
+        self.hello = frame
+        return frame
+
+    async def expect_error(self, code: str) -> dict[str, Any]:
+        frame = await self.frame()
+        assert frame["type"] == FRAME_ERROR, frame
+        assert frame["code"] == code, frame
+        assert TOKEN not in json.dumps(frame)
+        return frame
+
+    async def welcome(
+        self,
+        *,
+        session_id: str = "session-1",
+        actions: list[str] | None = None,
+        limits: dict[str, Any] | None = None,
+        nonce: Any = None,
+    ) -> dict[str, Any]:
+        """Answer the ``hello`` and return the ``agent.status`` event that follows."""
+
+        assert self.hello is not None
+        self.session_id = session_id
+        await self.send(
+            {
+                "type": FRAME_WELCOME,
+                "id": self.hello["id"] if nonce is None else nonce,
+                "session_id": session_id,
+                "actions": actions if actions is not None else [SCREEN_CAPTURE],
+                "limits": limits if limits is not None else dict(BRAIN_LIMITS),
+            }
+        )
+        event = await self.frame()
+        assert event["type"] == FRAME_EVENT, event
+        # Let the agent's heartbeat task take its first turn (and park on
+        # the injected clock) before a test moves that clock.
+        await settle()
+        return event
+
+    async def pair_up(self, **kwargs: Any) -> dict[str, Any]:
+        await self.expect_hello()
+        return await self.welcome(**kwargs)
+
+    def call_frame(
+        self,
+        call_id: str,
+        seq: Any,
+        *,
+        remaining_ms: Any = 5000,
+        action: str = SCREEN_CAPTURE,
+        arguments: dict[str, Any] | None = None,
+        run_id: str = RUN_ID,
+        principal: str = PRINCIPAL,
+        deadline_utc: str = "2023-11-14T22:13:25.000Z",
+        max_attachment_bytes: int | None = STORE_LIMITS["max_object_bytes"],
+    ) -> dict[str, Any]:
+        frame: dict[str, Any] = {
+            "type": FRAME_CALL,
+            "id": call_id,
+            "action_name": action,
+            "action_version": 1,
+            "arguments": arguments if arguments is not None else {},
+            "conversation_id": "conversation-1",
+            "run_id": run_id,
+            "call_id": call_id,
+            "source_event_id": "source-1",
+            "destination": {"platform": "fake", "channel_id": "channel-9", "scope": "capture"},
+            "principal": principal,
+            "message_id": "source-1",
+            "contract_version": 1,
+            "seq": seq,
+            "deadline_utc": deadline_utc,
+            "remaining_ms": remaining_ms,
+        }
+        if max_attachment_bytes is not None:
+            frame["max_attachment_bytes"] = max_attachment_bytes
+        return frame
+
+    async def call(self, call_id: str, seq: Any, **kwargs: Any) -> None:
+        await self.send(self.call_frame(call_id, seq, **kwargs))
+
+    async def observation(self, call_id: str | None = None) -> dict[str, Any]:
+        frame = await self.frame()
+        assert frame["type"] == FRAME_OBSERVATION, frame
+        if call_id is not None:
+            assert frame["id"] == call_id, frame
+        return frame
+
+    async def ack(self, attachment_id: str, *, accepted: bool = True, code: str | None = None) -> None:
+        frame: dict[str, Any] = {
+            "type": FRAME_ATTACHMENT_ACK,
+            "id": self.session_id,
+            "attachment_id": attachment_id,
+            "accepted": accepted,
+        }
+        if code is not None:
+            frame["code"] = code
+        await self.send(frame)
+
+    async def receive_transfer(self) -> tuple[dict[str, Any], bytes]:
+        header = await self.frame()
+        assert header["type"] == FRAME_ATTACHMENT, header
+        payload = await self.binary()
+        return header, payload
+
+    def received_types(self) -> list[str]:
+        """Every frame type the agent wrote on this connection, in order."""
+
+        types: list[str] = []
+        for message in self.pair.client.sent:
+            if message.type == WSMsgType.TEXT:
+                types.append(json.loads(message.data)["type"])
+            elif message.type == WSMsgType.BINARY:
+                types.append("<binary>")
+        return types
+
+    def received_frames(self, frame_type: str) -> list[dict[str, Any]]:
+        return [
+            json.loads(message.data)
+            for message in self.pair.client.sent
+            if message.type == WSMsgType.TEXT and json.loads(message.data)["type"] == frame_type
+        ]
+
+
+async def paired_host(**kwargs: Any) -> tuple[AgentHost, BrainEnd]:
+    host = AgentHost(**kwargs)
+    await host.activate()
+    brain = host.connect()
+    await brain.pair_up()
+    return host, brain
+
+
+# --------------------------------------------------------------------------- #
+# Manifest, settings, declarations
+# --------------------------------------------------------------------------- #
+
+
+def test_agent_link_manifest_declares_the_input_role_no_event_and_no_action() -> None:
+    manifest = yaml.safe_load(agent_link.MANIFEST_PATH.read_text(encoding="utf-8"))
+    assert manifest["name"] == AGENT_MODULE
+    assert manifest["manifest_version"] == 2
+    assert manifest["runtime_api"] == RUNTIME_API
+    assert manifest["produces"] == [] and manifest["consumes"] == []
+    assert manifest["middleware"] is False
+    assert manifest["lifecycle"] == {"roles": [ROLE_INPUT]}
+    assert manifest["credentials"] == ["pairing_token"]
+    assert manifest["settings_validator"] == "validate_settings"
+    assert "actions" not in manifest
+    schema = manifest["settings_schema"]
+    assert set(schema["required"]) == {"brain_url", "pairing_token", "agent_id", "actions"}
+    assert set(schema["properties"]) == {
+        "brain_url", "pairing_token", "agent_id", "actions", "reconnect", "heartbeat_seconds",
+        "heartbeat_timeout_seconds", "call_table", "max_frame_bytes", "action_seconds", "limits",
+    }
+    assert set(schema["properties"]["reconnect"]["properties"]) == {
+        "initial_seconds", "multiplier", "max_seconds",
+    }
+    assert set(schema["properties"]["call_table"]["properties"]) == {"max_entries", "ttl_seconds"}
+    assert "twitch" not in agent_link.MANIFEST_PATH.read_text(encoding="utf-8").lower()
+
+
+def test_agent_link_validate_settings_accepts_loopback_ws_and_wss_anywhere() -> None:
+    for url in ("ws://127.0.0.1:8765", "ws://localhost:8765/agent", "ws://[::1]:8765",
+                "wss://brain.example.net:8765", "wss://10.0.0.7/agent"):
+        settings = {**AGENT_SETTINGS, "brain_url": url, "actions": [SCREEN_CAPTURE]}
+        assert agent_link.validate_settings(settings) == [], url
+    full = {
+        **AGENT_SETTINGS,
+        "actions": [SCREEN_CAPTURE],
+        "reconnect": {"initial_seconds": 1, "multiplier": 2, "max_seconds": 30},
+        "heartbeat_seconds": 15,
+        "heartbeat_timeout_seconds": 10,
+        "call_table": {"max_entries": 1024, "ttl_seconds": 300},
+        "max_frame_bytes": 1_048_576,
+        "action_seconds": 10,
+        "limits": {"attachments": dict(STORE_LIMITS)},
+    }
+    assert agent_link.validate_settings(full) == []
+    parsed = agent_link._Settings.from_mapping({**AGENT_SETTINGS, "actions": [SCREEN_CAPTURE]})
+    assert (parsed.reconnect.initial_seconds, parsed.reconnect.multiplier, parsed.reconnect.max_seconds) == (1.0, 2.0, 30.0)
+    assert (parsed.heartbeat_seconds, parsed.heartbeat_timeout_seconds) == (15.0, 10.0)
+    assert (parsed.call_table.max_entries, parsed.call_table.ttl_seconds) == (1024, 300.0)
+    assert parsed.max_frame_bytes == PROXY_DEFAULT_MAX_FRAME_BYTES
+    assert parsed.action_seconds == 10.0
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["ws://10.0.0.7:8765", "ws://brain.example.net/agent", "http://127.0.0.1:8765",
+     "wss:///agent", "not a url", ""],
+)
+def test_agent_link_validate_settings_refuses_non_loopback_ws_and_unknown_schemes_without_echo(
+    url: str,
+) -> None:
+    """R6: a non-loopback ``brain_url`` must use ``wss``; any other scheme is
+    refused; the diagnostic names module and field and never the value."""
+
+    diagnostics = agent_link.validate_settings(
+        {**AGENT_SETTINGS, "brain_url": url, "actions": [SCREEN_CAPTURE]}
+    )
+    assert len(diagnostics) == 1, diagnostics
+    assert diagnostics[0].startswith(f"module {AGENT_MODULE!r}: field 'brain_url'")
+    if url.strip():
+        assert url not in diagnostics[0] and "example" not in diagnostics[0]
+
+
+def test_agent_link_validate_settings_refuses_bad_entries_and_non_finite_bounds() -> None:
+    diagnostics = agent_link.validate_settings(
+        {
+            "brain_url": BRAIN_URL,
+            "actions": ["", SCREEN_CAPTURE, SCREEN_CAPTURE, 7],
+            "reconnect": {"initial_seconds": float("inf"), "multiplier": 0.5, "max_seconds": 0, "other": 1},
+            "heartbeat_seconds": float("nan"),
+            "heartbeat_timeout_seconds": -1,
+            "call_table": {"max_entries": 0, "ttl_seconds": float("inf"), "extra": 1},
+            "max_frame_bytes": True,
+            "action_seconds": "10",
+            "unknown": 1,
+            "_connector": "not callable",
+        }
+    )
+    fields = {d.split("field ")[1].split(":")[0] for d in diagnostics}
+    assert fields == {
+        "'pairing_token'", "'agent_id'", "'actions[0]'", "'actions[2]'", "'actions[3]'",
+        "'reconnect.initial_seconds'", "'reconnect.multiplier'", "'reconnect.max_seconds'",
+        "'reconnect.other'", "'heartbeat_seconds'", "'heartbeat_timeout_seconds'",
+        "'call_table.max_entries'", "'call_table.ttl_seconds'", "'call_table.extra'",
+        "'max_frame_bytes'", "'action_seconds'", "'unknown'", "'_connector'",
+    }
+    assert all(d.startswith(f"module {AGENT_MODULE!r}: field ") for d in diagnostics)
+    assert agent_link.validate_settings("nope") == [
+        f"module {AGENT_MODULE!r}: field 'settings': must be a mapping"
+    ]
+
+
+def test_agent_link_declaration_round_trips_through_the_brains_comparison_delivery_included() -> None:
+    """The agent's ``hello`` declaration rebuilds, on the brain, into a spec
+    equal to the catalog's — ``delivery`` included — so the pairing accepts it."""
+
+    for spec in (screen_capture_spec(), fake_write_spec()):
+        declaration = agent_link.spec_declaration(spec)
+        assert json.loads(json.dumps(declaration)) == declaration
+        assert spec_from_declaration(declaration) == spec
+    assert "delivery" in agent_link.spec_declaration(fake_write_spec())
+    assert "delivery" not in agent_link.spec_declaration(screen_capture_spec())
+
+
+async def test_agent_link_hello_carries_the_nonce_the_identity_the_declarations_and_the_bound() -> None:
+    """``hello`` includes ``delivery`` on the declared write action and no
+    ``delivery`` on the read; the nonce comes from the injected random source."""
+
+    host = AgentHost(actions=(SCREEN_CAPTURE, FAKE_WRITE), max_frame_bytes=4096)
+    try:
+        module = await host.activate()
+        assert list(module.declared_actions) == [SCREEN_CAPTURE, FAKE_WRITE]
+        brain = host.connect()
+        hello = await brain.expect_hello()
+        assert hello["v"] == 1 and hello["type"] == FRAME_HELLO
+        assert isinstance(hello["id"], str) and hello["id"]
+        assert hello["agent_id"] == AGENT_ID and hello["token"] == TOKEN
+        assert hello["max_frame_bytes"] == 4096
+        declared = {entry["name"]: entry for entry in hello["actions"]}
+        assert list(declared) == [SCREEN_CAPTURE, FAKE_WRITE]
+        assert declared[FAKE_WRITE]["delivery"] == {"text_argument": "text"}
+        assert "delivery" not in declared[SCREEN_CAPTURE]
+        assert spec_from_declaration(declared[SCREEN_CAPTURE]) == screen_capture_spec()
+        assert spec_from_declaration(declared[FAKE_WRITE]) == fake_write_spec()
+        assert host.dial_urls == [BRAIN_URL]
+        assert host.rng.draws >= 4
+    finally:
+        await host.close()
+
+
+async def test_agent_link_prepare_refuses_an_action_no_local_manifest_declares() -> None:
+    host = AgentHost(actions=(SCREEN_CAPTURE, "camera.pan"))
+    try:
+        with pytest.raises(AgentLinkError) as refused:
+            await host.activate()
+        assert "actions[1]" in str(refused.value) and "camera.pan" in str(refused.value)
+        degraded = events_of(host.bus, TRACE_MODULE_DEGRADED)
+        assert degraded and "actions[1]" in degraded[-1]["payload"]["reason"]
+        assert host.dial_urls == []
+        assert not host.module.running
+    finally:
+        await host.close()
+
+
+async def test_agent_link_activate_refuses_bad_settings_and_an_incomplete_context() -> None:
+    context = runtime_context()
+    with pytest.raises(AgentLinkError):
+        await agent_link.activate(context.for_module(AGENT_MODULE), {"brain_url": BRAIN_URL}, {})
+    with pytest.raises(AgentLinkError):
+        await agent_link.activate(context.for_module(AGENT_MODULE), "settings", {})
+    incomplete = SimpleNamespace(actions=None, executor=None, tasks=None, clock=None, rng=None)
+    with pytest.raises(AgentLinkError):
+        await agent_link.activate(incomplete, {**AGENT_SETTINGS, "actions": [SCREEN_CAPTURE]}, {})
+    assert inspect.iscoroutinefunction(agent_link.activate)
+    assert (ROOT / "modules" / AGENT_MODULE / "__init__.py").is_file()
+
+
+async def test_agent_link_start_inputs_requires_prepare_and_stop_ends_the_loop() -> None:
+    host = AgentHost()
+    try:
+        module = await host.activate(prepare=False, start=False)
+        with pytest.raises(AgentLinkError):
+            await module.start_inputs()
+        await module.prepare()
+        await module.start_inputs()
+        assert module.running and AGENT_MODULE in host.context.tasks.owners()
+        brain = host.connect()
+        await brain.pair_up()
+        assert module.paired
+        await module.stop_inputs()
+        assert await brain.close_frame() == agent_link.CLOSE_GOING_AWAY
+        assert not module.running and not module.paired
+        assert AGENT_MODULE not in host.context.tasks.owners()
+        # Nothing reconnects after stop: no backoff delay, no further dial.
+        assert host.backoffs == [] and host.dial_urls == [BRAIN_URL]
+        assert events_of(host.bus, TRACE_MODULE_DEGRADED) == []
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# Pairing
+# --------------------------------------------------------------------------- #
+
+
+async def test_agent_link_welcome_sends_agent_status_paired_reports_ready_and_resets_state() -> None:
+    host = AgentHost()
+    try:
+        module = await host.activate()
+        brain = host.connect()
+        hello = await brain.expect_hello()
+        assert not module.paired
+        event = await brain.welcome(session_id="s-42")
+        assert event == {
+            "v": 1, "type": FRAME_EVENT, "id": "s-42",
+            "event_type": AGENT_STATUS_EVENT, "payload": {"state": STATE_PAIRED},
+        }
+        assert module.paired and module.session_id == "s-42"
+        assert module.accepted_actions == frozenset({SCREEN_CAPTURE})
+        assert module.last_seq == 0 and module.retained_calls == ()
+        assert module.pairings == 1 and module.consecutive_failures == 0
+        ready = events_of(host.bus, TRACE_MODULE_READY)
+        assert ready and ready[-1]["payload"]["module"] == AGENT_MODULE
+        assert ready[-1]["payload"]["capabilities"] == [SCREEN_CAPTURE]
+        assert TOKEN not in json.dumps(host.bus.list_events())
+        # A welcome answering another hello is malformed and pairs nothing.
+        assert hello["id"] != "other"
+    finally:
+        await host.close()
+
+
+async def test_agent_link_a_refused_pairing_is_diagnosed_by_code_only_and_redialed() -> None:
+    host = AgentHost(immediate_sleeper=True)
+    try:
+        module = await host.activate()
+        brain = host.connect()
+        await brain.expect_hello()
+        await brain.send({"type": FRAME_ERROR, "id": brain.hello["id"], "code": PROXY_ERROR_AUTH_FAILED,
+                          "message": "pairing token refused", "retryable": False})
+        await brain.ws.close(code=PROXY_CLOSE_AUTH_FAILED)
+        again = host.connect()
+        await again.expect_hello()
+        assert not module.paired and module.errors_received == 1
+        assert any(PROXY_ERROR_AUTH_FAILED in line for line in host.diagnostics)
+        assert all(TOKEN not in line for line in host.diagnostics)
+        assert host.backoffs == [0.5]
+    finally:
+        await host.close()
+
+
+async def test_agent_link_frames_before_welcome_and_malformed_frames_are_refused_like_the_brain() -> None:
+    host = AgentHost(max_frame_bytes=512, immediate_sleeper=True)
+    try:
+        module = await host.activate()
+        brain = host.connect()
+        await brain.expect_hello()
+        await brain.send({"type": FRAME_PING, "id": "x"})
+        error = await brain.expect_error(PROXY_ERROR_UNKNOWN_SESSION)
+        assert error["id"] is None
+        await brain.send_raw("not json")
+        await brain.expect_error(PROXY_ERROR_INVALID_FRAME)
+        await brain.send({"type": "teleport", "id": "x"})
+        await brain.expect_error(PROXY_ERROR_UNKNOWN_FRAME)
+        # A welcome answering another hello pairs nothing.
+        await brain.send({"type": FRAME_WELCOME, "id": "other", "session_id": "s", "actions": [], "limits": {}})
+        await brain.expect_error(PROXY_ERROR_INVALID_FRAME)
+        assert not module.paired and not brain.ws.closed
+
+        await brain.welcome()
+        assert module.paired
+        for frame_type in (FRAME_HELLO, FRAME_OBSERVATION, FRAME_ATTACHMENT, FRAME_EVENT, FRAME_WELCOME):
+            await brain.send({"type": frame_type, "id": brain.session_id})
+            await brain.expect_error(PROXY_ERROR_INVALID_FRAME)
+        await brain.send({"type": FRAME_PING, "id": "other"})
+        await brain.expect_error(PROXY_ERROR_UNKNOWN_SESSION)
+        await brain.send({"type": FRAME_PING, "id": brain.session_id})
+        assert await brain.frame() == {"v": 1, "type": FRAME_PONG, "id": brain.session_id}
+        assert module.paired
+
+        await brain.send({"type": FRAME_PING, "id": brain.session_id}, v=2)
+        await brain.expect_error(PROXY_ERROR_UNSUPPORTED_PROTOCOL_VERSION)
+        assert await brain.close_frame() == PROXY_CLOSE_BAD_REQUEST
+        await wait_until(lambda: not module.paired)
+
+        again = host.connect()
+        await again.pair_up()
+        await again.send_raw("x" * 513)
+        await again.expect_error(PROXY_ERROR_FRAME_TOO_LARGE)
+        assert await again.close_frame() == PROXY_CLOSE_FRAME_TOO_LARGE
+        await wait_until(lambda: not module.paired)
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC34 — the budget on the agent's monotonic clock
+# --------------------------------------------------------------------------- #
+
+
+def _deadline_utc(wall: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(wall, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+async def test_ac34_remaining_ms_bounds_the_call_on_the_agents_monotonic_clock_whatever_deadline_utc_says() -> None:
+    """AC34 (R6): the agent's wall clock is 3 h ahead of the brain's, so the
+    brain's ``deadline_utc`` (brain wall + 5 s) is 3 h in the agent's past
+    and would expire the call at once if it were read; the call is bounded
+    at 5 s on the agent's monotonic clock from ``remaining_ms: 5000``. With
+    ``remaining_ms: 20000`` and ``action_seconds: 10`` the bound is 10 s.
+    A ``deadline_utc`` 3 h in the agent's future never extends it either."""
+
+    host, brain = await paired_host(action_seconds=10)
+    try:
+        before = host.clock()
+        await brain.call("call-1", 1, remaining_ms=5000, deadline_utc=_deadline_utc(BRAIN_WALL_CLOCK + 5))
+        observation = await brain.observation("call-1")
+        assert observation["status"] == "success", observation
+        (call,) = host.provider.calls
+        assert call.deadline == pytest.approx(before + 5.0)
+        assert call.call_id == "call-1" and call.principal == PRINCIPAL and call.run_id == RUN_ID
+        assert call.destination == CAPTURE_DESTINATION
+
+        await brain.call("call-2", 2, remaining_ms=20_000, deadline_utc=_deadline_utc(AGENT_WALL_CLOCK + 3 * 3600))
+        await brain.observation("call-2")
+        assert host.provider.calls[-1].deadline == pytest.approx(before + 10.0)
+
+        await brain.call("call-3", 3, remaining_ms=20_000, deadline_utc="not even a date")
+        await brain.observation("call-3")
+        assert host.provider.calls[-1].deadline == pytest.approx(before + 10.0)
+
+        # A budget already spent on the brain: expired before the provider.
+        await brain.call("call-4", 4, remaining_ms=0)
+        expired = await brain.observation("call-4")
+        assert expired["status"] == "timeout" and len(host.provider.calls) == 3
+        assert host.executor.outcome("call-4").status == "timeout"
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# Default-deny execution with the forwarded principal
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_forwarded_call_runs_through_the_agents_default_deny_executor() -> None:
+    """R6: peer authentication grants nothing. Without an agent-side rule the
+    call is ``refused not_authorized`` with 0 providers entered; the rule
+    granting principal ``brain`` does not cover another forwarded principal;
+    with the rule the local provider serves it and the observation carries
+    the executor's provenance and the action's result."""
+
+    host, brain = await paired_host(policy=AuthorizationPolicy())
+    try:
+        await brain.call("call-1", 1)
+        refused = await brain.observation("call-1")
+        assert refused["status"] == "refused"
+        assert refused["error"]["code"] == ERROR_NOT_AUTHORIZED
+        assert host.provider.calls == [] and host.executor.provider_invocations == 0
+        assert host.module.executions == 1
+        assert host.executor.outcome("call-1").status == "refused"
+        started = events_of(host.bus, TRACE_ACTION_STARTED)
+        assert started and started[-1]["payload"]["principal"] == PRINCIPAL
+    finally:
+        await host.close()
+
+    host, brain = await paired_host()
+    try:
+        await brain.call("call-1", 1, principal="viewer")
+        assert (await brain.observation("call-1"))["error"]["code"] == ERROR_NOT_AUTHORIZED
+        assert host.provider.calls == []
+
+        await brain.call("call-2", 2, arguments={"source": "screen"})
+        served = await brain.observation("call-2")
+        assert served["status"] == "success" and served["result"] == capture_result(4)
+        assert served["provenance"]["provider"] == "capture"
+        assert served["provenance"]["module"] == "capture"
+        assert served["parts"] == []
+        assert "error" not in served
+        assert host.provider.calls[-1].arguments == {"source": "screen"}
+        assert host.executor.provider_invocations == 1
+
+        await brain.call("call-3", 3, arguments={"source": 7})
+        assert (await brain.observation("call-3"))["error"]["code"] == "invalid_arguments"
+        await brain.call("call-4", 4, action="no.such")
+        assert (await brain.observation("call-4"))["error"]["code"] == "unknown_action"
+        assert host.executor.provider_invocations == 1
+    finally:
+        await host.close()
+
+
+async def test_a_malformed_call_frame_is_invalid_frame_and_touches_no_state() -> None:
+    host, brain = await paired_host()
+    try:
+        for mutation in (
+            {"seq": None}, {"seq": 0}, {"seq": -1}, {"seq": "1"}, {"seq": True}, {"seq": 1.5},
+            {"remaining_ms": -1}, {"remaining_ms": "5000"}, {"arguments": []},
+            {"destination": "fake/channel-9/capture"}, {"destination": {"platform": "fake"}},
+            {"run_id": ""}, {"principal": None}, {"call_id": "another"}, {"action_version": "1"},
+        ):
+            frame = brain.call_frame("call-x", 1)
+            frame.update(mutation)
+            for key in [key for key, value in mutation.items() if value is None]:
+                del frame[key]
+            await brain.send(frame)
+            error = await brain.expect_error(PROXY_ERROR_INVALID_FRAME)
+            assert error["id"] == "call-x" and error["retryable"] is False
+        assert host.module.last_seq == 0 and host.module.retained_calls == ()
+        assert host.module.executions == 0
+        # The next well-formed call is still seq 1 and executes.
+        await brain.call("call-1", 1)
+        assert (await brain.observation("call-1"))["status"] == "success"
+        assert host.module.last_seq == 1
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC36 — call identity and de-duplication on the agent
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac36_agent_side_a_repeated_call_returns_the_retained_observation_without_executing() -> None:
+    host, brain = await paired_host(heartbeat_seconds=100_000)
+    try:
+        await brain.call("call-1", 1)
+        first = await brain.observation("call-1")
+        assert first["status"] == "success" and host.module.executions == 1
+        first_text = brain.pair.client.sent[-1].data
+
+        await brain.call("call-1", 1)
+        repeat = await brain.observation("call-1")
+        assert repeat == first and host.module.executions == 1
+        assert host.executor.provider_invocations == 1
+        assert brain.pair.client.sent[-1].data == first_text
+        assert host.module.retained_calls == ("call-1",) and host.module.last_seq == 1
+
+        # A repeat while the first execution is still running waits for the
+        # same observation: one execution, two identical frames.
+        host.provider.hold = asyncio.get_running_loop().create_future()
+        await brain.call("call-2", 2)
+        await host.provider.entered.wait()
+        await brain.call("call-2", 2)
+        await settle()
+        assert brain.received_frames(FRAME_OBSERVATION) == [first, first]
+        host.provider.hold.set_result(None)
+        second = await brain.observation("call-2")
+        assert await brain.observation("call-2") == second
+        assert host.module.executions == 2 and host.executor.provider_invocations == 2
+    finally:
+        await host.close()
+
+
+async def test_ac36_agent_side_the_same_frame_after_ttl_plus_one_is_duplicate_call_unknown() -> None:
+    host, brain = await paired_host(heartbeat_seconds=100_000)
+    try:
+        await brain.call("call-1", 1)
+        await brain.observation("call-1")
+        host.clock.advance(300)
+        await brain.call("call-1", 1)
+        assert (await brain.observation("call-1"))["status"] == "success"
+        host.clock.advance(1)
+        await brain.call("call-1", 1)
+        error = await brain.expect_error(PROXY_ERROR_DUPLICATE_CALL_UNKNOWN)
+        assert error["id"] == "call-1" and error["retryable"] is False
+        assert host.module.executions == 1 and host.module.retained_calls == ()
+        assert host.module.last_seq == 1
+    finally:
+        await host.close()
+
+
+async def test_ac36_agent_side_a_configured_ttl_is_honoured() -> None:
+    host, brain = await paired_host(heartbeat_seconds=100_000, call_table={"ttl_seconds": 5})
+    try:
+        await brain.call("call-1", 1)
+        await brain.observation("call-1")
+        host.clock.advance(6)
+        await brain.call("call-1", 1)
+        await brain.expect_error(PROXY_ERROR_DUPLICATE_CALL_UNKNOWN)
+        assert host.module.executions == 1
+    finally:
+        await host.close()
+
+
+async def test_ac36_agent_side_a_never_seen_call_id_at_or_below_last_seq_is_duplicate_call_unknown() -> None:
+    host, brain = await paired_host()
+    try:
+        await brain.call("call-1", 1)
+        await brain.observation("call-1")
+        await brain.call("call-2", 2)
+        await brain.observation("call-2")
+        for seq in (1, 2):
+            await brain.call("never-seen", seq)
+            error = await brain.expect_error(PROXY_ERROR_DUPLICATE_CALL_UNKNOWN)
+            assert error["id"] == "never-seen" and error["retryable"] is False
+        assert host.module.executions == 2 and host.module.last_seq == 2
+        assert host.module.retained_calls == ("call-1", "call-2")
+        # A retained call_id under another seq is malformed, not a repeat.
+        await brain.call("call-1", 3)
+        await brain.expect_error(PROXY_ERROR_INVALID_FRAME)
+        await brain.call("call-2", 1)
+        await brain.expect_error(PROXY_ERROR_INVALID_FRAME)
+        assert host.module.executions == 2 and host.module.last_seq == 2
+        # A gap in seq is fine: only the order matters.
+        await brain.call("call-9", 9)
+        await brain.observation("call-9")
+        assert host.module.last_seq == 9 and host.module.executions == 3
+    finally:
+        await host.close()
+
+
+async def test_ac36_agent_side_max_entries_2_evicts_the_oldest_and_the_table_holds_exactly_2() -> None:
+    host, brain = await paired_host(call_table={"max_entries": 2})
+    try:
+        for index in (1, 2, 3):
+            await brain.call(f"call-{index}", index)
+            await brain.observation(f"call-{index}")
+        assert host.module.retained_calls == ("call-2", "call-3")
+        await brain.call("call-1", 1)
+        await brain.expect_error(PROXY_ERROR_DUPLICATE_CALL_UNKNOWN)
+        assert host.module.executions == 3
+        assert len(host.module.retained_calls) == 2
+        await brain.call("call-3", 3)
+        assert (await brain.observation("call-3"))["status"] == "success"
+        assert host.module.executions == 3
+    finally:
+        await host.close()
+
+
+async def test_ac36_agent_side_a_new_welcome_resets_last_seq_and_the_table() -> None:
+    """After a new ``welcome`` a ``call`` with ``seq: 1`` executes — even
+    when it repeats a ``call_id`` of the previous session, and even when the
+    brain reissues the same ``session_id``: the table is per pairing."""
+
+    host, brain = await paired_host(immediate_sleeper=True)
+    try:
+        await brain.call("call-1", 1)
+        await brain.observation("call-1")
+        await brain.call("call-2", 2)
+        await brain.observation("call-2")
+        assert host.module.retained_calls == ("call-1", "call-2")
+
+        await brain.ws.close(code=1000)
+        again = host.connect()
+        await again.pair_up(session_id=brain.session_id)
+        assert host.module.pairings == 2
+        assert host.module.last_seq == 0 and host.module.retained_calls == ()
+        await again.call("call-3", 1)
+        assert (await again.observation("call-3"))["status"] == "success"
+        assert host.module.executions == 3 and host.module.last_seq == 1
+        # The executor's own outcome store answers a call id it already
+        # terminated: 0 providers entered, but the link did execute it.
+        await again.call("call-1", 2)
+        assert (await again.observation("call-1"))["status"] == "success"
+        assert host.module.executions == 4 and host.executor.provider_invocations == 3
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC37 — backoff
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac37_six_failures_back_off_half_one_two_four_eight_fifteen_and_a_welcome_resets() -> None:
+    """AC37 (R6, decision 9): with an RNG returning 0.5 the delays after six
+    consecutive failures are exactly [0.5, 1, 2, 4, 8, 15] s (full jitter of
+    1·2ⁿ capped at 30); attempts are unlimited; after a ``welcome`` the next
+    failure starts again from the 1 s base."""
+
+    host = AgentHost(rng=ConstantRandom(0.5), immediate_sleeper=True)
+    try:
+        module = await host.activate()
+        host.fail_dial(6)
+        await wait_until(lambda: len(host.backoffs) == 6)
+        assert host.backoffs == [0.5, 1.0, 2.0, 4.0, 8.0, 15.0]
+        await wait_until(lambda: module.attempts == 7)
+        assert module.consecutive_failures == 6
+        assert all(TOKEN not in line and BRAIN_URL not in line for line in host.diagnostics)
+
+        # Still dialing: the seventh attempt pairs.
+        brain = host.connect()
+        await brain.pair_up()
+        assert module.consecutive_failures == 0 and module.paired
+        assert len(host.backoffs) == 6
+
+        # A drop after the welcome: the next failure is 0.5 s again.
+        brain.pair.drop()
+        await wait_until(lambda: len(host.backoffs) == 7)
+        assert host.backoffs[-1] == 0.5 and not module.paired
+        host.fail_dial(1)
+        await wait_until(lambda: len(host.backoffs) == 8)
+        assert host.backoffs[-1] == 1.0
+        degraded = events_of(host.bus, TRACE_MODULE_DEGRADED)
+        assert degraded and "disconnected" in degraded[-1]["payload"]["reason"]
+    finally:
+        await host.close()
+
+
+async def test_ac37_the_cap_and_the_configured_parameters_bound_every_delay() -> None:
+    host = AgentHost(
+        rng=ConstantRandom(1.0), immediate_sleeper=True,
+        reconnect={"initial_seconds": 0.25, "multiplier": 4, "max_seconds": 10},
+    )
+    try:
+        await host.activate()
+        host.fail_dial(5)
+        await wait_until(lambda: len(host.backoffs) == 5)
+        assert host.backoffs == [0.25, 1.0, 4.0, 10.0, 10.0]
+    finally:
+        await host.close()
+
+
+async def test_ac37_the_backoff_sleeps_on_the_injected_sleeper_and_nothing_dials_meanwhile() -> None:
+    host = AgentHost(rng=ConstantRandom(0.5))
+    try:
+        module = await host.activate()
+        host.fail_dial(1)
+        await wait_until(lambda: host.backoffs == [0.5])
+        await settle()
+        assert module.attempts == 1 and host.dial_urls == [BRAIN_URL]
+        host.clock.advance(0.5)
+        await wait_until(lambda: module.attempts == 2)
+        assert host.dial_urls == [BRAIN_URL, BRAIN_URL]
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# Attachments from the agent (AC33, agent half)
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_agent_transfers_the_image_as_one_header_one_binary_frame_then_the_observation() -> None:
+    image = png_bytes(16, 9)
+    host, brain = await paired_host(image=image)
+    try:
+        await brain.call("call-1", 1)
+        header, payload = await brain.receive_transfer()
+        assert header["id"] == brain.session_id and header["call_id"] == "call-1"
+        assert header["content_type"] == "image/png" and header["size"] == len(image)
+        assert payload == image
+        attachment_id = header["attachment_id"]
+        assert host.store.lookup(attachment_id) is not None
+        # The observation waits for the ack.
+        await settle()
+        assert FRAME_OBSERVATION not in brain.received_types()
+        await brain.ack(attachment_id)
+        observation = await brain.observation("call-1")
+        assert observation["status"] == "success"
+        (part,) = observation["parts"]
+        assert part["type"] == "image_ref" and part["attachment_id"] == attachment_id
+        assert part["size"] == len(image) and part["provider_id"] == "capture"
+        # No filesystem path: the only slashes are the content type's and
+        # the destination's (``fake/channel-9/capture``) in the provenance.
+        rendered = json.dumps(observation).replace("image/png", "").replace(str(CAPTURE_DESTINATION), "")
+        assert "/" not in rendered, rendered
+        assert brain.received_types() == [FRAME_HELLO, FRAME_EVENT, FRAME_ATTACHMENT, "<binary>", FRAME_OBSERVATION]
+        # The bytes left the agent: nothing is retained locally.
+        assert host.store.object_count == 0
+        # A repeat re-sends the observation only: no second transfer.
+        await brain.call("call-1", 1)
+        assert await brain.observation("call-1") == observation
+        assert brain.received_types().count(FRAME_ATTACHMENT) == 1
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize("code", [ATTACHMENT_ACK_TOO_LARGE, ATTACHMENT_ACK_STORE_FULL, ATTACHMENT_ACK_UNEXPECTED_BINARY])
+async def test_an_unaccepted_ack_drops_the_part_and_the_observation_is_error_attachment_refused(code: str) -> None:
+    image = png_bytes(4, 4)
+    host, brain = await paired_host(image=image)
+    try:
+        await brain.call("call-1", 1)
+        header, _ = await brain.receive_transfer()
+        await brain.ack(header["attachment_id"], accepted=False, code=code)
+        observation = await brain.observation("call-1")
+        assert observation["status"] == "error"
+        assert observation["error"]["code"] == ERROR_ATTACHMENT_REFUSED
+        assert code in observation["error"]["message"]
+        assert observation["parts"] == [] and "result" not in observation
+        assert host.store.object_count == 0
+        assert host.executor.outcome("call-1").status == "success"
+    finally:
+        await host.close()
+
+
+async def test_an_image_above_the_calls_max_attachment_bytes_is_never_sent() -> None:
+    image = png_bytes(8, 8)
+    host, brain = await paired_host(image=image)
+    try:
+        await brain.call("call-1", 1, max_attachment_bytes=len(image) - 1)
+        observation = await brain.observation("call-1")
+        assert observation["status"] == "error"
+        assert observation["error"]["code"] == ERROR_ATTACHMENT_REFUSED
+        assert FRAME_ATTACHMENT not in brain.received_types()
+        assert host.store.object_count == 0
+        await brain.call("call-2", 2, max_attachment_bytes=len(image))
+        header, payload = await brain.receive_transfer()
+        await brain.ack(header["attachment_id"])
+        assert (await brain.observation("call-2"))["status"] == "success"
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC33 — brain proxy and agent link in one process
+# --------------------------------------------------------------------------- #
+
+
+class PairedRuntimes:
+    """The brain's proxy and the agent's link on the two ends of one pair.
+
+    The agent runs the shipped ``modules/capture`` on a fake screen through
+    its own executor; the brain's executor calls ``screen.capture`` exactly
+    as it would a local provider.
+    """
+
+    def __init__(self, *, image: bytes = PNG, brain_actions: tuple[str, ...] = (SCREEN_CAPTURE,)) -> None:
+        self.brain = Brain(actions=brain_actions, specs=(screen_capture_spec(), fake_write_spec()))
+        self.agent = AgentHost(clock=ManualClock(5000.0), register_provider=False)
+        self.source = FakeCaptureSource(data=image, width=IMAGE_WIDTH, height=IMAGE_HEIGHT)
+        self.capture: Any = None
+        self.handlers: list[asyncio.Task[None]] = []
+        self.pairs: list[MemoryWebSocketPair] = []
+
+    async def start(self) -> None:
+        await self.brain.activate(start=True)
+        # The agent's shipped capture module, on the agent's own context.
+        self.capture = await capture_module.activate(
+            self.agent.context.for_module("capture"),
+            {
+                "sources": {CAPTURE_SOURCE: {"kind": "file", "path": "/nonexistent/never-read.png"}},
+                "default_source": CAPTURE_SOURCE,
+                "_source_factory": lambda spec: self.source,
+            },
+            {},
+        )
+        await self.capture.prepare()
+        await self.agent.activate()
+        await self.pair()
+
+    async def pair(self) -> None:
+        pair = MemoryWebSocketPair()
+        self.pairs.append(pair)
+        handler = self.brain.servers[0].kwargs["handler"]
+        self.handlers.append(asyncio.create_task(handler(pair.server)))
+        self.agent.dials.put_nowait(pair)
+        await wait_until(lambda: self.agent.module.paired and self.brain.module.paired)
+        await settle()
+
+    def wire(self, index: int = -1) -> list[str]:
+        """Every frame that crossed the pair, in order, prefixed by its direction."""
+
+        pair = self.pairs[index]
+        agent_sent = [(m, "A>") for m in pair.client.sent]
+        brain_sent = [(m, "B>") for m in pair.server.sent]
+        # Each end's ``sent`` is ordered; the tests read per-direction
+        # sequences and counts, never the interleaving.
+        types: list[str] = []
+        for message, prefix in agent_sent + brain_sent:
+            if message.type == WSMsgType.TEXT:
+                types.append(prefix + json.loads(message.data)["type"])
+            elif message.type == WSMsgType.BINARY:
+                types.append(prefix + "<binary>")
+        return types
+
+    async def close(self) -> None:
+        await self.agent.close()
+        if self.capture is not None:
+            await self.capture.close()
+        await self.brain.close()
+        for task in self.handlers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*self.handlers, return_exceptions=True)
+
+
+async def test_ac33_in_process_the_brains_executor_reaches_the_agents_capture_by_reference() -> None:
+    """AC33 (R6), executor level: the brain's ``screen.capture`` call is
+    served by the agent's shipped capture module through the agent's own
+    default-deny executor; the image reaches the brain's store after
+    exactly one ``attachment`` header, one binary frame and one
+    ``attachment_ack``; the observation frame carries no filesystem path;
+    the agent retains no bytes and the brain's run cleanup releases exactly
+    what was leased — as with the local provider."""
+
+    paired = PairedRuntimes()
+    try:
+        await paired.start()
+        assert paired.brain.authorized() == [SCREEN_CAPTURE]
+        assert paired.agent.module.accepted_actions == frozenset({SCREEN_CAPTURE})
+
+        observation = await paired.brain.executor.invoke(
+            capture_call("call-1", deadline=paired.brain.clock() + 30)
+        )
+        assert observation.status == "success", observation.error
+        assert observation.provenance["provider"] == PROVIDER_NAME
+        assert observation.provenance["remote"]["provider"] == "capture"
+        (part,) = observation.parts
+        ref = paired.brain.store.lookup(part["attachment_id"])
+        assert ref is not None and ref.run_id == RUN_ID and ref.size == len(PNG)
+        assert paired.brain.store.get(ref) == PNG
+        assert part["width"] == IMAGE_WIDTH and part["height"] == IMAGE_HEIGHT
+        assert observation.result["source"] == CAPTURE_SOURCE
+        assert len(paired.source.calls) == 1
+        assert paired.agent.executor.provider_invocations == 1
+        assert paired.agent.executor.outcome("call-1").status == "success"
+        assert paired.agent.store.object_count == 0
+
+        wire = paired.wire()
+        assert wire.count("A>" + FRAME_ATTACHMENT) == 1
+        assert wire.count("A><binary>") == 1
+        assert wire.count("B>" + FRAME_ATTACHMENT_ACK) == 1
+        assert wire.count("A>" + FRAME_OBSERVATION) == 1
+        assert [t for t in wire if t.startswith("A>")] == [
+            "A>" + FRAME_HELLO, "A>" + FRAME_EVENT, "A>" + FRAME_ATTACHMENT, "A><binary>", "A>" + FRAME_OBSERVATION,
+        ]
+        assert [t for t in wire if t.startswith("B>")] == ["B>" + FRAME_WELCOME, "B>" + FRAME_CALL, "B>" + FRAME_ATTACHMENT_ACK]
+        frames = [json.loads(m.data) for m in paired.pairs[-1].client.sent if m.type == WSMsgType.TEXT]
+        assert "/nonexistent" not in json.dumps(frames)
+        assert TOKEN not in json.dumps([f for f in frames if f["type"] != FRAME_HELLO])
+        assert paired.brain.module.late_observations == 0
+
+        released = paired.brain.store.release(RUN_ID)
+        assert released.objects == 1 and paired.brain.store.object_count == 0
+    finally:
+        await paired.close()
+
+
+async def test_ac33_in_process_the_agent_refuses_a_principal_its_rule_does_not_grant() -> None:
+    paired = PairedRuntimes()
+    try:
+        await paired.start()
+        call = ActionCall(
+            action_name=SCREEN_CAPTURE, action_version=1, arguments={}, conversation_id="c",
+            run_id=RUN_ID, call_id="call-v", source_event_id="s", destination=CAPTURE_DESTINATION,
+            principal="viewer", deadline=paired.brain.clock() + 30,
+        )
+        observation = await paired.brain.executor.invoke(call)
+        assert observation.status == "refused"
+        assert observation.error["code"] == ERROR_NOT_AUTHORIZED
+        assert paired.source.calls == [] and paired.agent.executor.provider_invocations == 0
+    finally:
+        await paired.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC35 from the agent side, cancel, heartbeat
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac35_agent_side_a_drop_with_a_call_in_flight_repairs_without_retransmission() -> None:
+    """AC35 (R6) seen from the agent: the connection drops while the local
+    execution is in flight; the agent reports degraded, re-dials after the
+    backoff and pairs again from scratch (``hello``, ``welcome``, one
+    ``agent.status``); the execution finishes locally and its observation
+    is not sent on the new session; nothing is retransmitted."""
+
+    host, brain = await paired_host(immediate_sleeper=True, image=png_bytes(2, 2))
+    try:
+        module = host.module
+        host.provider.hold = asyncio.get_running_loop().create_future()
+        await brain.call("call-1", 1)
+        await host.provider.entered.wait()
+        assert module.in_flight == ("call-1",)
+
+        brain.pair.drop()
+        await wait_until(lambda: not module.paired)
+        again = host.connect()
+        await again.pair_up(session_id="session-2")
+        assert host.backoffs == [0.5]
+        assert module.pairings == 2 and module.last_seq == 0 and module.retained_calls == ()
+        degraded = events_of(host.bus, TRACE_MODULE_DEGRADED)
+        assert degraded and "disconnected" in degraded[-1]["payload"]["reason"]
+
+        host.provider.hold.set_result(None)
+        await wait_until(lambda: host.executor.outcome("call-1") is not None)
+        await settle()
+        assert host.executor.outcome("call-1").status == "success"
+        assert again.received_types() == [FRAME_HELLO, FRAME_EVENT]
+        assert brain.received_types() == [FRAME_HELLO, FRAME_EVENT]
+        # The bytes captured for the dropped call are not retained.
+        assert host.store.object_count == 0
+
+        # The new session starts at seq 1 and serves a fresh call.
+        await again.call("call-2", 1)
+        header, _ = await again.receive_transfer()
+        await again.ack(header["attachment_id"])
+        assert (await again.observation("call-2"))["status"] == "success"
+    finally:
+        await host.close()
+
+
+async def test_a_cancel_frame_cancels_the_local_execution_and_nothing_is_sent_for_it() -> None:
+    host, brain = await paired_host()
+    try:
+        host.provider.hold = asyncio.get_running_loop().create_future()
+        await brain.call("call-1", 1)
+        await host.provider.entered.wait()
+        await brain.send({"type": FRAME_CANCEL, "id": "call-1"})
+        await wait_until(lambda: host.executor.outcome("call-1") is not None)
+        await settle()
+        assert host.executor.outcome("call-1").status == "cancelled"
+        assert host.executor.outcome("call-1").error["code"] == ERROR_CANCELLED
+        assert host.module.in_flight == ()
+        assert brain.received_types() == [FRAME_HELLO, FRAME_EVENT]
+        # A cancel for an unknown call is ignored; the link still serves.
+        host.provider.hold = None
+        await brain.send({"type": FRAME_CANCEL, "id": "nope"})
+        await brain.call("call-2", 2)
+        assert (await brain.observation("call-2"))["status"] == "success"
+    finally:
+        await host.close()
+
+
+async def test_a_cancel_during_the_image_transfer_discards_the_image_and_resolves_the_call() -> None:
+    """The cancel lands while the transfer awaits its ``attachment_ack``:
+    the leased image leaves the agent's store at once (not at expiry), the
+    execution is over, nothing more is sent for the call, and a repeat of
+    it re-sends nothing rather than hanging on an unresolved entry."""
+
+    host, brain = await paired_host(image=png_bytes(2, 2))
+    try:
+        module = host.module
+        await brain.call("call-1", 1)
+        header, _ = await brain.receive_transfer()
+        assert host.store.object_count == 1 and module.in_flight == ("call-1",)
+        await brain.send({"type": FRAME_CANCEL, "id": "call-1"})
+        await wait_until(lambda: module.in_flight == ())
+        await settle()
+        assert host.store.object_count == 0
+        assert host.store.lookup(header["attachment_id"]) is None
+        assert brain.received_types() == [FRAME_HELLO, FRAME_EVENT, FRAME_ATTACHMENT, "<binary>"]
+        # A late ack for the cancelled transfer is ignored; a repeat of the
+        # call is answered from the (empty) retained outcome: nothing sent.
+        await brain.ack(header["attachment_id"])
+        await brain.call("call-1", 1)
+        await settle()
+        assert brain.received_types() == [FRAME_HELLO, FRAME_EVENT, FRAME_ATTACHMENT, "<binary>"]
+        assert module.executions == 1 and module.retained_calls == ("call-1",)
+        # The link still serves: the next call transfers and observes.
+        await brain.call("call-2", 2)
+        header, _ = await brain.receive_transfer()
+        await brain.ack(header["attachment_id"])
+        assert (await brain.observation("call-2"))["status"] == "success"
+        assert host.store.object_count == 0
+    finally:
+        await host.close()
+
+
+async def test_a_call_evicted_from_the_table_while_running_stays_cancellable() -> None:
+    """``max_entries: 1``: accepting ``call-2`` evicts ``call-1`` from the
+    retention table while its provider still runs; ``cancel call-1`` still
+    reaches that execution — the table bounds retained observations, not
+    the running executions."""
+
+    host, brain = await paired_host(call_table={"max_entries": 1})
+    try:
+        module = host.module
+        # One hold per call: cancelling a task cancels the future it awaits.
+        host.provider.hold = asyncio.get_running_loop().create_future()
+        await brain.call("call-1", 1)
+        await host.provider.entered.wait()
+        host.provider.entered.clear()
+        host.provider.hold = second = asyncio.get_running_loop().create_future()
+        await brain.call("call-2", 2)
+        await host.provider.entered.wait()
+        assert module.retained_calls == ("call-2",)
+        assert module.in_flight == ("call-1", "call-2")
+
+        await brain.send({"type": FRAME_CANCEL, "id": "call-1"})
+        await wait_until(lambda: host.executor.outcome("call-1") is not None)
+        await settle()
+        assert host.executor.outcome("call-1").status == "cancelled"
+        assert host.executor.outcome("call-2") is None
+        assert module.in_flight == ("call-2",)
+
+        second.set_result(None)
+        assert (await brain.observation("call-2"))["status"] == "success"
+        assert module.in_flight == ()
+        assert brain.received_frames(FRAME_OBSERVATION) == [
+            frame for frame in brain.received_frames(FRAME_OBSERVATION) if frame["id"] == "call-2"
+        ]
+    finally:
+        await host.close()
+
+
+async def test_agent_heartbeat_pings_every_15_seconds_and_a_missing_pong_within_10_is_a_drop() -> None:
+    host, brain = await paired_host()
+    try:
+        module = host.module
+        host.clock.advance(14)
+        await settle()
+        assert FRAME_PING not in brain.received_types()
+        host.clock.advance(1)
+        await settle()
+        assert await brain.frame() == {"v": 1, "type": FRAME_PING, "id": brain.session_id}
+        host.clock.advance(9)
+        await brain.send({"type": FRAME_PONG, "id": brain.session_id})
+        await settle()
+        host.clock.advance(1)
+        await settle()
+        assert module.paired and not brain.ws.closed
+        host.clock.advance(15)
+        await settle()
+        assert (await brain.frame())["type"] == FRAME_PING
+        await brain.send({"type": FRAME_PONG, "id": "other"})
+        await brain.expect_error(PROXY_ERROR_UNKNOWN_SESSION)
+        host.clock.advance(10)
+        await settle()
+        assert await brain.close_frame() == agent_link.CLOSE_GOING_AWAY
+        await wait_until(lambda: not module.paired)
+        reasons = [e["payload"]["reason"] for e in events_of(host.bus, TRACE_MODULE_DEGRADED)]
+        assert any("heartbeat" in reason for reason in reasons)
+        # The drop is a failure: the backoff sleep is drawn on the clock.
+        await wait_until(lambda: host.backoffs == [0.5])
+    finally:
+        await host.close()
+
+
+async def test_close_cancels_a_running_execution_and_leaves_no_task_behind() -> None:
+    host, brain = await paired_host()
+    module = host.module
+    host.provider.hold = asyncio.get_running_loop().create_future()
+    await brain.call("call-1", 1)
+    await host.provider.entered.wait()
+    await module.close()
+    assert not module.paired and not module.running
+    assert host.executor.outcome("call-1").status == "cancelled"
+    assert AGENT_MODULE not in host.context.tasks.owners()
+    assert await brain.close_frame() == agent_link.CLOSE_GOING_AWAY
+    await module.close()  # idempotent
+
+
+# --------------------------------------------------------------------------- #
+# AC33 — the AC1 scenario end to end, brain and agent loaded by the real loader
+# --------------------------------------------------------------------------- #
+
+PAIRED_SHIPPED = ("brain", "chat_context", "users", "capture", "proxy", AGENT_MODULE)
+
+
+@pytest.fixture(scope="module")
+def paired_modules(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One temporary ``modules_directory`` for this file: copies of the
+    shipped packages both profiles need plus the ``fakeplatform`` fixture."""
+
+    directory = tmp_path_factory.mktemp("paired-modules")
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    for name in PAIRED_SHIPPED:
+        shutil.copytree(SHIPPED_MODULES / name, directory / name, ignore=ignore)
+    shutil.copytree(FIXTURE_MODULES / FAKE_MODULE, directory / FAKE_MODULE, ignore=ignore)
+    return directory
+
+
+
+async def activate_remote_vertical(
+    *bodies: Any, modules_directory: Path
+) -> tuple[VerticalHarness, list[FakeServer]]:
+    """The server profile's shape on the fake platform: the shipped
+    ``fakeplatform``, ``chat_context``, ``users``, ``proxy`` (``actions:
+    [screen.capture]``) and ``brain`` modules loaded and prepared by the real
+    loader on one runtime — ``capture`` disabled, so ``screen.capture`` is
+    served remotely only (decision 7). Mirrors ``activate_vertical`` of the
+    agentic-loop suite with the proxy in the capture module's place."""
+
+    clock = ManualClock()
+    store = AttachmentStore(clock=clock, **VERTICAL_STORE_LIMITS)
+    policy = AuthorizationPolicy(
+        [grant(action) for action in (CHAT_READ, USERS_READ, SCREEN_CAPTURE, CHAT_WRITE)]
+    )
+    context = runtime_context(
+        clock=clock,
+        authorization=policy,
+        attachments=store,
+        trigger_registry=TriggerRegistry(companion_name=COMPANION),
+        chat=ChatContext(clock=clock, **CHAT_LIMITS),
+    )
+    diagnostics: list[str] = []
+    session = ScriptedModel(*bodies)
+    fake_transport = SimpleNamespace(outcomes=[], sends=[])
+    servers: list[FakeServer] = []
+
+    async def factory(handler: Any, **kwargs: Any) -> FakeServer:
+        server = FakeServer(handler=handler, **kwargs)
+        servers.append(server)
+        return server
+
+    brain_settings = merge_settings(None)
+    brain_settings.update(
+        {
+            "_session_factory": lambda: session,
+            "_sleeper": clock.sleep,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    )
+    modules: dict[str, dict[str, Any]] = {
+        FAKE_MODULE: {
+            "channel_ids": [FAKE_CHANNEL],
+            "companion_name": COMPANION,
+            "transport": fake_transport,
+            "diagnostic_reporter": diagnostics.append,
+        },
+        "chat_context": {"limits": {"chat_context": dict(CHAT_LIMITS)}},
+        "users": dict(USERS_SETTINGS),
+        MODULE_NAME: {
+            **BASE_SETTINGS,
+            "actions": [SCREEN_CAPTURE],
+            "_server_factory": factory,
+            "_sleeper": clock.sleep,
+            "_wall_clock": lambda: BRAIN_WALL_CLOCK,
+            "diagnostic_reporter": diagnostics.append,
+            "limits": {"attachments": dict(VERTICAL_STORE_LIMITS)},
+        },
+        BRAIN_MODULE: brain_settings,
+    }
+    loader = ModuleLoader(context.bus, modules_directory, context=context, environ={})
+    activations = await loader.activate_enabled(
+        {"enabled_modules": list(modules), "modules": modules}
+    )
+    handles = {activation.name: activation.handle for activation in activations}
+    assert list(handles) == list(modules)
+    harness = VerticalHarness(
+        platform=FAKE_PLATFORM,
+        channel=FAKE_CHANNEL,
+        context=context,
+        clock=clock,
+        store=store,
+        session=session,
+        source=FakeCaptureSource(data=PNG, width=IMAGE_WIDTH, height=IMAGE_HEIGHT),
+        handles=handles,
+        diagnostics=diagnostics,
+        tasks_before=0,
+        fake_transport=fake_transport,
+    )
+    try:
+        for handle in handles.values():
+            await handle.prepare()
+        await handles[FAKE_MODULE].start_inputs()
+        await handles[MODULE_NAME].start_inputs()
+    except BaseException:
+        await harness.close()
+        raise
+    harness.tasks_before = context.tasks.active
+    return harness, servers
+
+
+class AgentProfile:
+    """The agent profile's shape: the shipped ``capture`` (fake screen) and
+    ``agent_link`` modules loaded by the real loader on the agent's own
+    runtime — its own clock, store, random source and a default-deny policy
+    granting ``screen.capture`` to principal ``brain`` — and driven by the
+    real phase coordinator (prepare, barrier, ``start_inputs``; ``stop``)."""
+
+    def __init__(self) -> None:
+        self.clock = ManualClock(7000.0)
+        self.store = AttachmentStore(clock=self.clock, **STORE_LIMITS)
+        self.context: RuntimeContext = runtime_context(
+            clock=self.clock,
+            attachments=self.store,
+            authorization=agent_policy(),
+            rng=ConstantRandom(0.5),
+        )
+        self.source = FakeCaptureSource(data=PNG, width=IMAGE_WIDTH, height=IMAGE_HEIGHT)
+        self.dials: asyncio.Queue[MemoryWebSocketPair] = asyncio.Queue()
+        self.diagnostics: list[str] = []
+        self.handles: dict[str, Any] = {}
+        self.coordinator: PhaseCoordinator | None = None
+
+    async def _connector(self, url: str, **kwargs: Any) -> Any:
+        assert url == BRAIN_URL
+        return (await self.dials.get()).client
+
+    async def start(self, modules_directory: Path) -> None:
+        modules: dict[str, dict[str, Any]] = {
+            "capture": {
+                "sources": {CAPTURE_SOURCE: {"kind": "file", "path": "/nonexistent/never-read.png"}},
+                "default_source": CAPTURE_SOURCE,
+                "_source_factory": lambda spec: self.source,
+            },
+            AGENT_MODULE: {
+                **AGENT_SETTINGS,
+                "actions": [SCREEN_CAPTURE],
+                "_connector": self._connector,
+                "_sleeper": self.clock.sleep,
+                "diagnostic_reporter": self.diagnostics.append,
+                "limits": {"attachments": dict(STORE_LIMITS)},
+            },
+        }
+        loader = ModuleLoader(self.context.bus, modules_directory, context=self.context, environ={})
+        activations = await loader.activate_enabled(
+            {"enabled_modules": list(modules), "modules": modules}
+        )
+        self.handles = {activation.name: activation.handle for activation in activations}
+        assert list(self.handles) == ["capture", AGENT_MODULE]
+        self.coordinator = PhaseCoordinator(
+            activations, tasks=self.context.tasks, reporter=self.diagnostics.append
+        )
+        report = await self.coordinator.start()
+        assert report.status == 0, (report, self.diagnostics)
+
+    @property
+    def link(self) -> AgentLinkModule:
+        return self.handles[AGENT_MODULE]
+
+    @property
+    def executor(self) -> Any:
+        return self.context.executor
+
+    async def close(self) -> None:
+        if self.coordinator is not None:
+            await self.coordinator.stop()
+
+
+def wire_types(pair: MemoryWebSocketPair) -> tuple[list[str], list[str]]:
+    """``(agent → brain, brain → agent)`` frame types crossing *pair*, in order."""
+
+    def types(end: Any) -> list[str]:
+        result: list[str] = []
+        for message in end.sent:
+            if message.type == WSMsgType.TEXT:
+                result.append(json.loads(message.data)["type"])
+            elif message.type == WSMsgType.BINARY:
+                result.append("<binary>")
+        return result
+
+    return types(pair.client), types(pair.server)
+
+
+async def test_ac33_the_ac1_scenario_through_the_proxy_matches_the_local_provider(
+    paired_modules: Path,
+) -> None:
+    """AC33 (R6): the AC1 scenario with ``screen.capture`` served through the
+    proxy — the agent side (shipped ``capture`` + ``agent_link``, loaded by
+    the real loader and started by the real coordinator on its own runtime)
+    in the same process behind the in-memory transport — produces the same
+    brain-side executor call sequence, the same trace set, the same tools
+    offered, the same delivery and the same completion record as the local
+    provider on the same fake platform; the image reaches the model from
+    the brain's store after exactly one ``attachment`` header + one binary
+    frame + one ``attachment_ack``; the ``observation`` frame carries no
+    filesystem path; every store is empty once the run ends."""
+
+    local = await activate_vertical(*AC1_SCRIPT, platform=FAKE_PLATFORM, modules_directory=paired_modules)
+    remote, servers = await activate_remote_vertical(*AC1_SCRIPT, modules_directory=paired_modules)
+    agent = AgentProfile()
+    pair = MemoryWebSocketPair()
+    handler: asyncio.Task[None] | None = None
+    try:
+        proxy = remote.handles[MODULE_NAME]
+        registry = remote.context.actions
+        assert set(registry.discovered()) == {CHAT_READ, USERS_READ, SCREEN_CAPTURE, CHAT_WRITE}
+        assert [(b.module, b.provider_name) for b in registry.bindings(SCREEN_CAPTURE)] == [(MODULE_NAME, PROVIDER_NAME)]
+        assert SCREEN_CAPTURE not in registry.registered_ready()
+        assert len(servers) == 1
+
+        await agent.start(paired_modules)
+        assert [(b.module, b.provider_name) for b in agent.context.actions.bindings(SCREEN_CAPTURE)] == [("capture", "capture")]
+        handler = asyncio.create_task(servers[0].kwargs["handler"](pair.server))
+        agent.dials.put_nowait(pair)
+        await wait_until(lambda: agent.link.paired and proxy.paired)
+        await settle()
+        assert proxy.agent_id == AGENT_ID
+        assert SCREEN_CAPTURE in registry.registered_ready()
+        status = events_of(remote.bus, AGENT_STATUS_EVENT)
+        assert len(status) == 1 and status[0]["payload"] == {"state": STATE_PAIRED}
+        assert status[0]["metadata"]["source"] == MODULE_NAME
+        assert status[0]["metadata"]["provider_id"] == AGENT_ID
+
+        runs: list[str] = []
+        for harness in (local, remote):
+            await harness.observe(*CONTEXT_LINES)
+            record = await harness.ask()
+            assert record.status == "success"
+            runs.append(record.run_id)
+        local_run, remote_run = runs
+
+        # The same brain-side call sequence, served by a different provider.
+        expected_calls = [(CHAT_READ, "call-1"), (SCREEN_CAPTURE, "call-2"), (CHAT_WRITE, "call-3")]
+        assert call_suffixes(local, local_run) == expected_calls
+        assert call_suffixes(remote, remote_run) == expected_calls
+        for harness, run_id in ((local, local_run), (remote, remote_run)):
+            assert [
+                harness.executor.outcome(f"{run_id}/call-{index}").status for index in (1, 2, 3)
+            ] == ["success", "success", "success"]
+        assert local.executor.outcome(f"{local_run}/call-2").provenance["provider"] == "capture"
+        remote_capture = remote.executor.outcome(f"{remote_run}/call-2")
+        assert remote_capture.provenance["provider"] == PROVIDER_NAME
+        assert remote_capture.provenance["agent_id"] == AGENT_ID
+        assert remote_capture.provenance["remote"]["provider"] == "capture"
+        assert remote_capture.result["source"] == CAPTURE_SOURCE
+
+        # The same trace set, the same tools, the same delivery, the same record.
+        assert trace_set(local, local_run) == trace_set(remote, remote_run)
+        assert (TRACE_ACTION_COMPLETED, SCREEN_CAPTURE, "success", "call-2") in trace_set(remote, remote_run)
+        assert [local.tools(index) for index in range(3)] == [remote.tools(index) for index in range(3)]
+        assert remote.tools(0) == [CHAT_READ, SCREEN_CAPTURE, USERS_READ]
+        assert local.sends() == remote.sends() == [FINAL_TEXT]
+        compared = ("status", "turns", "action_calls", "model_calls", "sends", "delivery", "fallback")
+        assert {key: local.run_completed()[key] for key in compared} == {
+            key: remote.run_completed()[key] for key in compared
+        }
+
+        # The image reached the model from the brain's store, once, on both.
+        for harness in (local, remote):
+            assert [len(image_parts(body)) for body in harness.requests()] == [0, 0, 1]
+        assert image_parts(remote.requests()[2]) == image_parts(local.requests()[2])
+
+        # The agent executed the call through its own executor, once; the
+        # capture was taken once on each side's screen.
+        assert len(agent.source.calls) == 1 and len(local.source.calls) == 1
+        assert agent.executor.provider_invocations == 1
+        assert agent.executor.outcome(f"{remote_run}/call-2").status == "success"
+        assert agent.link.executions == 1 and agent.link.last_seq == 1
+
+        # Exactly one header + one binary frame + one ack on the wire; the
+        # observation frame names the attachment and no path.
+        agent_sent, brain_sent = wire_types(pair)
+        assert agent_sent == [FRAME_HELLO, FRAME_EVENT, FRAME_ATTACHMENT, "<binary>", FRAME_OBSERVATION]
+        assert brain_sent == [FRAME_WELCOME, FRAME_CALL, FRAME_ATTACHMENT_ACK]
+        frames = [json.loads(m.data) for m in pair.client.sent if m.type == WSMsgType.TEXT]
+        (observation_frame,) = [f for f in frames if f["type"] == FRAME_OBSERVATION]
+        (header,) = [f for f in frames if f["type"] == FRAME_ATTACHMENT]
+        assert observation_frame["parts"][0]["attachment_id"] == header["attachment_id"]
+        assert header["size"] == len(PNG)
+        assert "/nonexistent" not in json.dumps(frames) and "never-read" not in json.dumps(frames)
+        assert TOKEN not in json.dumps([f for f in frames if f["type"] != FRAME_HELLO])
+        assert proxy.late_observations == 0
+
+        # Store cleanup: the run's cleanup released the brain's lease on
+        # both sides exactly as with the local provider; the agent kept
+        # nothing once the bytes were acknowledged.
+        assert local.store.object_count == 0 and remote.store.object_count == 0
+        assert agent.store.object_count == 0
+        assert local.diagnostics == [] and remote.diagnostics == [] and agent.diagnostics == []
+        assert TOKEN not in json.dumps(remote.bus.list_events())
+    finally:
+        await agent.close()
+        await remote.close()
+        await local.close()
+        if handler is not None:
+            if not handler.done():
+                handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+
+
+# --------------------------------------------------------------------------- #
+# Package hygiene
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("directory", ["modules/proxy", f"modules/{AGENT_MODULE}"])
+def test_ac31_the_proxy_and_the_agent_link_name_no_platform(directory: str) -> None:
+    """AC31 (R5): ``grep -r twitch`` over ``modules/proxy`` and
+    ``modules/agent_link`` matches 0 lines — the two ends of the wire carry
+    a destination's platform as a runtime value only. Extends the grep of
+    the agentic-loop suite (``core/``, ``modules/brain``, ``modules/chat_context``,
+    ``modules/users``, ``modules/capture``) to the two directories P20 adds."""
+
+    completed = subprocess.run(
+        ["grep", "-r", "-i", "--exclude-dir=__pycache__", "twitch", str(ROOT / directory)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    matches = [line for line in completed.stdout.splitlines() if line]
+    assert completed.returncode in (0, 1), completed.stderr
+    assert matches == [], "\n".join(matches)
+
+
+def test_the_agent_link_package_calls_no_sleep_directly() -> None:
+    """R8: no ``time.sleep`` and no direct ``asyncio.sleep(...)`` call; every
+    wait goes through the injected sleeper seam, which ``activate`` defaults
+    to ``asyncio.sleep`` by reference."""
+
+    source = (ROOT / "modules" / AGENT_MODULE / "__init__.py").read_text(encoding="utf-8")
+    assert "time.sleep" not in source
+    assert "asyncio.sleep(" not in source
+    assert "settings.get(_SEAM_SLEEPER, asyncio.sleep)" in source

@@ -42,6 +42,7 @@ modules = ["*/module.yaml"]
 "modules.users" = ["module.yaml"]
 "modules.capture" = ["module.yaml"]
 "modules.proxy" = ["module.yaml"]
+"modules.agent_link" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
