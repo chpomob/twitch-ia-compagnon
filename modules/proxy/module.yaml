@@ -1,0 +1,139 @@
+# Brain-side proxy: WebSocket JSON server for one paired PC agent — manifest
+# v2 (R6, decisions 6–8).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no token, no grant and **no action**
+# lives here. The proxy provides actions it does not declare: at `prepare` it
+# binds itself as the provider of every action its `actions` allowlist names,
+# taking the specification from the brain's catalog — the registry's
+# discovered view when an enabled manifest declares the action, else the
+# manifest of a disabled module, such as `capture` on the server (decision 7),
+# so the same `screen.capture` contract is served locally by `capture` or
+# remotely through this module, and never by both (AC41). Only an explicit
+# authorization rule ever offers one of them (R5).
+
+name: proxy
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# The one event type the source adapter lets through from the agent (R6,
+# AC38): published on the local bus with `metadata.source = "proxy"` and
+# `metadata.provider_id` = the paired agent's id. Nothing is consumed: no bus
+# subscription crosses the wire.
+produces:
+  - agent.status
+consumes: []
+middleware: false
+
+# Lifecycle role, never the module name, decides what each phase asks of this
+# module (R4). An `input` is a producer: its handle exposes `prepare` (bind
+# the remote provider, nothing ready yet), is held at the readiness barrier,
+# then `start_inputs` (open the listener), `stop_inputs` (stop accepting) and
+# `close` (drop the paired agent, close the listener).
+lifecycle:
+  roles:
+    - input
+
+# Business settings belong to the module (R7). The schema states the shape;
+# the declared hook, defined by the module package, checks each field and
+# reports one diagnostic per offending field naming module and field, with
+# no configured value echoed back. The reserved `limits` block the entry
+# point hands every enabled module is accepted so the binary bound can be
+# tightened to the attachment store's `max_object_bytes`.
+settings_schema:
+  type: object
+  properties:
+    listen:
+      type: object
+      description: >-
+        Where the WebSocket server listens. A non-loopback `host` is refused
+        at validation unless `tls` is configured (R6).
+      properties:
+        host:
+          type: string
+          description: Interface to bind; loopback unless `tls` is configured.
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: TCP port to bind.
+      required:
+        - host
+        - port
+    tls:
+      type: object
+      description: >-
+        Certificate and private key the listener serves; required for a
+        non-loopback `listen.host`. Reference the files, never inline them.
+      properties:
+        certfile:
+          type: string
+          description: Path of the PEM certificate chain.
+        keyfile:
+          type: string
+          description: Path of the PEM private key.
+      required:
+        - certfile
+        - keyfile
+    pairing_token:
+      type: string
+      description: >-
+        The shared secret an agent presents in `hello`, compared in constant
+        time; resolved from an environment reference.
+    actions:
+      type: array
+      items:
+        type: string
+      description: >-
+        The action names this module provides remotely; each must be declared
+        by a manifest of the catalog (enabled or not), and none may also have
+        a local provider.
+    max_frame_bytes:
+      type: integer
+      minimum: 1
+      description: >-
+        The largest text frame accepted; a larger one is refused
+        `frame_too_large` and the connection closed 4413. Default 1048576.
+    max_attachment_bytes:
+      type: integer
+      minimum: 1
+      description: >-
+        The largest single attachment accepted from the agent, announced in
+        every `call` and in `welcome`; bounded further by the store's
+        `max_object_bytes`. Default 5242880.
+    heartbeat_seconds:
+      type: number
+      minimum: 0
+      description: Interval between the `ping` frames sent to the agent. Default 15.
+    heartbeat_timeout_seconds:
+      type: number
+      minimum: 0
+      description: >-
+        How long a `pong` may take before the connection is treated as
+        dropped. Default 10.
+    late_result_seconds:
+      type: number
+      minimum: 0
+      description: >-
+        How long a terminal call identity is remembered so a late
+        `observation` for it is recognised as late rather than unknown; both
+        are ignored and counted. Default 60.
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point to every
+        enabled module. Read for `attachments.max_object_bytes` only.
+  required:
+    - listen
+    - pairing_token
+    - actions
+settings_validator: validate_settings
+
+# The pairing token is a credential (R8): its accepted value — literal or
+# resolved from `${NAME}` — is redacted from every supervision trace and
+# lost-trace diagnostic before this module is activated, and it never
+# appears in an `error` frame.
+credentials:
+  - pairing_token

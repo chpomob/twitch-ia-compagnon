@@ -79,8 +79,11 @@ processed; the connection stays open so the agent can still send its `hello`
 3. If another agent is already paired, the brain sends `error agent_limit`
    and closes `4409`; the first agent stays connected (AC32).
 4. Otherwise the brain compares each declared action against the spec it took
-   from its discovered catalog for the names of its `actions` allowlist
-   (decision 7). A declaration is **identical** when name, version, argument
+   from its catalog for the names of its `actions` allowlist (decision 7): the
+   registry's discovered spec when an enabled manifest declares the action,
+   else the declaration of a disabled module's manifest — `capture` on the
+   server, where `screen.capture` is served remotely only. A declaration is
+   **identical** when name, version, argument
    and result schemas, nature, supported destinations — and, being part of the
    compared spec, the optional `delivery` capability — are equal. An identical
    declaration makes that action **ready**; a differing one is excluded with
