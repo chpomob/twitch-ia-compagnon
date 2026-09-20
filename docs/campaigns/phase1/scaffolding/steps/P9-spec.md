@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_brain.py`: AC20 parametrised over the 10 fields × {absent, 0, negative, inf} and the wait > total case; AC10 both refusals; `delivery.mode: teleport` and a fixed entry lacking `action` each give one diagnostic naming the field; `test_manifest_declares_v2_shape_settings_hook_and_no_grant` compares the schema to the extended constant. `tests/test_examples.py::test_example_config_satisfies_every_module_owned_settings_validator` passes unchanged (reads the new keys through the validator). Every other suite green.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

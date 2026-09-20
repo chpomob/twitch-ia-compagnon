@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_proxy.py`: AC34 (agent clock 3 h ahead: bound 5 s for `remaining_ms: 5000`; 10 s for 20 000 with `action_seconds: 10`); AC36 agent side (repeat of retained call → 0 executions, same observation; after `ttl + 1` → `duplicate_call_unknown`; never-seen `seq ≤ last_seq` → `duplicate_call_unknown`; `max_entries: 2` eviction; new `welcome` resets); AC37 backoff sequence and reset after `welcome`; AC33 in-process (brain proxy and agent link on the two ends of `MemoryWebSocketPair`, capture served through the agent's local executor: same brain-side call sequence, traces and store cleanup as the local provider; exactly one attachment header + one binary frame + one ack); AC35 from the agent side (drop while a call is in flight; reconnect pairs again without retransmission); hello includes `delivery` on declared write actions; AC31's grep extended to `modules/proxy modules/agent_link`.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

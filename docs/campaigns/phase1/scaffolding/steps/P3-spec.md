@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_actions.py`: a provider returning a valid `image_ref` leased to the call's run is adopted with parts intact; an `image_ref` leased to another run, expired on the injected clock, or with `size` off by 1 byte becomes `invalid_result` and the object is released (store usage 0) (AC22, AC47 tail); an observation over `max_observation_bytes` becomes `observation_too_large` and releases its images (AC47 head); a not-ready module returns `refused` with `provider_not_ready` and 0 provider invocations; synthetic observations carry `parts == ()`. `tests/test_observations.py`: executor validation of `image_ref` through the shared `runtime_context(attachments=...)`.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

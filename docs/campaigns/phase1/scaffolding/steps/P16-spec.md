@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_capture.py`: AC29 (file source → `image_ref` matching the file's `width/height/size`; command source exceeding the timeout → `capture_timed_out`, store 0 bytes; missing source at `prepare` → not ready, `module.degraded` names the source); AC23 (`max_object_bytes: 1024`, 2048-byte capture → `attachment_refused`, 0 bytes retained); AC30 (no rule → refused, provider 0 invocations); an unknown `source` argument → `invalid_arguments`; the observation contains no filesystem path; `command` runs a Python one-liner writing a PNG to stdout (no sleep in the test — the timeout case uses the injected runner held on a future).
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

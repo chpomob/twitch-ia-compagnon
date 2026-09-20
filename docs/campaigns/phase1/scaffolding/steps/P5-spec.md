@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_main.py`: `builtin` resolves to the checkout's `modules/` directory (same `discover` result as `./modules`); an unresolvable package is a `ConfigurationError` naming the field; `--check-config` on the current example with a dummy environment returns 0 and activates 0 modules (a spy entry point records 0 `activate` calls); with `TWITCH_ACCESS_TOKEN` unset it returns 2 and the diagnostic names `modules.twitch.access_token` and no value; `main(["--config", path, "--check-config"])` returns the same status without installing the watchdog's process exit; `--help` exits 0.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

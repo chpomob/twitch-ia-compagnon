@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_budgets.py`: AC13 full (`fallback == "sent"`, `delivery == "fallback:success"`, 1 send); AC17 (clock at 51 s → 0 further requests and fallback; at 60 s → 0 sends, `skipped:deadline_exceeded`); AC18 (disabled, not authorized with provider invoked 0 times, action budget consumed); AC19 (queued work expiring `wait_seconds` → `stale_drop`, 0 model requests, exactly 1 fallback send; disabled → 0 sends) with the injected clock and no positive sleep. `tests/test_delivery.py`: AC55 (two-entry fallback; exactly 1 call left → `["success", "skipped:budget_exhausted"]`; no rule for either → `skipped:not_authorized`).
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

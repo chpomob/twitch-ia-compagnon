@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_chat_context_module.py`: AC26 (limit 3 of 5 → newest 3 oldest-first, `retained 5`, `complete false`; limit 10 → 5, `complete true`; a channel at `max_messages` → `complete false`; `limit` 0 and 51 → `invalid_arguments`); AC30 (no rule → `refused not_authorized`, provider invoked 0 times, on `twitch/*/chat` and `fake/*/chat`); the `text` part equals the rendered messages; manifest test (v2 shape, action declaration, no grant); `grep twitch` on the module is 0 lines.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

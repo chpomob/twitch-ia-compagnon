@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_agentic_loop.py` (a scripted read provider bound in the test as `chat.read`/`screen.capture` doubles — the real modules join in P17): AC1 (3 executor calls with `call-1..3`, 1 send, `turns: 3`, `action_calls: 3`, one `run_id`/`conversation_id` across traces); AC2 (second request carries the text observation, third exactly one image, store 0 objects after completion); AC3; AC4 (refused `screen.capture` then final → `success`, `turns: 2`); AC5; AC6 (with grants for `chat.read`, `users.read` on scope `chat` and `screen.capture` on scope `capture`, every request's tools are exactly the three; dropping the `capture` rule removes only `screen.capture`; a `screen.capture` rule on scope `chat` offers nothing); AC46 (`chat.write` proposal refused `not_a_read_action` with 0 executor calls, then final as `call-1`; `nope.action` → `unknown_action`); AC11; AC12 (no base64/path in bus events, traces, audit records; traces carry `attachment_id`, `size`, `width`, `height`); AC24; AC25 (6 terminal paths, store 0 objects and `SupervisedTasks.active` back to baseline); AC47 model side (0 or 1 image parts in the next request). `tests/test_budgets.py` (created here): AC13 loop part (2 requests then `budget: model_turns`), AC14, AC15, AC16 (held session + clock advance; held capture → `timeout` observation then `success`). `tests/test_observations.py`: expired/foreign lease through the whole brain path.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

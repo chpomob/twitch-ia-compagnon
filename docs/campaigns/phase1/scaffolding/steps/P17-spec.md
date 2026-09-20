@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 AC1/AC2 with real providers; AC31 (same call sequence and trace set on `fake`; `grep -r twitch` over `core/ modules/brain modules/chat_context modules/users modules/capture` is 0 lines — proxy/agent_link directories are added to the grep in P20); AC25 with the real capture provider on every terminal path; AC41 local half (only `capture` enabled → `screen.capture` offered; 0 references to `capture` or `proxy` in `modules/brain/`).
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_proxy.py` over `MemoryWebSocketPair` driving `connection_handler`: AC32; AC48; the `hello` spec comparison (identical → accepted, a `delivery`-less declaration → `action_mismatch`, others accepted); AC33 brain side (a scripted agent end answering `call` with an attachment header + binary + observation → the executor adopts the `image_ref` from the brain's store after exactly one ack, the observation frame has no path); AC35 (drop with a write / a read in flight; actions absent from `authorized()` until re-pair); AC36 brain side (late and duplicate observations counted); AC38; heartbeat drop on the injected clock; AC41 (both `capture` and `proxy` enabled → ambiguity diagnostic naming `screen.capture` and both providers); `max_frame_bytes` bound on a 1 048 577-byte text frame.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

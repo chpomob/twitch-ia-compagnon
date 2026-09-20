@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_admission.py`: the hook is called exactly once per stale item with `(work, session_key, remaining)`, remaining is the total budget minus the wait already spent; a hook that raises leaves the `stale_drop` record and its `brain.run.completed` intact and counts one failure; a hook returning `{"fallback": "sent"}` shows in the record; the 4 existing constructors run unchanged without the hook.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

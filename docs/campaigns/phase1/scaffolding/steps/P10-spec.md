@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_model_adapter.py`: AC8 (vision probe non-2xx → exact diagnostic, no key/endpoint substring, 0 scenario requests; both probes OK → ready, exactly 2 probe requests, the second with exactly one image part); AC9 (`no_tool_call`, `multiple_tool_calls`, exactly 1 probe with `[structured_output]`); `malformed_arguments`, `timed_out` (held session + clock advance), `transport_failed`; request shape (tools are the offered specs, `tool_choice: auto` for scenario turns, image parts encoded from the store only at request time and absent from the transcript object); classification of the 5 shapes; redaction (the api key never appears in diagnostics or traces on every failure path). `tests/test_brain.py`: existing request-shape tests adapted to `messages`+`tools` (allowlisted rewrites are done in P12).
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_delivery.py` (fixtures enabled through `runtime_context` + the loader on `tests/fixtures/modules`): AC49 (single entry identical to today: `deliveries == [{chat.write, call-1, true, success}]`, inherited mapping); AC50 (two-entry text + effect, exact arguments, both orders); AC51 (two text entries, tools never list `chat.write`/`audio.say`); AC52 (`modules` mode: resolved order, `overlay.raw` absent, `ignored` preference, list `[chat.write]` when fakeeffects is disabled); AC53 (each of the 7 fixed lists and `modules` with no delivery-capable action fails `prepare` with the named entry and reason, 0 scenario requests, 0 sends, not ready); AC54 (per-entry outcomes, `FAIL_AFTER_EMISSION` → `external_unknown`, raising scene provider → `error`, refused scene entry with the chat send still made); AC57 (override on `fake/chan-b`, diagnostic path for an override naming `nope.action`); AC56 (grep of `modules/brain/` for the 5 literals is 0 lines; scenarios use the shipped brain with only `delivery` changed). `tests/test_brain.py`: `send["call_id"] == f"{run_id}/call-1"` unchanged.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

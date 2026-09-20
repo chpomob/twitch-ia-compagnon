@@ -51,7 +51,7 @@ CAMPAIGN_LOG = CAMPAIGN / "campaign.log"
 SUMMARY = CAMPAIGN / "campaign-summary.md"
 GATE_PROMPT_1 = CAMPAIGN / "gate-prompt-1.md"
 
-TEST_CMD = "python3 -m pytest tests/ -q -p no:cacheprovider"
+TEST_CMD = ".venv/bin/python -m pytest tests/ -q -p no:cacheprovider"
 STEP_IDS = [f"P{i}" for i in range(1, 24)]        # P24 is the standalone full-branch gate
 DEV_CLAUDE_TUI = f"python3 {CLAUDE} --timeout 2700 --hard-timeout 3900 --cwd {REPO}"
 DEV_GLM = "pi -p --provider zai --model glm-5.3 --thinking high"

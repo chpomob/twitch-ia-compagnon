@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_contracts.py`: AC21 — unknown part type, `text` part over the bound (through `validate_parts`), each of the 7 `image_ref` fields missing, each raising `ContractError` naming the field; an observation with no `parts` constructs as before; `parts` are frozen. `tests/test_observations.py` (created here, extended in P3/P12): `observation_size` counts text bytes + image `size` only (AC47 arithmetic: 3 145 728 + 3 145 728 > 5 242 880; 3 145 728 + 2 097 152 = 5 242 880 accepted); vocabulary constants have the spec's literal values, `PROBE_TOOL == "runtime.probe"`, and close codes are distinct.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

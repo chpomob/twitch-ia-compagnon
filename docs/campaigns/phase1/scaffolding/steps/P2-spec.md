@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_contracts.py`: `delivery` on a `write` spec is accepted and takes part in equality (two specs differing only by `delivery` are unequal); `delivery` on a `read` spec, an unknown key, a `text_argument` absent from the schema or non-string each raise naming `ActionSpec.delivery`. `tests/test_loader.py`: a temp manifest declaring `delivery` on a `read` action fails discovery with a diagnostic naming the action; the shipped twitch manifest parses with `delivery_text_argument == "text"`. `tests/test_twitch.py`: the manifest test asserts the new field and everything else unchanged.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in

@@ -42,7 +42,9 @@ All dependencies are already merged into `main` when this step runs.
 
 `tests/test_loader.py`: discovery of `tests/fixtures/modules` yields exactly the 2 manifests; `fakeplatform`'s `chat.write` spec equals twitch's except for platform and `delivery_text_argument == "text"`; `fakeeffects` declares 3 actions, two with `delivery`; activating each on `runtime_context` binds the declared providers; `fakeplatform.inject` publishes one `channel.chat.message` with `platform == "fake"` and `metadata.schema_version == 2`; the scripted feed publishes on `start_inputs` and again on each `after_event`.
 
-Test command (must pass): `python3 -m pytest tests/ -q -p no:cacheprovider`
+Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the
+two-process topology tests import — a `python3 -m pytest` run fails at collection there.
 Every acceptance criterion this step owns must be enforced by a test that fails without the
 change. Never weaken, skip, xfail or delete an existing assertion to make the suite pass; if an
 existing test encodes a superseded guarantee, replace it and cite the superseding requirement in
