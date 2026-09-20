@@ -170,11 +170,16 @@ The `ActionObservation` fields: `status` (one of `TERMINAL_STATUSES`),
 `parts` follow R4: `text` parts carry `text`; `image_ref` parts carry the seven
 `IMAGE_REF_FIELDS` (`attachment_id`, `content_type`, `size`, `width`,
 `height`, `captured_at`, `provider_id`) and **must name an attachment already
-acknowledged `accepted: true` in this session** (§10). An `observation`
-carrying an unacknowledged `attachment_id` is treated by the brain as an
-`error` observation for that call (code `attachment_refused` of the brain
-vocabulary). An observation never carries a filesystem path, a payload or an
-inline image (AC33).
+acknowledged `accepted: true` in this session, for this call** (§10). An
+`observation` carrying an unacknowledged `attachment_id` — never
+acknowledged, acknowledged for another call, or whose bytes the brain's store
+no longer holds — is refused by the brain at the boundary, before its
+executor sees the reference: it becomes an `error` observation for that call
+(code `attachment_refused` of the brain vocabulary, `retryable: false`;
+status `external_unknown` instead of `error` when the call is a `write` the
+agent did not report `refused`, since its effect may have been engaged), and
+whatever that call had uploaded is discarded. An observation never carries a
+filesystem path, a payload or an inline image (AC33).
 
 ### 5.6 `cancel` (brain → agent)
 
@@ -373,9 +378,22 @@ part. A transfer is exactly three steps (AC33):
      and payload.
 
 Only an acknowledged `attachment_id` may appear in an `image_ref` part of a
-later `observation` (§5.5). Stored bytes belong to the run named by the call
-in flight and follow the store's lease and retention: they are released with
-the run's cleanup exactly like a local provider's attachments.
+later `observation` (§5.5), and only in the observation of the call it was
+uploaded for. Stored bytes belong to the run named by the call in flight and
+follow the store's lease and retention: they are released with the run's
+cleanup exactly like a local provider's attachments.
+
+**Bounded acknowledgement.** The brain remembers an accepted upload — the
+agent's `attachment_id` and the store reference it translates to — only
+while its call is in flight and the store still holds the bytes: the entry
+is forgotten with the call's terminal outcome (observed, cancelled, timed
+out, answered by an `error` frame, resolved on a drop), with the run's
+release of the object, with the store's time-to-live, and with the whole
+session. At most `MAX_ACKNOWLEDGED_ATTACHMENTS` (`256`) such entries are
+held per session; a further upload while the table is full is refused
+`store_full` on its payload, nothing is stored, and the brain counts the
+refusal (`saturated_uploads`). An agent that uploads and observes call by
+call never reaches the bound.
 
 **Call identity.** An upload is bound to exactly one call: the one the
 header's `call_id` names, else the most recently issued call still in flight.

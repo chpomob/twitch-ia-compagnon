@@ -23,6 +23,13 @@ Three checks over the files themselves, none over the runtime:
 * AC44: ``docs/README.md`` has the section "Phase 1 topology trial" with its
   six fields — commit, profiles, hosts, TLS, outcome, limits — each with a
   recorded value, the commit one naming a commit hash.
+* Target list (gate finding F5): the phase 1 spec's ``targets`` front matter
+  is the authority on which repository files the phase touches, so every
+  file a plan step names must be a target, lie in the permitted scope the
+  spec states (the campaign's own directory), or be one the spec records
+  as planned but untouched; the spec must state that permitted scope in so
+  many words; and every target must exist, so the list names no file the
+  branch never produced.
 """
 
 from __future__ import annotations
@@ -38,10 +45,25 @@ TESTS_DIR = ROOT / "tests"
 CORE_DIR = ROOT / "core"
 MODULES_DIR = ROOT / "modules"
 README = ROOT / "docs" / "README.md"
+CAMPAIGN_DIR = ROOT / "docs" / "campaigns" / "phase1"
+SPEC = CAMPAIGN_DIR / "spec.md"
+PLAN = CAMPAIGN_DIR / "plan.md"
 
 SLEEP_MODULES = ("asyncio", "time")
 ZERO_LITERALS = ("0", "0.0")
 MODEL_LITERALS = ("gpt-", "claude-", "llama", "mistral", "gemini")
+
+SCOPE_SECTION_TITLE = "Target list and permitted scope"
+#: The one place the spec lets a step write outside its targets: the
+#: campaign's own documents and scaffolding, as a repository-relative prefix.
+PERMITTED_SCOPE = "docs/campaigns/phase1/"
+#: Plan steps name the repository-root ``spec.md`` / ``plan.md``; the step
+#: generator redirects them to the campaign directory, which the spec's
+#: scope section records, so they resolve inside the permitted scope.
+ROOT_DOCUMENT_ALIASES = {"spec.md": "docs/campaigns/phase1/spec.md", "plan.md": "docs/campaigns/phase1/plan.md"}
+#: Files the plan schedules an edit of that turned out to need none; the
+#: spec must say so by name, since they are not targets.
+PLANNED_BUT_UNTOUCHED = ("tests/test_lifecycle.py", "tests/test_retention.py")
 
 TRIAL_SECTION_TITLE = "Phase 1 topology trial"
 #: The six fields of R8 / AC44, as the README's table labels them (French,
@@ -300,3 +322,92 @@ def test_ac44_readme_records_the_phase_1_topology_trial() -> None:
     assert re.search(r"loopback|distinct", values["Hôtes"], re.IGNORECASE)
     assert re.search(r"utilisé|used", values["TLS"], re.IGNORECASE)
     assert "test_ac39_two_process_topology_over_loopback" in section
+
+
+# --------------------------------------------------------------------------- #
+# Target list (gate finding F5)
+# --------------------------------------------------------------------------- #
+
+
+def _spec_targets(text: str) -> list[str]:
+    """The ``file:`` entries of the spec's ``targets`` front matter, in order."""
+
+    match = re.match(r"---\n(.*?)\n---\n", text, re.DOTALL)
+    assert match is not None, "the spec has no front matter"
+    return re.findall(r"^  - file: (\S+)$", match.group(1), re.MULTILINE)
+
+
+def _subsection(markdown: str, title: str) -> str:
+    """The body of the ``###`` subsection titled *title*, up to the next
+    heading of level three or above."""
+
+    lines = markdown.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("### ") and title in line]
+    assert len(starts) == 1, f"expected exactly one subsection titled {title!r}, found {len(starts)}"
+    start = starts[0]
+    end = next(
+        (index for index in range(start + 1, len(lines)) if re.match(r"^#{1,3} ", lines[index])),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _plan_files(text: str) -> dict[str, list[str]]:
+    """Every file a plan step's ``**Files:**`` line names, by step title."""
+
+    steps: dict[str, list[str]] = {}
+    title = ""
+    for line in text.splitlines():
+        heading = re.match(r"^### (P\d+[A-Z0-9]*):", line)
+        if heading:
+            title = heading.group(1)
+            continue
+        files = re.match(r"^- \*\*Files:\*\* \[(.*)\]$", line)
+        if files and title:
+            steps.setdefault(title, []).extend(
+                name.strip().strip("`") for name in files.group(1).split(",") if name.strip()
+            )
+    return steps
+
+
+def test_the_spec_target_list_covers_every_file_the_plan_edits() -> None:
+    """Gate finding F5: the spec's ``targets`` list is the authority on the
+    files the phase touches, so each file a plan step names is a target,
+    inside the permitted scope the spec states, or one the spec records as
+    planned but untouched — and every target exists on disk."""
+
+    spec = SPEC.read_text(encoding="utf-8")
+    targets = _spec_targets(spec)
+    assert targets, "the spec's front matter names no target"
+    assert len(targets) == len(set(targets)), "a target is listed twice"
+    missing = [name for name in targets if not (ROOT / name).is_file()]
+    assert missing == [], f"targets the tree does not have: {missing}"
+
+    section = _subsection(spec, SCOPE_SECTION_TITLE)
+    assert f"`{PERMITTED_SCOPE}`" in section, "the spec does not state the permitted scope"
+    assert "`docs/design-v2.md`" in section, "the design authority is not named as untouched"
+    for name in PLANNED_BUT_UNTOUCHED:
+        assert f"`{name}`" in section, f"{name} is neither a target nor recorded as untouched"
+
+    steps = _plan_files(PLAN.read_text(encoding="utf-8"))
+    assert len(steps) >= 24, sorted(steps)
+    covered = set(targets)
+    outside: list[str] = []
+    for step, names in steps.items():
+        for name in names:
+            resolved = ROOT_DOCUMENT_ALIASES.get(name, name)
+            if resolved in covered or resolved.startswith(PERMITTED_SCOPE):
+                continue
+            if name in PLANNED_BUT_UNTOUCHED:
+                continue
+            outside.append(f"{step}: {name}")
+    assert outside == [], "plan files outside the spec's targets:\n" + "\n".join(outside)
+
+
+def test_the_target_list_parsers_read_the_documents_shape(tmp_path: Path) -> None:
+    spec = "---\nname: x\ntargets:\n  - file: a/b.py\n    description: \"one\"\n  - file: c.md\n    description: \"two\"\n---\n\n# Body\n  - file: not/front/matter.py\n"
+    assert _spec_targets(spec) == ["a/b.py", "c.md"]
+    plan = "### P1: First\n- **Files:** [`a/b.py`, `c.md`]\n- **Tests:** none\n### P2: Second\n- **Files:** [`d.py`]\n"
+    assert _plan_files(plan) == {"P1": ["a/b.py", "c.md"], "P2": ["d.py"]}
+    body = "## Top\n\n### Other\nx\n\n### Scope here\nline one\n\n#### Deeper\nstill inside\n\n### Next\nout\n"
+    assert _subsection(body, "Scope here") == "### Scope here\nline one\n\n#### Deeper\nstill inside\n"

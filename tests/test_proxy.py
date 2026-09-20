@@ -329,10 +329,12 @@ from conftest import (
     wait_until,
 )
 
+import modules.proxy as proxy_module
 from modules.proxy import (
     AGENT_STATUS_EVENT,
     CLOSE_GOING_AWAY,
     MANIFEST_PATH,
+    MAX_ACKNOWLEDGED_ATTACHMENTS,
     MODULE_NAME,
     PROVIDER_NAME,
     ProxyModule,
@@ -1835,7 +1837,110 @@ async def test_ac33_brain_side_the_image_reaches_the_store_after_exactly_one_tra
         await brain.close()
 
 
-async def test_an_image_ref_naming_an_unacknowledged_attachment_is_invalid_result_at_the_executor() -> None:
+async def test_an_image_ref_naming_an_unacknowledged_attachment_is_attachment_refused_at_the_proxy() -> None:
+    """§5.5: an ``image_ref`` naming an ``attachment_id`` this session never
+    acknowledged is refused **at the proxy boundary** with the brain's
+    ``attachment_refused`` — the executor never sees the reference. (Gate
+    finding F4: the test this replaces sent ``"never-sent"`` and asserted
+    the executor's ``invalid_result``, encoding the defect.) An upload the
+    same call did make alongside the bogus reference is discarded at once:
+    nothing will ever name it."""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        task = asyncio.create_task(brain.executor.invoke(capture_call(deadline=brain.clock() + 30)))
+        call = await agent.call_frame()
+        ack = await agent.transfer("real", b"\x01" * 100, call_id=call["call_id"])
+        assert ack["accepted"] is True and brain.store.object_count == 1
+        await agent.observe(
+            call["call_id"], result=capture_result(100),
+            parts=[image_ref("real", 100), image_ref("never-sent", 100)],
+        )
+        observation = await task
+        assert observation.status == "error"
+        assert observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert observation.error["retryable"] is False
+        assert "never-sent" in observation.error["message"]
+        assert observation.parts == ()
+        assert observation.provenance["provider"] == PROVIDER_NAME
+        # Refused before the executor: no lease was validated, and the
+        # executor's own record carries the proxy's code, not ``invalid_result``.
+        recorded = brain.executor.outcome(call["call_id"])
+        assert recorded is not None and recorded.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert brain.store.object_count == 0
+        assert module.acknowledged_attachments == 0
+        assert module.in_flight == ()
+        assert not agent.ws.closed
+    finally:
+        await brain.close()
+
+
+async def test_an_image_ref_acknowledged_for_another_call_is_attachment_refused_and_that_call_keeps_it() -> None:
+    """§5.5 / §10: an acknowledged identifier may be named only by the
+    observation of the call it was uploaded for. Call B naming A's upload is
+    refused ``attachment_refused``; A's bytes stay leased and A's own
+    observation still resolves them."""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        deadline = brain.clock() + 30
+        first = asyncio.create_task(brain.executor.invoke(capture_call("c-a", run_id="run-A", deadline=deadline)))
+        await agent.call_frame()
+        second = asyncio.create_task(brain.executor.invoke(capture_call("c-b", run_id="run-B", deadline=deadline)))
+        await agent.call_frame()
+        ack = await agent.transfer("for-a", b"\x0a" * 8, call_id="c-a")
+        assert ack["accepted"] is True
+
+        await agent.observe("c-b", result=capture_result(8), parts=[image_ref("for-a", 8)])
+        observation = await second
+        assert observation.status == "error"
+        assert observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert "for-a" in observation.error["message"] and "c-a" in observation.error["message"]
+        assert brain.store.usage("run-A").objects == 1
+
+        await agent.observe("c-a", result=capture_result(8), parts=[image_ref("for-a", 8)])
+        observation = await first
+        assert observation.status == "success", observation.error
+        (part,) = observation.parts
+        assert brain.store.lookup(part["attachment_id"]).run_id == "run-A"
+    finally:
+        await brain.close()
+
+
+async def test_an_unacknowledged_image_ref_on_a_write_is_external_unknown_attachment_refused() -> None:
+    """The refusal keeps the conservative side for a write the agent did not
+    say it refused (R2, R5): the effect may have been engaged, so the status
+    is ``external_unknown`` with the same ``attachment_refused`` code."""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        task = asyncio.create_task(brain.executor.invoke(write_call(deadline=brain.clock() + 30)))
+        call = await agent.call_frame()
+        await agent.observe(call["call_id"], result={"sent": True}, parts=[image_ref("never-sent", 4)])
+        observation = await task
+        assert observation.status == "external_unknown"
+        assert observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert "never-sent" in observation.error["message"]
+    finally:
+        await brain.close()
+
+
+async def test_a_malformed_image_ref_identifier_is_still_the_executors_invalid_result() -> None:
+    """The boundary refusal is for well-formed identifiers only: an
+    ``image_ref`` whose ``attachment_id`` is not text is a malformed part,
+    named by the executor's validation as before."""
+
     brain = Brain()
     try:
         await brain.activate()
@@ -1843,12 +1948,250 @@ async def test_an_image_ref_naming_an_unacknowledged_attachment_is_invalid_resul
         await agent.pair_up()
         task = asyncio.create_task(brain.executor.invoke(capture_call(deadline=brain.clock() + 30)))
         call = await agent.call_frame()
-        await agent.observe(call["call_id"], result=capture_result(100), parts=[image_ref("never-sent", 100)])
+        part = image_ref("x", 100)
+        part["attachment_id"] = 7
+        await agent.observe(call["call_id"], result=capture_result(100), parts=[part])
         observation = await task
         assert observation.status == "error"
         assert observation.error["code"] == ERROR_INVALID_RESULT
-        assert "never-sent" in observation.error["message"]
         assert brain.store.object_count == 0
+    finally:
+        await brain.close()
+
+
+async def test_repeated_image_runs_over_one_connection_leave_no_translation_entry_behind() -> None:
+    """Gate finding F2: more than ``MAX_ACKNOWLEDGED_ATTACHMENTS`` sequential
+    image runs over ONE connection, each observed and released normally,
+    leave the translation table empty after each — it is pruned with the
+    call, not with the session — and the store back at zero; the bound is
+    never reached and nothing is refused."""
+
+    assert MAX_ACKNOWLEDGED_ATTACHMENTS >= 1
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        runs = MAX_ACKNOWLEDGED_ATTACHMENTS + 3
+        for index in range(runs):
+            run_id = f"run-{index}"
+            task = asyncio.create_task(
+                brain.executor.invoke(capture_call(f"c-{index}", run_id=run_id, deadline=brain.clock() + 30))
+            )
+            call = await agent.call_frame()
+            ack = await agent.transfer(f"att-{index}", b"\x01" * 8, call_id=call["call_id"])
+            assert ack["accepted"] is True, (index, ack)
+            assert module.acknowledged_attachments == 1
+            await agent.observe(call["call_id"], result=capture_result(8), parts=[image_ref(f"att-{index}", 8)])
+            observation = await task
+            assert observation.status == "success", (index, observation.error)
+            assert module.acknowledged_attachments == 0
+            assert brain.store.release(run_id).objects == 1
+            assert brain.store.object_count == 0
+        assert module.saturated_uploads == 0
+        assert module.paired and not agent.ws.closed
+        assert agent.received_types().count(FRAME_ATTACHMENT_ACK) == runs
+    finally:
+        await brain.close()
+
+
+async def test_translation_entries_are_pruned_on_cancellation_error_release_and_expiry() -> None:
+    """Gate finding F2: an entry is tied to its call and to the store's
+    lease. It goes when the call is cancelled or answered by an ``error``
+    frame, when the run's cleanup releases the object, when the executor
+    discards it, or when the store's time-to-live reaps it — whether or not
+    an observation ever came."""
+
+    # A short time-to-live, so the expiry case fits inside the call's own
+    # 10 s timeout and under the 15 s heartbeat.
+    brain = Brain(store_limits={**STORE_LIMITS, "ttl_seconds": 5.0})
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        deadline = brain.clock() + 30
+
+        # Cancelled between upload and observation.
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-1", run_id="run-1", deadline=deadline)))
+        await agent.call_frame()
+        assert (await agent.transfer("a-1", b"\x01" * 8, call_id="c-1"))["accepted"] is True
+        assert module.acknowledged_attachments == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert (await agent.frame())["type"] == FRAME_CANCEL
+        assert module.acknowledged_attachments == 0
+
+        # Answered by an ``error`` frame.
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-2", run_id="run-2", deadline=deadline)))
+        await agent.call_frame()
+        assert (await agent.transfer("a-2", b"\x02" * 8, call_id="c-2"))["accepted"] is True
+        assert module.acknowledged_attachments == 1
+        await agent.send({"type": FRAME_ERROR, "id": "c-2", "code": "invalid_frame", "message": "no", "retryable": False})
+        assert (await task).status == "error"
+        assert module.acknowledged_attachments == 0
+
+        # Released by the run's cleanup while the call is still in flight:
+        # the entry goes at the next pruning — the next upload, the next
+        # observation — and an observation naming it is refused at the
+        # boundary: the bytes are gone.
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-3", run_id="run-3", deadline=deadline)))
+        await agent.call_frame()
+        assert (await agent.transfer("a-3", b"\x03" * 8, call_id="c-3"))["accepted"] is True
+        assert brain.store.release("run-3").objects == 1
+        assert module.acknowledged_attachments == 1  # not yet looked at
+        assert (await agent.transfer("a-3b", b"\x03" * 8, call_id="c-3"))["accepted"] is True
+        assert module.acknowledged_attachments == 1  # a-3 pruned, a-3b held
+        await agent.observe("c-3", result=capture_result(8), parts=[image_ref("a-3", 8)])
+        observation = await task
+        assert observation.status == "error" and observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert "a-3" in observation.error["message"]
+        assert module.acknowledged_attachments == 0
+        # a-3b was discarded with the refusal; the objects of runs 1 and 2
+        # stay leased until their runs' cleanup, as a local provider's would.
+        assert brain.store.usage("run-3").objects == 0
+        assert brain.store.object_count == 2
+
+        # Released, then named straight away with no upload in between: the
+        # observation itself is the pruning, and the reference is refused.
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-5", run_id="run-5", deadline=deadline)))
+        await agent.call_frame()
+        assert (await agent.transfer("a-5", b"\x05" * 8, call_id="c-5"))["accepted"] is True
+        assert brain.store.release("run-5").objects == 1
+        assert module.acknowledged_attachments == 1
+        await agent.observe("c-5", result=capture_result(8), parts=[image_ref("a-5", 8)])
+        observation = await task
+        assert observation.status == "error" and observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert module.acknowledged_attachments == 0
+
+        # Past the store's time-to-live. Nothing reads the store between
+        # the clock advancing and the next upload — ``lookup`` returns an
+        # expired reference as stored, and only ``put`` reaps — so the
+        # entry must be judged expired by the proxy itself, on the clock.
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-4", run_id="run-4", deadline=deadline)))
+        await agent.call_frame()
+        assert (await agent.transfer("a-4", b"\x04" * 8, call_id="c-4"))["accepted"] is True
+        brain.clock.advance(6)
+        assert (await agent.transfer("a-4b", b"\x04" * 8, call_id="c-4"))["accepted"] is True
+        assert module.acknowledged_attachments == 1  # a-4 pruned as expired, a-4b held
+        assert brain.store.object_count == 1
+        await agent.observe("c-4", result=capture_result(8), parts=[image_ref("a-4b", 8)])
+        assert (await task).status == "success"
+        assert module.acknowledged_attachments == 0
+
+        assert module.saturated_uploads == 0
+        assert not agent.ws.closed
+    finally:
+        await brain.close()
+
+
+async def test_the_translation_table_at_its_bound_refuses_the_next_upload_store_full_and_counts_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate finding F2: the bound is explicit and its policy is counted, not
+    silent. With the bound lowered to 2 and three calls in flight, the
+    third upload is refused ``store_full`` — nothing stored — and
+    ``saturated_uploads`` reads 1; once a held call is observed, its entry
+    goes and the same upload is accepted. The session stays intact.
+
+    A table at the bound whose leases have all expired is not stuck: the
+    next upload finds the expired entries pruned and is accepted, with no
+    other operation having made the store reap in between."""
+
+    monkeypatch.setattr(proxy_module, "MAX_ACKNOWLEDGED_ATTACHMENTS", 2)
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        deadline = brain.clock() + 30
+        tasks = []
+        for index in range(3):
+            tasks.append(asyncio.create_task(
+                brain.executor.invoke(capture_call(f"c-{index}", run_id=f"run-{index}", deadline=deadline))
+            ))
+            await agent.call_frame()
+        assert (await agent.transfer("a-0", b"\x00" * 8, call_id="c-0"))["accepted"] is True
+        assert (await agent.transfer("a-1", b"\x01" * 8, call_id="c-1"))["accepted"] is True
+        assert module.acknowledged_attachments == 2
+
+        ack = await agent.transfer("a-2", b"\x02" * 8, call_id="c-2")
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_STORE_FULL
+        assert ack["attachment_id"] == "a-2"
+        assert module.saturated_uploads == 1
+        assert module.acknowledged_attachments == 2
+        assert brain.store.object_count == 2
+        assert brain.store.usage("run-2").objects == 0
+        assert not agent.ws.closed
+
+        # Observing c-0 frees its entry; the refused upload now fits.
+        await agent.observe("c-0", result=capture_result(8), parts=[image_ref("a-0", 8)])
+        assert (await tasks[0]).status == "success"
+        assert module.acknowledged_attachments == 1
+        ack = await agent.transfer("a-2", b"\x02" * 8, call_id="c-2")
+        assert ack["accepted"] is True
+        assert module.saturated_uploads == 1
+        await agent.observe("c-2", result=capture_result(8), parts=[image_ref("a-2", 8)])
+        assert (await tasks[2]).status == "success"
+        await agent.observe("c-1", result=capture_result(8), parts=[image_ref("a-1", 8)])
+        assert (await tasks[1]).status == "success"
+        assert module.acknowledged_attachments == 0
+    finally:
+        await brain.close()
+
+
+async def test_the_translation_table_at_its_bound_recovers_when_its_leases_expire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate finding F2, review A1: ``AttachmentStore.lookup`` returns a
+    reference past its deadline as stored and reaps nothing; with the bound
+    reached and every lease expired, the pruning must judge expiry on the
+    clock itself, or every upload is refused ``store_full`` until some other
+    operation makes the store reap. Nothing here touches the store between
+    the clock advancing and the upload."""
+
+    monkeypatch.setattr(proxy_module, "MAX_ACKNOWLEDGED_ATTACHMENTS", 2)
+    brain = Brain(store_limits={**STORE_LIMITS, "ttl_seconds": 5.0})
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        deadline = brain.clock() + 30
+        tasks = []
+        for index in range(3):
+            tasks.append(asyncio.create_task(
+                brain.executor.invoke(capture_call(f"c-{index}", run_id=f"run-{index}", deadline=deadline))
+            ))
+            await agent.call_frame()
+        assert (await agent.transfer("a-0", b"\x00" * 8, call_id="c-0"))["accepted"] is True
+        assert (await agent.transfer("a-1", b"\x01" * 8, call_id="c-1"))["accepted"] is True
+        assert module.acknowledged_attachments == 2
+
+        brain.clock.advance(6)
+        ack = await agent.transfer("a-2", b"\x02" * 8, call_id="c-2")
+        assert ack["accepted"] is True
+        assert module.saturated_uploads == 0
+        assert module.acknowledged_attachments == 1  # a-0 and a-1 expired, a-2 held
+        assert brain.store.object_count == 1
+
+        # The expired uploads may no longer be named; the live one may.
+        await agent.observe("c-0", result=capture_result(8), parts=[image_ref("a-0", 8)])
+        observation = await tasks[0]
+        assert observation.status == "error" and observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        await agent.observe("c-2", result=capture_result(8), parts=[image_ref("a-2", 8)])
+        assert (await tasks[2]).status == "success"
+        await agent.observe("c-1", result=capture_result(8))
+        assert (await tasks[1]).status == "success"
+        assert module.acknowledged_attachments == 0
+        assert not agent.ws.closed
     finally:
         await brain.close()
 

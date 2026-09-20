@@ -1,6 +1,6 @@
 ---
 name: "phase1-agentic-vertical"
-version: "1.2"
+version: "1.3"
 author: "adversarial-spec"
 status: "draft"
 tags: [adversarial, spec]
@@ -88,7 +88,33 @@ targets:
   - file: tests/test_profiles.py
     description: "New: `--check-config` on the three example files with dummy environment, transport selection (local vs remote, ambiguity refused), clean-environment install and `builtin` discovery of 8 manifests."
   - file: tests/test_hygiene.py
-    description: "New: whole-suite grep asserting no positive-duration `asyncio.sleep`/`time.sleep` in `tests/`, and no model name literal in `core/` or `modules/`."
+    description: "New: whole-suite grep asserting no positive-duration `asyncio.sleep`/`time.sleep` in `tests/`, and no model name literal in `core/` or `modules/`; the authority-document consistency check of the target list against the plan (v1.3)."
+  - file: core/attachments.py
+    description: "Migration (plan P3): the two public accessors the executor's lease validation needs — `AttachmentStore.lookup(attachment_id)` (a pure read, no TTL side effect) and `discard(attachment_id)` (drop one object, idempotent with `release`); nothing else in the store changes."
+  - file: core/loader.py
+    description: "Migration (plan P2): `_manifest_actions` parses the optional `delivery` key of an action declaration and names `actions[<i>].delivery` when the contract refuses it (a `read` action declaring `delivery` fails manifest validation, AC58)."
+  - file: core/lifecycle.py
+    description: "Migration (plan P17, platform neutrality AC31): the `close_modules` docstring no longer names the platform module; no behaviour changes."
+  - file: modules/twitch/__init__.py
+    description: "Migration (plan P2): `_declared_chat_write_spec` passes the manifest's `delivery` capability through so the redeclared `chat.write` spec equals the loader's; no other change."
+  - file: tests/test_actions.py
+    description: "Migration (plan P3): executor validation of `image_ref` leases (foreign run, expired, size off by one), `observation_too_large`, `provider_not_ready` for a not-ready binding, synthetic observations without parts."
+  - file: tests/test_admission.py
+    description: "Migration (plan P4): the stale-drop hook is called exactly once per stale item with `(work, session_key, remaining)`; a raising hook leaves the record intact; the existing constructors run unchanged without it."
+  - file: tests/test_contracts.py
+    description: "Migration (plan P1, P2): AC21 part validation (`text` bound, the seven `image_ref` fields, unknown part type), the `delivery` capability on `ActionSpec` (accepted on writes, refused on reads, part of equality)."
+  - file: tests/test_integration.py
+    description: "Migration (plan P9): the `brain:` settings block of the integration suite carries the phase 1 keys with the acted defaults; no assertion changes."
+  - file: tests/test_loader.py
+    description: "Migration (plan P2, P8): `delivery` on a `read` action refused at manifest validation naming the action; discovery and activation of the two fixture modules under `tests/fixtures/modules`."
+  - file: tests/test_main.py
+    description: "Migration (plan P5, P6, P9): `modules_directory: builtin` resolution, `--check-config` exit codes and diagnostics, the packaging declarations of `pyproject.toml`, the `brain:` block with the phase 1 keys."
+  - file: tests/test_shutdown.py
+    description: "Migration (plan P9): the `brain:` settings block carries the phase 1 keys; no assertion changes."
+  - file: tests/test_triggers.py
+    description: "Migration (plan P7): one added case proving the trigger engine `runtime_context` builds draws from the injected `rng` (AC3 through the shared fixture); no assertion changes."
+  - file: tests/test_twitch.py
+    description: "Migration (plan P2): the manifest test asserts the `delivery` capability of `chat.write` and everything else unchanged."
 ---
 
 # Phase 1 — Agentic text + image vertical, local and remote
@@ -213,6 +239,38 @@ Each is a **contract**, not a mechanism; the plan chooses the code.
 - Tests never use a positive-duration sleep: clock, RNG, sleepers and
   transports are injected (enforced by a whole-suite grep, R8).
 - An uncertain external outcome is never memorised as a confirmed send.
+
+### Target list and permitted scope
+
+The `targets` list of the front matter is the complete set of repository
+files this phase creates or modifies: every listed file is touched by the
+branch, and no file outside it is — with the single exception below. The
+plan's `Files:` lines are a subset of it: a step may edit only files the
+list names (the review gate compares `git diff --name-only <base>..HEAD`
+against the list, and `tests/test_hygiene.py` checks the plan against it).
+
+**Permitted scope beyond the target list.** The campaign's own directory,
+`docs/campaigns/phase1/` — its authority documents (`brief.md`, `spec.md`,
+`plan.md`, `README.md`) and its scaffolding (`scaffolding/`: the generated
+step specs, gate prompts and gate reports, the runner scripts, its
+`.gitignore`) — may change at any step: it records the campaign, it is not
+the product. Nothing under it is runtime code, a test, a profile or
+packaging. Plan steps that name the repository-root `spec.md` / `plan.md`
+(P23, P24) are redirected to this directory by the step generator: the root
+`spec.md` and `plan.md` are the frozen v1 MVP documents and
+`docs/design-v2.md` is the design authority; none of the three is modified
+by this phase.
+
+**Reconciliation (v1.3, gate finding F5).** The v1.2 list named the new and
+rewritten files only; the plan then explicitly scheduled migrations of
+existing files it depends on (P2 `core/loader.py`, `modules/twitch/__init__.py`;
+P3 `core/attachments.py`; P4/P5/P6/P9 the existing test suites), and two
+further edits landed without a plan line (`core/lifecycle.py`, a docstring,
+under P17's platform-neutrality check; `tests/test_triggers.py`, one added
+case, under P7's shared fixture). Every one of them is now a target,
+described as a migration and attributed to its step; none is reverted.
+`tests/test_lifecycle.py` and `tests/test_retention.py`, which P9 lists,
+needed no edit and are not targets.
 
 ## Requirements
 

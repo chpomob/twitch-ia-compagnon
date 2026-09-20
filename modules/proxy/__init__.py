@@ -66,9 +66,19 @@ header and its payload invalidates the header, so a late upload can never
 recreate a lease after the run's cleanup. An
 ``image_ref`` part of the observation names the agent's acknowledged
 ``attachment_id``; it is rewritten to the store's own reference before the
-executor validates the lease, so an id that was never acknowledged reaches
-the executor unchanged and is refused ``invalid_result`` there. No observation
-carries a filesystem path or a payload.
+executor validates the lease. An id this session never acknowledged — or
+acknowledged for another call — is refused at the proxy boundary, as
+§5.5 of the protocol requires: the observation becomes ``error
+attachment_refused`` (``external_unknown`` for a write the agent did not
+say it refused, as for any malformed frame), and whatever that call had
+uploaded is discarded from the store. The translation table itself is
+bound to the calls it serves: an accepted upload is remembered only while
+its call is in flight and its bytes are held by the store — the entry goes
+with the call's terminal outcome, with the run's release or with the
+store's expiry — and at most :data:`MAX_ACKNOWLEDGED_ATTACHMENTS` uploads
+are held per session; one more is refused ``store_full`` and counted in
+:attr:`ProxyModule.saturated_uploads`. No observation carries a filesystem
+path or a payload.
 
 **Drops (AC35, AC36).** On a disconnection — transport close, a ``pong``
 missing ``heartbeat_timeout_seconds`` after a ``ping`` sent every
@@ -126,6 +136,7 @@ from core.contracts import (
     ATTACHMENT_ACK_STORE_FULL,
     ATTACHMENT_ACK_TOO_LARGE,
     ATTACHMENT_ACK_UNEXPECTED_BINARY,
+    BRAIN_ERROR_ATTACHMENT_REFUSED,
     BRAIN_ERROR_INVALID_RESULT,
     FRAME_ATTACHMENT,
     FRAME_ATTACHMENT_ACK,
@@ -182,6 +193,16 @@ DEFAULT_LATE_RESULT_SECONDS = 60.0
 
 MAX_TERMINAL_CALLS = 1024
 """How many terminal call identities are remembered for late observations."""
+
+MAX_ACKNOWLEDGED_ATTACHMENTS = 256
+"""How many accepted uploads a session holds in translation at once.
+
+An entry lives only while the call it was uploaded for is in flight and the
+store still holds its bytes, so the table normally stays at the handful of
+images of the calls in progress; the bound is the ceiling under an agent
+that uploads without ever observing. Reaching it refuses the next upload
+``store_full`` and counts it (gate finding F2).
+"""
 
 CLOSE_GOING_AWAY = 1001
 """The close code the brain sends when it drops a session itself."""
@@ -247,6 +268,15 @@ Sleeper = Callable[[float], Awaitable[None]]
 
 class ProxyModuleError(RuntimeError):
     """A configuration or lifecycle failure of the proxy module."""
+
+
+class _UnacknowledgedReference(Exception):
+    """An ``image_ref`` names an upload the observing call may not name (§5.5)."""
+
+    def __init__(self, attachment_id: str, reason: str) -> None:
+        super().__init__(f"{attachment_id!r} {reason}")
+        self.attachment_id = attachment_id
+        self.reason = reason
 
 
 # --------------------------------------------------------------------------- #
@@ -571,6 +601,20 @@ class _PendingCall:
 
 
 @dataclass(slots=True, eq=False)
+class _Acknowledged:
+    """One accepted upload, held until the observation of its call.
+
+    ``ref`` is the store's reference the agent's ``attachment_id`` translates
+    to; ``owner`` the in-flight call the bytes were leased for. The entry is
+    pruned with that call, with the store's release or expiry of the object,
+    and only an observation of ``owner`` may name it (gate findings F2, F4).
+    """
+
+    ref: Any
+    owner: _PendingCall
+
+
+@dataclass(slots=True, eq=False)
 class _Connection:
     """One accepted WebSocket, paired or not."""
 
@@ -590,8 +634,11 @@ class _Session:
     accepted: frozenset[str]
     next_seq: int = 1
     calls: "OrderedDict[str, _PendingCall]" = field(default_factory=OrderedDict)
-    #: Agent-chosen ``attachment_id`` → the store's reference, once acknowledged.
-    acknowledged: dict[str, Any] = field(default_factory=dict)
+    #: Agent-chosen ``attachment_id`` → its translation entry, while the call
+    #: it was uploaded for is in flight; bounded by
+    #: :data:`MAX_ACKNOWLEDGED_ATTACHMENTS`, pruned on the call's terminal
+    #: outcome and whenever the store no longer holds the object.
+    acknowledged: "OrderedDict[str, _Acknowledged]" = field(default_factory=OrderedDict)
     #: The ``attachment`` header awaiting its one binary frame, with the
     #: in-flight call it belongs to under ``owner`` (``None`` once that call
     #: ended: the payload is then refused, never stored).
@@ -667,6 +714,7 @@ class ProxyModule:
         self._pairings = 0
         self._late_observations = 0
         self._dropped_events = 0
+        self._saturated_uploads = 0
         # Terminal call identities → the instant they became terminal, so a
         # late observation is told apart from an unknown one in the
         # diagnostic; bounded by count and by ``late_result_seconds``.
@@ -691,6 +739,20 @@ class ProxyModule:
         """Allowlisted events the local bus refused to publish."""
 
         return self._dropped_events
+
+    @property
+    def saturated_uploads(self) -> int:
+        """Uploads refused ``store_full`` because the session already held
+        :data:`MAX_ACKNOWLEDGED_ATTACHMENTS` acknowledged, unobserved
+        uploads (gate finding F2)."""
+
+        return self._saturated_uploads
+
+    @property
+    def acknowledged_attachments(self) -> int:
+        """Accepted uploads currently held in translation for the paired agent."""
+
+        return len(self._session.acknowledged) if self._session is not None else 0
 
     @property
     def paired(self) -> bool:
@@ -1300,10 +1362,13 @@ class ProxyModule:
         awaiting its binary frame for that call is detached from it: the
         payload, when it comes, is refused ``unexpected_binary`` rather than
         stored under a run that may already be cleaned up (gate finding F3).
+        The uploads acknowledged for the call leave the translation table
+        with it: no later observation may name them (gate finding F2).
         """
 
         session.calls.pop(call_id, None)
         self._remember_terminal(call_id, self._clock())
+        self._prune_acknowledged(session, call_id=call_id)
         header = session.pending_header
         owner = header["owner"] if header is not None else None
         if owner is not None and owner.call.call_id == call_id:
@@ -1322,6 +1387,31 @@ class ProxyModule:
             else:
                 break
 
+    def _prune_acknowledged(self, session: _Session, *, call_id: str | None = None) -> None:
+        """Forget the translation entries no observation may name any more.
+
+        An entry lives exactly as long as the call it was uploaded for: once
+        that call is terminal — observed, cancelled, timed out, answered by
+        an ``error`` frame — *call_id*'s entries go. Whatever the store no
+        longer holds — released by the run's cleanup, reaped by its
+        time-to-live, discarded by the executor — goes too, whichever call
+        it belonged to, so the table never outlives the leases it translates
+        (gate finding F2). Expiry is judged here, on the shared clock:
+        :meth:`AttachmentStore.lookup` returns a reference past its deadline
+        as stored, without reaping it, and a table full of such entries
+        would otherwise keep refusing uploads ``store_full`` until something
+        else made the store reap.
+        """
+
+        now = self._clock()
+        for attachment_id, entry in tuple(session.acknowledged.items()):
+            if entry.owner.call.call_id == call_id:
+                del session.acknowledged[attachment_id]
+                continue
+            held = self._attachments.lookup(entry.ref.attachment_id)
+            if held is None or now >= held.expires_at:
+                del session.acknowledged[attachment_id]
+
     # -- observations (§5.5, §11) ------------------------------------------- #
 
     async def _on_observation(self, session: _Session, frame: Mapping[str, Any]) -> None:
@@ -1330,8 +1420,15 @@ class ProxyModule:
         if entry is None or entry.future.done():
             self._late_observations += 1
             return
+        # Uploads the store no longer holds (released, reaped, discarded)
+        # are forgotten first, so naming one is refused at the boundary like
+        # any unacknowledged reference; the frame is then translated while
+        # the call's live uploads are still held, and forgetting the call
+        # prunes them from the table.
+        self._prune_acknowledged(session)
+        observation = self._observation_from_frame(session, entry, frame)
         self._forget_call(session, call_id)
-        entry.future.set_result(self._observation_from_frame(session, entry, frame))
+        entry.future.set_result(observation)
 
     def _observation_from_frame(
         self, session: _Session, entry: _PendingCall, frame: Mapping[str, Any]
@@ -1349,7 +1446,29 @@ class ProxyModule:
                 provenance=provenance,
                 result=frame.get("result"),
                 error=frame.get("error"),
-                parts=tuple(self._resolve_part(session, part) for part in parts),
+                parts=tuple(self._resolve_part(session, entry, part) for part in parts),
+            )
+        except _UnacknowledgedReference as refused:
+            # §5.5: an ``image_ref`` naming an upload this session never
+            # acknowledged — or acknowledged for another call — is refused
+            # here, at the boundary, with the brain's ``attachment_refused``;
+            # the executor never sees the reference (gate finding F4). What
+            # the call did upload is discarded at once: nothing will name it.
+            for held in session.acknowledged.values():
+                if held.owner is entry:
+                    self._attachments.discard(held.ref.attachment_id)
+            uncertain = entry.spec.nature == "write" and frame.get("status") != "refused"
+            return ActionObservation(
+                status="external_unknown" if uncertain else "error",
+                provenance=provenance,
+                error={
+                    "code": BRAIN_ERROR_ATTACHMENT_REFUSED,
+                    "message": (
+                        f"observation names attachment {refused.attachment_id!r}, which "
+                        f"{refused.reason}"
+                    ),
+                    "retryable": False,
+                },
             )
         except (ContractError, TypeError, ValueError) as exc:
             # A malformed frame for a write the agent did not say it refused:
@@ -1366,16 +1485,30 @@ class ProxyModule:
                 },
             )
 
-    def _resolve_part(self, session: _Session, part: Any) -> Any:
-        """Rewrite an acknowledged ``image_ref`` to the store's own reference."""
+    def _resolve_part(self, session: _Session, entry: _PendingCall, part: Any) -> Any:
+        """Rewrite an ``image_ref`` acknowledged for *entry* to the store's reference.
+
+        A part that is not an ``image_ref``, or whose ``attachment_id`` is not
+        even text, passes unchanged: the executor's part validation names
+        the malformed field (``invalid_result``). A well-formed identifier
+        this session never acknowledged, or acknowledged for another call,
+        raises :class:`_UnacknowledgedReference` (§5.5, gate finding F4).
+        """
 
         if not isinstance(part, Mapping) or part.get("type") != PART_TYPE_IMAGE_REF:
             return part
-        ref = session.acknowledged.get(part.get("attachment_id"))
-        if ref is None:
+        attachment_id = part.get("attachment_id")
+        if not _is_text(attachment_id):
             return part
+        held = session.acknowledged.get(attachment_id)
+        if held is None:
+            raise _UnacknowledgedReference(attachment_id, "this session never acknowledged")
+        if held.owner is not entry:
+            raise _UnacknowledgedReference(
+                attachment_id, f"was acknowledged for call {held.owner.call.call_id!r}"
+            )
         resolved = dict(part)
-        resolved["attachment_id"] = ref.attachment_id
+        resolved["attachment_id"] = held.ref.attachment_id
         return resolved
 
     def _on_error_frame(self, session: _Session, frame: Mapping[str, Any]) -> None:
@@ -1500,6 +1633,15 @@ class ProxyModule:
         ):
             await self._ack(session, header["attachment_id"], ATTACHMENT_ACK_UNEXPECTED_BINARY)
             return
+        # The translation table is bounded: entries the store no longer
+        # backs are dropped first, then a table still at the bound refuses
+        # the upload — counted, and told to the agent as ``store_full``, the
+        # code for a store that cannot afford another object (gate finding F2).
+        self._prune_acknowledged(session)
+        if len(session.acknowledged) >= MAX_ACKNOWLEDGED_ATTACHMENTS:
+            self._saturated_uploads += 1
+            await self._ack(session, header["attachment_id"], ATTACHMENT_ACK_STORE_FULL)
+            return
         try:
             ref = self._attachments.put(
                 owner.call.run_id, payload, content_type=header["content_type"]
@@ -1515,7 +1657,7 @@ class ProxyModule:
         except Exception:
             await self._ack(session, header["attachment_id"], ATTACHMENT_ACK_STORE_FULL)
             return
-        session.acknowledged[header["attachment_id"]] = ref
+        session.acknowledged[header["attachment_id"]] = _Acknowledged(ref=ref, owner=owner)
         await self._ack(session, header["attachment_id"], None)
 
     async def _ack(self, session: _Session, attachment_id: str | None, code: str | None) -> None:
@@ -2005,6 +2147,7 @@ def _require_runtime_surfaces(context: Any) -> None:
 
 __all__ = [
     "AGENT_STATUS_EVENT",
+    "MAX_ACKNOWLEDGED_ATTACHMENTS",
     "CLOSE_GOING_AWAY",
     "DEFAULT_HEARTBEAT_SECONDS",
     "DEFAULT_HEARTBEAT_TIMEOUT_SECONDS",
