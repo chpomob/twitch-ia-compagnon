@@ -1474,26 +1474,39 @@ async def test_a_bad_image_lease_is_invalid_result_and_releases_the_object(make_
     """AC22, AC47 tail: wrong run, expired, or a size 1 byte off the stored one.
 
     The observation becomes ``error invalid_result``, nothing of the provider's
-    result or parts is adopted, and every object the observation named is
-    released at once: the store holds 0 objects for either run before any
-    model request could carry the image.
+    result or parts is adopted, and every object of *this* run the
+    observation named is released at once: the store holds 0 objects for
+    ``run-1`` before any model request could carry the image.
+
+    An object leased to **another** run is not this run's to release: it
+    stays with its owner, readable, until that run's own cleanup (gate
+    finding F1 — this test used to assert the foreign object was destroyed).
     """
 
     harness, store = _image_harness()
     part = make_part(store, harness.clock)
+    foreign = store.lookup(part["attachment_id"]) if make_part is _leased_to_another_run else None
 
     provider, observation = await _observe(harness, [_text(3), part])
 
     _assert_rejected(observation, ERROR_INVALID_RESULT)
     assert "parts[1]" in observation.error["message"]
     assert len(provider.calls) == 1
-    assert store.object_count == 0
     assert store.usage("run-1").objects == 0
-    assert store.usage("run-2").objects == 0
-    assert store.total_bytes == 0
-    # Idempotent with the run-end release: nothing is freed twice.
+    # Idempotent with the run-end release: nothing of run-1 is freed twice.
     assert store.release("run-1").objects == 0
-    assert store.release("run-2").objects == 0
+    if foreign is None:
+        assert store.object_count == 0
+        assert store.total_bytes == 0
+        assert store.usage("run-2").objects == 0
+    else:
+        assert store.lookup(foreign.attachment_id) == foreign
+        assert store.get(foreign) == b"\x00" * 64
+        assert store.usage("run-2").objects == 1
+        assert store.object_count == 1
+        # The owner's own cleanup is what releases it.
+        assert store.release("run-2").objects == 1
+    assert store.object_count == 0
     completed = harness.bus.of_type(TRACE_ACTION_COMPLETED)
     assert [(p["status"], p["error_code"]) for p in completed] == [("error", "invalid_result")]
 
@@ -1520,20 +1533,25 @@ async def test_one_bad_lease_rejects_the_whole_observation_and_releases_every_im
     """R4 invariant: no partially adopted observation.
 
     Two images, the first a valid lease of this run, the second leased to
-    another run: the observation is rejected whole and **both** objects are
-    released — the valid one is not kept leased behind an error.
+    another run: the observation is rejected whole and this run's valid
+    object is released — not kept leased behind an error. The other run's
+    object is not this run's to release: it stays readable for its owner
+    (gate finding F1 — this test used to assert it was destroyed too).
     """
 
     harness, store = _image_harness()
     mine = store.put("run-1", b"\x00" * 64, content_type="image/png")
-    theirs = store.put("run-2", b"\x00" * 64, content_type="image/jpeg")
+    theirs = store.put("run-2", b"\x01" * 64, content_type="image/jpeg")
 
     _provider, observation = await _observe(harness, [_image_ref(mine), _image_ref(theirs)])
 
     _assert_rejected(observation, ERROR_INVALID_RESULT)
     assert store.lookup(mine.attachment_id) is None
-    assert store.lookup(theirs.attachment_id) is None
-    assert store.object_count == 0
+    assert store.usage("run-1").objects == 0
+    assert store.lookup(theirs.attachment_id) == theirs
+    assert store.get(theirs) == b"\x01" * 64
+    assert store.usage("run-2").objects == 1
+    assert store.object_count == 1
 
 
 @pytest.mark.parametrize("status", ["error", "timeout", "cancelled", "refused"])
@@ -1546,7 +1564,10 @@ async def test_every_terminal_status_has_its_image_leases_validated(status):
     _provider, observation = await _observe(harness, [_image_ref(foreign)], status=status)
 
     _assert_rejected(observation, ERROR_INVALID_RESULT)
-    assert store.object_count == 0
+    # Refused, not destroyed: the object belongs to run-2 (gate finding F1).
+    assert store.lookup(foreign.attachment_id) == foreign
+    assert store.usage("run-2").objects == 1
+    assert store.usage("run-1").objects == 0
 
 
 async def test_a_non_success_observation_with_a_valid_image_is_adopted_as_it_stands():
@@ -1635,7 +1656,9 @@ async def test_without_a_bound_only_the_leases_are_checked():
     foreign = store.put("run-2", b"\x00" * 64, content_type="image/png")
     _provider, rejected = await _observe(harness, [_image_ref(foreign)])
     _assert_rejected(rejected, ERROR_INVALID_RESULT)
-    assert store.lookup(foreign.attachment_id) is None
+    # run-2's object stays with run-2 (gate finding F1).
+    assert store.lookup(foreign.attachment_id) == foreign
+    assert store.usage("run-1").objects == 1
 
 
 async def test_an_image_ref_without_a_store_cannot_be_validated_and_is_invalid_result():
@@ -1725,9 +1748,10 @@ async def test_rejected_parts_do_not_erase_the_uncertainty_of_an_emitted_write(s
 
     The provider signalled an emission, then returned ``timeout`` (or
     ``cancelled``) carrying an image leased to another run. The parts are
-    rejected and the foreign object released, but the terminal status stays
-    ``external_unknown`` — as it would have with sound parts — never
-    ``error``, which a caller would read as licence to send again.
+    rejected — the foreign object left to its owner (gate finding F1) —
+    but the terminal status stays ``external_unknown`` — as it would have
+    with sound parts — never ``error``, which a caller would read as
+    licence to send again.
     """
 
     harness, store = _writer_with_images()
@@ -1744,7 +1768,8 @@ async def test_rejected_parts_do_not_erase_the_uncertainty_of_an_emitted_write(s
     # The rejection is still on record, inside the message.
     assert ERROR_INVALID_RESULT in observation.error["message"]
     assert "run-2" in observation.error["message"]
-    assert store.lookup(foreign.attachment_id) is None
+    assert store.lookup(foreign.attachment_id) == foreign
+    assert store.usage("run-2").objects == 1
     assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
     completed = harness.bus.of_type(TRACE_ACTION_COMPLETED)
     assert [(p["status"], p["error_code"]) for p in completed] == [
@@ -1764,7 +1789,8 @@ async def test_a_silent_write_interrupted_with_bad_parts_is_still_external_unkno
     assert observation.status == "external_unknown"
     assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
     assert observation.parts == ()
-    assert store.lookup(foreign.attachment_id) is None
+    # The foreign object is refused, not destroyed (gate finding F1).
+    assert store.lookup(foreign.attachment_id) == foreign
 
 
 async def test_a_read_interrupted_with_bad_parts_is_a_certain_error():
@@ -1777,7 +1803,8 @@ async def test_a_read_interrupted_with_bad_parts_is_a_certain_error():
     observation = await harness.executor.invoke(make_call(READ_SPEC))
 
     _assert_rejected(observation, ERROR_INVALID_RESULT)
-    assert store.lookup(foreign.attachment_id) is None
+    # The foreign object is refused, not destroyed (gate finding F1).
+    assert store.lookup(foreign.attachment_id) == foreign
     assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
 
 

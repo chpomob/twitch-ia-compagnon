@@ -1441,7 +1441,7 @@ class ActionExecutor:
             # possibly-sent write past the uncertainty barrier.
             status, code = _uncertain_status(invocation.emission, spec, observation.status)
             if status != observation.status:
-                self._discard_images(observation.parts)
+                self._discard_images(call.run_id, observation.parts)
                 return await self._terminate(
                     call, binding, started_at, status,
                     code=code,
@@ -1475,7 +1475,8 @@ class ActionExecutor:
     ) -> ActionObservation:
         """Replace a provider observation the executor cannot adopt.
 
-        The images it named are discarded and none of its parts survive.
+        The images of its own run it named are discarded (another run's
+        stay with their owner) and none of its parts survive.
         Its *status*, though, is not simply ``error``: a rejection says the
         observation is unusable, not that the effect did not happen. An
         interruption the provider reported (``timeout``, ``cancelled``) is
@@ -1489,7 +1490,7 @@ class ActionExecutor:
         the rejection is kept in the message either way.
         """
 
-        self._discard_images(observation.parts)
+        self._discard_images(call.run_id, observation.parts)
         status = "error"
         if observation.status in ("timeout", "cancelled"):
             status, _ = _uncertain_status(invocation.emission, spec, observation.status)
@@ -1600,17 +1601,21 @@ class ActionExecutor:
                 )
         return None
 
-    def _discard_images(self, parts: Sequence[Mapping[str, Any]]) -> None:
-        """Drop from the store every attachment the rejected *parts* name.
+    def _discard_images(self, run_id: str, parts: Sequence[Mapping[str, Any]]) -> None:
+        """Drop from the store every attachment of *run_id* the rejected *parts* name.
 
         A rejected observation adopts nothing, so an image it named would
         otherwise stay leased until the run's terminal record releases it.
         Discarding is idempotent with that release — the store drops an
         object exactly once — and an identifier the store does not hold is
-        a no-op, so a lease that was already unknown costs nothing here. The
-        identifiers are unguessable, so any one a provider names is one the
-        store handed out: dropping it prevents a leak, never reaches bytes
-        the provider was not given.
+        a no-op, so a lease that was already unknown costs nothing here.
+
+        Only the rejecting call's own run is cleaned. An ``image_ref`` leased
+        to *another* run is exactly what the validation refused, and that
+        run may still need the bytes for its next model turn: dropping them
+        here would let one run's invalid observation destroy an unrelated
+        run's image (gate finding F1). The foreign object stays with its
+        owner, whose own cleanup releases it.
         """
 
         if self._attachments is None:
@@ -1618,7 +1623,10 @@ class ActionExecutor:
         for part in parts:
             if isinstance(part, Mapping) and part.get("type") == PART_TYPE_IMAGE_REF:
                 attachment_id = part.get("attachment_id")
-                if isinstance(attachment_id, str) and attachment_id.strip():
+                if not isinstance(attachment_id, str) or not attachment_id.strip():
+                    continue
+                ref = self._attachments.lookup(attachment_id)
+                if ref is not None and ref.run_id == run_id:
                     self._attachments.discard(attachment_id)
 
     async def _terminate_uncertain(

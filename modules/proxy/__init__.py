@@ -57,7 +57,13 @@ sends an ``attachment`` header then exactly one binary frame; the bytes are
 stored through ``context.attachments.put`` under the run of the call in
 flight — the one the header's optional ``call_id`` names, else the most
 recently issued — and acknowledged ``accepted`` or refused
-``attachment_too_large`` / ``store_full`` / ``unexpected_binary``. An
+``attachment_too_large`` / ``store_full`` / ``unexpected_binary``. The
+upload is bound to that call: a ``call_id`` naming a call that is unknown
+or already terminal is refused ``unexpected_binary`` (never charged to
+another call in flight), and the binary frame is stored only if its call
+is still in flight when the frame arrives — a call ending between the
+header and its payload invalidates the header, so a late upload can never
+recreate a lease after the run's cleanup. An
 ``image_ref`` part of the observation names the agent's acknowledged
 ``attachment_id``; it is rewritten to the store's own reference before the
 executor validates the lease, so an id that was never acknowledged reaches
@@ -586,7 +592,9 @@ class _Session:
     calls: "OrderedDict[str, _PendingCall]" = field(default_factory=OrderedDict)
     #: Agent-chosen ``attachment_id`` → the store's reference, once acknowledged.
     acknowledged: dict[str, Any] = field(default_factory=dict)
-    #: The ``attachment`` header awaiting its one binary frame.
+    #: The ``attachment`` header awaiting its one binary frame, with the
+    #: in-flight call it belongs to under ``owner`` (``None`` once that call
+    #: ended: the payload is then refused, never stored).
     pending_header: dict[str, Any] | None = None
     heartbeat_task: "asyncio.Task[None] | None" = None
     awaiting_pong: bool = False
@@ -1248,15 +1256,13 @@ class ProxyModule:
         try:
             await self._send(session.connection, frame)
         except asyncio.CancelledError:
-            session.calls.pop(call.call_id, None)
-            self._remember_terminal(call.call_id, self._clock())
+            self._forget_call(session, call.call_id)
             raise
         except Exception:
             # The transport refused the frame: the call is in flight from the
             # executor's point of view and is classified by nature, the
             # conservative side for a write whose bytes may have left.
-            session.calls.pop(call.call_id, None)
-            self._remember_terminal(call.call_id, self._clock())
+            self._forget_call(session, call.call_id)
             return self._disconnected_observation(session, entry)
         if spec.nature == "write":
             invocation.mark_emitted()
@@ -1267,8 +1273,7 @@ class ProxyModule:
             # Run cancellation or deadline: the executor classifies; tell the
             # agent best-effort and forget the call (a later observation is
             # late, AC36).
-            session.calls.pop(call.call_id, None)
-            self._remember_terminal(call.call_id, self._clock())
+            self._forget_call(session, call.call_id)
             if not session.closed:
                 try:
                     await self._send(session.connection, {"type": FRAME_CANCEL, "id": call.call_id})
@@ -1287,6 +1292,24 @@ class ProxyModule:
             "session_id": session.session_id,
             "seq": seq,
         }
+
+    def _forget_call(self, session: _Session, call_id: str) -> None:
+        """Take *call_id* out of flight on *session*.
+
+        The call is remembered terminal, and an ``attachment`` header still
+        awaiting its binary frame for that call is detached from it: the
+        payload, when it comes, is refused ``unexpected_binary`` rather than
+        stored under a run that may already be cleaned up (gate finding F3).
+        """
+
+        session.calls.pop(call_id, None)
+        self._remember_terminal(call_id, self._clock())
+        header = session.pending_header
+        owner = header["owner"] if header is not None else None
+        if owner is not None and owner.call.call_id == call_id:
+            # The header stays, so the refusal names its attachment; it
+            # simply no longer belongs to any call.
+            header["owner"] = None
 
     def _remember_terminal(self, call_id: str, now: float) -> None:
         self._terminal[call_id] = now
@@ -1307,8 +1330,7 @@ class ProxyModule:
         if entry is None or entry.future.done():
             self._late_observations += 1
             return
-        session.calls.pop(call_id, None)
-        self._remember_terminal(call_id, self._clock())
+        self._forget_call(session, call_id)
         entry.future.set_result(self._observation_from_frame(session, entry, frame))
 
     def _observation_from_frame(
@@ -1368,8 +1390,7 @@ class ProxyModule:
         entry = session.calls.get(call_id) if isinstance(call_id, str) else None
         if entry is None or entry.future.done():
             return
-        session.calls.pop(call_id, None)
-        self._remember_terminal(call_id, self._clock())
+        self._forget_call(session, call_id)
         code = frame.get("code")
         retryable = frame.get("retryable")
         entry.future.set_result(
@@ -1405,27 +1426,41 @@ class ProxyModule:
         if size > self._settings.binary_bound:
             await self._ack(session, attachment_id, ATTACHMENT_ACK_TOO_LARGE)
             return
-        call_id = frame.get("call_id")
-        run_id = self._run_for_attachment(session, call_id)
-        if run_id is None:
+        owner = self._call_for_attachment(session, frame.get("call_id"))
+        if owner is None:
             await self._ack(session, attachment_id, ATTACHMENT_ACK_UNEXPECTED_BINARY)
             return
+        # The header keeps the *call* it belongs to, not only its run: the
+        # binary frame is stored only if that same call is still in flight
+        # when it arrives (gate finding F3).
         session.pending_header = {
             "attachment_id": attachment_id,
             "content_type": content_type,
             "size": size,
-            "run_id": run_id,
+            "owner": owner,
         }
 
-    def _run_for_attachment(self, session: _Session, call_id: Any) -> str | None:
-        """The run an attachment is leased to: the named call's, else the latest's."""
+    def _call_for_attachment(self, session: _Session, call_id: Any) -> _PendingCall | None:
+        """The in-flight call an attachment belongs to, or ``None`` to refuse it.
 
-        if isinstance(call_id, str) and call_id in session.calls:
-            return session.calls[call_id].call.run_id
-        if not session.calls:
+        A header naming a ``call_id`` is bound to that call and to nothing
+        else: a call that is unknown, already terminal (observed, cancelled,
+        timed out, dropped) or named by a malformed field is refused, never
+        replaced by whatever call happens to be in flight — a delayed upload
+        for a finished run must not be charged to an unrelated one (gate
+        finding F3). A header naming no call goes to the most recently
+        issued call still in flight.
+        """
+
+        if call_id is not None:
+            entry = session.calls.get(call_id) if isinstance(call_id, str) else None
+            if entry is None or entry.future.done():
+                return None
+            return entry
+        live = [entry for entry in session.calls.values() if not entry.future.done()]
+        if not live:
             return None
-        latest = max(session.calls.values(), key=lambda entry: entry.seq)
-        return latest.call.run_id
+        return max(live, key=lambda entry: entry.seq)
 
     async def _on_binary(self, connection: _Connection, data: Any) -> None:
         session = connection.session
@@ -1452,9 +1487,22 @@ class ProxyModule:
                 ATTACHMENT_ACK_UNEXPECTED_BINARY,
             )
             return
+        # Ownership is judged again here, at the moment the bytes would be
+        # stored: the call the header named may have ended between the two
+        # frames (cancelled, timed out, observed), and its run's cleanup may
+        # already have released the store — a lease created now would
+        # outlive every cleanup (gate finding F3).
+        owner = header["owner"]
+        if (
+            owner is None
+            or session.calls.get(owner.call.call_id) is not owner
+            or owner.future.done()
+        ):
+            await self._ack(session, header["attachment_id"], ATTACHMENT_ACK_UNEXPECTED_BINARY)
+            return
         try:
             ref = self._attachments.put(
-                header["run_id"], payload, content_type=header["content_type"]
+                owner.call.run_id, payload, content_type=header["content_type"]
             )
         except AttachmentRefused as refused:
             code = (

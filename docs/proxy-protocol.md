@@ -189,6 +189,7 @@ the observation it returns, if any. The brain never waits for an answer.
 | `attachment_id` | non-empty string | Agent-chosen identifier, unique within the session. |
 | `content_type`  | string           | One of `IMAGE_CONTENT_TYPES` (`image/png`, `image/jpeg`). |
 | `size`          | positive integer | Exact byte length of the binary frame that follows. |
+| `call_id`       | string, optional | The in-flight `call` the upload belongs to (§10). Absent: the most recently issued call still in flight. |
 
 Followed by **exactly one binary frame** of `size` bytes (§10).
 
@@ -374,7 +375,17 @@ part. A transfer is exactly three steps (AC33):
 Only an acknowledged `attachment_id` may appear in an `image_ref` part of a
 later `observation` (§5.5). Stored bytes belong to the run named by the call
 in flight and follow the store's lease and retention: they are released with
-the run's cleanup exactly like a local provider's attachments. The agent
+the run's cleanup exactly like a local provider's attachments.
+
+**Call identity.** An upload is bound to exactly one call: the one the
+header's `call_id` names, else the most recently issued call still in flight.
+A header whose `call_id` names a call that is unknown or already terminal
+(observed, cancelled, timed out, resolved on a drop) is refused
+`unexpected_binary` on the header alone — it is never charged to another call
+in flight. The binding is checked again when the binary frame arrives: a call
+that ended between the header and its payload invalidates the header, and the
+payload is refused `unexpected_binary` and discarded, so a late upload never
+creates a lease after its run's cleanup. The agent
 transfers before sending the `observation`, so a refused transfer lets it
 return an `error` observation (`attachment_refused`) instead of a dangling
 reference. Attachments are never retransmitted after a drop (§11).

@@ -1950,6 +1950,170 @@ async def test_an_attachment_is_leased_to_the_run_of_the_call_the_header_names()
         await brain.close()
 
 
+async def test_a_binary_frame_for_a_call_cancelled_after_its_header_is_refused_and_leases_nothing() -> None:
+    """Gate finding F3, interleaving 1: the header is accepted for run A;
+    A is cancelled, its terminal record published and its store usage
+    released; only then does the binary frame arrive. The payload is
+    refused ``unexpected_binary`` naming the header's attachment and no
+    object is stored — a lease created now would belong to a run whose
+    cleanup has already happened, and nothing would ever release it."""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        task = asyncio.create_task(
+            brain.executor.invoke(capture_call("c-a", run_id="run-A", deadline=brain.clock() + 30))
+        )
+        call = await agent.call_frame()
+        assert call["call_id"] == "c-a"
+
+        # The header alone: accepted for c-a, awaiting its payload.
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "late",
+            "content_type": "image/png", "size": 8, "call_id": "c-a",
+        })
+        await settle()
+        pending = module._session.pending_header  # type: ignore[union-attr]
+        assert pending is not None and pending["attachment_id"] == "late"
+        assert pending["owner"].call.call_id == "c-a"
+
+        # Run A is cancelled: the executor records the terminal outcome, the
+        # brain tells the agent, and the run's cleanup releases its usage.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert (await agent.frame()) == {"v": 1, "type": FRAME_CANCEL, "id": "c-a"}
+        recorded = brain.executor.outcome("c-a")
+        assert recorded is not None and recorded.status == "cancelled"
+        assert brain.store.release("run-A").objects == 0
+        assert module.in_flight == ()
+
+        # The delayed payload: refused, and nothing is leased to anyone.
+        await agent.send_bytes(b"\x00" * 8)
+        ack = await agent.frame()
+        assert ack["type"] == FRAME_ATTACHMENT_ACK and ack["accepted"] is False
+        assert ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY and ack["attachment_id"] == "late"
+        assert brain.store.object_count == 0
+        assert brain.store.usage("run-A").objects == 0
+        assert brain.store.live_runs() == ()
+        assert brain.store.release("run-A").objects == 0
+        assert not agent.ws.closed
+
+        # The session is intact: a fresh call still transfers normally.
+        task = asyncio.create_task(
+            brain.executor.invoke(capture_call("c-b", run_id="run-B", deadline=brain.clock() + 30))
+        )
+        await agent.call_frame()
+        ack = await agent.transfer("fresh", b"\x01" * 8, call_id="c-b")
+        assert ack["accepted"] is True
+        assert brain.store.usage("run-B").objects == 1
+        await agent.observe("c-b", result=capture_result(8), parts=[image_ref("fresh", 8)])
+        assert (await task).status == "success"
+    finally:
+        await brain.close()
+
+
+async def test_a_header_naming_a_terminal_call_is_refused_and_never_charged_to_the_call_in_flight() -> None:
+    """Gate finding F3, interleaving 2: run A's call terminates while run
+    B's call is still in flight; a delayed header explicitly naming A's
+    call is refused ``unexpected_binary`` on the header alone — it is never
+    reassigned to B — and the payload that follows is refused as
+    unannounced. B's usage stays 0 until B's own transfer. (The module
+    used to fall back to the most recent call for any unknown ``call_id``;
+    this test replaces that expectation.)"""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        deadline = brain.clock() + 30
+        first = asyncio.create_task(brain.executor.invoke(capture_call("c-a", run_id="run-A", deadline=deadline)))
+        await agent.call_frame()
+        second = asyncio.create_task(brain.executor.invoke(capture_call("c-b", run_id="run-B", deadline=deadline)))
+        await agent.call_frame()
+
+        # A terminates (observed without an image); B stays in flight.
+        await agent.observe("c-a", status="error", error={"code": "capture_failed", "message": "no frame", "retryable": True})
+        assert (await first).status == "error"
+        assert module.in_flight == ("c-b",)
+
+        # The delayed upload for A: refused on the header, not charged to B.
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "for-a",
+            "content_type": "image/png", "size": 8, "call_id": "c-a",
+        })
+        ack = await agent.frame()
+        assert ack["type"] == FRAME_ATTACHMENT_ACK and ack["accepted"] is False
+        assert ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY and ack["attachment_id"] == "for-a"
+        assert brain.store.usage("run-B").objects == 0
+        assert brain.store.usage("run-A").objects == 0
+        await agent.send_bytes(b"\x0a" * 8)
+        ack = await agent.frame()
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        assert brain.store.object_count == 0
+
+        # A never-issued call is refused the same way, as is a malformed one.
+        for call_id in ("never-issued", 7):
+            await agent.send({
+                "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "stray",
+                "content_type": "image/png", "size": 8, "call_id": call_id,
+            })
+            ack = await agent.frame()
+            assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+            await agent.send_bytes(b"\x00" * 8)
+            ack = await agent.frame()
+            assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        assert brain.store.object_count == 0
+        assert module.in_flight == ("c-b",)
+
+        # B's own upload, naming B, is what B is charged for.
+        ack = await agent.transfer("for-b", b"\x0b" * 8, call_id="c-b")
+        assert ack["accepted"] is True
+        assert brain.store.usage("run-B").objects == 1
+        await agent.observe("c-b", result=capture_result(8), parts=[image_ref("for-b", 8)])
+        observation = await second
+        assert observation.status == "success"
+        (part,) = observation.parts
+        assert brain.store.lookup(part["attachment_id"]).run_id == "run-B"
+    finally:
+        await brain.close()
+
+
+async def test_a_binary_frame_for_a_call_observed_between_header_and_payload_is_refused() -> None:
+    """Gate finding F3: the owning call may end between the two frames by
+    its own ``observation`` too — the header is invalidated with the call
+    and the payload refused, whatever ended the call."""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-a", run_id="run-A", deadline=brain.clock() + 30)))
+        await agent.call_frame()
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "orphan",
+            "content_type": "image/png", "size": 8, "call_id": "c-a",
+        })
+        await agent.observe("c-a", status="error", error={"code": "capture_failed", "message": "gave up", "retryable": True})
+        assert (await task).status == "error"
+        await agent.send_bytes(b"\x00" * 8)
+        ack = await agent.frame()
+        assert ack["type"] == FRAME_ATTACHMENT_ACK and ack["accepted"] is False
+        assert ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY and ack["attachment_id"] == "orphan"
+        assert brain.store.object_count == 0
+        assert brain.store.release("run-A").objects == 0
+    finally:
+        await brain.close()
+
+
 async def test_a_malformed_observation_frame_is_invalid_result_and_uncertain_for_a_write() -> None:
     brain = Brain()
     try:

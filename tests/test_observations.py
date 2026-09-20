@@ -385,18 +385,30 @@ async def test_the_shared_context_carries_one_store_for_modules_and_executor() -
 async def test_an_image_leased_to_another_run_is_invalid_result_through_the_context() -> None:
     """AC22 through the shared fixture: leased to another run, or expired on
     the injected clock, the observation is ``invalid_result`` and the store
-    holds 0 objects before any model request could carry the image.
+    holds 0 objects of the rejecting run before any model request could
+    carry the image.
+
+    The object leased to the other run is refused, not destroyed: its
+    owner may still need it for its next model turn, and only that run's
+    own cleanup releases it (gate finding F1 — this test used to assert
+    the whole store became empty).
     """
 
     context, clock, store, provider = _context_with_store()
 
-    foreign = store.put("run-2", b"\x00" * 256, content_type="image/png")
+    foreign = store.put("run-2", b"\x7f" * 256, content_type="image/png")
     provider.scripted.append([_image_part(foreign)])
     rejected = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
     assert rejected.status == "error"
     assert rejected.error["code"] == ERROR_INVALID_RESULT
     assert rejected.parts == ()
     assert rejected.result is None
+    assert store.usage("run-1").objects == 0
+    assert store.lookup(foreign.attachment_id) == foreign
+    assert store.get(foreign) == b"\x7f" * 256
+    assert store.usage("run-2").objects == 1
+    # The owner's cleanup is what releases it.
+    assert store.release("run-2").objects == 1
     assert store.object_count == 0
 
     stale = store.put("run-1", b"\x00" * 256, content_type="image/png")
@@ -505,8 +517,12 @@ async def test_a_foreign_lease_is_invalid_result_for_the_model_and_the_run_goes_
     """AC22 through the brain: a capture returning an ``image_ref`` leased to
     another run is ``invalid_result`` at the executor; the model receives
     that error observation, the request that follows carries 0 image
-    parts, the foreign object is discarded and the run ends ``success``
-    on the scripted final response."""
+    parts and the run ends ``success`` on the scripted final response.
+
+    The foreign object is refused, not discarded: it stays leased to its
+    owner with its bytes readable, and this run's cleanup releases nothing
+    of it (gate finding F1 — this test used to assert the store was empty
+    and the owner's usage 0)."""
 
     harness = await activate_loop(tool_call(SCREEN_CAPTURE, {}), final("Nothing to see."))
     harness.capture.lease_run = "another-run"
@@ -520,9 +536,16 @@ async def test_a_foreign_lease_is_invalid_result_for_the_model_and_the_run_goes_
         (result,) = tool_messages(harness.requests()[1])
         assert observation_envelope(result) == {"status": "error", "error": {"code": ERROR_INVALID_RESULT}}
         assert image_parts(harness.requests()[1]) == []
-        assert harness.store.object_count == 0
-        assert harness.store.usage("another-run").objects == 0
         assert harness.observations()[0]["parts"] == []
+        # The run that rejected holds nothing; the owner keeps its image.
+        assert harness.store.usage(record.run_id).objects == 0
+        (foreign,) = harness.capture.refs
+        assert foreign.run_id == "another-run"
+        assert harness.store.lookup(foreign.attachment_id) == foreign
+        assert harness.store.get(foreign) == harness.capture.data
+        assert harness.store.usage("another-run").objects == 1
+        assert harness.store.object_count == 1
+        assert harness.store.release("another-run").objects == 1
     finally:
         await harness.close()
 
