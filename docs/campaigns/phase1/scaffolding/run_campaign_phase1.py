@@ -49,10 +49,13 @@ REFRESH = os.path.expanduser(
 CREDS = os.path.expanduser("~/.claude/.credentials.json")
 CAMPAIGN_LOG = CAMPAIGN / "campaign.log"
 SUMMARY = CAMPAIGN / "campaign-summary.md"
-GATE_PROMPT_1 = CAMPAIGN / "gate-prompt-1.md"
+GATE_PROMPT = CAMPAIGN / os.environ.get("GATE_PROMPT", "gate-prompt-1.md")
+GATE_REPORT = CAMPAIGN / os.environ.get("GATE_REPORT", "gate-report-1.md")
 
 TEST_CMD = ".venv/bin/python -m pytest tests/ -q -p no:cacheprovider"
-STEP_IDS = [f"P{i}" for i in range(1, 24)]        # P24 is the standalone full-branch gate
+# Fix rounds (gate findings) are appended after the plan's steps, e.g. EXTRA_STEPS=P24F1,P24F2
+STEP_IDS = [f"P{i}" for i in range(1, 24)] + [
+    s.strip() for s in os.environ.get("EXTRA_STEPS", "").split(",") if s.strip()]
 DEV_CLAUDE_TUI = f"python3 {CLAUDE} --timeout 2700 --hard-timeout 3900 --cwd {REPO}"
 DEV_GLM = "pi -p --provider zai --model glm-5.3 --thinking high"
 CLAUDE_LOOP_TIMEOUT = 4800
@@ -245,13 +248,18 @@ def run_gate(deadline):
     if not wait_for_codex(deadline):
         return "unavailable", None
     log("gate: running the Codex full-branch review")
-    r = sh(f'codex exec --sandbox workspace-write "$(cat {GATE_PROMPT_1})"', cwd=REPO, timeout=10800)
-    (LOGS / "gate-1.log").write_text((r.stdout or "") + (r.stderr or ""), encoding="utf-8")
-    report = CAMPAIGN / "gate-report-1.md"
+    r = sh(f'codex exec --sandbox workspace-write "$(cat {GATE_PROMPT})"', cwd=REPO, timeout=10800)
+    (LOGS / f"{GATE_REPORT.stem}.log").write_text((r.stdout or "") + (r.stderr or ""), encoding="utf-8")
+    report = GATE_REPORT
     verdict = ""
     if report.exists():
         m = re.search(r"\*\*VERDICT:\s*(APPROVE|REQUEST_CHANGES|REJECT)",
                       report.read_text(encoding="utf-8"))
+        verdict = m.group(1) if m else ""
+    if not verdict:
+        # Codex sometimes answers inline instead of writing the file: fall back to the captured log.
+        m = re.search(r"\*\*VERDICT:\s*(APPROVE|REQUEST_CHANGES|REJECT)",
+                      (LOGS / f"{GATE_REPORT.stem}.log").read_text(encoding="utf-8"))
         verdict = m.group(1) if m else ""
     return verdict or "unparsed", report
 
