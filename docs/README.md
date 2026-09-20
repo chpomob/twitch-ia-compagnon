@@ -22,6 +22,13 @@ ne réécrit ni les verdicts ni les livraisons ci-dessous. Pour distinguer les
 deux vocabulaires, cet index préfixe toujours les identifiants : « v1 R4 »
 désigne la spec historique, « phase 0 R6 » la spec de la phase 0.
 
+La phase 1 (spec `phase1-agentic` v1.2, exigences R1–R8 et AC1–AC58) ne
+remplace de la phase 0 que ce que son allowlist nomme. La section
+[Versionnement de la spec phase 0 (phase 1)](#versionnement-de-la-spec-phase-0-phase-1)
+l'enregistre de la même manière, et la section
+[Essai de topologie de la phase 1](#essai-de-topologie-de-la-phase-1-phase-1-topology-trial)
+consigne l'essai PC/serveur exigé avant de décrire cette topologie comme livrée.
+
 ## Étapes, livraisons et preuves
 
 « Livraison » désigne ici le commit historique de l'étape, sans présumer sa
@@ -157,6 +164,80 @@ branche à partir de `b9e08da` (P22) : **636 passed**. Comme pour la re-validati
 de `c0632b7` plus haut, cela valide l'exécution de la suite telle qu'elle existe
 sur la branche ; cela ne constitue pas la revue de branche P24, ni un essai avec
 les services réels, et ne modifie pas les verdicts historiques de P1–P8.
+
+## Versionnement de la spec phase 0 (phase 1)
+
+La phase 1 (branche `feat(phase1)`, commits `7a08d6c` à `be9e539` pour P1–P22,
+spec `phase1-agentic` v1.2 archivée dans
+[campaigns/phase1/spec.md](campaigns/phase1/spec.md), plan dans
+[campaigns/phase1/plan.md](campaigns/phase1/plan.md), issue de
+[design-v2.md](design-v2.md) §3.1–3.4, §4.1–4.4 et §6) ne remplace rien de la
+phase 0 **sauf ce que son allowlist nomme** : quatre tests. Cette section
+enregistre, comme la précédente, **ce qui change et par quoi**, pas une
+nouvelle conformité : les verdicts, livraisons et limites des sections
+précédentes restent valables pour les états qu'elles citent. Les exigences de
+la phase 0 non citées ici restent en vigueur telles quelles (admission bornée,
+cycle de vie par phases, statut terminal explicite des actions, autorisation
+par défaut-refus lectures comprises, rétention bornée, délai global unique de
+démarrage/arrêt, redaction des secrets configurés) ; les adaptations du
+harnais que la spec de phase 1 liste comme « non allowlistées » (réponse à la
+sonde de capacités, forme des requêtes par outils) conservent leur garantie et
+ne sont pas versionnées. La revue de branche P24 n'est pas consignée par cet
+index. Vocabulaire : « phase 0 R5 » désigne la spec `phase0-foundation`,
+« phase 1 R1 » la spec `phase1-agentic`.
+
+### Exigences phase 0 remplacées
+
+| Spec phase 0 | Ce que la phase 0 exigeait | Remplacée par (phase 1) | Ce qui change | Tests de l'allowlist concernés |
+| --- | --- | --- | --- | --- |
+| Phase 0 R5 (livraison par le brain) | Au plus un appel modèle par travail admis ; le contexte système offre au modèle la vue **autorisée** du registre d'actions (l'action de livraison `chat.write` comprise, dès qu'elle est accordée) ; la livraison est un appel de l'exécuteur vers l'action codée en dur `DELIVERY_ACTION = "chat.write"` dans `modules/brain/__init__.py`, son statut lu sur le résultat explicite de l'exécuteur. | Phase 1 R1, décision 1, AC1, AC6, AC46 (`7471842`, P10 ; `6054fce`, P11 ; `033303e`, P12 ; `a1f119c`, P13) | Boucle agentique multi-tours : le modèle ne reçoit, **comme outils**, que les actions autorisées de nature `read`, relues à chaque tour ; `chat.write` n'est jamais offert, même accordé (une proposition qui le nomme donne une observation `refused` synthétique, 0 appel exécuteur). La livraison devient une **étape terminale configurée et enfichable** : une liste ordonnée d'actions de livraison (mode `fixed`, ou mode `modules` dérivé des modules activés déclarant une capacité de livraison, avec ordre de préférence), chaque entrée déclarant comment le texte final entre dans ses arguments (argument nommé, ou aucun pour un effet pur), résolue à `prepare`, exécutée une fois et dans l'ordre à la fin du run seulement, un appel exécuteur par entrée ; le modèle ne choisit jamais la livraison et n'exécute aucun effet intermédiaire ; ajouter un module de livraison ne touche pas la boucle. La constante `DELIVERY_ACTION` est supprimée (`6054fce`). Inchangés : défaut-refus de l'exécuteur à chaque appel, statut terminal explicite, route de compatibilité `channel.chat.send`. | `tests/test_brain.py::test_admitted_message_drives_one_configured_request_with_viewer_context`, `tests/test_brain.py::test_request_offers_no_action_without_a_grant_and_reads_the_view_afresh`. |
+| Phase 0 R7 (manifests v2) et v1 R7 reconduit par la phase 0 (exemple de configuration) | `config.yaml.example` active les trois modules MVP `twitch`, `brain`, `audit` et ses règles d'autorisation accordent exactement les actions que leurs manifests déclarent, soit {`chat.write`}. | Phase 1 R7, AC40–AC42 (`71597c4`, P21) | `config.yaml.example` devient le **profil PC** à six modules (`twitch`, `chat_context`, `users`, `capture`, `brain`, `audit`) ; ses règles accordent exactement son ensemble d'actions fournies {`chat.read`, `users.read`, `screen.capture`, `chat.write`}. Deux profils s'ajoutent sur le même `run()` : `config.server.yaml.example` (serveur : `proxy` à la place de `capture`, `screen.capture` fourni par l'allowlist `actions` du proxy et par aucun manifest activé) et `agent.yaml.example` (agent PC : `capture`, `agent_link`, {`screen.capture`}). Les deux profils brain portent le groupe `delivery` en `mode: fixed` avec l'unique entrée `{action: chat.write, text_argument: text}` : leur livraison observable reste un `chat.write` par run. Forme des manifests v2, validation par hook de module, 0 secret littéral et références `${NAME}` : inchangés. | `tests/test_examples.py::test_example_config_is_complete_and_contains_no_literal_credentials`, `tests/test_examples.py::test_example_authorization_grants_exactly_the_actions_the_modules_declare`. |
+
+### Critères d'acceptation phase 0 remplacés
+
+| Critère phase 0 | Remplacé par (phase 1) | Ce qui change | Tests de l'allowlist concernés |
+| --- | --- | --- | --- |
+| Phase 0 AC19 (R5) : 1 message admis → exactement 1 appel modèle, 1 appel exécuteur, 1 requête d'envoi au transport fictif | Phase 1 AC1, AC6, AC46 | Un message admis donne autant de tours modèle que de propositions plus la réponse finale (bornés par les budgets de R3), un appel exécuteur par proposition `read` exécutée **plus** un par entrée de la liste de livraison, et toujours exactement 1 envoi au transport fictif — après la réponse finale, jamais avant. L'unicité de l'envoi externe et l'exclusivité route de compatibilité / exécuteur sont conservées. | Les deux tests `tests/test_brain.py::*` listés sous phase 0 R5. |
+| Phase 0 R5, vue autorisée offerte au modèle (assertion de `tests/test_brain.py` : l'action de livraison accordée figure dans le contexte système) | Phase 1 AC6 | Le contexte système ne contient ni balise `[send:` ni outil `chat.write` ; la vue autorisée offerte est celle des actions `read` seulement, avec leur nom, description et schéma d'arguments comme définitions d'outils. Un grant `chat.write` change la livrabilité, jamais les outils offerts. | Les deux mêmes tests. |
+| v1 AC20 reconduit par la phase 0 : l'exemple active les mêmes trois modules et accorde exactement ce que leurs manifests déclarent | Phase 1 AC42 (et AC40 pour `--check-config`) | Trois fichiers d'exemple, chacun à 0 identifiant littéral, chacun accordant exactement son ensemble d'actions fournies (manifests activés ∪ allowlist `actions` d'un `proxy` activé) ; chacun validé par `--check-config` avec sortie 0 et 0 socket ouvert. | Les deux tests `tests/test_examples.py::*` listés sous phase 0 R7. |
+
+### Allowlist de la spec phase 1 : sort de chaque test
+
+Les 4 entrées de l'allowlist de la spec `phase1-agentic` (section « Test
+failure allowlist ») sont reprises ici avec ce qui leur est arrivé sur la
+branche, avec le même vocabulaire que pour la phase 0 : « réécrit en place »
+conserve le nom, « remplacé par » supprime le test et nomme celui qui porte
+la garantie qui le remplace. Dans les deux cas la docstring cite l'exigence
+de remplacement. Aucune entrée n'a été neutralisée par `skip`, `xfail` ou
+affaiblissement d'assertion.
+
+| # | Test allowlisté (phase 0) | Sort | Test porteur sur la branche | Exigence(s) phase 1 | Commit |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `tests/test_brain.py::test_admitted_message_drives_one_configured_request_with_viewer_context` | Réécrit en place (l'assertion `DELIVERY_ACTION in system` devient : les outils offerts sont la vue `read` autorisée, la livraison jamais offerte) | même nom | R1, AC6, décision 1 | `7471842` (P10), complété par `6054fce` (P11) et `033303e` (P12) |
+| 2 | `tests/test_brain.py::test_request_offers_no_action_without_a_grant_and_reads_the_view_afresh` | Réécrit en place (l'assertion que le grant `chat.write` atteint le prompt devient : un grant `read` atteint les outils du tour suivant, le grant de livraison n'atteint aucune requête) | même nom | R1, AC6, décision 1 | `7471842` (P10), complété par `6054fce` (P11) et `033303e` (P12) |
+| 3 | `tests/test_examples.py::test_example_config_is_complete_and_contains_no_literal_credentials` | Remplacé par | `tests/test_examples.py::test_profile_enables_its_modules_and_contains_no_literal_credentials` (paramétré sur les trois profils) | R7, AC42 | `71597c4` (P21) |
+| 4 | `tests/test_examples.py::test_example_authorization_grants_exactly_the_actions_the_modules_declare` | Remplacé par | `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set` (paramétré sur les trois profils) | R5, R7, AC42 | `71597c4` (P21) |
+
+## Essai de topologie de la phase 1 (Phase 1 topology trial)
+
+La topologie PC/serveur de la phase 1 (brain sur une machine, agent de
+capture sur le PC du streamer, proxy WebSocket JSON entre les deux, spec
+phase 1 R6–R7) n'est décrite comme livrée qu'accompagnée de cet
+enregistrement (phase 1 R8, AC44). L'essai est le test à deux processus réels
+`tests/test_proxy_process.py::test_ac39_two_process_topology_over_loopback`
+(P22, AC39), exécuté le 20 septembre 2026 avec
+`.venv/bin/python -m pytest tests/test_proxy_process.py -q -p no:cacheprovider`.
+Les six champs ci-dessous sont ceux que R8 exige ; l'AC44 est vérifié par
+`tests/test_hygiene.py`.
+
+| Champ | Valeur enregistrée |
+| --- | --- |
+| Commit | `be9e539` (P22, arbre sur lequel l'essai a été exécuté et cet enregistrement écrit). La revue de branche P24 réexécute l'essai sur son commit de porte et met ce champ à jour. |
+| Profils utilisés | Les deux profils livrés, dérivés sans changer leurs budgets, limites ni liste de livraison : **brain** = `config.server.yaml.example` (module `twitch` remplacé par le module fixture `fakeplatform`, dont le flux scripté émet deux messages à chaque appairage ; endpoint modèle pointé sur un faux serveur Chat Completions scripté tenu par le test ; audit vers un fichier temporaire ; section `tls` du proxy retirée, écoute `127.0.0.1:<port libre>` ; `modules_directory` = copie temporaire des modules livrés plus la fixture) ; **agent** = `agent.yaml.example` (`brain_url: ws://127.0.0.1:<port>`, deux sources de capture : `file` sur un PNG 16×9 et `command` sur un script « à verrou » que le test libère ou laisse orphelin ; jeton d'appairage par référence `${PROXY_PAIRING_TOKEN}`). |
+| Hôtes | **Loopback**, pas d'hôtes distincts : les processus brain, agent, agent intrus et agent redémarré sont quatre enfants `python -m core.main --config <fichier>` du processus de test, sur la même machine, reliés par `127.0.0.1`. |
+| TLS | **Non utilisé** : `ws://` sur loopback, ce que le validateur du proxy n'accepte que pour une adresse de loopback (une écoute non loopback sans `tls` est refusée à la validation, `tests/test_proxy.py`). Aucun certificat n'a été chargé ; le chemin `wss://` n'est couvert que par la validation des réglages et par le document de protocole. |
+| Résultat observé | **1 passed** (0,73 s d'appel). Dans l'ordre : le brain se déclare prêt après les 2 sondes de capacités ; un agent présentant un mauvais jeton reçoit `auth_failed` (sa sortie d'erreur ne contient aucun jeton) et un appel direct avec ce jeton est fermé avec le code 4401, sans qu'aucun événement le nomme sur le bus ; l'agent valide s'appaire, ce qui déclenche le flux : le run « fichier » se termine avec l'image transférée **par référence** (identifiant d'attachement, jamais un chemin) et reçue par le modèle par valeur ; le run « verrou » démarre sa capture, l'agent est tué (SIGKILL) capture en vol, le run observe `error proxy_disconnected` sans partie image et répond quand même ; l'agent redémarré s'appaire de nouveau, les deux runs réussissent une seconde fois (capture libérée par le verrou) ; les deux processus sortent en `0` sur SIGTERM. Le fichier d'audit, lu après leur sortie, montre 2 appairages du seul agent valide, 4 runs `success`, les transitions `module.degraded`/`module.ready` du proxy autour de la coupure, et ne contient ni jeton ni chemin de fichier. |
+| Limites restantes | Aucun hôte distinct ni réseau réel (loopback seulement) ; pas de TLS de bout en bout ; entrée `fakeplatform` scriptée, pas de plateforme réelle ni de Twitch ; modèle factice scripté (pas d'endpoint réel, pas de vision réelle) ; capture = un PNG fixe et un script Python, pas d'écran ; un seul agent, un seul canal, un seul spectateur, deux messages par appairage ; livraison observée sur le transport fictif de la plateforme fixture ; aucune mesure de latence, de débit ni de tenue dans le temps ; dépend d'un port loopback libre (le module se saute sinon, en nommant la raison) et de signaux POSIX. Un essai sur deux hôtes distincts avec `wss://` reste à faire avant de décrire la topologie comme éprouvée hors laboratoire. |
 
 ## Lecture des manifests de runs
 
