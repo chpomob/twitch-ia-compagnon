@@ -191,7 +191,7 @@ the observation it returns, if any. The brain never waits for an answer.
 
 | Field           | Type             | Meaning |
 | --------------- | ---------------- | ------- |
-| `attachment_id` | non-empty string | Agent-chosen identifier, unique within the session. |
+| `attachment_id` | non-empty string | Agent-chosen identifier, unique within the session: one a live call already holds an accepted upload under is refused (§10). |
 | `content_type`  | string           | One of `IMAGE_CONTENT_TYPES` (`image/png`, `image/jpeg`). |
 | `size`          | positive integer | Exact byte length of the binary frame that follows. |
 | `call_id`       | string, optional | The in-flight `call` the upload belongs to (§10). Absent: the most recently issued call still in flight. |
@@ -374,8 +374,10 @@ part. A transfer is exactly three steps (AC33):
    - `store_full`: the store refused the object for any other bound
      (`max_objects`, `max_total_bytes`, `max_bytes_per_run`);
    - `unexpected_binary`: a binary frame that no header announced (including
-     one sent after its header was refused), or a malformed pairing of header
-     and payload.
+     one sent after its header was refused), a malformed pairing of header
+     and payload, a header bound to no call in flight (call identity below),
+     or a header whose `attachment_id` a live call already holds an accepted
+     upload under (identifier uniqueness below).
 
 Only an acknowledged `attachment_id` may appear in an `image_ref` part of a
 later `observation` (§5.5), and only in the observation of the call it was
@@ -403,7 +405,18 @@ A header whose `call_id` names a call that is unknown or already terminal
 in flight. The binding is checked again when the binary frame arrives: a call
 that ended between the header and its payload invalidates the header, and the
 payload is refused `unexpected_binary` and discarded, so a late upload never
-creates a lease after its run's cleanup. The agent
+creates a lease after its run's cleanup.
+
+**Identifier uniqueness.** An `attachment_id` is unique within the session
+for as long as it is acknowledged: a header naming an id under which a call
+still in flight holds an accepted upload — whether that call is another one
+or the same one — is refused `unexpected_binary` on the header alone, before
+any translation is allocated or replaced. The first owner's entry and bytes
+are untouched, its acknowledged reference keeps resolving in its own
+observation, and the duplicate stores nothing and leases nothing. The check
+is made against the bounded translation table as it stands (no further
+history is kept): an id whose entry has gone — its call terminal, its bytes
+released or expired — may be used again. The agent
 transfers before sending the `observation`, so a refused transfer lets it
 return an `error` observation (`attachment_refused`) instead of a dangling
 reference. Attachments are never retransmitted after a drop (§11).

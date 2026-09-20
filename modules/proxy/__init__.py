@@ -63,7 +63,11 @@ or already terminal is refused ``unexpected_binary`` (never charged to
 another call in flight), and the binary frame is stored only if its call
 is still in flight when the frame arrives — a call ending between the
 header and its payload invalidates the header, so a late upload can never
-recreate a lease after the run's cleanup. An
+recreate a lease after the run's cleanup. The ``attachment_id`` is unique
+within the session: a header naming an id a live call already holds an
+accepted upload under — from another call or the same one — is refused
+``unexpected_binary`` on the header alone, and the first owner's reference
+keeps resolving to its own bytes. An
 ``image_ref`` part of the observation names the agent's acknowledged
 ``attachment_id``; it is rewritten to the store's own reference before the
 executor validates the lease. An id this session never acknowledged — or
@@ -1563,6 +1567,13 @@ class ProxyModule:
         if owner is None:
             await self._ack(session, attachment_id, ATTACHMENT_ACK_UNEXPECTED_BINARY)
             return
+        if self._is_live_acknowledged(session, attachment_id):
+            # The id already names a live acknowledged upload (§5.7 requires
+            # it unique within the session): the duplicate is refused on the
+            # header alone and the original owner's reference keeps
+            # resolving (gate finding F6).
+            await self._ack(session, attachment_id, ATTACHMENT_ACK_UNEXPECTED_BINARY)
+            return
         # The header keeps the *call* it belongs to, not only its run: the
         # binary frame is stored only if that same call is still in flight
         # when it arrives (gate finding F3).
@@ -1572,6 +1583,24 @@ class ProxyModule:
             "size": size,
             "owner": owner,
         }
+
+    def _is_live_acknowledged(self, session: _Session, attachment_id: str) -> bool:
+        """Whether *attachment_id* still names an upload some live call may observe.
+
+        An ``attachment_id`` is unique within the session (§5.7): while an
+        accepted upload under that id is held for a call in flight and its
+        bytes are still in the store, a second upload under the same id —
+        from another call or from the same one — is refused before any
+        translation is allocated or replaced, so the acknowledged reference
+        the first owner holds keeps resolving (gate finding F6). The check
+        reuses the bounded translation table as it stands: entries the store
+        no longer backs are pruned first, so an id whose bytes expired or
+        were released is free again, and nothing beyond the
+        :data:`MAX_ACKNOWLEDGED_ATTACHMENTS` ceiling is remembered.
+        """
+
+        self._prune_acknowledged(session)
+        return attachment_id in session.acknowledged
 
     def _call_for_attachment(self, session: _Session, call_id: Any) -> _PendingCall | None:
         """The in-flight call an attachment belongs to, or ``None`` to refuse it.
@@ -1641,6 +1670,14 @@ class ProxyModule:
         if len(session.acknowledged) >= MAX_ACKNOWLEDGED_ATTACHMENTS:
             self._saturated_uploads += 1
             await self._ack(session, header["attachment_id"], ATTACHMENT_ACK_STORE_FULL)
+            return
+        # The id was free when its header was accepted and nothing but a
+        # binary frame — this one — can add an entry since; the collision is
+        # nonetheless judged again here, at the one place a translation is
+        # written, so a duplicate can never replace a live owner's reference
+        # (gate finding F6).
+        if header["attachment_id"] in session.acknowledged:
+            await self._ack(session, header["attachment_id"], ATTACHMENT_ACK_UNEXPECTED_BINARY)
             return
         try:
             ref = self._attachments.put(

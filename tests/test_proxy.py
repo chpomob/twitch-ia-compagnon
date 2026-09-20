@@ -2457,6 +2457,231 @@ async def test_a_binary_frame_for_a_call_observed_between_header_and_payload_is_
         await brain.close()
 
 
+async def test_a_duplicate_attachment_id_from_another_call_is_refused_and_the_owner_keeps_its_reference() -> None:
+    """Gate finding F6 (X1): call A uploads ``same-id``; while A is live,
+    call B uploads ``same-id`` too. The duplicate is refused
+    ``unexpected_binary`` on the header alone — the module used to accept
+    it and silently replace A's translation, so A's own acknowledged
+    reference stopped resolving. Now A's entry and bytes are untouched, A's
+    observation succeeds with A's bytes, and B — which stored and leased
+    nothing — fails cleanly when it names the id it does not own."""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        deadline = brain.clock() + 30
+        first = asyncio.create_task(brain.executor.invoke(capture_call("c-a", run_id="run-A", deadline=deadline)))
+        await agent.call_frame()
+        second = asyncio.create_task(brain.executor.invoke(capture_call("c-b", run_id="run-B", deadline=deadline)))
+        await agent.call_frame()
+
+        ack_a = await agent.transfer("same-id", b"\x0a" * 8, call_id="c-a")
+        assert ack_a["accepted"] is True
+        session = module._session
+        assert session is not None
+        held = session.acknowledged["same-id"]
+        ref_a = held.ref
+
+        # B's header is refused before any translation is touched; the
+        # payload that follows is unannounced and refused too.
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "same-id",
+            "content_type": "image/png", "size": 8, "call_id": "c-b",
+        })
+        ack_b = await agent.frame()
+        assert ack_b["type"] == FRAME_ATTACHMENT_ACK and ack_b["accepted"] is False
+        assert ack_b["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY and ack_b["attachment_id"] == "same-id"
+        await agent.send_bytes(b"\x0b" * 8)
+        ack = await agent.frame()
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        assert session.acknowledged["same-id"] is held
+        assert session.acknowledged["same-id"].ref is ref_a
+        assert session.acknowledged["same-id"].owner.call.call_id == "c-a"
+        assert module.acknowledged_attachments == 1
+        assert brain.store.object_count == 1
+        assert brain.store.usage("run-B").objects == 0
+        assert brain.store.get(ref_a) == b"\x0a" * 8
+        assert module.saturated_uploads == 0
+        assert not agent.ws.closed
+
+        # A's acknowledged reference still resolves, to A's own bytes.
+        await agent.observe("c-a", result=capture_result(8), parts=[image_ref("same-id", 8)])
+        observation = await first
+        assert observation.status == "success", observation.error
+        (part,) = observation.parts
+        stored = brain.store.lookup(part["attachment_id"])
+        assert stored.run_id == "run-A"
+        assert brain.store.get(stored) == b"\x0a" * 8
+
+        # B naming the id it was refused fails cleanly: nothing of B's was
+        # stored, nothing is leased to run-B.
+        await agent.observe("c-b", result=capture_result(8), parts=[image_ref("same-id", 8)])
+        observation = await second
+        assert observation.status == "error"
+        assert observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert not observation.parts
+        assert brain.store.usage("run-B").objects == 0
+        assert module.acknowledged_attachments == 0
+        assert module.in_flight == ()
+    finally:
+        await brain.close()
+
+
+async def test_a_duplicate_attachment_id_from_the_same_call_is_refused_and_keeps_the_first_bytes() -> None:
+    """Gate finding F6: the same call uploading twice under one id is a
+    duplicate too — the second transfer is refused ``unexpected_binary``,
+    stores nothing, and the first upload's bytes and reference are what
+    the observation resolves. An id freed by its call's terminal outcome
+    may be used again by a later call."""
+
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        deadline = brain.clock() + 30
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-a", run_id="run-A", deadline=deadline)))
+        await agent.call_frame()
+
+        ack = await agent.transfer("shot", b"\x01" * 8, call_id="c-a")
+        assert ack["accepted"] is True
+        session = module._session
+        assert session is not None
+        ref = session.acknowledged["shot"].ref
+
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "shot",
+            "content_type": "image/png", "size": 8, "call_id": "c-a",
+        })
+        ack = await agent.frame()
+        assert ack["type"] == FRAME_ATTACHMENT_ACK and ack["accepted"] is False
+        assert ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY and ack["attachment_id"] == "shot"
+        await agent.send_bytes(b"\x02" * 8)
+        ack = await agent.frame()
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        assert session.acknowledged["shot"].ref is ref
+        assert brain.store.get(ref) == b"\x01" * 8
+        assert brain.store.object_count == 1
+        assert brain.store.usage("run-A").objects == 1
+
+        # A header naming no call falls to the same live call and is refused
+        # the same way.
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "shot",
+            "content_type": "image/png", "size": 8,
+        })
+        ack = await agent.frame()
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        await agent.send_bytes(b"\x03" * 8)
+        ack = await agent.frame()
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        assert brain.store.object_count == 1
+
+        await agent.observe("c-a", result=capture_result(8), parts=[image_ref("shot", 8)])
+        observation = await task
+        assert observation.status == "success", observation.error
+        (part,) = observation.parts
+        assert brain.store.get(brain.store.lookup(part["attachment_id"])) == b"\x01" * 8
+        assert module.acknowledged_attachments == 0
+
+        # The id is free again once its call is terminal.
+        task = asyncio.create_task(brain.executor.invoke(capture_call("c-b", run_id="run-B", deadline=deadline)))
+        await agent.call_frame()
+        ack = await agent.transfer("shot", b"\x04" * 8, call_id="c-b")
+        assert ack["accepted"] is True
+        await agent.observe("c-b", result=capture_result(8), parts=[image_ref("shot", 8)])
+        observation = await task
+        assert observation.status == "success", observation.error
+        (part,) = observation.parts
+        assert brain.store.get(brain.store.lookup(part["attachment_id"])) == b"\x04" * 8
+    finally:
+        await brain.close()
+
+
+async def test_repeated_duplicate_uploads_leave_the_translation_table_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate finding F6: identity protection reuses the bounded translation
+    table, not a session history. With the bound lowered to 2, hundreds of
+    duplicate attempts — against one id, from the owner and from another
+    live call — add no entry, store no object and count as no saturation;
+    the third distinct id still meets the counted ``store_full`` policy,
+    and every duplicate attempt after that leaves the table at its bound."""
+
+    monkeypatch.setattr(proxy_module, "MAX_ACKNOWLEDGED_ATTACHMENTS", 2)
+    brain = Brain()
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        module = brain.module
+        assert module is not None
+        deadline = brain.clock() + 30
+        tasks = []
+        for index in range(3):
+            tasks.append(asyncio.create_task(
+                brain.executor.invoke(capture_call(f"c-{index}", run_id=f"run-{index}", deadline=deadline))
+            ))
+            await agent.call_frame()
+        assert (await agent.transfer("a-0", b"\x00" * 8, call_id="c-0"))["accepted"] is True
+        assert module.acknowledged_attachments == 1
+
+        for attempt in range(300):
+            call_id = ("c-0", "c-1", "c-2")[attempt % 3]
+            await agent.send({
+                "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "a-0",
+                "content_type": "image/png", "size": 8, "call_id": call_id,
+            })
+            ack = await agent.frame()
+            assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+            await agent.send_bytes(bytes([attempt % 256]) * 8)
+            ack = await agent.frame()
+            assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        assert module.acknowledged_attachments == 1
+        assert brain.store.object_count == 1
+        assert module.saturated_uploads == 0
+        assert not agent.ws.closed
+
+        # The bound itself is unchanged: a second distinct id fits, a third
+        # is refused store_full and counted, duplicates of either add nothing.
+        assert (await agent.transfer("a-1", b"\x01" * 8, call_id="c-1"))["accepted"] is True
+        ack = await agent.transfer("a-2", b"\x02" * 8, call_id="c-2")
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_STORE_FULL
+        assert module.saturated_uploads == 1
+        for attachment_id in ("a-0", "a-1") * 50:
+            await agent.send({
+                "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": attachment_id,
+                "content_type": "image/png", "size": 8, "call_id": "c-2",
+            })
+            ack = await agent.frame()
+            assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+            await agent.send_bytes(b"\xff" * 8)
+            ack = await agent.frame()
+            assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_UNEXPECTED_BINARY
+        assert module.acknowledged_attachments == 2
+        assert brain.store.object_count == 2
+        assert module.saturated_uploads == 1
+
+        for index, attachment_id in ((0, "a-0"), (1, "a-1")):
+            await agent.observe(f"c-{index}", result=capture_result(8), parts=[image_ref(attachment_id, 8)])
+            observation = await tasks[index]
+            assert observation.status == "success", observation.error
+            (part,) = observation.parts
+            assert brain.store.get(brain.store.lookup(part["attachment_id"])) == bytes([index]) * 8
+        assert (await agent.transfer("a-2", b"\x02" * 8, call_id="c-2"))["accepted"] is True
+        await agent.observe("c-2", result=capture_result(8), parts=[image_ref("a-2", 8)])
+        assert (await tasks[2]).status == "success"
+        assert module.acknowledged_attachments == 0
+    finally:
+        await brain.close()
+
+
 async def test_a_malformed_observation_frame_is_invalid_result_and_uncertain_for_a_write() -> None:
     brain = Brain()
     try:
