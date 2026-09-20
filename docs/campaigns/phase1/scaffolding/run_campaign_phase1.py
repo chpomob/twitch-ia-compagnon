@@ -257,10 +257,12 @@ def run_gate(deadline):
                       report.read_text(encoding="utf-8"))
         verdict = m.group(1) if m else ""
     if not verdict:
-        # Codex sometimes answers inline instead of writing the file: fall back to the captured log.
-        m = re.search(r"\*\*VERDICT:\s*(APPROVE|REQUEST_CHANGES|REJECT)",
-                      (LOGS / f"{GATE_REPORT.stem}.log").read_text(encoding="utf-8"))
-        verdict = m.group(1) if m else ""
+        # Codex sometimes answers inline instead of writing the file. Take the LAST verdict in the
+        # captured log: the FIRST one can be the echoed prompt, not the answer.
+        log_text = (LOGS / f"{GATE_REPORT.stem}.log").read_text(encoding="utf-8")
+        hits = re.findall(r"\*\*VERDICT:\s*(APPROVE|REQUEST_CHANGES|REJECT)", log_text)
+        if hits and "usage limit" not in log_text.lower():
+            verdict = hits[-1]
     return verdict or "unparsed", report
 
 
