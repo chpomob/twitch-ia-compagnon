@@ -1,6 +1,6 @@
 ---
 name: "phase2-audio-stream-interaction"
-version: "1.1"
+version: "1.0"
 author: "adversarial-spec"
 status: "draft"
 tags: [adversarial, spec]
@@ -8,7 +8,7 @@ targets:
   - file: core/contracts.py
     description: "Add the `audio_ref` observation part (its eight fields plus the optional dated `transcription` object), the audio content type and the attachment content-type set shared by store, proxy and agent, count `audio_ref` `size` in the observation size, add the `audio` capability name, the probe reason `audio_rejected` and the `capability_missing` audio case to the shared vocabularies."
   - file: core/actions.py
-    description: "Validate `audio_ref` parts on every terminal observation exactly as `image_ref` (leased to the call's run, unexpired, `size` equal to the stored size) and release them with the run; change the provider-record adoption rule of `_run_provider`/`_run_invocation` (R10): a provider-authored interruption record (`timeout`, `cancelled`, `error`) whose completion stamp is at or after `expires_at` is adopted through the ordinary validation path instead of being replaced by the executor's generic record, while a late `success`/`refused` (or any other non-interruption record) is still discarded and the executor's own timer stays in force when no record arrives; no audio, platform or vendor name."
+    description: "Validate `audio_ref` parts on every terminal observation exactly as `image_ref` (leased to the call's run, unexpired, `size` equal to the stored size) and release them with the run; no audio, platform or vendor name."
   - file: core/runtime.py
     description: "Add the optional `services` collaborator of `RuntimeContext` (a bounded registry where a module publishes a shared provider service under a `(kind, platform)` key and another module resolves it at prepare) and its module-scoped facade; the core knows no kind name."
   - file: core/main.py
@@ -47,8 +47,6 @@ targets:
     description: "Agent profile enables `audio_input`, `audio_output` and `stream_control` (scenes `websocket`, polls disabled) beside `capture` and `agent_link`, lists the five actions in `agent_link.actions` and grants each to principal `brain`; 0 literal secrets."
   - file: pyproject.toml
     description: "Add the three `modules.<name>` package-data lines (`audio_output`, `audio_input`, `stream_control`) so a clean install discovers 11 manifests; dependencies unchanged."
-  - file: tests/test_actions.py
-    description: "Add the tests pinning both sides of the R10 adoption boundary (AC38–AC40 executor half): a provider `timeout`/`cancelled`/`error` record stamped `== expires_at` and `> expires_at` is adopted with its own `cause`, `played_ms` and error code and the emission rule still applied; a `success` and a `refused` record stamped at or after `expires_at` are still replaced by the generic record; a provider that never returns is still cut by the executor's timer. The two phase 1 boundary tests `test_a_confirmation_landing_after_the_deadline_is_never_a_success` and `test_a_confirmation_landing_in_time_survives_a_late_adoption` are unchanged."
   - file: tests/conftest.py
     description: "Make the shared fake model transport answer the audio probe and keep it out of per-run counts; add shared doubles: scripted speech-synthesis transport, scripted transcription transport, recording player runner, injectable audio source, scripted scene provider, scripted poll service, and a generated silent WAV helper."
   - file: tests/fixtures/modules/fakeplatform/__init__.py
@@ -569,64 +567,9 @@ step; nothing under it is runtime code, a test, a profile or packaging.
   unset. `core/` and `modules/` gain no model-name literal and `tests/` no
   positive-duration sleep.
 
-- R10: **A late provider-authored interruption record is authoritative; the
-  executor's generic record is the fallback, never its replacement.** The
-  conflict, verified in the plan stage and kept visible here: phase 1's
-  `core/actions.py::_run_provider` (through `_run_invocation`) discards
-  **any** provider record whose completion stamp (`provider_completed_at`,
-  taken on the provider's own task) is `>= expires_at` and publishes its own
-  generic record instead — `timeout` (resolved by the emission rule) with
-  code `timed_out` and the message "… timed out with emission …": no
-  `result`, no `cause`, no `played_ms`, no module error code. Two phase 1
-  tests pin that boundary:
-  `tests/test_actions.py::test_a_confirmation_landing_after_the_deadline_is_never_a_success`
-  (stamp `==` deadline → NOT adopted) and
-  `::test_a_confirmation_landing_in_time_survives_a_late_adoption` (stamp
-  `<` deadline → adopted). Consequence: R1/AC3 ("the call deadline reached
-  during playback → the player is terminated → the call ends `timeout`
-  cause `playback` carrying `played_ms`") and R3/AC10 (`error
-  capture_timed_out`) are unsatisfiable at the literal instant — the
-  module's record for a stop triggered by the deadline is stamped `>=
-  expires_at` and thrown away. A module-side workaround (stopping the player
-  `0.1 s` before the deadline, an "adoption lead") is rejected: it
-  prematurely times out a player that would legitimately finish at
-  `expiry − 0.05 s` and silently shortens every call's budget by a magic
-  constant. **Ruling (precedence).** A *provider-authored interruption
-  record* — status `timeout`, `cancelled` or `error`, produced by the module
-  for its own action and carrying its own `cause` (`playback`), its
-  `played_ms` or its own error code (`capture_timed_out`) — landing at or
-  after `expires_at` is **authoritative and adopted**, not discarded: the
-  interruption already happened on the device, so the module's record is
-  the true one, and the executor's generic record loses the information the
-  acceptance criteria require. It is adopted through the same path as an
-  in-time interruption record: parts validated (R4), the emission rule
-  applied unchanged (an emitted write's `timeout` still resolves
-  `external_unknown`; the playback actions, whose effect is local, signal
-  that nothing was emitted so their `timeout`/`cancelled` stands —
-  decision 4), nothing else rewritten. A provider record asserting
-  `success` or `refused`, or any other record that is not an interruption
-  (a proposed action), stamped at or after `expires_at` is **still
-  discarded** and replaced by the executor's generic record: the phase 1
-  guarantee "a late confirmation is never a success" is unchanged, and so
-  is its boundary — `>=` judged on the provider's completion stamp, never on
-  the instant the executor is resumed to adopt it. **When no provider record
-  arrives, the executor's own timer stays in force** exactly as in phase 1:
-  at expiry it cancels the provider and publishes the generic record, so a
-  module that never answers is still cut at the deadline. **Prohibition.**
-  No module-side "adoption lead", no early-stop margin and no other
-  quantity subtracted from the call deadline may exist in
-  `modules/audio_output/`, `modules/audio_input/` or `modules/stream_control/`
-  (nor a setting for one): a module stops its player, its recorder or its
-  request when the call deadline itself is reached and reports the
-  interruption it observed. R1's `stop_grace_seconds` runs *after* that
-  stop and R3's `grace_seconds` is the admission reserve of
-  `capture_too_long` only; neither shortens the deadline, and no call's
-  budget is shortened by a constant.
-
-Non-trivial requirement count: 8 (R1, R3, R4, R5, R6, R7, R8, R10). R2 is a
+Non-trivial requirement count: 7 (R1, R3, R4, R5, R6, R7, R8). R2 is a
 declaration-and-proof requirement on phase 1 machinery and R9 is
-configuration, packaging and documentation; R10 amends one phase 1 executor
-rule and is the precondition of AC3 and AC10.
+configuration, packaging and documentation.
 
 ## Acceptance criteria
 
@@ -971,61 +914,6 @@ rule and is the precondition of AC3 and AC10.
   injected clock, with the capture `cancelled` (0 attachments), the
   playback `cancelled` with its `played_ms`, and the scene change resolved
   per AC23.
-- AC38 (R10, R1): The AC3 setup — 10 s segment, a recording player runner
-  that accepts 128 000 bytes then stops reading — with the call deadline at
-  `t = 100.0` on the injected clock: the runner records 0 stops at
-  `t = 99.99` and exactly 1 stop at `t = 100.0`; the module's record is
-  stamped `provider_completed_at >= 100.0` (`>= expires_at`), and the
-  executor adopts it: the terminal observation is `timeout` with `error`
-  carrying `cause == "playback"` and `played_ms == 4000`, its message is
-  the module's and not the executor's generic "timed out with emission",
-  `action.completed` carries `status: timeout`, and no second record exists
-  for the call. The same holds when the executor is resumed late and the
-  record is stamped at `100.0` exactly and at `100.5` (both sides of the
-  old `>=` boundary adopted). A module-authored `cancelled` record at the
-  same point (drain started at `t = 100.0`) is adopted the same way with
-  `played_ms == 4000`. A runner that accepts everything and exits 0 at
-  `t = 99.95` (`expiry − 0.05 s`) ends `success` with `played_ms ==
-  duration_ms`, 0 stops. Executor half in `tests/test_actions.py`: a
-  scripted provider returning `timeout {cause: "playback", played_ms:
-  4000}` stamped `== expires_at` and `> expires_at` yields that record
-  verbatim (cause and `played_ms` present, code the provider's), with the
-  emission rule applied — the same record from a write provider that
-  signalled emission ends `external_unknown` exactly as in time.
-- AC39 (R10, R3): The AC10 recorder that has emitted nothing when the call
-  deadline `t = 100.0` arrives: the runner records 0 kills at `t = 99.99`
-  and exactly 1 kill at `t = 100.0`; the module's record `error
-  capture_timed_out` is stamped `>= expires_at` and adopted: the terminal
-  observation is `error` with `error.code == "capture_timed_out"` — never
-  `timed_out` — with 0 attachments stored and `action.completed` carrying
-  `status: error`; the `grace_seconds` reserve is not applied to the kill
-  (0 kills at `t = 98.0` with `grace_seconds: 2`). Executor half: a
-  scripted read provider returning `error {code: capture_timed_out}`
-  stamped `== expires_at` yields that code, not the generic `timeout`.
-- AC40 (R10): The phase 1 boundary is unchanged and both tests stay green
-  unmodified: `tests/test_actions.py::test_a_confirmation_landing_after_the_deadline_is_never_a_success`
-  (an emitted write's `success` stamped exactly `== expires_at` — deadline
-  `1000.0`, clock at `1000.0` — is NOT adopted: `external_unknown`, no
-  `result`, 0 `success` outcomes) and
-  `::test_a_confirmation_landing_in_time_survives_a_late_adoption` (a
-  `success` stamped at `9.0` `<` deadline `10.0`, adopted at `11.0`: it IS
-  adopted as `success`). New cases beside them: a read provider's `success`
-  stamped `> expires_at` and a `refused` stamped `== expires_at` are each
-  replaced by the generic record (`timeout`, code `timed_out`, no `result`,
-  the provider's refusal code absent); a provider that never returns is
-  cancelled by the executor's timer at expiry and the call ends with the
-  generic record whose message contains "timed out with emission" —
-  `COUNTER_ACTION_TIMEOUTS` incremented — proving the timer is in force
-  when no provider record arrives.
-- AC41 (R10): `grep -rniE "adoption_lead|lead_seconds|deadline_margin|
-  early_stop|deadline_lead"` over `modules/audio_output/`,
-  `modules/audio_input/` and `modules/stream_control/` (code and
-  manifests) matches 0 lines; the three settings schemas declare no
-  lead/margin key; the gate review of `git diff <base>..HEAD -- modules/`
-  finds no expression subtracting a literal or a setting from the call
-  deadline other than R3's `capture_too_long` admission check; the
-  README's playback and capture sections describe no lead; and AC38's
-  `expiry − 0.05 s` success case passes.
 
 ## Caller enumeration
 

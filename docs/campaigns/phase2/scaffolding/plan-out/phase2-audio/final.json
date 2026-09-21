@@ -1,0 +1,145 @@
+{
+  "verdict": "REJECT",
+  "findings": [],
+  "infrastructure": false,
+  "provider_history": [],
+  "reason": "findings unresolved after 2 loops",
+  "loops": 2,
+  "branch": "plan/phase2-audio/1",
+  "merged": false,
+  "artifacts_dir": "/media/chpo/HDD-papa/twitch-ia-compagnon/docs/campaigns/phase2/scaffolding/plan-out/phase2-audio",
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 17711,
+        "completion_tokens": 2511,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "plan": {
+        "prompt_tokens": 3170,
+        "completion_tokens": 195,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "challenge": {
+        "prompt_tokens": 2775,
+        "completion_tokens": 852,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "revise": {
+        "prompt_tokens": 6166,
+        "completion_tokens": 1017,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "verify": {
+        "prompt_tokens": 5600,
+        "completion_tokens": 447,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "personas": {
+      "plan-writer": {
+        "prompt_tokens": 9336,
+        "completion_tokens": 1212,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "plan-challenger": {
+        "prompt_tokens": 8375,
+        "completion_tokens": 1299,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "total": {
+      "prompt_tokens": 17711,
+      "completion_tokens": 2511,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 3170,
+        "completion_tokens": 195,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "plan",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2775,
+        "completion_tokens": 852,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "challenge",
+        "persona": "plan-challenger"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 3083,
+        "completion_tokens": 572,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "revise",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2800,
+        "completion_tokens": 288,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "verify",
+        "persona": "plan-challenger"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 3083,
+        "completion_tokens": 445,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "revise",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2800,
+        "completion_tokens": 159,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "verify",
+        "persona": "plan-challenger"
+      }
+    ]
+  },
+  "complexity": {
+    "score": 79327,
+    "level": "high",
+    "recommended_agents": 6,
+    "stats": {
+      "chars": 73847,
+      "files": 0,
+      "source_lines": 62,
+      "hunks": 0,
+      "requirements": 10,
+      "modules": 0
+    },
+    "tier": "high",
+    "max_agents": 6,
+    "summary": "high: 73847 chars, 0 files, 62 source lines, 0 hunks, 10 requirements, 0 modules"
+  },
+  "contract": {
+    "settle": "APPROVE",
+    "ac_status": {},
+    "failures": []
+  },
+  "status": "findings",
+  "error": ""
+}

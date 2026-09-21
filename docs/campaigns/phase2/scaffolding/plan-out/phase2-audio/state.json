@@ -1,0 +1,310 @@
+{
+  "provider_history": [],
+  "stash_id": "",
+  "parent_branch": "main",
+  "transactions": [
+    {
+      "step": "_push",
+      "status": "success",
+      "detail": ""
+    },
+    {
+      "step": "_resolve",
+      "status": "success",
+      "detail": ""
+    },
+    {
+      "step": "_create_branch",
+      "status": "success",
+      "detail": ""
+    },
+    {
+      "step": "_checkout_branch",
+      "status": "success",
+      "detail": ""
+    },
+    {
+      "step": "_record_branch_point",
+      "status": "success",
+      "detail": ""
+    },
+    {
+      "step": "_apply_gitignore",
+      "status": "success",
+      "detail": ""
+    },
+    {
+      "step": "_checkout_parent",
+      "status": "success",
+      "detail": ""
+    },
+    {
+      "step": "_unstash",
+      "status": "success",
+      "detail": ""
+    }
+  ],
+  "last_transaction": {
+    "outcome": "success",
+    "label": "restore_git",
+    "workdir": "/media/chpo/HDD-papa/twitch-ia-compagnon"
+  },
+  "branch": "plan/phase2-audio/1",
+  "branch_point": "b3c099eddbb77ac920f4de884c6fae7b7ee39057",
+  "exit_code": 0,
+  "feature": "phase2-audio",
+  "calls": [
+    {
+      "label": "plan",
+      "ok": true,
+      "attempts": [
+        {
+          "attempt": 1,
+          "returncode": 0,
+          "elapsed": 930.7656167770037,
+          "retryable": false,
+          "reason": "success",
+          "usage": {
+            "model": "other",
+            "prompt_tokens": 3170,
+            "completion_tokens": 195,
+            "est_cost_usd": 0.0,
+            "estimated": true,
+            "phase": "plan",
+            "persona": "plan-writer"
+          }
+        }
+      ],
+      "cap_events": []
+    },
+    {
+      "label": "challenge",
+      "ok": true,
+      "attempts": [],
+      "cap_events": []
+    },
+    {
+      "label": "revise_1",
+      "ok": true,
+      "attempts": [
+        {
+          "attempt": 1,
+          "returncode": 0,
+          "elapsed": 279.9113109050086,
+          "retryable": false,
+          "reason": "success",
+          "usage": {
+            "model": "other",
+            "prompt_tokens": 3083,
+            "completion_tokens": 572,
+            "est_cost_usd": 0.0,
+            "estimated": true,
+            "phase": "revise",
+            "persona": "plan-writer"
+          }
+        }
+      ],
+      "cap_events": []
+    },
+    {
+      "label": "verify_1",
+      "ok": true,
+      "attempts": [],
+      "cap_events": []
+    },
+    {
+      "label": "revise_2",
+      "ok": true,
+      "attempts": [
+        {
+          "attempt": 1,
+          "returncode": 0,
+          "elapsed": 402.0780428730068,
+          "retryable": false,
+          "reason": "success",
+          "usage": {
+            "model": "other",
+            "prompt_tokens": 3083,
+            "completion_tokens": 445,
+            "est_cost_usd": 0.0,
+            "estimated": true,
+            "phase": "revise",
+            "persona": "plan-writer"
+          }
+        }
+      ],
+      "cap_events": []
+    },
+    {
+      "label": "verify_2",
+      "ok": true,
+      "attempts": [],
+      "cap_events": []
+    }
+  ],
+  "attempts": [
+    {
+      "phase": "plan",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 930.7656167770037,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 3170,
+        "completion_tokens": 195,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "plan",
+        "persona": "plan-writer"
+      }
+    },
+    {
+      "phase": "revise_1",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 279.9113109050086,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 3083,
+        "completion_tokens": 572,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "revise",
+        "persona": "plan-writer"
+      }
+    },
+    {
+      "phase": "revise_2",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 402.0780428730068,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 3083,
+        "completion_tokens": 445,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "revise",
+        "persona": "plan-writer"
+      }
+    }
+  ],
+  "cap_events": [],
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 17711,
+        "completion_tokens": 2511,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "plan": {
+        "prompt_tokens": 3170,
+        "completion_tokens": 195,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "challenge": {
+        "prompt_tokens": 2775,
+        "completion_tokens": 852,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "revise": {
+        "prompt_tokens": 6166,
+        "completion_tokens": 1017,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "verify": {
+        "prompt_tokens": 5600,
+        "completion_tokens": 447,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "personas": {
+      "plan-writer": {
+        "prompt_tokens": 9336,
+        "completion_tokens": 1212,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "plan-challenger": {
+        "prompt_tokens": 8375,
+        "completion_tokens": 1299,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "total": {
+      "prompt_tokens": 17711,
+      "completion_tokens": 2511,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 3170,
+        "completion_tokens": 195,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "plan",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2775,
+        "completion_tokens": 852,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "challenge",
+        "persona": "plan-challenger"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 3083,
+        "completion_tokens": 572,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "revise",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2800,
+        "completion_tokens": 288,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "verify",
+        "persona": "plan-challenger"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 3083,
+        "completion_tokens": 445,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "revise",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2800,
+        "completion_tokens": 159,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "verify",
+        "persona": "plan-challenger"
+      }
+    ]
+  }
+}

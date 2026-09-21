@@ -1,0 +1,52 @@
+{
+  "findings": [
+    {
+      "id": "P1",
+      "severity": "blocker",
+      "step": "P15",
+      "summary": "The required policy is missing for unavailable poll services.",
+      "evidence": "R8 requires that with required: true, prepare fails naming the module and dependency field. P15 specifies only 'none resolved \u2192 unbound with module.degraded' and tests only degraded startup when polls.enabled is true and no service exists. No step implements or tests startup failure for this dependency under required: true.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "P2",
+      "severity": "major",
+      "step": "P7",
+      "summary": "Playback instructions discard the WAV header despite requiring the complete WAV on stdin.",
+      "evidence": "P7 specifies 'bounded writes of the data chunk', but its test requires a player that 'received 48 044 bytes' for 48 000 data bytes. R1 requires feeding the segment bytes, and AC1 explicitly requires all 48 044 bytes. Specify transmission of the complete WAV while counting only accepted data bytes for played_ms.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "P3",
+      "severity": "major",
+      "step": "overall",
+      "summary": "The dependency graph leaves shared-file edits unordered and omits the websocket prerequisite.",
+      "evidence": "P12 and P13 both modify tests/test_stream_control.py, but neither depends transitively on the other. P14 and P15 both modify modules/stream_control/__init__.py and tests/test_stream_control.py, but both depend on P13 without ordering each other. P17 explicitly uses a 'websocket-kind provider against the in-process peer', yet its dependencies [P6, P8, P10, P11, P12, P15] do not include P14 transitively. P20 consequently does not transitively require P14 either.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "P4",
+      "severity": "major",
+      "step": "P8",
+      "summary": "The proposed playback deadline changes the specified timeout behavior.",
+      "evidence": "Decision 1 sets the playback deadline to 'expiry \u2212 stop_grace_seconds', and P8 stops playback at that earlier deadline. R1 and AC3 require termination when the call deadline arrives, followed by the stop grace. A playback that would finish during the final grace-sized interval before the actual deadline is prematurely timed out. P8 also changes its test trigger to the playback deadline, so it does not verify the specified boundary.",
+      "confidence": "high",
+      "basis": "spec",
+      "status": "RESOLVED BY SPEC AMENDMENT \u2014 implement the spec's new requirement",
+      "arbiter_note": "The spec has been amended: a provider-authored INTERRUPTION record (timeout/cancelled/error) landing at or after expires_at is authoritative and MUST be adopted by core/actions.py (_run_provider), carrying its cause/played_ms/error code; a provider record asserting success/refused/proposed-action at or after the deadline is still discarded. Consequence for this plan: DROP any module-side adoption lead or any quantity subtracted from the call deadline (grep-able absence), scope the core/actions.py adoption change, and pin both sides of the new boundary with tests \u2014 including that the two phase 1 deadline tests stay green."
+    },
+    {
+      "id": "P5",
+      "severity": "major",
+      "step": "P8",
+      "summary": "Cancellation can release output ownership before the previous player exits.",
+      "evidence": "P8 returns the timeout observation 'at once' with termination escalation 'joined at close', and its Risks require releasing the lock 'before the observation is published'. R1 and AC4 require the next playback to start only after the previous player exits. For a player that ignores termination, releasing the playback lock while kill escalation remains pending permits overlapping players unless a separate exit barrier retains output ownership; the plan specifies no such barrier or queued-successor cancellation test.",
+      "confidence": "medium",
+      "basis": "spec"
+    }
+  ],
+  "arbiter_ruling": {}
+}

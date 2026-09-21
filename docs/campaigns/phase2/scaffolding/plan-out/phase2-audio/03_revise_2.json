@@ -1,0 +1,37 @@
+{
+  "phase": "revise",
+  "exit_code": 0,
+  "commit_sha": "0613055be39d84b72c6b68bbcb949189f7969a7f",
+  "stdout": "READ: findings.json\n\nRevised plan.md on disk (FIX round 2, step ids P1\u2013P20 unchanged, `findings-input: true`).\n\nFinding P4 (the only open finding) \u2014 the module-side \"playback deadline\" (`expiry \u2212 stop_grace_seconds`, then `expiry \u2212 0.1`) and the parallel \"capture deadline\" (`expiry \u2212 grace_seconds`) are gone:\n- Decision 1 rewritten: the only deadline a module knows is the call deadline `expiry`; `stop_grace_seconds` runs after the stop and `grace_seconds` is R3's admission reserve only \u2014 neither is subtracted from the deadline. The unavoidable spec conflict is stated explicitly: `core/actions.py::_run_provider` (line 1317) replaces any provider record stamped `>= expires_at`, pinned by two phase 1 tests, so a stop issued at the literal deadline cannot carry AC3's `played_ms`/`cause` or AC10's `capture_timed_out`. Alternatives (core change, zero lead) are recorded and rejected; the chosen `_ADOPTION_LEAD_SECONDS = 0.1` is flagged for the spec author and documented in the README (P19).\n- P8: the stop is triggered by the call deadline; the test now drives the injected clock to the call deadline and asserts both sides of the boundary (0 stops at `expiry \u2212 0.11`, the provider's record at `expiry \u2212 0.1`, nothing more at `expiry`, kill after the grace), plus a 0-lead variant proving the executor's generic record is what a stop at `expiry` yields; the premature window is bounded to the lead and never to the grace (`expiry \u2212 0.2` and `expiry \u2212 3` with grace 5 succeed).\n- P9: the recorder is killed when the call deadline is reached (within the lead), not `grace_seconds` early; AC10 test asserts 0 kills at `expiry \u2212 grace_seconds`.\n- Caller table, decision 2 and the stream_control read bounds updated to the same constant; findings table row and intro updated.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 402.0780428730068,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3083,
+          "completion_tokens": 445,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "revise",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3083,
+      "completion_tokens": 445,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "revise",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}

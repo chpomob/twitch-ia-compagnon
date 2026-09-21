@@ -1,0 +1,37 @@
+{
+  "phase": "plan",
+  "exit_code": 0,
+  "commit_sha": "8ecff9ec0096ac6279c6247d27c4c67cf4d356da",
+  "stdout": "READ: spec.md\nWrote plan.md (spec \"phase2-audio-stream-interaction\", findings-input: false; the findings.json present in the workdir is the archived phase 1 plan review and was not used). 20 steps P1\u2013P20, every Files entry inside the spec's target list or docs/campaigns/phase2/, all 37 targets covered, dependencies acyclic and backward-only, full-branch review gate at P20, caller tables and ordering rationale included. Decisions flagged in the plan: provider deadline convention (modules return their own timeout/cancelled records before the executor's expiry), player runner seam, private per-module WAV readers, ServiceRegistry shape, the R4 omission hunk in _propose, PC profile ships polls disabled, empty-capabilities module.degraded for a transcription-only degradation.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 930.7656167770037,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3170,
+          "completion_tokens": 195,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "plan",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3170,
+      "completion_tokens": 195,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "plan",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}

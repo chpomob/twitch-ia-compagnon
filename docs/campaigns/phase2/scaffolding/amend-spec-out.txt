@@ -1,0 +1,76 @@
+Amended docs/campaigns/phase2/spec.md (only file touched; git status confirms).
+
+IDS ADDED AND WHERE
+- R10 — new requirement, inserted after R9 (spec.md lines 572–624), before the
+  "Non-trivial requirement count" line. Quotes the verified conflict
+  (`core/actions.py::_run_provider` → `_run_invocation` discards any record with
+  `provider_completed_at >= expires_at`, generic record `timed_out` "… timed out with
+  emission …" with no result/cause/played_ms; the two pinning tests and their `==` /
+  `<` boundary; AC3 and AC10 unsatisfiable at the literal instant; the rejected 0.1 s
+  lead and why), then the ruling verbatim in substance: provider-authored
+  interruption record (`timeout`/`cancelled`/`error`, own `cause` `playback`,
+  `played_ms`, own code `capture_timed_out`) at or after `expires_at` is authoritative
+  and adopted; `success`/`refused`/non-interruption (proposed action) at or after
+  `expires_at` still discarded, boundary `>=` on the provider stamp unchanged; the
+  executor's timer stays in force when no record arrives; prohibition of any
+  module-side adoption lead / early-stop margin / quantity subtracted from the call
+  deadline in the three new modules (stop_grace_seconds runs after the stop,
+  grace_seconds is the capture_too_long admission reserve only). One addition
+  beyond the ruling's wording, needed for consistency with the code: the adopted
+  late record goes through the same path as an in-time one (R4 part validation and
+  the unchanged emission rule), and decision 4's "never external_unknown" for
+  playback rests on the module signalling not-emitted, as twitch/capture already do.
+- AC38 (R10, R1), AC39 (R10, R3), AC40 (R10), AC41 (R10) — appended after AC35 at
+  the end of "Acceptance criteria" (lines 974–1028).
+- Front matter (lines 3, 10, 50–51): `core/actions.py` target description extended
+  with the adoption-rule change; new target `tests/test_actions.py` for the tests
+  pinning both sides of the boundary; `version` bumped "1.0" → "1.1" because
+  scaffolding/spec-v1.md is an identical archive of the previous text (flag: revert
+  if the campaign tooling keys on "1.0").
+- "Non-trivial requirement count" line (626–629) updated 7 → 8 naming R10, so the
+  count stays true. Everything else is byte-identical (diff: 6 hunks, 116+/4-).
+
+HOW (a)–(d) ARE STATED
+(a) AC38: AC3 setup with deadline t=100.0 on the injected clock; 0 stops at 99.99,
+    1 stop at 100.0; module record stamped >= expires_at is adopted → terminal
+    `timeout` with `error.cause == "playback"`, `error.played_ms == 4000`, the
+    module's message (not the generic one), one record only; adopted at stamp
+    == 100.0 and 100.5; module-authored `cancelled` at the same point adopted with
+    played_ms 4000; a player finishing at expiry − 0.05 s ends success (no premature
+    stop). Executor half in tests/test_actions.py: scripted `timeout {cause,
+    played_ms}` stamped == and > expires_at adopted verbatim; emission rule still
+    applied (an emitted write's late timeout → external_unknown as in time).
+(b) AC39: AC10 recorder, 0 kills at 99.99, 1 kill at 100.0; `error capture_timed_out`
+    stamped >= expires_at adopted (code never `timed_out`), 0 attachments,
+    action.completed status error; grace_seconds not applied to the kill (0 kills
+    at 98.0). Executor half: scripted read provider `error capture_timed_out`
+    stamped == expires_at keeps its code.
+(c) AC40: names both phase 1 tests, restates their boundary (success at stamp ==
+    deadline 1000.0/clock 1000.0 → NOT adopted, external_unknown, no result, 0
+    successes; success stamped 9.0 < 10.0 adopted at 11.0 → success) and says they
+    stay green unmodified; adds late `success` (> expires_at) and `refused`
+    (== expires_at) → generic record, and a never-returning provider → cut by the
+    timer with the "timed out with emission" message and COUNTER_ACTION_TIMEOUTS
+    incremented.
+(d) AC41: `grep -rniE "adoption_lead|lead_seconds|deadline_margin|early_stop|
+    deadline_lead"` over the three module directories (code + manifests) = 0 lines;
+    no lead/margin settings key; gate review of the modules diff finds no
+    subtraction from the deadline except R3's capture_too_long admission check;
+    README describes no lead; AC38's expiry − 0.05 s case passes.
+
+NOT ENCODED / CAVEATS
+- Nothing in the ruling was left out. Two points are worth knowing:
+  1. A "proposed action" is not a record kind the executor knows (no such field on
+     ActionObservation); I kept the ruling's phrase as "any other record that is
+     not an interruption (a proposed action)" so the intent is visible.
+  2. `cause` and `played_ms` can only ride in the `error` mapping (a non-success
+     ActionObservation carries no `result`; extra keys in `error` are accepted by
+     `_normalised_error`). AC38/AC39 say `error.cause` / `error.played_ms`
+     explicitly; R1's wording "with cause `playback` and the `played_ms` reached"
+     was left untouched.
+  3. An outside cancellation of the executor's task (`except CancelledError` in
+     `_run_invocation`) never adopts a provider record today, by design; the
+     ruling's `cancelled` case is therefore stated for a module-authored `cancelled`
+     record (drain-driven, as AC23/AC35 already assume), not for that path.
+- Caller-enumeration tables were not extended (not among the four required edits);
+  the `core/actions.py` row there still describes only the part-validation site.

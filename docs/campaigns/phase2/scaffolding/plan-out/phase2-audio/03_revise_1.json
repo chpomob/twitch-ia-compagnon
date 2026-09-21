@@ -1,0 +1,37 @@
+{
+  "phase": "revise",
+  "exit_code": 0,
+  "commit_sha": "2ba4151936b4d4297d3b8ec1ae502a639a6a7c8f",
+  "stdout": "READ: findings.json\n\nBranch state verified: HEAD 8ecff9e (the plan commit), tree clean apart from the orchestrator's `findings.json`/`spec.md` inputs. Revised `plan.md` on disk (frontmatter `findings-input: true`; step ids P1\u2013P20 unchanged; 86 insertions / 30 deletions).\n\nFindings addressed:\n- P1 (blocker, polls `required` policy): P13 establishes the R8 policy for the poll dependency (no lookup there, so `polls.enabled: true` = no service resolved \u2192 degraded, or under `required: true` a prepare failure naming `stream_control` and `polls.enabled`, 0 transports open); P15 keeps it over the real registry lookup; both steps test the failing and passing sides, including a context without a service registry and the loader path with the fixture platform.\n- P2 (WAV header discarded): P7 writes the complete WAV (header + data) to the player and `parse_wav` returns `data_offset`; `played_ms` derives from `min(data_bytes, max(0, accepted_total \u2212 data_offset))` (P8); the conftest `FakePlayer.accept_limit` counts data bytes (P4) so AC1's 48 044 received and AC3's 128 000 data bytes are both asserted.\n- P3 (dependency graph): P13 now depends on P12, P15 on P14, P17 on P14 explicitly; a \"shared-file rule\" paragraph in the ordering rationale lists every file two steps touch and the edge that orders them; validated that every step depends on lower ids only.\n- P4 (playback deadline): decision 1 and P8 issue the stop at `expiry \u2212 0.1 s` (a private `_DEADLINE_MARGIN_SECONDS`, the executor's adoption resolution \u2014 `core/actions.py::_run_provider` discards any record stamped at or after `expires_at`), not `expiry \u2212 stop_grace_seconds`; the grace runs after the stop; P8 tests the boundary (a player finishing 0.2 s / 3 s before the deadline succeeds with 0 stops; no stop before `expiry \u2212 0.1`) and explains the two-move clock drive.\n- P5 (output ownership): decision 2 and P8 make the output slot owned by the player process from `start` until `wait` returned \u2014 the supervised escalation task holds it through terminate \u2192 grace \u2192 kill \u2192 wait; the observation publishes without waiting for the exit; P8 tests a queued successor behind a player that ignores termination (second start recorded only after the first's kill), plus drain during the escalation. Risks updated accordingly.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 279.9113109050086,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3083,
+          "completion_tokens": 572,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "revise",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3083,
+      "completion_tokens": 572,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "revise",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}
