@@ -1424,3 +1424,606 @@ async def test_a_send_confirmed_before_a_cancelled_entry_stays_in_the_record() -
         assert harness.memory() == []
     finally:
         await harness.close()
+
+
+# =========================================================================== #
+# Phase 2 P17 — the real `audio_output` and `stream_control` modules in the
+# delivery list (R2; AC6, AC7)
+# =========================================================================== #
+#
+# The same fixture platform and the same shipped brain, with the shipped
+# ``audio_output`` (scripted speech transport, recording player runner) and
+# ``stream_control`` (scripted scene provider) activated by the real loader
+# on the same context — or, for the dropped-proxy case, the shipped ``proxy``
+# serving ``audio.speak`` for a scripted agent over ``MemoryWebSocketPair``.
+# The brain is handed nothing but a ``delivery`` group: it names none of
+# these modules, and the phase 1 resolution rules carry their declarations
+# (``audio.speak`` with the text, ``audio.play`` and ``stream.scene.set``
+# effect-only). ``modules`` mode follows the catalog order the loaders
+# yield, so every scenario fixes ``enabled_modules`` explicitly. Nothing
+# sleeps: the clock is injected and every wait is a bounded number of turns.
+
+from core.actions import ERROR_NO_PROVIDER, ERROR_PROVIDER_NOT_READY
+from core.attachments import AttachmentStore
+from core.contracts import PROXY_ERROR_PROXY_DISCONNECTED
+from conftest import (
+    MemoryWebSocketPair,
+    RecordingPlayerRunner,
+    ScriptedSceneProvider,
+    ScriptedSpeechTransport,
+    wav_bytes,
+)
+
+AUDIO_SPEAK = "audio.speak"
+AUDIO_PLAY = "audio.play"
+SCENE_SET = "stream.scene.set"
+POLL_CREATE = "stream.poll.create"
+AUDIO_OUTPUT = "audio_output"
+STREAM_CONTROL = "stream_control"
+PROXY = "proxy"
+
+#: The permission each granted action requires, as its manifest declares it.
+PHASE2_PERMISSIONS = {
+    CHAT_WRITE: CHAT_WRITE,
+    CHAT_READ: CHAT_READ,
+    AUDIO_SPEAK: "audio.speak",
+    AUDIO_PLAY: "audio.play",
+    SCENE_SET: "stream.scene",
+}
+
+TALKING = "Talking"
+CHIME = "chime"
+#: ``argv[0]`` must resolve to an executable at ``prepare``, so the player
+#: names the running interpreter; the runner is injected, nothing is spawned.
+PLAYER_ARGV = [sys.executable, "player-under-test", "-"]
+SPEECH_ENDPOINT = "http://speech.invalid/v1/audio/speech"
+SPEECH_MODEL = "speech-model-under-test"
+
+SPEECH_BODY = wav_bytes(1.5)
+CHIME_CLIP = wav_bytes(0.5)
+
+AC7_PREFERENCE = [CHAT_WRITE, AUDIO_SPEAK]
+AC7_RESOLVED = [CHAT_WRITE, AUDIO_SPEAK, AUDIO_PLAY, SCENE_SET]
+
+PROXY_TOKEN = "pairing-secret-token"
+PROXY_STORE_LIMITS: dict[str, Any] = {
+    "max_object_bytes": 1_048_576,
+    "max_objects": 4,
+    "max_total_bytes": 4_194_304,
+    "max_bytes_per_run": 2_097_152,
+    "ttl_seconds": 300.0,
+}
+
+
+def phase2_rule(action: str) -> AuthorizationRule:
+    """One explicit grant of *action*'s declared permission to the brain."""
+
+    return AuthorizationRule(
+        rule_id=f"brain-{action}",
+        action_name=action,
+        principals=(PRINCIPAL,),
+        granted_permissions=(PHASE2_PERMISSIONS[action],),
+    )
+
+
+def speak_entry() -> dict[str, Any]:
+    return {"action": AUDIO_SPEAK, "text_argument": "text"}
+
+
+def chat_entry() -> dict[str, Any]:
+    return {"action": CHAT_WRITE, "text_argument": "text"}
+
+
+def chime_entry() -> dict[str, Any]:
+    return {"action": AUDIO_PLAY, "text_argument": "none", "arguments": {"sound": CHIME}}
+
+
+def talking_entry() -> dict[str, Any]:
+    return {"action": SCENE_SET, "text_argument": "none", "arguments": {"scene": TALKING}}
+
+
+@dataclass
+class Phase2Harness(DeliveryHarness):
+    """The delivery harness with the shipped phase 2 modules' seams."""
+
+    speech: Any = None
+    runner: Any = None
+    scenes: Any = None
+    proxy: Any = None
+
+    def outcome(self, call_id: str) -> ActionObservation:
+        return self.executor.outcome(call_id)
+
+
+async def activate_phase2(
+    *bodies: Any,
+    delivery: Mapping[str, Any],
+    clip_dir: Path,
+    enabled: Sequence[str] = (AUDIO_OUTPUT, STREAM_CONTROL),
+    speech_answers: Sequence[Any] = (),
+    synthesis: Mapping[str, Any] | None = None,
+    player_argv: Sequence[str] = PLAYER_ARGV,
+    grants: Sequence[str] = tuple(PHASE2_PERMISSIONS),
+) -> Phase2Harness:
+    """The fixture platform, then *enabled* and the shipped brain, prepared.
+
+    The fixture loader declares ``chat.write`` first; the shipped loader then
+    declares the actions of *enabled* in that order, which is the catalog
+    order ``mode: modules`` follows after the preferred names. Every module
+    is prepared before the brain, so the brain resolves against the whole
+    catalog and delivers to providers already bound (or already unbound).
+    """
+
+    clock = ManualClock()
+    store = AttachmentStore(clock=clock, **PROXY_STORE_LIMITS) if PROXY in enabled else None
+    context = build_context(
+        clock=clock,
+        trigger_registry=TriggerRegistry(companion_name=COMPANION),
+        chat=ChatContext(max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=clock),
+        authorization=AuthorizationPolicy([phase2_rule(action) for action in grants]),
+        attachments=store,
+    )
+    context.actions.register(CHAT_READ_SPEC, NeverInvokedReadProvider(), module=READER_MODULE)
+    context.actions.mark_ready(READER_MODULE)
+
+    diagnostics: list[str] = []
+    transport = SimpleNamespace(outcomes=[], sends=[])
+    fixtures = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    (platform,) = await fixtures.activate_enabled(
+        {
+            "enabled_modules": ["fakeplatform"],
+            "modules": {
+                "fakeplatform": {
+                    "channel_ids": [CHANNEL_A, CHANNEL_B],
+                    "companion_name": COMPANION,
+                    "transport": transport,
+                    "diagnostic_reporter": diagnostics.append,
+                }
+            },
+        }
+    )
+
+    clip = clip_dir / "chime.wav"
+    clip.write_bytes(CHIME_CLIP)
+    speech = ScriptedSpeechTransport(*speech_answers)
+    runner = RecordingPlayerRunner(clock=clock)
+    scenes = ScriptedSceneProvider(scenes=(TALKING, "Gaming"), current="Gaming")
+    session = ScriptedModel(*bodies)
+    brain_settings = copy_settings(VALID_SETTINGS)
+    brain_settings["delivery"] = copy.deepcopy(dict(delivery))
+    brain_settings.update(
+        {
+            "_session_factory": lambda: session,
+            "_sleeper": clock.sleep,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    )
+    available: dict[str, dict[str, Any]] = {
+        AUDIO_OUTPUT: {
+            "synthesis": {
+                "endpoint": SPEECH_ENDPOINT,
+                "model": SPEECH_MODEL,
+                "api_key": "",
+                "probe": False,
+                **(synthesis or {}),
+            },
+            "voices": {"allowed": ["narrator"], "default": "narrator"},
+            "outputs": {"speakers": {"player": {"argv": list(player_argv)}}},
+            "default_output": "speakers",
+            "clips": {CHIME: {"path": str(clip)}},
+            "_synthesis_transport": speech,
+            "_player_runner": runner,
+            "_sleeper": clock.sleep,
+        },
+        STREAM_CONTROL: {
+            "scenes": {"provider": {"kind": "scripted"}, "allowed": [TALKING]},
+            "polls": {"enabled": False},
+            "_scene_provider": scenes,
+            "_sleeper": clock.sleep,
+            "_wall_clock": clock,
+        },
+        PROXY: {
+            "listen": {"host": "127.0.0.1", "port": 8765},
+            "pairing_token": PROXY_TOKEN,
+            "actions": [AUDIO_SPEAK],
+            "_sleeper": clock.sleep,
+            "_wall_clock": lambda: 1_700_000_000.0,
+            "diagnostic_reporter": diagnostics.append,
+            "limits": {"attachments": dict(PROXY_STORE_LIMITS)},
+        },
+    }
+    names = [*enabled, MODULE_NAME]
+    shipped = ModuleLoader(context.bus, SHIPPED_MODULES, context=context, environ={})
+    activations = await shipped.activate_enabled(
+        {
+            "enabled_modules": names,
+            "modules": {
+                name: (brain_settings if name == MODULE_NAME else available[name]) for name in names
+            },
+        }
+    )
+    handles = {activation.name: activation.handle for activation in activations}
+    brain = handles.pop(MODULE_NAME)
+    handles = {"fakeplatform": platform.handle, **handles}
+    for handle in handles.values():
+        await handle.prepare()
+    await brain.prepare()
+    return Phase2Harness(
+        context=context,
+        clock=clock,
+        brain=brain,
+        platform=platform.handle,
+        effects=None,
+        session=session,
+        transport=transport,
+        diagnostics=diagnostics,
+        settings=brain_settings,
+        handles=handles,
+        speech=speech,
+        runner=runner,
+        scenes=scenes,
+        proxy=handles.get(PROXY),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# AC6 — fixed lists over the real modules
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac6_chat_write_then_audio_speak_writes_and_speaks_the_one_final_answer(
+    tmp_path: Path,
+) -> None:
+    """AC6 (R2): ``[{chat.write, text}, {audio.speak, text}]`` — one final
+    answer, ``deliveries == [{chat.write, text: true, success}, {audio.speak,
+    text: true, success}]``, exactly 1 chat send, exactly 1 synthesis request
+    whose ``input`` is the final text, one player that received the whole
+    synthesised WAV, memory written once with the answer."""
+
+    harness = await activate_phase2(
+        final(T),
+        delivery={"mode": "fixed", "actions": [chat_entry(), speak_entry()]},
+        clip_dir=tmp_path,
+        speech_answers=(SPEECH_BODY,),
+    )
+    try:
+        assert harness.resolved() == {
+            "default": [CHAT_WRITE, AUDIO_SPEAK], "overrides": {}, "ignored": []
+        }
+        record = await harness.ask()
+        run = record.run_id
+
+        assert harness.deliveries() == [
+            delivery_entry(CHAT_WRITE, f"{run}/call-1", True, "success"),
+            delivery_entry(AUDIO_SPEAK, f"{run}/call-2", True, "success"),
+        ]
+        assert harness.executor_calls() == [
+            (CHAT_WRITE, f"{run}/call-1"), (AUDIO_SPEAK, f"{run}/call-2")
+        ]
+        (send,) = harness.platform.sends
+        assert send["text"] == T
+        (request,) = harness.speech.requests
+        assert request["json"]["input"] == T
+        assert request["json"]["voice"] == "narrator"
+        assert harness.runner.starts == [PLAYER_ARGV]
+        assert harness.runner.received == SPEECH_BODY
+        spoken = harness.outcome(f"{run}/call-2")
+        assert spoken.result["playback"] == "completed"
+        assert spoken.result["duration_ms"] == spoken.result["played_ms"] == 1500
+        assert (record.status, record.delivery, record.sends) == ("success", "success", 2)
+        completed = harness.completed()
+        assert (completed["delivery"], completed["action_calls"]) == ("success", 2)
+        assert len(harness.session.requests()) == 1
+        assert harness.tools() == [[CHAT_READ]]
+        assert harness.memory() == [T]
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac6_chat_write_then_audio_play_plays_the_clip_without_the_text(
+    tmp_path: Path,
+) -> None:
+    """AC6 (R2): ``[{chat.write, text}, {audio.play, none, arguments: {sound:
+    chime}}]`` — the play entry is ``text: false`` and its call carries
+    exactly ``{sound: chime}``; the clip is played (1 player start, the
+    clip's bytes), 0 synthesis requests, 1 chat send, both ``success``."""
+
+    harness = await activate_phase2(
+        final(T),
+        delivery={"mode": "fixed", "actions": [chat_entry(), chime_entry()]},
+        clip_dir=tmp_path,
+    )
+    try:
+        record = await harness.ask()
+        run = record.run_id
+
+        assert harness.deliveries() == [
+            delivery_entry(CHAT_WRITE, f"{run}/call-1", True, "success"),
+            delivery_entry(AUDIO_PLAY, f"{run}/call-2", False, "success"),
+        ]
+        played = harness.outcome(f"{run}/call-2")
+        assert played.result["sound"] == CHIME
+        assert played.result["playback"] == "completed"
+        assert played.result["duration_ms"] == 500
+        assert harness.runner.starts == [PLAYER_ARGV]
+        assert harness.runner.received == CHIME_CLIP
+        assert T.encode("utf-8") not in harness.runner.received
+        assert harness.speech.requests == []
+        (send,) = harness.platform.sends
+        assert send["text"] == T
+        assert (record.status, record.delivery, record.sends) == ("success", "success", 1)
+        assert harness.memory() == [T]
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac6_a_scene_only_list_sets_the_scene_once_and_succeeds(tmp_path: Path) -> None:
+    """AC6 (R2): ``[{stream.scene.set, none, arguments: {scene: Talking}}]``
+    with the scripted scene provider — exactly one set command, for
+    ``Talking``; ``delivery == "success"``; no text left anywhere (0 sends,
+    0 synthesis requests, 0 player starts) and, no entry having received the
+    text, nothing memorised."""
+
+    harness = await activate_phase2(
+        final(T),
+        delivery={"mode": "fixed", "actions": [talking_entry()]},
+        clip_dir=tmp_path,
+    )
+    try:
+        record = await harness.ask()
+        run = record.run_id
+
+        assert harness.scenes.sets == [TALKING]
+        assert harness.scenes.current == TALKING
+        assert harness.deliveries() == [
+            delivery_entry(SCENE_SET, f"{run}/call-1", False, "success")
+        ]
+        switched = harness.outcome(f"{run}/call-1")
+        assert (switched.result["scene"], switched.result["previous_scene"]) == (TALKING, "Gaming")
+        assert harness.completed()["delivery"] == "success"
+        assert (record.status, record.delivery, record.sends) == ("success", "success", 0)
+        assert harness.platform.sends == []
+        assert harness.speech.requests == []
+        assert harness.runner.starts == []
+        assert harness.memory() == []
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC7 — mode `modules`, a module not ready, an uncertain speech
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "expected"),
+    [
+        ((AUDIO_OUTPUT, STREAM_CONTROL), AC7_RESOLVED),
+        ((STREAM_CONTROL, AUDIO_OUTPUT), [CHAT_WRITE, AUDIO_SPEAK, SCENE_SET, AUDIO_PLAY]),
+    ],
+    ids=["audio-then-scenes", "scenes-then-audio"],
+)
+async def test_ac7_modules_mode_resolves_preferred_first_then_catalog_order(
+    tmp_path: Path, enabled: tuple[str, ...], expected: list[str]
+) -> None:
+    """AC7 (R2): with the platform, ``audio_output`` and ``stream_control``
+    enabled and ``preference: [chat.write, audio.speak]``, one
+    ``brain.delivery.resolved`` lists ``[chat.write, audio.speak, audio.play,
+    stream.scene.set]`` — ``stream.poll.create`` (declared, no delivery
+    capability) and ``chat.read`` absent. The remaining entries follow the
+    catalog order: enabling ``stream_control`` first puts the scene before
+    the clip. The run invokes every entry in that order, the text to the two
+    text entries only; a derived effect entry carries no constant, so its
+    call is refused by the executor's argument check (phase 1 rule, AC52)."""
+
+    harness = await activate_phase2(
+        final(T),
+        delivery={"mode": "modules", "preference": list(AC7_PREFERENCE)},
+        clip_dir=tmp_path,
+        enabled=enabled,
+        speech_answers=(SPEECH_BODY,),
+    )
+    try:
+        assert harness.resolved() == {"default": expected, "overrides": {}, "ignored": []}
+        assert POLL_CREATE in harness.context.actions.discovered()
+        record = await harness.ask()
+        run = record.run_id
+
+        assert harness.executor_calls() == [
+            (action, f"{run}/call-{index}") for index, action in enumerate(expected, start=1)
+        ]
+        statuses = {entry["action"]: (entry["text"], entry["status"]) for entry in harness.deliveries()}
+        assert statuses == {
+            CHAT_WRITE: (True, "success"),
+            AUDIO_SPEAK: (True, "success"),
+            AUDIO_PLAY: (False, "error"),
+            SCENE_SET: (False, "error"),
+        }
+        (request,) = harness.speech.requests
+        assert request["json"]["input"] == T
+        assert harness.runner.starts == [PLAYER_ARGV]
+        assert harness.scenes.sets == []
+        (send,) = harness.platform.sends
+        assert send["text"] == T
+        assert harness.memory() == [T]
+        assert len(events_of(harness.bus, TRACE_DELIVERY_RESOLVED)) == 1
+    finally:
+        await harness.close()
+
+
+async def run_ac7_modules_list(harness: Phase2Harness) -> tuple[Any, dict[str, Any]]:
+    """Run the AC7 list; the record and each entry's ``(status, code)``."""
+
+    assert harness.resolved()["default"] == AC7_RESOLVED
+    record = await harness.ask()
+    outcomes: dict[str, Any] = {}
+    for entry in harness.deliveries():
+        observation = harness.outcome(entry["call_id"])
+        code = None if observation.error is None else observation.error["code"]
+        outcomes[entry["action"]] = (entry["status"], code)
+    return record, outcomes
+
+
+@pytest.mark.asyncio
+async def test_ac7_audio_output_not_ready_refuses_speech_and_keeps_the_other_outcomes(
+    tmp_path: Path,
+) -> None:
+    """AC7 (R2, R8): ``audio_output`` whose only player resolves to no
+    executable is not ready (its probe sends nothing: there is no output to
+    verify); the ``audio.speak`` entry is ``refused provider_not_ready`` and
+    reaches no provider, every other entry keeps the outcome it has when the
+    module is ready, and — a text entry not having succeeded — conversation
+    memory is not written (phase 1 rule)."""
+
+    ready = await activate_phase2(
+        final(T),
+        delivery={"mode": "modules", "preference": list(AC7_PREFERENCE)},
+        clip_dir=tmp_path,
+        speech_answers=(SPEECH_BODY,),
+    )
+    try:
+        _record, baseline = await run_ac7_modules_list(ready)
+        assert baseline[AUDIO_SPEAK] == ("success", None)
+    finally:
+        await ready.close()
+
+    harness = await activate_phase2(
+        final(T),
+        delivery={"mode": "modules", "preference": list(AC7_PREFERENCE)},
+        clip_dir=tmp_path,
+        synthesis={"probe": True},
+        player_argv=[str(tmp_path / "no-such-player"), "-"],
+    )
+    try:
+        assert not harness.context.actions.is_ready(AUDIO_OUTPUT)
+        assert AUDIO_SPEAK not in harness.context.actions.registered_ready()
+        record, outcomes = await run_ac7_modules_list(harness)
+
+        assert outcomes[AUDIO_SPEAK] == ("refused", ERROR_PROVIDER_NOT_READY)
+        assert {action: outcomes[action] for action in outcomes if action != AUDIO_SPEAK} == {
+            action: baseline[action] for action in baseline if action != AUDIO_SPEAK
+        }
+        assert [entry["action"] for entry in harness.deliveries()] == AC7_RESOLVED
+        assert harness.speech.requests == []
+        assert harness.runner.starts == []
+        (send,) = harness.platform.sends
+        assert send["text"] == T
+        assert record.sends == 1
+        assert record.delivery != "success"
+        assert harness.memory() == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac7_a_failed_speech_probe_fails_the_speech_entry_and_writes_no_memory(
+    tmp_path: Path,
+) -> None:
+    """AC7 (R2), the failed-probe case: the probe synthesis raising leaves
+    ``audio.speak`` unbound while ``audio.play`` stays bound, so the module
+    itself stays ready; the speech entry reaches no provider (no request
+    past the probe, no player), the other entries keep their outcomes and
+    memory is not written.
+
+    The code is the executor's ``error no_provider``, not the ``refused
+    provider_not_ready`` AC7 names for this cause: readiness is per module
+    in the registry, and ``audio_output`` binds ``audio.play`` — the
+    deviation P9 pinned in ``test_a_failing_probe_leaves_speak_unbound_and_
+    play_bound`` and reported; it is asserted here as observed so the delivery
+    list's behaviour on that path is fixed either way (see the P17 report)."""
+
+    harness = await activate_phase2(
+        final(T),
+        delivery={"mode": "modules", "preference": list(AC7_PREFERENCE)},
+        clip_dir=tmp_path,
+        synthesis={"probe": True},
+        speech_answers=(ConnectionError("speech endpoint unreachable"),),
+    )
+    try:
+        assert harness.context.actions.is_ready(AUDIO_OUTPUT)
+        assert AUDIO_SPEAK not in harness.context.actions.registered_ready()
+        assert AUDIO_PLAY in harness.context.actions.registered_ready()
+        assert len(harness.speech.requests) == 1  # the probe, never played
+        record, outcomes = await run_ac7_modules_list(harness)
+
+        assert outcomes == {
+            CHAT_WRITE: ("success", None),
+            AUDIO_SPEAK: ("error", ERROR_NO_PROVIDER),
+            AUDIO_PLAY: ("error", ERROR_INVALID_ARGUMENTS),
+            SCENE_SET: ("error", ERROR_INVALID_ARGUMENTS),
+        }
+        assert len(harness.speech.requests) == 1
+        assert harness.runner.starts == []
+        assert record.sends == 1
+        assert harness.memory() == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac7_an_uncertain_speech_across_a_dropped_proxy_is_never_memorised(
+    tmp_path: Path,
+) -> None:
+    """AC7 (R2, R5): ``[{chat.write, text}, {audio.speak, text}]`` with
+    ``audio.speak`` served by the shipped ``proxy`` for a paired agent; the
+    connection drops after the ``call`` frame carrying the final text, so the
+    speech entry ends ``external_unknown`` (``proxy_disconnected``) while the
+    chat entry keeps its ``success`` — and the answer is never memorised as
+    a confirmed send."""
+
+    from test_proxy import Agent as ProxyAgent, audio_speak_spec
+
+    harness = await activate_phase2(
+        final(T),
+        delivery={"mode": "fixed", "actions": [chat_entry(), speak_entry()]},
+        clip_dir=tmp_path,
+        enabled=(PROXY,),
+    )
+    agent: Any = None
+    asking: asyncio.Task[Any] | None = None
+    try:
+        assert harness.resolved()["default"] == [CHAT_WRITE, AUDIO_SPEAK]
+        pair = MemoryWebSocketPair()
+        handler = asyncio.create_task(harness.proxy.connection_handler(pair.server))
+        agent = ProxyAgent(None, pair, handler)
+        welcome = await agent.pair_up(token=PROXY_TOKEN, specs=(audio_speak_spec(),))
+        assert welcome["actions"] == [AUDIO_SPEAK] and agent.mismatches == []
+
+        asking = asyncio.create_task(harness.ask())
+        # Bounded: a delivery that never emits the frame fails here, not hangs.
+        call = await asyncio.wait_for(agent.call_frame(), timeout=5)
+        assert call["action_name"] == AUDIO_SPEAK
+        assert call["arguments"] == {"text": T}
+        pair.drop()
+        record = await asking
+        run = record.run_id
+
+        assert harness.deliveries() == [
+            delivery_entry(CHAT_WRITE, f"{run}/call-1", True, "success"),
+            delivery_entry(AUDIO_SPEAK, f"{run}/call-2", True, "external_unknown"),
+        ]
+        spoken = harness.outcome(f"{run}/call-2")
+        assert spoken.error["code"] == PROXY_ERROR_PROXY_DISCONNECTED
+        (send,) = harness.platform.sends
+        assert send["text"] == T
+        assert (record.status, record.delivery, record.sends) == (
+            "external_unknown", "external_unknown", 1
+        )
+        assert harness.completed()["delivery_error"] == PROXY_ERROR_PROXY_DISCONNECTED
+        assert harness.memory() == []
+        await wait_until(handler.done)
+    finally:
+        if asking is not None and not asking.done():
+            asking.cancel()
+            await asyncio.gather(asking, return_exceptions=True)
+        await harness.close()
+        if agent is not None and not agent.handler.done():
+            agent.handler.cancel()
+            await asyncio.gather(agent.handler, return_exceptions=True)
