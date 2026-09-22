@@ -1,12 +1,16 @@
-"""The brain's model adapter (R2, R4; AC8, AC9, AC12, AC15).
+"""The brain's model adapter (R2, R4; AC8, AC9, AC12, AC14, AC15, AC16, AC17).
 
 One Chat Completions adapter: the offered actions travel as tool
 definitions, the answer is classified per decision 2 and never guessed, the
 required backend capabilities are verified by a bounded probe at ``prepare``
 before the readiness barrier (decision 3) — ``audio`` by a third probe
-carrying one generated silent WAV part (R4, AC15) — and an ``image_ref`` part is read
-from the attachment store and encoded **only** while the request body is
-built — the encoded bytes exist in the request body and nowhere else (AC12).
+carrying one generated silent WAV part (R4, AC15) — and an ``image_ref`` or
+``audio_ref`` part is read from the attachment store and encoded **only**
+while the request body is built — the encoded bytes exist in the request
+body and nowhere else (AC12, AC16). Without a verified ``audio`` capability
+an ``audio_ref`` is shown as its transcription text, counted as omitted, or
+ends the run ``capability_missing`` (AC16); an audio part is estimated at 10
+tokens per second (AC17).
 
 The probe runs through the shared ``FakeSession`` of ``conftest``, which
 tells a probe from a scenario request by its body; ``Harness.requests()``
@@ -1237,3 +1241,371 @@ def test_ac15_settings_accept_audio_and_still_refuse_an_unknown_name() -> None:
         "module does not know (known: audio, structured_output, vision)"
     ]
     assert_sanitized(diagnostics)
+
+
+# --------------------------------------------------------------------------- #
+# AC16, AC17, AC14 (tail): an ``audio_ref`` through the whole brain path (R4)
+# --------------------------------------------------------------------------- #
+
+from pathlib import Path  # noqa: E402
+
+from core.actions import AuthorizationRule  # noqa: E402
+from core.contracts import (  # noqa: E402
+    BRAIN_ERROR_ATTACHMENT_EXPIRED,
+    RUN_FAILURE_CAPABILITY_MISSING,
+    WILDCARD,
+    ActionObservation,
+)
+from conftest import trace_texts, wav_bytes  # noqa: E402
+from modules.brain import (  # noqa: E402
+    PRINCIPAL,
+    TRACE_OBSERVATION,
+    _estimate_message_tokens,
+    _estimate_tokens,
+)
+from test_agentic_loop import (  # noqa: E402
+    ALL_GRANTS,
+    CHAT_READ,
+    STORE_LIMITS,
+    activate_loop,
+)
+
+AUDIO_CAPTURE = "audio.capture"
+AUDIO_SCOPE = "audio"
+LISTENER_MODULE = "listener"
+TRANSCRIPT = "the streamer said hello"
+SEGMENT = wav_bytes(0.5, fill=7)
+# The recorder segment the provider reads its bytes from: a path the brain
+# must never repeat in a trace or an event (R4).
+SEGMENT_NAME = "segment-under-test.wav"
+
+AUDIO_CAPTURE_SPEC = ActionSpec(
+    name=AUDIO_CAPTURE,
+    version=1,
+    description="Record a short segment of the stream's audio.",
+    argument_schema={
+        "type": "object",
+        "properties": {"seconds": {"type": "number"}},
+        "required": [],
+        "additionalProperties": False,
+    },
+    result_schema={"type": "object"},
+    nature="read",
+    required_permissions=(AUDIO_CAPTURE,),
+    supported_destinations=(Destination(WILDCARD, WILDCARD, AUDIO_SCOPE),),
+    timeout_seconds=10.0,
+    idempotency="none",
+)
+AUDIO_GRANT = AuthorizationRule(
+    rule_id="brain-audio.capture",
+    action_name=AUDIO_CAPTURE,
+    destination=Destination(WILDCARD, WILDCARD, AUDIO_SCOPE),
+    principals=(PRINCIPAL,),
+    granted_permissions=(AUDIO_CAPTURE,),
+)
+
+
+class AudioCaptureProvider:
+    """An ``audio.capture``-shaped provider: reads its segment from a file,
+    leases the bytes in the run's store and answers one ``audio_ref``."""
+
+    name = "fake-audio-capture"
+
+    def __init__(self, store: AttachmentStore, clock: ManualClock, segment: Path) -> None:
+        self.store = store
+        self.clock = clock
+        self.segment = segment
+        self.transcription: str | None = TRANSCRIPT
+        self.duration_ms = 500
+        self.refs: list[Any] = []
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        invocation.mark_not_emitted()
+        data = self.segment.read_bytes()
+        ref = self.store.put(invocation.call.run_id, data, content_type="audio/wav")
+        self.refs.append(ref)
+        part: dict[str, Any] = {
+            "type": "audio_ref",
+            "attachment_id": ref.attachment_id,
+            "content_type": "audio/wav",
+            "size": ref.size,
+            "duration_ms": self.duration_ms,
+            "sample_rate_hz": 16_000,
+            "channels": 1,
+            "captured_at": self.clock(),
+            "provider_id": self.name,
+        }
+        if self.transcription is not None:
+            part["transcription"] = {
+                "text": self.transcription,
+                "transcribed_at": self.clock(),
+                "provider_id": "fake-stt",
+                "truncated": False,
+            }
+        return ActionObservation(
+            status="success",
+            provenance={"provider": self.name},
+            result={"transcription_status": "ok" if self.transcription else "disabled"},
+            parts=[part],
+        )
+
+
+async def activate_audio(
+    tmp_path: Path, *bodies: Any, required: list[str]
+) -> tuple[Any, AudioCaptureProvider]:
+    """The agentic-loop harness plus ``audio.capture`` in its registry."""
+
+    harness = await activate_loop(
+        *bodies,
+        grants=(*ALL_GRANTS, AUDIO_GRANT),
+        settings_overrides={"capabilities": {"required": required}},
+    )
+    segment = tmp_path / SEGMENT_NAME
+    segment.write_bytes(SEGMENT)
+    provider = AudioCaptureProvider(harness.store, harness.clock, segment)
+    harness.context.actions.register(AUDIO_CAPTURE_SPEC, provider, module=LISTENER_MODULE)
+    harness.context.actions.mark_ready(LISTENER_MODULE)
+    return harness, provider
+
+
+def request_texts(body: dict[str, Any]) -> list[str]:
+    texts: list[str] = []
+    for message in body["messages"]:
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(part["text"] for part in content if part.get("type") == "text")
+    return texts
+
+
+async def test_ac16_a_verified_audio_capability_encodes_the_stored_segment_at_request_time(
+    tmp_path: Path,
+) -> None:
+    """AC16 (R4), ``audio`` verified: the request following the
+    ``audio.capture`` observation carries exactly one ``input_audio`` part,
+    format ``wav``, whose decoded bytes are the stored attachment, followed
+    by the transcription text; no trace or event of the run carries the
+    base64 payload or the segment's filesystem path; the attachment is
+    released once the run ends and ``audio_omitted`` is 0."""
+
+    harness, provider = await activate_audio(
+        tmp_path, tool_call(AUDIO_CAPTURE, {}), final("I heard it."), required=["structured_output", "audio"]
+    )
+    try:
+        assert "audio" in harness.handle.verified_capabilities
+        record = await harness.ask()
+        assert record.status == "success"
+        first, second = harness.requests()
+        assert audio_parts(first) == []
+        (part,) = audio_parts(second)
+        assert part["input_audio"]["format"] == "wav"
+        assert base64.b64decode(part["input_audio"]["data"], validate=True) == SEGMENT
+        (audio_message,) = [
+            message
+            for message in second["messages"]
+            if isinstance(message.get("content"), list)
+            and any(item.get("type") == "input_audio" for item in message["content"])
+        ]
+        assert audio_message["role"] == "user"
+        kinds = [item["type"] for item in audio_message["content"]]
+        assert kinds == ["text", "input_audio", "text"]
+        assert audio_message["content"][2]["text"] == TRANSCRIPT
+        assert not carries_image_part(second)
+
+        (ref,) = provider.refs
+        assert harness.observations()[0]["parts"] == [
+            {
+                "type": "audio_ref",
+                "attachment_id": ref.attachment_id,
+                "content_type": "audio/wav",
+                "size": len(SEGMENT),
+                "duration_ms": 500,
+            }
+        ]
+        payload = part["input_audio"]["data"]
+        texts = trace_texts(harness.bus)
+        assert texts
+        for text in texts:
+            assert payload not in text
+            assert str(tmp_path) not in text
+            assert SEGMENT_NAME not in text
+        rendered = "\n".join(harness.diagnostics)
+        assert payload not in rendered and str(tmp_path) not in rendered
+        assert harness.run_completed()["audio_omitted"] == 0
+        assert harness.store.lookup(ref.attachment_id) is None
+        assert harness.store.object_count == 0
+    finally:
+        await harness.close()
+
+
+async def test_ac16_without_audio_verified_the_transcription_stands_in_and_is_counted_once(
+    tmp_path: Path,
+) -> None:
+    """AC16 (R4), ``audio`` not verified, transcription present: every
+    following request carries the transcription text and 0 audio parts,
+    and ``brain.run.completed`` carries ``audio_omitted: 1`` — one
+    observation counted once, however many requests re-render it."""
+
+    harness, provider = await activate_audio(
+        tmp_path,
+        tool_call(AUDIO_CAPTURE, {}),
+        tool_call(CHAT_READ, {"limit": 2}),
+        final("I read it."),
+        required=["structured_output", "vision"],
+    )
+    try:
+        assert "audio" not in harness.handle.verified_capabilities
+        record = await harness.ask()
+        assert record.status == "success"
+        requests = harness.requests()
+        assert len(requests) == 3
+        for body in requests:
+            assert audio_parts(body) == []
+            assert not carries_audio_part(body)
+        for body in requests[1:]:
+            assert TRANSCRIPT in request_texts(body)
+        completed = harness.run_completed()
+        assert completed["audio_omitted"] == 1
+        (ref,) = provider.refs
+        assert harness.store.lookup(ref.attachment_id) is None
+    finally:
+        await harness.close()
+
+
+async def test_ac16_without_audio_verified_nor_transcription_the_run_ends_capability_missing(
+    tmp_path: Path,
+) -> None:
+    """AC16 (R4), ``audio`` not verified and no transcription: the run ends
+    ``error`` with ``failure: capability_missing``, ``capability: audio``,
+    0 requests for the turn that would have carried it, and the attachment
+    released — the audio is never dropped silently."""
+
+    harness, provider = await activate_audio(
+        tmp_path, tool_call(AUDIO_CAPTURE, {}), final("never"), required=["structured_output"]
+    )
+    provider.transcription = None
+    try:
+        record = await harness.ask()
+        assert record.status == "error"
+        assert len(harness.requests()) == 1
+        completed = harness.run_completed()
+        assert completed["failure"] == RUN_FAILURE_CAPABILITY_MISSING
+        assert completed["capability"] == "audio"
+        assert completed["audio_omitted"] == 0
+        (ref,) = provider.refs
+        assert harness.store.lookup(ref.attachment_id) is None
+        assert harness.store.object_count == 0
+        assert harness.sender.sends == []
+    finally:
+        await harness.close()
+
+
+async def test_ac14_an_audio_lease_expired_before_its_model_turn_ends_the_run(
+    tmp_path: Path,
+) -> None:
+    """AC14 (R4), last clause: an ``audio_ref`` whose lease expired on the
+    clock after the observation was adopted and before the model turn that
+    would use it ends the run ``error`` / ``attachment_expired`` with 0
+    further requests and 0 audio parts sent."""
+
+    harness, provider = await activate_audio(
+        tmp_path, tool_call(AUDIO_CAPTURE, {}), final("never"), required=["structured_output", "audio"]
+    )
+
+    def expire(event: dict[str, Any]) -> None:
+        if event["payload"].get("action") == AUDIO_CAPTURE:
+            harness.clock.advance(STORE_LIMITS["ttl_seconds"] + 1.0)
+
+    harness.bus.subscribe(TRACE_OBSERVATION, expire)
+    try:
+        record = await harness.ask()
+        assert record.status == "error"
+        assert harness.run_completed()["failure"] == BRAIN_ERROR_ATTACHMENT_EXPIRED
+        assert len(harness.requests()) == 1
+        assert audio_parts(harness.requests()[0]) == []
+        (ref,) = provider.refs
+        assert harness.store.lookup(ref.attachment_id) is None
+        assert harness.sender.sends == []
+    finally:
+        await harness.close()
+
+
+def _audio_message(duration_ms: int) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Audio captured by tool call c1:"},
+            {
+                "type": "audio_ref",
+                "attachment_id": "a-1",
+                "content_type": "audio/wav",
+                "size": 96_044,
+                "duration_ms": duration_ms,
+                "sample_rate_hz": 16_000,
+                "channels": 1,
+                "captured_at": 1000.0,
+                "provider_id": "fake-audio-capture",
+            },
+        ],
+    }
+
+
+def test_ac17_an_audio_part_is_estimated_at_ten_tokens_per_second_rounded_up() -> None:
+    """AC17 (R4): read from the reference before encoding, a 3 000 ms part
+    costs exactly 30 tokens, a 3 001 ms part 31; the image estimate is
+    unchanged."""
+
+    bare = _audio_message(3000)
+    bare["content"] = bare["content"][:1]
+    base = _estimate_message_tokens(bare)
+    assert _estimate_message_tokens(_audio_message(3000)) - base == 30
+    assert _estimate_message_tokens(_audio_message(3001)) - base == 31
+    assert _estimate_message_tokens(_audio_message(100)) - base == 1
+
+
+def test_ac17_an_audio_transcription_is_estimated_as_the_text_part_sent_beside_it() -> None:
+    """AC17 (R4): a transcription the adapter sends as a ``text`` part beside
+    the audio is counted too — as that text part would be — on top of the
+    duration estimate, never instead of it."""
+
+    plain = _audio_message(3000)
+    heard = _audio_message(3000)
+    text = "hello chat, this is what was said"
+    heard["content"][1]["transcription"] = {"text": text}
+    assert _estimate_message_tokens(heard) - _estimate_message_tokens(plain) == (
+        _estimate_tokens(text)
+    )
+
+
+async def _estimated_run_tokens(tmp_path: Path, duration_ms: int) -> dict[str, Any]:
+    harness, provider = await activate_audio(
+        tmp_path, tool_call(AUDIO_CAPTURE, {}), final("I heard it."), required=["structured_output", "audio"]
+    )
+    provider.transcription = None
+    provider.duration_ms = duration_ms
+    try:
+        record = await harness.ask()
+        assert record.status == "success"
+        assert len(audio_parts(harness.requests()[1])) == 1
+        return harness.run_completed()
+    finally:
+        await harness.close()
+
+
+async def test_ac17_with_no_usage_reported_the_run_estimate_grows_by_the_audio_duration(
+    tmp_path: Path,
+) -> None:
+    """AC17 (R4) through the run: the scripted backend reports no usage,
+    so the run's tokens are an estimate flagged ``tokens_estimated: true``,
+    and the only difference between otherwise identical runs is the audio
+    part — 3 000 ms adds exactly 30 tokens (6 000 − 3 000), 3 001 ms one
+    more than 3 000 ms."""
+
+    three = await _estimated_run_tokens(tmp_path, 3000)
+    six = await _estimated_run_tokens(tmp_path, 6000)
+    over = await _estimated_run_tokens(tmp_path, 3001)
+    for completed in (three, six, over):
+        assert completed["tokens_estimated"] is True
+    assert six["tokens"] - three["tokens"] == 30
+    assert over["tokens"] - three["tokens"] == 1

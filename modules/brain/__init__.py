@@ -79,7 +79,9 @@ image part for ``vision`` and with one 0.25 s silent WAV audio part for
 never the key, the endpoint or a body — and leaves the module not ready. The
 verified set is :attr:`BrainModule.verified_capabilities`. An ``image_ref``
 part is read from the attachment store and encoded only while a request body
-is built: the bytes exist in that body and nowhere else (AC12).
+is built: the bytes exist in that body and nowhere else (AC12); so is an
+``audio_ref`` part, as one ``wav`` audio input part followed by its
+transcription text (R4, AC16).
 
 **The run** (R1, R2, R3, R4, R5, R8). One admitted work is one agentic
 loop and one terminal delivery step through the
@@ -114,7 +116,10 @@ ending the run ``error`` with ``failure: budget_exhausted`` and
 observation fed back to the model. An ``image_ref`` in a run whose
 verified capabilities lack ``vision`` ends the run ``capability_missing``
 before any request; one whose lease expired before its model turn ends it
-``attachment_expired``. The final response is the terminal step: the
+``attachment_expired``. An ``audio_ref`` in a run whose verified
+capabilities lack ``audio`` is shown as its transcription text and counted
+in ``audio_omitted``, or, with no transcription, ends the run
+``capability_missing`` (R4); an expired one ends it ``attachment_expired``. The final response is the terminal step: the
 text is handed to every entry of the run's resolved delivery list, in
 order, one executor call per entry with call ids continuing the run's
 counter (``<run_id>/call-<n>``), each with its own explicit
@@ -127,7 +132,7 @@ tagged output, no bus republication and no second path: the compatibility
 same send service, and this module never uses it. The run body returns a
 :class:`~core.admission.RunOutcome` — terminal state, delivery outcome
 reported separately, model-call count and correlation (``turns``,
-``action_calls``, ``tokens``, ``tokens_estimated``, ``fallback``,
+``action_calls``, ``tokens``, ``tokens_estimated``, ``fallback``, ``audio_omitted``,
 ``deliveries``, ``delivery``, ``failure``, ``budget``, ``capability``) —
 and publishes **neither** ``brain.run.started`` **nor**
 ``brain.run.completed``: the scheduler is the single emission owner of
@@ -331,7 +336,9 @@ Correlation, the action, the call id (``null`` for a synthetic observation
 the executor never saw), the observation's status and error code, and one
 summary per part: a ``text`` part as its byte count, an ``image_ref`` part
 as ``attachment_id``, ``content_type``, ``size``, ``width`` and ``height``
-(AC12). Never the text itself, never a payload, never a path.
+(AC12), an ``audio_ref`` part as ``attachment_id``, ``content_type``,
+``size`` and ``duration_ms`` (R4). Never the text itself, never a payload,
+never a path.
 """
 
 _INPUT_EVENT = "channel.chat.message"
@@ -357,6 +364,10 @@ _TOKEN_MESSAGE_OVERHEAD = 4
 # no usage: a flat, deliberately high count, since nothing in the bytes says
 # how a backend accounts for an image — an estimate flagged as such (§3.4).
 _TOKEN_IMAGE_ESTIMATE = 512
+
+# What one ``audio_ref`` part is estimated to cost when the backend reports no
+# usage: 10 tokens per second of ``duration_ms``, rounded up (R4, AC17).
+_AUDIO_MS_PER_TOKEN = 100
 
 # The share of ``budget.max_tokens`` retained history may fill: whatever the
 # input leaves is the reply's room, so at least this much is reserved for the
@@ -1670,6 +1681,8 @@ _ROLE_TOOL = "tool"
 # The text that precedes the image parts of an observation in the ``user``
 # message following its tool result, naming the call the images answer.
 _IMAGE_MESSAGE_TEXT = "Image captured by tool call {key}:"
+# The same for the audio parts of an observation (R4).
+_AUDIO_MESSAGE_TEXT = "Audio captured by tool call {key}:"
 
 _ROUTE_SYNTHETIC = "synthetic"
 _ROUTE_EXECUTOR = "executor"
@@ -1689,13 +1702,19 @@ class _TurnEntry:
     a ``user`` message that names the call and carries the references — a
     ``tool`` message accepts text only in the Chat Completions schema, so
     an image placed there would be rejected by a backend enforcing it while
-    the vision probe, sent as ``user``, had passed.
+    the vision probe, sent as ``user``, had passed. Its ``audio_ref`` parts
+    follow in the same way (R4): kept as the references they are, for the
+    adapter to encode, or — ``audio_omitted``, in a run whose verified
+    capabilities lack ``audio`` — each rendered as a ``text`` part holding
+    its transcription text, the omission counted once, when the entry was
+    appended, never per re-rendering.
     """
 
     key: str
     name: str
     arguments: str
     observation: ActionObservation
+    audio_omitted: bool = False
 
     def messages(self) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
@@ -1727,6 +1746,17 @@ class _TurnEntry:
                     ],
                 }
             )
+        audio = _observation_audio(self.observation, omitted=self.audio_omitted)
+        if audio:
+            messages.append(
+                {
+                    "role": _ROLE_USER,
+                    "content": [
+                        {"type": _PART_TEXT, "text": _AUDIO_MESSAGE_TEXT.format(key=self.key)},
+                        *audio,
+                    ],
+                }
+            )
         return messages
 
 
@@ -1739,7 +1769,8 @@ class _Transcript:
     A ``text`` part is rendered into the tool result; an ``image_ref`` part
     is kept as the reference it is, in a ``user`` message that follows the
     tool result — the adapter resolves and encodes it while a request body
-    is built and nowhere else (R2, AC12). The object is
+    is built and nowhere else (R2, AC12); an ``audio_ref`` part likewise
+    (R4). The object is
     a local of the run: it exists from the first turn to the terminal
     outcome and is never retained past it.
     """
@@ -1755,14 +1786,16 @@ class _Transcript:
     def turn_messages(self) -> list[dict[str, Any]]:
         return [message for entry in self.entries for message in entry.messages()]
 
-    def image_parts(self) -> tuple[Mapping[str, Any], ...]:
-        """Every ``image_ref`` part the transcript still references."""
+    def attachment_parts(self) -> tuple[Mapping[str, Any], ...]:
+        """Every ``image_ref`` and ``audio_ref`` part the transcript still
+        references (R2, R4) — an omitted audio part included: its lease is
+        the run's until the run ends, whatever the model was shown."""
 
         return tuple(
             part
             for entry in self.entries
             for part in entry.observation.parts
-            if part.get("type") == _PART_IMAGE_REF
+            if part.get("type") in _ATTACHMENT_PART_TYPES
         )
 
 
@@ -1780,7 +1813,10 @@ class _RunState:
     arguments)`` for the repeated-action budget; ``fallback`` is what the
     run reports under that name, and ``fallback_reason`` the failure that
     calls for a fallback — a spent budget or the delivery reserve — set by
-    the boundary that ended the loop and read once the loop has returned.
+    the boundary that ended the loop and read once the loop has returned;
+    ``audio_omitted`` counts the observations whose audio was shown to the
+    model as its transcription text only, in a run whose verified
+    capabilities lack ``audio`` (R4) — once per observation.
     """
 
     turns: int = 0
@@ -1792,6 +1828,7 @@ class _RunState:
     repeats: dict[tuple[str, str], int] = field(default_factory=dict)
     fallback: str = FALLBACK_NONE
     fallback_reason: str | None = None
+    audio_omitted: int = 0
 
     def correlation(self) -> dict[str, Any]:
         return {
@@ -1800,6 +1837,7 @@ class _RunState:
             "tokens": self.tokens,
             "tokens_estimated": self.tokens_estimated,
             "fallback": self.fallback,
+            "audio_omitted": self.audio_omitted,
         }
 
     def spend(self, reply: "_ModelReply") -> None:
@@ -1922,8 +1960,39 @@ def _observation_images(observation: ActionObservation) -> list[dict[str, Any]]:
     return [dict(part) for part in observation.parts if part.get("type") == _PART_IMAGE_REF]
 
 
+def _observation_audio(observation: ActionObservation, *, omitted: bool) -> list[dict[str, Any]]:
+    """The ``audio_ref`` parts of an observation for the ``user`` message
+    that follows its tool result (R4): copied as the references they are
+    for the adapter to encode, or, *omitted*, each as a ``text`` part
+    holding its transcription text — the only form the model may read in a
+    run whose verified capabilities lack ``audio``."""
+
+    rendered: list[dict[str, Any]] = []
+    for part in observation.parts:
+        if part.get("type") != _PART_AUDIO_REF:
+            continue
+        if not omitted:
+            rendered.append(dict(part))
+            continue
+        text = _transcription_text(part)
+        if text is not None:
+            rendered.append({"type": _PART_TEXT, "text": text})
+    return rendered
+
+
+def _transcription_text(part: Mapping[str, Any]) -> str | None:
+    """The transcription text an ``audio_ref`` carries, if any (R3, R4)."""
+
+    transcription = part.get("transcription")
+    if not isinstance(transcription, Mapping):
+        return None
+    text = transcription.get("text")
+    return text if isinstance(text, str) else None
+
+
 def _part_summaries(parts: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """What a trace says about the parts: sizes and dimensions only (AC12)."""
+    """What a trace says about the parts: sizes, dimensions and durations
+    only (AC12, R4) — never a transcription, a payload or a path."""
 
     summaries: list[dict[str, Any]] = []
     for part in parts:
@@ -1936,6 +2005,16 @@ def _part_summaries(parts: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                     "size": part["size"],
                     "width": part["width"],
                     "height": part["height"],
+                }
+            )
+        elif part.get("type") == _PART_AUDIO_REF:
+            summaries.append(
+                {
+                    "type": _PART_AUDIO_REF,
+                    "attachment_id": part["attachment_id"],
+                    "content_type": part["content_type"],
+                    "size": part["size"],
+                    "duration_ms": part["duration_ms"],
                 }
             )
         elif part.get("type") == _PART_TEXT:
@@ -2297,7 +2376,7 @@ class BrainModule:
                 outcome = await self._fallback_outcome(run, message, state, outcome)
             return outcome
         finally:
-            self._discard_images(transcript.image_parts())
+            self._discard_images(transcript.attachment_parts())
 
     async def _loop(
         self,
@@ -2422,7 +2501,13 @@ class BrainModule:
         (``observation_too_large``, its images released) for a runtime whose
         executor bound is ``None``; an ``image_ref`` in a run whose verified
         capabilities lack ``vision`` ends the run ``capability_missing``
-        without a request and with the image released (R2, AC11). Every
+        without a request and with the image released (R2, AC11). Beside
+        it, an ``audio_ref`` in a run whose verified capabilities lack
+        ``audio`` is shown to the model as its transcription text, the entry
+        appended ``audio_omitted`` and counted once on the run; one with no
+        transcription ends the run ``capability_missing`` (``capability:
+        audio``) without a request and with its attachments released (R4,
+        AC16). Every
         proposal is traced as ``brain.run.observation`` and appended to the
         transcript; every proposal counts one turn, which the model call
         already did.
@@ -2489,12 +2574,29 @@ class BrainModule:
                 RUN_FAILURE_CAPABILITY_MISSING,
                 capability=CAPABILITY_VISION,
             )
+        audio_omitted = False
+        audio = [part for part in observation.parts if part.get("type") == _PART_AUDIO_REF]
+        if audio and CAPABILITY_AUDIO not in self.verified_capabilities:
+            if any(_transcription_text(part) is None for part in audio):
+                self._discard_images(observation.parts)
+                self._diagnose(
+                    "brain run: audio observation without a verified audio capability"
+                )
+                return self._failed(
+                    state,
+                    _STATUS_ERROR,
+                    RUN_FAILURE_CAPABILITY_MISSING,
+                    capability=CAPABILITY_AUDIO,
+                )
+            audio_omitted = True
+            state.audio_omitted += 1
         transcript.append(
             _TurnEntry(
                 key=key,
                 name=name,
                 arguments=_raw_arguments_text(proposal.raw_arguments),
                 observation=observation,
+                audio_omitted=audio_omitted,
             )
         )
         return None
@@ -2540,7 +2642,7 @@ class BrainModule:
         production runtime leaves it ``None`` and the budget is applied
         here, one rule at two possible points. Over the bound, the
         observation becomes a synthetic ``error`` (``observation_too_large``)
-        and every ``image_ref`` it named is released at once (AC47).
+        and every ``image_ref`` or ``audio_ref`` it named is released at once (AC47).
         """
 
         parts = observation.parts
@@ -2558,8 +2660,9 @@ class BrainModule:
             _STATUS_ERROR, BRAIN_ERROR_OBSERVATION_TOO_LARGE, route=_ROUTE_EXECUTOR
         )
 
-    def _expired_image(self, transcript: _Transcript) -> bool:
-        """Whether an ``image_ref`` the transcript carries is no longer leased.
+    def _expired_attachment(self, transcript: _Transcript) -> bool:
+        """Whether an ``image_ref`` or ``audio_ref`` the transcript carries is
+        no longer leased.
 
         Looked up on the clock, now, before the request is built (R4, AC24):
         a lease past its deadline, or one the store already reaped, ends the
@@ -2572,7 +2675,7 @@ class BrainModule:
         if store is None:
             return False
         now = self._clock()
-        for part in transcript.image_parts():
+        for part in transcript.attachment_parts():
             try:
                 ref = store.lookup(part["attachment_id"])
             except Exception:
@@ -2580,6 +2683,10 @@ class BrainModule:
             if ref is None or now >= ref.expires_at:
                 return True
         return False
+
+    # The name :meth:`_loop` calls: that method carries no hunk of phase 2
+    # (AC7), so its call site keeps the phase 1 name of the same rule.
+    _expired_image = _expired_attachment
 
     async def _trace_observation(
         self,
@@ -3146,7 +3253,8 @@ class BrainModule:
         return observation
 
     def _discard_images(self, parts: Sequence[Mapping[str, Any]]) -> None:
-        """Release every ``image_ref`` of *parts* from the store, if any.
+        """Release every ``image_ref`` and ``audio_ref`` of *parts* from the
+        store, if any (R2, R4).
 
         Idempotent with the run-end release — the store drops an object
         exactly once — and a no-op for a reference it no longer holds. A
@@ -3159,12 +3267,12 @@ class BrainModule:
         if store is None:
             return
         for part in parts:
-            if part.get("type") != _PART_IMAGE_REF:
+            if part.get("type") not in _ATTACHMENT_PART_TYPES:
                 continue
             try:
                 store.discard(part["attachment_id"])
             except Exception:
-                self._diagnose("brain attachments: image release failed")
+                self._diagnose("brain attachments: attachment release failed")
 
     # -- shutdown phases --------------------------------------------------- #
 
@@ -3243,7 +3351,10 @@ class BrainModule:
 
 _PART_TEXT = "text"
 _PART_IMAGE_REF = "image_ref"
+_PART_AUDIO_REF = "audio_ref"
 _PART_IMAGE_URL = "image_url"
+# The reference parts whose bytes live in the attachment store (R2, R4).
+_ATTACHMENT_PART_TYPES = frozenset({_PART_IMAGE_REF, _PART_AUDIO_REF})
 
 _TOOL_CHOICE_AUTO = "auto"
 
@@ -3333,7 +3444,7 @@ _UNSUPPORTED_MALFORMED_TOOL_CALL = "malformed_tool_call"
 _UNSUPPORTED_NO_CONTENT = "no_content"
 _UNSUPPORTED_MALFORMED_BODY = "malformed_body"
 
-# Failures of a request whose image part could not be read from the store.
+# Failures of a request whose attachment part could not be read from the store.
 _FAILURE_ATTACHMENT_UNAVAILABLE = "attachment_unavailable"
 # The request failures the loop maps onto a run status or a budget (R3).
 _FAILURE_TIMED_OUT = "timed_out"
@@ -3372,8 +3483,8 @@ class _Unsupported:
 class _Prompt:
     """The composed request: messages, offered tools, the token room left.
 
-    ``messages`` may carry list content whose parts are ``text`` or
-    ``image_ref`` (an :class:`~core.contracts.ActionObservation` part, by
+    ``messages`` may carry list content whose parts are ``text``,
+    ``image_ref`` or ``audio_ref`` (an :class:`~core.contracts.ActionObservation` part, by
     ``attachment_id``); the reference is all this object ever holds — the
     bytes are read and encoded by the adapter for the request and nowhere
     else (R2, AC12). ``tools`` are the offered action specs, rendered as tool
@@ -3431,12 +3542,15 @@ class _OverBudgetResponse(Exception):
         self.estimated = estimated
 
 
-class _ImageUnavailable(Exception):
-    """An ``image_ref`` part the store could not serve at request time."""
+class _AttachmentUnavailable(Exception):
+    """An ``image_ref`` or ``audio_ref`` part the store could not serve at
+    request time."""
 
-    def __init__(self, failure: str) -> None:
+    def __init__(self, failure: str, kind: str = "image") -> None:
         super().__init__(failure)
         self.failure = failure
+        self.kind = kind
+
 
 
 class _ModelAdapter:
@@ -3625,8 +3739,8 @@ class _ModelAdapter:
         room = self._budget.max_tokens if token_room is None else token_room
         try:
             body = self._request_body(prompt)
-        except _ImageUnavailable as unavailable:
-            self._diagnose("brain model request: image attachment unavailable")
+        except _AttachmentUnavailable as unavailable:
+            self._diagnose(f"brain model request: {unavailable.kind} attachment unavailable")
             return _ModelReply(failure=unavailable.failure)
         try:
             answer = await self._bounded(self._post(body), budget_seconds)
@@ -3645,7 +3759,7 @@ class _ModelAdapter:
             self._diagnose("brain model request: transport failed")
             return _ModelReply(failure="transport_failed")
         finally:
-            # The encoded image, if any, lived in this body and nowhere else.
+            # The encoded attachments, if any, lived in this body and nowhere else.
             del body
 
         classification = _classify(answer)
@@ -3683,21 +3797,51 @@ class _ModelAdapter:
         content = message.get("content")
         if not isinstance(content, (list, tuple)):
             return dict(message)
-        return {**message, "content": [self._encode_part(part) for part in content]}
+        return {
+            **message,
+            "content": [encoded for part in content for encoded in self._encode_part(part)],
+        }
 
-    def _encode_part(self, part: Any) -> Any:
+    def _encode_part(self, part: Any) -> list[Any]:
+        """The request parts one transcript part becomes, encoded now.
+
+        An ``image_ref`` becomes one ``image_url`` data URL (R2); an
+        ``audio_ref`` one ``input_audio`` part of the stored WAV bytes,
+        followed by a ``text`` part holding its transcription text when it
+        carries one (R4). Both are resolved from the store here and nowhere
+        earlier.
+        """
+
         if not isinstance(part, Mapping):
-            return part
+            return [part]
         kind = part.get("type")
         if kind == _PART_TEXT:
-            return {"type": _PART_TEXT, "text": part.get("text", "")}
+            return [{"type": _PART_TEXT, "text": part.get("text", "")}]
         if kind == _PART_IMAGE_REF:
-            content_type, data = self._resolve_image(part.get("attachment_id"))
-            return {"type": _PART_IMAGE_URL, "image_url": {"url": _data_url(content_type, data)}}
-        return dict(part)
+            content_type, data = self._resolve_attachment(part.get("attachment_id"), kind="image")
+            return [
+                {"type": _PART_IMAGE_URL, "image_url": {"url": _data_url(content_type, data)}}
+            ]
+        if kind == _PART_AUDIO_REF:
+            _, data = self._resolve_attachment(part.get("attachment_id"), kind="audio")
+            encoded: list[Any] = [
+                {
+                    "type": _PART_INPUT_AUDIO,
+                    "input_audio": {
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "format": _AUDIO_FORMAT_WAV,
+                    },
+                }
+            ]
+            text = _transcription_text(part)
+            if text is not None:
+                encoded.append({"type": _PART_TEXT, "text": text})
+            return encoded
+        return [dict(part)]
 
-    def _resolve_image(self, attachment_id: Any) -> tuple[str, bytes]:
-        """The bytes behind an ``image_ref``, read from the store now (R2).
+    def _resolve_attachment(self, attachment_id: Any, *, kind: str = "image") -> tuple[str, bytes]:
+        """The bytes behind an ``image_ref`` or ``audio_ref``, read from the
+        store now (R2, R4).
 
         Read at request time and never earlier: a lease that expired since
         the observation was appended is ``attachment_expired`` here, not a
@@ -3707,23 +3851,23 @@ class _ModelAdapter:
 
         store = self._attachments
         if store is None or not isinstance(attachment_id, str):
-            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE)
+            raise _AttachmentUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE, kind)
         try:
             ref = store.lookup(attachment_id)
         except Exception:
-            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE) from None
+            raise _AttachmentUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE, kind) from None
         if ref is None:
-            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE)
+            raise _AttachmentUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE, kind)
         if self._clock() >= ref.expires_at:
-            raise _ImageUnavailable(BRAIN_ERROR_ATTACHMENT_EXPIRED)
+            raise _AttachmentUnavailable(BRAIN_ERROR_ATTACHMENT_EXPIRED, kind)
         try:
             data = store.get(ref)
         except AttachmentExpired:
-            raise _ImageUnavailable(BRAIN_ERROR_ATTACHMENT_EXPIRED) from None
+            raise _AttachmentUnavailable(BRAIN_ERROR_ATTACHMENT_EXPIRED, kind) from None
         except Exception:
-            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE) from None
+            raise _AttachmentUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE, kind) from None
         if not isinstance(data, (bytes, bytearray)):
-            raise _ImageUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE)
+            raise _AttachmentUnavailable(_FAILURE_ATTACHMENT_UNAVAILABLE, kind)
         return str(ref.content_type), bytes(data)
 
     # -- the wire ---------------------------------------------------------- #
@@ -4122,8 +4266,11 @@ def _estimate_message_tokens(message: Mapping[str, Any]) -> int:
 
     String content is measured as text; list content part by part — a
     ``text`` part as its text, an ``image_ref`` part as the flat
-    :data:`_TOKEN_IMAGE_ESTIMATE`; an assistant tool call as its name and
-    the arguments it echoes. Nothing in the transcript costs nothing.
+    :data:`_TOKEN_IMAGE_ESTIMATE`, an ``audio_ref`` part — read from the
+    reference, before encoding — as 10 tokens per second of its
+    ``duration_ms``, rounded up (R4, AC17), plus its transcription text, if
+    any, as the ``text`` part the adapter sends beside it; an assistant tool
+    call as its name and the arguments it echoes. Nothing in the transcript costs nothing.
     """
 
     content = message.get("content")
@@ -4136,6 +4283,11 @@ def _estimate_message_tokens(message: Mapping[str, Any]) -> int:
                 continue
             if part.get("type") == _PART_IMAGE_REF:
                 tokens += _TOKEN_IMAGE_ESTIMATE
+            elif part.get("type") == _PART_AUDIO_REF:
+                tokens += _audio_token_estimate(part)
+                transcription = _transcription_text(part)
+                if transcription is not None:
+                    tokens += _estimate_tokens(transcription)
             else:
                 tokens += _estimate_tokens(str(part.get("text", "")))
     else:
@@ -4147,6 +4299,15 @@ def _estimate_message_tokens(message: Mapping[str, Any]) -> int:
                 str(function.get("name", "")) + str(function.get("arguments", ""))
             )
     return tokens
+
+
+def _audio_token_estimate(part: Mapping[str, Any]) -> int:
+    """One ``audio_ref`` part's estimate: ``ceil(duration_ms / 100)`` tokens."""
+
+    duration = part.get("duration_ms")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
+        return 0
+    return math.ceil(duration / _AUDIO_MS_PER_TOKEN)
 
 
 def _estimate_tool_tokens(tools: Sequence[Any]) -> int:
