@@ -59,6 +59,32 @@ def _image(size: int) -> dict:
     }
 
 
+def _transcription(text: str = "hello chat") -> dict:
+    return {
+        "text": text,
+        "transcribed_at": 101.5,
+        "provider_id": "audio_input",
+        "truncated": False,
+    }
+
+
+def _audio(size: int, *, transcription: dict | None = None) -> dict:
+    part = {
+        "type": "audio_ref",
+        "attachment_id": "att-audio-1",
+        "content_type": "audio/wav",
+        "size": size,
+        "duration_ms": 3_000,
+        "sample_rate_hz": 16_000,
+        "channels": 1,
+        "captured_at": 100.0,
+        "provider_id": "audio_input",
+    }
+    if transcription is not None:
+        part["transcription"] = transcription
+    return part
+
+
 # --------------------------------------------------------------------------- #
 # observation_size (R4, AC47)
 # --------------------------------------------------------------------------- #
@@ -109,10 +135,205 @@ def test_ac47_arithmetic_against_the_default_bound() -> None:
     )
 
 
+def test_observation_size_adds_each_audio_ref_size() -> None:
+    # AC13: a text part of 100 UTF-8 bytes plus an audio_ref of 96 044 bytes.
+    assert observation_size([_text(100), _audio(96_044)]) == 96_144
+    # Duration, rate, channels, timestamps and the transcription never count.
+    heard = _audio(10, transcription=_transcription(text="x" * 5_000))
+    heard["duration_ms"] = 10_000_000
+    assert observation_size([heard]) == 10
+    assert observation_size([_text(1), _image(2), _audio(3)]) == 6
+
+
 def test_observation_size_refuses_an_unknown_part_rather_than_skipping_it() -> None:
     with pytest.raises(ContractError) as refused:
         observation_size([_text(1), {"type": "audio", "size": 10}])
     assert refused.value.field == "ActionObservation.parts[1].type"
+
+
+# --------------------------------------------------------------------------- #
+# The audio_ref part (phase 2 R4, AC13)
+# --------------------------------------------------------------------------- #
+
+
+def _field(refused: pytest.ExceptionInfo) -> str:
+    return refused.value.field
+
+
+@pytest.mark.parametrize("with_transcription", [False, True])
+def test_audio_ref_with_the_eight_fields_is_accepted(with_transcription: bool) -> None:
+    part = _audio(96_044, transcription=_transcription() if with_transcription else None)
+    (frozen,) = contracts.validate_parts([part])
+    assert frozen == part
+    assert set(frozen) - {"type", "transcription"} == set(contracts.AUDIO_REF_FIELDS)
+    with pytest.raises(TypeError):
+        frozen["size"] = 1  # type: ignore[index]
+    if with_transcription:
+        # The nested mapping is frozen too, not shared with the caller.
+        with pytest.raises(TypeError):
+            frozen["transcription"]["text"] = "changed"  # type: ignore[index]
+        part["transcription"]["text"] = "mutated after validation"
+        assert frozen["transcription"]["text"] == "hello chat"
+    observation = ActionObservation("success", {"p": 1}, None, None, [part])
+    assert observation.parts[0]["type"] == "audio_ref"
+
+
+def test_a_transcription_needs_only_text_and_transcribed_at() -> None:
+    minimal = _audio(10, transcription={"text": "", "transcribed_at": 101})
+    contracts.validate_parts([minimal])
+
+
+def test_audio_ref_fields_are_the_eight_of_r4() -> None:
+    assert contracts.AUDIO_REF_FIELDS == (
+        "attachment_id",
+        "content_type",
+        "size",
+        "duration_ms",
+        "sample_rate_hz",
+        "channels",
+        "captured_at",
+        "provider_id",
+    )
+    assert contracts.AUDIO_TRANSCRIPTION_FIELDS == (
+        "text",
+        "transcribed_at",
+        "provider_id",
+        "truncated",
+    )
+    assert contracts.AUDIO_CONTENT_TYPES == {"audio/wav"}
+    assert contracts.ATTACHMENT_CONTENT_TYPES == {"image/png", "image/jpeg", "audio/wav"}
+    assert contracts.PART_TYPE_AUDIO_REF == "audio_ref"
+
+
+@pytest.mark.parametrize("missing", contracts.AUDIO_REF_FIELDS)
+def test_audio_ref_missing_any_field_is_rejected_naming_it(missing: str) -> None:
+    part = _audio(10)
+    del part[missing]
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([part])
+    assert _field(refused) == f"ActionObservation.parts[0].{missing}"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("content_type", "audio/mpeg"),
+        ("content_type", "image/png"),
+        ("content_type", None),
+        ("duration_ms", 0),
+        ("duration_ms", -1),
+        ("duration_ms", True),
+        ("duration_ms", 1.5),
+        ("size", 0),
+        ("size", False),
+        ("size", "96044"),
+        ("sample_rate_hz", 0),
+        ("sample_rate_hz", True),
+        ("channels", -1),
+        ("channels", True),
+        ("captured_at", float("nan")),
+        ("captured_at", float("inf")),
+        ("captured_at", True),
+        ("captured_at", "100"),
+        ("attachment_id", ""),
+        ("attachment_id", 7),
+        ("provider_id", "  "),
+        ("provider_id", None),
+    ],
+)
+def test_audio_ref_mistyped_field_is_rejected_naming_it(name: str, value: object) -> None:
+    part = _audio(10)
+    part[name] = value
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([part])
+    assert _field(refused) == f"ActionObservation.parts[0].{name}"
+
+
+@pytest.mark.parametrize("unknown", ["width", "path", "data", "bytes"])
+def test_audio_ref_unknown_key_is_rejected_naming_it(unknown: str) -> None:
+    part = _audio(10)
+    part[unknown] = 1
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([part])
+    assert _field(refused) == f"ActionObservation.parts[0].{unknown}"
+
+
+@pytest.mark.parametrize("missing", ["text", "transcribed_at"])
+def test_transcription_missing_a_required_field_is_rejected_naming_it(missing: str) -> None:
+    transcription = _transcription()
+    del transcription[missing]
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([_audio(10, transcription=transcription)])
+    assert _field(refused) == f"ActionObservation.parts[0].transcription.{missing}"
+
+
+@pytest.mark.parametrize("value", ["hello", ["hello"], None, 3])
+def test_non_mapping_transcription_is_rejected_naming_it(value: object) -> None:
+    part = _audio(10)
+    part["transcription"] = value
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([part])
+    assert _field(refused) == "ActionObservation.parts[0].transcription"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("text", None),
+        ("text", 12),
+        ("transcribed_at", float("nan")),
+        ("transcribed_at", True),
+        ("transcribed_at", "101"),
+        ("provider_id", ""),
+        ("provider_id", 1),
+        ("truncated", "no"),
+        ("truncated", 0),
+        ("language", "fr"),
+    ],
+)
+def test_transcription_mistyped_or_unknown_field_is_rejected_naming_it(
+    name: str, value: object
+) -> None:
+    transcription = _transcription()
+    transcription[name] = value
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([_audio(10, transcription=transcription)])
+    assert _field(refused) == f"ActionObservation.parts[0].transcription.{name}"
+
+
+def test_image_ref_rules_are_unchanged_by_the_audio_part() -> None:
+    contracts.validate_parts([_image(10)])
+    # An image_ref cannot borrow the audio content type or the audio fields.
+    wav_image = _image(10)
+    wav_image["content_type"] = "audio/wav"
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([wav_image])
+    assert _field(refused) == "ActionObservation.parts[0].content_type"
+    timed_image = _image(10)
+    timed_image["duration_ms"] = 3_000
+    with pytest.raises(ContractError) as refused:
+        contracts.validate_parts([timed_image])
+    assert _field(refused) == "ActionObservation.parts[0].duration_ms"
+
+
+def test_audio_capability_name() -> None:
+    assert contracts.CAPABILITY_AUDIO == "audio"
+    assert contracts.CAPABILITY_STRUCTURED_OUTPUT == "structured_output"
+    assert contracts.CAPABILITY_VISION == "vision"
+    assert contracts.PROBE_REASON_AUDIO_REJECTED == "audio_rejected"
+    assert contracts.PROBE_REASON_AUDIO_REJECTED in PROBE_REASONS
+    for name in (
+        "PART_TYPE_AUDIO_REF",
+        "AUDIO_CONTENT_TYPES",
+        "ATTACHMENT_CONTENT_TYPES",
+        "AUDIO_REF_FIELDS",
+        "AUDIO_TRANSCRIPTION_FIELDS",
+        "CAPABILITY_AUDIO",
+        "CAPABILITY_STRUCTURED_OUTPUT",
+        "CAPABILITY_VISION",
+        "PROBE_REASON_AUDIO_REJECTED",
+    ):
+        assert name in contracts.__all__, name
 
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +364,9 @@ def test_brain_synthetic_codes_and_run_failures_have_the_spec_literals() -> None
 
 
 def test_probe_tool_and_reasons() -> None:
+    """Phase 2 R4 supersedes the phase 1 seven-reason set: ``audio_rejected``
+    joins it for the third (audio) probe."""
+
     assert PROBE_TOOL == "runtime.probe"
     assert PROBE_REASONS == {
         "non_success_status",
@@ -150,6 +374,7 @@ def test_probe_tool_and_reasons() -> None:
         "multiple_tool_calls",
         "malformed_arguments",
         "image_rejected",
+        "audio_rejected",
         "timed_out",
         "transport_failed",
     }
@@ -166,6 +391,9 @@ def test_delivery_resolution_reasons() -> None:
 
 
 def test_image_ref_fields_are_the_seven_of_r4() -> None:
+    """``PART_TYPES`` gains ``audio_ref`` under phase 2 R4 (superseding the
+    phase 1 two-member set); the ``image_ref`` vocabulary is unchanged."""
+
     assert IMAGE_REF_FIELDS == (
         "attachment_id",
         "content_type",
@@ -176,7 +404,7 @@ def test_image_ref_fields_are_the_seven_of_r4() -> None:
         "provider_id",
     )
     assert contracts.IMAGE_CONTENT_TYPES == {"image/png", "image/jpeg"}
-    assert contracts.PART_TYPES == {"text", "image_ref"}
+    assert contracts.PART_TYPES == {"text", "image_ref", "audio_ref"}
 
 
 def test_proxy_protocol_v1_vocabulary() -> None:

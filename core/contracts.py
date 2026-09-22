@@ -185,8 +185,9 @@ TRACE_MIN_MAX_BYTES = 64
 
 PART_TYPE_TEXT = "text"
 PART_TYPE_IMAGE_REF = "image_ref"
-PART_TYPES = frozenset({PART_TYPE_TEXT, PART_TYPE_IMAGE_REF})
-"""The two part types an :class:`ActionObservation` may carry (R4)."""
+PART_TYPE_AUDIO_REF = "audio_ref"
+PART_TYPES = frozenset({PART_TYPE_TEXT, PART_TYPE_IMAGE_REF, PART_TYPE_AUDIO_REF})
+"""The part types an :class:`ActionObservation` may carry (phase 1 R4, phase 2 R4)."""
 
 IMAGE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg"})
 """Content types an ``image_ref`` part may declare (R4)."""
@@ -201,6 +202,31 @@ IMAGE_REF_FIELDS = (
     "provider_id",
 )
 """The seven fields every ``image_ref`` part must carry (R4, AC21)."""
+
+AUDIO_CONTENT_TYPES = frozenset({"audio/wav"})
+"""Content types an ``audio_ref`` part may declare (phase 2 R4)."""
+
+ATTACHMENT_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_CONTENT_TYPES
+"""The one attachment content-type set store, proxy and agent share (phase 2 R5)."""
+
+AUDIO_REF_FIELDS = (
+    "attachment_id",
+    "content_type",
+    "size",
+    "duration_ms",
+    "sample_rate_hz",
+    "channels",
+    "captured_at",
+    "provider_id",
+)
+"""The eight fields every ``audio_ref`` part must carry (phase 2 R4, AC13)."""
+
+AUDIO_REF_TRANSCRIPTION = "transcription"
+"""The one optional key of an ``audio_ref`` part beside its eight fields."""
+
+AUDIO_TRANSCRIPTION_FIELDS = ("text", "transcribed_at", "provider_id", "truncated")
+"""The fields of an ``audio_ref`` transcription; ``text`` and ``transcribed_at``
+are required, ``provider_id`` and ``truncated`` optional (phase 2 R3, R4)."""
 
 # --------------------------------------------------------------------------- #
 # Brain vocabulary shared with the executor and the modules (phase 1, R1–R4)
@@ -243,6 +269,11 @@ RUN_FAILURES = frozenset(
     }
 )
 
+# Capability names ``capabilities.required`` accepts (phase 1 R2, phase 2 R4).
+CAPABILITY_STRUCTURED_OUTPUT = "structured_output"
+CAPABILITY_VISION = "vision"
+CAPABILITY_AUDIO = "audio"
+
 PROBE_TOOL = "runtime.probe"
 """Name of the tool the prepare-time capability probe forces (R2, decision 3).
 
@@ -256,6 +287,7 @@ PROBE_REASON_NO_TOOL_CALL = "no_tool_call"
 PROBE_REASON_MULTIPLE_TOOL_CALLS = "multiple_tool_calls"
 PROBE_REASON_MALFORMED_ARGUMENTS = "malformed_arguments"
 PROBE_REASON_IMAGE_REJECTED = "image_rejected"
+PROBE_REASON_AUDIO_REJECTED = "audio_rejected"
 PROBE_REASON_TIMED_OUT = "timed_out"
 PROBE_REASON_TRANSPORT_FAILED = "transport_failed"
 
@@ -266,6 +298,7 @@ PROBE_REASONS = frozenset(
         PROBE_REASON_MULTIPLE_TOOL_CALLS,
         PROBE_REASON_MALFORMED_ARGUMENTS,
         PROBE_REASON_IMAGE_REJECTED,
+        PROBE_REASON_AUDIO_REJECTED,
         PROBE_REASON_TIMED_OUT,
         PROBE_REASON_TRANSPORT_FAILED,
     }
@@ -401,6 +434,11 @@ __all__ = [
     "ATTACHMENT_ACK_STORE_FULL",
     "ATTACHMENT_ACK_TOO_LARGE",
     "ATTACHMENT_ACK_UNEXPECTED_BINARY",
+    "ATTACHMENT_CONTENT_TYPES",
+    "AUDIO_CONTENT_TYPES",
+    "AUDIO_REF_FIELDS",
+    "AUDIO_REF_TRANSCRIPTION",
+    "AUDIO_TRANSCRIPTION_FIELDS",
     "BRAIN_ERROR_ATTACHMENT_EXPIRED",
     "BRAIN_ERROR_ATTACHMENT_REFUSED",
     "BRAIN_ERROR_CODES",
@@ -409,6 +447,9 @@ __all__ = [
     "BRAIN_ERROR_NOT_A_READ_ACTION",
     "BRAIN_ERROR_OBSERVATION_TOO_LARGE",
     "BRAIN_ERROR_UNKNOWN_ACTION",
+    "CAPABILITY_AUDIO",
+    "CAPABILITY_STRUCTURED_OUTPUT",
+    "CAPABILITY_VISION",
     "COMBINATION_OPERATORS",
     "CONTRACT_VERSION",
     "COUNTER_ACTION_TIMEOUTS",
@@ -442,10 +483,12 @@ __all__ = [
     "IMAGE_REF_FIELDS",
     "INTERNAL_TRACE_TYPES",
     "PART_TYPES",
+    "PART_TYPE_AUDIO_REF",
     "PART_TYPE_IMAGE_REF",
     "PART_TYPE_TEXT",
     "POLICY_VERSION_LENGTH",
     "PROBE_REASONS",
+    "PROBE_REASON_AUDIO_REJECTED",
     "PROBE_REASON_IMAGE_REJECTED",
     "PROBE_REASON_MALFORMED_ARGUMENTS",
     "PROBE_REASON_MULTIPLE_TOOL_CALLS",
@@ -1312,7 +1355,9 @@ def validate_parts(
     ``text`` part carries a UTF-8 encodable string ``text`` — a lone
     surrogate is rejected — of at most *max_text_bytes* UTF-8 bytes when a
     bound is given, an ``image_ref`` part carries exactly the
-    seven :data:`IMAGE_REF_FIELDS` with their declared types. A missing,
+    seven :data:`IMAGE_REF_FIELDS` with their declared types, an
+    ``audio_ref`` part the eight :data:`AUDIO_REF_FIELDS` plus an optional
+    ``transcription`` mapping (phase 2 R4). A missing,
     mistyped or unexpected field raises :class:`ContractError` with
     ``<field>[<i>].<name>`` (R4, AC21). The executor calls this with the
     configured bound; construction calls it without one.
@@ -1337,8 +1382,10 @@ def validate_parts(
             raise ContractError(f"{label}.type", f"must be one of {allowed}, got {kind!r}")
         if kind == PART_TYPE_TEXT:
             _validate_text_part(part, label, max_text_bytes)
-        else:
+        elif kind == PART_TYPE_IMAGE_REF:
             _validate_image_ref_part(part, label)
+        else:
+            _validate_audio_ref_part(part, label)
         frozen.append(_freeze(part, label))
     return tuple(frozen)
 
@@ -1394,11 +1441,64 @@ def _validate_image_ref_part(part: Mapping[str, Any], label: str) -> None:
     _require_finite_number(part["captured_at"], f"{label}.captured_at")
 
 
+def _validate_audio_ref_part(part: Mapping[str, Any], label: str) -> None:
+    for name in part:
+        if name not in ("type", AUDIO_REF_TRANSCRIPTION) and name not in AUDIO_REF_FIELDS:
+            raise ContractError(f"{label}.{name}", "is not a field of an audio_ref part")
+    for name in AUDIO_REF_FIELDS:
+        if name not in part:
+            raise ContractError(f"{label}.{name}", "is required and missing")
+
+    _require_text(part["attachment_id"], f"{label}.attachment_id")
+    _require_text(part["provider_id"], f"{label}.provider_id")
+    content_type = part["content_type"]
+    if not isinstance(content_type, str) or content_type not in AUDIO_CONTENT_TYPES:
+        allowed = ", ".join(sorted(AUDIO_CONTENT_TYPES))
+        raise ContractError(
+            f"{label}.content_type", f"must be one of {allowed}, got {content_type!r}"
+        )
+    for name in ("size", "duration_ms", "sample_rate_hz", "channels"):
+        value = part[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ContractError(
+                f"{label}.{name}", f"must be an integer, got {type(value).__name__}"
+            )
+        if value <= 0:
+            raise ContractError(f"{label}.{name}", "must be strictly positive")
+    _require_finite_number(part["captured_at"], f"{label}.captured_at")
+    if AUDIO_REF_TRANSCRIPTION in part:
+        _validate_transcription(
+            part[AUDIO_REF_TRANSCRIPTION], f"{label}.{AUDIO_REF_TRANSCRIPTION}"
+        )
+
+
+def _validate_transcription(transcription: Any, label: str) -> None:
+    _require_mapping(transcription, label)
+    for name in transcription:
+        if name not in AUDIO_TRANSCRIPTION_FIELDS:
+            raise ContractError(f"{label}.{name}", "is not a field of a transcription")
+    for name in ("text", "transcribed_at"):
+        if name not in transcription:
+            raise ContractError(f"{label}.{name}", "is required and missing")
+    text = transcription["text"]
+    if not isinstance(text, str):
+        raise ContractError(f"{label}.text", f"must be a string, got {type(text).__name__}")
+    _require_finite_number(transcription["transcribed_at"], f"{label}.transcribed_at")
+    if "provider_id" in transcription:
+        _require_text(transcription["provider_id"], f"{label}.provider_id")
+    if "truncated" in transcription and not isinstance(transcription["truncated"], bool):
+        raise ContractError(
+            f"{label}.truncated",
+            f"must be a boolean, got {type(transcription['truncated']).__name__}",
+        )
+
+
 def observation_size(parts: Sequence[Mapping[str, Any]]) -> int:
     """Return the size of an observation as R4 defines it.
 
     The sum, over *parts*, of the UTF-8 byte length of each ``text`` part's
-    ``text`` and of the ``size`` of each ``image_ref`` part. The envelope, the
+    ``text`` and of the ``size`` of each ``image_ref`` and ``audio_ref`` part
+    (phase 2 R4). The envelope, the
     ``result`` mapping and the part metadata (dimensions, timestamps, ids)
     are not counted (R4, AC47). *parts* must already satisfy
     :func:`validate_parts`; an unknown part type raises rather than being
@@ -1410,7 +1510,7 @@ def observation_size(parts: Sequence[Mapping[str, Any]]) -> int:
         kind = part.get("type") if isinstance(part, Mapping) else None
         if kind == PART_TYPE_TEXT:
             total += len(part["text"].encode("utf-8"))
-        elif kind == PART_TYPE_IMAGE_REF:
+        elif kind in (PART_TYPE_IMAGE_REF, PART_TYPE_AUDIO_REF):
             total += part["size"]
         else:
             raise ContractError(
