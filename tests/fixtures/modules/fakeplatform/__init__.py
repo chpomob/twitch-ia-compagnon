@@ -45,13 +45,25 @@ imports this package under a private name — reaches the same objects through
 the handle's :attr:`FakePlatform.transports`, or hands one in through the
 ``transport`` settings seam (used for every configured channel and registered
 in :data:`TRANSPORTS` under each).
+
+**Polls** (R7, plan decision 7). ``activate`` publishes a
+:class:`ScriptedPollService` under ``(poll, fake)`` in the runtime's service
+registry — only when the context carries one (``context.services.available``);
+a context built without a registry publishes nothing. The service is scripted
+per channel (:meth:`ScriptedPollService.script_create`,
+:meth:`ScriptedPollService.script_get`), records every call in ``creates`` and
+``gets`` and keeps the polls it made in ``polls``. It lives in the
+module-level :data:`POLL_SERVICES` registry (:func:`poll_service_for`,
+cleared by :func:`reset`), is reachable as :attr:`FakePlatform.poll_service`,
+and may be handed in through the ``poll_service`` settings seam. The declared
+actions are unchanged: ``chat.write`` only.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,10 +185,208 @@ def transport_for(channel_id: str) -> FakeChatTransport:
     return transport
 
 
+# --------------------------------------------------------------------------- #
+# The scripted poll service (R7, plan decision 7)
+# --------------------------------------------------------------------------- #
+
+
+POLL_SERVICE_KIND = "poll"
+"""The service kind the poll service is published under; the core defines none."""
+
+# Outcomes a scripted ``create`` may produce.
+POLL_OK = "ok"
+POLL_LOST = "lost"
+POLL_TRANSPORT = "transport"
+POLL_MALFORMED = "malformed"
+POLL_HELD = "held"
+POLL_STATUS_PREFIX = "status:"
+# Outcomes a scripted ``get`` may produce (besides an explicit list).
+POLL_LIST = "list"
+POLL_RAISE = "raise"
+
+
+class PollServiceError(Exception):
+    """Base of the scripted poll service's failures."""
+
+
+class PollTransportError(PollServiceError):
+    """The transport failed; ``sent`` says whether the request had left."""
+
+    def __init__(self, sent: bool) -> None:
+        super().__init__("poll request lost" if sent else "poll request not sent")
+        self.sent = sent
+
+
+class PollStatusError(PollServiceError):
+    """A non-2xx answer: ``status`` and a sanitised ``message``, never a body."""
+
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message or f"poll request failed with status {status}")
+        self.status = status
+        self.message = message or f"status {status}"
+
+
+class PollMalformedAnswer(PollServiceError):
+    """A 2xx answer whose body is not a poll."""
+
+    sent = True
+
+
+class ScriptedPollService:
+    """A poll service (``create``, ``get``) scripted per channel.
+
+    ``create`` records the call in ``creates`` and applies the channel's next
+    scripted outcome (else :data:`POLL_OK`): :data:`POLL_OK` adds a poll to
+    ``polls[channel_id]`` and returns it; :data:`POLL_LOST` adds it and raises
+    ``PollTransportError(sent=True)``; ``"status:<code>"`` adds nothing and
+    raises ``PollStatusError(code)``; :data:`POLL_TRANSPORT` adds nothing and
+    raises ``PollTransportError(sent=False)``; :data:`POLL_MALFORMED` adds it
+    and raises :class:`PollMalformedAnswer`; :data:`POLL_HELD` parks the call
+    until cancelled or :meth:`release_held`; an exception is raised.
+
+    ``get`` records the channel in ``gets`` and applies the channel's next
+    scripted outcome (else :data:`POLL_LIST`): :data:`POLL_LIST` answers the
+    channel's ``polls``; :data:`POLL_RAISE` raises
+    ``PollTransportError(sent=True)``; a list is answered as given; an
+    exception is raised. Poll times come from *clock* (0.0 without one).
+    """
+
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock
+        self._create_script: dict[str, list[Any]] = {}
+        self._get_script: dict[str, list[Any]] = {}
+        self._held: list[asyncio.Future[Any]] = []
+        self._next_id = 0
+        self.polls: dict[str, list[dict[str, Any]]] = {}
+        self.creates: list[dict[str, Any]] = []
+        self.gets: list[str] = []
+
+    def script_create(self, channel_id: str, *outcomes: Any) -> "ScriptedPollService":
+        self._create_script.setdefault(channel_id, []).extend(outcomes)
+        return self
+
+    def script_get(self, channel_id: str, *outcomes: Any) -> "ScriptedPollService":
+        self._get_script.setdefault(channel_id, []).extend(outcomes)
+        return self
+
+    def add_poll(
+        self,
+        channel_id: str,
+        question: str,
+        options: Sequence[str],
+        *,
+        started_at: float | None = None,
+        duration_seconds: int = 60,
+        state: str = "active",
+    ) -> dict[str, Any]:
+        """Put a poll in the channel's table directly (a poll made elsewhere)."""
+
+        self._next_id += 1
+        if started_at is not None:
+            started = float(started_at)
+        else:
+            started = float(self._clock()) if self._clock is not None else 0.0
+        poll = {
+            "poll_id": f"fake-poll-{self._next_id}",
+            "question": question,
+            "options": list(options),
+            "started_at": started,
+            "ends_at": started + duration_seconds,
+            "state": state,
+        }
+        self.polls.setdefault(channel_id, []).append(poll)
+        return dict(poll)
+
+    def release_held(self, answer: Any = None) -> None:
+        for waiter in self._held:
+            if not waiter.done():
+                waiter.set_result(answer)
+                return
+        raise FakePlatformError("fake poll service: no held create to release")
+
+    async def create(
+        self,
+        channel_id: str,
+        question: str,
+        options: Sequence[str],
+        duration_seconds: int,
+    ) -> dict[str, Any]:
+        self.creates.append(
+            {
+                "channel_id": channel_id,
+                "question": question,
+                "options": list(options),
+                "duration_seconds": duration_seconds,
+            }
+        )
+        queue = self._create_script.get(channel_id)
+        outcome = queue.pop(0) if queue else POLL_OK
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome == POLL_TRANSPORT:
+            raise PollTransportError(sent=False)
+        if isinstance(outcome, str) and outcome.startswith(POLL_STATUS_PREFIX):
+            raise PollStatusError(int(outcome[len(POLL_STATUS_PREFIX):]))
+        if outcome == POLL_HELD:
+            waiter: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            self._held.append(waiter)
+            try:
+                answer = await waiter
+            finally:
+                self._held = [item for item in self._held if item is not waiter]
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        if outcome not in (POLL_OK, POLL_LOST, POLL_MALFORMED):
+            raise FakePlatformError(f"fake poll service: unknown create outcome {outcome!r}")
+        poll = self.add_poll(channel_id, question, options, duration_seconds=duration_seconds)
+        if outcome == POLL_LOST:
+            raise PollTransportError(sent=True)
+        if outcome == POLL_MALFORMED:
+            raise PollMalformedAnswer("poll answer malformed")
+        return poll
+
+    async def get(self, channel_id: str) -> list[dict[str, Any]]:
+        self.gets.append(channel_id)
+        queue = self._get_script.get(channel_id)
+        outcome = queue.pop(0) if queue else POLL_LIST
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome == POLL_RAISE:
+            raise PollTransportError(sent=True)
+        if outcome == POLL_LIST:
+            return [
+                {key: poll[key] for key in ("poll_id", "question", "options", "started_at", "state")}
+                for poll in self.polls.get(channel_id, [])
+            ]
+        if isinstance(outcome, (list, tuple)):
+            return [dict(entry) for entry in outcome]
+        raise FakePlatformError(f"fake poll service: unknown get outcome {outcome!r}")
+
+
+POLL_SERVICES: dict[str, ScriptedPollService] = {}
+"""Module-level registry of poll services keyed by platform.
+
+``activate`` reads the one of :data:`PLATFORM`, creating it when absent,
+unless one is handed in through the ``poll_service`` settings seam (then
+registered here). :func:`reset` clears it between scenarios.
+"""
+
+
+def poll_service_for(platform: str = PLATFORM) -> ScriptedPollService:
+    """The registered poll service of *platform*, created when absent."""
+
+    service = POLL_SERVICES.get(platform)
+    if service is None:
+        service = POLL_SERVICES[platform] = ScriptedPollService()
+    return service
+
+
 def reset() -> None:
-    """Forget every registered transport."""
+    """Forget every registered transport and poll service."""
 
     TRANSPORTS.clear()
+    POLL_SERVICES.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -218,6 +428,13 @@ def validate_settings(settings: Any) -> list[str]:
     if transport is not None and not _is_transport(transport):
         diagnostics.append(
             _setting_diagnostic("transport", "must expose sends and outcomes lists")
+        )
+    poll_service = settings.get("poll_service")
+    if poll_service is not None and not all(
+        callable(getattr(poll_service, name, None)) for name in ("create", "get")
+    ):
+        diagnostics.append(
+            _setting_diagnostic("poll_service", "must expose create() and get()")
         )
     return diagnostics
 
@@ -461,7 +678,14 @@ class _ChatWriteProvider:
 class FakePlatform:
     """The v2 handle: phase hooks, the in-process door, scripted sends."""
 
-    def __init__(self, context: Any, settings: _Settings, reporter: Any) -> None:
+    def __init__(
+        self,
+        context: Any,
+        settings: _Settings,
+        reporter: Any,
+        poll_service: Any = None,
+    ) -> None:
+        self._poll_service = poll_service
         self._bus = context.bus
         self._tasks = context.tasks
         self._actions = context.actions
@@ -485,6 +709,12 @@ class FakePlatform:
         """Every event this handle published, feed and injections alike."""
 
     # -- test seams -------------------------------------------------------- #
+
+    @property
+    def poll_service(self) -> Any:
+        """The poll service ``activate`` publishes under ``(poll, fake)``."""
+
+        return self._poll_service
 
     @property
     def transports(self) -> Mapping[str, FakeChatTransport]:
@@ -901,7 +1131,17 @@ async def activate(
         # the module-level view and the handle's agree.
         for channel_id in parsed.channel_ids:
             TRANSPORTS[channel_id] = transport
-    return FakePlatform(context, parsed, reporter)
+    poll_service = settings.get("poll_service")
+    if poll_service is None:
+        poll_service = poll_service_for(PLATFORM)
+    else:
+        POLL_SERVICES[PLATFORM] = poll_service
+    # Published only on a bound registry (R7); a duplicate key is not caught
+    # and fails activation (AC25).
+    services = getattr(context, "services", None)
+    if services is not None and getattr(services, "available", False) is True:
+        services.publish(POLL_SERVICE_KIND, PLATFORM, poll_service)
+    return FakePlatform(context, parsed, reporter, poll_service)
 
 
 def _declared_chat_write_spec() -> ActionSpec:

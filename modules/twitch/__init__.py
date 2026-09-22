@@ -67,6 +67,14 @@ outstanding at once, a trace offered past that cap is dropped and counted — in
 exactly as it was, and ``close`` waits for the outstanding traces inside
 ``DEFAULT_SENT_TRACE_CLOSE_SECONDS`` only, cancelling and counting the rest, so
 a subscriber that never returns can neither grow that set nor hold shutdown.
+
+**Polls** (R7). ``activate`` publishes a poll service under ``(poll, twitch)``
+in the runtime's service registry — only when the context carries one
+(``context.services.available``); a context built without a registry
+publishes nothing and activates exactly as before. The service issues one
+Helix request per call over the send session and credential, and leaves
+reconciliation to its consumer; it adds no action, and ``chat.write`` and the
+chat source are unchanged.
 """
 
 from __future__ import annotations
@@ -79,6 +87,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +118,7 @@ EVENTSUB_SUBSCRIPTIONS_URL = (
     "https://api.twitch.tv/helix/eventsub/subscriptions"
 )
 HELIX_CHAT_URL = "https://api.twitch.tv/helix/chat/messages"
+HELIX_POLLS_URL = "https://api.twitch.tv/helix/polls"
 TOKEN_VALIDATION_URL = "https://id.twitch.tv/oauth2/validate"
 
 # Module-level seams make the network client and retry clock replaceable without
@@ -169,6 +179,13 @@ counted exactly like dropped ones. Overridable through the
 ``_sent_trace_close_seconds`` seam, validated finite at activation.
 """
 _STABLE_CONNECTION_SECONDS = 10.0
+
+POLL_SERVICE_KIND = "poll"
+"""The service kind this module publishes its poll service under (R7).
+
+The core defines no kind: the name is agreed between the publishing platform
+and the consuming module, the registry never interprets it.
+"""
 
 # EventSub badge set identifiers mapped to the trusted claim they attest. Only
 # a platform-attested badge becomes a claim; nothing in the message body can
@@ -350,6 +367,202 @@ class _ChatWriteProvider:
         return await self._module._invoke_chat_write(invocation)
 
 
+class PollServiceError(Exception):
+    """Base of the poll service's failures; the text never carries a body."""
+
+
+class PollTransportError(PollServiceError):
+    """The transport failed; ``sent`` says whether the request had left.
+
+    ``sent=False`` only when the transport proves nothing left — the
+    connection was never established (``aiohttp.ClientConnectorError``) or the
+    handle was already closed. Every other failure, timeouts and dropped
+    connections included, may have reached the platform: ``sent=True``, the
+    rule ``chat.write`` applies through ``mark_emitted`` (R7).
+    """
+
+    def __init__(self, sent: bool) -> None:
+        super().__init__("poll request lost" if sent else "poll request not sent")
+        self.sent = sent
+
+
+class PollStatusError(PollServiceError):
+    """A non-2xx answer: ``status`` and a sanitised ``message``, never the body."""
+
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message or f"poll request failed with status {status}")
+        self.status = status
+        self.message = message or f"status {status}"
+
+
+class PollMalformedAnswer(PollServiceError):
+    """A 2xx answer whose body is not a poll; the request did leave."""
+
+    sent = True
+
+
+class _TwitchPollService:
+    """The poll service this module publishes under ``(poll, twitch)`` (R7).
+
+    One Helix request per call, over the module's own HTTP session and
+    credential (``_helix_headers``): ``create`` is one POST to
+    :data:`HELIX_POLLS_URL`, ``get`` one GET on it for the channel. Nothing is
+    retried here — the consumer owns reconciliation. Failures are classified
+    by certainty (:class:`PollTransportError` ``sent``), refusals carry the
+    status code and a message built here (:class:`PollStatusError`), and a
+    2xx that is not a poll is :class:`PollMalformedAnswer`. Times are epoch
+    seconds parsed from the platform's RFC 3339 stamps; ``state`` is the
+    platform status in lower case (``active`` for a running poll).
+    """
+
+    __slots__ = ("_module",)
+
+    def __init__(self, module: "TwitchModule") -> None:
+        self._module = module
+
+    async def create(
+        self,
+        channel_id: str,
+        question: str,
+        options: Any,
+        duration_seconds: int,
+    ) -> dict[str, Any]:
+        body = {
+            "broadcaster_id": channel_id,
+            "title": question,
+            "choices": [{"title": option} for option in options],
+            "duration": duration_seconds,
+        }
+        _, answer = await self._request(
+            "create",
+            lambda session: session.post(
+                HELIX_POLLS_URL, headers=self._module._helix_headers(), json=body
+            ),
+        )
+        data = answer.get("data") if isinstance(answer, Mapping) else None
+        entry = data[0] if isinstance(data, list) and data else None
+        poll = _parse_poll(entry)
+        if poll is None:
+            self._module._diagnose("twitch poll create: malformed response")
+            raise PollMalformedAnswer("twitch poll create: malformed response")
+        return poll
+
+    async def get(self, channel_id: str) -> list[dict[str, Any]]:
+        _, answer = await self._request(
+            "get",
+            lambda session: session.get(
+                HELIX_POLLS_URL,
+                headers=self._module._helix_headers(),
+                params={"broadcaster_id": channel_id},
+            ),
+        )
+        data = answer.get("data") if isinstance(answer, Mapping) else None
+        polls = [_parse_poll(entry) for entry in data] if isinstance(data, list) else None
+        if polls is None or any(poll is None for poll in polls):
+            self._module._diagnose("twitch poll get: malformed response")
+            raise PollMalformedAnswer("twitch poll get: malformed response")
+        return [
+            {key: poll[key] for key in ("poll_id", "question", "options", "started_at", "state")}
+            for poll in polls
+            if poll is not None
+        ]
+
+    async def _request(
+        self, operation: str, send: Callable[[Any], Any]
+    ) -> tuple[int, Any]:
+        module = self._module
+        if module._closed:
+            raise PollTransportError(sent=False)
+        try:
+            response = await _resolve(send(module._session))
+        except asyncio.CancelledError:
+            raise
+        except Exception as failure:
+            sent = not _never_sent(failure)
+            module._diagnose(
+                f"twitch poll {operation}: "
+                + ("request lost" if sent else "request not sent")
+            )
+            raise PollTransportError(sent=sent) from None
+        try:
+            status, answer = await _read_response(response)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            module._diagnose(f"twitch poll {operation}: answer lost")
+            raise PollTransportError(sent=True) from None
+        if status is None:
+            module._diagnose(f"twitch poll {operation}: malformed response")
+            raise PollMalformedAnswer(f"twitch poll {operation}: malformed response")
+        if not 200 <= status < 300:
+            message = f"twitch poll {operation}: rejected (status {status})"
+            module._diagnose(message)
+            raise PollStatusError(status, message)
+        return status, answer
+
+
+def _never_sent(failure: BaseException) -> bool:
+    """Whether *failure* proves the request never left (R7).
+
+    Only a connection that was never established does; anything later —
+    a server disconnect, a timeout, a reset — may follow a delivered request.
+    """
+
+    connector_error = getattr(aiohttp, "ClientConnectorError", None)
+    return connector_error is not None and isinstance(failure, connector_error)
+
+
+def _parse_poll(entry: Any) -> dict[str, Any] | None:
+    """One Helix poll object as the service's poll, or ``None`` when malformed."""
+
+    if not isinstance(entry, Mapping):
+        return None
+    poll_id = entry.get("id")
+    title = entry.get("title")
+    choices = entry.get("choices")
+    state = entry.get("status")
+    duration = entry.get("duration")
+    started_at = _epoch_seconds(entry.get("started_at"))
+    if (
+        not isinstance(poll_id, str)
+        or not poll_id.strip()
+        or not isinstance(title, str)
+        or not isinstance(choices, list)
+        or not isinstance(state, str)
+        or not state
+        or isinstance(duration, bool)
+        or not isinstance(duration, int)
+        or started_at is None
+    ):
+        return None
+    options: list[str] = []
+    for choice in choices:
+        option = choice.get("title") if isinstance(choice, Mapping) else None
+        if not isinstance(option, str):
+            return None
+        options.append(option)
+    return {
+        "poll_id": poll_id,
+        "question": title,
+        "options": options,
+        "started_at": started_at,
+        "ends_at": started_at + duration,
+        "state": state.lower(),
+    }
+
+
+def _epoch_seconds(stamp: Any) -> float | None:
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
 @dataclass(frozen=True, repr=False, slots=True)
 class _Settings:
     client_id: str
@@ -413,6 +626,7 @@ class TwitchModule:
         self._reporter = reporter
         self._retry_delay = retry_delay
         self._provider = _ChatWriteProvider(self)
+        self._poll_service = _TwitchPollService(self)
         self._send_record = SendRecord()
         self._bound = False
         # Covers normalisation and the dedup decision only (R2): it is released
@@ -436,6 +650,12 @@ class TwitchModule:
         self._abandoned_sent_traces: list[asyncio.Task[None]] = []
         self._closed = False
         self._close_lock = asyncio.Lock()
+
+    @property
+    def poll_service(self) -> _TwitchPollService:
+        """The poll service ``activate`` publishes under ``(poll, twitch)`` (R7)."""
+
+        return self._poll_service
 
     @property
     def send_record(self) -> SendRecord:
@@ -1588,7 +1808,7 @@ async def activate(
         _safe_report(reporter, "twitch transport: session creation failed")
         raise TwitchModuleError("twitch transport initialization failed") from None
 
-    return TwitchModule(
+    module = TwitchModule(
         context,
         parsed,
         session,
@@ -1597,6 +1817,18 @@ async def activate(
         max_pending_sent_traces=max_pending_sent_traces,
         sent_trace_close_seconds=sent_trace_close_seconds,
     )
+    # Published only on a bound registry: a context built without one hands
+    # out a facade whose ``available`` is false, and activation on it stays
+    # exactly what it was (R7). A duplicate key is not caught — it fails
+    # activation, the session released first (AC25).
+    services = getattr(context, "services", None)
+    if services is not None and getattr(services, "available", False) is True:
+        try:
+            services.publish(POLL_SERVICE_KIND, PLATFORM, module.poll_service)
+        except BaseException:
+            await _close_session(session)
+            raise
+    return module
 
 
 def _validate_count_limit(value: Any, field_name: str) -> int:
@@ -1925,9 +2157,15 @@ __all__ = [
     "CHAT_WRITE_PROVIDER",
     "DEFAULT_MAX_PENDING_SENT_TRACES",
     "DEFAULT_SENT_TRACE_CLOSE_SECONDS",
+    "HELIX_POLLS_URL",
     "MANIFEST_PATH",
     "MODULE_NAME",
     "PLATFORM",
+    "POLL_SERVICE_KIND",
+    "PollMalformedAnswer",
+    "PollServiceError",
+    "PollStatusError",
+    "PollTransportError",
     "SendRecord",
     "TwitchModule",
     "TwitchModuleError",
