@@ -488,6 +488,7 @@ class Brain:
         store_limits: dict[str, Any] | None = None,
         specs: tuple[ActionSpec, ...] | None = None,
         catalog: dict[str, Any] | None = None,
+        authorization: AuthorizationPolicy | None = None,
         **extra_settings: Any,
     ) -> None:
         self.clock = clock if clock is not None else ManualClock()
@@ -497,7 +498,7 @@ class Brain:
         self.context: RuntimeContext = runtime_context(
             clock=self.clock,
             attachments=self.store,
-            authorization=grant_everything(),
+            authorization=authorization if authorization is not None else grant_everything(),
         )
         for spec in specs if specs is not None else (screen_capture_spec(), fake_write_spec()):
             self.context.actions.declare(spec, module="fixture")
@@ -3231,11 +3232,12 @@ class AgentHost:
         image: bytes | None = None,
         immediate_sleeper: bool = False,
         register_provider: bool = True,
+        store_limits: dict[str, Any] | None = None,
         **extra_settings: Any,
     ) -> None:
         self.clock = clock if clock is not None else ManualClock()
         self.rng = rng if rng is not None else ConstantRandom(0.5)
-        self.store = AttachmentStore(clock=self.clock, **STORE_LIMITS)
+        self.store = AttachmentStore(clock=self.clock, **(store_limits or STORE_LIMITS))
         self.context: RuntimeContext = runtime_context(
             clock=self.clock,
             attachments=self.store,
@@ -4852,3 +4854,596 @@ def test_the_agent_link_package_calls_no_sleep_directly() -> None:
     assert "time.sleep" not in source
     assert "asyncio.sleep(" not in source
     assert "settings.get(_SEAM_SLEEPER, asyncio.sleep)" in source
+
+
+# =========================================================================== #
+# Phase 2 P12 — audio attachments over protocol v1 (R5; AC18, AC19, AC20)
+# =========================================================================== #
+#
+# The same in-memory pair and harnesses as above, with the shipped
+# ``audio.capture`` and ``audio.speak`` contracts read from their manifests,
+# a store whose object bound is the protocol's default binary bound
+# (1 048 576 bytes), and WAV segments from ``conftest.wav_bytes``. No
+# positive-duration sleep anywhere.
+
+from core.contracts import ATTACHMENT_ACK_CODES as _ACK_CODES
+from core.contracts import ATTACHMENT_CONTENT_TYPES, PROXY_DEFAULT_MAX_FRAME_BYTES as _MAX_FRAME
+from conftest import wav_bytes
+
+AUDIO_CAPTURE = "audio.capture"
+AUDIO_SPEAK = "audio.speak"
+AUDIO_INPUT_MANIFEST = ROOT / "modules" / "audio_input" / "module.yaml"
+AUDIO_OUTPUT_MANIFEST = ROOT / "modules" / "audio_output" / "module.yaml"
+AUDIO_DESTINATION = Destination("fake", "channel-9", "audio")
+DEFAULT_BINARY_BOUND = 1_048_576
+
+AUDIO_STORE_LIMITS: dict[str, Any] = {
+    "max_object_bytes": DEFAULT_BINARY_BOUND,
+    "max_objects": 4,
+    "max_total_bytes": 4 * DEFAULT_BINARY_BOUND,
+    "max_bytes_per_run": 2 * DEFAULT_BINARY_BOUND,
+    "ttl_seconds": 300.0,
+}
+
+#: A 3 s, 16 kHz, mono, 16-bit segment: 44 header bytes + 96 000 data bytes.
+SEGMENT_3S = wav_bytes(3.0)
+#: A 30 s segment: 960 044 bytes, under the default bound.
+SEGMENT_30S = wav_bytes(30.0)
+
+TRANSCRIPTION: dict[str, Any] = {
+    "text": "bonjour le chat",
+    "transcribed_at": 1240.25,
+    "provider_id": "stt-local",
+    "truncated": False,
+}
+
+
+def _manifest(path: Path) -> dict[str, Any]:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def manifest_spec(path: Path, name: str) -> ActionSpec:
+    (entry,) = [item for item in _manifest(path)["actions"] if item["name"] == name]
+    spec = spec_from_declaration(entry)
+    assert spec is not None
+    return spec
+
+
+def audio_capture_spec() -> ActionSpec:
+    return manifest_spec(AUDIO_INPUT_MANIFEST, AUDIO_CAPTURE)
+
+
+def audio_speak_spec() -> ActionSpec:
+    return manifest_spec(AUDIO_OUTPUT_MANIFEST, AUDIO_SPEAK)
+
+
+def audio_policy() -> AuthorizationPolicy:
+    return AuthorizationPolicy(
+        [
+            AuthorizationRule(
+                rule_id="grant-audio-capture",
+                action_name=AUDIO_CAPTURE,
+                principals=(PRINCIPAL,),
+                granted_permissions=("audio.capture",),
+            ),
+            AuthorizationRule(
+                rule_id="grant-audio-speak",
+                action_name=AUDIO_SPEAK,
+                principals=(PRINCIPAL,),
+                granted_permissions=("audio.speak",),
+            ),
+        ]
+    )
+
+
+def audio_ref(attachment_id: str, size: int, *, transcription: dict[str, Any] | None = None) -> dict[str, Any]:
+    part: dict[str, Any] = {
+        "type": "audio_ref",
+        "attachment_id": attachment_id,
+        "content_type": "audio/wav",
+        "size": size,
+        "duration_ms": 3000,
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "captured_at": 1234.5,
+        "provider_id": "audio_input",
+    }
+    if transcription is not None:
+        part["transcription"] = dict(transcription)
+    return part
+
+
+def audio_capture_result(size: int) -> dict[str, Any]:
+    return {
+        "source": "mic",
+        "content_type": "audio/wav",
+        "size": size,
+        "duration_ms": 3000,
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "captured_at": 1234.5,
+        "transcription_status": "ok",
+    }
+
+
+def audio_call(
+    call_id: str = "call-a1",
+    *,
+    action: str = AUDIO_CAPTURE,
+    deadline: float,
+    arguments: dict[str, Any] | None = None,
+) -> ActionCall:
+    return ActionCall(
+        action_name=action,
+        action_version=1,
+        arguments=arguments if arguments is not None else {"seconds": 3},
+        conversation_id="conversation-1",
+        run_id=RUN_ID,
+        call_id=call_id,
+        source_event_id="source-1",
+        destination=AUDIO_DESTINATION,
+        principal=PRINCIPAL,
+        deadline=deadline,
+    )
+
+
+def assert_every_frame_is_v1(pair: MemoryWebSocketPair) -> int:
+    """AC20: every text frame either end wrote carries ``v == 1``."""
+
+    count = 0
+    for message in list(pair.client.sent) + list(pair.server.sent):
+        if message.type == WSMsgType.TEXT:
+            frame = json.loads(message.data)
+            assert frame.get("v") == 1, frame
+            count += 1
+    assert count > 0
+    return count
+
+
+class RecordingAudio:
+    """The agent's ``audio.capture`` provider: stores *segment* as ``audio/wav``
+    in the agent's store under the call's run and answers the ``audio_ref``
+    with its transcription, as ``modules/audio_input`` does."""
+
+    name = "audio_input"
+
+    def __init__(self, host: AgentHost, segment: bytes) -> None:
+        self.host = host
+        self.segment = segment
+        self.calls: list[ActionCall] = []
+        self.stored: list[str] = []
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        call = invocation.call
+        self.calls.append(call)
+        ref = self.host.store.put(call.run_id, self.segment, content_type="audio/wav")
+        self.stored.append(ref.attachment_id)
+        return ActionObservation(
+            status="success",
+            provenance={"provider": self.name, "module": "audio_input"},
+            result=audio_capture_result(len(self.segment)),
+            parts=(audio_ref(ref.attachment_id, len(self.segment), transcription=TRANSCRIPTION),),
+        )
+
+
+def audio_agent_host(segment: bytes) -> tuple[AgentHost, RecordingAudio]:
+    host = AgentHost(
+        actions=(AUDIO_CAPTURE,),
+        policy=audio_policy(),
+        register_provider=False,
+        store_limits=AUDIO_STORE_LIMITS,
+    )
+    provider = RecordingAudio(host, segment)
+    host.context.actions.register(
+        audio_capture_spec(), provider, module="audio_input", provider_name="audio_input"
+    )
+    host.context.actions.mark_ready("audio_input")
+    return host, provider
+
+
+def audio_call_frame(brain_end: BrainEnd, call_id: str, seq: int, **kwargs: Any) -> dict[str, Any]:
+    frame = brain_end.call_frame(
+        call_id, seq, action=AUDIO_CAPTURE, arguments={"seconds": 3}, **kwargs
+    )
+    frame["destination"] = {"platform": "fake", "channel_id": "channel-9", "scope": "audio"}
+    return frame
+
+
+# --------------------------------------------------------------------------- #
+# AC18 — an audio segment crosses the boundary by reference
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac18_an_agent_side_audio_capture_reaches_the_brain_store_by_reference() -> None:
+    """AC18 (R5): the brain's proxy and the agent's link on one in-memory
+    pair; the agent's ``audio.capture`` provider stores a 96 044-byte
+    segment. Exactly 1 ``attachment`` header (``audio/wav``, 96 044), 1
+    binary frame of 96 044 bytes and 1 ``attachment_ack accepted: true``
+    cross; the brain's observation carries the ``audio_ref`` translated to a
+    brain-store attachment of 96 044 bytes leased to the run, typed by the
+    acknowledged header, its ``transcription`` verbatim. AC20: every frame
+    carries ``v == 1``."""
+
+    assert len(SEGMENT_3S) == 96_044
+    brain = Brain(
+        actions=(AUDIO_CAPTURE,),
+        specs=(audio_capture_spec(),),
+        store_limits=AUDIO_STORE_LIMITS,
+        authorization=audio_policy(),
+    )
+    host, provider = audio_agent_host(SEGMENT_3S)
+    pair = MemoryWebSocketPair()
+    handler: asyncio.Task[None] | None = None
+    try:
+        await brain.activate(start=True)
+        await host.activate()
+        handler = asyncio.create_task(brain.servers[0].kwargs["handler"](pair.server))
+        host.dials.put_nowait(pair)
+        await wait_until(lambda: host.module.paired and brain.module.paired)
+        await settle()
+        assert brain.authorized(AUDIO_DESTINATION) == [AUDIO_CAPTURE]
+
+        observation = await brain.executor.invoke(audio_call(deadline=brain.clock() + 30))
+
+        assert observation.status == "success", observation.error
+        assert observation.provenance["provider"] == PROVIDER_NAME
+        assert observation.provenance["remote"]["provider"] == "audio_input"
+        (part,) = observation.parts
+        assert part["type"] == "audio_ref"
+        assert part["attachment_id"] not in provider.stored
+        ref = brain.store.lookup(part["attachment_id"])
+        assert ref is not None and ref.run_id == RUN_ID
+        assert ref.size == 96_044 and ref.content_type == "audio/wav"
+        assert brain.store.get(ref) == SEGMENT_3S
+        assert part["size"] == 96_044
+        assert part["transcription"] == TRANSCRIPTION
+        expected = audio_ref(part["attachment_id"], 96_044, transcription=TRANSCRIPTION)
+        assert dict(part) == expected
+        assert brain.store.usage(RUN_ID).objects == 1
+
+        agent_frames = [m for m in pair.client.sent if m.type in (WSMsgType.TEXT, WSMsgType.BINARY)]
+        headers = [
+            json.loads(m.data) for m in agent_frames
+            if m.type == WSMsgType.TEXT and json.loads(m.data)["type"] == FRAME_ATTACHMENT
+        ]
+        binaries = [m.data for m in agent_frames if m.type == WSMsgType.BINARY]
+        assert len(headers) == 1
+        assert headers[0]["content_type"] == "audio/wav" and headers[0]["size"] == 96_044
+        assert headers[0]["attachment_id"] == provider.stored[0]
+        assert [len(b) for b in binaries] == [96_044]
+        acks = [
+            json.loads(m.data) for m in pair.server.sent
+            if m.type == WSMsgType.TEXT and json.loads(m.data)["type"] == FRAME_ATTACHMENT_ACK
+        ]
+        assert acks == [{
+            "v": 1, "type": FRAME_ATTACHMENT_ACK, "id": headers[0]["id"],
+            "attachment_id": provider.stored[0], "accepted": True,
+        }]
+        # The agent retains no bytes; the brain's run cleanup releases exactly
+        # what was leased.
+        assert host.store.object_count == 0
+        assert assert_every_frame_is_v1(pair) >= 6
+        released = brain.store.release(RUN_ID)
+        assert released.objects == 1 and brain.store.object_count == 0
+    finally:
+        await host.close()
+        await brain.close()
+        if handler is not None and not handler.done():
+            handler.cancel()
+        if handler is not None:
+            await asyncio.gather(handler, return_exceptions=True)
+
+
+async def test_ac18_the_audio_header_rules_content_type_default_bound_and_too_large() -> None:
+    """AC18 (R5), header rules at the brain: ``audio/mpeg`` is ``error
+    invalid_frame`` (the message says "an accepted content_type") with
+    nothing stored; a 960 044-byte segment passes under the default
+    1 048 576 bound; ``size: 1 048 577`` is ``attachment_ack accepted:
+    false``, ``attachment_too_large``, on the header alone. AC20: ``v == 1``."""
+
+    assert len(SEGMENT_30S) == 960_044
+    assert ATTACHMENT_CONTENT_TYPES == {"image/png", "image/jpeg", "audio/wav"}
+    brain = Brain(
+        actions=(AUDIO_CAPTURE,),
+        specs=(audio_capture_spec(),),
+        store_limits=AUDIO_STORE_LIMITS,
+        authorization=audio_policy(),
+    )
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        welcome = await agent.pair_up(specs=(audio_capture_spec(),))
+        assert welcome["limits"]["max_attachment_bytes"] == DEFAULT_BINARY_BOUND
+        task = asyncio.create_task(brain.executor.invoke(audio_call(deadline=brain.clock() + 30)))
+        call = await agent.call_frame()
+        assert call["max_attachment_bytes"] == DEFAULT_BINARY_BOUND
+
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "mp3",
+            "content_type": "audio/mpeg", "size": 4, "call_id": call["call_id"],
+        })
+        error = await agent.expect_error(PROXY_ERROR_INVALID_FRAME)
+        assert "an accepted content_type" in error["message"]
+        assert brain.store.object_count == 0
+        assert not agent.ws.closed
+
+        await agent.send({
+            "type": FRAME_ATTACHMENT, "id": agent.session_id, "attachment_id": "huge",
+            "content_type": "audio/wav", "size": DEFAULT_BINARY_BOUND + 1, "call_id": call["call_id"],
+        })
+        # Answered on the header alone: no binary frame was sent.
+        ack = await agent.frame()
+        assert ack["type"] == FRAME_ATTACHMENT_ACK and ack["attachment_id"] == "huge"
+        assert ack["accepted"] is False and ack["code"] == ATTACHMENT_ACK_TOO_LARGE
+        assert [m.type for m in agent.ws.sent].count(WSMsgType.BINARY) == 0
+        assert brain.store.object_count == 0
+
+        ack = await agent.transfer("long", SEGMENT_30S, content_type="audio/wav", call_id=call["call_id"])
+        assert ack["accepted"] is True, ack
+        assert brain.store.usage(RUN_ID).total_bytes == 960_044
+
+        await agent.observe(
+            call["call_id"], result=audio_capture_result(960_044),
+            parts=[audio_ref("long", 960_044, transcription=TRANSCRIPTION)],
+            provenance={"provider": "audio_input"},
+        )
+        observation = await task
+        assert observation.status == "success", observation.error
+        (part,) = observation.parts
+        ref = brain.store.lookup(part["attachment_id"])
+        assert ref is not None and ref.size == 960_044 and ref.content_type == "audio/wav"
+        assert part["transcription"] == TRANSCRIPTION
+        assert brain.store.object_count == 1
+        assert_every_frame_is_v1(agent.pair)
+    finally:
+        await brain.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC19 — no reference without an acknowledged upload; writes dropped
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac19_an_audio_ref_naming_an_unacknowledged_attachment_is_refused_at_the_proxy() -> None:
+    """AC19 (R5), brain side: an ``audio_ref`` naming an ``attachment_id``
+    this session never acknowledged ends the call ``error
+    attachment_refused`` (``retryable: false``) at the boundary; the upload
+    the same call did make is discarded and 0 attachments stay leased."""
+
+    brain = Brain(
+        actions=(AUDIO_CAPTURE,),
+        specs=(audio_capture_spec(),),
+        store_limits=AUDIO_STORE_LIMITS,
+        authorization=audio_policy(),
+    )
+    try:
+        module = await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up(specs=(audio_capture_spec(),))
+        task = asyncio.create_task(brain.executor.invoke(audio_call(deadline=brain.clock() + 30)))
+        call = await agent.call_frame()
+        ack = await agent.transfer("real", SEGMENT_3S, content_type="audio/wav", call_id=call["call_id"])
+        assert ack["accepted"] is True and brain.store.object_count == 1
+        await agent.observe(
+            call["call_id"], result=audio_capture_result(96_044),
+            parts=[audio_ref("real", 96_044), audio_ref("never-sent", 96_044)],
+        )
+        observation = await task
+        assert observation.status == "error"
+        assert observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert observation.error["retryable"] is False
+        assert "never-sent" in observation.error["message"]
+        assert observation.parts == ()
+        assert brain.store.object_count == 0
+        assert brain.store.usage(RUN_ID).objects == 0
+        assert module.acknowledged_attachments == 0
+        assert module.in_flight == ()
+        assert_every_frame_is_v1(agent.pair)
+    finally:
+        await brain.close()
+
+
+async def test_ac19_an_unacknowledged_audio_ref_on_a_write_is_external_unknown() -> None:
+    """The write side of the §5.5 rule for ``audio_ref``: a forwarded
+    ``audio.speak`` the agent did not report ``refused`` becomes
+    ``external_unknown`` with the same ``attachment_refused`` code."""
+
+    brain = Brain(
+        actions=(AUDIO_SPEAK,),
+        specs=(audio_speak_spec(),),
+        store_limits=AUDIO_STORE_LIMITS,
+        authorization=audio_policy(),
+    )
+    try:
+        await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up(specs=(audio_speak_spec(),))
+        task = asyncio.create_task(brain.executor.invoke(
+            audio_call("call-s1", action=AUDIO_SPEAK, arguments={"text": "salut"}, deadline=brain.clock() + 30)
+        ))
+        call = await agent.call_frame()
+        await agent.observe(
+            call["call_id"],
+            result={"output": "main", "voice": "v", "duration_ms": 3000, "played_ms": 3000, "playback": "completed"},
+            parts=[audio_ref("never-sent", 96_044)],
+        )
+        observation = await task
+        assert observation.status == "external_unknown"
+        assert observation.error["code"] == ERROR_ATTACHMENT_REFUSED
+        assert observation.error["retryable"] is False
+        assert brain.store.object_count == 0
+    finally:
+        await brain.close()
+
+
+@pytest.mark.parametrize("code", [ATTACHMENT_ACK_TOO_LARGE, ATTACHMENT_ACK_STORE_FULL, ATTACHMENT_ACK_UNEXPECTED_BINARY])
+async def test_ac19_the_agent_facing_a_refused_audio_transfer_returns_attachment_refused(code: str) -> None:
+    """AC19 (R5), agent side: the agent transfers the ``audio_ref``'s
+    segment before its observation; a refused ack turns the observation into
+    ``error attachment_refused`` with no part — never a dangling reference —
+    and the local segment is discarded."""
+
+    host, provider = audio_agent_host(SEGMENT_3S)
+    try:
+        await host.activate()
+        brain_end = host.connect()
+        await brain_end.pair_up(actions=[AUDIO_CAPTURE])
+        await brain_end.send(audio_call_frame(brain_end, "call-1", 1, max_attachment_bytes=DEFAULT_BINARY_BOUND))
+        header, payload = await brain_end.receive_transfer()
+        assert header["content_type"] == "audio/wav" and header["size"] == 96_044
+        assert len(payload) == 96_044 and header["attachment_id"] == provider.stored[0]
+        # The observation waits for the ack.
+        await settle()
+        assert FRAME_OBSERVATION not in brain_end.received_types()
+        await brain_end.ack(header["attachment_id"], accepted=False, code=code)
+        observation = await brain_end.observation("call-1")
+        assert observation["status"] == "error"
+        assert observation["error"]["code"] == ERROR_ATTACHMENT_REFUSED
+        assert observation["error"]["retryable"] is False
+        assert code in observation["error"]["message"]
+        assert observation["parts"] == [] and "result" not in observation
+        assert "audio_ref" not in json.dumps(observation)
+        assert host.store.object_count == 0
+        assert_every_frame_is_v1(brain_end.pair)
+    finally:
+        await host.close()
+
+
+async def test_ac19_the_agent_sends_no_audio_above_the_calls_bound_and_refuses_the_observation() -> None:
+    host, _ = audio_agent_host(SEGMENT_3S)
+    try:
+        await host.activate()
+        brain_end = host.connect()
+        await brain_end.pair_up(actions=[AUDIO_CAPTURE])
+        await brain_end.send(audio_call_frame(brain_end, "call-1", 1, max_attachment_bytes=96_043))
+        observation = await brain_end.observation("call-1")
+        assert observation["status"] == "error"
+        assert observation["error"]["code"] == ERROR_ATTACHMENT_REFUSED
+        assert observation["parts"] == []
+        assert FRAME_ATTACHMENT not in brain_end.received_types()
+        assert host.store.object_count == 0
+
+        # At the bound it is transferred, and the accepted reference is kept.
+        await brain_end.send(audio_call_frame(brain_end, "call-2", 2, max_attachment_bytes=96_044))
+        header, _ = await brain_end.receive_transfer()
+        await brain_end.ack(header["attachment_id"])
+        observation = await brain_end.observation("call-2")
+        assert observation["status"] == "success"
+        (part,) = observation["parts"]
+        assert part["type"] == "audio_ref" and part["attachment_id"] == header["attachment_id"]
+        assert part["transcription"] == TRANSCRIPTION
+        assert host.store.object_count == 0
+        assert_every_frame_is_v1(brain_end.pair)
+    finally:
+        await host.close()
+
+
+async def test_ac19_a_forwarded_audio_speak_dropped_after_its_call_is_external_unknown_and_not_resent() -> None:
+    """AC19 (R5): ``audio.speak``, declared in the harness catalog (the
+    shipped ``audio_output`` manifest) and served through the proxy, whose
+    connection drops after the ``call`` frame, resolves ``external_unknown``
+    cause ``proxy_disconnected``; on reconnect nothing is retransmitted and
+    its late ``observation`` is ignored and counted. AC20: ``v == 1``."""
+
+    brain = Brain(
+        actions=(AUDIO_SPEAK,),
+        specs=(),
+        catalog={
+            "audio_output": _manifest(AUDIO_OUTPUT_MANIFEST),
+            MODULE_NAME: _manifest(MANIFEST_PATH),
+        },
+        authorization=audio_policy(),
+    )
+    try:
+        module = await brain.activate()
+        assert brain.context.actions.discovered()[AUDIO_SPEAK] == audio_speak_spec()
+        agent = brain.connect()
+        welcome = await agent.pair_up(specs=(audio_speak_spec(),))
+        assert welcome["actions"] == [AUDIO_SPEAK] and agent.mismatches == []
+        task = asyncio.create_task(brain.executor.invoke(
+            audio_call("call-speak", action=AUDIO_SPEAK, arguments={"text": "bonjour"}, deadline=brain.clock() + 30)
+        ))
+        call = await agent.call_frame()
+        assert call["action_name"] == AUDIO_SPEAK and call["arguments"] == {"text": "bonjour"}
+
+        agent.pair.drop()
+        observation = await task
+        assert observation.status == "external_unknown"
+        assert observation.error["code"] == PROXY_ERROR_PROXY_DISCONNECTED
+        assert observation.provenance["emission"] == "emitted"
+        assert brain.executor.outcome("call-speak") == observation
+        await wait_until(agent.handler.done)
+        assert_every_frame_is_v1(agent.pair)
+
+        again = brain.connect()
+        await again.pair_up(nonce="h2", specs=(audio_speak_spec(),))
+        await settle()
+        assert again.received_types().count(FRAME_CALL) == 0
+        late_before = module.late_observations
+        await again.observe(
+            "call-speak",
+            result={"output": "main", "voice": "v", "duration_ms": 1000, "played_ms": 1000, "playback": "completed"},
+            provenance={"provider": "audio_output"},
+        )
+        await wait_until(lambda: module.late_observations == late_before + 1)
+        assert brain.executor.outcome("call-speak") == observation
+        assert brain.executor.provider_invocations == 1
+        assert again.received_types().count(FRAME_CALL) == 0
+        assert_every_frame_is_v1(again.pair)
+    finally:
+        await brain.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC20 — the protocol document's addendum; the vocabulary is unchanged
+# --------------------------------------------------------------------------- #
+
+
+def test_ac20_the_protocol_document_carries_the_phase_2_addendum(protocol_doc: str) -> None:
+    heading = re.search(r"^## \d+\. Phase 2 addendum$", protocol_doc, re.MULTILINE)
+    assert heading is not None, "docs/proxy-protocol.md lacks the Phase 2 addendum"
+    addendum = protocol_doc[heading.start():]
+    assert re.search(
+        r"`attachment\.content_type ∈ \{image/png, image/jpeg,\s+audio/wav\}`", addendum
+    ), "the addendum does not state the content-type set"
+    for literal in ("image/png", "image/jpeg", "audio/wav"):
+        assert literal in addendum
+    assert "`audio_ref`" in addendum and "§5.5" in addendum and "§10" in addendum
+    assert "attachment_refused" in addendum
+    assert "`v` stays `1`" in addendum
+    assert "decision 11" in addendum and "provider_not_ready" in addendum
+    assert PROXY_PROTOCOL_VERSION == 1
+    # The §5.7 row names the shared set and its three members.
+    row = re.search(r"^\| `content_type`\s+\|.*$", protocol_doc, re.MULTILINE)
+    assert row is not None
+    assert "`ATTACHMENT_CONTENT_TYPES`" in row.group(0)
+    for content_type in sorted(ATTACHMENT_CONTENT_TYPES):
+        assert f"`{content_type}`" in row.group(0)
+
+
+def test_ac20_the_frame_table_limits_and_codes_are_the_phase_1_ones(protocol_doc: str) -> None:
+    """AC20: nothing but the content-type set and the ``audio_ref`` sentence
+    changed — the frame types, the error/ack/close codes and the default
+    frame bound are the phase 1 literals, in the constants and in the
+    document's error-code table."""
+
+    assert PROXY_FRAME_TYPES == {
+        "hello", "welcome", "error", "call", "observation", "cancel",
+        "attachment", "attachment_ack", "event", "ping", "pong",
+    }
+    phase1_codes = {
+        "auth_failed", "agent_limit", "unsupported_protocol_version", "invalid_frame",
+        "frame_too_large", "unknown_frame", "unknown_session", "duplicate_call_unknown",
+        "action_mismatch", "proxy_disconnected", "event_not_allowed",
+    }
+    assert set(PROXY_ERROR_CODES) == phase1_codes
+    section = protocol_doc[protocol_doc.index("## 7. Error codes"):protocol_doc.index("## 8. ")]
+    table = {
+        m.group(1)
+        for m in re.finditer(r"^\| `([a-z_]+)`\s+\| (?:brain|agent|both)", section, re.MULTILINE)
+    }
+    assert table == phase1_codes
+    assert set(_ACK_CODES) == {"attachment_too_large", "store_full", "unexpected_binary"}
+    assert set(PROXY_CLOSE_CODES) == {4400, 4401, 4409, 4413}
+    assert _MAX_FRAME == DEFAULT_BINARY_BOUND
+    assert "twelve frame types" in protocol_doc

@@ -67,8 +67,11 @@ recreate a lease after the run's cleanup. The ``attachment_id`` is unique
 within the session: a header naming an id a live call already holds an
 accepted upload under — from another call or the same one — is refused
 ``unexpected_binary`` on the header alone, and the first owner's reference
-keeps resolving to its own bytes. An
-``image_ref`` part of the observation names the agent's acknowledged
+keeps resolving to its own bytes. The header's ``content_type`` is one
+of :data:`~core.contracts.ATTACHMENT_CONTENT_TYPES` (``image/png``,
+``image/jpeg``, ``audio/wav``; phase 2 R5), and the store records the
+acknowledged header's type, never the part's. An ``image_ref`` or
+``audio_ref`` part of the observation names the agent's acknowledged
 ``attachment_id``; it is rewritten to the store's own reference before the
 executor validates the lease. An id this session never acknowledged — or
 acknowledged for another call — is refused at the proxy boundary, as
@@ -153,7 +156,8 @@ from core.contracts import (
     FRAME_PING,
     FRAME_PONG,
     FRAME_WELCOME,
-    IMAGE_CONTENT_TYPES,
+    ATTACHMENT_CONTENT_TYPES,
+    PART_TYPE_AUDIO_REF,
     PART_TYPE_IMAGE_REF,
     PROXY_CLOSE_AGENT_LIMIT,
     PROXY_CLOSE_AUTH_FAILED,
@@ -274,8 +278,12 @@ class ProxyModuleError(RuntimeError):
     """A configuration or lifecycle failure of the proxy module."""
 
 
+_REFERENCE_PART_TYPES = frozenset({PART_TYPE_IMAGE_REF, PART_TYPE_AUDIO_REF})
+"""Part types naming an acknowledged upload, translated at the boundary (§5.5, R5)."""
+
+
 class _UnacknowledgedReference(Exception):
-    """An ``image_ref`` names an upload the observing call may not name (§5.5)."""
+    """A reference part names an upload the observing call may not name (§5.5)."""
 
     def __init__(self, attachment_id: str, reason: str) -> None:
         super().__init__(f"{attachment_id!r} {reason}")
@@ -1453,7 +1461,7 @@ class ProxyModule:
                 parts=tuple(self._resolve_part(session, entry, part) for part in parts),
             )
         except _UnacknowledgedReference as refused:
-            # §5.5: an ``image_ref`` naming an upload this session never
+            # §5.5: an ``image_ref`` or ``audio_ref`` naming an upload this session never
             # acknowledged — or acknowledged for another call — is refused
             # here, at the boundary, with the brain's ``attachment_refused``;
             # the executor never sees the reference (gate finding F4). What
@@ -1490,16 +1498,19 @@ class ProxyModule:
             )
 
     def _resolve_part(self, session: _Session, entry: _PendingCall, part: Any) -> Any:
-        """Rewrite an ``image_ref`` acknowledged for *entry* to the store's reference.
+        """Rewrite a reference acknowledged for *entry* to the store's reference.
 
-        A part that is not an ``image_ref``, or whose ``attachment_id`` is not
+        ``image_ref`` and ``audio_ref`` parts are treated alike (phase 2 R5);
+        only ``attachment_id`` is rewritten, every other field — an audio
+        part's ``transcription`` included — is kept verbatim. A part that is
+        not a reference part, or whose ``attachment_id`` is not
         even text, passes unchanged: the executor's part validation names
         the malformed field (``invalid_result``). A well-formed identifier
         this session never acknowledged, or acknowledged for another call,
         raises :class:`_UnacknowledgedReference` (§5.5, gate finding F4).
         """
 
-        if not isinstance(part, Mapping) or part.get("type") != PART_TYPE_IMAGE_REF:
+        if not isinstance(part, Mapping) or part.get("type") not in _REFERENCE_PART_TYPES:
             return part
         attachment_id = part.get("attachment_id")
         if not _is_text(attachment_id):
@@ -1550,13 +1561,13 @@ class ProxyModule:
         size = frame.get("size")
         if (
             not _is_text(attachment_id)
-            or content_type not in IMAGE_CONTENT_TYPES
+            or content_type not in ATTACHMENT_CONTENT_TYPES
             or not _is_positive_int(size)
         ):
             session.pending_header = None
             await self._error(
                 session.connection, session.session_id, PROXY_ERROR_INVALID_FRAME,
-                "attachment requires attachment_id, an image content_type and a positive size",
+                "attachment requires attachment_id, an accepted content_type and a positive size",
             )
             return
         session.pending_header = None

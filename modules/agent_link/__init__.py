@@ -46,8 +46,8 @@ missing or non-positive ``seq``, or a ``call_id`` retained under another
 monotonic clock; ``deadline_utc`` is informational and never read for the
 bound, so wall-clock skew between the hosts cannot lengthen a call.
 
-**Attachments (AC33).** For every ``image_ref`` part of the local
-observation the bytes are read from the agent's store, sent as one
+**Attachments (AC33; phase 2 R5).** For every ``image_ref`` or
+``audio_ref`` part of the local observation the bytes are read from the agent's store, sent as one
 ``attachment`` header plus exactly one binary frame under the send lock,
 and the ``attachment_ack`` awaited **before** the ``observation`` leaves. An
 ack that is not ``accepted`` — or bytes the store no longer holds, or a
@@ -108,6 +108,7 @@ from core.contracts import (
     FRAME_PING,
     FRAME_PONG,
     FRAME_WELCOME,
+    PART_TYPE_AUDIO_REF,
     PART_TYPE_IMAGE_REF,
     PROXY_CLOSE_BAD_REQUEST,
     PROXY_CLOSE_FRAME_TOO_LARGE,
@@ -137,7 +138,10 @@ STATE_PAIRED = "paired"
 """The ``agent.status`` state sent right after every ``welcome``."""
 
 ERROR_ATTACHMENT_REFUSED = BRAIN_ERROR_ATTACHMENT_REFUSED
-"""The observation error code when the brain refused an image transfer."""
+"""The observation error code when the brain refused an attachment transfer."""
+
+_REFERENCE_PART_TYPES = frozenset({PART_TYPE_IMAGE_REF, PART_TYPE_AUDIO_REF})
+"""Part types naming an attachment the agent transfers before the observation (R5)."""
 
 DEFAULT_RECONNECT_INITIAL_SECONDS = 1.0
 DEFAULT_RECONNECT_MULTIPLIER = 2.0
@@ -1247,12 +1251,17 @@ class AgentLinkModule:
         observation: ActionObservation,
         max_attachment_bytes: int | None,
     ) -> dict[str, Any]:
-        """Transfer every image the observation names, then shape the frame."""
+        """Transfer every attachment the observation names, then shape the frame.
+
+        ``image_ref`` and ``audio_ref`` parts are handled alike (phase 2 R5):
+        a refused transfer drops the part — never a dangling reference — and
+        the observation becomes ``error attachment_refused``.
+        """
 
         parts: list[Any] = []
         refused: str | None = None
         for part in observation.parts:
-            if not isinstance(part, Mapping) or part.get("type") != PART_TYPE_IMAGE_REF:
+            if not isinstance(part, Mapping) or part.get("type") not in _REFERENCE_PART_TYPES:
                 parts.append(_jsonable(part))
                 continue
             attachment_id = part.get("attachment_id")
@@ -1282,7 +1291,7 @@ class AgentLinkModule:
             "provenance": _jsonable(observation.provenance),
             "error": {
                 "code": ERROR_ATTACHMENT_REFUSED,
-                "message": f"the image of {call.action_name!r} was not transferred ({refused})",
+                "message": f"the attachment of {call.action_name!r} was not transferred ({refused})",
                 "retryable": False,
             },
             "parts": parts,
@@ -1329,7 +1338,7 @@ class AgentLinkModule:
 
     def _discard_images(self, parts: Sequence[Mapping[str, Any]]) -> None:
         for part in parts:
-            if isinstance(part, Mapping) and part.get("type") == PART_TYPE_IMAGE_REF:
+            if isinstance(part, Mapping) and part.get("type") in _REFERENCE_PART_TYPES:
                 self._discard(part.get("attachment_id"))
 
     async def _transfer(

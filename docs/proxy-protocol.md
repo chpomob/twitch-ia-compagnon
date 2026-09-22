@@ -192,7 +192,7 @@ the observation it returns, if any. The brain never waits for an answer.
 | Field           | Type             | Meaning |
 | --------------- | ---------------- | ------- |
 | `attachment_id` | non-empty string | Agent-chosen identifier, unique within the session: one a live call already holds an accepted upload under is refused (§10). |
-| `content_type`  | string           | One of `IMAGE_CONTENT_TYPES` (`image/png`, `image/jpeg`). |
+| `content_type`  | string           | One of `ATTACHMENT_CONTENT_TYPES` (`image/png`, `image/jpeg`, `audio/wav`; phase 2 addendum, §17). |
 | `size`          | positive integer | Exact byte length of the binary frame that follows. |
 | `call_id`       | string, optional | The in-flight `call` the upload belongs to (§10). Absent: the most recently issued call still in flight. |
 
@@ -530,3 +530,40 @@ else.
 | Backoff, unlimited attempts                     |                         | ✔ |
 | TLS at validation                               | ✔ (`listen`/`tls`)      | ✔ (`wss`) |
 | Event allowlist, `metadata` rewrite             | ✔                       |   |
+
+## 17. Phase 2 addendum
+
+Phase 2 (`docs/campaigns/phase2/spec.md`, R5 and decision 11) extends what
+protocol v1 carries without changing its version or its rules:
+
+- **Content types.** `attachment.content_type ∈ {image/png, image/jpeg,
+  audio/wav}` — the shared `ATTACHMENT_CONTENT_TYPES` set of
+  `core/contracts.py`, which the brain's store, the proxy and the agent use
+  alike. Any other value (`audio/mpeg`, for instance) is `error
+  invalid_frame` and nothing is stored. The brain's store records the type
+  of the acknowledged `attachment` header, never the type a part repeats.
+- **`audio_ref` parts.** An `observation` may carry `audio_ref` parts
+  (the `AUDIO_REF_FIELDS`, `transcription` included) under exactly the
+  acknowledged-reference rule of §5.5 and §10: the agent transfers the
+  attachment of every `audio_ref` before it sends the observation and returns
+  `error attachment_refused` — never a dangling reference — when a transfer is
+  refused; the brain refuses an `audio_ref` naming an unacknowledged
+  `attachment_id` with `error attachment_refused` (`retryable: false`;
+  `external_unknown` for a `write` the agent did not report `refused`) and
+  discards the call's uploads. The brain rewrites only `attachment_id`; every
+  other field of the part, `transcription` included, reaches the executor
+  verbatim.
+- **Unchanged.** `v` stays `1`. The twelve frame types of §5, the limits of §6
+  (binary bound `min(max_object_bytes, max_attachment_bytes)`, default
+  1 048 576 bytes), the error, `attachment_ack` and close codes of §7, the
+  three-step transfer, call identity, `attachment_id` uniqueness and the
+  no-retransmission rule of §11 are otherwise unchanged. A forwarded write —
+  `audio.speak`, `audio.play`, `stream.scene.set` — dropped after its `call`
+  frame resolves `external_unknown` (cause `proxy_disconnected`) like any
+  write.
+- **Remote-readiness limit (decision 11).** The brain's ready view lists a
+  proxy-bound action as ready while an agent that declared it is paired; an
+  action whose module is not ready on the agent answers `refused
+  provider_not_ready` from the agent's executor at call time. Agent-side
+  readiness changes are **not** propagated over the wire in protocol v1; that
+  is a recorded limit, deferred to a later protocol revision.
