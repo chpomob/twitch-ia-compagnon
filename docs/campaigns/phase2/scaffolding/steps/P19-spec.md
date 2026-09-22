@@ -1,4 +1,4 @@
-# Step P19 — Profiles, packaging assertions, degraded and chat-only startup, examples and profile suites (R8, R9; AC30, AC31, AC32, AC33)
+# Step P19 — Profiles, packaging assertions, degraded and chat-only startup, examples and profile suites (R8, R9; AC30, AC31, AC32, AC33, AC43)
 
 Plan step `P19` of the approved Phase 2 plan for `twitch-ia-compagnon`.
 Authority documents (read them, do not re-derive):
@@ -14,7 +14,7 @@ PC profile: `enabled_modules` `[twitch, chat_context, users, capture, audio_inpu
 ## Requirements
 
 Plan mapping: R8, R9
-Acceptance criteria owned by this step: AC30, AC31, AC32, AC33
+Acceptance criteria owned by this step: AC30, AC31, AC32, AC33, AC43
 Read the exact R/AC text in the specification file before writing code. Requirements not listed
 here are other steps' responsibility — do not implement them.
 Phase-1 product decision that overrides any contrary reading: delivery is a **configured, pluggable
@@ -40,7 +40,7 @@ All dependencies are already merged into `main` when this step runs.
 
 ## Tests
 
-AC30 — the PC profile with `enabled_modules` reduced to the six phase 1 modules passes `--check-config` (exit 0), reaches readiness with 0 `module.degraded`, runs `chat.read` → final → `chat.write` with 1 send, `registered_ready()` is exactly `{chat.read, users.read, screen.capture, chat.write}` and the catalog declares 9 actions. AC31 — the full PC profile with every phase 2 endpoint at a closed loopback port (`127.0.0.1:1`, bounded on the clock), a non-executable player and no poll service reaches readiness with exactly 3 `module.degraded` (`audio_output`, `audio_input`, `stream_control`), runs the chat scenario with 1 send, lists none of the five phase 2 actions in `registered_ready()`, and the brain's authorized tools are the phase 1 read actions only. AC32 — each profile enables exactly R9's module list in order, references every endpoint and credential as `${NAME}` with 0 literal secrets, passes `--check-config` with exit 0 and 0 sockets, its grants equal its provided-action set (9, 9, 5); the two brain profiles keep the acted budgets and the single fixed `chat.write` entry; the server profile binds the five allowlisted actions to the proxy provider and `stream.poll.create` to `stream_control` with no ambiguity diagnostic. AC33 — `pyproject.toml` carries the three package-data lines, the install test discovers exactly 11 manifests, the runtime dependency list is `aiohttp`, `PyYAML` only.
+AC43 — the shipped `config.yaml.example` and every audio-enabled profile carry an EMPTY speech and transcription endpoint: `audio.speak` is named not ready with a value-free reason, zero requests are attempted, startup succeeds, and the chat-only profile is identical (arbiter decision 22/09: no provider default). AC30 — the PC profile with `enabled_modules` reduced to the six phase 1 modules passes `--check-config` (exit 0), reaches readiness with 0 `module.degraded`, runs `chat.read` → final → `chat.write` with 1 send, `registered_ready()` is exactly `{chat.read, users.read, screen.capture, chat.write}` and the catalog declares 9 actions. AC31 — the full PC profile with every phase 2 endpoint at a closed loopback port (`127.0.0.1:1`, bounded on the clock), a non-executable player and no poll service reaches readiness with exactly 3 `module.degraded` (`audio_output`, `audio_input`, `stream_control`), runs the chat scenario with 1 send, lists none of the five phase 2 actions in `registered_ready()`, and the brain's authorized tools are the phase 1 read actions only. AC32 — each profile enables exactly R9's module list in order, references every endpoint and credential as `${NAME}` with 0 literal secrets, passes `--check-config` with exit 0 and 0 sockets, its grants equal its provided-action set (9, 9, 5); the two brain profiles keep the acted budgets and the single fixed `chat.write` entry; the server profile binds the five allowlisted actions to the proxy provider and `stream.poll.create` to `stream_control` with no ambiguity diagnostic. AC33 — `pyproject.toml` carries the three package-data lines, the install test discovers exactly 11 manifests, the runtime dependency list is `aiohttp`, `PyYAML` only.
 
 Test command (must pass): `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
 Always use the project virtualenv: the SYSTEM python lacks `aiohttp`, which the proxy and the

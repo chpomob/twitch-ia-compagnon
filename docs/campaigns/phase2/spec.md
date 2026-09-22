@@ -40,7 +40,7 @@ targets:
   - file: docs/README.md
     description: "Add the phase 2 versioning section (which phase 1 assertions change and by what) and the per-provider integration trial records (speech synthesis, transcription, playback command, capture command, scene provider, platform polls), each with commit, settings shape, outcome and limits; states the `played_ms` accepted-bytes estimate and names the scene provider's wire protocol."
   - file: config.yaml.example
-    description: "PC profile enables the three new modules with `required: false` and loopback-only endpoints by `${NAME}` reference, keeps the single fixed `chat.write` delivery entry (an `audio.speak` entry shown commented), adds grants for the five new actions; acted budgets unchanged; 0 literal secrets."
+    description: "PC profile enables the three new modules with `required: false`, NO speech or transcription endpoint configured (the AC43 not-ready path), no `${NAME}` endpoint default, keeps the single fixed `chat.write` delivery entry (an `audio.speak` entry shown commented), adds grants for the five new actions; acted budgets unchanged; 0 literal secrets."
   - file: config.server.yaml.example
     description: "Server profile enables `stream_control` with scenes `none` and polls enabled, extends the proxy `actions` allowlist to `audio.capture`, `audio.speak`, `audio.play`, `stream.scene.set`, adds the matching grants; 0 literal secrets."
   - file: agent.yaml.example
@@ -110,12 +110,19 @@ historical v1 documents and are not modified.
 
 - A speech synthesis/transcription HTTP service listens on loopback port
   5050 without authentication on the reference machine. It is one candidate
-  provider; every endpoint, model and voice stays a module setting.
+  provider; every endpoint, model and voice stays a module setting, and
+  **no endpoint is shipped as a default** (arbiter decision, 22/09): the
+  speech endpoint setting is empty out of the box, `audio.speak` is unbound
+  while it is empty or unusable, and the module reports a named not-ready
+  reason — the design's "discovered but not ready".
 - Playback and recording tooling exists on the reference machine as ordinary
   executables; the modules drive a configured command, never a named tool.
 - No streaming-software scene provider is installed and its port is closed:
   `stream_control` must stay discovered-but-not-ready for scenes on this
-  machine, the boundary being proven against a scripted provider.
+  machine, the boundary being proven against a scripted provider. A real
+  scene-provider integration trial is run separately (arbiter decision,
+  22/09) once a provider is installed on a machine, using the `websocket`
+  kind.
 
 ### Decisions this spec settles (design §6 delegated them to implementation)
 
@@ -131,9 +138,16 @@ Each is a contract, not a mechanism; the plan chooses the code.
    delivery capability: creating a poll is not delivering an answer. Letting
    the model propose policy-permitted writes is a phase 3+ decision.
 2. **Speech synthesis happens in the module that serves `audio.speak`.** The
-   provider is an HTTP endpoint (loopback service or remote service) taking
+   provider is an HTTP endpoint (a locally hosted service or a remote
+   service) taking
    the speech request shape of the API family the model adapter already
    speaks (design §3.1); playback happens on the machine running the module.
+   **No endpoint ships as a default** (arbiter decision, 22/09): the setting
+   is empty in the shipped profiles and examples; while it is empty (or the
+   service is unreachable at prepare) `audio.speak` is unbound and the
+   module reports a named not-ready reason, so a chat-only profile and a
+   freshly installed one both start clean. Configuring a provider is the
+   operator's act, never an implicit localhost assumption.
    In the server profile the action is proxy-bound, so synthesis and
    playback both happen on the agent, whose synthesis endpoint may itself be
    remote. No audio bytes therefore travel brain → agent, and protocol v1
@@ -1095,6 +1109,19 @@ rule and is the precondition of AC3 and AC10.
   `t = 99.0` or at `t = 99.5` (`(expiry − now) − 1 s ≤ 0`) — sends 0
   requests and reports `skipped:deadline`, still `success` with the
   `audio_ref`.
+
+- AC43 (R2, R9, arbiter decision 22/09): No speech provider is assumed.
+  With the shipped `config.yaml.example` and with every profile that
+  enables the audio modules, the speech endpoint setting is EMPTY:
+  `audio.speak` is not in the bound action set, the runtime's capability
+  view names it with a value-free not-ready reason, no request is
+  attempted and startup succeeds; the optional transcription endpoint is
+  empty by the same rule and a capture without it is still `success` with
+  its `audio_ref`. A chat-only profile behaves identically with the three
+  phase 2 modules disabled. No shipped profile or example carries a
+  localhost, vendor or model default; binding the action requires an
+  operator-configured endpoint, and a test asserts the empty-setting
+  startup with the action named as not ready and zero requests.
 
 ## Caller enumeration
 

@@ -1,4 +1,4 @@
-# Step P20 — README phase 2 versioning and per-provider trial records, hygiene assertions, opt-in trial runner (R9, R10-documentation; AC34, AC41-README)
+# Step P20 — README phase 2 versioning and per-provider trial records, hygiene assertions, opt-in trial runner (R9, R10-documentation; AC34, AC41-README, scene trial against an installed provider)
 
 Plan step `P20` of the approved Phase 2 plan for `twitch-ia-compagnon`.
 Authority documents (read them, do not re-derive):
@@ -53,7 +53,7 @@ the transports.
 
 ## Risks
 
-Trivial in code; the honesty of the six rows is the deliverable: the scene-provider row records "not run" with the closed port when that is the truth, and the commit field names a commit that exists on the branch (filled at the gate).
+Trivial in code; the honesty of the six rows is the deliverable: the scene-provider row records what actually ran: the arbiter decided (22/09) that a REAL scene-provider integration trial is performed against a provider installed on the machine (obs-websocket protocol 5 over the `websocket` kind), and that "not run" with the closed port is recorded only if the trial genuinely could not run, and the commit field names a commit that exists on the branch (filled at the gate).
 
 ## Constraints
 
