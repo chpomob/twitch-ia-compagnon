@@ -19,6 +19,14 @@ protocol against an in-process loopback peer on ``MemoryWebSocketPair`` —
 and once against a real ``aiohttp`` loopback server, for the default
 factory's framing — with every timeout on the injected clock, and its
 supervised reconnection (R6; AC36, AC22).
+
+Section "polls": ``stream.poll.create`` over the conftest
+``ScriptedPollService`` published under ``(poll, fake)`` on the harness
+registry — one create per call, the tracked table and its bounds,
+reconciliation, per-channel serialization and drain — and the ``required``
+policy over the real service lookup, through the loader with the fixture
+platform and through a minimal three-method registry (R7, R8, R10; AC26,
+AC27, AC28, AC37, AC29).
 """
 
 from __future__ import annotations
@@ -1080,6 +1088,7 @@ def scene_settings(
             **(scenes or {}),
         },
         "_sleeper": clock.sleep,
+        "_wall_clock": clock,
         **extra,
     }
     if provider is not None:
@@ -2930,3 +2939,1164 @@ async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_sock
     finally:
         await h.handle.close()
         await runner.cleanup()
+
+
+# --------------------------------------------------------------------------- #
+# Polls (R7, R8, R10; AC26, AC27, AC28, AC37, AC29; finding P1, round 2 P3)
+# --------------------------------------------------------------------------- #
+
+from conftest import PollStatusError as ScriptedStatusError  # noqa: E402
+from conftest import ScriptedPollService  # noqa: E402
+from core.actions import ERROR_INVALID_ARGUMENTS  # noqa: E402
+from modules.stream_control import (  # noqa: E402
+    ERROR_PLATFORM_FORBIDDEN,
+    ERROR_PLATFORM_UNAVAILABLE,
+    ERROR_POLL_ACTIVE,
+    ERROR_POLL_REJECTED,
+    POLL_SERVICE_KIND,
+)
+
+
+POLL_START = 1000.0
+QUESTION = "Next game?"
+OPTIONS = ("A", "B")
+#: TTL of a 60 s poll's entry: ``duration_seconds + 300``.
+POLL_TTL = 360.0
+
+
+def poll_listing(
+    question: str = QUESTION,
+    options: Sequence[str] = OPTIONS,
+    *,
+    started_at: float = POLL_START,
+    poll_id: Any = "listed-1",
+    state: str = "active",
+) -> dict[str, Any]:
+    """One entry of a ``get`` answer, as a poll service lists it."""
+
+    entry = {
+        "question": question,
+        "options": list(options),
+        "started_at": started_at,
+        "state": state,
+    }
+    if poll_id is not None:
+        entry["poll_id"] = poll_id
+    return entry
+
+
+def grant_poll(runtime: Any) -> None:
+    runtime.actions._authorization.grant(
+        AuthorizationRule(
+            rule_id="grant-poll", action_name=POLL_ACTION, granted_permissions=("stream.poll",)
+        )
+    )
+
+
+def poll_call(
+    call_id: str,
+    channel: str = "chan-a",
+    *,
+    platform: str = "fake",
+    question: str = QUESTION,
+    options: Sequence[str] = OPTIONS,
+    duration_seconds: Any = 60,
+    deadline: float = 100_000.0,
+) -> ActionCall:
+    return ActionCall(
+        action_name=POLL_ACTION,
+        action_version=1,
+        arguments={
+            "question": question,
+            "options": list(options),
+            "duration_seconds": duration_seconds,
+        },
+        conversation_id="conversation-1",
+        run_id="run-1",
+        call_id=call_id,
+        source_event_id="source-1",
+        destination=Destination(platform, channel, "poll"),
+        principal="brain",
+        deadline=deadline,
+        message_id="source-1",
+    )
+
+
+class PollHarness:
+    """One stream_control handle with polls enabled over a scripted poll service."""
+
+    def __init__(
+        self, runtime: RuntimeContext, handle: StreamControlModule, service: Any, clock: ManualClock
+    ) -> None:
+        self.runtime = runtime
+        self.handle = handle
+        self.service = service
+        self.clock = clock
+        self._calls = 0
+
+    def call(self, channel: str = "chan-a", **arguments: Any) -> ActionCall:
+        self._calls += 1
+        return poll_call(f"poll-call-{self._calls}", channel, **arguments)
+
+    async def create(self, channel: str = "chan-a", **arguments: Any) -> ActionObservation:
+        return await self.runtime.executor.invoke(self.call(channel, **arguments))
+
+    def start(
+        self, channel: str = "chan-a", **arguments: Any
+    ) -> "asyncio.Future[ActionObservation]":
+        return asyncio.ensure_future(self.create(channel, **arguments))
+
+    @property
+    def requests(self) -> tuple[int, int]:
+        """``(creates, gets)`` the service received so far."""
+
+        return len(self.service.creates), len(self.service.gets)
+
+    def tracked(self) -> set[str]:
+        return {channel for _platform, channel in self.handle.tracked_poll_channels()}
+
+    def degraded(self) -> list[dict[str, Any]]:
+        return [event["payload"] for event in events_of(self.runtime.bus, "module.degraded")]
+
+
+async def poll_harness(
+    *,
+    polls: dict[str, Any] | None = None,
+    services: Any = "registry",
+    prepare: bool = True,
+    **settings: Any,
+) -> PollHarness:
+    """``kind: none`` for scenes, ``polls.enabled: true``, ``(poll, fake)`` published."""
+
+    clock = ManualClock(POLL_START)
+    service = ScriptedPollService(clock=clock)
+    if services == "registry":
+        services = ServiceRegistry()
+        services.publish(POLL_SERVICE_KIND, "fake", service, module="fakeplatform")
+    runtime = runtime_context(clock=clock, services=services)
+    handle = await activate_stream_control(
+        runtime.for_module(STREAM_CONTROL),
+        scene_settings(
+            None, clock, kind="none", polls={"enabled": True, **(polls or {})}, **settings
+        ),
+        {},
+    )
+    if prepare:
+        await handle.prepare()
+    grant_poll(runtime)
+    return PollHarness(runtime, handle, service, clock)
+
+
+def assert_poll_failure(observation: ActionObservation, status: str, code: str) -> dict[str, Any]:
+    assert observation.status == status, observation
+    assert observation.result is None
+    assert observation.error is not None and observation.error["code"] == code, observation.error
+    return dict(observation.error)
+
+
+def assert_poll_success(observation: ActionObservation, *, reconciled: bool) -> dict[str, Any]:
+    assert observation.status == "success", observation
+    result = dict(observation.result)
+    result["options"] = list(result["options"])
+    assert isinstance(result["poll_id"], str) and result["poll_id"]
+    assert result["state"] == "active"
+    assert result["ends_at"] == result["started_at"] + 60
+    assert result["reconciled"] is reconciled
+    return result
+
+
+# -- AC26: one create, tracked, bounds --------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_poll_is_created_once_and_its_channel_refused_until_the_ttl() -> None:
+    """AC26: ``success`` with ``poll_id``, ``state: active``, ``started_at``,
+    ``ends_at == started_at + 60``, ``reconciled: false`` and 1 create; the
+    same call again is ``refused poll_active`` with 0 requests until the
+    entry's TTL (``60 + 300`` s) passed, after which the create proceeds."""
+
+    h = await poll_harness()
+    try:
+        observation = await h.create()
+        result = assert_poll_success(observation, reconciled=False)
+        assert result == {
+            "poll_id": h.service.polls["chan-a"][0]["poll_id"],
+            "state": "active",
+            "question": QUESTION,
+            "options": list(OPTIONS),
+            "started_at": POLL_START,
+            "ends_at": POLL_START + 60,
+            "reconciled": False,
+        }
+        assert h.service.creates == [
+            {
+                "channel_id": "chan-a",
+                "question": QUESTION,
+                "options": ["A", "B"],
+                "duration_seconds": 60,
+            }
+        ]
+        assert h.requests == (1, 0)
+
+        assert_poll_failure(await h.create(), "refused", ERROR_POLL_ACTIVE)
+        assert h.requests == (1, 0)
+        h.clock.advance(POLL_TTL - 0.5)
+        assert_poll_failure(await h.create(), "refused", ERROR_POLL_ACTIVE)
+        assert h.requests == (1, 0)
+
+        h.clock.advance(1.5)  # 361 s after the create
+        assert_poll_success(await h.create(), reconciled=False)
+        assert h.requests == (2, 0)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"question": "q" * 61},
+        {"question": ""},
+        {"options": ["A"]},
+        {"options": ["A", "B", "C", "D", "E", "F"]},
+        {"options": ["A", "o" * 26]},
+        {"options": ["A", ""]},
+        {"options": ["A", "A"]},
+        {"duration_seconds": 14},
+        {"duration_seconds": 1801},
+    ],
+    ids=[
+        "61-char-question",
+        "empty-question",
+        "1-option",
+        "6-options",
+        "26-char-option",
+        "empty-option",
+        "duplicates",
+        "14-s",
+        "1801-s",
+    ],
+)
+async def test_each_bound_violation_is_invalid_arguments_with_no_request(
+    arguments: dict[str, Any],
+) -> None:
+    """AC26: every argument outside the ``polls`` bounds → ``error
+    invalid_arguments`` with 0 requests and nothing tracked."""
+
+    h = await poll_harness()
+    try:
+        assert_poll_failure(await h.create(**arguments), "error", ERROR_INVALID_ARGUMENTS)
+        assert h.requests == (0, 0)
+        assert h.tracked() == set()
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_the_bounds_themselves_are_accepted_and_configurable() -> None:
+    """R7: the edges of the default bounds pass; a configured bound replaces
+    its default."""
+
+    h = await poll_harness()
+    try:
+        edges = [
+            {"question": "q" * 60},
+            {"options": ["A", "B", "C", "D", "o" * 25]},
+            {"duration_seconds": 15},
+            {"duration_seconds": 1800},
+        ]
+        for index, arguments in enumerate(edges):
+            observation = await h.create(f"edge-{index}", **arguments)
+            assert observation.status == "success", (arguments, observation)
+        assert h.requests == (4, 0)
+    finally:
+        await h.handle.close()
+
+    h = await poll_harness(polls={"max_question_chars": 5, "max_options": 2})
+    try:
+        assert_poll_failure(await h.create(question="Q" * 6), "error", ERROR_INVALID_ARGUMENTS)
+        assert_poll_failure(
+            await h.create(options=["A", "B", "C"]), "error", ERROR_INVALID_ARGUMENTS
+        )
+        assert h.requests == (0, 0)
+        assert (await h.create(question="Q" * 5)).status == "success"
+    finally:
+        await h.handle.close()
+
+
+# -- AC27: lost confirmations, platform answers, reconciliation --------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["lost", "malformed"])
+async def test_a_lost_create_answer_reconciled_by_one_get_is_a_reconciled_success(
+    answer: str,
+) -> None:
+    """AC27: a create whose answer is lost (or a malformed 2xx) → exactly 1
+    ``get``; the listed poll with the same question and options started at
+    the call's start → ``success reconciled: true`` carrying its ``poll_id``;
+    the channel is then tracked active (the next call ``poll_active``, 0
+    requests)."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", answer)
+    try:
+        result = assert_poll_success(await h.create(), reconciled=True)
+        assert result["poll_id"] == h.service.polls["chan-a"][0]["poll_id"]
+        assert h.requests == (1, 1)
+
+        assert_poll_failure(await h.create(), "refused", ERROR_POLL_ACTIVE)
+        assert h.requests == (1, 1)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_poll_started_after_the_call_start_reconciles() -> None:
+    """AC27: a ``get`` listing a matching poll started after the call's start
+    → ``success reconciled: true`` with the listed ``poll_id``."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "lost")
+    h.service.script_get("chan-a", [poll_listing(started_at=POLL_START + 2.0, poll_id="later")])
+    try:
+        result = assert_poll_success(await h.create(), reconciled=True)
+        assert result["poll_id"] == "later"
+        assert result["started_at"] == POLL_START + 2.0
+        assert h.requests == (1, 1)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "listing",
+    [
+        [],
+        [poll_listing(started_at=POLL_START - 1.0)],
+        [poll_listing(options=("B", "A"))],
+        [poll_listing(question="Other?")],
+        [poll_listing(poll_id=None)],
+        [poll_listing(poll_id="")],
+        "raise",
+    ],
+    ids=[
+        "none",
+        "started-before",
+        "options-reordered",
+        "other-question",
+        "no-id",
+        "empty-id",
+        "get-raises",
+    ],
+)
+async def test_an_unconfirmed_lost_create_is_external_unknown_and_marks_the_channel(
+    listing: Any,
+) -> None:
+    """AC27: no matching poll listed (none, started before the call, options in
+    another order, another question, no ``poll_id``) or ``get`` raising →
+    ``external_unknown`` cause ``confirmation_lost``, never ``success``; 1
+    create, 1 ``get``; the channel is marked uncertain."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "lost")
+    h.service.script_get("chan-a", listing)
+    try:
+        error = assert_poll_failure(await h.create(), "external_unknown", ERROR_EXTERNAL_UNKNOWN)
+        assert error["cause"] == CAUSE_CONFIRMATION_LOST
+        assert h.requests == (1, 1)
+        assert h.tracked() == {"chan-a"}
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_after_external_unknown_the_next_create_reconciles_first() -> None:
+    """AC27: after an ``external_unknown`` the next create on the channel
+    performs 1 ``get`` before anything: an active poll listed → ``refused
+    poll_active`` with 0 creates; none → 1 create."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "lost")
+    h.service.script_get("chan-a", [])
+    try:
+        assert (await h.create()).status == "external_unknown"
+        assert h.requests == (1, 1)
+
+        # The poll the lost create opened is listed active.
+        assert_poll_failure(await h.create(), "refused", ERROR_POLL_ACTIVE)
+        assert h.requests == (1, 2)
+
+        h.service.script_get("chan-a", [poll_listing(state="completed")])
+        assert_poll_success(await h.create(), reconciled=False)
+        assert h.requests == (2, 3)
+        assert [entry["channel_id"] for entry in h.service.creates] == ["chan-a", "chan-a"]
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_reconciliation_get_before_the_create_keeps_the_marker() -> None:
+    """R7: a ``get`` failing before the create → ``external_unknown`` with 0
+    creates; the marker stays, so the following call reconciles again."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "lost")
+    h.service.script_get("chan-a", [], "raise", [])
+    try:
+        assert (await h.create()).status == "external_unknown"
+        assert_poll_failure(await h.create(), "external_unknown", ERROR_EXTERNAL_UNKNOWN)
+        assert h.requests == (1, 2)
+        assert (await h.create()).status == "success"
+        assert h.requests == (2, 3)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_forbidden_create_is_refused_platform_forbidden(status: int) -> None:
+    """AC27: 401/403 → ``refused platform_forbidden``, 1 create, 0 ``get``, the
+    channel not marked."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", ScriptedStatusError(status, BODY_SECRET))
+    try:
+        error = assert_poll_failure(await h.create(), "refused", ERROR_PLATFORM_FORBIDDEN)
+        assert BODY_SECRET not in repr(error)
+        assert h.requests == (1, 0)
+        assert h.tracked() == set()
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_create_carries_the_status_and_never_the_body() -> None:
+    """AC27: a 400 → ``error poll_rejected`` whose message contains ``400`` and
+    none of the body; 1 create, 0 ``get``; the next create performs 0 ``get``."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", ScriptedStatusError(400, BODY_SECRET))
+    try:
+        observation = await h.create()
+        error = assert_poll_failure(observation, "error", ERROR_POLL_REJECTED)
+        assert "400" in error["message"]
+        assert BODY_SECRET not in repr(observation)
+        assert BODY_SECRET not in " ".join(trace_texts(h.runtime.bus))
+        assert h.requests == (1, 0)
+        assert (await h.create()).status == "success"
+        assert h.requests == (2, 0)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_create_never_sent_is_platform_unavailable_with_no_effect() -> None:
+    """AC27: a transport failure before sending → ``error
+    platform_unavailable``, no poll opened, 0 ``get``, the channel not marked."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "transport")
+    try:
+        assert_poll_failure(await h.create(), "error", ERROR_PLATFORM_UNAVAILABLE)
+        assert h.service.polls == {}
+        assert h.requests == (1, 0)
+        assert h.tracked() == set()
+        assert (await h.create()).status == "success"
+        assert h.requests == (2, 0)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_5xx_with_a_matching_poll_listed_is_a_reconciled_success() -> None:
+    """AC27: a 503 → exactly 1 ``get``; a matching poll listed → ``success
+    reconciled: true``; 1 create."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "status:503")
+    h.service.script_get("chan-a", [poll_listing(poll_id="made-anyway")])
+    try:
+        result = assert_poll_success(await h.create(), reconciled=True)
+        assert result["poll_id"] == "made-anyway"
+        assert h.requests == (1, 1)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_5xx_with_no_poll_listed_is_platform_unavailable_and_unmarked() -> None:
+    """AC27: a 503 and none listed → ``error platform_unavailable`` whose
+    message contains ``503`` and none of the body; the next create performs 0
+    ``get`` before its create."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", ScriptedStatusError(503, BODY_SECRET))
+    try:
+        observation = await h.create()
+        error = assert_poll_failure(observation, "error", ERROR_PLATFORM_UNAVAILABLE)
+        assert "503" in error["message"]
+        assert BODY_SECRET not in repr(observation)
+        assert h.requests == (1, 1)
+        assert h.tracked() == set()
+
+        assert (await h.create()).status == "success"
+        assert h.requests == (2, 1)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_5xx_whose_get_fails_is_external_unknown_and_marks_the_channel() -> None:
+    """AC27: a 503 and ``get`` raising → ``external_unknown`` cause
+    ``confirmation_lost``; the next create performs 1 ``get`` first."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "status:503")
+    h.service.script_get("chan-a", "raise", [])
+    try:
+        error = assert_poll_failure(await h.create(), "external_unknown", ERROR_EXTERNAL_UNKNOWN)
+        assert error["cause"] == CAUSE_CONFIRMATION_LOST
+        assert h.requests == (1, 1)
+
+        assert (await h.create()).status == "success"
+        assert h.requests == (2, 2)
+        assert h.service.gets == ["chan-a", "chan-a"]
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_create_held_at_the_call_deadline_is_external_unknown_and_marked() -> None:
+    """AC27/R10: a create still pending at ``expiry`` → nothing at ``expiry −
+    0.01``; at ``expiry`` the call ends ``external_unknown`` (the module's own
+    ``timeout`` resolved by the emission rule), 1 create, 0 ``get`` past the
+    deadline, the channel marked: the next call reconciles first."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "held")
+    try:
+        call = asyncio.ensure_future(
+            h.runtime.executor.invoke(poll_call("held-1", deadline=POLL_START + 10.0))
+        )
+        await wait_until(lambda: len(h.service.creates) == 1)
+        h.clock.advance(9.99)
+        await settle()
+        assert not call.done()
+
+        h.clock.advance(0.01)
+        observation = await finished(call)
+        assert observation.status == "external_unknown", observation
+        assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
+        assert h.requests == (1, 0)
+        assert h.tracked() == {"chan-a"}
+        assert len(h.runtime.executor.outcomes()) == 1
+
+        h.service.script_get("chan-a", [])
+        assert (await h.create()).status == "success"
+        assert h.requests == (2, 1)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_get_held_at_the_call_deadline_is_external_unknown_and_marked() -> None:
+    """R7/R10: the reconciliation ``get`` still pending at ``expiry`` → the
+    call ends ``external_unknown``, the channel marked, 1 create, 1 ``get``."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "lost")
+    gate: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    original_get = h.service.get
+
+    async def held_get(channel_id: str) -> Any:
+        h.service.gets.append(channel_id)
+        await gate
+        return []
+
+    h.service.get = held_get  # type: ignore[method-assign]
+    try:
+        call = asyncio.ensure_future(
+            h.runtime.executor.invoke(poll_call("held-get", deadline=POLL_START + 10.0))
+        )
+        await wait_until(lambda: len(h.service.gets) == 1)
+        h.clock.advance(10.0)
+        observation = await finished(call)
+        assert observation.status == "external_unknown", observation
+        assert h.requests == (1, 1)
+        assert h.tracked() == {"chan-a"}
+    finally:
+        h.service.get = original_get  # type: ignore[method-assign]
+        await h.handle.close()
+
+
+# -- AC28: per-channel serialization ---------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_two_sessions_on_one_channel_make_one_create_and_a_third_is_busy() -> None:
+    """AC28: two concurrent calls on one channel → 1 create in total, the
+    second ``refused poll_active`` after waiting for the first; a third with
+    ``max_waiters: 1`` → ``refused resource_busy`` at once."""
+
+    h = await poll_harness(polls={"max_waiters": 1})
+    h.service.script_create("chan-a", "held")
+    try:
+        first = h.start()
+        await wait_until(lambda: len(h.service.creates) == 1)
+        second = h.start()
+        await settle()
+        assert not second.done()
+
+        third = await h.create()
+        assert_poll_failure(third, "refused", ERROR_RESOURCE_BUSY)
+        assert not second.done()
+
+        h.service.release_held(
+            {**poll_listing(poll_id="held-poll"), "ends_at": POLL_START + 60}
+        )
+        assert_poll_success(await finished(first), reconciled=False)
+        assert_poll_failure(await finished(second), "refused", ERROR_POLL_ACTIVE)
+        assert h.requests == (1, 0)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_two_channels_proceed_concurrently() -> None:
+    """AC28: two channels → 2 creates in flight at once."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "held")
+    h.service.script_create("chan-b", "held")
+    try:
+        first = h.start("chan-a")
+        second = h.start("chan-b")
+        await wait_until(lambda: len(h.service.creates) == 2)
+        h.service.release_held(poll_listing(poll_id="poll-a"))
+        h.service.release_held(poll_listing(poll_id="poll-b"))
+        assert (await finished(first)).status == "success"
+        assert (await finished(second)).status == "success"
+        assert h.requests == (2, 0)
+        assert h.tracked() == {"chan-a", "chan-b"}
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_cancels_the_waiting_poll_and_confirms_the_one_in_flight() -> None:
+    """R7/R8: ``drain`` ends a waiting call ``cancelled`` with 0 creates; the
+    create in flight keeps the drain deadline and ends ``success``."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "held")
+    try:
+        first = h.start()
+        await wait_until(lambda: len(h.service.creates) == 1)
+        second = h.start()
+        await settle()
+        drain = asyncio.ensure_future(h.handle.drain(4.0))
+        observation = await finished(second)
+        assert observation.status == "cancelled", observation
+        assert not first.done()
+
+        h.service.release_held(poll_listing(poll_id="drained"))
+        assert (await finished(first)).status == "success"
+        await finished(drain)
+        assert h.requests == (1, 0)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_create_past_the_drain_deadline_is_external_unknown_and_marked() -> None:
+    """R7/R8: a create still unanswered when the drain deadline passes →
+    ``external_unknown``, the channel marked, 0 ``get``."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "held")
+    try:
+        call = h.start()
+        await wait_until(lambda: len(h.service.creates) == 1)
+        drain = asyncio.ensure_future(h.handle.drain(4.0))
+        await settle()
+        assert not call.done()
+        h.clock.advance(4.0)
+        observation = await finished(call)
+        await finished(drain)
+        assert observation.status == "external_unknown", observation
+        assert h.requests == (1, 0)
+        assert h.tracked() == {"chan-a"}
+    finally:
+        await h.handle.close()
+
+
+# -- AC37: the bounded table -------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_channel_cap_refuses_an_untracked_channel_until_an_entry_expires() -> None:
+    """AC37: ``max_tracked_channels: 2`` — ``a`` and ``b`` succeed (2
+    requests); ``c`` is ``refused resource_busy`` with 0 requests while both
+    live; past ``a``'s TTL ``c`` proceeds and the table tracks exactly ``b``
+    and ``c``."""
+
+    h = await poll_harness(polls={"max_tracked_channels": 2})
+    try:
+        assert (await h.create("a")).status == "success"
+        h.clock.advance(100.0)
+        assert (await h.create("b")).status == "success"
+        assert h.requests == (2, 0)
+
+        assert_poll_failure(await h.create("c"), "refused", ERROR_RESOURCE_BUSY)
+        assert h.requests == (2, 0)
+        assert h.tracked() == {"a", "b"}
+
+        h.clock.advance(POLL_TTL - 100.0 + 1.0)  # past a's TTL, within b's
+        assert (await h.create("c")).status == "success"
+        assert h.requests == (3, 0)
+        assert h.tracked() == {"b", "c"}
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_an_uncertain_marker_is_never_evicted_by_the_cap() -> None:
+    """AC37: ``a`` marked uncertain and the cap reached → ``d`` refused
+    ``resource_busy`` with 0 requests; ``a`` keeps its marker until its TTL
+    and the next create on ``a`` still performs its reconciliation ``get``
+    first."""
+
+    h = await poll_harness(polls={"max_tracked_channels": 2})
+    h.service.script_create("a", "lost")
+    h.service.script_get("a", [])
+    try:
+        assert (await h.create("a")).status == "external_unknown"
+        assert (await h.create("b")).status == "success"
+        assert h.requests == (2, 1)
+
+        assert_poll_failure(await h.create("d"), "refused", ERROR_RESOURCE_BUSY)
+        assert h.requests == (2, 1)
+
+        h.clock.advance(POLL_TTL - 1.0)
+        assert h.tracked() == {"a", "b"}
+        assert_poll_failure(await h.create("d"), "refused", ERROR_RESOURCE_BUSY)
+        assert h.requests == (2, 1)
+
+        h.service.script_get("a", [])
+        assert (await h.create("a")).status == "success"
+        assert h.requests == (3, 2)
+        assert h.service.gets == ["a", "a"]
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_the_thirty_third_live_entry_of_a_channel_is_refused() -> None:
+    """AC37: 32 uncertain markers on one channel; the 33rd live entry is
+    ``refused resource_busy`` with 0 create requests (its reconciliation
+    ``get`` ran first)."""
+
+    h = await poll_harness()
+    try:
+        for index in range(32):
+            if index:
+                h.service.script_get("chan-a", [])  # the reconciliation first
+            h.service.script_create("chan-a", "lost")
+            h.service.script_get("chan-a", [])  # the confirmation read
+            observation = await h.create()
+            assert observation.status == "external_unknown", (index, observation)
+        assert h.requests == (32, 63)
+
+        h.service.script_get("chan-a", [])
+        assert_poll_failure(await h.create(), "refused", ERROR_RESOURCE_BUSY)
+        assert h.requests == (32, 64)
+
+        # Past the TTL every marker expired: the channel starts afresh.
+        h.clock.advance(POLL_TTL + 1.0)
+        assert h.tracked() == set()
+        assert (await h.create()).status == "success"
+        assert h.requests == (33, 64)
+    finally:
+        await h.handle.close()
+
+
+# -- AC29 / finding P1: required over the real lookup ------------------------- #
+
+
+class ThreeMethodRegistry:
+    """The accepted service surface and nothing else — not ``ServiceRegistry``."""
+
+    def __init__(self) -> None:
+        self._table: dict[tuple[str, str], tuple[str, Any]] = {}
+        self.calls: list[str] = []
+
+    def publish(self, kind: str, platform: str, service: Any, *, module: str) -> None:
+        self.calls.append("publish")
+        self._table[(kind, platform)] = (module, service)
+
+    def resolve(self, kind: str, platform: str) -> Any:
+        self.calls.append("resolve")
+        entry = self._table.get((kind, platform))
+        return None if entry is None else entry[1]
+
+    def entries(self) -> dict[tuple[str, str], str]:
+        self.calls.append("entries")
+        return {key: module for key, (module, _service) in self._table.items()}
+
+
+def poll_destinations(runtime: RuntimeContext) -> list[str]:
+    return [
+        f"{b.destination.platform}/{b.destination.channel_id}/{b.destination.scope}"
+        for b in runtime.actions.bindings(POLL_ACTION)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_three_method_registry_serves_the_poll_consumer() -> None:
+    """Round 2, P3: a minimal three-method registry (not ``ServiceRegistry``)
+    holding ``(poll, fake)`` → ``prepare`` binds ``stream.poll.create`` to
+    ``fake/*/poll`` through ``entries()`` and ``resolve()`` only, and a
+    create reaches the scripted service. The two-method form never reaches
+    ``prepare``: the context refuses it at construction."""
+
+    registry = ThreeMethodRegistry()
+    clock = ManualClock(POLL_START)
+    service = ScriptedPollService(clock=clock)
+    registry.publish(POLL_SERVICE_KIND, "fake", service, module="fakeplatform")
+    registry.calls.clear()
+    assert not isinstance(registry, ServiceRegistry)
+
+    h = await poll_harness(services=registry)
+    h.service = service
+    try:
+        assert set(registry.calls) == {"entries", "resolve"}
+        assert poll_destinations(h.runtime) == ["fake/*/poll"]
+        assert POLL_ACTION in h.runtime.actions.registered_ready()
+        assert h.handle.poll_platforms == ("fake",)
+
+        assert (await h.create()).status == "success"
+        assert len(service.creates) == 1
+        assert set(registry.calls) == {"entries", "resolve"}
+    finally:
+        await h.handle.close()
+
+    with pytest.raises(RuntimeContextError) as refused:
+        runtime_context(services=_PublishAndResolveOnly())
+    assert "services" in str(refused.value)
+
+
+@pytest.mark.asyncio
+async def test_every_published_poll_platform_is_a_destination_and_other_kinds_are_ignored() -> None:
+    """R7: one binding per resolved ``(poll, <platform>)``; a key of another
+    kind is not a poll service; a call on a platform without a service is not
+    routed to this provider."""
+
+    clock = ManualClock(POLL_START)
+    registry = ServiceRegistry()
+    fake, other = ScriptedPollService(clock=clock), ScriptedPollService(clock=clock)
+    registry.publish(POLL_SERVICE_KIND, "fake", fake, module="fakeplatform")
+    registry.publish(POLL_SERVICE_KIND, "other", other, module="otherplatform")
+    registry.publish("chat", "third", ScriptedPollService(clock=clock), module="third")
+    h = await poll_harness(services=registry)
+    try:
+        assert poll_destinations(h.runtime) == ["fake/*/poll", "other/*/poll"]
+        assert (await h.create("x", platform="other")).status == "success"
+        assert len(other.creates) == 1 and fake.creates == []
+        refused = await h.create("x", platform="third")
+        assert refused.status != "success"
+        assert len(other.creates) == 1 and fake.creates == []
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_polls_enabled_with_only_other_kinds_published_degrades() -> None:
+    """AC29 (``required: false``): a registry holding no ``poll`` key →
+    ``module.degraded`` with ``capabilities: ["stream.poll.create"]``, the
+    action discovered and unbound."""
+
+    registry = ServiceRegistry()
+    registry.publish("chat", "fake", object(), module="fakeplatform")
+    h = await poll_harness(services=registry)
+    try:
+        (degraded,) = h.degraded()
+        assert degraded["capabilities"] == [POLL_ACTION]
+        assert degraded["reason"] == REASON_NO_POLL_SERVICE
+        assert h.runtime.actions.bindings(POLL_ACTION) == ()
+        assert POLL_ACTION in h.runtime.actions.discovered()
+        assert POLL_ACTION not in h.runtime.actions.registered_ready()
+        invocations = h.runtime.executor.provider_invocations
+        assert (await h.create()).status != "success"
+        assert h.runtime.executor.provider_invocations == invocations
+    finally:
+        await h.handle.close()
+
+
+async def coordinated_stream_control(
+    context: RuntimeContext, clock: ManualClock, provider: Any, **settings: Any
+) -> tuple[PhaseCoordinator, Any, list[str]]:
+    """stream_control through the loader and the phase coordinator."""
+
+    loader = ModuleLoader(context.bus, REPOSITORY / "modules", context=context, environ={})
+    activations = await loader.activate_enabled(
+        {
+            "enabled_modules": [STREAM_CONTROL],
+            "modules": {
+                STREAM_CONTROL: {**scene_settings(provider, clock, **settings), "limits": {}}
+            },
+        }
+    )
+    diagnostics: list[str] = []
+    coordinator = PhaseCoordinator(
+        activations,
+        tasks=context.tasks,
+        clock=clock,
+        sleeper=clock.sleep,
+        reporter=diagnostics.append,
+    )
+    return coordinator, activations[0].handle, diagnostics
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("services", ["empty registry", "no services"])
+async def test_required_polls_without_a_service_abort_startup(services: str) -> None:
+    """AC29 / finding P1: ``required: true``, ``polls.enabled: true`` and no
+    poll service (an empty registry, or a context built without ``services``)
+    → ``prepare`` raises naming ``stream_control`` and ``polls.enabled``, the
+    coordinator aborts startup with the scene provider closed (0 transports
+    open) and neither action in ``registered_ready()``."""
+
+    def build() -> RuntimeContext:
+        context = runtime_context(clock=clock)
+        if services == "no services":
+            context = dataclasses.replace(context, services=None)
+        return context
+
+    clock = ManualClock(POLL_START)
+    context = build()
+    provider = LoggedSceneProvider()
+    handle = await activate_stream_control(
+        context.for_module(STREAM_CONTROL),
+        scene_settings(provider, clock, required=True, polls={"enabled": True}),
+        {},
+    )
+    with pytest.raises(StreamControlModuleError) as refused:
+        await handle.prepare()
+    assert STREAM_CONTROL in str(refused.value)
+    assert FIELD_POLLS_ENABLED in str(refused.value)
+    assert provider.close_calls == 1
+    await handle.close()
+
+    context = build()
+    provider = LoggedSceneProvider()
+    coordinator, handle, diagnostics = await coordinated_stream_control(
+        context, clock, provider, required=True, polls={"enabled": True}
+    )
+    report = await coordinator.start()
+
+    assert report.status != 0
+    assert any(STREAM_CONTROL in failure for failure in report.failures)
+    assert provider.close_calls == 1 and not provider.connected
+    assert POLL_ACTION not in context.actions.registered_ready()
+    assert SCENE_ACTION not in context.actions.registered_ready()
+    assert context.actions.bindings(POLL_ACTION) == ()
+    assert handle.poll_platforms == ()
+
+
+@pytest.mark.asyncio
+async def test_required_with_a_published_poll_service_reaches_readiness() -> None:
+    """AC29 / finding P1: ``required: true``, ``polls.enabled: true`` and
+    ``(poll, fake)`` published → the coordinator reaches readiness with the
+    action bound to ``fake/*/poll``, no ``module.degraded``."""
+
+    clock = ManualClock(POLL_START)
+    registry = ServiceRegistry()
+    registry.publish(
+        POLL_SERVICE_KIND, "fake", ScriptedPollService(clock=clock), module="fakeplatform"
+    )
+    context = runtime_context(clock=clock, services=registry)
+    provider = LoggedSceneProvider()
+    coordinator, handle, _diagnostics = await coordinated_stream_control(
+        context, clock, provider, required=True, polls={"enabled": True}
+    )
+    try:
+        assert (await coordinator.start()).status == 0
+        assert poll_destinations(context) == ["fake/*/poll"]
+        assert {POLL_ACTION, SCENE_ACTION} <= set(context.actions.registered_ready())
+        assert events_of(context.bus, "module.degraded") == []
+    finally:
+        await coordinator.stop()
+    assert provider.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_polls_disabled_binds_nothing_whatever_is_published() -> None:
+    """AC29: ``required: true``, ``polls.enabled: false``, scenes reachable and
+    ``(poll, fake)`` published → readiness, the poll action unbound, no
+    degraded trace, the registry not even read."""
+
+    clock = ManualClock(POLL_START)
+    registry = ThreeMethodRegistry()
+    registry.publish(
+        POLL_SERVICE_KIND, "fake", ScriptedPollService(clock=clock), module="fakeplatform"
+    )
+    registry.calls.clear()
+    context = runtime_context(clock=clock, services=registry)
+    handle = await activate_stream_control(
+        context.for_module(STREAM_CONTROL),
+        scene_settings(LoggedSceneProvider(), clock, required=True, polls={"enabled": False}),
+        {},
+    )
+    try:
+        await handle.prepare()
+        assert context.actions.bindings(POLL_ACTION) == ()
+        assert SCENE_ACTION in context.actions.registered_ready()
+        assert events_of(context.bus, "module.degraded") == []
+        assert registry.calls == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_through_the_loader_the_fixture_platform_serves_the_poll(
+    clean_fakeplatform: None,
+) -> None:
+    """AC28/AC29: with the fixture platform enabled, ``required: true`` passes
+    because the platform published ``(poll, fake)`` at activation, and a
+    create reaches the service it published."""
+
+    clock = ManualClock(POLL_START)
+    context = runtime_context(
+        clock=clock, trigger_registry=TriggerRegistry(companion_name="companion")
+    )
+    platform_loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    activations = list(
+        await platform_loader.activate_enabled(
+            {"enabled_modules": ["fakeplatform"], "modules": {"fakeplatform": dict(FAKE_SETTINGS)}}
+        )
+    )
+    service = activations[0].handle.poll_service
+    provider = LoggedSceneProvider()
+    loader = ModuleLoader(context.bus, REPOSITORY / "modules", context=context, environ={})
+    activations += await loader.activate_enabled(
+        {
+            "enabled_modules": [STREAM_CONTROL],
+            "modules": {
+                STREAM_CONTROL: {
+                    **scene_settings(provider, clock, required=True, polls={"enabled": True}),
+                    "limits": {},
+                }
+            },
+        }
+    )
+    coordinator = PhaseCoordinator(
+        activations, tasks=context.tasks, clock=clock, sleeper=clock.sleep
+    )
+    try:
+        assert (await coordinator.start()).status == 0
+        assert poll_destinations(context) == ["fake/*/poll"]
+        assert POLL_ACTION in context.actions.registered_ready()
+        grant_poll(context)
+
+        observation = await context.executor.invoke(poll_call("loader-1", "chan-a"))
+        assert observation.status == "success", observation
+        assert [entry["channel_id"] for entry in service.creates] == ["chan-a"]
+        assert service.gets == []
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_after_the_create_left_marks_the_channel() -> None:
+    """R7/R10: the call cancelled while its create is pending → the create is
+    not repeated, the channel is marked uncertain and the next call on it
+    reconciles first."""
+
+    h = await poll_harness()
+    h.service.script_create("chan-a", "held")
+    try:
+        call = h.start()
+        await wait_until(lambda: len(h.service.creates) == 1)
+        call.cancel()
+        await asyncio.wait({call})
+        await settle()
+        assert h.tracked() == {"chan-a"}
+        assert h.requests == (1, 0)
+
+        h.service.script_get("chan-a", [])
+        assert (await h.create()).status == "success"
+        assert h.requests == (2, 1)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_poll_call_start_is_compared_on_the_wall_clock() -> None:
+    """Review A1: the platform's ``started_at`` is epoch seconds, so the
+    call's start is read on the wall clock, never the monotonic one — an
+    earlier poll listed with the same question and options, started after
+    the monotonic reading but before the call's wall-clock start, is not
+    this call's poll (``external_unknown``); one started after it is."""
+
+    wall = 1_700_000_000.0
+    h = await poll_harness(_wall_clock=lambda: wall)
+    try:
+        h.service.script_create("chan-a", "lost")
+        h.service.script_get("chan-a", [poll_listing(started_at=wall - 60.0, poll_id="old")])
+        observation = await h.create()
+        assert observation.status == "external_unknown", observation
+        assert h.requests == (1, 1)
+
+        h.clock.advance(POLL_TTL + 1.0)
+        h.service.script_create("chan-a", "lost")
+        h.service.script_get("chan-a", [poll_listing(started_at=wall + 1.0, poll_id="new")])
+        result = assert_poll_success(await h.create(), reconciled=True)
+        assert result["poll_id"] == "new"
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_scene_provider_loss_leaves_the_poll_action_ready() -> None:
+    """Review A2: readiness is per module in the registry, so a scene
+    provider lost while ``stream.poll.create`` is bound keeps the module
+    ready: the poll action stays in the registered-ready view and serves a
+    create, the scene call answers ``provider_unavailable`` on its own and
+    ``module.degraded`` still names the scene action once."""
+
+    clock = ManualClock(POLL_START)
+    service = ScriptedPollService(clock=clock)
+    registry = ServiceRegistry()
+    registry.publish(POLL_SERVICE_KIND, "fake", service, module="fakeplatform")
+    runtime = runtime_context(clock=clock, services=registry)
+    provider = LoggedSceneProvider()
+    handle = await activate_stream_control(
+        runtime.for_module(STREAM_CONTROL),
+        scene_settings(provider, clock, polls={"enabled": True}),
+        {},
+    )
+    await handle.prepare()
+    grant_poll(runtime)
+    grant_scene(runtime)
+    h = PollHarness(runtime, handle, service, clock)
+    scene_call = dataclasses.replace(
+        poll_call("scene-1"),
+        action_name=SCENE_ACTION,
+        arguments={"scene": "Talking"},
+        destination=STREAM,
+    )
+    try:
+        assert {SCENE_ACTION, POLL_ACTION} <= set(runtime.actions.registered_ready())
+        provider.disconnect()
+
+        observation = await runtime.executor.invoke(scene_call)
+        assert_scene_failure(observation, "error", ERROR_PROVIDER_UNAVAILABLE)
+        (degraded,) = h.degraded()
+        assert degraded["capabilities"] == [SCENE_ACTION]
+        assert POLL_ACTION in runtime.actions.registered_ready()
+
+        assert_poll_success(await h.create(), reconciled=False)
+        assert h.requests == (1, 0)
+    finally:
+        await handle.close()
