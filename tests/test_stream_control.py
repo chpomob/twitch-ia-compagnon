@@ -156,7 +156,7 @@ def test_the_module_facade_publishes_under_the_bound_module_name() -> None:
 
 
 def test_a_context_without_a_registry_hands_out_an_unavailable_facade() -> None:
-    context = runtime_context()
+    context = dataclasses.replace(runtime_context(), services=None)
     assert context.services is None
 
     services = context.for_module("m").services

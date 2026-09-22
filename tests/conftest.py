@@ -14,7 +14,17 @@ Chat Completions body builders :func:`tool_call`, :func:`tool_calls`,
 (:class:`FakeTransport` behind :class:`FakeSendProvider`), the screen
 behind ``screen.capture`` (:class:`FakeCaptureSource`, :func:`png_bytes`),
 the wire between brain and agent (:class:`MemoryWebSocketPair`), time itself
-(:class:`ManualClock`) and randomness (``rng``). A suite that mocked the
+(:class:`ManualClock`) and randomness (``rng``). Phase 2 adds the audio and
+stream edges (P5): generated WAV segments (:func:`wav_bytes`,
+:func:`silent_wav`), the speech and transcription transports
+(:class:`ScriptedSpeechTransport`, :class:`ScriptedTranscriptionTransport`),
+the player behind ``audio_output`` (:class:`RecordingPlayerRunner`,
+:class:`FakePlayer`), the recorder behind ``audio_input``
+(:class:`FakeAudioSource`, :class:`RecordingSubprocessRunner`), the scene
+provider (:class:`ScriptedSceneProvider`) and a platform poll service
+(:class:`ScriptedPollService`) — every one driven by the injected clock,
+none sleeping. The context carries a :class:`~core.runtime.ServiceRegistry`
+by default so a publishing module is exercised on the harness (R7). A suite that mocked the
 executor would hide AC19's executor-confirmed delivery, so the executor is
 never mocked here.
 
@@ -41,6 +51,7 @@ motivated it (P24).
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import random
 import struct
@@ -49,7 +60,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 from core.actions import (
     ERROR_TIMED_OUT,
@@ -61,7 +72,7 @@ from core.attachments import AttachmentStore
 from core.bus import EventBus
 from core.contracts import PROBE_TOOL, ActionObservation, Counters, SessionKey
 from core.lifecycle import SupervisedTasks
-from core.runtime import RuntimeContext, Supervision
+from core.runtime import RuntimeContext, ServiceRegistry, Supervision
 from core.triggers import TriggerEngine
 
 
@@ -159,6 +170,38 @@ def carries_image_part(body: Any) -> bool:
     return False
 
 
+def carries_audio_part(body: Any) -> bool:
+    """Whether a request body carries at least one ``input_audio`` part (R4)."""
+
+    if not isinstance(body, Mapping):
+        return False
+    for message in body.get("messages", ()):
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, Mapping) and part.get("type") == "input_audio":
+                return True
+    return False
+
+
+PROBE_KIND_TEXT = "text"
+PROBE_KIND_IMAGE = "image"
+PROBE_KIND_AUDIO = "audio"
+
+
+def probe_kind(body: Any) -> str:
+    """Which capability a request body exercises: ``audio`` when it carries an
+    ``input_audio`` part, ``image`` when it carries an image part, else
+    ``text`` (R2, R4, AC15)."""
+
+    if carries_audio_part(body):
+        return PROBE_KIND_AUDIO
+    if carries_image_part(body):
+        return PROBE_KIND_IMAGE
+    return PROBE_KIND_TEXT
+
+
 def _raise_or_return(result: Any) -> Any:
     if isinstance(result, BaseException):
         raise result
@@ -171,9 +214,11 @@ class FakeSession:
     ``results`` answer scenario requests and are consumed one per request;
     ``probe_results`` answer probe requests (see :func:`is_probe_request`) and
     never touch ``results``. Without an explicit ``probe_results`` — or once
-    the given ones are used up — every probe, the image probe included, is
-    answered with one valid forced tool call, so a module that probes at
-    ``prepare`` becomes ready without the suite scripting the probes.
+    the given ones are used up — every probe, the image and audio probes
+    included (:func:`probe_kind` tells them apart), is answered with one valid
+    forced tool call, so a module that probes at ``prepare`` becomes ready
+    without the suite scripting the probes, and a probe never lands in
+    ``post_calls`` (AC15).
     """
 
     def __init__(self, *results: Any, probe_results: Sequence[Any] | None = None) -> None:
@@ -449,6 +494,1022 @@ class FakeCaptureSource:
 
 
 # --------------------------------------------------------------------------- #
+# Generated WAV segments (R1, R3, R4)
+# --------------------------------------------------------------------------- #
+
+
+def wav_bytes(
+    seconds: float,
+    *,
+    sample_rate: int = 16000,
+    channels: int = 1,
+    bits: int = 16,
+    fill: int = 0,
+) -> bytes:
+    """A PCM RIFF/WAVE segment with the canonical 44-byte header.
+
+    The data chunk holds ``round(seconds × sample_rate)`` frames of
+    ``channels × bits / 8`` bytes, every byte equal to ``fill`` — so the
+    default is silence and ``wav_bytes(1.5)`` carries 48 000 data bytes.
+    """
+
+    if bits <= 0 or bits % 8:
+        raise ValueError("wav_bytes: bits must be a positive multiple of 8")
+    if sample_rate <= 0 or channels <= 0 or seconds < 0:
+        raise ValueError("wav_bytes: sample_rate and channels positive, seconds >= 0")
+    block_align = channels * bits // 8
+    frames = int(round(seconds * sample_rate))
+    data = bytes([fill & 0xFF]) * (frames * block_align)
+    fmt = struct.pack(
+        "<HHIIHH", 1, channels, sample_rate, sample_rate * block_align, block_align, bits
+    )
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(data))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
+
+
+def silent_wav(seconds: float = 0.25) -> bytes:
+    """A 16 kHz mono 16-bit all-zero segment: ``silent_wav()`` is the 8 044
+    bytes the brain's audio probe and the transcription probe send."""
+
+    return wav_bytes(seconds)
+
+
+def _wav_data_layout(data: bytes) -> tuple[int, int] | None:
+    """``(data_offset, declared_size)`` of the ``data`` chunk, or ``None``
+    while *data* does not yet hold a RIFF/WAVE header up to that chunk."""
+
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    position = 12
+    while position + 8 <= len(data):
+        kind = data[position : position + 4]
+        (size,) = struct.unpack("<I", data[position + 4 : position + 8])
+        if kind == b"data":
+            return position + 8, size
+        position += 8 + size + (size & 1)
+    return None
+
+
+def wav_data_size(data: bytes) -> int:
+    """How many bytes of the ``data`` chunk *data* actually holds."""
+
+    layout = _wav_data_layout(bytes(data))
+    if layout is None:
+        raise ValueError("wav_data_size: not a RIFF/WAVE segment with a data chunk")
+    offset, declared = layout
+    return max(0, min(declared, len(data) - offset))
+
+
+# --------------------------------------------------------------------------- #
+# Scripted HTTP transports: speech synthesis and transcription (R1, R3)
+# --------------------------------------------------------------------------- #
+
+
+class _Held:
+    """The answer that never comes on its own."""
+
+    def __repr__(self) -> str:
+        return "HELD"
+
+
+HELD: Any = _Held()
+"""A scripted answer that parks the request until the caller gives up.
+
+Nothing in the transport ever times it out: the module's own bound, parked on
+the injected sleeper, fires when the test advances the clock past the
+timeout, and cancels the request. ``release(answer)`` hands a late answer to
+the oldest held request, for the cases where a test lets it arrive.
+"""
+
+
+class FakeBytesResponse:
+    """An HTTP answer read as bytes (``read``) or as JSON (``json``).
+
+    ``body`` is bytes, a text, a JSON-able value, or an exception every read
+    raises (a body lost mid-answer).
+    """
+
+    def __init__(self, status: int, body: Any = b"") -> None:
+        self.status = status
+        self.body = body
+        self.release_calls = 0
+
+    async def read(self) -> bytes:
+        body = _raise_or_return(self.body)
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            return bytes(body)
+        if isinstance(body, str):
+            return body.encode("utf-8")
+        return json.dumps(body).encode("utf-8")
+
+    async def text(self) -> str:
+        return (await self.read()).decode("utf-8", errors="replace")
+
+    async def json(self, **_kwargs: Any) -> Any:
+        body = _raise_or_return(self.body)
+        if isinstance(body, (bytes, bytearray, memoryview, str)):
+            return json.loads(bytes(body) if not isinstance(body, str) else body)
+        return body
+
+    def release(self) -> None:
+        self.release_calls += 1
+
+    async def __aenter__(self) -> FakeBytesResponse:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        self.release()
+
+
+class _ScriptedHTTPTransport:
+    """One scripted answer per ``post``, in order; every request recorded.
+
+    The object is its own session factory (calling it returns itself and
+    counts ``factory_calls``), so it fits a ``_…_transport`` seam that expects
+    either a session or a factory. ``close`` is counted in ``close_calls``.
+    """
+
+    def __init__(self, *answers: Any, default: Any = None) -> None:
+        self.answers = list(answers)
+        self.default = default
+        self.requests: list[dict[str, Any]] = []
+        self.factory_calls = 0
+        self.close_calls = 0
+        self._held: list[asyncio.Future[Any]] = []
+
+    def __call__(self, *_args: Any, **_kwargs: Any) -> Any:
+        self.factory_calls += 1
+        return self
+
+    @property
+    def held(self) -> int:
+        """How many requests are parked on a :data:`HELD` answer right now."""
+
+        return sum(1 for waiter in self._held if not waiter.done())
+
+    def release(self, answer: Any) -> None:
+        """Hand *answer* to the oldest request still parked on :data:`HELD`."""
+
+        for waiter in self._held:
+            if not waiter.done():
+                waiter.set_result(answer)
+                return
+        raise AssertionError("no held request to release")
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.requests.append(self._record(url, kwargs))
+        answer = self.answers.pop(0) if self.answers else self._default_answer()
+        if answer is HELD:
+            waiter: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            self._held.append(waiter)
+            try:
+                answer = await waiter
+            finally:
+                self._held = [item for item in self._held if item is not waiter]
+        return self._normalise(_raise_or_return(answer))
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    def _record(self, url: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _default_answer(self) -> Any:
+        raise NotImplementedError
+
+    def _normalise(self, answer: Any) -> Any:
+        raise NotImplementedError
+
+
+class ScriptedSpeechTransport(_ScriptedHTTPTransport):
+    """The speech-synthesis endpoint behind ``audio_output`` (R1).
+
+    Each ``post`` records ``{url, headers, json}`` in ``requests`` and answers
+    with the next script entry: a :class:`FakeBytesResponse`, raw bytes (a
+    2xx answer carrying them), an ``int`` (that status, empty body), an
+    exception (raised: the transport failed), or :data:`HELD`. Past the
+    script every request is answered 200 with :func:`silent_wav` (or with
+    ``default`` when given), so a prepare-time probe needs no scripting.
+    """
+
+    def _record(self, url: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "url": url,
+            "headers": dict(kwargs.get("headers") or {}),
+            "json": kwargs.get("json"),
+        }
+
+    def _default_answer(self) -> Any:
+        return self.default if self.default is not None else silent_wav()
+
+    def _normalise(self, answer: Any) -> Any:
+        if isinstance(answer, (FakeBytesResponse, FakeResponse)):
+            return answer
+        if isinstance(answer, bool):
+            raise TypeError("ScriptedSpeechTransport: a bool is not an answer")
+        if isinstance(answer, int):
+            return FakeBytesResponse(answer, b"")
+        return FakeBytesResponse(200, answer)
+
+    def bodies(self) -> list[Any]:
+        """The JSON bodies of every request, in order."""
+
+        return [request["json"] for request in self.requests]
+
+
+def _form_value(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    getvalue = getattr(value, "getvalue", None)
+    if callable(getvalue):
+        return bytes(getvalue())
+    return value
+
+
+def _form_fields(data: Any) -> list[tuple[str, Any, str | None]]:
+    """``(name, value, filename)`` for each field of a multipart body.
+
+    Reads a plain mapping, or the field list of an ``aiohttp.FormData``
+    without importing it (the harness imports ``core`` only).
+    """
+
+    if isinstance(data, Mapping):
+        return [(str(name), _form_value(value), None) for name, value in data.items()]
+    fields = getattr(data, "_fields", None)
+    if not isinstance(fields, list):
+        return []
+    found = []
+    for entry in fields:
+        type_options, _headers, value = entry
+        name = type_options.get("name")
+        filename = type_options.get("filename")
+        found.append((str(name), _form_value(value), filename))
+    return found
+
+
+class ScriptedTranscriptionTransport(_ScriptedHTTPTransport):
+    """The transcription endpoint behind ``audio_input`` (R3).
+
+    Each ``post`` records the multipart fields: ``file`` (the WAV bytes of the
+    field named ``file``, else of the first bytes-valued field),
+    ``filename``, ``model`` and ``language`` (``None`` when absent), plus
+    ``url``, ``headers`` and every field by name under ``fields``. Answers: a
+    mapping (a 2xx JSON body), an ``int`` (that status), a
+    :class:`FakeBytesResponse`, an exception, or :data:`HELD`. Past the script
+    every request is answered 200 ``{"text": ""}`` (or ``default``).
+    """
+
+    def _record(self, url: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        fields = _form_fields(kwargs.get("data"))
+        named = {name: value for name, value, _filename in fields}
+        file_entry = next((entry for entry in fields if entry[0] == "file"), None)
+        if file_entry is None:
+            file_entry = next(
+                (entry for entry in fields if isinstance(entry[1], bytes)), None
+            )
+        return {
+            "url": url,
+            "headers": dict(kwargs.get("headers") or {}),
+            "fields": named,
+            "file": file_entry[1] if file_entry is not None else None,
+            "filename": file_entry[2] if file_entry is not None else None,
+            "model": named.get("model"),
+            "language": named.get("language"),
+        }
+
+    def _default_answer(self) -> Any:
+        return self.default if self.default is not None else {"text": ""}
+
+    def _normalise(self, answer: Any) -> Any:
+        if isinstance(answer, (FakeBytesResponse, FakeResponse)):
+            return answer
+        if isinstance(answer, bool):
+            raise TypeError("ScriptedTranscriptionTransport: a bool is not an answer")
+        if isinstance(answer, int):
+            return FakeBytesResponse(answer, {"error": {"code": answer}})
+        return FakeBytesResponse(200, answer)
+
+
+# --------------------------------------------------------------------------- #
+# The player behind ``audio_output`` (R1, decision 2, findings P2 and P5)
+# --------------------------------------------------------------------------- #
+
+
+class PlayerEvent(NamedTuple):
+    """One entry of :attr:`RecordingPlayerRunner.events`.
+
+    ``kind`` is ``start``, ``stop``, ``kill`` or ``exit``; ``player`` the
+    1-based start number; ``output`` the output name the argv belongs to
+    (from the runner's ``outputs`` map), else ``argv[0]``.
+    """
+
+    kind: str
+    player: int
+    output: str
+
+
+PLAYER_TERMINATED = -15
+PLAYER_KILLED = -9
+
+
+class FakePlayer:
+    """One scripted player process; :class:`RecordingPlayerRunner` starts it.
+
+    ``accept_limit`` counts **data** bytes: the player accepts every byte up
+    to the ``data`` chunk's payload (44 for the header :func:`wav_bytes`
+    writes) plus ``accept_limit`` payload bytes, then its standard input
+    blocks — ``FakePlayer(accept_limit=128_000)`` fed a 10 s segment holds
+    128 044 bytes in ``received``. ``None`` accepts everything.
+    ``accept_total`` (a harness extension) caps the total instead, header
+    included, for a player that stops inside the header. A write that
+    fills the limit returns the count it accepted from that chunk; the next
+    write parks until the player exits, then raises ``BrokenPipeError``.
+
+    The player exits with ``exit_code`` when its standard input is closed
+    with everything accepted (unless ``holds_exit``: it keeps playing until
+    :meth:`release`), or when :meth:`release` lets a blocked player go. A
+    stop terminates it at once (exit ``-15``) unless ``ignores_terminate``,
+    in which case only the kill after the grace ends it (exit ``-9``).
+    ``startable=False`` makes :meth:`RecordingPlayerRunner.start` fail.
+    """
+
+    def __init__(
+        self,
+        accept_limit: int | None = None,
+        exit_code: int = 0,
+        startable: bool = True,
+        ignores_terminate: bool = False,
+        *,
+        accept_total: int | None = None,
+        holds_exit: bool = False,
+    ) -> None:
+        self.accept_limit = accept_limit
+        self.exit_code = exit_code
+        self.startable = startable
+        self.ignores_terminate = ignores_terminate
+        self.accept_total = accept_total
+        self.holds_exit = holds_exit
+        self.received = bytearray()
+        self.argv: tuple[str, ...] = ()
+        self.number = 0
+        self.output = ""
+        self.returncode: int | None = None
+        self.stdin_closed = False
+        self._data_offset: int | None = None
+        self._runner: RecordingPlayerRunner | None = None
+        self._exited: asyncio.Future[None] | None = None
+
+    @property
+    def alive(self) -> bool:
+        return self.returncode is None
+
+    @property
+    def accepted(self) -> int:
+        return len(self.received)
+
+    def _limit(self, prospective: bytes) -> int | None:
+        limits = []
+        if self.accept_total is not None:
+            limits.append(self.accept_total)
+        if self.accept_limit is not None:
+            if self._data_offset is None:
+                layout = _wav_data_layout(prospective)
+                if layout is not None:
+                    self._data_offset = layout[0]
+            if self._data_offset is not None:
+                limits.append(self._data_offset + self.accept_limit)
+        return min(limits) if limits else None
+
+    def offer(self, chunk: bytes) -> int:
+        """Accept what the limit allows from *chunk*; the count accepted.
+
+        The synchronous half of a write, with no blocking: a full pipe
+        accepts 0.
+        """
+
+        if not self.alive:
+            raise BrokenPipeError(errno.EPIPE, "player exited")
+        chunk = bytes(chunk)
+        limit = self._limit(bytes(self.received[:65536]) + chunk[:65536])
+        room = len(chunk) if limit is None else max(0, limit - len(self.received))
+        accepted = min(len(chunk), room)
+        self.received += chunk[:accepted]
+        return accepted
+
+    async def write(self, chunk: bytes) -> int:
+        accepted = self.offer(chunk)
+        if accepted == 0 and chunk:
+            await self._wait_exit()
+            raise BrokenPipeError(errno.EPIPE, "player exited")
+        return accepted
+
+    def close_stdin(self) -> None:
+        self.stdin_closed = True
+        if self.alive and not self.holds_exit:
+            self._exit(self.exit_code)
+
+    def release(self) -> None:
+        """Let a blocked or still-playing player exit with ``exit_code``."""
+
+        if self.alive:
+            self._exit(self.exit_code)
+
+    async def wait(self) -> int:
+        await self._wait_exit()
+        assert self.returncode is not None
+        return self.returncode
+
+    def _future(self) -> asyncio.Future[None]:
+        if self._exited is None:
+            self._exited = asyncio.get_running_loop().create_future()
+            if not self.alive:
+                self._exited.set_result(None)
+        return self._exited
+
+    async def _wait_exit(self) -> None:
+        if self.alive:
+            await asyncio.shield(self._future())
+
+    def _exit(self, code: int) -> None:
+        self.returncode = code
+        if self._exited is not None and not self._exited.done():
+            self._exited.set_result(None)
+        if self._runner is not None:
+            self._runner._event("exit", self)
+
+
+class RecordingPlayerRunner:
+    """The player runner seam of decision 2, recording every step.
+
+    ``start(argv)`` hands out the next scripted :class:`FakePlayer` (a
+    default one past the script) and records ``argv`` in ``starts``; an
+    unstartable player is recorded in ``failed_starts`` and raises
+    ``FileNotFoundError``. ``write``, ``close_stdin`` and ``wait`` delegate
+    to the player. ``stop(process, grace_seconds)`` records the stop, then
+    terminates the player; one that ignores termination is killed after
+    ``grace_seconds`` on the injected sleeper (``clock.sleep`` or
+    ``sleeper``) — recorded in ``kills`` — and only then can ``wait``
+    return. ``events`` is the ordered ``start``/``stop``/``kill``/``exit``
+    log the ownership assertions read (finding P5). ``outputs`` optionally
+    maps an output name to its argv so events carry the output name.
+    """
+
+    def __init__(
+        self,
+        *players: FakePlayer,
+        clock: ManualClock | None = None,
+        sleeper: Any = None,
+        outputs: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
+        self.script = list(players)
+        self.players: list[FakePlayer] = []
+        self.starts: list[list[str]] = []
+        self.failed_starts: list[list[str]] = []
+        self.stops: list[int] = []
+        self.kills: list[int] = []
+        self.events: list[PlayerEvent] = []
+        self._sleeper = sleeper if sleeper is not None else (clock.sleep if clock else None)
+        self._outputs = {tuple(argv): name for name, argv in (outputs or {}).items()}
+
+    async def start(self, argv: Sequence[str]) -> FakePlayer:
+        player = self.script.pop(0) if self.script else FakePlayer()
+        if not player.startable:
+            self.failed_starts.append(list(argv))
+            raise FileNotFoundError(errno.ENOENT, "player cannot be started")
+        player.argv = tuple(argv)
+        player.number = len(self.players) + 1
+        player.output = self._outputs.get(player.argv, argv[0] if argv else "")
+        player._runner = self
+        self.players.append(player)
+        self.starts.append(list(argv))
+        self._event("start", player)
+        return player
+
+    async def write(self, process: FakePlayer, chunk: bytes) -> int:
+        return await process.write(chunk)
+
+    async def close_stdin(self, process: FakePlayer) -> None:
+        process.close_stdin()
+
+    async def wait(self, process: FakePlayer) -> int:
+        return await process.wait()
+
+    async def stop(self, process: FakePlayer, grace_seconds: float) -> None:
+        self.stops.append(process.number)
+        self._event("stop", process)
+        if not process.alive:
+            return
+        if not process.ignores_terminate:
+            process._exit(PLAYER_TERMINATED)
+            return
+        if self._sleeper is None:
+            raise AssertionError("RecordingPlayerRunner: a stop grace needs a clock or sleeper")
+        await self._sleeper(grace_seconds)
+        if process.alive:
+            self.kills.append(process.number)
+            self._event("kill", process)
+            process._exit(PLAYER_KILLED)
+
+    def release(self) -> None:
+        """Let every player still running exit with its ``exit_code``."""
+
+        for player in self.players:
+            player.release()
+
+    @property
+    def received(self) -> bytes:
+        """What the most recently started player accepted."""
+
+        return bytes(self.players[-1].received) if self.players else b""
+
+    def kinds(self) -> list[tuple[str, int]]:
+        """``events`` as ``(kind, player)`` pairs, the shape order checks read."""
+
+        return [(event.kind, event.player) for event in self.events]
+
+    def _event(self, kind: str, player: FakePlayer) -> None:
+        self.events.append(PlayerEvent(kind, player.number, player.output))
+
+
+# --------------------------------------------------------------------------- #
+# The recorder behind ``audio_input`` (R3)
+# --------------------------------------------------------------------------- #
+
+
+class FakeAudioSource:
+    """An injectable audio source: ``read(seconds)`` hands out WAV bytes.
+
+    ``data`` is the scripted segment (``wav_bytes(seconds)`` when ``None``);
+    every read is recorded in ``reads``. ``fail_with`` makes reads raise. A
+    ``gated`` source emits nothing until :meth:`release`; :meth:`kill`
+    (counted in ``kills``) ends a pending read with no bytes, as a killed
+    recorder would.
+    """
+
+    def __init__(
+        self,
+        data: bytes | None = None,
+        *,
+        gated: bool = False,
+        fail_with: BaseException | None = None,
+    ) -> None:
+        self.data = data
+        self.gated = gated
+        self.fail_with = fail_with
+        self.reads: list[float] = []
+        self.kills = 0
+        self.released = False
+        self.killed = False
+        self.entered = asyncio.Event()
+        self._gate: asyncio.Future[None] | None = None
+
+    async def read(self, seconds: float) -> bytes:
+        self.reads.append(seconds)
+        self.entered.set()
+        if self.fail_with is not None:
+            raise self.fail_with
+        if self.gated and not (self.released or self.killed):
+            if self._gate is None or self._gate.done():
+                self._gate = asyncio.get_running_loop().create_future()
+            await asyncio.shield(self._gate)
+        if self.killed:
+            return b""
+        return self.data if self.data is not None else wav_bytes(seconds)
+
+    __call__ = read
+
+    def release(self) -> None:
+        self.released = True
+        self._open_gate()
+
+    def kill(self) -> None:
+        self.kills += 1
+        self.killed = True
+        self._open_gate()
+
+    def _open_gate(self) -> None:
+        if self._gate is not None and not self._gate.done():
+            self._gate.set_result(None)
+
+
+class _FakeStdout:
+    def __init__(self, process: FakeRecorderProcess) -> None:
+        self._process = process
+
+    async def read(self, n: int = -1) -> bytes:
+        return await self._process._read(n)
+
+
+class FakeRecorderProcess:
+    """A recorder process shaped like ``asyncio.subprocess.Process``:
+    ``stdout.read(n)``, ``terminate()``, ``kill()``, ``await wait()``,
+    ``returncode``, ``pid``."""
+
+    def __init__(self, runner: RecordingSubprocessRunner, number: int, output: bytes, gated: bool) -> None:
+        self._runner = runner
+        self.pid = number
+        self.argv: tuple[str, ...] = ()
+        self._pending = bytes(output)
+        self._gated = gated
+        self.returncode: int | None = None
+        self.stdout = _FakeStdout(self)
+        self._wake: asyncio.Future[None] | None = None
+
+    async def _read(self, n: int) -> bytes:
+        while self._gated and self.returncode is None:
+            if self._wake is None or self._wake.done():
+                self._wake = asyncio.get_running_loop().create_future()
+            await asyncio.shield(self._wake)
+        if self._gated:
+            # Ended before it was released: it never emitted anything.
+            return b""
+        if not self._pending:
+            if self.returncode is None:
+                self._finish(0)
+            return b""
+        size = len(self._pending) if n is None or n < 0 else n
+        chunk, self._pending = self._pending[:size], self._pending[size:]
+        return chunk
+
+    def release(self) -> None:
+        """Let a gated recorder emit its output."""
+
+        self._gated = False
+        self._poke()
+
+    def terminate(self) -> None:
+        if self.returncode is None:
+            self._runner.terminates.append(self.pid)
+            self._finish(PLAYER_TERMINATED)
+
+    def kill(self) -> None:
+        self._runner.kills.append(self.pid)
+        if self.returncode is None:
+            self._finish(PLAYER_KILLED)
+
+    async def wait(self) -> int:
+        while self.returncode is None:
+            if self._wake is None or self._wake.done():
+                self._wake = asyncio.get_running_loop().create_future()
+            await asyncio.shield(self._wake)
+        return self.returncode
+
+    def _finish(self, code: int) -> None:
+        self.returncode = code
+        self._poke()
+
+    def _poke(self) -> None:
+        if self._wake is not None and not self._wake.done():
+            self._wake.set_result(None)
+
+
+class RecordingSubprocessRunner:
+    """The subprocess seam behind ``audio_input``'s command sources.
+
+    ``spawn(argv)`` (or calling the runner as ``create_subprocess_exec``
+    would be, ``runner(*argv, **kwargs)``) records ``argv`` in ``spawns`` and
+    returns a :class:`FakeRecorderProcess` whose stdout yields the next
+    scripted output (``wav_bytes(1.0)`` past the script). ``gated`` recorders
+    emit nothing until their ``release()`` or a kill; kills and terminations
+    are recorded by process number in ``kills``/``terminates``.
+    ``startable=False`` makes every spawn raise ``FileNotFoundError``.
+    """
+
+    def __init__(self, *outputs: bytes, gated: bool = False, startable: bool = True) -> None:
+        self.outputs = list(outputs)
+        self.gated = gated
+        self.startable = startable
+        self.spawns: list[list[str]] = []
+        self.kills: list[int] = []
+        self.terminates: list[int] = []
+        self.processes: list[FakeRecorderProcess] = []
+
+    @property
+    def spawn_count(self) -> int:
+        return len(self.spawns)
+
+    @property
+    def kill_count(self) -> int:
+        return len(self.kills)
+
+    async def spawn(self, argv: Sequence[str], **_kwargs: Any) -> FakeRecorderProcess:
+        if not self.startable:
+            raise FileNotFoundError(errno.ENOENT, "recorder cannot be started")
+        output = self.outputs.pop(0) if self.outputs else wav_bytes(1.0)
+        process = FakeRecorderProcess(self, len(self.processes) + 1, output, self.gated)
+        process.argv = tuple(argv)
+        self.processes.append(process)
+        self.spawns.append(list(argv))
+        return process
+
+    async def __call__(self, *argv: str, **kwargs: Any) -> FakeRecorderProcess:
+        return await self.spawn(list(argv), **kwargs)
+
+    def release(self) -> None:
+        for process in self.processes:
+            process.release()
+
+
+# --------------------------------------------------------------------------- #
+# The scene provider behind ``stream.scene.set`` (R6)
+# --------------------------------------------------------------------------- #
+
+
+SCENE_OK = "ok"
+SCENE_SWALLOW = "swallow"
+SCENE_RAISE = "raise"
+SCENE_UNKNOWN = "unknown"
+SCENE_UNKNOWN_CODE = 600
+
+
+class ScriptedSceneProvider:
+    """A scene provider (``connected``, ``list_scenes``, ``current_scene``,
+    ``set_scene``, ``close``) driven by a script.
+
+    ``set_scene(name)`` records ``name`` in ``sets`` and answers the next
+    entry of ``set_answers`` (``ok`` past the script), with the request/
+    response shape of the websocket provider:
+
+    - ``ok`` — the scene becomes ``current`` (recorded in ``applied``);
+      answers ``{"result": True}``; a name outside ``scenes`` answers as
+      ``unknown`` instead;
+    - ``swallow`` — the scene is applied but the answer is lost: raises
+      ``TimeoutError``;
+    - ``raise`` — the connection fails before the scene is applied: raises
+      ``ConnectionError``;
+    - ``unknown`` — ``{"result": False, "code": 600}``, nothing applied;
+    - an ``int`` — ``{"result": False, "code": <int>}``, nothing applied.
+
+    ``current_scene()`` records its answer in ``reads`` and answers the next
+    ``read_answers`` entry (a scene name, or ``raise``/an exception to fail),
+    else ``current``. While disconnected every call raises
+    ``ConnectionError`` and is not recorded; ``list_scenes`` calls are
+    counted in ``lists``.
+    """
+
+    def __init__(
+        self,
+        scenes: Sequence[str] = ("Talking", "Gaming"),
+        current: str = "Gaming",
+        *,
+        set_answers: Sequence[Any] = (),
+        read_answers: Sequence[Any] = (),
+        connected: bool = True,
+    ) -> None:
+        self.scenes = list(scenes)
+        self.current = current
+        self.set_answers = list(set_answers)
+        self.read_answers = list(read_answers)
+        self._connected = connected
+        self.sets: list[str] = []
+        self.applied: list[str] = []
+        self.reads: list[Any] = []
+        self.lists = 0
+        self.close_calls = 0
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+    def reconnect(self) -> None:
+        self._connected = True
+
+    def _require_connected(self) -> None:
+        if not self._connected:
+            raise ConnectionError("scene provider disconnected")
+
+    async def list_scenes(self) -> list[str]:
+        self._require_connected()
+        self.lists += 1
+        return list(self.scenes)
+
+    async def current_scene(self) -> str:
+        self._require_connected()
+        answer = self.read_answers.pop(0) if self.read_answers else self.current
+        self.reads.append(answer)
+        if answer == SCENE_RAISE:
+            raise ConnectionError("scene read failed")
+        return _raise_or_return(answer)
+
+    async def set_scene(self, name: str) -> dict[str, Any]:
+        self._require_connected()
+        self.sets.append(name)
+        answer = self.set_answers.pop(0) if self.set_answers else SCENE_OK
+        if answer == SCENE_RAISE:
+            raise ConnectionError("scene provider disconnected")
+        if answer == SCENE_UNKNOWN or (
+            answer in (SCENE_OK, SCENE_SWALLOW) and name not in self.scenes
+        ):
+            return {"result": False, "code": SCENE_UNKNOWN_CODE}
+        if isinstance(answer, int) and not isinstance(answer, bool):
+            return {"result": False, "code": answer}
+        if answer not in (SCENE_OK, SCENE_SWALLOW):
+            _raise_or_return(answer)
+            raise AssertionError(f"ScriptedSceneProvider: unknown set answer {answer!r}")
+        self.current = name
+        self.applied.append(name)
+        if answer == SCENE_SWALLOW:
+            raise TimeoutError("scene set answer lost")
+        return {"result": True}
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self._connected = False
+
+
+# --------------------------------------------------------------------------- #
+# A platform poll service (R7)
+# --------------------------------------------------------------------------- #
+
+
+class PollServiceError(Exception):
+    """Base of the scripted poll service's failures."""
+
+
+class PollTransportError(PollServiceError):
+    """The transport failed; ``sent`` says whether the request had left."""
+
+    def __init__(self, sent: bool) -> None:
+        super().__init__("poll request lost" if sent else "poll request not sent")
+        self.sent = sent
+
+
+class PollStatusError(PollServiceError):
+    """A non-2xx answer: ``status`` and a sanitised ``message``, never a body."""
+
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message or f"poll request failed with status {status}")
+        self.status = status
+        self.message = message or f"status {status}"
+
+
+class PollMalformedAnswer(PollServiceError):
+    """A 2xx answer whose body is not a poll."""
+
+    sent = True
+
+
+class ScriptedPollService:
+    """A poll service (``create``, ``get``) scripted per channel.
+
+    ``create(channel_id, question, options, duration_seconds)`` records the
+    call in ``creates`` and applies the next outcome for the channel
+    (:meth:`script_create`, else the service-wide ``create`` outcomes, else
+    ``ok``):
+
+    - ``ok`` — a poll is added to ``polls[channel_id]`` and returned;
+    - ``lost`` — the poll is added but the answer is lost:
+      ``PollTransportError(sent=True)``;
+    - ``status:<code>`` — nothing added, ``PollStatusError(code)``;
+    - ``transport`` — nothing sent: ``PollTransportError(sent=False)``;
+    - ``malformed`` — the poll is added, ``PollMalformedAnswer``;
+    - ``held`` — nothing added, the call parks until cancelled (or
+      :meth:`release_held`);
+    - an exception — raised.
+
+    ``get(channel_id)`` records the channel in ``gets`` and answers the next
+    outcome: ``list`` (the channel's ``polls``, the default), ``raise``
+    (``PollTransportError(sent=True)``), an explicit sequence (returned
+    as given) or an exception. Poll times come from ``clock`` (0.0 without
+    one). The failure classes are the harness's own; a consumer tells them
+    apart by their ``sent``/``status`` attributes, never by importing them.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Any = None,
+        create: Sequence[Any] = (),
+        get: Sequence[Any] = (),
+    ) -> None:
+        self._clock = clock
+        self._create_default = list(create)
+        self._get_default = list(get)
+        self._create_script: dict[str, list[Any]] = {}
+        self._get_script: dict[str, list[Any]] = {}
+        self.polls: dict[str, list[dict[str, Any]]] = {}
+        self.creates: list[dict[str, Any]] = []
+        self.gets: list[str] = []
+        self._held: list[asyncio.Future[Any]] = []
+        self._next_id = 0
+
+    def script_create(self, channel_id: str, *outcomes: Any) -> None:
+        self._create_script.setdefault(channel_id, []).extend(outcomes)
+
+    def script_get(self, channel_id: str, *outcomes: Any) -> None:
+        self._get_script.setdefault(channel_id, []).extend(outcomes)
+
+    def add_poll(
+        self,
+        channel_id: str,
+        question: str,
+        options: Sequence[str],
+        *,
+        started_at: float | None = None,
+        duration_seconds: int = 60,
+        state: str = "active",
+    ) -> dict[str, Any]:
+        """Put a poll in the channel's table directly (a poll made elsewhere)."""
+
+        self._next_id += 1
+        started = started_at if started_at is not None else self._now()
+        poll = {
+            "poll_id": f"poll-{self._next_id}",
+            "question": question,
+            "options": list(options),
+            "started_at": started,
+            "ends_at": started + duration_seconds,
+            "state": state,
+        }
+        self.polls.setdefault(channel_id, []).append(poll)
+        return dict(poll)
+
+    def release_held(self, answer: Any = None) -> None:
+        for waiter in self._held:
+            if not waiter.done():
+                waiter.set_result(answer)
+                return
+        raise AssertionError("no held create to release")
+
+    def _now(self) -> float:
+        return float(self._clock()) if self._clock is not None else 0.0
+
+    @staticmethod
+    def _next(script: dict[str, list[Any]], default: list[Any], channel_id: str, fallback: str) -> Any:
+        queue = script.get(channel_id)
+        if queue:
+            return queue.pop(0)
+        if default:
+            return default.pop(0)
+        return fallback
+
+    async def create(
+        self, channel_id: str, question: str, options: Sequence[str], duration_seconds: int
+    ) -> dict[str, Any]:
+        self.creates.append(
+            {
+                "channel_id": channel_id,
+                "question": question,
+                "options": list(options),
+                "duration_seconds": duration_seconds,
+            }
+        )
+        outcome = self._next(self._create_script, self._create_default, channel_id, "ok")
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome == "transport":
+            raise PollTransportError(sent=False)
+        if isinstance(outcome, str) and outcome.startswith("status:"):
+            status = int(outcome.split(":", 1)[1])
+            raise PollStatusError(status)
+        if outcome == "held":
+            waiter: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            self._held.append(waiter)
+            try:
+                return _raise_or_return(await waiter)
+            finally:
+                self._held = [item for item in self._held if item is not waiter]
+        if outcome not in ("ok", "lost", "malformed"):
+            raise AssertionError(f"ScriptedPollService: unknown create outcome {outcome!r}")
+        poll = self.add_poll(
+            channel_id, question, options, duration_seconds=duration_seconds
+        )
+        if outcome == "lost":
+            raise PollTransportError(sent=True)
+        if outcome == "malformed":
+            raise PollMalformedAnswer("poll answer malformed")
+        return poll
+
+    async def get(self, channel_id: str) -> list[dict[str, Any]]:
+        self.gets.append(channel_id)
+        outcome = self._next(self._get_script, self._get_default, channel_id, "list")
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome == "raise":
+            raise PollTransportError(sent=True)
+        if outcome == "list":
+            return [
+                {key: poll[key] for key in ("poll_id", "question", "options", "started_at", "state")}
+                for poll in self.polls.get(channel_id, [])
+            ]
+        if isinstance(outcome, Sequence) and not isinstance(outcome, str):
+            return [dict(entry) for entry in outcome]
+        raise AssertionError(f"ScriptedPollService: unknown get outcome {outcome!r}")
+
+
+# --------------------------------------------------------------------------- #
 # The in-memory wire between brain and agent (R6)
 # --------------------------------------------------------------------------- #
 
@@ -643,6 +1704,7 @@ def runtime_context(
     actions: ActionRegistry | None = None,
     attachments: AttachmentStore | None = None,
     rng: Any = None,
+    services: Any = None,
 ) -> RuntimeContext:
     """The versioned runtime every suite builds identically (P19).
 
@@ -663,12 +1725,18 @@ def runtime_context(
     suite without images exactly as before. ``rng`` is the one random
     source every component draws from (trigger probability rules, proxy
     session ids): a seeded ``random.Random(0)`` by default, so a run replays
-    identically without a suite seeding anything.
+    identically without a suite seeding anything. ``services`` is the service
+    registry modules publish into and resolve from (R7): a fresh
+    :class:`~core.runtime.ServiceRegistry` by default, so a publishing module
+    and its consumer meet on the harness exactly as on the assembled runtime;
+    a suite needing a context *without* a registry replaces the field with
+    ``dataclasses.replace(context, services=None)``.
     """
 
     target_bus = bus if bus is not None else EventBus()
     target_clock = clock if clock is not None else ManualClock()
     target_rng = rng if rng is not None else random.Random(0)
+    target_services = services if services is not None else ServiceRegistry()
     counters = Counters()
     policy = authorization if authorization is not None else AuthorizationPolicy()
     registry = actions if actions is not None else ActionRegistry(authorization=policy)
@@ -702,6 +1770,7 @@ def runtime_context(
         scheduler=scheduler,
         clock=target_clock,
         rng=target_rng,
+        services=target_services,
     )
 
 
@@ -727,3 +1796,61 @@ async def wait_until(predicate: Any, turns: int = 2000) -> None:
 
 def events_of(bus: EventBus, event_type: str) -> list[dict[str, Any]]:
     return [event for event in bus.list_events() if event["type"] == event_type]
+
+
+def trace_texts(bus: EventBus) -> list[str]:
+    """Every retained event on *bus* flattened to one JSON text, in order.
+
+    What a value-free assertion searches: a secret, a payload or a path must
+    be a substring of none of them.
+    """
+
+    return [
+        json.dumps(event, sort_keys=True, ensure_ascii=False, default=str)
+        for event in bus.list_events()
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Self-checks: every suite imports this file, so a broken double fails the run
+# --------------------------------------------------------------------------- #
+
+
+def _self_check() -> None:
+    silent = silent_wav(0.25)
+    assert len(silent) == 8044, len(silent)
+    assert silent[:4] == b"RIFF" and silent[8:12] == b"WAVE"
+    assert _wav_data_layout(silent) == (44, 8000)
+    assert not any(silent[44:]), "silent_wav samples are not all zero"
+    assert wav_data_size(wav_bytes(1.5)) == 48_000
+    assert wav_data_size(wav_bytes(10.0)) == 320_000
+    assert wav_data_size(wav_bytes(1.0, sample_rate=8000, channels=2, bits=8)) == 16_000
+
+    audio_part = {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,"}}
+    with_audio = {"messages": [{"role": "user", "content": [audio_part]}]}
+    with_image = {"messages": [{"role": "user", "content": [image_part]}]}
+    assert carries_audio_part(with_audio)
+    assert not carries_audio_part(with_image)
+    assert not carries_audio_part({"messages": [{"role": "user", "content": "text"}]})
+    assert probe_kind(with_audio) == PROBE_KIND_AUDIO
+    assert probe_kind(with_image) == PROBE_KIND_IMAGE
+    assert probe_kind({"messages": []}) == PROBE_KIND_TEXT
+
+    segment = wav_bytes(10.0)
+    player = FakePlayer(accept_limit=128_000)
+    accepted = 0
+    for start in range(0, len(segment), 32_768):
+        taken = player.offer(segment[start : start + 32_768])
+        accepted += taken
+        if taken < len(segment[start : start + 32_768]):
+            break
+    assert accepted == 128_044 and len(player.received) == 128_044, accepted
+    assert player.offer(segment[accepted:]) == 0
+    everything = FakePlayer()
+    assert everything.offer(segment) == len(segment)
+    header_only = FakePlayer(accept_total=20)
+    assert header_only.offer(segment) == 20
+
+
+_self_check()
