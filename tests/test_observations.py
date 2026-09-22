@@ -664,6 +664,146 @@ async def test_a_stored_size_off_by_one_byte_is_invalid_result_through_the_conte
 
 
 # --------------------------------------------------------------------------- #
+# audio_ref leases through the executor, exactly as image_ref (phase 2 P2; AC14)
+# --------------------------------------------------------------------------- #
+
+WAV_BYTES = 44 + 200
+"""A small ``audio/wav`` object — header plus data — within ``max_object_bytes``."""
+
+
+def _audio_part(ref, **overrides) -> dict:
+    part = {
+        "type": "audio_ref",
+        "attachment_id": ref.attachment_id,
+        "content_type": ref.content_type,
+        "size": ref.size,
+        "duration_ms": 3_000,
+        "sample_rate_hz": 16_000,
+        "channels": 1,
+        "captured_at": ref.created_at,
+        "provider_id": "audio_input",
+    }
+    part.update(overrides)
+    return part
+
+
+def _put_audio(store, run_id: str, fill: bytes = b"\x01"):
+    return store.put(run_id, fill * WAV_BYTES, content_type="audio/wav")
+
+
+def _assert_invalid_and_not_fed(observation) -> None:
+    assert observation.status == "error"
+    assert observation.error["code"] == ERROR_INVALID_RESULT
+    assert observation.result is None
+    assert observation.parts == ()
+
+
+async def test_ac14_an_audio_ref_leased_to_another_run_is_invalid_result() -> None:
+    """AC14: an ``audio_ref`` leased to another run is ``invalid_result`` and
+    the provider's result is not adopted; the foreign object is refused, not
+    destroyed — its owner's own release frees it (gate finding F1)."""
+
+    context, clock, store, provider = _context_with_store()
+    foreign = _put_audio(store, "run-2", b"\x7f")
+    provider.scripted.append([_audio_part(foreign)])
+
+    observation = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+
+    _assert_invalid_and_not_fed(observation)
+    assert "leased to run 'run-2'" in observation.error["message"]
+    assert store.lookup(foreign.attachment_id) == foreign
+    assert store.get(foreign) == b"\x7f" * WAV_BYTES
+    assert store.release("run-2").objects == 1
+    assert store.lookup(foreign.attachment_id) is None
+
+
+async def test_ac14_an_audio_ref_expired_past_the_ttl_is_invalid_result() -> None:
+    context, clock, store, provider = _context_with_store()
+    stale = _put_audio(store, "run-1")
+    clock.advance(ATTACHMENT_LIMITS["ttl_seconds"] + 1.0)
+    provider.scripted.append([_audio_part(stale)])
+
+    observation = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+
+    _assert_invalid_and_not_fed(observation)
+    assert "lease expired" in observation.error["message"]
+
+
+@pytest.mark.parametrize("delta", [1, -1])
+async def test_ac14_an_audio_ref_whose_size_is_off_by_one_byte_is_invalid_result(
+    delta: int,
+) -> None:
+    """The check compares the part's ``size`` with the **stored** size."""
+
+    context, clock, store, provider = _context_with_store()
+    ref = _put_audio(store, "run-1")
+    provider.scripted.append([_audio_part(ref, size=ref.size + delta)])
+
+    observation = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+
+    _assert_invalid_and_not_fed(observation)
+    assert f"the store holds {ref.size} bytes" in observation.error["message"]
+    # The rejected observation discarded the run's own audio at once.
+    assert store.lookup(ref.attachment_id) is None
+    assert store.usage("run-1").objects == 0
+
+
+async def test_ac14_a_valid_audio_ref_is_adopted_intact_and_released_with_the_run() -> None:
+    context, clock, store, provider = _context_with_store()
+    ref = _put_audio(store, "run-1")
+    provider.scripted.append([_audio_part(ref)])
+
+    observation = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+
+    assert observation.status == "success"
+    assert observation.parts == (_audio_part(ref),)
+    assert observation.result == {"content_type": "image/png"}
+    assert store.lookup(ref.attachment_id) == ref
+    # The run's terminal record releases it.
+    assert store.release("run-1").objects == 1
+    assert store.lookup(ref.attachment_id) is None
+
+
+async def test_ac14_a_rejected_observation_discards_only_the_runs_own_audio() -> None:
+    """No partially adopted observation: one bad part rejects the whole
+    observation and every ``audio_ref`` of the rejecting run it named is
+    discarded, while another run's audio stays; the discard is idempotent
+    with the run's release."""
+
+    context, clock, store, provider = _context_with_store()
+    own = _put_audio(store, "run-1")
+    other = _put_audio(store, "run-2", b"\x02")
+    image = store.put("run-1", b"\x00" * 64, content_type="image/png")
+    provider.scripted.append(
+        [_audio_part(own), _image_part(image), _audio_part(other)]
+    )
+
+    observation = await context.executor.invoke(_capture_call("run-1", "run-1/call-1", clock() + 5))
+
+    _assert_invalid_and_not_fed(observation)
+    assert store.lookup(own.attachment_id) is None
+    assert store.lookup(image.attachment_id) is None
+    assert store.lookup(other.attachment_id) == other
+    assert store.usage("run-1").objects == 0
+    assert store.release("run-1").objects == 0  # already discarded: nothing twice
+    assert store.usage("run-2").objects == 1
+
+
+def test_a_part_with_an_unhashable_type_does_not_break_the_cleanup() -> None:
+    """The cleanup of rejected parts skips a part whose ``type`` is
+    unhashable (a list) rather than raising, and still discards the run's
+    later ``audio_ref``. ``ActionObservation`` refuses such a part at
+    construction, so the helper is driven directly."""
+
+    context, _clock, store, _provider = _context_with_store()
+    own = _put_audio(store, "run-1")
+
+    context.executor._discard_images("run-1", [{"type": []}, _audio_part(own)])
+
+    assert store.lookup(own.attachment_id) is None
+
+
+# --------------------------------------------------------------------------- #
 # The two store accessors the executor relies on (P3)
 # --------------------------------------------------------------------------- #
 

@@ -271,7 +271,7 @@ def main():
     start_at = os.environ.get("START_AT", "")
     completed, halted = [], None
     log("=" * 60)
-    log("PHASE 1 CAMPAIGN — Claude DEV + Codex REVIEW, steps P1..P23 then the full-branch gate")
+    log("PHASE 2 CAMPAIGN — Claude DEV + Codex REVIEW, steps P1..P21 then the full-branch gate")
     sh("git checkout main", cwd=REPO)
     started = not start_at
 

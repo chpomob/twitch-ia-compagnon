@@ -39,17 +39,17 @@ AC35).
 
 Result validation covers the observation's typed ``parts`` (phase 1, R4) on
 **every** terminal observation a provider returns, whatever its status: the
-parts must have the contract's shape, every ``image_ref`` must name an
-attachment the injected :class:`~core.attachments.AttachmentStore` holds
+parts must have the contract's shape, every attachment reference
+(``image_ref`` or ``audio_ref``, phase 2 R4) must name an attachment the injected :class:`~core.attachments.AttachmentStore` holds
 leased to the call's ``run_id``, unexpired on the executor clock at
 validation and of the stored size, and the observation's size — text bytes
-plus image sizes, see :func:`~core.contracts.observation_size` — must not
+plus attachment sizes, see :func:`~core.contracts.observation_size` — must not
 exceed the executor's ``max_observation_bytes``. A lease failure is
 ``error invalid_result``, an oversized observation ``error
 observation_too_large``; in both cases nothing of the provider's observation
-is adopted and every ``image_ref`` it named is discarded from the store at
-once, so a rejected observation leaves no partially adopted parts and no
-bytes leased until the run ends (AC22, AC47). The size rule is one rule with
+is adopted and every attachment reference of the run it named is discarded
+from the store at once, so a rejected observation leaves no partially adopted
+parts and no bytes leased until the run ends (AC14, AC22, AC47). The size rule is one rule with
 two enforcement points: the brain enforces its own ``budget.max_observation_bytes``
 per run, the executor's bound is a runtime-wide guard a caller may set and
 ``core.main`` leaves unset. Observations the executor synthesises itself carry
@@ -102,6 +102,7 @@ from .contracts import (
     BRAIN_ERROR_OBSERVATION_TOO_LARGE,
     COUNTER_ACTION_TIMEOUTS,
     COUNTER_LOST_TRACES,
+    PART_TYPE_AUDIO_REF,
     PART_TYPE_IMAGE_REF,
     TRACE_ACTION_COMPLETED,
     TRACE_ACTION_STARTED,
@@ -160,6 +161,9 @@ ANY_PRINCIPAL = WILDCARD
 
 ANY_ACTION = WILDCARD
 """Action token a rule uses to apply to every action name."""
+
+_ATTACHMENT_PART_TYPES = frozenset({PART_TYPE_IMAGE_REF, PART_TYPE_AUDIO_REF})
+"""Part types naming a store attachment the executor validates and discards (R4)."""
 
 DEFAULT_MAX_OUTCOMES = 1024
 """How many terminal observations the executor keeps addressable by ``call_id``.
@@ -1528,11 +1532,12 @@ class ActionExecutor:
         2. the per-part text bound, ``observation_too_large``: a single text
            part above ``max_observation_bytes`` is the same oversize the
            whole-observation rule below reports, one code for one rule;
-        3. every ``image_ref`` must be an attachment the store holds, leased
-           to this call's ``run_id``, unexpired on the executor clock **now**
-           and of the recorded stored size — ``invalid_result`` (AC22, AC47);
-           without a store, no image can be validated at all;
-        4. the observation's size — text bytes plus image sizes — must not
+        3. every attachment reference — ``image_ref`` and ``audio_ref``
+           alike — must be an attachment the store holds, leased to this
+           call's ``run_id``, unexpired on the executor clock **now** and of
+           the recorded stored size — ``invalid_result`` (AC14, AC22, AC47);
+           without a store, no reference can be validated at all;
+        4. the observation's size — text bytes plus attachment sizes — must not
            exceed ``max_observation_bytes`` — ``observation_too_large``
            (AC47); ``None`` sets no bound.
 
@@ -1556,7 +1561,7 @@ class ActionExecutor:
 
         now = self._clock()
         for index, part in enumerate(parts):
-            if part["type"] != PART_TYPE_IMAGE_REF:
+            if part["type"] not in _ATTACHMENT_PART_TYPES:
                 continue
             label = f"ActionObservation.parts[{index}]"
             attachment_id = part["attachment_id"]
@@ -1604,30 +1609,38 @@ class ActionExecutor:
     def _discard_images(self, run_id: str, parts: Sequence[Mapping[str, Any]]) -> None:
         """Drop from the store every attachment of *run_id* the rejected *parts* name.
 
-        A rejected observation adopts nothing, so an image it named would
-        otherwise stay leased until the run's terminal record releases it.
-        Discarding is idempotent with that release — the store drops an
-        object exactly once — and an identifier the store does not hold is
-        a no-op, so a lease that was already unknown costs nothing here.
+        Every attachment reference is discarded — ``image_ref`` and
+        ``audio_ref`` alike (R4). A rejected observation adopts nothing, so
+        an attachment it named would otherwise stay leased until the run's
+        terminal record releases it. Discarding is idempotent with that
+        release — the store drops an object exactly once — and an identifier
+        the store does not hold is a no-op, so a lease that was already
+        unknown costs nothing here.
 
-        Only the rejecting call's own run is cleaned. An ``image_ref`` leased
-        to *another* run is exactly what the validation refused, and that
-        run may still need the bytes for its next model turn: dropping them
-        here would let one run's invalid observation destroy an unrelated
-        run's image (gate finding F1). The foreign object stays with its
+        Only the rejecting call's own run is cleaned. A reference leased to
+        *another* run is exactly what the validation refused, and that run
+        may still need the bytes for its next model turn: dropping them here
+        would let one run's invalid observation destroy an unrelated run's
+        attachment (gate finding F1). The foreign object stays with its
         owner, whose own cleanup releases it.
         """
 
         if self._attachments is None:
             return
         for part in parts:
-            if isinstance(part, Mapping) and part.get("type") == PART_TYPE_IMAGE_REF:
-                attachment_id = part.get("attachment_id")
-                if not isinstance(attachment_id, str) or not attachment_id.strip():
-                    continue
-                ref = self._attachments.lookup(attachment_id)
-                if ref is not None and ref.run_id == run_id:
-                    self._attachments.discard(attachment_id)
+            if not isinstance(part, Mapping):
+                continue
+            # The parts were rejected, so a type may be unhashable (a list):
+            # test set membership only on a string, never raise mid-cleanup.
+            part_type = part.get("type")
+            if not isinstance(part_type, str) or part_type not in _ATTACHMENT_PART_TYPES:
+                continue
+            attachment_id = part.get("attachment_id")
+            if not isinstance(attachment_id, str) or not attachment_id.strip():
+                continue
+            ref = self._attachments.lookup(attachment_id)
+            if ref is not None and ref.run_id == run_id:
+                self._attachments.discard(attachment_id)
 
     async def _terminate_uncertain(
         self,
