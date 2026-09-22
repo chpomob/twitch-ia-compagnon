@@ -66,7 +66,7 @@ def main():
 
         content = f"""# Step {sid} — {title_short}
 
-Plan step `{sid}` of the approved Phase 1 plan for `twitch-ia-compagnon`.
+Plan step `{sid}` of the approved Phase 2 plan for `twitch-ia-compagnon`.
 Authority documents (read them, do not re-derive):
 - Approved plan (this step is the whole scope, nothing more): `docs/campaigns/phase2/plan.md`
 - Approved specification v1.2 (requirement and acceptance-criteria wording): `docs/campaigns/phase2/spec.md`
