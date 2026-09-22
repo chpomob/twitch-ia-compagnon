@@ -14,6 +14,12 @@ Phase 1 (R4) adds the executor-side checks on observation ``parts``: an
 clock and of the stored size, the observation must fit the executor's byte
 bound, and a rejected observation releases every image it named (AC22, AC47);
 and the not-ready provider outcome becomes ``refused`` (R6, AC35).
+
+Phase 2 (R10) adds the last section: a provider-authored interruption record
+(``timeout``, ``cancelled``, ``error``) stamped at or after ``expires_at`` is
+adopted through the ordinary validation, while a late ``success``/``refused``
+and a provider that never answers still get the executor's generic record
+(AC38–AC40 executor halves).
 """
 
 import asyncio
@@ -31,6 +37,7 @@ from core.actions import (
     ERROR_NOT_AUTHORIZED,
     ERROR_OBSERVATION_TOO_LARGE,
     ERROR_PROVIDER_NOT_READY,
+    ERROR_TIMED_OUT,
     ERROR_UNKNOWN_ACTION,
     REASON_NO_RULE,
     ActionExecutor,
@@ -1920,3 +1927,354 @@ def test_an_action_spec_refuses_a_nature_outside_read_and_write():
             idempotency="none",
         )
     assert "ActionSpec.nature" in str(raised.value)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 R10 — a late provider-authored interruption record is the true one
+# (AC38–AC40 executor halves)
+# --------------------------------------------------------------------------- #
+
+LATE_DEADLINE = 100.0
+"""The call deadline of AC38/AC39; entered at t=96 with a 5 s spec timeout,
+it is the limit that applies, so ``expires_at == 100.0``."""
+
+GENERIC_MESSAGE = "timed out with emission"
+"""The executor's own record says this; a provider's record never does."""
+
+
+class ClockSleeper:
+    """An injected sleeper driven by the injected clock, never by real time.
+
+    ``sleep(delay)`` parks until :meth:`advance_to` moves the clock to or past
+    ``now + delay``. The executor's timer and a scripted provider may share it.
+    """
+
+    def __init__(self, clock: ManualClock) -> None:
+        self.clock = clock
+        self.waiters: list[tuple[float, asyncio.Future]] = []
+
+    async def __call__(self, delay: float) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        self.waiters.append((self.clock.now + delay, waiter))
+        await waiter
+
+    def advance_to(self, now: float) -> None:
+        self.clock.now = now
+        for due, waiter in self.waiters:
+            if due <= now and not waiter.done():
+                waiter.set_result(None)
+
+
+def _late_harness(spec: ActionSpec, behaviour, **kwargs):
+    clock = ManualClock(96.0)
+    sleeper = ClockSleeper(clock)
+    harness = Harness(sleeper=sleeper, clock=clock, **kwargs)
+    harness.declare(spec)
+    provider = Provider("late", behaviour)
+    harness.bind(spec, provider)
+    harness.ready()
+    harness.allow(spec)
+    return harness, sleeper, provider
+
+
+async def _settle() -> None:
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+def _late_record(record: ActionObservation, *, emission: str | None = None):
+    """A behaviour that answers *record* once released; returns (behaviour, release)."""
+
+    release = asyncio.Event()
+
+    async def behaviour(invocation) -> ActionObservation:
+        if emission == "emitted":
+            invocation.mark_emitted()
+        elif emission == "not_emitted":
+            invocation.mark_not_emitted()
+        await release.wait()
+        return record
+
+    return behaviour, release
+
+
+async def _invoke_late(spec: ActionSpec, record: ActionObservation, *, stamp: float,
+                       emission: str | None = None, **kwargs):
+    """Have *record* land stamped at *stamp*, the timer ready too when late.
+
+    Both the provider's answer and the executor's timer are made ready before
+    the executor is resumed, so the race cannot order them: only the
+    provider's own completion stamp decides.
+    """
+
+    behaviour, release = _late_record(record, emission=emission)
+    harness, sleeper, provider = _late_harness(spec, behaviour, **kwargs)
+    call = make_call(spec, deadline=LATE_DEADLINE)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await _settle()
+    assert len(provider.calls) == 1 and not task.done()
+    release.set()
+    sleeper.advance_to(stamp)
+    observation = await task
+    (invocation,) = provider.calls
+    assert invocation.provider_completed_at == stamp
+    return harness, call, observation
+
+
+def _playback_timeout() -> ActionObservation:
+    return ActionObservation(
+        status="timeout",
+        provenance={"transport": "fake"},
+        error={
+            "code": "timed_out",
+            "cause": "playback",
+            "played_ms": 4000,
+            "message": "player stopped at the call deadline",
+            "retryable": False,
+        },
+    )
+
+
+def _assert_single_record(harness: Harness, call: ActionCall, status: str) -> None:
+    assert list(harness.executor.outcomes()) == [call.call_id]
+    assert [p["status"] for p in harness.bus.of_type(TRACE_ACTION_COMPLETED)] == [status]
+
+
+@pytest.mark.parametrize("stamp", [LATE_DEADLINE, LATE_DEADLINE + 0.5])
+async def test_a_late_provider_timeout_is_adopted_verbatim(stamp):
+    """AC38 executor half: a not-emitted write's own ``timeout`` stamped
+    ``== expires_at`` and ``> expires_at`` is the terminal record, cause,
+    ``played_ms``, code and message intact."""
+
+    harness, call, observation = await _invoke_late(
+        WRITE_SPEC, _playback_timeout(), stamp=stamp, emission="not_emitted"
+    )
+
+    assert observation.status == "timeout"
+    assert observation.error["cause"] == "playback"
+    assert observation.error["played_ms"] == 4000
+    assert observation.error["code"] == "timed_out"
+    assert observation.error["message"] == "player stopped at the call deadline"
+    assert GENERIC_MESSAGE not in observation.error["message"]
+    assert observation.provenance["transport"] == "fake"
+    _assert_single_record(harness, call, "timeout")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 1
+
+
+@pytest.mark.parametrize("stamp", [99.0, LATE_DEADLINE, LATE_DEADLINE + 0.5])
+async def test_a_late_timeout_after_emission_ends_external_unknown_as_in_time(stamp):
+    """AC38: the emission rule is unchanged — an emitted write's ``timeout``
+    resolves ``external_unknown`` late exactly as it does in time (t=99)."""
+
+    if stamp < LATE_DEADLINE:
+        behaviour, release = _late_record(_playback_timeout(), emission="emitted")
+        harness, sleeper, _provider = _late_harness(WRITE_SPEC, behaviour)
+        call = make_call(WRITE_SPEC, deadline=LATE_DEADLINE)
+        task = asyncio.ensure_future(harness.executor.invoke(call))
+        await _settle()
+        release.set()
+        sleeper.advance_to(stamp)
+        observation = await task
+    else:
+        harness, call, observation = await _invoke_late(
+            WRITE_SPEC, _playback_timeout(), stamp=stamp, emission="emitted"
+        )
+
+    assert observation.status == "external_unknown"
+    assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
+    assert observation.provenance["emission"] == EMISSION_EMITTED
+    _assert_single_record(harness, call, "external_unknown")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+
+
+async def test_a_late_provider_cancelled_record_is_adopted_with_its_played_ms():
+    """AC38: a module-authored ``cancelled`` at the deadline is adopted too."""
+
+    record = ActionObservation(
+        status="cancelled",
+        provenance={"transport": "fake"},
+        error={
+            "code": "cancelled",
+            "cause": "playback",
+            "played_ms": 4000,
+            "message": "player drained at the call deadline",
+        },
+    )
+    harness, call, observation = await _invoke_late(
+        WRITE_SPEC, record, stamp=LATE_DEADLINE, emission="not_emitted"
+    )
+
+    assert observation.status == "cancelled"
+    assert observation.error["played_ms"] == 4000
+    assert observation.error["message"] == "player drained at the call deadline"
+    _assert_single_record(harness, call, "cancelled")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+
+
+async def test_a_late_provider_error_keeps_its_own_code():
+    """AC39 executor half: a read's ``error capture_timed_out`` stamped
+    ``== expires_at`` keeps that code — never ``timed_out``."""
+
+    record = ActionObservation(
+        status="error",
+        provenance={"transport": "fake"},
+        error={"code": "capture_timed_out", "message": "nothing captured by the deadline"},
+    )
+    harness, call, observation = await _invoke_late(READ_SPEC, record, stamp=LATE_DEADLINE)
+
+    assert observation.status == "error"
+    assert observation.error["code"] == "capture_timed_out"
+    assert observation.error["code"] != ERROR_TIMED_OUT
+    _assert_single_record(harness, call, "error")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+
+
+async def test_the_timer_winning_adopts_the_record_of_a_provider_that_answers_its_cancel():
+    """R10: the executor's timer fires at expiry; a provider that catches the
+    cancellation, stops and answers within the grace has the true record."""
+
+    clock = ManualClock(96.0)
+    sleeper = ClockSleeper(clock)
+
+    async def plays_past_the_budget(invocation) -> ActionObservation:
+        invocation.mark_not_emitted()
+        try:
+            await sleeper(10.0)  # longer than the 4 s left of the budget
+        except asyncio.CancelledError:
+            return _playback_timeout()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    harness = Harness(sleeper=sleeper, clock=clock)
+    harness.declare(WRITE_SPEC)
+    provider = Provider("player", plays_past_the_budget)
+    harness.bind(WRITE_SPEC, provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    call = make_call(WRITE_SPEC, deadline=LATE_DEADLINE)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await _settle()
+    assert len(sleeper.waiters) == 2  # the executor's timer and the provider
+    sleeper.advance_to(LATE_DEADLINE)  # only the timer is due
+    observation = await task
+
+    assert observation.status == "timeout"
+    assert observation.error["cause"] == "playback"
+    assert observation.error["played_ms"] == 4000
+    assert GENERIC_MESSAGE not in observation.error["message"]
+    _assert_single_record(harness, call, "timeout")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 1
+
+
+async def test_a_late_success_is_still_replaced_by_the_generic_record():
+    """AC40: a read's ``success`` stamped ``> expires_at`` is not adopted."""
+
+    record = ActionObservation(
+        status="success", provenance={"transport": "fake"}, result={"lines": ["late"]}
+    )
+    harness, call, observation = await _invoke_late(
+        READ_SPEC, record, stamp=LATE_DEADLINE + 0.5
+    )
+
+    assert observation.status == "timeout"
+    assert observation.error["code"] == ERROR_TIMED_OUT
+    assert GENERIC_MESSAGE in observation.error["message"]
+    assert observation.result is None
+    assert observation.provenance.get("transport") is None
+    _assert_single_record(harness, call, "timeout")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 1
+
+
+async def test_a_late_refusal_is_still_replaced_by_the_generic_record():
+    """AC40: a read's ``refused`` stamped ``== expires_at`` is not adopted."""
+
+    record = ActionObservation(
+        status="refused",
+        provenance={"transport": "fake"},
+        error={"code": "upstream_refused", "message": "the source said no"},
+    )
+    harness, call, observation = await _invoke_late(READ_SPEC, record, stamp=LATE_DEADLINE)
+
+    assert observation.status == "timeout"
+    assert observation.error["code"] == ERROR_TIMED_OUT
+    assert "upstream_refused" not in observation.error["message"]
+    assert GENERIC_MESSAGE in observation.error["message"]
+    assert observation.result is None
+    _assert_single_record(harness, call, "timeout")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 1
+
+
+async def test_a_provider_that_never_answers_is_cut_by_the_timer_at_expiry():
+    """AC40: with no provider record, the executor's timer is in force."""
+
+    parked: list[asyncio.Future] = []
+
+    async def never_returns(_invocation) -> ActionObservation:
+        waiter = asyncio.get_running_loop().create_future()
+        parked.append(waiter)
+        await waiter  # no clock advance ever releases it
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    harness, sleeper, provider = _late_harness(READ_SPEC, never_returns)
+    call = make_call(READ_SPEC, deadline=LATE_DEADLINE)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await _settle()
+    sleeper.advance_to(LATE_DEADLINE - 0.01)
+    await _settle()
+    assert not task.done()  # not a moment early
+    sleeper.advance_to(LATE_DEADLINE)
+    observation = await task
+
+    assert parked and parked[0].cancelled()
+    assert observation.status == "timeout"
+    assert observation.error["code"] == ERROR_TIMED_OUT
+    assert GENERIC_MESSAGE in observation.error["message"]
+    _assert_single_record(harness, call, "timeout")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 1
+
+
+async def test_a_late_interruption_with_an_invalid_audio_ref_is_rejected_whole():
+    """AC40 / R4: adoption goes through the ordinary validation — a late
+    ``timeout`` naming an ``audio_ref`` of the wrong size is ``invalid_result``,
+    no part of it adopted, the attachment released."""
+
+    clock = ManualClock(96.0)
+    store = _store(clock)
+    ref = store.put("run-1", b"RIFF" + b"\x00" * 60, content_type="audio/wav")
+    part = {
+        "type": "audio_ref",
+        "attachment_id": ref.attachment_id,
+        "content_type": "audio/wav",
+        "size": ref.size + 1,
+        "duration_ms": 3_000,
+        "sample_rate_hz": 16_000,
+        "channels": 1,
+        "captured_at": 96.0,
+        "provider_id": "late",
+    }
+    record = ActionObservation(
+        status="timeout",
+        provenance={"transport": "fake"},
+        error={"code": "capture_timed_out", "message": "stopped at the deadline"},
+        parts=[part],
+    )
+    behaviour, release = _late_record(record)
+    sleeper = ClockSleeper(clock)
+    harness = Harness(sleeper=sleeper, clock=clock, attachments=store)
+    harness.declare(READ_SPEC)
+    provider = Provider("late", behaviour)
+    harness.bind(READ_SPEC, provider)
+    harness.ready()
+    harness.allow(READ_SPEC)
+
+    call = make_call(READ_SPEC, deadline=LATE_DEADLINE)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await _settle()
+    release.set()
+    sleeper.advance_to(LATE_DEADLINE)
+    observation = await task
+
+    assert provider.calls[0].provider_completed_at == LATE_DEADLINE
+    _assert_rejected(observation, ERROR_INVALID_RESULT)
+    assert store.lookup(ref.attachment_id) is None
+    _assert_single_record(harness, call, "error")

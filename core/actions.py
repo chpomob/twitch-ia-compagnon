@@ -1296,6 +1296,18 @@ class ActionExecutor:
         expires_at: float,
         invocation: ActionInvocation,
     ) -> ActionObservation:
+        """Race the provider against the call's budget and record the outcome.
+
+        Which record stands when the call expires (R10):
+
+        - a provider record stamped before ``expires_at`` is adopted as it stands;
+        - a late ``timeout``/``cancelled``/``error`` the provider authored is adopted;
+        - a late ``success``/``refused``, or no record at all, gets the generic one.
+
+        Every adopted record goes through :meth:`_validate_observation`, so
+        parts, schema and the emission rule are applied from one place.
+        """
+
         self._provider_invocations += 1
         provider_task = asyncio.ensure_future(self._observe(binding, invocation))
         timer_task = asyncio.ensure_future(self._sleep(budget))
@@ -1319,17 +1331,24 @@ class ActionExecutor:
             await self._cancel(timer_task)
             completed_at = invocation.provider_completed_at
             if completed_at is None or completed_at >= expires_at:
-                # The result *arrived* after the call expired — the spec's
+                # The record *arrived* after the call expired — the spec's
                 # timeout or the call deadline, whichever applied — including
                 # the case where both futures were already ready when the wait
                 # returned, so the race itself cannot order a late confirmation
                 # first. The instant judged is the provider's own completion
                 # stamp, not the clock now: a confirmation that landed in time
                 # stays a confirmation however late the executor is resumed to
-                # adopt it (R5, design §3.3). Whatever a late provider says,
-                # even a confirmed success, the call was unconfirmed at expiry
-                # (R2/AC33): the result is not adopted, and the interruption is
-                # latched through the single emission rule instead.
+                # adopt it (R5, design §3.3). R10's ruling: a late confirmation
+                # is never a success; a late interruption the provider observed
+                # itself is the true record. A late ``success`` or ``refused``
+                # (R2/AC33) is not adopted, and the interruption is latched
+                # through the single emission rule instead; a late ``timeout``,
+                # ``cancelled`` or ``error`` is adopted through the ordinary
+                # validation, which applies that same rule to it.
+                if _is_interruption_record(provider_task):
+                    return await self._validate_observation(
+                        call, spec, binding, started_at, invocation, provider_task.result()
+                    )
                 _consume(provider_task)
                 return await self._terminate_uncertain(
                     call, binding, started_at, invocation.emission, spec, certain="timeout"
@@ -1365,7 +1384,16 @@ class ActionExecutor:
             )
 
         # The timer won: cancel the provider and resolve what the effect may be.
-        await self._cancel(provider_task)
+        # A provider that caught the cancellation, stopped what it was doing
+        # and answered within the grace with its own interruption record has
+        # the true record (R10); one that never answers — or answers only
+        # after it was abandoned — gets the executor's generic record, so the
+        # timer stays in force.
+        stopped = await self._cancel(provider_task)
+        if stopped and _is_interruption_record(provider_task):
+            return await self._validate_observation(
+                call, spec, binding, started_at, invocation, provider_task.result()
+            )
         return await self._terminate_uncertain(
             call, binding, started_at, invocation.emission, spec, certain="timeout"
         )
@@ -1783,6 +1811,28 @@ def _uncertain_status(emission: str, spec: ActionSpec, certain: str) -> tuple[st
     if emission == EMISSION_NOT_EMITTED or spec.nature == "read":
         return certain, (ERROR_TIMED_OUT if certain == "timeout" else ERROR_CANCELLED)
     return "external_unknown", ERROR_EXTERNAL_UNKNOWN
+
+
+_INTERRUPTION_STATUSES = frozenset({"timeout", "cancelled", "error"})
+"""The statuses of a provider-authored interruption record (R10)."""
+
+
+def _is_interruption_record(task: "asyncio.Future[Any]") -> bool:
+    """Whether *task* ended with an interruption record its provider authored.
+
+    The task must have ended by returning — not cancelled (checked first, as
+    a cancelled future raises on :meth:`~asyncio.Future.exception`), not
+    raising — an :class:`ActionObservation` whose status is ``timeout``,
+    ``cancelled`` or ``error``. Only status names are read.
+    """
+
+    if not task.done() or task.cancelled() or task.exception() is not None:
+        return False
+    observation = task.result()
+    return (
+        isinstance(observation, ActionObservation)
+        and observation.status in _INTERRUPTION_STATUSES
+    )
 
 
 def _consume(task: "asyncio.Future[Any]") -> None:
