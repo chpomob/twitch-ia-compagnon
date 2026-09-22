@@ -13,6 +13,12 @@ Section "scenes": ``modules/stream_control`` — the manifest and settings, the
 reconciliation, the call deadline), its serialization and drain, readiness
 and the ``required`` policy for scenes and polls (R6, R8, R9, R10; AC21,
 AC22, AC23, AC24, AC29, AC41).
+
+Section "websocket provider": the ``websocket`` scene provider's wire
+protocol against an in-process loopback peer on ``MemoryWebSocketPair`` —
+and once against a real ``aiohttp`` loopback server, for the default
+factory's framing — with every timeout on the injected clock, and its
+supervised reconnection (R6; AC36, AC22).
 """
 
 from __future__ import annotations
@@ -1799,8 +1805,13 @@ def test_validate_settings_accepts_the_declared_defaults() -> None:
 async def test_the_password_appears_in_no_trace_or_diagnostic() -> None:
     """AC24: the declared credential is redacted by the loader and never
     appears in a trace, an observation or a diagnostic — a ``websocket``
-    provider with no protocol in this step (unreachable, degraded) and a
-    scripted provider serving a call, both configured with the password."""
+    provider whose dial is refused (unreachable, degraded; R6 names the
+    protocol, so the dial goes through the injected factory rather than the
+    network) and a scripted provider serving a call, both configured with
+    the password."""
+
+    async def refused(url: str) -> Any:
+        raise ConnectionRefusedError("connection refused")
 
     clock = ManualClock(SCENE_START)
     context, loader, activations = await loaded_stream_control(
@@ -1808,6 +1819,7 @@ async def test_the_password_appears_in_no_trace_or_diagnostic() -> None:
         clock,
         kind="websocket",
         provider_fields={"url": LOOPBACK_URL, "password": SCENE_PASSWORD},
+        _websocket_factory=refused,
     )
     assert loader.redacted_credentials == 1
     (activation,) = activations
@@ -2183,3 +2195,738 @@ def test_no_lead_or_margin_exists_in_stream_control() -> None:
     manifest = yaml.safe_load(STREAM_CONTROL_MANIFEST.read_text(encoding="utf-8"))
     for name in keys(manifest["settings_schema"]):
         assert not re.search(r"lead|margin|early_stop", name), name
+
+
+# --------------------------------------------------------------------------- #
+# Websocket provider (R6; AC36, AC22)
+# --------------------------------------------------------------------------- #
+
+import json  # noqa: E402
+import socket  # noqa: E402
+
+from aiohttp import web  # noqa: E402
+
+from conftest import MemoryWebSocketPair, WSMsgType  # noqa: E402
+from modules.stream_control import (  # noqa: E402
+    REQUEST_CURRENT_SCENE,
+    REQUEST_LIST_SCENES,
+    REQUEST_SET_SCENE,
+    WebSocketSceneProvider,
+)
+
+
+WS_PASSWORD = "secret"
+WS_CHALLENGE = {"challenge": "abc", "salt": "xyz"}
+#: base64(sha256(base64(sha256("secret" + "xyz")) + "abc")) — AC36's value.
+WS_AUTHENTICATION = "REWw9R5R6WPBVKaASURdjK10mBqyNuldXAaq+k6jOaI="
+WS_CONNECT_TIMEOUT = 5.0
+WS_REQUEST_TIMEOUT = 5.0
+
+
+class ScenePeer:
+    """An in-process peer speaking the R6 wire protocol on ``MemoryWebSocketPair``.
+
+    ``factory`` is the provider's ``websocket_factory``: each dial pops the
+    next *handshakes* entry (``ok`` past the list) — ``ok``; ``refuse`` (the
+    dial raises); ``close-4009`` (closes with 4009 after ``Identify``);
+    ``rpc-2`` (``Identified {negotiatedRpcVersion: 2}``); ``silent`` (never
+    answers ``Identify``). Each request pops the next *answers* entry of its
+    type (answered normally past the list): ``silent`` (never answered),
+    ``apply-silent`` (a set applied, never answered), ``drop`` (the
+    connection is lost instead), ``("close", code)``, or an ``int`` status
+    code (``result: false`` with the comment ``boom``).
+    """
+
+    def __init__(
+        self,
+        *,
+        scenes: Sequence[str] = ("Talking", "Gaming"),
+        current: str = "Gaming",
+        authentication: dict[str, str] | None = None,
+        handshakes: Sequence[str] = (),
+        answers: dict[str, list[Any]] | None = None,
+    ) -> None:
+        self.scenes = list(scenes)
+        self.current = current
+        self.authentication = authentication
+        self.handshakes = list(handshakes)
+        self.answers = {name: list(items) for name, items in (answers or {}).items()}
+        self.dials = 0
+        self.urls: list[str] = []
+        self.pairs: list[MemoryWebSocketPair] = []
+        self.identifies: list[dict[str, Any]] = []
+        self.requests: list[dict[str, Any]] = []
+        self.responses: list[dict[str, Any]] = []
+        self._serving: list[asyncio.Future[None]] = []
+
+    async def factory(self, url: str) -> Any:
+        self.dials += 1
+        self.urls.append(url)
+        mode = self.handshakes.pop(0) if self.handshakes else "ok"
+        if mode == "refuse":
+            raise ConnectionRefusedError("connection refused")
+        pair = MemoryWebSocketPair()
+        self.pairs.append(pair)
+        self._serving.append(asyncio.ensure_future(self._serve(pair, mode)))
+        return pair.client
+
+    def requested(self, request_type: str | None = None) -> list[dict[str, Any]]:
+        return [r for r in self.requests if request_type in (None, r["requestType"])]
+
+    def request_types(self) -> list[str]:
+        return [r["requestType"] for r in self.requests]
+
+    def frames_sent_by_the_module(self) -> list[str]:
+        return [message.data for pair in self.pairs for message in pair.client.sent]
+
+    def every_frame(self) -> list[str]:
+        return [
+            str(message.data) for pair in self.pairs for end in pair.ends for message in end.sent
+        ]
+
+    async def stop(self) -> None:
+        for task in self._serving:
+            task.cancel()
+        if self._serving:
+            await asyncio.wait(self._serving)
+
+    @staticmethod
+    async def _next(end: Any) -> dict[str, Any] | None:
+        message = await end.receive()
+        if message.type is not WSMsgType.TEXT:
+            return None
+        return json.loads(message.data)
+
+    async def _serve(self, pair: MemoryWebSocketPair, mode: str) -> None:
+        server = pair.server
+        hello: dict[str, Any] = {"rpcVersion": 1}
+        if self.authentication is not None:
+            hello["authentication"] = dict(self.authentication)
+        await server.send_str(json.dumps({"op": 0, "d": hello}))
+        identify = await self._next(server)
+        if identify is None:
+            return
+        self.identifies.append(identify)
+        if mode == "close-4009":
+            await server.close(code=4009)
+            return
+        if mode == "silent":
+            await self._next(server)
+            return
+        version = 2 if mode == "rpc-2" else 1
+        await server.send_str(json.dumps({"op": 2, "d": {"negotiatedRpcVersion": version}}))
+        while True:
+            frame = await self._next(server)
+            if frame is None:
+                return
+            if frame.get("op") != 6:
+                continue
+            request = frame["d"]
+            self.requests.append(request)
+            queue = self.answers.get(request["requestType"], [])
+            action = queue.pop(0) if queue else "ok"
+            if action == "silent":
+                continue
+            if action == "drop":
+                pair.drop()
+                return
+            if isinstance(action, tuple):
+                await server.close(code=action[1])
+                return
+            response = self._answer(request, action)
+            if response is None:
+                continue
+            self.responses.append(response)
+            await server.send_str(json.dumps({"op": 7, "d": response}))
+
+    def _answer(self, request: dict[str, Any], action: Any) -> dict[str, Any] | None:
+        response: dict[str, Any] = {
+            "requestType": request["requestType"],
+            "requestId": request["requestId"],
+            "requestStatus": {"result": True, "code": 100},
+        }
+        if isinstance(action, int):
+            response["requestStatus"] = {"result": False, "code": action, "comment": "boom"}
+            return response
+        kind = request["requestType"]
+        if kind == REQUEST_LIST_SCENES:
+            scenes = [{"sceneName": name, "sceneIndex": i} for i, name in enumerate(self.scenes)]
+            response["responseData"] = {"scenes": scenes}
+        elif kind == REQUEST_CURRENT_SCENE:
+            response["responseData"] = {
+                "currentProgramSceneName": self.current,
+                "sceneName": self.current,
+            }
+        elif kind == REQUEST_SET_SCENE:
+            name = request["requestData"]["sceneName"]
+            if name not in self.scenes:
+                response["requestStatus"] = {"result": False, "code": 600, "comment": "no"}
+                return response
+            self.current = name
+            if action == "apply-silent":
+                return None
+        else:
+            response["requestStatus"] = {"result": False, "code": 204}
+        return response
+
+
+class ScriptedRandom:
+    """The injected random source: answers *values* in order, records draws."""
+
+    def __init__(self, values: Sequence[float]) -> None:
+        self.values = list(values)
+        self.draws: list[float] = []
+
+    def random(self) -> float:
+        value = self.values.pop(0)
+        self.draws.append(value)
+        return value
+
+
+async def websocket_harness(
+    peer: ScenePeer,
+    *,
+    prepare: bool = True,
+    rng: Any = None,
+    url: str = LOOPBACK_URL,
+    factory: bool = True,
+    provider_fields: dict[str, Any] | None = None,
+    websocket_factory: Any = None,
+) -> SceneHarness:
+    clock = ManualClock(SCENE_START)
+    runtime = runtime_context(clock=clock, rng=rng)
+    context = runtime.for_module(STREAM_CONTROL)
+    extra: dict[str, Any] = (
+        {"_websocket_factory": websocket_factory or peer.factory} if factory else {}
+    )
+    settings = scene_settings(
+        None,
+        clock,
+        kind="websocket",
+        provider_fields={"url": url, "password": WS_PASSWORD, **(provider_fields or {})},
+        **extra,
+    )
+    handle = await activate_stream_control(context, settings, {})
+    if prepare:
+        await handle.prepare()
+    grant_scene(runtime)
+    return SceneHarness(context, handle, peer, clock)
+
+
+async def close_websocket(h: SceneHarness) -> None:
+    await h.handle.close()
+    await h.provider.stop()
+
+
+def ready_events(h: SceneHarness) -> list[dict[str, Any]]:
+    return [event["payload"] for event in events_of(h.runtime.bus, "module.ready")]
+
+
+# -- AC36: the handshake ---------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_identify_carries_the_derived_authentication_and_never_the_password() -> None:
+    """AC36: ``Hello`` with ``authentication {challenge: abc, salt: xyz}``
+    and password ``secret`` → exactly one ``Identify`` with ``rpcVersion:
+    1``, ``eventSubscriptions: 0`` and the derived string; the password is in
+    0 frames and 0 traces; the prepare probe is exactly 1 ``GetSceneList``
+    and the action is bound and ready."""
+
+    peer = ScenePeer(authentication=WS_CHALLENGE)
+    h = await websocket_harness(peer)
+    try:
+        assert peer.identifies == [
+            {
+                "op": 1,
+                "d": {
+                    "rpcVersion": 1,
+                    "eventSubscriptions": 0,
+                    "authentication": WS_AUTHENTICATION,
+                },
+            }
+        ]
+        assert peer.dials == 1 and peer.urls == [LOOPBACK_URL]
+        assert peer.request_types() == [REQUEST_LIST_SCENES]
+        assert "requestData" not in peer.requests[0]
+        assert SCENE_ACTION in h.runtime.actions.registered_ready()
+        assert h.degraded() == []
+        frames = peer.every_frame()
+        assert frames and not any(WS_PASSWORD in frame for frame in frames)
+        assert not any(WS_PASSWORD in text for text in trace_texts(h.runtime.bus))
+        assert WS_PASSWORD not in repr(h.handle._provider)
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+async def test_a_hello_without_authentication_gets_an_identify_without_it() -> None:
+    """AC36: no ``authentication`` in ``Hello`` → none in ``Identify``."""
+
+    peer = ScenePeer()
+    h = await websocket_harness(peer)
+    try:
+        assert peer.identifies == [{"op": 1, "d": {"rpcVersion": 1, "eventSubscriptions": 0}}]
+        assert peer.request_types() == [REQUEST_LIST_SCENES]
+        assert SCENE_ACTION in h.runtime.actions.registered_ready()
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handshake", ["close-4009", "rpc-2", "silent"])
+async def test_a_failed_handshake_leaves_the_action_unbound_at_prepare(handshake: str) -> None:
+    """AC36/AC29: a close 4009 after ``Identify``, ``Identified
+    {negotiatedRpcVersion: 2}`` or no ``Identified`` within
+    ``connect_timeout_seconds`` (on the clock) → the action unbound at
+    prepare, one value-free ``module.degraded`` naming it, no request sent,
+    the socket closed and no reconnection dialed."""
+
+    peer = ScenePeer(handshakes=[handshake])
+    h = await websocket_harness(peer, prepare=False)
+    try:
+        prepare = asyncio.ensure_future(h.handle.prepare())
+        await wait_until(lambda: len(peer.identifies) == 1)
+        if handshake == "silent":
+            h.clock.advance(WS_CONNECT_TIMEOUT - 0.5)
+            await settle()
+            assert not prepare.done()
+            h.clock.advance(0.5)
+        await finished(prepare)
+
+        assert SCENE_ACTION not in h.runtime.actions.registered_ready()
+        assert SCENE_ACTION in h.runtime.actions.discovered()
+        (degraded,) = h.degraded()
+        assert degraded["capabilities"] == [SCENE_ACTION]
+        assert_reason_value_free(degraded["reason"])
+        assert peer.requests == []
+        await wait_until(lambda: peer.pairs[0].client.closed)
+
+        h.clock.advance(120.0)
+        await settle()
+        assert peer.dials == 1
+
+        observation = await h.set("Talking")
+        assert_scene_failure(observation, "refused", ERROR_PROVIDER_NOT_READY)
+    finally:
+        await close_websocket(h)
+
+
+# -- AC36: the three requests ------------------------------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_a_scene_change_is_one_set_then_one_read_back_each_on_its_own_request_id() -> None:
+    """AC36: ``stream.scene.set {scene: Talking}`` → exactly 1
+    ``SetCurrentProgramScene {sceneName: Talking}`` followed by exactly 1
+    ``GetCurrentProgramScene``, each answered on its own ``requestId``;
+    ``success`` when the read-back names ``Talking``. The reader task is the
+    provider's own, not a supervised task the shutdown drain would wait on."""
+
+    peer = ScenePeer()
+    h = await websocket_harness(peer)
+    try:
+        assert h.context.tasks.active == 0
+        observation = await h.set("Talking")
+
+        assert observation.status == "success", observation
+        assert observation.result["scene"] == "Talking"
+        assert observation.result["previous_scene"] == "Gaming"
+        assert observation.result["reconciled"] is False
+        after_probe = peer.requests[1:]
+        (set_request,) = [r for r in after_probe if r["requestType"] == REQUEST_SET_SCENE]
+        assert set_request["requestData"] == {"sceneName": "Talking"}
+        following = after_probe[after_probe.index(set_request) + 1 :]
+        assert [r["requestType"] for r in following] == [REQUEST_CURRENT_SCENE]
+        ids = [r["requestId"] for r in peer.requests]
+        assert len(set(ids)) == len(ids)
+        assert [r["requestId"] for r in peer.responses] == ids
+        assert h.context.tasks.active == 0
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+async def test_status_600_on_the_set_is_scene_unknown_with_no_read_back() -> None:
+    """AC36: ``requestStatus {result: false, code: 600}`` → ``error
+    scene_unknown`` and 0 read-back after the set command."""
+
+    peer = ScenePeer(answers={REQUEST_SET_SCENE: [600]})
+    h = await websocket_harness(peer)
+    try:
+        observation = await h.set("Talking")
+
+        assert_scene_failure(observation, "error", ERROR_SCENE_UNKNOWN)
+        assert peer.request_types()[-1] == REQUEST_SET_SCENE
+        assert len(peer.requested(REQUEST_SET_SCENE)) == 1
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+async def test_another_status_on_the_set_carries_its_code_and_never_the_comment() -> None:
+    """AC36: ``{result: false, code: 207, comment: "boom"}`` → ``error
+    scene_not_applied`` whose message contains ``207`` and not ``boom``."""
+
+    peer = ScenePeer(answers={REQUEST_SET_SCENE: [207]})
+    h = await websocket_harness(peer)
+    try:
+        observation = await h.set("Talking")
+
+        error = assert_scene_failure(observation, "error", ERROR_SCENE_NOT_APPLIED)
+        assert "207" in error["message"]
+        assert "boom" not in error["message"] and "boom" not in repr(observation)
+        assert not any("boom" in text for text in trace_texts(h.runtime.bus))
+        assert len(peer.requested(REQUEST_SET_SCENE)) == 1
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("applied", "status"), [(True, "success"), (False, "external_unknown")])
+async def test_a_set_unanswered_within_the_request_timeout_gets_one_reconciliation_read(
+    applied: bool, status: str
+) -> None:
+    """AC36/AC22: the peer never answers the set command; at
+    ``request_timeout_seconds`` on the clock (not before) exactly 1
+    reconciliation ``GetCurrentProgramScene`` follows — naming ``Talking`` →
+    ``success reconciled: true``, else ``external_unknown`` cause
+    ``confirmation_lost`` — and the set command count stays 1."""
+
+    peer = ScenePeer(answers={REQUEST_SET_SCENE: ["apply-silent" if applied else "silent"]})
+    h = await websocket_harness(peer)
+    try:
+        call = h.start("Talking")
+        await wait_until(lambda: len(peer.requested(REQUEST_SET_SCENE)) == 1)
+        assert h.context.tasks.active == 0  # the reader is the provider's own
+        requests = len(peer.requests)
+
+        h.clock.advance(WS_REQUEST_TIMEOUT - 0.5)
+        await settle()
+        assert not call.done() and len(peer.requests) == requests
+
+        h.clock.advance(0.5)
+        observation = await finished(call)
+
+        assert peer.request_types()[requests:] == [REQUEST_CURRENT_SCENE]
+        assert len(peer.requested(REQUEST_SET_SCENE)) == 1
+        assert observation.status == status, observation
+        if applied:
+            assert observation.result["reconciled"] is True
+        else:
+            assert observation.error["cause"] == CAUSE_CONFIRMATION_LOST
+    finally:
+        await close_websocket(h)
+
+
+# -- AC36/AC22: a connection lost after readiness, supervised reconnection -- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["drop", 4009])
+async def test_a_connection_lost_after_readiness_is_provider_unavailable(loss: Any) -> None:
+    """AC36/AC22: after readiness the peer drops the socket (or closes it
+    with 4009) while the call's request is pending → the pending request
+    fails at once, the call ends ``error provider_unavailable`` with 0 set
+    commands, one ``module.degraded`` names the action and it leaves the
+    ready view; the next call is refused before the provider."""
+
+    action = "drop" if loss == "drop" else ("close", loss)
+    peer = ScenePeer(answers={REQUEST_CURRENT_SCENE: [action]})
+    h = await websocket_harness(peer)
+    try:
+        assert SCENE_ACTION in h.runtime.actions.registered_ready()
+        observation = await h.set("Talking")
+
+        assert_scene_failure(observation, "error", ERROR_PROVIDER_UNAVAILABLE)
+        assert peer.requested(REQUEST_SET_SCENE) == []
+        (degraded,) = h.degraded()
+        assert degraded["capabilities"] == [SCENE_ACTION]
+        assert_reason_value_free(degraded["reason"])
+        assert SCENE_ACTION not in h.runtime.actions.registered_ready()
+
+        again = await h.set("Talking")
+        assert_scene_failure(again, "refused", ERROR_PROVIDER_NOT_READY)
+        assert len(h.degraded()) == 1
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+async def test_a_connection_lost_while_idle_degrades_and_reconnects_without_a_call() -> None:
+    """AC22 (review A1): the peer drops the socket while no request is
+    pending → the provider notices at once: one ``module.degraded`` names the
+    action, it leaves the ready view and the reconnection loop dials after
+    its delay; readiness comes back and a call succeeds, all without any call
+    having found the socket gone."""
+
+    peer = ScenePeer()
+    h = await websocket_harness(peer, rng=ScriptedRandom([0.5] * 4))
+    try:
+        assert h.context.tasks.active == 0
+        peer.pairs[0].drop()
+
+        await wait_until(lambda: len(h.degraded()) == 1)
+        (degraded,) = h.degraded()
+        assert degraded["capabilities"] == [SCENE_ACTION]
+        assert SCENE_ACTION not in h.runtime.actions.registered_ready()
+        await wait_until(lambda: h.context.tasks.active == 1)  # the reconnection loop
+
+        h.clock.advance(0.5)
+        await wait_until(lambda: len(ready_events(h)) == 1)
+        assert peer.dials == 2
+        assert SCENE_ACTION in h.runtime.actions.registered_ready()
+        observation = await h.set("Talking")
+        assert observation.status == "success", observation
+    finally:
+        await close_websocket(h)
+
+
+class _StalledSetSend:
+    """A client end whose ``SetCurrentProgramScene`` send never completes."""
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+        self.stalled = 0
+
+    async def receive(self) -> Any:
+        return await self._ws.receive()
+
+    async def send_str(self, data: str) -> None:
+        if REQUEST_SET_SCENE in data:
+            self.stalled += 1
+            await asyncio.Event().wait()
+        await self._ws.send_str(data)
+
+    async def close(self, **kwargs: Any) -> bool:
+        return await self._ws.close(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_set_whose_send_stalls_is_bounded_by_the_request_timeout() -> None:
+    """Review A3: the set command's send never completes (transport
+    backpressure) → at ``request_timeout_seconds`` on the clock (not before)
+    the request is a lost answer and exactly 1 reconciliation
+    ``GetCurrentProgramScene`` follows, within the call's deadline."""
+
+    peer = ScenePeer()
+    ends: list[_StalledSetSend] = []
+
+    async def factory(url: str) -> Any:
+        ends.append(_StalledSetSend(await peer.factory(url)))
+        return ends[-1]
+
+    h = await websocket_harness(peer, websocket_factory=factory)
+    try:
+        call = h.start("Talking")
+        await wait_until(lambda: ends[0].stalled == 1)
+        requests = len(peer.requests)
+
+        h.clock.advance(WS_REQUEST_TIMEOUT - 0.5)
+        await settle()
+        assert not call.done() and len(peer.requests) == requests
+
+        h.clock.advance(0.5)
+        observation = await finished(call)
+
+        assert peer.request_types()[requests:] == [REQUEST_CURRENT_SCENE]
+        assert peer.requested(REQUEST_SET_SCENE) == []
+        assert observation.status == "external_unknown", observation
+        assert observation.error["cause"] == CAUSE_CONFIRMATION_LOST
+    finally:
+        await close_websocket(h)
+
+
+class _RefusingTasks:
+    """A task registry already closed: every spawn is refused."""
+
+    def spawn(self, coro: Any, *, name: str) -> Any:
+        coro.close()
+        raise RuntimeError(f"{name}: the registry is closed")
+
+
+@pytest.mark.asyncio
+async def test_a_lost_socket_is_closed_when_no_reconnection_can_be_spawned() -> None:
+    """Review A2: the socket is lost while the task registry refuses the
+    reconnection loop → the lost socket is still closed, once."""
+
+    peer = ScenePeer()
+    clock = ManualClock(SCENE_START)
+    closes: list[int] = []
+
+    async def factory(url: str) -> Any:
+        ws = await peer.factory(url)
+        close = ws.close
+
+        async def counted_close(**kwargs: Any) -> bool:
+            closes.append(1)
+            return await close(**kwargs)
+
+        ws.close = counted_close
+        return ws
+
+    provider = WebSocketSceneProvider(
+        LOOPBACK_URL,
+        WS_PASSWORD,
+        WS_CONNECT_TIMEOUT,
+        WS_REQUEST_TIMEOUT,
+        websocket_factory=factory,
+        sleeper=clock.sleep,
+        clock=clock,
+        rng=ScriptedRandom([0.5]),
+        tasks=_RefusingTasks(),
+    )
+    try:
+        await provider.connect()
+        peer.pairs[0].drop()
+
+        await wait_until(lambda: not provider.connected)
+        await wait_until(lambda: closes == [1])
+        assert not provider.reconnecting
+    finally:
+        await provider.close()
+        await peer.stop()
+    assert closes == [1]
+
+
+@pytest.mark.asyncio
+async def test_reconnection_backs_off_with_full_jitter_and_restores_readiness() -> None:
+    """AC22: after the socket is lost, reconnection delays drawn on the
+    injected RNG and clock are ``rng × min(30, 1 × 2ⁿ)`` — bases 1, 2, 4, 8,
+    16, then capped at 30 — each attempt dialing exactly when its delay has
+    passed (refused dials and failed handshakes alike count as failures);
+    the first successful reconnection emits ``module.ready`` with the action
+    back in the ready view and a call succeeds again."""
+
+    values = [0.5, 0.25, 0.75, 0.5, 0.5, 0.5, 0.25, 0.75]
+    bases = [1, 2, 4, 8, 16, 30, 30, 30]
+    rng = ScriptedRandom(values)
+    peer = ScenePeer(
+        handshakes=["ok", "refuse", "close-4009", "rpc-2", *["refuse"] * 4, "ok"],
+        answers={REQUEST_CURRENT_SCENE: ["drop"]},
+    )
+    h = await websocket_harness(peer, rng=rng)
+    try:
+        observation = await h.set("Talking")
+        assert_scene_failure(observation, "error", ERROR_PROVIDER_UNAVAILABLE)
+        await wait_until(lambda: len(rng.draws) == 1)
+        assert len(h.degraded()) == 1
+        assert ready_events(h) == []
+
+        for attempt, (value, base) in enumerate(zip(values, bases)):
+            delay = value * base
+            dials = peer.dials
+            h.clock.advance(delay - 0.25)
+            await settle()
+            assert peer.dials == dials, attempt
+            h.clock.advance(0.25)
+            await wait_until(lambda: peer.dials == dials + 1)
+            if attempt < len(values) - 1:
+                await wait_until(lambda: len(rng.draws) == attempt + 2)
+                assert SCENE_ACTION not in h.runtime.actions.registered_ready()
+
+        await wait_until(lambda: len(ready_events(h)) == 1)
+        assert rng.draws == values
+        (ready,) = ready_events(h)
+        assert ready["capabilities"] == [SCENE_ACTION]
+        assert SCENE_ACTION in h.runtime.actions.registered_ready()
+        assert len(h.degraded()) == 1
+
+        observation = await h.set("Talking")
+        assert observation.status == "success", observation
+        assert h.context.tasks.active == 0
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+async def test_close_stops_the_reconnection_loop_and_the_socket() -> None:
+    """R6: ``close`` during a reconnection backoff stops the loop — no dial
+    follows however far the clock moves — and leaves no task running."""
+
+    peer = ScenePeer(answers={REQUEST_CURRENT_SCENE: ["drop"]})
+    h = await websocket_harness(peer, rng=ScriptedRandom([0.5] * 4))
+    try:
+        await h.set("Talking")
+        await wait_until(lambda: h.context.tasks.active == 1)
+        await h.handle.close()
+        assert h.context.tasks.active == 0
+        h.clock.advance(120.0)
+        await settle()
+        assert peer.dials == 1
+        assert all(pair.client.closed for pair in peer.pairs)
+    finally:
+        await close_websocket(h)
+
+
+@pytest.mark.asyncio
+async def test_close_while_connected_closes_the_socket() -> None:
+    peer = ScenePeer()
+    h = await websocket_harness(peer)
+    await close_websocket(h)
+    assert peer.pairs[0].client.closed
+    assert h.context.tasks.active == 0
+
+
+# -- The default factory over a real loopback socket ------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket() -> None:
+    """AC36: without an injected factory the provider dials with ``aiohttp``:
+    a real loopback server receives ``Identify`` (op 1) with the derived
+    authentication and then one ``GetSceneList`` request (op 6) as JSON text
+    frames, answers them, and the action becomes ready. No timer fires: the
+    clock is never advanced."""
+
+    received: list[str] = []
+
+    async def serve(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str(
+            json.dumps({"op": 0, "d": {"rpcVersion": 1, "authentication": WS_CHALLENGE}})
+        )
+        async for message in ws:
+            if message.type is not aiohttp.WSMsgType.TEXT:
+                break
+            received.append(message.data)
+            frame = json.loads(message.data)
+            if frame["op"] == 1:
+                await ws.send_str(json.dumps({"op": 2, "d": {"negotiatedRpcVersion": 1}}))
+            elif frame["op"] == 6:
+                answer = {
+                    "requestType": frame["d"]["requestType"],
+                    "requestId": frame["d"]["requestId"],
+                    "requestStatus": {"result": True, "code": 100},
+                    "responseData": {"scenes": [{"sceneName": "Talking", "sceneIndex": 0}]},
+                }
+                await ws.send_str(json.dumps({"op": 7, "d": answer}))
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/", serve)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    site = web.SockSite(runner, sock)
+    await site.start()
+    peer = ScenePeer()
+    h = await websocket_harness(peer, url=f"ws://127.0.0.1:{port}/", factory=False)
+    try:
+        assert SCENE_ACTION in h.runtime.actions.registered_ready()
+        frames = [json.loads(text) for text in received]
+        assert frames[0] == {
+            "op": 1,
+            "d": {"rpcVersion": 1, "eventSubscriptions": 0, "authentication": WS_AUTHENTICATION},
+        }
+        assert [(f["op"], f["d"]["requestType"]) for f in frames[1:]] == [
+            (6, REQUEST_LIST_SCENES)
+        ]
+        assert not any(WS_PASSWORD in text for text in received)
+        assert peer.dials == 0
+    finally:
+        await h.handle.close()
+        await runner.cleanup()

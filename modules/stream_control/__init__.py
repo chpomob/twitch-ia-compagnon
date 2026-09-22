@@ -13,9 +13,8 @@ the scene and ``{"result": False, "code": <n>}`` for any other refusal; it
 raises when its answer is lost. The ``kind`` of provider is configured:
 ``none`` binds nothing here (the action stays declared, so another module —
 a proxy — may serve it), ``scripted`` takes the provider injected through the
-``_scene_provider`` seam, and ``websocket`` is the network provider (its
-protocol lives in a later step; until then it never answers the ``prepare``
-probe, so the action stays unbound under the ``required`` policy).
+``_scene_provider`` seam, and ``websocket`` is the network provider,
+:class:`WebSocketSceneProvider` (below).
 
 **One scene switch, confirmed or reconciled — never repeated** (R6). A scene
 outside ``scenes.allowed`` is ``refused scene_not_allowed`` with the provider
@@ -63,6 +62,29 @@ none) leaves ``stream.poll.create`` unbound with one ``module.degraded``
 closed. The module is marked ready when at least one action is bound. The
 URL and the password never appear in an observation, an error or a trace.
 
+**The ``websocket`` provider** speaks obs-websocket protocol 5 (RPC version
+1), the protocol the reference streaming software serves, restricted to what
+the boundary needs: the ``Hello`` → ``Identify`` → ``Identified`` handshake
+with ``rpcVersion: 1`` and ``eventSubscriptions: 0`` (the authentication
+string, when ``Hello`` asks for one, is derived from the password, the salt
+and the challenge — the password itself is never sent), and three
+``Request``/``RequestResponse`` pairs matched by ``requestId``:
+``GetSceneList`` (the ``prepare`` probe), ``GetCurrentProgramScene`` and
+``SetCurrentProgramScene``. A handshake that does not reach ``Identified``
+with version 1 within ``connect_timeout_seconds`` — close code 4009, another
+version, silence — is an unreachable provider; an answer missing within
+``request_timeout_seconds`` — sending the request included — is a lost
+answer. A reader task watches the socket from ``Identified`` until the socket
+is lost or ``close``: it dispatches the answers and notices a loss while the
+provider is idle. The provider owns it and ``close`` stops it, so it is not
+one of the module's supervised tasks the shutdown drain would wait on. A lost
+socket fails every pending request at once, marks
+the provider disconnected — the module withdraws readiness
+(``module.degraded``) — and starts a supervised reconnection loop: delays
+``rng() × min(30, 1 × 2ⁿ)`` s on the sleeper, ``module.ready`` and the
+action back in the ready view on the first success. ``close`` stops the loop
+and the socket.
+
 **Seams, for the tests.** ``_scene_provider`` (the ``scripted`` provider),
 ``_sleeper`` (the sleep every bound is raced against, ``asyncio.sleep`` by
 default) and ``_websocket_factory`` (the connection factory of the
@@ -73,9 +95,13 @@ from a configuration file.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import inspect
 import ipaddress
+import json
 import math
+import random
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -583,10 +609,22 @@ class StreamControlModule:
         self._supervision = getattr(context, "supervision", None)
         self._clock: Callable[[], float] = getattr(context, "clock", None) or time.monotonic
         self._settings = settings
-        self._provider = scene_provider
         self._sleeper = sleeper
-        # The connection factory of the ``websocket`` provider, kept for it.
-        self._websocket_factory = websocket_factory
+        if settings.kind == KIND_WEBSOCKET and scene_provider is None:
+            scene_provider = WebSocketSceneProvider(
+                settings.url,
+                settings.password,
+                settings.connect_timeout_seconds,
+                settings.request_timeout_seconds,
+                websocket_factory=websocket_factory or default_websocket_factory,
+                sleeper=sleeper,
+                clock=self._clock,
+                rng=getattr(context, "rng", None) or random.Random(),
+                tasks=getattr(context, "tasks", None),
+                on_disconnected=self._on_provider_lost,
+                on_reconnected=self._on_provider_restored,
+            )
+        self._provider = scene_provider
         self._scene_provider = _SceneActionProvider(self)
         self._slot = _SceneSlot()
         loop = asyncio.get_running_loop()
@@ -748,7 +786,7 @@ class StreamControlModule:
         if provider is None:
             return False
         bound = self._settings.connect_timeout_seconds + self._settings.request_timeout_seconds
-        task = asyncio.ensure_future(provider.list_scenes())
+        task = asyncio.ensure_future(_probe_request(provider))
         timer = asyncio.ensure_future(self._sleeper(bound))
         try:
             await asyncio.wait({task, timer}, return_when=asyncio.FIRST_COMPLETED)
@@ -780,13 +818,39 @@ class StreamControlModule:
             return
 
     async def _withdraw_readiness(self) -> None:
-        """The provider is gone: withdraw readiness and say so, once."""
+        """The provider is gone: withdraw readiness and say so, once per loss."""
 
         if self._withdrawn:
             return
         self._withdrawn = True
         self._actions.mark_not_ready()
         await self._report_degraded(REASON_SCENE_PROVIDER_DISCONNECTED, [SCENE_ACTION])
+
+    async def _on_provider_lost(self) -> None:
+        """The provider's socket was lost: withdraw readiness at once."""
+
+        if self._closed or not self._scene_bound:
+            return
+        await self._withdraw_readiness()
+
+    async def _on_provider_restored(self) -> None:
+        """A supervised reconnection succeeded: the action is ready again."""
+
+        if self._closed or not self._scene_bound:
+            return
+        self._withdrawn = False
+        self._actions.mark_ready()
+        ready = getattr(self._supervision, "ready", None)
+        if not callable(ready):
+            return
+        try:
+            outcome = ready(capabilities=[SCENE_ACTION])
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a health report must not fail the loop
+            return
 
     # -- stream.scene.set (R6, AC21–AC23) ------------------------------------ #
 
@@ -1011,6 +1075,15 @@ class StreamControlModule:
         return _Claim(slot)
 
 
+async def _probe_request(provider: Any) -> Any:
+    """Connect a provider that dials (the ``websocket`` kind), then list its scenes."""
+
+    connect = getattr(provider, "connect", None)
+    if callable(connect):
+        await connect()
+    return await provider.list_scenes()
+
+
 def _set_answer(answer: Any) -> bool | int | None:
     """``True`` when applied, the numeric status when refused, ``None`` when lost."""
 
@@ -1127,6 +1200,481 @@ def _failure_observation(provenance: Mapping[str, Any], failure: _CallFailure) -
 
 
 # --------------------------------------------------------------------------- #
+# The ``websocket`` scene provider (R6, AC36, AC22)
+# --------------------------------------------------------------------------- #
+
+# Protocol 5 opcodes and the one RPC version this provider speaks.
+_OP_HELLO = 0
+_OP_IDENTIFY = 1
+_OP_IDENTIFIED = 2
+_OP_REQUEST = 6
+_OP_REQUEST_RESPONSE = 7
+RPC_VERSION = 1
+#: The close code of a refused authentication: an unreachable provider.
+CLOSE_AUTHENTICATION_FAILED = 4009
+
+REQUEST_LIST_SCENES = "GetSceneList"
+REQUEST_CURRENT_SCENE = "GetCurrentProgramScene"
+REQUEST_SET_SCENE = "SetCurrentProgramScene"
+
+#: Supervised reconnection: initial delay, multiplier, cap (full jitter).
+RECONNECT_INITIAL_SECONDS = 1.0
+RECONNECT_MULTIPLIER = 2.0
+RECONNECT_MAX_SECONDS = 30.0
+
+# The frame types that end a connection, compared by name so importing this
+# module never imports the websocket library.
+_WS_TERMINAL = frozenset({"CLOSE", "CLOSING", "CLOSED", "ERROR"})
+
+Notify = Callable[[], Awaitable[Any]]
+
+
+class SceneProviderUnavailable(ConnectionError):
+    """The provider is not connected, or the connection was lost."""
+
+
+class SceneRequestTimeout(TimeoutError):
+    """A request's answer did not arrive within ``request_timeout_seconds``."""
+
+
+class SceneRequestFailed(RuntimeError):
+    """A read answered with an unsuccessful status; carries its code only."""
+
+    def __init__(self, request_type: str, code: Any) -> None:
+        super().__init__(f"{request_type} answered with status {code}")
+        self.code = code
+
+
+def authentication_string(password: str, salt: str, challenge: str) -> str:
+    """``base64(sha256(base64(sha256(password + salt)) + challenge))``."""
+
+    secret = base64.b64encode(hashlib.sha256((password + salt).encode("utf-8")).digest())
+    digest = hashlib.sha256(secret + challenge.encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+class WebSocketSceneProvider:
+    """The scene provider over obs-websocket protocol 5 (RPC version 1).
+
+    Nothing is dialed at construction: :meth:`connect` opens the socket
+    through *websocket_factory* and runs the handshake, bounded by
+    *connect_timeout* on the *sleeper*. Each request is bounded by
+    *request_timeout*. *on_disconnected* is awaited once when an identified
+    connection is lost, before the reconnection loop draws its first delay;
+    *on_reconnected* once when a reconnection succeeded. The URL and the
+    password appear in no error, no frame and no trace.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        password: str,
+        connect_timeout: float,
+        request_timeout: float,
+        *,
+        websocket_factory: Callable[[str], Any],
+        sleeper: Sleeper,
+        clock: Callable[[], float],
+        rng: Any,
+        tasks: Any = None,
+        on_disconnected: Notify | None = None,
+        on_reconnected: Notify | None = None,
+    ) -> None:
+        self._url = url
+        self._password = password
+        self._connect_timeout = float(connect_timeout)
+        self._request_timeout = float(request_timeout)
+        self._factory = websocket_factory
+        self._sleeper = sleeper
+        self._clock = clock
+        self._rng = rng
+        self._tasks = tasks
+        self.on_disconnected = on_disconnected
+        self.on_reconnected = on_reconnected
+        self._ws: Any = None
+        self._connected = False
+        self._closing = False
+        self._sequence = 0
+        self._pending: dict[str, asyncio.Future[Mapping[str, Any]]] = {}
+        self._reader: asyncio.Future[Any] | None = None
+        self._reconnect: asyncio.Future[Any] | None = None
+        # Lost sockets whose close runs detached, awaited by ``close``.
+        self._closing_sockets: set[asyncio.Future[Any]] = set()
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(connected={self._connected})"
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def reconnecting(self) -> bool:
+        return self._reconnect is not None and not self._reconnect.done()
+
+    # -- the handshake ------------------------------------------------------ #
+
+    async def connect(self) -> None:
+        """Open the socket and reach ``Identified``, within ``connect_timeout``."""
+
+        if self._connected:
+            return
+        if self._closing:
+            raise SceneProviderUnavailable("the scene provider is closed")
+        attempt = asyncio.ensure_future(self._open_and_identify())
+        timer = asyncio.ensure_future(self._sleeper(self._connect_timeout))
+        try:
+            await asyncio.wait({attempt, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            _abandon(timer)
+            if not attempt.done():
+                _abandon(attempt)
+        if not attempt.done():
+            raise SceneProviderUnavailable("the scene provider did not identify in time")
+        if attempt.cancelled() or attempt.exception() is not None:
+            raise SceneProviderUnavailable("the scene provider refused the connection")
+        ws = attempt.result()
+        if self._closing:
+            await _close_socket(ws)
+            raise SceneProviderUnavailable("the scene provider is closed")
+        self._ws = ws
+        self._connected = True
+        self._start_reader(ws)
+
+    async def _open_and_identify(self) -> Any:
+        created = self._factory(self._url)
+        ws = await created if inspect.isawaitable(created) else created
+        try:
+            hello = await _receive_frame(ws)
+            if hello.get("op") != _OP_HELLO:
+                raise SceneProviderUnavailable("the scene provider did not say hello")
+            data = hello.get("d") if isinstance(hello.get("d"), Mapping) else {}
+            identify: dict[str, Any] = {"rpcVersion": RPC_VERSION, "eventSubscriptions": 0}
+            challenge = data.get("authentication")
+            if isinstance(challenge, Mapping):
+                identify["authentication"] = authentication_string(
+                    self._password,
+                    str(challenge.get("salt", "")),
+                    str(challenge.get("challenge", "")),
+                )
+            await ws.send_str(json.dumps({"op": _OP_IDENTIFY, "d": identify}))
+            identified = await _receive_frame(ws)
+            answer = identified.get("d") if isinstance(identified.get("d"), Mapping) else {}
+            if (
+                identified.get("op") != _OP_IDENTIFIED
+                or answer.get("negotiatedRpcVersion") != RPC_VERSION
+            ):
+                raise SceneProviderUnavailable("the scene provider did not identify")
+        except BaseException:
+            await _close_socket(ws)
+            raise
+        return ws
+
+    # -- the boundary ------------------------------------------------------- #
+
+    async def list_scenes(self) -> list[str]:
+        data = await self._read(REQUEST_LIST_SCENES)
+        scenes = data.get("scenes")
+        if isinstance(scenes, str) or not isinstance(scenes, Sequence):
+            raise SceneRequestFailed(REQUEST_LIST_SCENES, "malformed")
+        return [
+            str(scene["sceneName"])
+            for scene in scenes
+            if isinstance(scene, Mapping) and isinstance(scene.get("sceneName"), str)
+        ]
+
+    async def current_scene(self) -> str:
+        data = await self._read(REQUEST_CURRENT_SCENE)
+        for key in ("currentProgramSceneName", "sceneName"):
+            if isinstance(data.get(key), str):
+                return data[key]
+        raise SceneRequestFailed(REQUEST_CURRENT_SCENE, "malformed")
+
+    async def set_scene(self, name: str) -> Mapping[str, Any]:
+        """``{"result": True}`` or ``{"result": False, "code": n}`` — never the comment."""
+
+        response = await self._request(REQUEST_SET_SCENE, {"sceneName": name})
+        status = response.get("requestStatus")
+        if isinstance(status, Mapping):
+            if status.get("result") is True:
+                return {"result": True}
+            code = status.get("code")
+            refused = status.get("result") is False
+            if refused and isinstance(code, int) and not isinstance(code, bool):
+                return {"result": False, "code": code}
+        raise SceneRequestFailed(REQUEST_SET_SCENE, "malformed")
+
+    async def _read(self, request_type: str) -> Mapping[str, Any]:
+        response = await self._request(request_type)
+        status = response.get("requestStatus")
+        if not isinstance(status, Mapping) or status.get("result") is not True:
+            code = status.get("code") if isinstance(status, Mapping) else "malformed"
+            raise SceneRequestFailed(request_type, code)
+        data = response.get("responseData")
+        return data if isinstance(data, Mapping) else {}
+
+    async def _request(
+        self, request_type: str, data: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]:
+        """One ``Request``, its ``RequestResponse`` matched by ``requestId``.
+
+        Sending and answering are raced against one ``request_timeout``: a
+        send stalled under backpressure is a lost answer like a silent peer.
+        """
+
+        ws = self._ws
+        if not self._connected or ws is None:
+            raise SceneProviderUnavailable("the scene provider is not connected")
+        self._sequence += 1
+        request_id = f"scene-{self._sequence}"
+        answer: asyncio.Future[Mapping[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = answer
+        request: dict[str, Any] = {"requestType": request_type, "requestId": request_id}
+        if data is not None:
+            request["requestData"] = dict(data)
+        sending = asyncio.ensure_future(ws.send_str(json.dumps({"op": _OP_REQUEST, "d": request})))
+        timer = asyncio.ensure_future(self._sleeper(self._request_timeout))
+        try:
+            waiting: set[asyncio.Future[Any]] = {sending, answer, timer}
+            while not answer.done() and not timer.done():
+                await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                if sending in waiting and sending.done():
+                    waiting.discard(sending)
+                    if sending.cancelled() or sending.exception() is not None:
+                        self._lost(ws)
+                        raise SceneProviderUnavailable(
+                            "the scene provider connection was lost"
+                        ) from None
+            if not answer.done():
+                raise SceneRequestTimeout(f"{request_type} was not answered in time")
+            return answer.result()
+        finally:
+            _abandon(timer)
+            if not sending.done():
+                _abandon(sending)
+            else:
+                _consume(sending)
+            self._pending.pop(request_id, None)
+            if not answer.done():
+                answer.cancel()
+
+    # -- the reader --------------------------------------------------------- #
+
+    def _start_reader(self, ws: Any) -> None:
+        """Watch *ws* until it is lost or the provider closes.
+
+        Not a supervised task on purpose: the coordinator drains supervised
+        tasks before the module drain hooks, and an idle watcher would make
+        every shutdown wait out the whole drain budget. ``close`` stops it.
+        """
+
+        reader = asyncio.ensure_future(self._read_frames(ws))
+        reader.add_done_callback(_consume)
+        self._reader = reader
+
+    async def _read_frames(self, ws: Any) -> None:
+        """Dispatch answers until the socket ends or the provider closes."""
+
+        try:
+            while True:
+                message = await ws.receive()
+                kind = getattr(getattr(message, "type", None), "name", None)
+                if kind in _WS_TERMINAL:
+                    break
+                if kind != "TEXT":
+                    continue
+                self._dispatch(message.data)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a failing socket is a lost one
+            pass
+        self._lost(ws)
+
+    def _dispatch(self, text: Any) -> None:
+        try:
+            frame = json.loads(text)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(frame, Mapping) or frame.get("op") != _OP_REQUEST_RESPONSE:
+            return
+        data = frame.get("d")
+        if not isinstance(data, Mapping):
+            return
+        answer = self._pending.get(data.get("requestId"))  # type: ignore[arg-type]
+        if answer is not None and not answer.done():
+            answer.set_result(data)
+
+    # -- loss and reconnection ---------------------------------------------- #
+
+    def _lost(self, ws: Any) -> None:
+        """The socket *ws* is gone: fail every pending request, reconnect."""
+
+        if ws is not self._ws:
+            return
+        self._ws = None
+        self._connected = False
+        self._fail_pending()
+        if self._reader is not None and self._reader is not asyncio.current_task():
+            self._reader.cancel()
+        self._reader = None
+        if self._closing:
+            self._close_later(ws)
+            return
+        try:
+            self._reconnect = self._spawn(self._reconnect_forever(ws), "scene-provider-reconnect")
+        except Exception:  # noqa: BLE001 - a closed task registry: no reconnection
+            self._close_later(ws)
+
+    def _close_later(self, ws: Any) -> None:
+        """Close *ws* detached; ``close`` waits for it."""
+
+        closing = asyncio.ensure_future(_close_socket(ws))
+        self._closing_sockets.add(closing)
+        closing.add_done_callback(self._closing_sockets.discard)
+
+    def _fail_pending(self) -> None:
+        pending, self._pending = self._pending, {}
+        for answer in pending.values():
+            if not answer.done():
+                answer.set_exception(
+                    SceneProviderUnavailable("the scene provider connection was lost")
+                )
+                # A request already given up on must not log an unread error.
+                answer.add_done_callback(_consume)
+
+    async def _reconnect_forever(self, lost: Any) -> None:
+        """Retry with full-jitter backoff until connected or closed."""
+
+        await _close_socket(lost)
+        await _notify(self.on_disconnected)
+        attempt = 0
+        while not self._closing:
+            await self._sleeper(self.reconnect_delay(attempt))
+            attempt += 1
+            if self._closing:
+                return
+            try:
+                await self.connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the next attempt follows its delay
+                continue
+            await _notify(self.on_reconnected)
+            return
+
+    def reconnect_delay(self, attempt: int) -> float:
+        """``rng() × min(30, 1 × 2ⁿ)`` for the *attempt*-th retry (from 0)."""
+
+        exponent = min(attempt, 32)
+        base = min(
+            RECONNECT_MAX_SECONDS, RECONNECT_INITIAL_SECONDS * RECONNECT_MULTIPLIER**exponent
+        )
+        return float(self._rng.random()) * base
+
+    def _spawn(self, coro: Awaitable[Any], name: str) -> asyncio.Future[Any]:
+        spawn = getattr(self._tasks, "spawn", None)
+        if callable(spawn):
+            return spawn(coro, name=name)
+        return asyncio.ensure_future(coro)
+
+    async def close(self) -> None:
+        """Stop the reconnection loop and the reader, close the socket."""
+
+        self._closing = True
+        current = asyncio.current_task()
+        for task in (self._reconnect, self._reader):
+            if task is not None and not task.done() and task is not current:
+                task.cancel()
+                await asyncio.wait({task})
+        self._reconnect = None
+        self._reader = None
+        ws, self._ws = self._ws, None
+        self._connected = False
+        self._fail_pending()
+        if ws is not None:
+            await _close_socket(ws)
+        if self._closing_sockets:
+            await asyncio.wait(set(self._closing_sockets))
+
+
+async def _receive_frame(ws: Any) -> Mapping[str, Any]:
+    """The next text frame as JSON; the socket ending is an unreachable provider."""
+
+    while True:
+        message = await ws.receive()
+        kind = getattr(getattr(message, "type", None), "name", None)
+        if kind in _WS_TERMINAL:
+            raise SceneProviderUnavailable("the scene provider closed the connection")
+        if kind != "TEXT":
+            continue
+        try:
+            frame = json.loads(message.data)
+        except (TypeError, ValueError):
+            raise SceneProviderUnavailable("the scene provider sent a malformed frame") from None
+        if not isinstance(frame, Mapping):
+            raise SceneProviderUnavailable("the scene provider sent a malformed frame")
+        return frame
+
+
+async def _close_socket(ws: Any) -> None:
+    try:
+        await ws.close()
+    except Exception:  # noqa: BLE001 - a socket that fails to close is gone anyway
+        pass
+
+
+async def _notify(callback: Notify | None) -> None:
+    if callback is None:
+        return
+    try:
+        await callback()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a health report must not stop the loop
+        return
+
+
+class _ClientConnection:
+    """The dialed socket and the client session that owns it, closed together."""
+
+    __slots__ = ("_session", "_ws")
+
+    def __init__(self, session: Any, ws: Any) -> None:
+        self._session = session
+        self._ws = ws
+
+    @property
+    def closed(self) -> bool:
+        return bool(self._ws.closed)
+
+    async def receive(self) -> Any:
+        return await self._ws.receive()
+
+    async def send_str(self, data: str) -> None:
+        await self._ws.send_str(data)
+
+    async def close(self) -> bool:
+        try:
+            return bool(await self._ws.close())
+        finally:
+            await self._session.close()
+
+
+async def default_websocket_factory(url: str) -> _ClientConnection:
+    """Dial *url* with ``aiohttp``; imported on first use only."""
+
+    import aiohttp
+
+    session = aiohttp.ClientSession()
+    try:
+        ws = await session.ws_connect(url, autoping=True)
+    except BaseException:
+        await session.close()
+        raise
+    return _ClientConnection(session, ws)
+
+
+# --------------------------------------------------------------------------- #
 # Activation
 # --------------------------------------------------------------------------- #
 
@@ -1216,6 +1764,7 @@ def _declared_spec(action_name: str) -> ActionSpec:
 
 __all__ = [
     "CAUSE_CONFIRMATION_LOST",
+    "CLOSE_AUTHENTICATION_FAILED",
     "DEFAULT_CONNECT_TIMEOUT_SECONDS",
     "DEFAULT_MAX_WAITERS",
     "DEFAULT_REQUEST_TIMEOUT_SECONDS",
@@ -1237,12 +1786,25 @@ __all__ = [
     "REASON_NO_POLL_SERVICE",
     "REASON_SCENE_PROVIDER_DISCONNECTED",
     "REASON_SCENE_PROVIDER_UNREACHABLE",
+    "RECONNECT_INITIAL_SECONDS",
+    "RECONNECT_MAX_SECONDS",
+    "RECONNECT_MULTIPLIER",
+    "REQUEST_CURRENT_SCENE",
+    "REQUEST_LIST_SCENES",
+    "REQUEST_SET_SCENE",
+    "RPC_VERSION",
     "SCENE_ACTION",
     "SCENE_PROVIDER_KINDS",
     "SCENE_UNKNOWN_CODE",
     "SceneProvider",
+    "SceneProviderUnavailable",
+    "SceneRequestFailed",
+    "SceneRequestTimeout",
     "StreamControlModule",
     "StreamControlModuleError",
+    "WebSocketSceneProvider",
     "activate",
+    "authentication_string",
+    "default_websocket_factory",
     "validate_settings",
 ]
