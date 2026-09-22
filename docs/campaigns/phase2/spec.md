@@ -1112,10 +1112,12 @@ rule and is the precondition of AC3 and AC10.
 
 - AC43 (R2, R9, arbiter decision 22/09): No speech provider is assumed.
   With the shipped `config.yaml.example` and with every profile that
-  enables the audio modules, the speech endpoint setting is EMPTY:
+  enables the audio modules, the speech endpoint setting is EMPTY, and
+  the same holds when a configured service is UNREACHABLE at prepare:
   `audio.speak` is not in the bound action set, the runtime's capability
-  view names it with a value-free not-ready reason, no request is
-  attempted and startup succeeds; the optional transcription endpoint is
+  view names it with a value-free not-ready reason (empty and unreachable
+  share the not-ready shape, with distinct value-free reasons), no
+  request is attempted and startup succeeds; the optional transcription endpoint is
   empty by the same rule and a capture without it is still `success` with
   its `audio_ref`. A chat-only profile behaves identically with the three
   phase 2 modules disabled. No shipped profile or example carries a
