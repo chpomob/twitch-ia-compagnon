@@ -15,7 +15,22 @@ stamped at or after the deadline, is adopted by the real executor; a
 cancellation or a drain kills it and ends ``cancelled``; the run's release and
 the store's TTL leave nothing behind. AC12 — nothing is spawned outside a
 call (checked across the whole module by the last test), no task at
-``prepare``, no producer role, default-deny. AC41 — no lead or margin.
+``prepare``, no producer role, default-deny. AC41 — no lead or margin; the
+only deadline subtractions are the admission reserve and the transcription
+window.
+
+P11 — the optional transcription. AC11: one multipart request carrying the
+stored WAV and ``model`` (``language`` when set), ``ok`` with a dated
+transcription cut to ``max_chars``, the four failure kinds each a ``success``
+without ``transcription``, ``skipped:deadline`` with nothing sent when the
+window is exhausted. AC42: the window edge ``expiry − 1 s`` abandons a held
+request and the record, stamped at the module's decision instant before the
+deadline, is adopted as ``success`` — at the edge, on a delayed wake with a
+late answer, with the executor's adoption parked past the deadline; a drain
+and a cancellation after storing end the same way. AC29 (``audio_input``): a
+failed transcription probe degrades the transcription only, value-free;
+``required: true`` fails ``prepare`` naming ``transcription.endpoint`` with
+the transport closed.
 
 Every call goes through the real executor built by ``runtime_context`` over a
 shared :class:`AttachmentStore` on the :class:`ManualClock`; the sources, the
@@ -33,6 +48,7 @@ import select
 import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -40,17 +56,21 @@ import yaml
 
 from core.actions import ERROR_INVALID_ARGUMENTS, ERROR_TIMED_OUT, ActionExecutor, AuthorizationRule
 from core.attachments import AttachmentExpired, AttachmentStore
-from core.contracts import ActionCall, ActionObservation, Destination
+from core.contracts import COUNTER_ACTION_TIMEOUTS, ActionCall, ActionObservation, Destination
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from core.runtime import ModuleContext, RuntimeContext
 from conftest import (
+    HELD,
     FakeAudioSource,
+    FakeBytesResponse,
     ManualClock,
     RecordingSubprocessRunner,
+    ScriptedTranscriptionTransport,
     events_of,
     runtime_context,
     settle,
+    silent_wav,
     trace_texts,
     wait_until,
     wav_bytes,
@@ -68,11 +88,15 @@ from modules.audio_input import (
     MODULE_NAME,
     PROVIDER_ID,
     PROVIDER_NAME,
+    TRANSCRIPTION_DEGRADED_REASON,
+    TRANSCRIPTION_PROVIDER_ID,
+    TRANSCRIPTION_RESERVE_SECONDS,
     AudioInputModule,
     AudioInputModuleError,
     InvalidSegment,
     activate,
     cut_segment,
+    probe_segment,
     spawn_recorder,
     validate_settings,
 )
@@ -1418,6 +1442,615 @@ async def test_the_shipped_runner_kills_a_child_left_by_an_exited_wrapper(tmp_pa
         assert os.read(fd, 1) == b""  # the child ended with the group
     finally:
         os.close(fd)
+
+
+# --------------------------------------------------------------------------- #
+# P11: the optional transcription (AC11, AC42, AC29)
+# --------------------------------------------------------------------------- #
+
+STT_ENDPOINT = "http://stt.invalid:8443/v1/audio/transcriptions"
+STT_KEY = "stt-key-7e2d9a41c6"
+STT_MODEL = "stt-model-under-test"
+#: What the prepare-time probe is answered with; every scripted transport
+#: below answers it first.
+PROBE_OK: dict[str, Any] = {"text": ""}
+
+
+class LateAnswerTransport(ScriptedTranscriptionTransport):
+    """A transport whose :data:`HELD` answers a test hands over when it chooses.
+
+    Unlike :meth:`release`, :meth:`deliver` still hands the answer over after
+    the module abandoned the request — the answer arrives at the transport and
+    nobody is left to take it, as a real endpoint answering late would.
+    """
+
+    def __init__(self, *answers: Any) -> None:
+        super().__init__(*answers)
+        self.gates: list[asyncio.Future[Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        if not (self.answers and self.answers[0] is HELD):
+            return await super().post(url, **kwargs)
+        self.answers.pop(0)
+        self.requests.append(self._record(url, kwargs))
+        gate: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self.gates.append(gate)
+        return self._normalise(await asyncio.shield(gate))
+
+    @property
+    def waiting(self) -> int:
+        return sum(1 for gate in self.gates if not gate.done())
+
+    def deliver(self, answer: Any) -> None:
+        for gate in self.gates:
+            if not gate.done():
+                gate.set_result(answer)
+                return
+        raise AssertionError("no held request to answer")
+
+
+def stt_settings(**extra: Any) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "endpoint": STT_ENDPOINT,
+        "model": STT_MODEL,
+        "api_key": STT_KEY,
+        **extra,
+    }
+
+
+async def stt_harness(
+    transport: ScriptedTranscriptionTransport,
+    source: FakeAudioSource | None = None,
+    *,
+    stt: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> Harness:
+    return await harness(
+        source if source is not None else FakeAudioSource(wav_bytes(5.0)),
+        transcription=stt_settings(**(stt or {})),
+        _transcription_transport=transport,
+        **kwargs,
+    )
+
+
+def call_requests(transport: ScriptedTranscriptionTransport) -> list[dict[str, Any]]:
+    """The requests of the calls: the first request is the prepare-time probe."""
+
+    probe, *rest = transport.requests
+    assert probe["file"] == probe_segment()
+    return rest
+
+
+def stored_bytes(h: Harness, part: dict[str, Any]) -> bytes:
+    ref = h.store.lookup(part["attachment_id"])
+    assert ref is not None
+    return h.store.get(ref)
+
+
+def assert_captured(
+    h: Harness, observation: ActionObservation, transcription_status: str
+) -> dict[str, Any]:
+    """``success`` with its ``audio_ref`` leased to the run and the given status."""
+
+    assert observation.status == "success", observation.error
+    assert observation.error is None
+    assert observation.result is not None
+    assert observation.result["transcription_status"] == transcription_status
+    (part,) = observation.parts
+    assert part["type"] == "audio_ref"
+    assert part["size"] == 96_044
+    ref = h.store.lookup(part["attachment_id"])
+    assert ref is not None and ref.run_id == RUN_ID and ref.size == 96_044
+    return dict(part)
+
+
+def timeouts_counted(h: Harness) -> int:
+    return h.runtime.supervision.snapshot().get(COUNTER_ACTION_TIMEOUTS, 0)
+
+
+def test_the_probe_segment_is_generated_silence_of_8044_bytes() -> None:
+    """R3: the transcription probe's 0.25 s silent segment is generated — 8 044
+    bytes, the canonical 16 kHz mono 16-bit header over zeros."""
+
+    segment = probe_segment()
+    assert len(segment) == 8_044
+    assert segment == silent_wav(0.25)
+    assert cut_segment(segment, 1).duration_ms == 250
+
+
+@pytest.mark.parametrize("language", [None, "fr"])
+async def test_a_transcription_answer_is_dated_and_carried_by_the_audio_ref(
+    language: str | None,
+) -> None:
+    """AC11: a scripted transport answering ``{"text": "bonjour à tous"}`` →
+    ``transcription == {text, transcribed_at, provider_id, truncated:
+    false}``, ``transcription_status == "ok"``, exactly 1 request carrying the
+    stored 96 044-byte WAV as a file, ``model``, ``language`` when set and the
+    bearer header; the key appears in no trace."""
+
+    transport = ScriptedTranscriptionTransport(PROBE_OK, {"text": "bonjour à tous"})
+    stt = {"language": language} if language is not None else {}
+    h = await stt_harness(transport, stt=stt, start=1234.5)
+
+    observation = await h.capture(seconds=3)
+
+    part = assert_captured(h, observation, "ok")
+    assert part["transcription"] == {
+        "text": "bonjour à tous",
+        "transcribed_at": 1234.5,
+        "provider_id": TRANSCRIPTION_PROVIDER_ID,
+        "truncated": False,
+    }
+    (request,) = call_requests(transport)
+    assert request["url"] == STT_ENDPOINT
+    assert len(request["file"]) == 96_044
+    assert request["file"] == stored_bytes(h, part)
+    assert request["filename"]
+    assert request["model"] == STT_MODEL
+    assert request["language"] == language
+    assert request["headers"]["Authorization"] == f"Bearer {STT_KEY}"
+    assert_adopted_once(h, "success")
+    for text in trace_texts(h.runtime.bus):
+        assert STT_KEY not in text
+    await h.handle.close()
+    assert transport.close_calls == 1
+
+
+async def test_a_long_transcription_is_cut_to_max_chars() -> None:
+    """AC11: a 2 500-character answer with ``max_chars: 2000`` → 2 000
+    characters, ``truncated: true``."""
+
+    transport = ScriptedTranscriptionTransport(PROBE_OK, {"text": "é" * 2500})
+    h = await stt_harness(transport, stt={"max_chars": 2000})
+
+    part = assert_captured(h, await h.capture(seconds=3), "ok")
+
+    assert part["transcription"]["text"] == "é" * 2000
+    assert part["transcription"]["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("answer", "status"),
+    [
+        (OSError("connection refused by 10.0.0.7:8443"), "failed:stt_unavailable"),
+        (500, "failed:stt_failed"),
+        (HELD, "failed:stt_timed_out"),
+        ({"segments": []}, "failed:invalid_transcription"),
+        ({"text": 42}, "failed:invalid_transcription"),
+        (FakeBytesResponse(200, b"not json at all"), "failed:invalid_transcription"),
+        (FakeBytesResponse(200, ConnectionResetError("reset mid-body")), "failed:stt_unavailable"),
+    ],
+    ids=[
+        "transport-exception",
+        "http-500",
+        "no-answer",
+        "no-text",
+        "text-not-string",
+        "not-json",
+        "body-lost-after-200",
+    ],
+)
+async def test_a_failed_transcription_leaves_the_capture_a_success(answer: Any, status: str) -> None:
+    """AC11: a transport exception, an HTTP 500, no answer within
+    ``timeout_seconds`` on the clock (not earlier), a 2xx body lost
+    mid-read (a transport failure) and a 2xx body without a string ``text``
+    each yield ``success`` with the ``audio_ref``,
+    ``transcription`` absent and their own status; exactly 1 request."""
+
+    transport = ScriptedTranscriptionTransport(PROBE_OK, answer)
+    source = FakeAudioSource(wav_bytes(5.0))
+    h = await stt_harness(transport, source)
+
+    task = h.start(seconds=3)
+    if answer is HELD:
+        await wait_until(lambda: transport.held == 1)
+        h.clock.advance(9.99)
+        await spin()
+        assert not task.done()
+        h.clock.advance(0.01)
+    observation = await finished(task)
+
+    part = assert_captured(h, observation, status)
+    assert "transcription" not in part
+    assert len(call_requests(transport)) == 1
+    assert source.kills == 0
+    assert h.store.object_count == 1
+    assert_adopted_once(h, "success")
+    if answer is HELD:
+        assert transport.held == 0  # the request was abandoned
+        assert h.invocations[0].provider_completed_at == 1010.0
+
+
+@pytest.mark.parametrize("stored_at", [99.5, 99.0], ids=["0.5-s-left", "exactly-1-s-left"])
+async def test_an_exhausted_window_sends_nothing_and_is_skipped(stored_at: float) -> None:
+    """AC11/AC42: a segment stored with 0.5 s — or exactly 1 s — left before
+    the call deadline has no transcription window: 0 requests,
+    ``skipped:deadline``, still ``success`` with the ``audio_ref``."""
+
+    transport = ScriptedTranscriptionTransport(PROBE_OK)
+    source = FakeAudioSource(wav_bytes(5.0), gated=True)
+    h = await stt_harness(transport, source, start=90.0)
+    h.deadline = DEADLINE
+
+    task = h.start(seconds=3)
+    await wait_until(source.entered.is_set)
+    advance_to(h.clock, stored_at)
+    source.release()
+    observation = await finished(task)
+
+    part = assert_captured(h, observation, "skipped:deadline")
+    assert "transcription" not in part
+    assert call_requests(transport) == []
+    assert h.invocations[0].provider_completed_at == stored_at
+    assert_adopted_once(h, "success")
+
+
+async def boundary_harness(
+    *, executor_sleeper: Any = None
+) -> tuple[Harness, LateAnswerTransport, FakeAudioSource, "asyncio.Task[ActionObservation]"]:
+    """AC42 setup: call deadline ``t = 100.0``, ``timeout_seconds: 10``, the
+    segment stored at ``t = 95.0``, the one request held by the transport."""
+
+    transport = LateAnswerTransport(PROBE_OK, HELD)
+    source = FakeAudioSource(wav_bytes(5.0), gated=True)
+    h = await stt_harness(
+        transport,
+        source,
+        stt={"timeout_seconds": 10},
+        start=90.0,
+        executor_sleeper=executor_sleeper,
+    )
+    h.deadline = DEADLINE
+    task = h.start(seconds=3)
+    await wait_until(source.entered.is_set)
+    advance_to(h.clock, 95.0)
+    source.release()
+    await wait_until(lambda: transport.waiting == 1)
+    await spin()
+    assert len(call_requests(transport)) == 1
+    return h, transport, source, task
+
+
+def assert_window_closed(
+    h: Harness, observation: ActionObservation, source: FakeAudioSource, stamp: float
+) -> None:
+    """AC42's record: ``success`` with the ``audio_ref``, no transcription,
+    ``failed:stt_timed_out``, stamped *stamp* ``< expires_at`` and adopted by
+    the in-time rule — one record, no timeout counted, nothing killed, the
+    attachment still leased to the run."""
+
+    part = assert_captured(h, observation, "failed:stt_timed_out")
+    assert "transcription" not in part
+    (invocation,) = h.invocations
+    assert invocation.provider_completed_at == stamp
+    assert invocation.provider_completed_at < DEADLINE
+    assert_adopted_once(h, "success")
+    assert timeouts_counted(h) == 0
+    assert source.kills == 0
+    assert h.store.object_count == 1
+
+
+async def test_the_window_edge_abandons_the_request_and_keeps_the_capture() -> None:
+    """AC42 (a): at ``t = 98.99`` the call still runs with exactly 1 request
+    and 0 records; at ``t = 99.0`` (``expiry − 1 s``) the request is abandoned
+    and the record, stamped ``== 99.0``, is the capture's ``success`` with
+    ``failed:stt_timed_out``; the answer released at ``t = 99.5`` changes
+    nothing."""
+
+    h, transport, source, task = await boundary_harness()
+
+    advance_to(h.clock, 98.99)
+    await spin()
+    assert not task.done()
+    assert len(call_requests(transport)) == 1
+    assert len(h.runtime.executor.outcomes()) == 0
+    assert events_of(h.runtime.bus, "action.completed") == []
+
+    advance_to(h.clock, DEADLINE - TRANSCRIPTION_RESERVE_SECONDS)
+    assert h.clock.now == 99.0
+    observation = await finished(task)
+    await spin()
+    assert_window_closed(h, observation, source, 99.0)
+
+    advance_to(h.clock, 99.5)
+    transport.deliver({"text": "trop tard"})
+    await spin()
+    assert_window_closed(h, observation, source, 99.0)
+    assert len(call_requests(transport)) == 1
+
+
+@pytest.mark.parametrize("order", ["bound-then-answer", "answer-then-bound", "answer-only"])
+async def test_a_delayed_wake_does_not_adopt_a_late_text(order: str) -> None:
+    """AC42 (b): the clock goes from ``t = 98.0`` to ``99.6`` in one step, so
+    the bound parked at ``99.0`` wakes the module with the clock already at
+    ``99.6``, and the answer is released at ``99.6`` too — in either order,
+    or with the answer alone waking the module, its text in hand: the clock
+    decides, not the winning event. The record is the capture's ``success``
+    with ``failed:stt_timed_out``, stamped ``== 99.6 < 100.0``."""
+
+    h, transport, source, task = await boundary_harness()
+    advance_to(h.clock, 98.0)
+    await spin()
+    assert not task.done()
+
+    if order == "bound-then-answer":
+        advance_to(h.clock, 99.6)
+        transport.deliver({"text": "trop tard"})
+    elif order == "answer-then-bound":
+        h.clock.now = 99.6
+        transport.deliver({"text": "trop tard"})
+        h.clock.advance(0.0)
+    else:
+        h.clock.now = 99.6
+        transport.deliver({"text": "trop tard"})
+    observation = await finished(task)
+    await spin()
+
+    assert_window_closed(h, observation, source, 99.6)
+
+
+async def test_a_delayed_wake_adopted_late_by_the_executor_is_still_a_success() -> None:
+    """AC42 (b), adoption parked: the record stamped at ``t = 99.6`` is adopted
+    as ``success`` even though the executor only resumes at ``t = 100.5`` —
+    the phase 1 in-time rule, never R10's late-interruption path."""
+
+    executor_timer = ParkedSleeper()
+    h, transport, source, task = await boundary_harness(executor_sleeper=executor_timer)
+    advance_to(h.clock, 98.0)
+    await spin()
+
+    advance_to(h.clock, 99.6)
+    transport.deliver({"text": "trop tard"})
+    (invocation,) = h.invocations
+    for _ in range(200):
+        if invocation.provider_completed_at is not None:
+            break
+        await asyncio.sleep(0)
+    assert invocation.provider_completed_at == 99.6
+    assert not task.done()  # adoption has not happened yet
+    h.clock.now = 100.5
+
+    observation = await finished(task)
+    await spin()
+    assert_window_closed(h, observation, source, 99.6)
+    assert executor_timer.delays == [10.0]
+
+
+@pytest.mark.parametrize("answered", [True, False], ids=["answered-at-97", "held-at-98"])
+async def test_a_drain_lets_the_transcription_finish_within_its_deadline(answered: bool) -> None:
+    """AC42/decision 1: a drain started at ``t = 96.0`` with ``deadline_seconds:
+    2`` cancels nothing and kills nothing: an answer at ``t = 97.0`` is
+    adopted (``ok``); a request still held at ``t = 98.0`` is abandoned when
+    the drain deadline passes (``failed:stt_timed_out``), the capture a
+    ``success`` either way and the drain done within its deadline."""
+
+    h, transport, source, task = await boundary_harness()
+    advance_to(h.clock, 96.0)
+    drain = asyncio.ensure_future(h.handle.drain(2.0))
+    await spin()
+    assert not drain.done()
+    assert not task.done()
+
+    if answered:
+        advance_to(h.clock, 97.0)
+        transport.deliver({"text": "bonjour"})
+    else:
+        advance_to(h.clock, 97.99)
+        await spin()
+        assert not drain.done() and not task.done()
+        advance_to(h.clock, 98.0)
+    observation = await finished(task)
+    await finished(drain)
+    assert h.clock.now <= 98.0
+
+    if answered:
+        part = assert_captured(h, observation, "ok")
+        assert part["transcription"]["text"] == "bonjour"
+        assert part["transcription"]["transcribed_at"] == 97.0
+    else:
+        part = assert_captured(h, observation, "failed:stt_timed_out")
+        assert "transcription" not in part
+    assert_adopted_once(h, "success")
+    assert source.kills == 0
+    assert h.store.object_count == 1
+    await h.handle.close()
+
+
+@pytest.mark.parametrize("phase", ["transcribing", "recording"])
+async def test_a_cancellation_after_storing_returns_the_capture(phase: str) -> None:
+    """Round 2 P1: the provider coroutine, invoked directly and cancelled at
+    ``t = 96.0`` after its segment was stored, catches the cancellation,
+    abandons the request and returns ``success`` with the ``audio_ref`` and
+    ``failed:stt_timed_out`` — 0 kills, 1 attachment. The same cancellation
+    while still recording ends ``cancelled`` with 0 attachments and 1 kill
+    (P10)."""
+
+    transport = LateAnswerTransport(PROBE_OK, HELD)
+    source = FakeAudioSource(wav_bytes(5.0), gated=True)
+    h = await stt_harness(transport, source, start=90.0)
+    h.deadline = DEADLINE
+    invocation = SimpleNamespace(
+        call=h.call({"seconds": 3}),
+        spec=h.runtime.actions.discovered()[CAPTURE_ACTION],
+        mark_not_emitted=lambda: None,
+    )
+    task = asyncio.ensure_future(h.handle._provider.invoke(invocation))
+    await wait_until(source.entered.is_set)
+    advance_to(h.clock, 95.0)
+    if phase == "transcribing":
+        source.release()
+        await wait_until(lambda: transport.waiting == 1)
+    await spin()
+    advance_to(h.clock, 96.0)
+    await spin()
+    assert not task.done()
+
+    task.cancel()
+    observation = await finished(task)
+
+    if phase == "transcribing":
+        part = assert_captured(h, observation, "failed:stt_timed_out")
+        assert "transcription" not in part
+        assert source.kills == 0
+        assert h.store.object_count == 1
+    else:
+        assert_failure(observation, "cancelled", "cancelled")
+        assert source.kills == 1
+        assert_nothing_stored(h)
+        assert call_requests(transport) == []
+
+
+async def test_the_recorder_is_still_killed_at_the_deadline_itself_with_transcription() -> None:
+    """AC39/AC41: the transcription window never moves the recorder's kill —
+    0 kills at ``t = 99.0`` for a recorder still running with a ``t = 100.0``
+    deadline, 1 kill at ``100.0``, ``capture_timed_out``, no request."""
+
+    transport = ScriptedTranscriptionTransport(PROBE_OK)
+    source = FakeAudioSource(gated=True)
+    h = await stt_harness(transport, source, start=90.0, executor_sleeper=ParkedSleeper())
+    h.deadline = DEADLINE
+
+    task = h.start(seconds=3)
+    await wait_until(source.entered.is_set)
+    advance_to(h.clock, 99.0)
+    await spin()
+    assert source.kills == 0 and not task.done()
+    advance_to(h.clock, 99.99)
+    await spin()
+    assert source.kills == 0 and not task.done()
+
+    advance_to(h.clock, 100.0)
+    observation = await finished(task)
+    await spin()
+
+    assert source.kills == 1
+    assert_failure(observation, "error", ERROR_CAPTURE_TIMED_OUT)
+    assert_nothing_stored(h)
+    assert call_requests(transport) == []
+
+
+def assert_value_free(reason: str) -> None:
+    for fragment in (STT_ENDPOINT, "stt.invalid", "8443", "http", "127.0.0.1", ":1", "/v1", STT_KEY):
+        assert fragment not in reason, fragment
+
+
+@pytest.mark.parametrize("failure", ["raising", "http-503", "held"])
+async def test_a_failed_transcription_probe_degrades_the_transcription_only(failure: str) -> None:
+    """AC29 (``audio_input``, decision 11): a probe that raises, answers a
+    non-2xx status or does not answer within ``timeout_seconds`` on the clock
+    → exactly 1 ``module.degraded`` with the value-free reason ``transcription
+    unavailable`` and no capability; ``audio.capture`` stays bound and ready;
+    every later capture is ``success`` with ``transcription_status:
+    "unavailable"`` and sends 0 requests; the transport is released."""
+
+    probe_answer = {
+        "raising": ConnectionRefusedError(f"cannot reach {STT_ENDPOINT}"),
+        "http-503": 503,
+        "held": HELD,
+    }[failure]
+    transport = ScriptedTranscriptionTransport(probe_answer)
+    h = await stt_harness(transport, prepare=False)
+    preparing = asyncio.ensure_future(h.handle.prepare())
+    if failure == "held":
+        await wait_until(lambda: transport.held == 1)
+        h.clock.advance(9.99)
+        await spin()
+        assert not preparing.done()
+        h.clock.advance(0.01)
+    await finished(preparing)
+
+    (payload,) = degraded_payloads(h)
+    assert payload["reason"] == TRANSCRIPTION_DEGRADED_REASON
+    assert payload.get("capabilities", []) == []
+    assert_value_free(payload["reason"])
+    for text in trace_texts(h.runtime.bus):
+        assert STT_ENDPOINT not in text and STT_KEY not in text
+    assert CAPTURE_ACTION in h.runtime.actions.registered_ready()
+    assert h.handle.transcription_available is False
+    assert transport.close_calls == 1
+    assert h.context.tasks.active == 0
+
+    observation = await h.capture(seconds=3)
+    part = assert_captured(h, observation, "unavailable")
+    assert "transcription" not in part
+    assert len(transport.requests) == 1  # the probe alone
+    assert transport.held == 0
+
+
+async def test_the_real_transport_against_a_closed_port_degrades_the_transcription() -> None:
+    """AC29 with the shipped factory: an endpoint on the closed loopback port
+    ``127.0.0.1:1`` fails the probe — bounded by ``timeout_seconds`` through
+    the sleeper seam — and degrades the transcription alone, value-free."""
+
+    source = FakeAudioSource(wav_bytes(5.0))
+    h = await harness(
+        source,
+        prepare=False,
+        transcription=stt_settings(endpoint="http://127.0.0.1:1/v1/audio/transcriptions"),
+    )
+    await finished(asyncio.ensure_future(h.handle.prepare()))
+
+    (payload,) = degraded_payloads(h)
+    assert payload["reason"] == TRANSCRIPTION_DEGRADED_REASON
+    assert payload.get("capabilities", []) == []
+    assert_value_free(payload["reason"])
+    assert CAPTURE_ACTION in h.runtime.actions.registered_ready()
+    assert h.handle._session is None  # the transport was released
+
+    observation = await h.capture(seconds=3)
+    assert_captured(h, observation, "unavailable")
+    await h.handle.close()
+
+
+async def test_required_with_a_failed_transcription_probe_fails_prepare() -> None:
+    """AC29/R8: with ``required: true`` a failed transcription probe fails
+    ``prepare`` naming ``audio_input`` and ``transcription.endpoint`` — no
+    value — with 0 transports left open."""
+
+    transport = ScriptedTranscriptionTransport(OSError(f"refused by {STT_ENDPOINT}"))
+    with pytest.raises(AudioInputModuleError) as raised:
+        await stt_harness(transport, required=True)
+
+    message = str(raised.value)
+    assert "audio_input" in message and "transcription.endpoint" in message
+    assert STT_ENDPOINT not in message and STT_KEY not in message
+    assert transport.factory_calls == 1
+    assert transport.close_calls == 1
+
+
+async def test_a_disabled_transcription_opens_no_transport() -> None:
+    """R3: ``transcription.enabled: false`` sends no probe and no request and
+    reports ``disabled``."""
+
+    transport = ScriptedTranscriptionTransport()
+    h = await harness(
+        FakeAudioSource(wav_bytes(5.0)),
+        transcription=stt_settings(enabled=False),
+        _transcription_transport=transport,
+    )
+
+    assert_captured(h, await h.capture(seconds=3), "disabled")
+    assert transport.requests == [] and transport.factory_calls == 0
+
+
+def test_the_only_deadline_subtractions_are_the_two_ac41_authorizes() -> None:
+    """AC41 (amended, round 3 V4): in the module, the call deadline ``expiry``
+    loses a quantity in exactly two places — the ``capture_too_long``
+    admission reserve and the transcription window's 1-s
+    ``transcription_reserve`` — besides the watcher's remaining time, which
+    subtracts only the clock."""
+
+    text = (MODULE_DIR / "__init__.py").read_text(encoding="utf-8")
+    code = [line.split("#", 1)[0].strip() for line in text.splitlines()]
+    sites = [line for line in code if re.search(r"\bexpiry\s*-", line)]
+    assert sites == [
+        "if seconds > (expiry - self._clock()) - settings.grace_seconds:",
+        "watcher = asyncio.ensure_future(self._sleeper(max(0.0, expiry - self._clock())))",
+        "transcription_edge = expiry - transcription_reserve",
+    ]
+    assert TRANSCRIPTION_RESERVE_SECONDS == 1.0
+    assert "transcription_reserve = TRANSCRIPTION_RESERVE_SECONDS" in code
 
 
 # --------------------------------------------------------------------------- #

@@ -45,6 +45,37 @@ calls ending ``cancelled``. One kill per capture: the first trigger fixes the
 status. The executor adopts such a record even when it is stamped at or after
 the deadline (R10).
 
+**The optional transcription** (R3; decision 1, round 2 P1, round 3 V1
+and V4). With ``transcription.enabled``, once ``attachments.put`` has
+returned the capture is complete: the segment is leased to the run, the
+observation is a ``success`` carrying its ``audio_ref`` whatever becomes of
+the transcription, and the module never releases the segment itself. It then
+reads the clock once and computes three named quantities —
+``transcription_reserve`` (1 s, R3's ``skipped:deadline`` constant),
+``transcription_edge = expiry − transcription_reserve`` and
+``transcription_window = transcription_edge − now`` — the second of the two
+deadline subtractions AC41 authorizes, and bounding the transcription request
+only (the recorder is killed at ``expiry`` itself). A window ``≤ 0``
+transcribes nothing (``skipped:deadline``). Otherwise one multipart request —
+the WAV streamed from memory, ``model``, ``language`` when set, a bearer
+header when ``api_key`` is set — is raced against a bound of
+``min(timeout_seconds, transcription_window)`` on the sleeper. The order is
+fixed: *attempt*, then *decide* at the wake, whatever woke the call (the
+answer, the bound, ``drain`` or a ``CancelledError``), on the clock read at
+that instant — an answer in hand before ``transcription_edge`` gives its
+status, anything else abandons the request as ``failed:stt_timed_out`` — then
+*author* the ``success`` record and return it with no further await, so the
+executor's completion stamp is the decision instant, before ``expiry``. A 2xx
+JSON ``{text}`` becomes ``audio_ref.transcription = {text (cut to
+max_chars), transcribed_at, provider_id: "audio-input-stt", truncated}`` and
+``ok``; a transport failure is ``failed:stt_unavailable``, a non-2xx answer
+``failed:stt_failed``, a 2xx answer without a string ``text``
+``failed:invalid_transcription``. ``prepare`` sends one probe — a generated
+0.25 s silent segment, bounded by ``timeout_seconds``; when it fails, the
+capture stays bound, one ``module.degraded`` reports ``transcription
+unavailable`` with no capability, and every capture reports ``unavailable``
+with no request (decision 11).
+
 **Seams, for the tests.** ``_source_factory`` builds the source object of
 each configured source (by default :class:`FileSource` and
 :class:`CommandSource`; a harness hands in its own), ``_subprocess_runner``
@@ -60,13 +91,19 @@ Lifecycle: the manifest declares no role, so the handle takes part in
 ``audio.capture`` when at least one is usable and reports ``module.degraded``
 for the others (value-free, naming the source); with none usable the action is
 left unbound, and ``required: true`` turns an unusable source into a failed
-``prepare`` naming the field.
+``prepare`` naming the field; with transcription enabled it also sends the
+transcription probe, and ``required: true`` turns its failure into a failed
+``prepare`` naming ``transcription.endpoint``. ``drain`` lets a call in its
+transcription phase finish within the drain deadline and abandons its request
+when that deadline passes first; ``close`` releases the transport.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import io
+import json
 import math
 import os
 import shutil
@@ -78,6 +115,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+try:  # Keep the module importable for transport-injected contract tests.
+    import aiohttp
+except ModuleNotFoundError:  # pragma: no cover - production installs dependencies
+    aiohttp = None  # type: ignore[assignment]
 
 from core.actions import ERROR_CANCELLED, ERROR_INVALID_ARGUMENTS
 from core.attachments import AttachmentRefused
@@ -122,7 +164,34 @@ DEFAULT_GRACE_SECONDS = 2.0
 DEFAULT_TRANSCRIPTION_TIMEOUT_SECONDS = 10.0
 DEFAULT_TRANSCRIPTION_MAX_CHARS = 2000
 
+TRANSCRIPTION_PROVIDER_ID = "audio-input-stt"
+"""The ``provider_id`` of an ``audio_ref`` transcription."""
+
 TRANSCRIPTION_DISABLED = "disabled"
+TRANSCRIPTION_OK = "ok"
+TRANSCRIPTION_UNAVAILABLE = "unavailable"
+"""The prepare-time probe failed: no capture sends a transcription request."""
+TRANSCRIPTION_SKIPPED_DEADLINE = "skipped:deadline"
+TRANSCRIPTION_STT_UNAVAILABLE = "failed:stt_unavailable"
+TRANSCRIPTION_STT_FAILED = "failed:stt_failed"
+TRANSCRIPTION_STT_TIMED_OUT = "failed:stt_timed_out"
+TRANSCRIPTION_INVALID = "failed:invalid_transcription"
+
+TRANSCRIPTION_RESERVE_SECONDS = 1.0
+"""R3's ``skipped:deadline`` constant: the ``transcription_reserve``.
+
+The second of the two deadline subtractions AC41 authorizes, and the only
+literal of the transcription window: a request is not started, and a running
+one is abandoned, once less than this remains before ``expiry``, so the
+capture's ``success`` record is stamped before the call expires. It bounds the
+transcription request only; the recorder is killed at ``expiry`` itself.
+"""
+
+TRANSCRIPTION_DEGRADED_REASON = "transcription unavailable"
+"""The value-free ``module.degraded`` reason of a failed transcription probe."""
+
+PROBE_SEGMENT_SECONDS = 0.25
+"""The generated silent segment the transcription probe sends (8 044 bytes)."""
 
 ERROR_CAPTURE_TOO_LONG = "capture_too_long"
 """``seconds`` exceeds the time left before the deadline minus ``grace_seconds``."""
@@ -173,6 +242,19 @@ _SEAM_SLEEPER = "_sleeper"
 _SEAMS = frozenset(
     {_SEAM_SOURCE_FACTORY, _SEAM_SUBPROCESS_RUNNER, _SEAM_TRANSCRIPTION_TRANSPORT, _SEAM_SLEEPER}
 )
+
+#: The multipart field names and the file name the transcription request uses.
+_FIELD_FILE = "file"
+_FIELD_MODEL = "model"
+_FIELD_LANGUAGE = "language"
+_UPLOAD_FILENAME = "segment.wav"
+#: How much of a transcription answer is read at a time, and the room its
+#: JSON may take beyond ``max_chars`` characters (each at most 12 bytes when
+#: escaped as a surrogate pair): an answer past the bound is not a
+#: transcription the module will hold in memory.
+_ANSWER_CHUNK = 65_536
+_ANSWER_ALLOWANCE_BYTES = 65_536
+_ANSWER_BYTES_PER_CHAR = 12
 
 #: How much a command source reads from the recorder's stdout at a time.
 _READ_CHUNK = 65_536
@@ -396,7 +478,7 @@ class SourceSpec:
 
 @dataclass(frozen=True, slots=True)
 class _Transcription:
-    """The transcription settings, parsed; P11 acts on them."""
+    """The transcription settings, parsed."""
 
     enabled: bool = False
     endpoint: str = ""
@@ -566,6 +648,16 @@ def _canonical_header(data_bytes: int) -> bytes:
         + b"data"
         + struct.pack("<I", data_bytes)
     )
+
+
+def probe_segment() -> bytes:
+    """The transcription probe's segment: 0.25 s of silence, 8 044 bytes.
+
+    Generated in memory at each probe, never read from disk.
+    """
+
+    data_bytes = int(PROBE_SEGMENT_SECONDS * BYTES_PER_SECOND)
+    return _canonical_header(data_bytes) + bytes(data_bytes)
 
 
 # --------------------------------------------------------------------------- #
@@ -864,6 +956,16 @@ def _close_stdout(process: Any) -> None:
         pipe.close()
 
 
+def _default_session_factory() -> Any:
+    if aiohttp is None:
+        raise RuntimeError("aiohttp is not installed")
+    return aiohttp.ClientSession()
+
+
+SESSION_FACTORY: Callable[[], Any] = _default_session_factory
+"""The shipped transcription transport: an ``aiohttp`` session, made on first use."""
+
+
 def default_source_factory(
     spec: SourceSpec, *, runner: SubprocessRunner, sleeper: Sleeper, max_bytes: int
 ) -> FileSource | CommandSource:
@@ -912,6 +1014,46 @@ class _CallFailure(Exception):
         self.message = message
 
 
+@dataclass(frozen=True, slots=True)
+class _Answer:
+    """What one transcription request came back with: its status, its text on ``ok``."""
+
+    status: str
+    text: str | None = None
+
+
+class _Transcribing:
+    """One call in its transcription phase: what ``drain`` waits for and interrupts."""
+
+    __slots__ = ("finished", "interrupt")
+
+    def __init__(self) -> None:
+        loop = asyncio.get_running_loop()
+        self.interrupt: asyncio.Future[None] = loop.create_future()
+        self.finished: asyncio.Future[None] = loop.create_future()
+
+
+@dataclass(frozen=True, slots=True)
+class _Stored:
+    """A capture complete in the store: what its ``success`` record is authored from."""
+
+    wav: bytes
+    result: Mapping[str, Any]
+    part: Mapping[str, Any]
+    provenance: Mapping[str, Any]
+
+    def observation(
+        self, transcription_status: str, transcription: Mapping[str, Any] | None
+    ) -> ActionObservation:
+        result = {**self.result, "transcription_status": transcription_status}
+        part = dict(self.part)
+        if transcription is not None:
+            part["transcription"] = dict(transcription)
+        return ActionObservation(
+            status="success", provenance=dict(self.provenance), result=result, parts=(part,)
+        )
+
+
 class AudioInputModule:
     """The v2 handle: probe and bind at ``prepare``, record on demand."""
 
@@ -922,7 +1064,7 @@ class AudioInputModule:
         sources: Mapping[str, Any],
         *,
         sleeper: Sleeper,
-        transport_factory: Callable[[], Any] | None,
+        transport_factory: Callable[[], Any],
     ) -> None:
         self._actions = context.actions
         self._attachments = context.attachments
@@ -931,10 +1073,13 @@ class AudioInputModule:
         self._settings = settings
         self._sources = dict(sources)
         self._sleeper = sleeper
-        # Read by the optional transcription (P11); never opened here.
+        # The transcription transport: made on first use, released by close.
         self._transport_factory = transport_factory
+        self._session: Any | None = None
+        self._transcription_available = settings.transcription.enabled
         self._provider = _CaptureProvider(self)
         self._captures: set[_Capture] = set()
+        self._transcribing: set[_Transcribing] = set()
         self._usable: frozenset[str] = frozenset()
         self._prepared = False
         self._draining = False
@@ -956,6 +1101,12 @@ class AudioInputModule:
 
         return self._usable
 
+    @property
+    def transcription_available(self) -> bool:
+        """Whether captures send a transcription request (enabled, probe not failed)."""
+
+        return self._transcription_available
+
     # -- lifecycle hooks ---------------------------------------------------- #
 
     async def prepare(self) -> None:
@@ -969,7 +1120,17 @@ class AudioInputModule:
         with a value-free reason naming them; ``audio.capture`` is bound and the module marked
         ready when at least one source is usable, and left declared but
         unbound — reported as the degraded capability — when none is.
-        Nothing is spawned and no task is started.
+
+        With transcription enabled and a usable source, one probe request
+        carrying :func:`probe_segment` is sent, bounded by
+        ``timeout_seconds`` on the sleeper, and must answer a transcription.
+        When it does not, the transport is released, ``required: true``
+        fails ``prepare`` naming ``transcription.endpoint``, and otherwise
+        the transcription alone is degraded: ``audio.capture`` stays bound,
+        one ``module.degraded`` carries the value-free reason ``transcription
+        unavailable`` and no capability (decision 11), and every capture
+        reports ``unavailable`` without a request. Nothing is spawned and no
+        task is started.
         """
 
         if self._prepared or self._closed:
@@ -983,7 +1144,19 @@ class AudioInputModule:
                         f"{MODULE_NAME} prepare: field '{_SETTING_SOURCES}.{name}' unavailable"
                     )
                 unusable.append(name)
-        self._usable = frozenset(name for name in settings.sources if name not in unusable)
+        usable = frozenset(name for name in settings.sources if name not in unusable)
+        transcription_failed = False
+        if settings.transcription.enabled and usable:
+            transcription_failed = not await self._probe_transcription()
+            if transcription_failed:
+                self._transcription_available = False
+                await self._close_session()
+                if settings.required:
+                    raise AudioInputModuleError(
+                        f"{MODULE_NAME} prepare: field "
+                        f"'{_SETTING_TRANSCRIPTION}.endpoint' unavailable"
+                    )
+        self._usable = usable
         spec = _declared_capture_spec()
         try:
             if self._usable:
@@ -1001,22 +1174,32 @@ class AudioInputModule:
         if unusable:
             names = ", ".join(repr(name) for name in unusable)
             await self._report_degraded(f"{MODULE_NAME}: unavailable sources {names}", [])
+        if transcription_failed:
+            await self._report_degraded(TRANSCRIPTION_DEGRADED_REASON, [])
         self._actions.mark_ready()
 
     async def drain(self, deadline_seconds: float) -> None:
-        """Kill every running recorder; their calls end ``cancelled``, 0 bytes stored.
+        """Kill every running recorder; let the transcriptions end within the deadline.
 
-        Kills are immediate, so nothing is left to join within
-        *deadline_seconds*; a call arriving afterwards ends ``cancelled``
-        before any process is spawned.
+        A recorder's call ends ``cancelled`` with 0 bytes stored; a call
+        arriving afterwards ends ``cancelled`` before any process is spawned.
+        A call already in its transcription phase has stored its capture: it
+        is not cancelled and nothing is killed — its request may still answer
+        within *deadline_seconds* on the clock, and is abandoned
+        (``failed:stt_timed_out``, the capture still ``success``) when the
+        drain deadline passes first.
         """
 
-        del deadline_seconds
         self._draining = True
         self._kill_all("cancelled")
+        await self._join_transcriptions(max(float(deadline_seconds), 0.0))
 
     async def close(self) -> None:
-        """Withdraw readiness and kill whatever still records."""
+        """Withdraw readiness, kill whatever still records, release the transport.
+
+        A transcription still pending is abandoned (its capture ends
+        ``success``, ``failed:stt_timed_out``) before the transport closes.
+        """
 
         if self._closed:
             return
@@ -1025,6 +1208,45 @@ class AudioInputModule:
         if self._prepared and self._usable:
             self._actions.mark_not_ready()
         self._kill_all("cancelled")
+        self._interrupt_transcriptions()
+        await self._close_session()
+
+    async def _join_transcriptions(self, budget: float) -> None:
+        """Wait for the transcribing calls up to *budget* on the sleeper, then interrupt them."""
+
+        def pending() -> set[asyncio.Future[None]]:
+            return {item.finished for item in self._transcribing if not item.finished.done()}
+
+        waiting = pending()
+        if not waiting:
+            return
+        if budget <= 0:
+            self._interrupt_transcriptions()
+            return
+        timer = asyncio.ensure_future(self._sleeper(budget))
+        try:
+            while waiting and not timer.done():
+                await asyncio.wait(waiting | {timer}, return_when=asyncio.FIRST_COMPLETED)
+                waiting = pending()
+        finally:
+            _abandon(timer)
+            self._interrupt_transcriptions()
+
+    def _interrupt_transcriptions(self) -> None:
+        for item in tuple(self._transcribing):
+            if not item.interrupt.done():
+                item.interrupt.set_result(None)
+
+    async def _close_session(self) -> None:
+        session, self._session = self._session, None
+        close = getattr(session, "close", None)
+        if callable(close):
+            try:
+                outcome = close()
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:  # noqa: BLE001 - a transport that fails to close is gone anyway
+                pass
 
     def _kill_all(self, status: str) -> None:
         for capture in tuple(self._captures):
@@ -1080,13 +1302,19 @@ class AudioInputModule:
             provenance["source"] = name
             data = await self._record(self._sources[name], seconds, expiry)
             captured_at = float(self._clock())
-            return self._store(call.run_id, name, data, seconds, captured_at, provenance)
+            stored = self._store(call.run_id, name, data, seconds, captured_at, provenance)
         except _CallFailure as failure:
             return ActionObservation(
                 status=failure.status,
                 provenance=provenance,
                 error={"code": failure.code, "message": failure.message, "retryable": False},
             )
+        # The capture is complete: from here the record is a ``success`` with
+        # its ``audio_ref`` whatever happens to the transcription (R3), and it
+        # is authored and returned with no await after the decision, so the
+        # executor's completion stamp is the decision instant.
+        status, transcription = await self._transcribe(stored.wav, expiry)
+        return stored.observation(status, transcription)
 
     def _admit(self, arguments: Mapping[str, Any], expiry: float) -> tuple[str, int]:
         """The source and seconds of the call, or the refusal — before any spawn."""
@@ -1191,7 +1419,7 @@ class AudioInputModule:
         seconds: int,
         captured_at: float,
         provenance: Mapping[str, Any],
-    ) -> ActionObservation:
+    ) -> _Stored:
         try:
             segment = cut_segment(data, seconds)
         except InvalidSegment as invalid:
@@ -1223,7 +1451,7 @@ class AudioInputModule:
             "captured_at": captured_at,
             "transcription_status": TRANSCRIPTION_DISABLED,
         }
-        part = {
+        part: dict[str, Any] = {
             "type": PART_TYPE_AUDIO_REF,
             "attachment_id": ref.attachment_id,
             "content_type": CONTENT_TYPE_WAV,
@@ -1234,9 +1462,224 @@ class AudioInputModule:
             "captured_at": captured_at,
             "provider_id": PROVIDER_ID,
         }
-        return ActionObservation(
-            status="success", provenance=dict(provenance), result=result, parts=(part,)
+        return _Stored(wav=segment.data, result=result, part=part, provenance=dict(provenance))
+
+    # -- the optional transcription (R3; decision 1) --------------------------- #
+
+    async def _transcribe(
+        self, wav: bytes, expiry: float
+    ) -> tuple[str, Mapping[str, Any] | None]:
+        """The transcription status of a stored capture, and its transcription on ``ok``.
+
+        Never raises and never re-raises a cancellation: the capture it
+        follows is complete. The clock is read once for the window —
+        ``transcription_reserve`` is R3's 1 s, the second deadline
+        subtraction AC41 authorizes, bounding this request only — and an
+        exhausted window sends nothing. Otherwise: *attempt* one request
+        against the bound ``min(timeout_seconds, transcription_window)``;
+        *decide* at the wake, whatever woke the call, on the clock read then
+        — an answer in hand before ``transcription_edge`` gives its status,
+        anything else abandons the request (``failed:stt_timed_out``, a late
+        text not adopted); the caller then authors the record with no
+        further await. The last wake this schedules is the edge, never
+        anything at or after ``expiry``.
+        """
+
+        settings = self._settings.transcription
+        if not settings.enabled:
+            return TRANSCRIPTION_DISABLED, None
+        if not self._transcription_available:
+            return TRANSCRIPTION_UNAVAILABLE, None
+        now = self._clock()
+        transcription_reserve = TRANSCRIPTION_RESERVE_SECONDS
+        transcription_edge = expiry - transcription_reserve
+        transcription_window = transcription_edge - now
+        if transcription_window <= 0:
+            return TRANSCRIPTION_SKIPPED_DEADLINE, None
+
+        transcribing = _Transcribing()
+        self._transcribing.add(transcribing)
+        request: asyncio.Future[_Answer] | None = None
+        bound: asyncio.Future[Any] | None = None
+        answer: _Answer | None = None
+        try:
+            # Attempt.
+            try:
+                session = await self._session_or_none()
+                if session is None:
+                    answer = _Answer(TRANSCRIPTION_STT_UNAVAILABLE)
+                else:
+                    request = asyncio.ensure_future(self._request(session, wav))
+                    bound = asyncio.ensure_future(
+                        self._sleeper(min(settings.timeout_seconds, transcription_window))
+                    )
+                    await asyncio.wait(
+                        {request, bound, transcribing.interrupt},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+            except asyncio.CancelledError:
+                # Cancelled after storing: the request is abandoned, not
+                # awaited, and the capture's record is returned normally.
+                pass
+            # Decide, on the clock read at the wake.
+            decided_at = float(self._clock())
+            if request is not None and request.done() and not request.cancelled():
+                failure = request.exception()
+                answer = _Answer(TRANSCRIPTION_STT_UNAVAILABLE) if failure else request.result()
+            if answer is None or decided_at >= transcription_edge:
+                return TRANSCRIPTION_STT_TIMED_OUT, None
+            if answer.status != TRANSCRIPTION_OK or answer.text is None:
+                return answer.status, None
+            text = answer.text
+            return TRANSCRIPTION_OK, {
+                "text": text[: settings.max_chars],
+                "transcribed_at": decided_at,
+                "provider_id": TRANSCRIPTION_PROVIDER_ID,
+                "truncated": len(text) > settings.max_chars,
+            }
+        finally:
+            self._transcribing.discard(transcribing)
+            if not transcribing.finished.done():
+                transcribing.finished.set_result(None)
+            if bound is not None:
+                _abandon(bound)
+            if request is not None:
+                _abandon(request)
+
+    async def _probe_transcription(self) -> bool:
+        """One probe request with :func:`probe_segment`, bounded by ``timeout_seconds``."""
+
+        settings = self._settings.transcription
+        session = await self._session_or_none()
+        if session is None:
+            return False
+        request = asyncio.ensure_future(self._request(session, probe_segment()))
+        timer = asyncio.ensure_future(self._sleeper(settings.timeout_seconds))
+        try:
+            await asyncio.wait({request, timer}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            _abandon(request)
+            raise
+        finally:
+            _abandon(timer)
+        if not request.done():
+            # The bound won: the probe failed, its request is abandoned.
+            _abandon(request)
+            return False
+        if request.cancelled() or request.exception() is not None:
+            return False
+        return request.result().status == TRANSCRIPTION_OK
+
+    async def _session_or_none(self) -> Any | None:
+        """The transport, made on first use; ``None`` when it cannot be made."""
+
+        if not self._settings.transcription.endpoint:
+            return None
+        if self._session is None:
+            try:
+                created = self._transport_factory()
+                if inspect.isawaitable(created):
+                    created = await created
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - reported as the transport being unavailable
+                return None
+            self._session = created
+        return self._session
+
+    async def _request(self, session: Any, wav: bytes) -> _Answer:
+        """POST *wav* as a multipart body; the answer's status and text.
+
+        The WAV is streamed from memory — the transport never sees a path.
+        A transport failure — before the answer or while its body is read —
+        is ``failed:stt_unavailable``, a non-2xx answer
+        ``failed:stt_failed`` (its body never read), a 2xx answer that is not
+        JSON with a string ``text`` — or larger than the answer bound —
+        ``failed:invalid_transcription``.
+        """
+
+        settings = self._settings.transcription
+        headers: dict[str, str] = {}
+        if settings.api_key:
+            headers["Authorization"] = f"Bearer {settings.api_key}"
+        response: Any | None = None
+        try:
+            try:
+                response = await session.post(
+                    settings.endpoint, data=self._form(wav), headers=headers
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - any transport failure is the same outcome
+                return _Answer(TRANSCRIPTION_STT_UNAVAILABLE)
+            status = getattr(response, "status", None)
+            if not isinstance(status, int) or isinstance(status, bool) or not 200 <= status < 300:
+                return _Answer(TRANSCRIPTION_STT_FAILED)
+            try:
+                body = await self._read_answer(response)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a body lost mid-answer is a transport failure
+                return _Answer(TRANSCRIPTION_STT_UNAVAILABLE)
+            try:
+                decoded = json.loads(body.decode("utf-8")) if body is not None else None
+            except Exception:  # noqa: BLE001 - a body that does not decode is not a transcription
+                return _Answer(TRANSCRIPTION_INVALID)
+            text = decoded.get("text") if isinstance(decoded, Mapping) else None
+            if not isinstance(text, str):
+                return _Answer(TRANSCRIPTION_INVALID)
+            return _Answer(TRANSCRIPTION_OK, text)
+        finally:
+            if response is not None:
+                await _release(response)
+
+    def _form(self, wav: bytes) -> Any:
+        """The multipart body: the WAV file, ``model``, and ``language`` when set."""
+
+        settings = self._settings.transcription
+        if aiohttp is None:  # pragma: no cover - production installs dependencies
+            fields: dict[str, Any] = {_FIELD_FILE: io.BytesIO(wav), _FIELD_MODEL: settings.model}
+            if settings.language:
+                fields[_FIELD_LANGUAGE] = settings.language
+            return fields
+        form = aiohttp.FormData()
+        form.add_field(
+            _FIELD_FILE, io.BytesIO(wav), filename=_UPLOAD_FILENAME, content_type=CONTENT_TYPE_WAV
         )
+        form.add_field(_FIELD_MODEL, settings.model)
+        if settings.language:
+            form.add_field(_FIELD_LANGUAGE, settings.language)
+        return form
+
+    async def _read_answer(self, response: Any) -> bytes | None:
+        """The 2xx body, or ``None`` when it exceeds the answer bound.
+
+        Read in chunks off the response's stream so an oversized (or
+        endless) answer never holds more than one chunk past the bound; a
+        response with no stream is read whole.
+        """
+
+        limit = (
+            self._settings.transcription.max_chars * _ANSWER_BYTES_PER_CHAR
+            + _ANSWER_ALLOWANCE_BYTES
+        )
+        stream = getattr(response, "content", None)
+        read = getattr(stream, "read", None)
+        if not callable(read):
+            body = await response.read()
+            body = bytes(body)
+            return body if len(body) <= limit else None
+        parts: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await read(_ANSWER_CHUNK)
+            if not chunk:
+                break
+            parts.append(bytes(chunk))
+            total += len(chunk)
+            if total > limit:
+                return None
+        return b"".join(parts)
 
 
 def _probe(source: Any) -> str | None:
@@ -1265,6 +1708,18 @@ def _consume(task: "asyncio.Future[Any]") -> None:
         task.exception()
 
 
+async def _release(response: Any) -> None:
+    release = getattr(response, "release", None)
+    if not callable(release):
+        return
+    try:
+        outcome = release()
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception:  # noqa: BLE001 - a response that fails to release is gone anyway
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Activation (R7)
 # --------------------------------------------------------------------------- #
@@ -1284,7 +1739,8 @@ async def activate(
     checked through the same hook the loader ran. The seams
     ``_source_factory``, ``_subprocess_runner``, ``_transcription_transport``
     and ``_sleeper`` are read from *settings* and default to the shipped
-    sources, :func:`spawn_recorder`, no transport and ``asyncio.sleep``.
+    sources, :func:`spawn_recorder`, an ``aiohttp`` session factory (the
+    session is made on first use, never here) and ``asyncio.sleep``.
     Nothing is spawned and no transport is opened here.
     """
 
@@ -1331,7 +1787,7 @@ async def activate(
         parsed,
         sources,
         sleeper=sleeper,
-        transport_factory=settings.get(_SEAM_TRANSCRIPTION_TRANSPORT),
+        transport_factory=settings.get(_SEAM_TRANSCRIPTION_TRANSPORT, SESSION_FACTORY),
     )
 
 
@@ -1421,7 +1877,19 @@ __all__ = [
     "SOURCE_KINDS",
     "SOURCE_KIND_COMMAND",
     "SOURCE_KIND_FILE",
+    "PROBE_SEGMENT_SECONDS",
+    "SESSION_FACTORY",
+    "TRANSCRIPTION_DEGRADED_REASON",
     "TRANSCRIPTION_DISABLED",
+    "TRANSCRIPTION_INVALID",
+    "TRANSCRIPTION_OK",
+    "TRANSCRIPTION_PROVIDER_ID",
+    "TRANSCRIPTION_RESERVE_SECONDS",
+    "TRANSCRIPTION_SKIPPED_DEADLINE",
+    "TRANSCRIPTION_STT_FAILED",
+    "TRANSCRIPTION_STT_TIMED_OUT",
+    "TRANSCRIPTION_STT_UNAVAILABLE",
+    "TRANSCRIPTION_UNAVAILABLE",
     "WAV_HEADER_BYTES",
     "AudioInputModule",
     "AudioInputModuleError",
@@ -1436,6 +1904,7 @@ __all__ = [
     "activate",
     "cut_segment",
     "default_source_factory",
+    "probe_segment",
     "spawn_recorder",
     "validate_settings",
     "wav_data_layout",
