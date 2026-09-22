@@ -984,7 +984,8 @@ class RecordingPlayerRunner:
     terminates the player; one that ignores termination is killed after
     ``grace_seconds`` on the injected sleeper (``clock.sleep`` or
     ``sleeper``) — recorded in ``kills`` — and only then can ``wait``
-    return. ``events`` is the ordered ``start``/``stop``/``kill``/``exit``
+    return; ``kill(process)`` kills it at once, also recorded in ``kills``.
+    ``events`` is the ordered ``start``/``stop``/``kill``/``exit``
     log the ownership assertions read (finding P5). ``outputs`` optionally
     maps an output name to its argv so events carry the output name.
     """
@@ -1040,6 +1041,14 @@ class RecordingPlayerRunner:
         if self._sleeper is None:
             raise AssertionError("RecordingPlayerRunner: a stop grace needs a clock or sleeper")
         await self._sleeper(grace_seconds)
+        if process.alive:
+            self.kills.append(process.number)
+            self._event("kill", process)
+            process._exit(PLAYER_KILLED)
+
+    def kill(self, process: FakePlayer) -> None:
+        """Kill *process* at once, without awaiting anything (recorded in ``kills``)."""
+
         if process.alive:
             self.kills.append(process.number)
             self._event("kill", process)

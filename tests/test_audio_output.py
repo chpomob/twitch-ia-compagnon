@@ -23,17 +23,23 @@ sleeper are injected, and time moves only on the :class:`ManualClock`.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import struct
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 import yaml
 
-from core.actions import ERROR_INVALID_ARGUMENTS, ERROR_TIMED_OUT, AuthorizationRule
-from core.contracts import ActionCall, ActionObservation, Destination
+from core.actions import (
+    ERROR_INVALID_ARGUMENTS,
+    ERROR_TIMED_OUT,
+    ActionExecutor,
+    AuthorizationRule,
+)
+from core.contracts import COUNTER_ACTION_TIMEOUTS, ActionCall, ActionObservation, Destination
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext
@@ -44,13 +50,16 @@ from conftest import (
     ManualClock,
     RecordingPlayerRunner,
     ScriptedSpeechTransport,
+    events_of,
     runtime_context,
+    settle,
     trace_texts,
     wait_until,
     wav_bytes,
 )
 
 from modules.audio_output import (
+    CAUSE_PLAYBACK,
     CAUSE_SYNTHESIS,
     DEFAULT_MAX_AUDIO_BYTES,
     DEFAULT_MAX_TEXT_CHARS,
@@ -59,6 +68,7 @@ from modules.audio_output import (
     ERROR_INVALID_AUDIO,
     ERROR_OUTPUT_NOT_ALLOWED,
     ERROR_PLAYBACK_FAILED,
+    ERROR_RESOURCE_BUSY,
     ERROR_SPEECH_TOO_LONG,
     ERROR_TTS_FAILED,
     ERROR_TTS_UNAVAILABLE,
@@ -91,8 +101,11 @@ FAKE_AUDIO = Destination("fake", "channel-9", "audio")
 ENDPOINT = "http://speech.invalid/v1/audio/speech"
 API_KEY = "speech-key-4f1b9c2e7d"
 MODEL = "speech-model-under-test"
-PLAYER_ARGV = ["player-under-test", "--from-stdin"]
-HEADSET_ARGV = ["headset-player-under-test", "-"]
+#: ``argv[0]`` must resolve to an executable at ``prepare`` (R1 readiness,
+#: P9), so the scripted players name the running interpreter; the runner is
+#: injected and nothing is ever spawned from these.
+PLAYER_ARGV = [sys.executable, "player-under-test", "--from-stdin"]
+HEADSET_ARGV = [sys.executable, "headset-player-under-test", "-"]
 
 #: Every observation of this module's actions, for the module-wide AC2
 #: assertion that none is ``external_unknown``.
@@ -162,7 +175,24 @@ class Harness:
         self.transport = transport
         self.runner = runner
         self.clock = clock
+        self.deadline = 10_000.0
+        self.invocations: list[Any] = []
+        self.provider_tasks: list[asyncio.Task[Any]] = []
         self._calls = 0
+        # Record each invocation and the provider task it runs on, so a test
+        # can read the provider's completion stamp and cancel one call from
+        # below — the path R10's ``CancelledError`` handler serves.
+        for name in ("_invoke_speak", "_invoke_play"):
+            original = getattr(handle, name)
+
+            async def recorded(invocation: Any, _original: Any = original) -> Any:
+                self.invocations.append(invocation)
+                task = asyncio.current_task()
+                assert task is not None
+                self.provider_tasks.append(task)
+                return await _original(invocation)
+
+            setattr(handle, name, recorded)
 
     @property
     def runtime(self) -> RuntimeContext:
@@ -180,7 +210,7 @@ class Harness:
             source_event_id="source-1",
             destination=destination,
             principal=PRINCIPAL,
-            deadline=10_000.0,
+            deadline=self.deadline,
             message_id="source-1",
         )
 
@@ -204,18 +234,37 @@ async def harness(
     clips: dict[str, Path] | None = None,
     synthesis: dict[str, Any] | None = None,
     grant: bool = True,
+    start: float = 1000.0,
+    executor_sleeper: Any = None,
+    prepare: bool = True,
     **extra: Any,
 ) -> Harness:
-    clock = ManualClock(1000.0)
+    clock = ManualClock(start)
     transport = ScriptedSpeechTransport(*answers)
     runner = RecordingPlayerRunner(*players, clock=clock)
-    context = runtime_context(clock=clock).for_module(MODULE_NAME)
+    runtime = runtime_context(clock=clock)
+    if executor_sleeper is not None:
+        # The same real executor, its timer on a scripted sleeper, so a test
+        # decides when the executor notices the deadline (R10).
+        runtime = dataclasses.replace(
+            runtime,
+            executor=ActionExecutor(
+                runtime.actions,
+                runtime.actions._authorization,
+                supervision=runtime.supervision,
+                counters=runtime.executor._counters,
+                clock=clock,
+                sleeper=executor_sleeper,
+            ),
+        )
+    context = runtime.for_module(MODULE_NAME)
     handle = await activate(
         context,
         module_settings(transport, runner, clock, clips=clips, synthesis=synthesis, **extra),
         {},
     )
-    await handle.prepare()
+    if prepare:
+        await handle.prepare()
     if grant:
         policy = context._runtime.actions._authorization
         for action in (SPEAK_ACTION, PLAY_ACTION):
@@ -1020,7 +1069,12 @@ async def test_activation_refuses_refused_settings_without_values() -> None:
 
 async def test_activation_defaults_to_the_subprocess_runner_and_opens_no_session() -> None:
     """The seams default to the shipped runner, a lazily created ``aiohttp``
-    session and ``asyncio.sleep``: activation and ``prepare`` open nothing."""
+    session and ``asyncio.sleep``: activation and ``prepare`` open nothing.
+
+    Since P9 a ``prepare`` with ``synthesis.probe: true`` sends the probe
+    (R1 readiness), which needs the session; the "opens nothing" guarantee is
+    therefore pinned with ``probe: false``, the setting R1 defines as
+    "0 requests at prepare"."""
 
     import modules.audio_output as audio_output
 
@@ -1029,7 +1083,7 @@ async def test_activation_defaults_to_the_subprocess_runner_and_opens_no_session
     original = audio_output.SESSION_FACTORY
     audio_output.SESSION_FACTORY = lambda: created.append(1)  # type: ignore[assignment]
     try:
-        handle = await activate(context, _good_settings(), {})
+        handle = await activate(context, _with(_good_settings(), False, "synthesis", "probe"), {})
         await handle.prepare()
         assert isinstance(handle._runner, audio_output.SubprocessPlayerRunner)
         assert handle._sleeper is asyncio.sleep
@@ -1138,6 +1192,710 @@ def test_pyproject_ships_the_manifest() -> None:
 def test_module_names_no_platform() -> None:
     for path in (MODULE_DIR / "__init__.py", MANIFEST_PATH):
         assert "twitch" not in path.read_text(encoding="utf-8").lower()
+
+
+# --------------------------------------------------------------------------- #
+# P9 helpers: a 10 s segment, the call deadline at t = 100.0
+# --------------------------------------------------------------------------- #
+
+TEN_SECONDS = wav_bytes(10.0)
+"""16 kHz mono 16-bit: 320 000 data bytes, 32 000 B/s, ``duration_ms == 10 000``."""
+
+DEADLINE = 100.0
+
+
+class ParkedSleeper:
+    """The executor's timer, parked until a test fires it (R10 adoption)."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self._waiters: list[asyncio.Future[None]] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        await waiter
+
+    def fire(self) -> None:
+        for waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+
+def advance_to(clock: ManualClock, instant: float) -> None:
+    """Move the clock to *instant* exactly (``x + (t − x) == t`` for these values)."""
+
+    clock.advance(instant - clock.now)
+    assert clock.now == instant
+
+
+async def shutdown(h: Harness) -> None:
+    """Close the handle with every player let go and every grace passed, so a
+    failing assertion can never leave ``close`` joining a parked escalation."""
+
+    h.runner.release()
+    h.clock.advance(3600.0)
+    await asyncio.wait_for(h.handle.close(), 5.0)
+
+
+async def finished(task: "asyncio.Future[Any]") -> Any:
+    """Await *task*, failing (never hanging) if a regression leaves it parked."""
+
+    return await asyncio.wait_for(task, 5.0)
+
+
+async def spin() -> None:
+    await settle(60)
+
+
+async def blocked_speak(h: Harness, player: FakePlayer, limit: int = 128_000) -> asyncio.Task[Any]:
+    """Start ``audio.speak`` and wait until *player* accepted the header and *limit* data bytes."""
+
+    task = asyncio.ensure_future(h.speak(text="hello"))
+    await wait_until(lambda: player.accepted == 44 + limit)
+    return task
+
+
+def assert_playback_interruption(
+    observation: ActionObservation, status: str, played_ms: int = 4000
+) -> dict[str, Any]:
+    assert observation.status == status, observation
+    assert observation.result is None
+    error = dict(observation.error)
+    assert error["played_ms"] == played_ms
+    assert error["duration_ms"] == 10_000
+    assert error["played_ms"] <= error["duration_ms"]
+    if status == "timeout":
+        assert error["code"] == ERROR_TIMED_OUT
+        assert error["cause"] == CAUSE_PLAYBACK
+    else:
+        assert error["code"] == "cancelled"
+    # The module's own message, never the executor's generic record (R10).
+    assert "timed out with emission" not in error["message"]
+    assert "player stopped" in error["message"]
+    return error
+
+
+def assert_adopted_once(h: Harness, status: str) -> None:
+    outcomes = h.runtime.executor.outcomes()
+    assert list(outcomes) == [f"call-{h._calls}"]
+    completed = events_of(h.runtime.bus, "action.completed")
+    assert [event["payload"]["status"] for event in completed] == [status]
+
+
+# --------------------------------------------------------------------------- #
+# AC3 / AC38 module half: the player is stopped at the call deadline itself
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("path", ["watcher", "watcher-late-100.5", "executor-timer"])
+async def test_the_call_deadline_stops_the_player_and_the_module_record_is_adopted(
+    path: str,
+) -> None:
+    """AC3/AC38 (module half): a player that accepted the header and 128 000
+    of the 320 000 data bytes, then blocks and ignores termination; call
+    deadline ``t = 100.0``, ``stop_grace_seconds: 1``.
+
+    At ``t = 99.99`` nothing is stopped and the call runs; at the deadline
+    exactly one stop, the provider's record stamped ``>= 100.0`` and adopted by
+    the real executor — ``timeout`` cause ``playback`` with ``played_ms ==
+    4000`` and the module's message, one ``action.completed`` with ``status:
+    timeout``, one outcome, ``action_timeouts == 1`` — and at ``t = 101.0`` the
+    player is killed and its exit joined. Three ways the deadline is noticed:
+    the module's watcher with the executor's timer parked (stamp ``100.0``),
+    the watcher woken late (stamp ``100.5``), and the executor's timer first,
+    cancelling the provider at ``100.0`` (R10's ``CancelledError`` path)."""
+
+    executor_timer = ParkedSleeper()
+    player = FakePlayer(accept_limit=128_000, ignores_terminate=True)
+    h = await harness(
+        TEN_SECONDS,
+        players=(player,),
+        start=90.0,
+        executor_sleeper=executor_timer,
+        stop_grace_seconds=1,
+    )
+    h.deadline = DEADLINE
+    try:
+        task = await blocked_speak(h, player)
+        assert executor_timer.delays == [10.0]
+
+        advance_to(h.clock, 99.99)
+        await spin()
+        assert h.runner.stops == []
+        assert not task.done()
+
+        if path == "watcher":
+            advance_to(h.clock, 100.0)
+            stamp = 100.0
+        elif path == "watcher-late-100.5":
+            advance_to(h.clock, 100.5)
+            stamp = 100.5
+        else:
+            # The executor's timer notices first: the clock reads 100.0 but no
+            # sleeper on it has been woken yet.
+            h.clock.now = 100.0
+            executor_timer.fire()
+            stamp = 100.0
+        observation = await finished(task)
+        await spin()
+
+        assert h.runner.stops == [1]
+        (invocation,) = h.invocations
+        assert invocation.provider_completed_at == stamp
+        assert invocation.provider_completed_at >= DEADLINE
+        assert_playback_interruption(observation, "timeout")
+        assert_adopted_once(h, "timeout")
+        assert h.runtime.supervision.snapshot()[COUNTER_ACTION_TIMEOUTS] == 1
+
+        assert h.runner.kills == []
+        advance_to(h.clock, stamp + 1.0)
+        await wait_until(lambda: h.context.tasks.active == 0)
+        assert h.runner.kills == [1]
+        assert h.runner.kinds() == [("start", 1), ("stop", 1), ("kill", 1), ("exit", 1)]
+    finally:
+        await shutdown(h)
+
+
+async def test_a_drain_started_at_the_deadline_is_an_adopted_cancelled_record() -> None:
+    """AC38: a drain started at ``t = 100.0`` stops the player with status
+    ``cancelled`` — the first trigger fixes the status — and the record,
+    stamped at the deadline, is adopted with ``played_ms == 4000`` and 1 stop;
+    the drain joins the escalation within its budget once the grace passed."""
+
+    player = FakePlayer(accept_limit=128_000, ignores_terminate=True)
+    h = await harness(TEN_SECONDS, players=(player,), start=90.0, stop_grace_seconds=1)
+    h.deadline = DEADLINE
+    try:
+        task = await blocked_speak(h, player)
+        advance_to(h.clock, 99.99)
+        await spin()
+        h.clock.now = 100.0  # the drain begins before the watcher is woken
+        drain = asyncio.ensure_future(h.handle.drain(5.0))
+        observation = await finished(task)
+        await spin()
+
+        assert_playback_interruption(observation, "cancelled")
+        assert h.invocations[0].provider_completed_at == 100.0
+        assert_adopted_once(h, "cancelled")
+        assert h.runner.stops == [1]
+        assert not drain.done()
+
+        advance_to(h.clock, 101.0)
+        await finished(drain)
+        assert h.runner.kills == [1]
+        assert h.context.tasks.active == 0
+        assert h.runner.stops == [1]
+    finally:
+        await shutdown(h)
+
+
+async def test_a_cancellation_before_the_deadline_is_cancelled_with_played_ms() -> None:
+    """AC3: a ``CancelledError`` reaching the provider at ``t = 50.0`` (before
+    its deadline) is caught: one stop, and the returned record — adopted by the
+    executor — is ``cancelled`` with ``played_ms == 4000``."""
+
+    player = FakePlayer(accept_limit=128_000)
+    h = await harness(TEN_SECONDS, players=(player,), start=30.0, stop_grace_seconds=1)
+    h.deadline = DEADLINE  # expiry = min(100, 30 + 40) = 70
+    try:
+        task = await blocked_speak(h, player)
+        advance_to(h.clock, 50.0)
+        await spin()
+        assert h.runner.stops == []
+        h.provider_tasks[0].cancel()
+        observation = await finished(task)
+        await spin()
+
+        assert_playback_interruption(observation, "cancelled")
+        assert_adopted_once(h, "cancelled")
+        assert h.runner.stops == [1]
+        assert h.runner.kills == []
+        assert h.runtime.supervision.snapshot().get(COUNTER_ACTION_TIMEOUTS, 0) == 0
+    finally:
+        await shutdown(h)
+
+
+async def test_a_player_exiting_0_just_before_the_deadline_is_a_success() -> None:
+    """AC38: no lead — a player that accepted everything and exits 0 at
+    ``t = 99.95`` (``expiry − 0.05 s``) ends ``success`` with ``played_ms ==
+    duration_ms`` and 0 stops."""
+
+    player = FakePlayer(holds_exit=True)
+    h = await harness(TEN_SECONDS, players=(player,), start=90.0)
+    h.deadline = DEADLINE
+    try:
+        task = asyncio.ensure_future(h.speak(text="hello"))
+        await wait_until(lambda: player.stdin_closed)
+        advance_to(h.clock, 99.95)
+        await spin()
+        assert not task.done()
+        player.release()
+        observation = await finished(task)
+
+        assert observation.status == "success", observation.error
+        assert observation.result["played_ms"] == observation.result["duration_ms"] == 10_000
+        assert h.runner.stops == []
+        assert h.invocations[0].provider_completed_at == 99.95
+    finally:
+        await shutdown(h)
+
+
+async def test_the_stop_grace_runs_after_the_stop_never_before_the_deadline() -> None:
+    """AC38/AC41: with ``stop_grace_seconds: 5`` nothing is stopped at
+    ``t = 99.99`` — the grace shortens nothing — the stop comes at ``100.0``
+    and the kill of a player ignoring termination at ``105.0``."""
+
+    player = FakePlayer(accept_limit=128_000, ignores_terminate=True)
+    h = await harness(TEN_SECONDS, players=(player,), start=90.0, stop_grace_seconds=5)
+    h.deadline = DEADLINE
+    try:
+        task = await blocked_speak(h, player)
+        advance_to(h.clock, 99.99)
+        await spin()
+        assert h.runner.stops == []
+        advance_to(h.clock, 100.0)
+        assert_playback_interruption(await finished(task), "timeout")
+        await spin()
+        assert h.runner.stops == [1]
+        advance_to(h.clock, 104.99)
+        await spin()
+        assert h.runner.kills == []
+        advance_to(h.clock, 105.0)
+        await wait_until(lambda: h.runner.kills == [1])
+        await wait_until(lambda: h.context.tasks.active == 0)
+    finally:
+        await shutdown(h)
+
+
+async def test_played_ms_counts_accepted_data_bytes_rounded_down_and_capped() -> None:
+    """AC3: 128 031 accepted data bytes → ``played_ms == 4000`` (rounded down);
+    everything accepted and exit 1 → ``playback_failed`` with ``10000``;
+    ``played_ms`` never exceeds ``duration_ms``, whatever the total."""
+
+    player = FakePlayer(accept_limit=128_031)
+    h = await harness(TEN_SECONDS, TEN_SECONDS, players=(player, FakePlayer(exit_code=1)))
+    try:
+        task = await blocked_speak(h, player, limit=128_031)
+        player.release()
+        error = assert_failure(await finished(task), "error", ERROR_PLAYBACK_FAILED)
+        assert error["played_ms"] == 4000
+
+        error = assert_failure(await h.speak(text="hello"), "error", ERROR_PLAYBACK_FAILED)
+        assert error["played_ms"] == error["duration_ms"] == 10_000
+        assert h.runner.stops == []
+    finally:
+        await shutdown(h)
+
+    info = parse_wav(TEN_SECONDS)
+    for total in (0, 20, 44, 44 + 128_031, len(TEN_SECONDS), 10 * len(TEN_SECONDS)):
+        assert 0 <= info.played_ms(total) <= info.duration_ms
+
+
+# --------------------------------------------------------------------------- #
+# AC4: per-output serialization and ownership (finding P5)
+# --------------------------------------------------------------------------- #
+
+
+async def test_three_calls_on_one_output_play_in_turn_and_the_third_is_busy() -> None:
+    """AC4: with ``max_waiters: 1`` the first call plays, the second starts
+    only after the first player exited (runner order), the third is
+    ``refused resource_busy`` with 0 synthesis requests."""
+
+    first = FakePlayer(holds_exit=True)
+    h = await harness(players=(first, FakePlayer()), max_waiters=1)
+    try:
+        one = asyncio.ensure_future(h.speak(text="one"))
+        two = asyncio.ensure_future(h.speak(text="two"))
+        three = asyncio.ensure_future(h.speak(text="three"))
+
+        refused = await finished(three)
+        assert_failure(refused, "refused", ERROR_RESOURCE_BUSY)
+        await wait_until(lambda: first.stdin_closed)
+        await spin()
+        assert len(h.runner.starts) == 1
+        assert [body["input"] for body in h.transport.bodies()] == ["one", "two"]
+
+        first.release()
+        assert (await finished(one)).status == "success"
+        assert (await finished(two)).status == "success"
+        kinds = h.runner.kinds()
+        assert kinds.index(("exit", 1)) < kinds.index(("start", 2))
+        assert len(h.transport.requests) == 2
+    finally:
+        await shutdown(h)
+
+
+async def test_two_outputs_play_concurrently() -> None:
+    """AC4: calls on two different outputs both start before either exits."""
+
+    speakers, headset = FakePlayer(holds_exit=True), FakePlayer(holds_exit=True)
+    h = await harness(players=(speakers, headset))
+    try:
+        one = asyncio.ensure_future(h.speak(text="one"))
+        two = asyncio.ensure_future(h.speak(text="two", output="headset"))
+        await wait_until(lambda: len(h.runner.starts) == 2)
+        assert [kind for kind, _ in h.runner.kinds()] == ["start", "start"]
+        assert h.runner.starts == [PLAYER_ARGV, HEADSET_ARGV]
+        await wait_until(lambda: speakers.stdin_closed and headset.stdin_closed)
+        h.runner.release()
+        assert (await finished(one)).status == (await finished(two)).status == "success"
+    finally:
+        await shutdown(h)
+
+
+@pytest.mark.parametrize("interruption", ["cancelled", "timeout"])
+async def test_a_stopped_player_owns_its_output_until_its_kill_and_exit(
+    interruption: str,
+) -> None:
+    """Finding P5: the first call's player ignores termination; a second call
+    waits on the same output. When the first is cancelled — or, in the twin
+    case, reaches its deadline at ``t = 100.0`` — its observation is published
+    at once with its ``played_ms`` while the runner still records 1 start; a
+    third call arriving meanwhile is ``refused resource_busy``; only after the
+    grace passed, the player was killed and its ``wait`` returned does the
+    second ``start`` happen (``kill`` of the first before ``start`` of the
+    second)."""
+
+    first = FakePlayer(accept_limit=128_000, ignores_terminate=True)
+    h = await harness(
+        TEN_SECONDS, TEN_SECONDS, players=(first, FakePlayer()), start=90.0, stop_grace_seconds=1
+    )
+    try:
+        h.deadline = DEADLINE
+        one = await blocked_speak(h, first)
+        h.deadline = 10_000.0  # the second call's own deadline is far away
+        two = asyncio.ensure_future(h.speak(text="two"))
+        await wait_until(lambda: len(h.transport.requests) == 2)
+        await spin()
+
+        if interruption == "cancelled":
+            advance_to(h.clock, 95.0)
+            h.provider_tasks[0].cancel()
+        else:
+            advance_to(h.clock, 100.0)
+        observation = await finished(one)
+        assert_playback_interruption(observation, interruption)
+        await spin()
+        assert h.runner.stops == [1]
+        assert len(h.runner.starts) == 1
+        assert not two.done()
+
+        three = await h.speak(text="three")
+        assert_failure(three, "refused", ERROR_RESOURCE_BUSY)
+        assert len(h.transport.requests) == 2
+
+        h.clock.advance(1.0)  # stop_grace_seconds
+        await wait_until(lambda: len(h.runner.starts) == 2)
+        kinds = h.runner.kinds()
+        assert kinds[:4] == [("start", 1), ("stop", 1), ("kill", 1), ("exit", 1)]
+        assert kinds.index(("kill", 1)) < kinds.index(("start", 2))
+        assert (await finished(two)).status == "success"
+    finally:
+        await shutdown(h)
+
+
+async def test_a_drain_during_the_escalation_ends_waiters_and_joins_within_its_budget() -> None:
+    """Finding P5 / drain: while a stopped player's escalation owns the
+    output, ``drain`` ends the waiting call ``cancelled`` with 0 starts and
+    returns once the clock passes the grace — within its own budget."""
+
+    first = FakePlayer(accept_limit=128_000, ignores_terminate=True)
+    h = await harness(TEN_SECONDS, TEN_SECONDS, players=(first,), start=90.0, stop_grace_seconds=1)
+    try:
+        one = await blocked_speak(h, first)
+        two = asyncio.ensure_future(h.speak(text="two"))
+        await wait_until(lambda: len(h.transport.requests) == 2)
+        h.provider_tasks[0].cancel()
+        assert_playback_interruption(await finished(one), "cancelled")
+        await spin()
+
+        drain = asyncio.ensure_future(h.handle.drain(5.0))
+        waiting = await finished(two)
+        assert waiting.status == "cancelled"
+        assert waiting.error["played_ms"] == 0
+        await spin()
+        assert not drain.done()
+        h.clock.advance(1.0)
+        await finished(drain)
+        assert h.clock.now == 91.0
+        assert h.runner.kills == [1]
+        assert len(h.runner.starts) == 1
+        assert h.context.tasks.active == 0
+    finally:
+        await shutdown(h)
+
+
+async def test_a_cancelled_escalation_kills_the_player_and_keeps_its_output_until_close() -> None:
+    """Finding A1: the registry cancels an escalation mid-grace (its drain
+    budget ran out). The player that ignored termination is killed at once,
+    and the output stays owned — a waiting call does not start beside it —
+    until ``close`` reaped the player and freed the output."""
+
+    first = FakePlayer(accept_limit=128_000, ignores_terminate=True)
+    h = await harness(TEN_SECONDS, players=(first,), start=90.0, stop_grace_seconds=1)
+    try:
+        one = await blocked_speak(h, first)
+        h.provider_tasks[0].cancel()
+        assert_playback_interruption(await finished(one), "cancelled")
+        await spin()
+        assert h.runner.stops == [1]
+        assert h.runner.kills == []
+
+        (escalation,) = tuple(h.handle._escalations)
+        escalation.cancel()
+        await asyncio.wait({escalation})
+        assert h.runner.kills == [1]
+        assert not first.alive
+        slot = h.handle._slots["speakers"]
+        assert slot.lock.locked()
+        assert slot.occupants == 1
+
+        await asyncio.wait_for(h.handle.close(), 5.0)
+        assert not slot.lock.locked()
+        assert slot.occupants == 0
+        assert len(h.runner.starts) == 1
+    finally:
+        await shutdown(h)
+
+
+class _GatedStartRunner(RecordingPlayerRunner):
+    """A runner whose ``start`` parks until ``gate`` is set."""
+
+    def __init__(self, *players: FakePlayer, clock: ManualClock) -> None:
+        super().__init__(*players, clock=clock)
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def start(self, argv: Sequence[str]) -> FakePlayer:
+        self.entered.set()
+        await self.gate.wait()
+        return await super().start(argv)
+
+
+@pytest.mark.parametrize("hook", ["drain", "close"])
+async def test_shutdown_joins_a_player_whose_start_is_pending(hook: str) -> None:
+    """Finding A2: ``drain``/``close`` begins while ``runner.start`` is still
+    pending. It does not return before that start returned; the player it
+    yields is stopped at once and its escalation joined, so nothing plays on
+    after shutdown finished."""
+
+    player = FakePlayer(accept_limit=128_000)
+    h = await harness(TEN_SECONDS, players=(player,), start=90.0, stop_grace_seconds=1)
+    gated = _GatedStartRunner(player, clock=h.clock)
+    h.runner = gated
+    h.handle._runner = gated
+    try:
+        call = asyncio.ensure_future(h.speak(text="hello"))
+        await asyncio.wait_for(gated.entered.wait(), 5.0)
+
+        ending = asyncio.ensure_future(
+            h.handle.drain(5.0) if hook == "drain" else h.handle.close()
+        )
+        await spin()
+        assert not ending.done()
+
+        gated.gate.set()
+        await finished(ending)
+        assert gated.starts == [PLAYER_ARGV]
+        assert gated.stops == [1]
+        assert not player.alive
+        assert not h.handle._escalations
+        assert (await finished(call)).status == "cancelled"
+    finally:
+        await shutdown(h)
+
+
+# --------------------------------------------------------------------------- #
+# AC5 / AC29: readiness at prepare and the required policy
+# --------------------------------------------------------------------------- #
+
+MISSING_PLAYER = "/nonexistent-dir-7c1/player-missing"
+MISSING_OUTPUTS = {
+    "speakers": {"player": {"argv": [MISSING_PLAYER, "-"]}},
+    "headset": {"player": {"argv": ["player-missing-on-path-7c1"]}},
+}
+
+
+def degraded_events(h: Harness) -> list[dict[str, Any]]:
+    return [event["payload"] for event in events_of(h.runtime.bus, "module.degraded")]
+
+
+def assert_value_free(h: Harness, *texts: str) -> None:
+    for value in (ENDPOINT, "speech.invalid", API_KEY, MISSING_PLAYER, "player-missing"):
+        assert all(value not in text for text in trace_texts(h.runtime.bus)), value
+        assert all(value not in text for text in texts), value
+
+
+async def test_a_non_executable_player_leaves_both_actions_unbound() -> None:
+    """AC5/AC29: no output's ``argv[0]`` resolves → both actions absent from
+    the registered-ready view, present in the discovered view, 1
+    ``module.degraded`` with ``capabilities: [audio.speak, audio.play]`` and a
+    value-free reason; no probe is sent; a call is ``refused
+    provider_not_ready`` with 0 provider invocations."""
+
+    h = await harness(synthesis={"probe": True}, outputs=MISSING_OUTPUTS)
+    try:
+        ready = h.runtime.actions.registered_ready()
+        discovered = h.runtime.actions.discovered()
+        for action in (SPEAK_ACTION, PLAY_ACTION):
+            assert action not in ready
+            assert action in discovered
+        (degraded,) = degraded_events(h)
+        assert degraded["capabilities"] == [SPEAK_ACTION, PLAY_ACTION]
+        assert h.transport.requests == []
+
+        observation = await h.speak(text="hello")
+        assert_failure(observation, "refused", "provider_not_ready")
+        assert h.runtime.executor.provider_invocations == 0
+        assert h.runner.starts == []
+        assert_value_free(h, degraded["reason"])
+    finally:
+        await shutdown(h)
+
+
+@pytest.mark.parametrize("failure", ["exception", "timeout"])
+async def test_a_failing_probe_leaves_speak_unbound_and_play_bound(failure: str) -> None:
+    """AC5/AC29: the probe synthesis raising, or not answering within
+    ``timeout_seconds`` on the clock (it never outlives it), leaves
+    ``audio.speak`` unbound and ``audio.play`` bound and ready, with 1
+    ``module.degraded`` naming ``["audio.speak"]`` whose reason carries
+    neither the endpoint nor the key; no player is started by the probe.
+
+    A call to the unbound ``audio.speak`` reaches no provider (0
+    invocations). The registry's readiness is per module, so with
+    ``audio.play`` ready it answers ``error no_provider`` rather than
+    ``refused provider_not_ready`` — see the step report."""
+
+    answer: Any = ConnectionError(f"cannot reach {ENDPOINT} with {API_KEY}")
+    if failure == "timeout":
+        answer = HELD
+    h = await harness(answer, synthesis={"probe": True, "timeout_seconds": 10}, prepare=False)
+    try:
+        preparing = asyncio.ensure_future(h.handle.prepare())
+        if failure == "timeout":
+            await wait_until(lambda: h.transport.held == 1)
+            h.clock.advance(9.99)
+            await spin()
+            assert not preparing.done()
+            h.clock.advance(0.01)
+        await asyncio.wait_for(preparing, 1.0)
+        assert h.transport.held == 0
+        assert len(h.transport.requests) == 1
+        assert h.transport.bodies()[0]["input"] == "ready"
+        assert h.runner.starts == []
+
+        ready = h.runtime.actions.registered_ready()
+        assert SPEAK_ACTION not in ready
+        assert PLAY_ACTION in ready
+        assert SPEAK_ACTION in h.runtime.actions.discovered()
+        (degraded,) = degraded_events(h)
+        assert degraded["capabilities"] == [SPEAK_ACTION]
+        assert_value_free(h, degraded["reason"])
+
+        observation = await h.speak(text="hello")
+        assert observation.status in ("refused", "error")
+        assert observation.error["code"] == "no_provider"
+        assert h.runtime.executor.provider_invocations == 0
+    finally:
+        await shutdown(h)
+
+
+async def test_a_succeeding_probe_binds_both_actions_without_degradation() -> None:
+    """AC5: one probe synthesis of ``probe_text`` returning a parseable WAV →
+    both actions bound, no ``module.degraded``, no playback."""
+
+    h = await harness(synthesis={"probe": True})
+    try:
+        assert [body["input"] for body in h.transport.bodies()] == ["ready"]
+        assert {SPEAK_ACTION, PLAY_ACTION} <= set(h.runtime.actions.registered_ready())
+        assert degraded_events(h) == []
+        assert h.runner.starts == []
+    finally:
+        await shutdown(h)
+
+
+@pytest.mark.parametrize("required", [False, True])
+async def test_probe_false_sends_nothing_at_prepare_and_binds_both(required: bool) -> None:
+    """AC5: ``probe: false`` with a usable output → 0 requests at prepare,
+    both actions bound, no ``module.degraded`` — with ``required: true`` too —
+    and the first ``audio.speak`` against a raising transport is ``error
+    tts_unavailable`` with 0 player starts."""
+
+    h = await harness(
+        ConnectionError("down"), synthesis={"probe": False}, required=required
+    )
+    try:
+        assert h.transport.requests == []
+        assert {SPEAK_ACTION, PLAY_ACTION} <= set(h.runtime.actions.registered_ready())
+        assert degraded_events(h) == []
+        assert_failure(await h.speak(text="hello"), "error", ERROR_TTS_UNAVAILABLE)
+        assert h.runner.starts == []
+        assert_value_free(h)
+    finally:
+        await shutdown(h)
+
+
+async def test_required_with_a_non_executable_player_fails_prepare_naming_the_field() -> None:
+    """AC29: ``required: true`` and an output whose player does not resolve →
+    ``prepare`` raises naming the module and ``outputs.<name>.player``, never
+    the path; nothing is bound or ready and no transport was opened."""
+
+    h = await harness(
+        synthesis={"probe": True},
+        outputs={
+            "speakers": {"player": {"argv": list(PLAYER_ARGV)}},
+            "headset": {"player": {"argv": [MISSING_PLAYER]}},
+        },
+        required=True,
+        prepare=False,
+    )
+    with pytest.raises(AudioOutputModuleError) as refused:
+        await h.handle.prepare()
+    message = str(refused.value)
+    assert message == "audio_output prepare: field 'outputs.headset.player' unavailable"
+    assert_value_free(h, message)
+    assert SPEAK_ACTION not in h.runtime.actions.registered_ready()
+    assert h.transport.factory_calls == 0
+    await h.handle.close()
+
+
+async def test_required_with_a_failing_probe_fails_prepare_and_closes_the_transport() -> None:
+    """AC29: ``required: true`` with ``probe: true`` and an unreachable
+    endpoint → ``prepare`` raises naming ``synthesis.endpoint``, the key and
+    endpoint in no diagnostic, and the transport it opened is closed."""
+
+    h = await harness(
+        ConnectionError(f"{ENDPOINT} {API_KEY}"),
+        synthesis={"probe": True},
+        required=True,
+        prepare=False,
+    )
+    with pytest.raises(AudioOutputModuleError) as refused:
+        await h.handle.prepare()
+    message = str(refused.value)
+    assert message == "audio_output prepare: field 'synthesis.endpoint' unavailable"
+    assert_value_free(h, message)
+    assert h.transport.close_calls == 1
+    assert PLAY_ACTION not in h.runtime.actions.registered_ready()
+    await h.handle.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC41: no lead, no margin, no early stop
+# --------------------------------------------------------------------------- #
+
+
+def test_no_lead_or_margin_exists_in_the_module_or_its_manifest() -> None:
+    """AC41: the module and its manifest name no adoption lead, deadline
+    margin, early stop or deadline lead — the player is stopped at ``expiry``."""
+
+    pattern = re.compile(
+        r"adoption_lead|lead_seconds|deadline_margin|early_stop|deadline_lead", re.IGNORECASE
+    )
+    for path in (MODULE_DIR / "__init__.py", MANIFEST_PATH):
+        assert pattern.findall(path.read_text(encoding="utf-8")) == [], path
 
 
 # --------------------------------------------------------------------------- #

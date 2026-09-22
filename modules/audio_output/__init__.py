@@ -43,9 +43,42 @@ replaces the asyncio-subprocess runner of decision 2, ``_sleeper`` the sleep
 the synthesis bound is raced against. They are read from *settings* and never
 from a configuration file.
 
+**The call deadline stops the player, nothing earlier** (R10, decision 1).
+At entry a call computes ``expiry = min(call.deadline, clock() +
+spec.timeout_seconds)`` — the executor's own arithmetic, and the only
+deadline this module knows: no lead, margin or early stop is subtracted from
+it. While a player runs, a watcher parked on the injected sleeper until
+``expiry`` stops it (terminate now, kill ``stop_grace_seconds`` *after* the
+stop) and the call returns at once ``timeout`` with cause ``playback`` and
+the ``played_ms`` reached. A ``CancelledError`` reaching the call during
+playback is caught, the same stop is issued and the record is returned
+normally — ``timeout`` when the clock has reached ``expiry`` (the deadline
+interrupted the playback, whichever of the watcher or the executor's timer
+noticed first), ``cancelled`` otherwise; ``drain`` stops a running player
+with status ``cancelled``. One stop per playback: the first trigger fixes
+the status. The executor adopts such a record even when it is stamped at or
+after the deadline (R10).
+
+**One player per output, owned until it exited** (R1, finding P5). Each
+output has one lock, held from ``start`` until ``wait`` returned — by the
+call on a normal or failed exit, by a supervised escalation task (terminate
+→ grace → kill → ``wait``) after a stop — so an interrupted call's
+observation is published at once while its successor starts only once the
+player really exited. A call arriving while the output is busy waits behind
+at most ``max_waiters`` others; one more is ``refused resource_busy`` before
+any synthesis request.
+
 Lifecycle: the manifest declares no role, so the handle takes part in
-``prepare`` — which binds both actions and marks the module ready — and in
-``close``, which withdraws readiness and releases the transport.
+``prepare``, ``drain`` and ``close``. ``prepare`` keeps the outputs whose
+player resolves to an executable and, with ``synthesis.probe: true``, sends
+one bounded probe synthesis: ``audio.play`` is bound when an output is
+usable, ``audio.speak`` when in addition the probe succeeded (or is off);
+every unbound action is reported once through ``module.degraded`` with a
+value-free reason, and ``required: true`` turns an unusable dependency into
+a failed ``prepare`` naming the field. ``drain`` ends waiting calls
+``cancelled``, stops running players and joins their escalations within its
+budget on the clock; ``close`` withdraws readiness, joins what remains and
+releases the transport.
 """
 
 from __future__ import annotations
@@ -54,8 +87,10 @@ import asyncio
 import inspect
 import math
 import os
+import shutil
 import signal
 import struct
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,7 +98,7 @@ from typing import Any
 
 import yaml
 
-from core.actions import ERROR_INVALID_ARGUMENTS, ERROR_TIMED_OUT
+from core.actions import ERROR_CANCELLED, ERROR_INVALID_ARGUMENTS, ERROR_TIMED_OUT
 from core.contracts import ActionObservation, ActionSpec, Destination
 
 try:  # Keep the module importable for transport-injected contract tests.
@@ -97,6 +132,7 @@ READ_CHUNK_BYTES = 65_536
 
 PLAYBACK_COMPLETED = "completed"
 CAUSE_SYNTHESIS = "synthesis"
+CAUSE_PLAYBACK = "playback"
 
 ERROR_VOICE_NOT_ALLOWED = "voice_not_allowed"
 ERROR_OUTPUT_NOT_ALLOWED = "output_not_allowed"
@@ -107,6 +143,7 @@ ERROR_AUDIO_TOO_LARGE = "audio_too_large"
 ERROR_SPEECH_TOO_LONG = "speech_too_long"
 ERROR_CLIP_UNREADABLE = "clip_unreadable"
 ERROR_PLAYBACK_FAILED = "playback_failed"
+ERROR_RESOURCE_BUSY = "resource_busy"
 _ERROR_PROVIDER_CLOSED = "provider_closed"
 
 #: The reserved setting the entry point hands its accepted ``limits`` block
@@ -601,7 +638,9 @@ class SubprocessPlayerRunner:
     accepted (or what sits in the pipe buffer); ``close_stdin`` closes the
     pipe and raises if it broke before the buffered tail was delivered, ``wait`` reaps the exit status. ``stop(process, grace_seconds)``
     terminates the player's process group now and kills it once the grace
-    has passed on the injected sleeper, then reaps it.
+    has passed on the injected sleeper, then reaps it. ``kill(process)``
+    kills the group at once, without awaiting anything — the last resort of
+    an escalation cancelled before the exit was observed.
     """
 
     def __init__(
@@ -649,6 +688,10 @@ class SubprocessPlayerRunner:
         if process.returncode is None:
             _signal_group(process, signal.SIGKILL)
         await process.wait()
+
+    def kill(self, process: Any) -> None:
+        if process.returncode is None:
+            _signal_group(process, signal.SIGKILL)
 
 
 def _signal_group(process: Any, signum: int) -> None:
@@ -708,8 +751,79 @@ class _PlayProvider:
         return await self._module._invoke_play(invocation)
 
 
+class _OutputSlot:
+    """One output's serialization state (R1, finding P5).
+
+    ``lock`` is held from the player's ``start`` until its ``wait`` returned,
+    by whoever observes that exit: the call on a normal or failed exit, the
+    escalation task after a stop. ``occupants`` counts the calls admitted on
+    the output — synthesising, waiting or playing — plus an escalation that
+    still owns the player, so the admission rule reads one number.
+    """
+
+    __slots__ = ("lock", "occupants")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.occupants = 0
+
+
+class _Claim:
+    """One call's place on an output, from admission to the player's exit.
+
+    The call releases what it holds on every exit path — its occupancy, and
+    the lock when it observed the player's exit itself — unless a stop handed
+    both to the escalation task, which releases them once ``wait`` returned.
+    ``interrupt`` is resolved by ``drain``/``close`` to end a call that has
+    not started playing ``cancelled``.
+    """
+
+    __slots__ = ("counted", "handed_off", "interrupt", "owns_lock", "slot")
+
+    def __init__(self, slot: _OutputSlot) -> None:
+        self.slot = slot
+        self.interrupt: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.counted = True
+        self.owns_lock = False
+        self.handed_off = False
+        slot.occupants += 1
+
+    def release(self) -> None:
+        if self.handed_off:
+            return
+        if self.owns_lock:
+            self.owns_lock = False
+            self.slot.lock.release()
+        if self.counted:
+            self.counted = False
+            self.slot.occupants -= 1
+
+    def release_to_escalation(self) -> None:
+        """The escalation task observed the exit: release what the call handed it."""
+
+        if self.owns_lock:
+            self.owns_lock = False
+            self.slot.lock.release()
+        if self.counted:
+            self.counted = False
+            self.slot.occupants -= 1
+
+
+class _Playback:
+    """One running player: its accepted total and the one stop it may get."""
+
+    __slots__ = ("accepted", "claim", "interrupt", "process", "status")
+
+    def __init__(self, process: Any, claim: _Claim) -> None:
+        self.process = process
+        self.claim = claim
+        self.accepted = 0
+        self.status: str | None = None
+        self.interrupt: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+
 class AudioOutputModule:
-    """The v2 handle: bind both actions at ``prepare``, synthesise and play on demand."""
+    """The v2 handle: probe and bind at ``prepare``, synthesise and play on demand."""
 
     def __init__(
         self,
@@ -721,6 +835,9 @@ class AudioOutputModule:
         sleeper: Sleeper,
     ) -> None:
         self._actions = context.actions
+        self._supervision = getattr(context, "supervision", None)
+        self._tasks = getattr(context, "tasks", None)
+        self._clock: Callable[[], float] = getattr(context, "clock", None) or time.monotonic
         self._settings = settings
         self._transport_factory = transport_factory
         self._runner = runner
@@ -728,8 +845,21 @@ class AudioOutputModule:
         self._session: Any | None = None
         self._speak_provider = _SpeakProvider(self)
         self._play_provider = _PlayProvider(self)
-        self._stops: set[asyncio.Future[Any]] = set()
+        self._slots: dict[str, _OutputSlot] = {}
+        self._usable: frozenset[str] = frozenset(settings.outputs)
+        self._claims: set[_Claim] = set()
+        self._playbacks: set[_Playback] = set()
+        self._escalations: set[asyncio.Future[Any]] = set()
+        # One future per ``runner.start`` in flight, resolved once its player
+        # is registered (and stopped, when a drain began meanwhile): shutdown
+        # joins them so no player starts after it finished (finding A2).
+        self._starting: set[asyncio.Future[None]] = set()
+        # Players whose escalation was cancelled before their exit was
+        # observed: killed at once, still owning their output; ``close``
+        # reaps them (finding A1).
+        self._unreaped: set[_Playback] = set()
         self._prepared = False
+        self._draining = False
         self._closed = False
 
     @property
@@ -739,39 +869,172 @@ class AudioOutputModule:
     # -- lifecycle hooks ---------------------------------------------------- #
 
     async def prepare(self) -> None:
-        """Bind both actions and mark the module ready.
+        """Check the dependencies, bind what they allow, report what they do not.
 
-        No request is sent and no player is started here: the synthesis
-        endpoint is taken as unverified (``probe: false`` semantics), so an
-        unreachable one surfaces on the first call as ``tts_unavailable``.
+        An output whose player's ``argv[0]`` does not resolve to an
+        executable is dropped from the usable set. With ``synthesis.probe:
+        true`` one probe synthesis of ``probe_text`` — bounded by
+        ``timeout_seconds`` on the sleeper, never played — must answer a
+        parseable WAV; with ``probe: false`` no request is sent and the
+        endpoint is left unverified (it surfaces on the first call as
+        ``tts_unavailable``). ``audio.play`` is bound when an output is
+        usable, ``audio.speak`` when in addition the probe succeeded or is
+        off; the module is marked ready when at least one is bound, and the
+        unbound ones are reported once through ``module.degraded`` with a
+        value-free reason. With no usable output both actions are still
+        registered but the module is not ready, so a call is refused
+        ``provider_not_ready`` before the provider. ``required: true`` turns
+        an unusable output or a failed probe into a failed ``prepare`` naming
+        the field.
         """
 
         if self._prepared or self._closed:
             return
-        for name, provider in (
-            (SPEAK_ACTION, self._speak_provider),
-            (PLAY_ACTION, self._play_provider),
+        settings = self._settings
+        usable = tuple(
+            name for name, argv in settings.outputs.items() if _resolves(argv[0])
+        )
+        if settings.required:
+            for name in settings.outputs:
+                if name not in usable:
+                    raise AudioOutputModuleError(
+                        f"{MODULE_NAME} prepare: field "
+                        f"'{_SETTING_OUTPUTS}.{name}.player' unavailable"
+                    )
+        self._usable = frozenset(usable)
+        self._slots = {name: _OutputSlot() for name in usable}
+
+        synthesis_ok = True
+        if settings.probe and usable:
+            synthesis_ok = await self._probe()
+        elif settings.probe:
+            synthesis_ok = False
+        if settings.required and not synthesis_ok:
+            await self._close_session()
+            raise AudioOutputModuleError(
+                f"{MODULE_NAME} prepare: field '{_SETTING_SYNTHESIS}.endpoint' unavailable"
+            )
+
+        speak = bool(usable) and synthesis_ok
+        play = bool(usable)
+        for name, provider, bind in (
+            (SPEAK_ACTION, self._speak_provider, speak),
+            (PLAY_ACTION, self._play_provider, play),
         ):
             spec = _declared_spec(name)
             try:
-                self._actions.register(spec, provider, provider_name=PROVIDER_NAME)
+                if bind or not usable:
+                    # With no usable output the module stays not ready, so a
+                    # registered action is refused before its provider.
+                    self._actions.register(spec, provider, provider_name=PROVIDER_NAME)
+                else:
+                    self._actions.declare(spec)
             except Exception:
                 raise AudioOutputModuleError(
                     f"{MODULE_NAME} prepare: action binding failed"
                 ) from None
-        self._actions.mark_ready()
         self._prepared = True
 
+        unbound = [
+            name for name, bound in ((SPEAK_ACTION, speak), (PLAY_ACTION, play)) if not bound
+        ]
+        if unbound:
+            reason = (
+                f"{MODULE_NAME}: no output player resolves to an executable"
+                if not usable
+                else f"{MODULE_NAME}: speech synthesis is unavailable"
+            )
+            await self._report_degraded(reason, unbound)
+        if speak or play:
+            self._actions.mark_ready()
+
+    async def drain(self, deadline_seconds: float) -> None:
+        """End waiting calls, stop running players, join their escalations.
+
+        A call that has not started playing ends ``cancelled`` with 0 player
+        starts; a running player is stopped (status ``cancelled``, the
+        ``played_ms`` it reached) and its escalation joined within
+        *deadline_seconds* on the clock. What is left is joined by
+        :meth:`close`.
+        """
+
+        self._draining = True
+        self._interrupt_all()
+        await self._join_escalations(max(float(deadline_seconds), 0.0))
+
     async def close(self) -> None:
-        """Withdraw readiness, join the stops in flight, release the transport."""
+        """Withdraw readiness, stop what still plays, join it, release the transport."""
 
         if self._closed:
             return
         self._closed = True
+        self._draining = True
         if self._prepared:
             self._actions.mark_not_ready()
-        if self._stops:
-            await asyncio.wait(set(self._stops))
+        self._interrupt_all()
+        await self._join_escalations(None)
+        await self._reap_unreaped()
+        await self._close_session()
+
+    def _interrupt_all(self) -> None:
+        for claim in tuple(self._claims):
+            if not claim.interrupt.done():
+                claim.interrupt.set_result(None)
+        for playback in tuple(self._playbacks):
+            self._stop(playback, "cancelled")
+
+    def _pending_stops(self) -> set[asyncio.Future[Any]]:
+        """The escalations still running and the starts not yet registered.
+
+        Read afresh on every turn: a start that returns hands its player to a
+        new escalation, which the join must then wait for too.
+        """
+
+        return {
+            future for future in self._escalations | self._starting if not future.done()
+        }
+
+    async def _join_escalations(self, budget: float | None) -> None:
+        pending = self._pending_stops()
+        if not pending:
+            return
+        if budget is None:
+            while pending:
+                await asyncio.wait(pending)
+                pending = self._pending_stops()
+            return
+        timer = asyncio.ensure_future(self._sleeper(budget))
+        try:
+            while pending and not timer.done():
+                await asyncio.wait(pending | {timer}, return_when=asyncio.FIRST_COMPLETED)
+                pending = self._pending_stops()
+        finally:
+            await _settle(timer)
+
+    async def _reap_unreaped(self) -> None:
+        """Kill and reap every player a cancelled escalation left, then free its output."""
+
+        runner = self._runner
+        while self._unreaped:
+            playback = self._unreaped.pop()
+            try:
+                self._kill_now(playback)
+                try:
+                    await runner.wait(playback.process)
+                except Exception:  # noqa: BLE001 - nothing more can be learnt from it
+                    pass
+            finally:
+                playback.claim.release_to_escalation()
+
+    def _kill_now(self, playback: _Playback) -> None:
+        kill = getattr(self._runner, "kill", None)
+        if callable(kill):
+            try:
+                kill(playback.process)
+            except Exception:  # noqa: BLE001 - the reap in close still follows
+                pass
+
+    async def _close_session(self) -> None:
         session, self._session = self._session, None
         close = getattr(session, "close", None)
         if callable(close):
@@ -782,7 +1045,30 @@ class AudioOutputModule:
             except Exception:  # noqa: BLE001 - a transport that fails to close is gone anyway
                 pass
 
-    # -- the two actions (R1, AC1, AC2) --------------------------------------- #
+    async def _probe(self) -> bool:
+        """One bounded synthesis of ``probe_text``; whether it answered a parseable WAV."""
+
+        try:
+            body = await self._synthesise(self._settings.probe_text, self._settings.default_voice)
+            parse_wav(body)
+        except (_CallFailure, InvalidAudio):
+            return False
+        return True
+
+    async def _report_degraded(self, reason: str, capabilities: Sequence[str]) -> None:
+        degraded = getattr(self._supervision, "degraded", None)
+        if not callable(degraded):
+            return
+        try:
+            outcome = degraded(reason=reason, capabilities=list(capabilities))
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a health report must not fail prepare
+            return
+
+    # -- the two actions (R1, AC1–AC4) ---------------------------------------- #
 
     async def _invoke_speak(self, invocation: Any) -> ActionObservation:
         """Serve one ``audio.speak`` call for the executor."""
@@ -790,10 +1076,11 @@ class AudioOutputModule:
         # Playback is local: nothing reaches the outside world, so an
         # interruption is a certain ``timeout``/``cancelled`` (decision 4).
         invocation.mark_not_emitted()
+        expiry = self._expiry(invocation)
         provenance = _provenance(invocation.call, SPEAK_ACTION)
+        claim: _Claim | None = None
         try:
-            if self._closed:
-                raise _CallFailure("error", _ERROR_PROVIDER_CLOSED, f"{MODULE_NAME}: closed")
+            self._check_open()
             arguments = invocation.call.arguments
             text = arguments.get("text")
             if not isinstance(text, str) or not 1 <= len(text) <= self._settings.max_text_chars:
@@ -810,11 +1097,16 @@ class AudioOutputModule:
             output = self._output(arguments)
             provenance["output"] = output
             provenance["voice"] = voice
-            body = await self._synthesise(text, voice)
+            claim = self._claim(output)
+            body = await self._before_playback(self._synthesise(text, voice), claim)
             info = self._admit(body)
-            played_ms = await self._play(output, body, info)
+            played_ms = await self._play(claim, output, body, info, expiry)
         except _CallFailure as failure:
             return _failure_observation(provenance, failure)
+        finally:
+            if claim is not None:
+                self._claims.discard(claim)
+                claim.release()
         return ActionObservation(
             status="success",
             provenance=provenance,
@@ -831,10 +1123,11 @@ class AudioOutputModule:
         """Serve one ``audio.play`` call for the executor."""
 
         invocation.mark_not_emitted()
+        expiry = self._expiry(invocation)
         provenance = _provenance(invocation.call, PLAY_ACTION)
+        claim: _Claim | None = None
         try:
-            if self._closed:
-                raise _CallFailure("error", _ERROR_PROVIDER_CLOSED, f"{MODULE_NAME}: closed")
+            self._check_open()
             arguments = invocation.call.arguments
             sound = arguments.get("sound")
             if not isinstance(sound, str) or sound not in self._settings.clips:
@@ -844,11 +1137,16 @@ class AudioOutputModule:
             output = self._output(arguments)
             provenance["output"] = output
             provenance["sound"] = sound
-            body = await self._read_clip(sound)
+            claim = self._claim(output)
+            body = await self._before_playback(self._read_clip(sound), claim)
             info = self._admit(body)
-            played_ms = await self._play(output, body, info)
+            played_ms = await self._play(claim, output, body, info, expiry)
         except _CallFailure as failure:
             return _failure_observation(provenance, failure)
+        finally:
+            if claim is not None:
+                self._claims.discard(claim)
+                claim.release()
         return ActionObservation(
             status="success",
             provenance=provenance,
@@ -861,6 +1159,22 @@ class AudioOutputModule:
             },
         )
 
+    def _expiry(self, invocation: Any) -> float:
+        """``min(call.deadline, clock() + spec.timeout_seconds)`` — nothing subtracted."""
+
+        return min(
+            float(invocation.call.deadline),
+            self._clock() + float(invocation.spec.timeout_seconds),
+        )
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise _CallFailure("error", _ERROR_PROVIDER_CLOSED, f"{MODULE_NAME}: closed")
+        if self._draining:
+            raise _CallFailure(
+                "cancelled", ERROR_CANCELLED, f"{MODULE_NAME}: shutting down", played_ms=0
+            )
+
     def _output(self, arguments: Mapping[str, Any]) -> str:
         output = arguments.get("output", self._settings.default_output)
         if not isinstance(output, str) or output not in self._settings.outputs:
@@ -868,6 +1182,44 @@ class AudioOutputModule:
                 "refused", ERROR_OUTPUT_NOT_ALLOWED, "output is not one this module configures"
             )
         return output
+
+    def _claim(self, output: str) -> _Claim:
+        """Take a place on *output*, or refuse before any request is sent."""
+
+        slot = self._slots.get(output)
+        if slot is None:
+            raise _CallFailure(
+                "error",
+                ERROR_PLAYBACK_FAILED,
+                f"output {output!r}: player is unavailable",
+                played_ms=0,
+            )
+        busy = slot.occupants > 0
+        if busy and slot.occupants - 1 >= self._settings.max_waiters:
+            raise _CallFailure(
+                "refused",
+                ERROR_RESOURCE_BUSY,
+                f"output {output!r} is busy and its waiting line is full",
+            )
+        claim = _Claim(slot)
+        self._claims.add(claim)
+        return claim
+
+    async def _before_playback(self, work: Awaitable[bytes], claim: _Claim) -> bytes:
+        """Run the synthesis or the clip read unless ``drain`` ends the call first."""
+
+        task = asyncio.ensure_future(work)
+        try:
+            await asyncio.wait({task, claim.interrupt}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            await _settle(task)
+            raise
+        if not task.done():
+            await _settle(task)
+            raise _CallFailure(
+                "cancelled", ERROR_CANCELLED, "call was cancelled before playback", played_ms=0
+            )
+        return task.result()
 
     # -- synthesis ------------------------------------------------------------ #
 
@@ -1025,69 +1377,108 @@ class AudioOutputModule:
             )
         return info
 
-    # -- playback (decision 2, finding P2) ------------------------------------ #
+    # -- playback (decision 2, findings P2, P4, P5) --------------------------- #
 
-    async def _play(self, output: str, body: bytes, info: WavInfo) -> int:
-        """Feed the whole WAV to one player on *output*; ``played_ms`` on completion.
+    async def _play(
+        self, claim: _Claim, output: str, body: bytes, info: WavInfo, expiry: float
+    ) -> int:
+        """Play the whole WAV on *output* once it is free; ``played_ms`` on completion.
 
-        Every byte is written — the header first, then the data chunk — in
-        writes of at most :data:`WRITE_CHUNK_BYTES`, and the running total is
-        read from the runner after *every* write, so a player that stops
-        reading mid-chunk is measured at the byte. Completion is every byte
-        accepted, standard input closed cleanly and exit 0; anything else is ``playback_failed`` with the
-        accepted-bytes estimate.
+        The output's lock is awaited first — a predecessor's player owns it
+        until its ``wait`` returned — and a ``drain`` meanwhile ends the call
+        ``cancelled`` with 0 starts. Every byte is then written — the header
+        first, then the data chunk — in writes of at most
+        :data:`WRITE_CHUNK_BYTES` on a writer task, while a watcher sleeps
+        until *expiry* itself. Whichever settles the call first wins: the
+        player's exit (completion is every byte accepted, standard input
+        closed cleanly and exit 0, anything else ``playback_failed`` with the
+        accepted-bytes estimate), the watcher (``timeout``, cause
+        ``playback``), ``drain`` (``cancelled``) or a ``CancelledError``
+        (``timeout`` at or after *expiry*, ``cancelled`` before). An
+        interrupted call stops the player once, cancels the loser and reads
+        the accepted count without awaiting anything, then returns its record
+        at once; the escalation task keeps the output until the player exited.
         """
 
-        runner = self._runner
-        try:
-            process = await runner.start(list(self._settings.outputs[output]))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
+        await self._acquire(claim)
+        if self._draining or claim.interrupt.done():
             raise _CallFailure(
-                "error",
-                ERROR_PLAYBACK_FAILED,
-                f"output {output!r}: player could not be started",
-                played_ms=0,
-                duration_ms=info.duration_ms,
-            ) from None
-
-        accepted_total = 0
+                "cancelled", ERROR_CANCELLED, "call was cancelled before playback", played_ms=0
+            )
+        started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._starting.add(started)
         try:
-            while accepted_total < len(body):
-                chunk = body[accepted_total : accepted_total + WRITE_CHUNK_BYTES]
-                try:
-                    accepted = await runner.write(process, chunk)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - a closed pipe ends the writes
-                    break
-                count = _accepted_count(accepted, len(chunk))
-                if count <= 0:
-                    break
-                accepted_total += count
-            closed = True
             try:
-                await runner.close_stdin(process)
+                process = await self._runner.start(list(self._settings.outputs[output]))
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - a failed close is an incomplete delivery
-                closed = False
-            try:
-                returncode = await runner.wait(process)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - an unreadable exit is not a completion
-                returncode = None
-        except asyncio.CancelledError:
-            # The call is going away: the player must not outlive it.
-            self._stop_detached(process)
-            raise
+            except Exception:
+                raise _CallFailure(
+                    "error",
+                    ERROR_PLAYBACK_FAILED,
+                    f"output {output!r}: player could not be started",
+                    played_ms=0,
+                    duration_ms=info.duration_ms,
+                ) from None
 
-        played_ms = info.played_ms(accepted_total)
-        if returncode == 0 and closed and accepted_total >= len(body):
+            playback = _Playback(process, claim)
+            self._claims.discard(claim)
+            self._playbacks.add(playback)
+            if self._draining:
+                # A drain began while the player was starting: it never plays
+                # on, and its escalation exists before the join is released.
+                self._stop(playback, "cancelled")
+        finally:
+            self._starting.discard(started)
+            started.set_result(None)
+        writer = asyncio.ensure_future(self._feed(playback, body))
+        watcher = asyncio.ensure_future(self._sleeper(max(0.0, expiry - self._clock())))
+        try:
+            try:
+                await asyncio.wait(
+                    {writer, watcher, playback.interrupt}, return_when=asyncio.FIRST_COMPLETED
+                )
+            except asyncio.CancelledError:
+                # The executor's timer or a cancellation from below: stop the
+                # player now and answer with the record, never re-raise — the
+                # executor adopts it (R10). Nothing is awaited from here on.
+                self._stop(
+                    playback, "timeout" if self._clock() >= expiry else "cancelled"
+                )
+            else:
+                if playback.status is None and not writer.done():
+                    self._stop(playback, "timeout")
+            if playback.status is not None:
+                _abandon(writer)
+                _abandon(watcher)
+                raise self._interruption(playback, output, info)
+            _abandon(watcher)
+            closed, returncode = writer.result()
+        finally:
+            self._playbacks.discard(playback)
+
+        if returncode is None:
+            # The exit could not be read: the player may still run, so it is
+            # stopped and the escalation owns the output until it is gone.
+            self._hand_off(playback)
+        accepted = playback.accepted
+        played_ms = info.played_ms(accepted)
+        if returncode == 0 and closed and accepted >= len(body):
+            if self._clock() >= expiry:
+                # Completed, but observed at or after the deadline: not a
+                # completion within the call (R1) — the deadline's record.
+                raise _CallFailure(
+                    "timeout",
+                    ERROR_TIMED_OUT,
+                    f"output {output!r}: playback reached the call deadline",
+                    cause=CAUSE_PLAYBACK,
+                    played_ms=played_ms,
+                    duration_ms=info.duration_ms,
+                )
             return played_ms
-        if returncode != 0:
+        if returncode is None:
+            reason = "player's exit status could not be read"
+        elif returncode != 0:
             reason = f"player exited with status {returncode}"
         elif not closed:
             reason = "player's input broke before the whole segment was delivered"
@@ -1101,13 +1492,176 @@ class AudioOutputModule:
             duration_ms=info.duration_ms,
         )
 
-    def _stop_detached(self, process: Any) -> None:
-        stop = getattr(self._runner, "stop", None)
-        if not callable(stop):
+    async def _acquire(self, claim: _Claim) -> None:
+        """Take the output's lock, unless ``drain`` ends the wait first."""
+
+        lock = claim.slot.lock
+        acquiring = asyncio.ensure_future(lock.acquire())
+        try:
+            await asyncio.wait({acquiring, claim.interrupt}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            _abandon_acquire(acquiring, lock)
+            raise
+        if not acquiring.done():
+            _abandon_acquire(acquiring, lock)
+            raise _CallFailure(
+                "cancelled", ERROR_CANCELLED, "call was cancelled before playback", played_ms=0
+            )
+        acquiring.result()
+        claim.owns_lock = True
+
+    async def _feed(self, playback: _Playback, body: bytes) -> tuple[bool, int | None]:
+        """Write every byte, close the input, reap the exit: ``(closed, exit status)``.
+
+        The running total is read from the runner after *every* write, so a
+        player that stops reading mid-chunk is measured at the byte.
+        """
+
+        runner = self._runner
+        process = playback.process
+        while playback.accepted < len(body):
+            chunk = body[playback.accepted : playback.accepted + WRITE_CHUNK_BYTES]
+            try:
+                accepted = await runner.write(process, chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a closed pipe ends the writes
+                break
+            count = _accepted_count(accepted, len(chunk))
+            if count <= 0:
+                break
+            playback.accepted += count
+        closed = True
+        try:
+            await runner.close_stdin(process)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a failed close is an incomplete delivery
+            closed = False
+        try:
+            returncode = await runner.wait(process)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - an unreadable exit is not a completion
+            returncode = None
+        if isinstance(returncode, bool) or not isinstance(returncode, int):
+            returncode = None
+        return closed, returncode
+
+    def _interruption(self, playback: _Playback, output: str, info: WavInfo) -> _CallFailure:
+        played_ms = info.played_ms(playback.accepted)
+        if playback.status == "timeout":
+            return _CallFailure(
+                "timeout",
+                ERROR_TIMED_OUT,
+                f"output {output!r}: player stopped at the call deadline",
+                cause=CAUSE_PLAYBACK,
+                played_ms=played_ms,
+                duration_ms=info.duration_ms,
+            )
+        return _CallFailure(
+            "cancelled",
+            ERROR_CANCELLED,
+            f"output {output!r}: player stopped on cancellation",
+            played_ms=played_ms,
+            duration_ms=info.duration_ms,
+        )
+
+    def _stop(self, playback: _Playback, status: str) -> None:
+        """Stop *playback* once; the first trigger fixes its status. Synchronous."""
+
+        if playback.status is not None:
             return
-        task = asyncio.ensure_future(_quietly(stop(process, self._settings.stop_grace_seconds)))
-        self._stops.add(task)
-        task.add_done_callback(self._stops.discard)
+        playback.status = status
+        if not playback.interrupt.done():
+            playback.interrupt.set_result(None)
+        self._hand_off(playback)
+
+    def _hand_off(self, playback: _Playback) -> None:
+        """Give the player and the output to a supervised escalation task."""
+
+        claim = playback.claim
+        if claim.handed_off:
+            return
+        claim.handed_off = True
+        name = f"{MODULE_NAME}-player-stop"
+        try:
+            task = self._tasks.spawn(self._escalate(playback), name=name)
+        except Exception:  # noqa: BLE001 - a closed registry still gets its stop
+            task = asyncio.ensure_future(self._escalate(playback))
+        self._escalations.add(task)
+        task.add_done_callback(self._escalations.discard)
+
+    async def _escalate(self, playback: _Playback) -> None:
+        """Terminate → ``stop_grace_seconds`` → kill → ``wait``, then free the output.
+
+        The runner's ``stop`` terminates the player now and kills it once the
+        grace has passed on the sleeper; ``wait`` then reaps it. Only when
+        that returned is the output's lock released, so a queued successor
+        never starts beside a player that ignored termination (finding P5).
+        """
+
+        runner = self._runner
+        exited = False
+        try:
+            stop = getattr(runner, "stop", None)
+            if callable(stop):
+                try:
+                    await stop(playback.process, self._settings.stop_grace_seconds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - the wait below still reaps it
+                    pass
+            try:
+                await runner.wait(playback.process)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - nothing more can be learnt from it
+                pass
+            exited = True
+        finally:
+            if exited:
+                playback.claim.release_to_escalation()
+            else:
+                # Cancelled before the exit was observed (the registry's
+                # drain budget ran out mid-grace): kill the player now and
+                # keep its output owned — ``close`` reaps it and only then
+                # frees the output (finding A1).
+                self._kill_now(playback)
+                self._unreaped.add(playback)
+
+
+def _abandon(task: "asyncio.Future[Any]") -> None:
+    """Cancel *task* without waiting for it; its outcome is consumed when it ends."""
+
+    if not task.done():
+        task.cancel()
+    task.add_done_callback(_consume)
+
+
+def _consume(task: "asyncio.Future[Any]") -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _abandon_acquire(acquiring: "asyncio.Future[Any]", lock: asyncio.Lock) -> None:
+    """Give up a lock acquisition; a lock it took anyway is released at once."""
+
+    def _release_if_taken(task: "asyncio.Future[Any]") -> None:
+        if not task.cancelled() and task.exception() is None:
+            lock.release()
+
+    if acquiring.done():
+        _release_if_taken(acquiring)
+        return
+    acquiring.cancel()
+    acquiring.add_done_callback(_release_if_taken)
+
+
+def _resolves(program: str) -> bool:
+    """Whether *program* — a name on ``PATH`` or a path — is an executable file."""
+
+    return shutil.which(program) is not None
 
 
 def _accepted_count(value: Any, offered: int) -> int:
@@ -1145,13 +1699,6 @@ async def _release(response: Any) -> None:
         if inspect.isawaitable(outcome):
             await outcome
     except Exception:  # noqa: BLE001 - a response that fails to release is gone anyway
-        pass
-
-
-async def _quietly(awaitable: Awaitable[Any]) -> None:
-    try:
-        await awaitable
-    except Exception:  # noqa: BLE001 - a failed stop leaves nothing to report here
         pass
 
 
@@ -1262,6 +1809,7 @@ def _declared_spec(action_name: str) -> ActionSpec:
 
 
 __all__ = [
+    "CAUSE_PLAYBACK",
     "CAUSE_SYNTHESIS",
     "DEFAULT_MAX_AUDIO_BYTES",
     "DEFAULT_MAX_SPEECH_SECONDS",
@@ -1275,6 +1823,7 @@ __all__ = [
     "ERROR_INVALID_AUDIO",
     "ERROR_OUTPUT_NOT_ALLOWED",
     "ERROR_PLAYBACK_FAILED",
+    "ERROR_RESOURCE_BUSY",
     "ERROR_SPEECH_TOO_LONG",
     "ERROR_TTS_FAILED",
     "ERROR_TTS_UNAVAILABLE",
