@@ -1,0 +1,1248 @@
+"""``stream.scene.set`` and ``stream.poll.create`` (R6, R7, R8).
+
+The companion switches the stream's program scene through this module, and
+opens platform polls. Which broadcast software answers a scene switch is the
+business of the configured *scene provider* (``scenes.provider``), never of
+the brain and never of a platform.
+
+**A scene provider** is any object with the :class:`SceneProvider` surface:
+``connected``, ``list_scenes()``, ``current_scene()``, ``set_scene(name)``
+and ``close()``. ``set_scene`` answers ``{"result": True}`` when the provider
+applied the scene, ``{"result": False, "code": 600}`` when it does not know
+the scene and ``{"result": False, "code": <n>}`` for any other refusal; it
+raises when its answer is lost. The ``kind`` of provider is configured:
+``none`` binds nothing here (the action stays declared, so another module —
+a proxy — may serve it), ``scripted`` takes the provider injected through the
+``_scene_provider`` seam, and ``websocket`` is the network provider (its
+protocol lives in a later step; until then it never answers the ``prepare``
+probe, so the action stays unbound under the ``required`` policy).
+
+**One scene switch, confirmed or reconciled — never repeated** (R6). A scene
+outside ``scenes.allowed`` is ``refused scene_not_allowed`` with the provider
+uninvoked; a provider that is disconnected at call time answers ``error
+provider_unavailable`` and the module withdraws its readiness
+(``module.degraded``). Otherwise the call reads the current scene (the
+``previous_scene``), declares the effect emitted and sends exactly one set
+command: a provider that does not know the scene is ``error scene_unknown``
+(nothing applied, no read-back), any other refusal ``error
+scene_not_applied`` carrying the numeric code. After an applied set the
+module reads the current scene back — equal is ``success`` with
+``reconciled: false``, different is ``error scene_not_applied``. When the set
+command's answer is lost, or the read-back fails, exactly one reconciliation
+read follows within the time left: the scene current is ``success`` with
+``reconciled: true``, anything else ``external_unknown`` with cause
+``confirmation_lost``. A second set command is never sent in one call.
+
+**The call deadline, nothing earlier** (R10, decision 1). At entry a call
+computes ``expiry = min(call.deadline, clock() + spec.timeout_seconds)`` —
+the executor's own arithmetic and the only deadline this module knows; no
+quantity is subtracted from it. A provider request still pending when
+``expiry`` is reached — noticed by the module's watcher on the injected
+sleeper, or by the executor's cancellation arriving at or after ``expiry`` —
+ends the call with the module's own ``timeout`` record (cause
+``confirmation_lost`` once the set command left), which the executor's
+emission rule resolves ``external_unknown``. A cancellation arriving earlier
+is ``cancelled``, resolved by the same rule.
+
+**One set command at a time per provider** (R6). A call waits behind the one
+in flight; at most ``scenes.max_waiters`` calls wait, one more is ``refused
+resource_busy``. ``drain`` ends every call that has not sent its set command
+``cancelled`` (0 set commands) and gives a command already sent the drain
+deadline, on the clock, to be confirmed; past it the call ends
+``external_unknown`` and no further read is started.
+
+**Readiness and the ``required`` policy** (R8, finding P1). ``prepare``
+probes a ``scripted``/``websocket`` provider once (``list_scenes()``, bounded
+on the sleeper): reachable binds ``stream.scene.set``; unreachable leaves it
+unbound and reports ``module.degraded`` with a value-free reason, or — with
+``required: true`` — fails ``prepare`` naming ``scenes.provider.url``.
+``polls.enabled: true`` with no poll service resolved (this step resolves
+none) leaves ``stream.poll.create`` unbound with one ``module.degraded``
+(reason ``"no poll service published"``), or fails ``prepare`` naming
+``polls.enabled`` under ``required: true`` — after the scene provider was
+closed. The module is marked ready when at least one action is bound. The
+URL and the password never appear in an observation, an error or a trace.
+
+**Seams, for the tests.** ``_scene_provider`` (the ``scripted`` provider),
+``_sleeper`` (the sleep every bound is raced against, ``asyncio.sleep`` by
+default) and ``_websocket_factory`` (the connection factory of the
+``websocket`` provider) are read from *settings* at ``activate`` and never
+from a configuration file.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import ipaddress
+import math
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlsplit
+
+import yaml
+
+from core.actions import (
+    ERROR_CANCELLED,
+    ERROR_EXTERNAL_UNKNOWN,
+    ERROR_INVALID_ARGUMENTS,
+    ERROR_TIMED_OUT,
+)
+from core.contracts import ActionObservation, ActionSpec, Destination
+
+
+MODULE_NAME = "stream_control"
+
+SCENE_ACTION = "stream.scene.set"
+POLL_ACTION = "stream.poll.create"
+PROVIDER_NAME = "stream_control"
+
+#: The manifest the specs are rebuilt from at ``prepare``.
+MANIFEST_PATH = Path(__file__).with_name("module.yaml")
+
+KIND_NONE = "none"
+KIND_SCRIPTED = "scripted"
+KIND_WEBSOCKET = "websocket"
+SCENE_PROVIDER_KINDS = (KIND_NONE, KIND_SCRIPTED, KIND_WEBSOCKET)
+
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
+DEFAULT_MAX_WAITERS = 1
+MAX_SCENE_NAME_CHARS = 64
+
+DEFAULT_POLLS_ENABLED = False
+DEFAULT_MAX_QUESTION_CHARS = 60
+DEFAULT_MIN_OPTIONS = 2
+DEFAULT_MAX_OPTIONS = 5
+DEFAULT_MAX_OPTION_CHARS = 25
+DEFAULT_MIN_DURATION_SECONDS = 15
+DEFAULT_MAX_DURATION_SECONDS = 1800
+DEFAULT_MAX_TRACKED_CHANNELS = 256
+
+#: The provider's "resource not found" status: the scene-unknown answer.
+SCENE_UNKNOWN_CODE = 600
+
+ERROR_SCENE_NOT_ALLOWED = "scene_not_allowed"
+ERROR_SCENE_UNKNOWN = "scene_unknown"
+ERROR_SCENE_NOT_APPLIED = "scene_not_applied"
+ERROR_PROVIDER_UNAVAILABLE = "provider_unavailable"
+ERROR_RESOURCE_BUSY = "resource_busy"
+_ERROR_PROVIDER_CLOSED = "provider_closed"
+
+#: The cause of an uncertain outcome once the set command left.
+CAUSE_CONFIRMATION_LOST = "confirmation_lost"
+
+#: The value-free reasons ``module.degraded`` carries (R8).
+REASON_SCENE_PROVIDER_UNREACHABLE = f"{MODULE_NAME}: the scene provider is unreachable"
+REASON_SCENE_PROVIDER_DISCONNECTED = f"{MODULE_NAME}: the scene provider is disconnected"
+REASON_NO_POLL_SERVICE = "no poll service published"
+
+# Setting names — referenced by name, never by value, in diagnostics.
+_ACCEPTED_LIMITS_SETTING = "limits"
+_SETTING_SCENES = "scenes"
+_SETTING_POLLS = "polls"
+_SETTING_REQUIRED = "required"
+_SETTINGS = frozenset({_SETTING_SCENES, _SETTING_POLLS, _SETTING_REQUIRED})
+
+_SCENES_FIELDS = frozenset({"provider", "allowed", "max_waiters"})
+_PROVIDER_FIELDS = frozenset(
+    {"kind", "url", "password", "connect_timeout_seconds", "request_timeout_seconds"}
+)
+_POLL_INT_FIELDS = (
+    "max_question_chars",
+    "min_options",
+    "max_options",
+    "max_option_chars",
+    "min_duration_seconds",
+    "max_duration_seconds",
+    "max_tracked_channels",
+)
+_POLLS_FIELDS = frozenset({"enabled", "max_waiters", *_POLL_INT_FIELDS})
+
+#: The dependency fields a failed ``prepare`` names under ``required: true``.
+FIELD_SCENES_PROVIDER_URL = "scenes.provider.url"
+FIELD_POLLS_ENABLED = "polls.enabled"
+
+_SEAM_SCENE_PROVIDER = "_scene_provider"
+_SEAM_SLEEPER = "_sleeper"
+_SEAM_WEBSOCKET_FACTORY = "_websocket_factory"
+_SEAMS = frozenset({_SEAM_SCENE_PROVIDER, _SEAM_SLEEPER, _SEAM_WEBSOCKET_FACTORY})
+
+_PROVIDER_METHODS = ("list_scenes", "current_scene", "set_scene", "close")
+
+_LOOPBACK_NAMES = frozenset({"localhost"})
+
+Sleeper = Callable[[float], Awaitable[Any]]
+
+
+class StreamControlModuleError(RuntimeError):
+    """A setup failure whose message contains no configured value."""
+
+
+@runtime_checkable
+class SceneProvider(Protocol):
+    """The scene provider boundary (R6).
+
+    ``connected`` says whether a request can be sent now. ``list_scenes``
+    returns the scene names (the ``prepare`` probe); ``current_scene`` the
+    program scene; ``set_scene`` switches it and answers ``{"result": bool,
+    "code": int}`` (see the module docstring), raising when its answer is
+    lost; ``close`` releases the transport.
+    """
+
+    @property
+    def connected(self) -> bool: ...
+
+    async def list_scenes(self) -> list[str]: ...
+
+    async def current_scene(self) -> str: ...
+
+    async def set_scene(self, name: str) -> Mapping[str, Any]: ...
+
+    async def close(self) -> None: ...
+
+
+class _CallFailure(Exception):
+    """One explicit non-success outcome of a call, raised to its invoke."""
+
+    def __init__(self, status: str, code: str, message: str, **details: Any) -> None:
+        super().__init__(code)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+# --------------------------------------------------------------------------- #
+# Settings validation hook
+# --------------------------------------------------------------------------- #
+
+
+def validate_settings(settings: Any) -> list[str]:
+    """Check this module's settings; return one diagnostic per offending field.
+
+    This is the hook ``settings_validator`` in the manifest names. Each
+    diagnostic names the module and the field and nothing else — no URL or
+    password is echoed; an empty list means the settings are accepted.
+
+    ``scenes.provider.kind`` is one of ``none``, ``scripted``, ``websocket``
+    (default ``none``); ``scripted`` needs the injected ``_scene_provider``;
+    ``websocket`` needs a ``url`` that is ``ws://`` on a loopback host
+    (``127.0.0.0/8``, ``::1``, ``localhost``) or ``wss://``. The password is
+    a string, the timeouts finite positive numbers, ``scenes.allowed`` a list
+    of 1..64-character names, the waiter bounds non-negative integers, the
+    poll bounds positive integers with each minimum at most its maximum,
+    ``polls.enabled`` and ``required`` booleans. The reserved ``limits``
+    block is accepted and not inspected; any other key is refused by name.
+    """
+
+    if not isinstance(settings, Mapping):
+        return [_setting_diagnostic("settings", "must be a mapping")]
+    diagnostics: list[str] = []
+
+    for field_name in settings:
+        if (
+            field_name not in _SETTINGS
+            and field_name != _ACCEPTED_LIMITS_SETTING
+            and field_name not in _SEAMS
+        ):
+            diagnostics.append(
+                _setting_diagnostic(str(field_name), "is not a setting this module declares")
+            )
+    for seam in (_SEAM_SLEEPER, _SEAM_WEBSOCKET_FACTORY):
+        if seam in settings and not callable(settings[seam]):
+            diagnostics.append(_setting_diagnostic(seam, "must be callable"))
+    if _SEAM_SCENE_PROVIDER in settings and not _is_scene_provider(
+        settings[_SEAM_SCENE_PROVIDER]
+    ):
+        diagnostics.append(
+            _setting_diagnostic(
+                _SEAM_SCENE_PROVIDER,
+                "must provide connected, list_scenes, current_scene, set_scene and close",
+            )
+        )
+
+    diagnostics.extend(
+        _scenes_diagnostics(
+            settings.get(_SETTING_SCENES), has_seam=_SEAM_SCENE_PROVIDER in settings
+        )
+    )
+    diagnostics.extend(_polls_diagnostics(settings.get(_SETTING_POLLS)))
+    if _SETTING_REQUIRED in settings and not isinstance(settings[_SETTING_REQUIRED], bool):
+        diagnostics.append(_setting_diagnostic(_SETTING_REQUIRED, "must be a boolean"))
+    return diagnostics
+
+
+def _scenes_diagnostics(scenes: Any, *, has_seam: bool) -> list[str]:
+    if scenes is None:
+        return []
+    if not isinstance(scenes, Mapping):
+        return [_setting_diagnostic(_SETTING_SCENES, "must be a mapping")]
+    diagnostics = [
+        _setting_diagnostic(f"{_SETTING_SCENES}.{name}", "is not a setting this module declares")
+        for name in scenes
+        if name not in _SCENES_FIELDS
+    ]
+    diagnostics.extend(_provider_diagnostics(scenes.get("provider"), has_seam=has_seam))
+
+    allowed = scenes.get("allowed")
+    if allowed is not None:
+        if isinstance(allowed, str) or not isinstance(allowed, Sequence):
+            diagnostics.append(
+                _setting_diagnostic(f"{_SETTING_SCENES}.allowed", "must be a list of scene names")
+            )
+        elif not all(_is_scene_name(name) for name in allowed):
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{_SETTING_SCENES}.allowed",
+                    f"must hold names of 1 to {MAX_SCENE_NAME_CHARS} characters",
+                )
+            )
+    if "max_waiters" in scenes and not _is_non_negative_int(scenes["max_waiters"]):
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{_SETTING_SCENES}.max_waiters", "must be a non-negative integer"
+            )
+        )
+    return diagnostics
+
+
+def _provider_diagnostics(provider: Any, *, has_seam: bool) -> list[str]:
+    prefix = f"{_SETTING_SCENES}.provider"
+    if provider is None:
+        return []
+    if not isinstance(provider, Mapping):
+        return [_setting_diagnostic(prefix, "must be a mapping")]
+    diagnostics = [
+        _setting_diagnostic(f"{prefix}.{name}", "is not a setting this module declares")
+        for name in provider
+        if name not in _PROVIDER_FIELDS
+    ]
+    kind = provider.get("kind", KIND_NONE)
+    if kind not in SCENE_PROVIDER_KINDS:
+        diagnostics.append(
+            _setting_diagnostic(f"{prefix}.kind", "must be one of none, scripted, websocket")
+        )
+    elif kind == KIND_SCRIPTED and not has_seam:
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{prefix}.kind", "'scripted' is only available with an injected scene provider"
+            )
+        )
+    url = provider.get("url")
+    if url is not None and not isinstance(url, str):
+        diagnostics.append(_setting_diagnostic(FIELD_SCENES_PROVIDER_URL, "must be a string"))
+    elif kind == KIND_WEBSOCKET and not _is_accepted_websocket_url(url or ""):
+        diagnostics.append(
+            _setting_diagnostic(
+                FIELD_SCENES_PROVIDER_URL,
+                "must be a ws:// URL on a loopback host, or a wss:// URL",
+            )
+        )
+    if "password" in provider and not isinstance(provider["password"], str):
+        diagnostics.append(_setting_diagnostic(f"{prefix}.password", "must be a string"))
+    for field_name in ("connect_timeout_seconds", "request_timeout_seconds"):
+        if field_name in provider and not _is_positive_number(provider[field_name]):
+            diagnostics.append(
+                _setting_diagnostic(f"{prefix}.{field_name}", "must be a finite positive number")
+            )
+    return diagnostics
+
+
+def _polls_diagnostics(polls: Any) -> list[str]:
+    if polls is None:
+        return []
+    if not isinstance(polls, Mapping):
+        return [_setting_diagnostic(_SETTING_POLLS, "must be a mapping")]
+    diagnostics = [
+        _setting_diagnostic(f"{_SETTING_POLLS}.{name}", "is not a setting this module declares")
+        for name in polls
+        if name not in _POLLS_FIELDS
+    ]
+    if "enabled" in polls and not isinstance(polls["enabled"], bool):
+        diagnostics.append(_setting_diagnostic(FIELD_POLLS_ENABLED, "must be a boolean"))
+    if "max_waiters" in polls and not _is_non_negative_int(polls["max_waiters"]):
+        diagnostics.append(
+            _setting_diagnostic(f"{_SETTING_POLLS}.max_waiters", "must be a non-negative integer")
+        )
+    for field_name in _POLL_INT_FIELDS:
+        if field_name in polls and not _is_positive_int(polls[field_name]):
+            diagnostics.append(
+                _setting_diagnostic(f"{_SETTING_POLLS}.{field_name}", "must be a positive integer")
+            )
+    for low, high, low_default, high_default in (
+        ("min_options", "max_options", DEFAULT_MIN_OPTIONS, DEFAULT_MAX_OPTIONS),
+        (
+            "min_duration_seconds",
+            "max_duration_seconds",
+            DEFAULT_MIN_DURATION_SECONDS,
+            DEFAULT_MAX_DURATION_SECONDS,
+        ),
+    ):
+        minimum = polls.get(low, low_default)
+        maximum = polls.get(high, high_default)
+        if _is_positive_int(minimum) and _is_positive_int(maximum) and minimum > maximum:
+            diagnostics.append(
+                _setting_diagnostic(f"{_SETTING_POLLS}.{low}", f"must not exceed {high}")
+            )
+    return diagnostics
+
+
+def _is_accepted_websocket_url(url: str) -> bool:
+    """``ws://`` on a loopback host, or ``wss://`` on any host (R6)."""
+
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - a malformed port raises here
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if parts.scheme == "wss":
+        return True
+    if parts.scheme != "ws":
+        return False
+    if host.lower() in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_scene_provider(value: Any) -> bool:
+    return hasattr(value, "connected") and all(
+        callable(getattr(value, method, None)) for method in _PROVIDER_METHODS
+    )
+
+
+def _setting_diagnostic(field_name: str, reason: str) -> str:
+    return f"module {MODULE_NAME!r}: field {field_name!r}: {reason}"
+
+
+def _is_scene_name(value: Any) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= MAX_SCENE_NAME_CHARS
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _is_non_negative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Settings:
+    """The accepted settings, parsed once."""
+
+    kind: str
+    url: str
+    password: str
+    connect_timeout_seconds: float
+    request_timeout_seconds: float
+    allowed: tuple[str, ...]
+    scene_max_waiters: int
+    polls_enabled: bool
+    max_question_chars: int
+    min_options: int
+    max_options: int
+    max_option_chars: int
+    min_duration_seconds: int
+    max_duration_seconds: int
+    poll_max_waiters: int
+    max_tracked_channels: int
+    required: bool
+
+    @classmethod
+    def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
+        scenes = settings.get(_SETTING_SCENES) or {}
+        provider = scenes.get("provider") or {}
+        polls = settings.get(_SETTING_POLLS) or {}
+        return cls(
+            kind=str(provider.get("kind", KIND_NONE)),
+            url=str(provider.get("url", "")),
+            password=str(provider.get("password", "")),
+            connect_timeout_seconds=float(
+                provider.get("connect_timeout_seconds", DEFAULT_CONNECT_TIMEOUT_SECONDS)
+            ),
+            request_timeout_seconds=float(
+                provider.get("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+            ),
+            allowed=tuple(str(name) for name in scenes.get("allowed") or ()),
+            scene_max_waiters=int(scenes.get("max_waiters", DEFAULT_MAX_WAITERS)),
+            polls_enabled=bool(polls.get("enabled", DEFAULT_POLLS_ENABLED)),
+            max_question_chars=int(polls.get("max_question_chars", DEFAULT_MAX_QUESTION_CHARS)),
+            min_options=int(polls.get("min_options", DEFAULT_MIN_OPTIONS)),
+            max_options=int(polls.get("max_options", DEFAULT_MAX_OPTIONS)),
+            max_option_chars=int(polls.get("max_option_chars", DEFAULT_MAX_OPTION_CHARS)),
+            min_duration_seconds=int(
+                polls.get("min_duration_seconds", DEFAULT_MIN_DURATION_SECONDS)
+            ),
+            max_duration_seconds=int(
+                polls.get("max_duration_seconds", DEFAULT_MAX_DURATION_SECONDS)
+            ),
+            poll_max_waiters=int(polls.get("max_waiters", DEFAULT_MAX_WAITERS)),
+            max_tracked_channels=int(
+                polls.get("max_tracked_channels", DEFAULT_MAX_TRACKED_CHANNELS)
+            ),
+            required=bool(settings.get(_SETTING_REQUIRED, False)),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# The handle
+# --------------------------------------------------------------------------- #
+
+
+class _SceneActionProvider:
+    """The ``stream.scene.set`` provider the executor invokes (R6)."""
+
+    __slots__ = ("_module",)
+
+    name = PROVIDER_NAME
+
+    def __init__(self, module: "StreamControlModule") -> None:
+        self._module = module
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        return await self._module._invoke_scene(invocation)
+
+
+class _SceneSlot:
+    """The scene provider's serialization state (R6).
+
+    ``lock`` is held by the call whose set command is in flight, from before
+    its ``previous_scene`` read until its outcome is known; ``occupants``
+    counts every admitted call — holding the lock or waiting for it — so the
+    admission rule reads one number.
+    """
+
+    __slots__ = ("lock", "occupants")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.occupants = 0
+
+
+class _Claim:
+    """One call's place on the scene provider; released on every exit path."""
+
+    __slots__ = ("counted", "owns_lock", "slot")
+
+    def __init__(self, slot: _SceneSlot) -> None:
+        self.slot = slot
+        self.counted = True
+        self.owns_lock = False
+        slot.occupants += 1
+
+    def release(self) -> None:
+        if self.owns_lock:
+            self.owns_lock = False
+            self.slot.lock.release()
+        if self.counted:
+            self.counted = False
+            self.slot.occupants -= 1
+
+
+class _Failed:
+    """A provider request that raised: its answer is lost."""
+
+    __slots__ = ()
+
+
+_FAILED = _Failed()
+
+
+class StreamControlModule:
+    """The v2 handle: probe and bind at ``prepare``, switch scenes on demand."""
+
+    def __init__(
+        self,
+        context: Any,
+        settings: _Settings,
+        *,
+        scene_provider: Any,
+        sleeper: Sleeper,
+        websocket_factory: Callable[..., Any] | None,
+    ) -> None:
+        self._actions = context.actions
+        self._supervision = getattr(context, "supervision", None)
+        self._clock: Callable[[], float] = getattr(context, "clock", None) or time.monotonic
+        self._settings = settings
+        self._provider = scene_provider
+        self._sleeper = sleeper
+        # The connection factory of the ``websocket`` provider, kept for it.
+        self._websocket_factory = websocket_factory
+        self._scene_provider = _SceneActionProvider(self)
+        self._slot = _SceneSlot()
+        loop = asyncio.get_running_loop()
+        # Resolved when ``drain`` begins: every call that has not sent its
+        # set command ends ``cancelled``.
+        self._drain_started: asyncio.Future[None] = loop.create_future()
+        # Resolved when the drain deadline passed: a call whose set command
+        # left ends ``external_unknown`` and starts no further read.
+        self._drain_expired: asyncio.Future[None] = loop.create_future()
+        # One future per running call, resolved when it returned.
+        self._calls: set[asyncio.Future[None]] = set()
+        self._scene_bound = False
+        self._withdrawn = False
+        self._prepared = False
+        self._draining = False
+        self._closed = False
+
+    @property
+    def settings(self) -> _Settings:
+        return self._settings
+
+    # -- lifecycle hooks ---------------------------------------------------- #
+
+    async def prepare(self) -> None:
+        """Probe the scene provider, apply the ``required`` policy, bind.
+
+        Dependencies are checked in settings order — scenes, then polls — and
+        under ``required: true`` the first one unavailable fails ``prepare``
+        naming its field, after the scene provider was closed, with nothing
+        bound. Under ``required: false`` each unavailable one is reported
+        once through ``module.degraded`` naming the action it leaves unbound.
+        A scene provider that did not answer its probe keeps
+        ``stream.scene.set`` registered on a module that is never marked
+        ready, so a call is ``refused provider_not_ready`` before the
+        provider; ``kind: none`` only declares it, so another module may
+        serve it.
+        """
+
+        if self._prepared or self._closed:
+            return
+        settings = self._settings
+        scene_reachable: bool | None = None
+        if settings.kind != KIND_NONE:
+            scene_reachable = await self._probe()
+            if not scene_reachable and settings.required:
+                await self._close_provider()
+                raise StreamControlModuleError(
+                    f"{MODULE_NAME} prepare: field '{FIELD_SCENES_PROVIDER_URL}' unavailable"
+                )
+        # No poll service is resolved in this step: an enabled poll action is
+        # an unavailable dependency like any other (finding P1).
+        polls_unavailable = settings.polls_enabled
+        if polls_unavailable and settings.required:
+            await self._close_provider()
+            raise StreamControlModuleError(
+                f"{MODULE_NAME} prepare: field '{FIELD_POLLS_ENABLED}' unavailable: "
+                "no poll service published for any platform"
+            )
+
+        self._scene_bound = scene_reachable is True
+        bound_any = self._scene_bound
+        try:
+            scene_spec = _declared_spec(SCENE_ACTION)
+            if self._scene_bound or (scene_reachable is False and not bound_any):
+                self._actions.register(
+                    scene_spec, self._scene_provider, provider_name=PROVIDER_NAME
+                )
+            else:
+                self._actions.declare(scene_spec)
+            self._actions.declare(_declared_spec(POLL_ACTION))
+        except StreamControlModuleError:
+            await self._close_provider()
+            raise
+        except Exception:
+            await self._close_provider()
+            raise StreamControlModuleError(
+                f"{MODULE_NAME} prepare: action binding failed"
+            ) from None
+        self._prepared = True
+
+        if scene_reachable is False:
+            await self._report_degraded(REASON_SCENE_PROVIDER_UNREACHABLE, [SCENE_ACTION])
+        if polls_unavailable:
+            await self._report_degraded(REASON_NO_POLL_SERVICE, [POLL_ACTION])
+        if bound_any:
+            self._actions.mark_ready()
+
+    async def drain(self, deadline_seconds: float) -> None:
+        """End waiting calls, give a sent set command the drain deadline.
+
+        Every call that has not sent its set command ends ``cancelled`` at
+        once, with 0 set commands. A call whose command left keeps waiting
+        for its confirmation until *deadline_seconds* passed on the clock;
+        past it the call ends ``external_unknown`` and starts no further
+        read.
+        """
+
+        self._draining = True
+        _resolve(self._drain_started)
+        try:
+            await self._join_calls(max(float(deadline_seconds), 0.0))
+        finally:
+            # Whatever ended the join — the budget, or the caller giving up on
+            # the drain — no call may outlive it waiting on a confirmation.
+            if self._pending_calls():
+                _resolve(self._drain_expired)
+
+    async def close(self) -> None:
+        """Withdraw readiness, end what still runs, release the provider."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._draining = True
+        if self._prepared:
+            self._actions.mark_not_ready()
+        _resolve(self._drain_started)
+        _resolve(self._drain_expired)
+        pending = self._pending_calls()
+        if pending:
+            await asyncio.wait(pending)
+        await self._close_provider()
+
+    def _pending_calls(self) -> set[asyncio.Future[None]]:
+        return {call for call in self._calls if not call.done()}
+
+    async def _join_calls(self, budget: float) -> None:
+        pending = self._pending_calls()
+        if not pending:
+            return
+        timer = asyncio.ensure_future(self._sleeper(budget))
+        try:
+            while pending and not timer.done():
+                await asyncio.wait(pending | {timer}, return_when=asyncio.FIRST_COMPLETED)
+                pending = self._pending_calls()
+            if pending:
+                # The drain deadline passed first: the calls still waiting on
+                # a confirmation end ``external_unknown`` now, on this turn.
+                _resolve(self._drain_expired)
+                await asyncio.wait(pending)
+        finally:
+            await _settle(timer)
+
+    async def _close_provider(self) -> None:
+        provider, self._provider = self._provider, None
+        close = getattr(provider, "close", None)
+        if callable(close):
+            try:
+                outcome = close()
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:  # noqa: BLE001 - a provider that fails to close is gone anyway
+                pass
+
+    async def _probe(self) -> bool:
+        """One ``list_scenes()``, bounded on the sleeper; whether it answered."""
+
+        provider = self._provider
+        if provider is None:
+            return False
+        bound = self._settings.connect_timeout_seconds + self._settings.request_timeout_seconds
+        task = asyncio.ensure_future(provider.list_scenes())
+        timer = asyncio.ensure_future(self._sleeper(bound))
+        try:
+            await asyncio.wait({task, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Neither the probe bound nor a cancellation of prepare() waits on
+            # the provider: a request still running is cancelled and left to
+            # end on its own, its outcome consumed whenever it does.
+            _abandon(timer)
+            if not task.done():
+                _abandon(task)
+        if not task.done():
+            return False
+        if task.cancelled() or task.exception() is not None:
+            return False
+        scenes = task.result()
+        return isinstance(scenes, Sequence) and not isinstance(scenes, str)
+
+    async def _report_degraded(self, reason: str, capabilities: Sequence[str]) -> None:
+        degraded = getattr(self._supervision, "degraded", None)
+        if not callable(degraded):
+            return
+        try:
+            outcome = degraded(reason=reason, capabilities=list(capabilities))
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a health report must not fail a call
+            return
+
+    async def _withdraw_readiness(self) -> None:
+        """The provider is gone: withdraw readiness and say so, once."""
+
+        if self._withdrawn:
+            return
+        self._withdrawn = True
+        self._actions.mark_not_ready()
+        await self._report_degraded(REASON_SCENE_PROVIDER_DISCONNECTED, [SCENE_ACTION])
+
+    # -- stream.scene.set (R6, AC21–AC23) ------------------------------------ #
+
+    async def _invoke_scene(self, invocation: Any) -> ActionObservation:
+        """Serve one ``stream.scene.set`` call for the executor."""
+
+        # Nothing has left before the set command: an interruption until then
+        # is a certain ``timeout``/``cancelled``.
+        invocation.mark_not_emitted()
+        expiry = self._expiry(invocation)
+        provenance = _provenance(invocation.call, SCENE_ACTION)
+        running: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._calls.add(running)
+        claim: _Claim | None = None
+        try:
+            self._check_open()
+            scene = invocation.call.arguments.get("scene")
+            if not _is_scene_name(scene):
+                raise _CallFailure(
+                    "error",
+                    ERROR_INVALID_ARGUMENTS,
+                    f"scene must hold 1 to {MAX_SCENE_NAME_CHARS} characters",
+                )
+            if scene not in self._settings.allowed:
+                raise _CallFailure(
+                    "refused", ERROR_SCENE_NOT_ALLOWED, "scene is not one this module allows"
+                )
+            provider = self._provider
+            if provider is None or not provider.connected:
+                await self._withdraw_readiness()
+                raise _CallFailure(
+                    "error", ERROR_PROVIDER_UNAVAILABLE, "the scene provider is not connected"
+                )
+            claim = self._claim()
+            await self._acquire(claim, expiry)
+            return await self._switch(invocation, provider, scene, expiry, provenance)
+        except _CallFailure as failure:
+            return _failure_observation(provenance, failure)
+        finally:
+            if claim is not None:
+                claim.release()
+            self._calls.discard(running)
+            _resolve(running)
+
+    async def _switch(
+        self,
+        invocation: Any,
+        provider: Any,
+        scene: str,
+        expiry: float,
+        provenance: Mapping[str, Any],
+    ) -> ActionObservation:
+        """Read the previous scene, send one set command, confirm it."""
+
+        self._check_may_continue(expiry, emitted=False)
+        previous = await self._request(provider.current_scene(), expiry, emitted=False)
+        if previous is _FAILED or not isinstance(previous, str):
+            if not provider.connected:
+                await self._withdraw_readiness()
+            raise _CallFailure(
+                "error", ERROR_PROVIDER_UNAVAILABLE, "the scene provider did not answer"
+            )
+
+        # The read may have answered on the same turn the drain began or the
+        # deadline passed: no set command leaves then.
+        self._check_may_continue(expiry, emitted=False)
+        # From here the scene may change: a lost answer is uncertain.
+        invocation.mark_emitted()
+        answer = await self._request(provider.set_scene(scene), expiry, emitted=True)
+        applied = _set_answer(answer)
+        if applied is None:
+            return await self._reconcile(provider, scene, previous, expiry, provenance)
+        if applied is not True:
+            if applied == SCENE_UNKNOWN_CODE:
+                raise _CallFailure(
+                    "error", ERROR_SCENE_UNKNOWN, "the scene provider does not know this scene"
+                )
+            raise _CallFailure(
+                "error",
+                ERROR_SCENE_NOT_APPLIED,
+                f"the scene provider refused the scene with status {applied}",
+                status_code=applied,
+            )
+
+        self._check_may_continue(expiry, emitted=True)
+        current = await self._request(provider.current_scene(), expiry, emitted=True)
+        if current is _FAILED:
+            return await self._reconcile(provider, scene, previous, expiry, provenance)
+        if current != scene:
+            raise _CallFailure(
+                "error",
+                ERROR_SCENE_NOT_APPLIED,
+                "the scene read back after the switch is not the one requested",
+            )
+        return _scene_success(provenance, scene, previous, self._clock(), reconciled=False)
+
+    async def _reconcile(
+        self,
+        provider: Any,
+        scene: str,
+        previous: str,
+        expiry: float,
+        provenance: Mapping[str, Any],
+    ) -> ActionObservation:
+        """Exactly one reconciliation read, within the time left."""
+
+        if self._drain_expired.done():
+            raise _uncertain("the drain deadline passed before the scene was confirmed")
+        if self._clock() >= expiry:
+            raise _deadline_failure(emitted=True)
+        current = await self._request(provider.current_scene(), expiry, emitted=True)
+        if current is _FAILED or current != scene:
+            raise _uncertain("the scene could not be confirmed after the switch")
+        return _scene_success(provenance, scene, previous, self._clock(), reconciled=True)
+
+    def _check_may_continue(self, expiry: float, *, emitted: bool) -> None:
+        """Refuse to start the next provider request once interrupted.
+
+        Before the set command the drain ends the call ``cancelled``; after
+        it the drain deadline ends it ``external_unknown``. Past *expiry*
+        either way the call ends ``timeout``.
+        """
+
+        if emitted:
+            if self._drain_expired.done():
+                raise _uncertain("the drain deadline passed before the scene was confirmed")
+        elif self._drain_started.done():
+            raise _CallFailure("cancelled", ERROR_CANCELLED, f"{MODULE_NAME}: shutting down")
+        if self._clock() >= expiry:
+            raise _deadline_failure(emitted=emitted)
+
+    async def _request(self, work: Awaitable[Any], expiry: float, *, emitted: bool) -> Any:
+        """Await one provider request, bounded by *expiry* on the sleeper.
+
+        Returns the answer, or :data:`_FAILED` when the request raised. A
+        request still pending at the deadline, at the drain (before the set
+        command) or at the drain deadline (after it), or when the call is
+        cancelled, is abandoned and the call ends with the matching
+        interruption record.
+        """
+
+        task = asyncio.ensure_future(work)
+        watcher = asyncio.ensure_future(self._sleeper(max(expiry - self._clock(), 0.0)))
+        interrupt = self._drain_expired if emitted else self._drain_started
+        try:
+            await asyncio.wait(
+                {task, watcher, interrupt}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            _abandon(task)
+            _abandon(watcher)
+            raise self._cancellation(expiry, emitted=emitted) from None
+        _abandon(watcher)
+        if task.done():
+            if task.cancelled() or task.exception() is not None:
+                return _FAILED
+            return task.result()
+        _abandon(task)
+        if interrupt.done():
+            if emitted:
+                raise _uncertain("the drain deadline passed before the scene was confirmed")
+            raise _CallFailure("cancelled", ERROR_CANCELLED, f"{MODULE_NAME}: shutting down")
+        raise _deadline_failure(emitted=emitted)
+
+    def _cancellation(self, expiry: float, *, emitted: bool) -> _CallFailure:
+        """The record a cancellation reaching the call stands for (decision 1)."""
+
+        if self._clock() >= expiry:
+            return _deadline_failure(emitted=emitted)
+        details = {"cause": CAUSE_CONFIRMATION_LOST} if emitted else {}
+        return _CallFailure("cancelled", ERROR_CANCELLED, "the call was cancelled", **details)
+
+    async def _acquire(self, claim: _Claim, expiry: float) -> None:
+        """Wait for the set command in flight, unless the drain or the deadline comes first."""
+
+        lock = self._slot.lock
+        acquiring = asyncio.ensure_future(lock.acquire())
+        watcher = asyncio.ensure_future(self._sleeper(max(expiry - self._clock(), 0.0)))
+        try:
+            await asyncio.wait(
+                {acquiring, watcher, self._drain_started}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            _abandon_acquire(acquiring, lock)
+            _abandon(watcher)
+            raise self._cancellation(expiry, emitted=False) from None
+        _abandon(watcher)
+        if acquiring.done() and not acquiring.cancelled() and acquiring.exception() is None:
+            claim.owns_lock = True
+            if self._drain_started.done():
+                raise _CallFailure("cancelled", ERROR_CANCELLED, f"{MODULE_NAME}: shutting down")
+            return
+        _abandon_acquire(acquiring, lock)
+        if self._drain_started.done():
+            raise _CallFailure("cancelled", ERROR_CANCELLED, f"{MODULE_NAME}: shutting down")
+        raise _deadline_failure(emitted=False)
+
+    def _expiry(self, invocation: Any) -> float:
+        """``min(call.deadline, clock() + spec.timeout_seconds)`` — nothing subtracted."""
+
+        return min(
+            float(invocation.call.deadline),
+            self._clock() + float(invocation.spec.timeout_seconds),
+        )
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise _CallFailure("error", _ERROR_PROVIDER_CLOSED, f"{MODULE_NAME}: closed")
+        if self._draining:
+            raise _CallFailure("cancelled", ERROR_CANCELLED, f"{MODULE_NAME}: shutting down")
+
+    def _claim(self) -> _Claim:
+        """Take a place behind the set command in flight, or refuse."""
+
+        slot = self._slot
+        if slot.occupants > 0 and slot.occupants - 1 >= self._settings.scene_max_waiters:
+            raise _CallFailure(
+                "refused",
+                ERROR_RESOURCE_BUSY,
+                "a scene switch is in flight and its waiting line is full",
+            )
+        return _Claim(slot)
+
+
+def _set_answer(answer: Any) -> bool | int | None:
+    """``True`` when applied, the numeric status when refused, ``None`` when lost."""
+
+    if answer is _FAILED or not isinstance(answer, Mapping):
+        return None
+    result = answer.get("result")
+    if result is True:
+        return True
+    code = answer.get("code")
+    if result is False and isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
+def _deadline_failure(*, emitted: bool) -> _CallFailure:
+    if emitted:
+        return _CallFailure(
+            "timeout",
+            ERROR_TIMED_OUT,
+            "the call deadline was reached before the scene was confirmed",
+            cause=CAUSE_CONFIRMATION_LOST,
+        )
+    return _CallFailure(
+        "timeout", ERROR_TIMED_OUT, "the call deadline was reached before the switch"
+    )
+
+
+def _uncertain(message: str) -> _CallFailure:
+    return _CallFailure(
+        "external_unknown", ERROR_EXTERNAL_UNKNOWN, message, cause=CAUSE_CONFIRMATION_LOST
+    )
+
+
+def _scene_success(
+    provenance: Mapping[str, Any],
+    scene: str,
+    previous: str,
+    confirmed_at: float,
+    *,
+    reconciled: bool,
+) -> ActionObservation:
+    return ActionObservation(
+        status="success",
+        provenance=provenance,
+        result={
+            "scene": scene,
+            "previous_scene": previous,
+            "confirmed_at": float(confirmed_at),
+            "reconciled": reconciled,
+        },
+    )
+
+
+def _resolve(future: "asyncio.Future[None]") -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+def _abandon(task: "asyncio.Future[Any]") -> None:
+    """Cancel *task* without waiting for it; its outcome is consumed when it ends."""
+
+    if not task.done():
+        task.cancel()
+    task.add_done_callback(_consume)
+
+
+def _consume(task: "asyncio.Future[Any]") -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _abandon_acquire(acquiring: "asyncio.Future[Any]", lock: asyncio.Lock) -> None:
+    """Give up a lock acquisition; a lock it took anyway is released at once."""
+
+    def _release_if_taken(task: "asyncio.Future[Any]") -> None:
+        if not task.cancelled() and task.exception() is None:
+            lock.release()
+
+    if acquiring.done():
+        _release_if_taken(acquiring)
+        return
+    acquiring.cancel()
+    acquiring.add_done_callback(_release_if_taken)
+
+
+async def _settle(task: "asyncio.Future[Any]") -> None:
+    """Cancel *task* if still running and wait for it, consuming its outcome."""
+
+    if not task.done():
+        task.cancel()
+    await asyncio.wait({task})
+    if not task.cancelled():
+        task.exception()
+
+
+def _provenance(call: Any, action: str) -> dict[str, Any]:
+    destination = call.destination
+    return {
+        "provider": PROVIDER_NAME,
+        "platform": destination.platform,
+        "channel_id": destination.channel_id,
+        "route": action,
+    }
+
+
+def _failure_observation(provenance: Mapping[str, Any], failure: _CallFailure) -> ActionObservation:
+    error: dict[str, Any] = {
+        "code": failure.code,
+        "message": failure.message,
+        "retryable": False,
+    }
+    error.update(failure.details)
+    return ActionObservation(status=failure.status, provenance=provenance, error=error)
+
+
+# --------------------------------------------------------------------------- #
+# Activation
+# --------------------------------------------------------------------------- #
+
+
+async def activate(
+    context: Any,
+    settings: Mapping[str, Any],
+    catalog: Mapping[str, Mapping[str, Any]],
+) -> StreamControlModule:
+    """Build the handle from the scoped runtime context.
+
+    Settings are checked through the same hook the loader ran, so a handle
+    built outside the loader is refused on the same terms. The seams
+    ``_scene_provider``, ``_sleeper`` and ``_websocket_factory`` are read
+    from *settings*; the sleeper defaults to ``asyncio.sleep``. No transport
+    is opened here.
+    """
+
+    del catalog  # Capabilities are declared by the colocated manifest.
+    actions = getattr(context, "actions", None)
+    if actions is None or not all(
+        callable(getattr(actions, method, None))
+        for method in ("declare", "register", "mark_ready", "mark_not_ready")
+    ):
+        raise StreamControlModuleError(f"{MODULE_NAME} activation: runtime context is invalid")
+    if not isinstance(settings, Mapping):
+        raise StreamControlModuleError(
+            f"{MODULE_NAME} configuration: settings must be a mapping"
+        )
+    diagnostics = validate_settings(settings)
+    if diagnostics:
+        raise StreamControlModuleError(
+            f"{MODULE_NAME} configuration: settings were refused "
+            f"({len(diagnostics)} diagnostics)"
+        )
+    parsed = _Settings.from_mapping(settings)
+    provider = settings.get(_SEAM_SCENE_PROVIDER) if parsed.kind == KIND_SCRIPTED else None
+    return StreamControlModule(
+        context,
+        parsed,
+        scene_provider=provider,
+        sleeper=settings.get(_SEAM_SLEEPER, asyncio.sleep),
+        websocket_factory=settings.get(_SEAM_WEBSOCKET_FACTORY),
+    )
+
+
+def _declared_spec(action_name: str) -> ActionSpec:
+    """Build *action_name*'s contract from the colocated manifest.
+
+    The spec registered at ``prepare`` must equal the one the loader declared
+    at discovery, field for field: reading the same file keeps the two from
+    drifting, and the registry refuses a redeclaration that differs.
+    """
+
+    try:
+        manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in manifest["actions"]
+            if isinstance(item, Mapping) and item.get("name") == action_name
+        )
+        return ActionSpec(
+            name=entry["name"],
+            version=entry["version"],
+            description=entry["description"],
+            argument_schema=entry["argument_schema"],
+            result_schema=entry["result_schema"],
+            nature=entry["nature"],
+            required_permissions=tuple(entry.get("required_permissions", ())),
+            supported_destinations=tuple(
+                Destination(
+                    platform=item.get("platform"),
+                    channel_id=item.get("channel_id"),
+                    scope=item.get("scope"),
+                )
+                for item in entry["supported_destinations"]
+            ),
+            timeout_seconds=entry["timeout_seconds"],
+            idempotency=entry["idempotency"],
+            delivery=entry.get("delivery"),
+        )
+    except Exception:
+        raise StreamControlModuleError(
+            f"{MODULE_NAME} prepare: manifest declaration of {action_name!r} is invalid"
+        ) from None
+
+
+__all__ = [
+    "CAUSE_CONFIRMATION_LOST",
+    "DEFAULT_CONNECT_TIMEOUT_SECONDS",
+    "DEFAULT_MAX_WAITERS",
+    "DEFAULT_REQUEST_TIMEOUT_SECONDS",
+    "ERROR_PROVIDER_UNAVAILABLE",
+    "ERROR_RESOURCE_BUSY",
+    "ERROR_SCENE_NOT_ALLOWED",
+    "ERROR_SCENE_NOT_APPLIED",
+    "ERROR_SCENE_UNKNOWN",
+    "FIELD_POLLS_ENABLED",
+    "FIELD_SCENES_PROVIDER_URL",
+    "KIND_NONE",
+    "KIND_SCRIPTED",
+    "KIND_WEBSOCKET",
+    "MANIFEST_PATH",
+    "MAX_SCENE_NAME_CHARS",
+    "MODULE_NAME",
+    "POLL_ACTION",
+    "PROVIDER_NAME",
+    "REASON_NO_POLL_SERVICE",
+    "REASON_SCENE_PROVIDER_DISCONNECTED",
+    "REASON_SCENE_PROVIDER_UNREACHABLE",
+    "SCENE_ACTION",
+    "SCENE_PROVIDER_KINDS",
+    "SCENE_UNKNOWN_CODE",
+    "SceneProvider",
+    "StreamControlModule",
+    "StreamControlModuleError",
+    "activate",
+    "validate_settings",
+]
