@@ -102,7 +102,7 @@ from .loader import (
     _declaration,
     _entry_point,
 )
-from .runtime import RuntimeContext, Supervision
+from .runtime import RuntimeContext, ServiceRegistry, Supervision
 from .triggers import TriggerEngine, TriggerRegistry
 
 
@@ -801,6 +801,7 @@ def _assemble_runtime(config: Mapping[str, Any]) -> _Runtime:
         attachments=attachments,
         clock=clock,
         rng=rng,
+        services=ServiceRegistry(),
     )
     return _Runtime(bus=bus, context=context, tasks=tasks, clock=clock)
 

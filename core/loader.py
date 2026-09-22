@@ -106,7 +106,7 @@ from .lifecycle import (
     _discard,
     _wait_bounded,
 )
-from .runtime import SUPPORTED_RUNTIME_APIS
+from .runtime import SUPPORTED_RUNTIME_APIS, ServiceConflictError
 from .triggers import COMPANION_NAME_SETTING
 
 
@@ -625,13 +625,22 @@ class ModuleLoader:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             # Everything the module raised — a ModuleLoadError of its own
             # included — becomes the loader's generic refusal: the module was
             # handed its settings, so its exception text may echo a
-            # configured credential into the diagnostics.
+            # configured credential into the diagnostics. A duplicate service
+            # publication adds the holding module's name, read back from the
+            # registry rather than from the exception text (AC25).
+            holder = self._verified_service_holder(name, exc)
+            conflict = (
+                ""
+                if holder is None
+                else f": a service it published is already published by "
+                f"module {holder!r}"
+            )
             raise ModuleLoadError(
-                f"module {name!r}: field 'activate': activation failed"
+                f"module {name!r}: field 'activate': activation failed{conflict}"
             ) from None
         if status == "deadline":
             raise _field_error(
@@ -756,6 +765,30 @@ class ModuleLoader:
         if release is not None:
             task.add_done_callback(lambda done: _hand_result(done, release))
         self._abandoned.append(task)
+
+    def _verified_service_holder(self, name: str, exc: BaseException) -> str | None:
+        """Return the module holding the key *name* failed to publish, if real.
+
+        Only a :class:`~core.runtime.ServiceConflictError` naming *name* as the
+        refused publisher counts, and only when the registry itself records
+        its key as held by another module this loader activated: a module
+        cannot forge the clause, and the name reported is one the loader
+        already knows, never text the module supplied.
+        """
+
+        if not isinstance(exc, ServiceConflictError) or exc.module != name:
+            return None
+        registry = getattr(self.context, "services", None)
+        if registry is None:
+            return None
+        try:
+            holder = registry.entries().get((exc.kind, exc.platform))
+        except Exception:
+            return None
+        activated = {activation.name for activation in self.activations}
+        if holder == exc.holder and holder != name and holder in activated:
+            return holder
+        return None
 
     def _close_late(self, activation: ModuleActivation) -> None:
         """Own the bounded close of a handle returned after the grace."""

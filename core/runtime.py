@@ -67,6 +67,15 @@ driven by the coordinator's phase transitions through
 handing ``module.stopped`` to ``record_and_emit``, so the terminal module trace
 obeys the same order as every other terminal trace.
 
+**One service table.** :class:`ServiceRegistry` is a bounded key→service
+table the core does not interpret: a module publishes a collaborator under a
+``(kind, platform)`` key during activation through its scoped
+:class:`ModuleServices` facade, and any module resolves it later. The core
+defines no kind and no platform; it only refuses a second publisher of one key
+(naming both modules), refuses the entry beyond its bound and remembers which
+module published what. :attr:`RuntimeContext.services` is optional, so a
+context built without one hands out a facade whose ``available`` is ``False``.
+
 This module performs no I/O of its own beyond publishing on the injected bus,
 and it imports no transport.
 """
@@ -111,10 +120,15 @@ __all__ = [
     "ModuleActions",
     "ModuleContext",
     "ModuleHealth",
+    "ModuleServices",
     "ModuleSupervision",
     "ModuleTasks",
     "RuntimeContext",
     "RuntimeContextError",
+    # A bounded key->service table the core does not interpret.
+    "ServiceConflictError",
+    "ServiceRegistry",
+    "ServiceRegistryError",
     "Supervision",
     "SupervisionError",
 ]
@@ -154,6 +168,100 @@ class RuntimeContextError(RuntimeError):
 
 class SupervisionError(RuntimeError):
     """Raised when supervision is used in a way that would break R8's order."""
+
+
+class ServiceRegistryError(RuntimeContextError):
+    """Raised when a service publication is refused by the registry."""
+
+
+class ServiceConflictError(ServiceRegistryError):
+    """Raised when a second module publishes a key another module holds.
+
+    The key and both module names are carried as attributes so the loader can
+    check the conflict against the registry and report both modules without
+    relaying the exception text itself.
+    """
+
+    def __init__(self, kind: str, platform: str, holder: str, module: str) -> None:
+        super().__init__(
+            f"service ({kind}, {platform}) is already published by module "
+            f"{holder!r}; module {module!r} cannot publish it"
+        )
+        self.kind = kind
+        self.platform = platform
+        self.holder = holder
+        self.module = module
+
+
+# --------------------------------------------------------------------------- #
+# Service registry (R7, AC25)
+# --------------------------------------------------------------------------- #
+
+DEFAULT_MAX_SERVICES = 64
+"""How many ``(kind, platform)`` entries one registry holds at most."""
+
+
+class ServiceRegistry:
+    """A bounded key→service table the core does not interpret.
+
+    Keys are ``(kind, platform)`` text pairs chosen by the modules; the core
+    attaches no meaning to either. Each key has exactly one publisher: a second
+    publication is refused with a diagnostic naming both modules, so two
+    modules can never silently race for one key. The table is bounded, and the
+    entry beyond the bound is refused rather than evicting an earlier one.
+    Diagnostics name keys and modules only, never the service itself.
+    """
+
+    __slots__ = ("_entries", "_max_entries")
+
+    def __init__(self, max_entries: int = DEFAULT_MAX_SERVICES) -> None:
+        if (
+            not isinstance(max_entries, int)
+            or isinstance(max_entries, bool)
+            or max_entries < 1
+        ):
+            raise ServiceRegistryError(
+                "service registry: max_entries must be a positive integer"
+            )
+        self._max_entries = max_entries
+        self._entries: dict[tuple[str, str], tuple[str, Any]] = {}
+
+    @property
+    def max_entries(self) -> int:
+        return self._max_entries
+
+    def publish(self, kind: str, platform: str, service: Any, *, module: str) -> None:
+        """Record *service* under ``(kind, platform)`` as published by *module*."""
+
+        kind = _require_text(kind, "service registry.publish.kind")
+        platform = _require_text(platform, "service registry.publish.platform")
+        module = _require_text(module, "service registry.publish.module")
+        if service is None:
+            raise ServiceRegistryError(
+                "service registry.publish.service: must not be None"
+            )
+        key = (kind, platform)
+        existing = self._entries.get(key)
+        if existing is not None:
+            raise ServiceConflictError(kind, platform, existing[0], module)
+        if len(self._entries) >= self._max_entries:
+            raise ServiceRegistryError(
+                f"service registry is full ({self._max_entries} entries)"
+            )
+        self._entries[key] = (module, service)
+
+    def resolve(self, kind: str, platform: str) -> Any:
+        """Return the service published under ``(kind, platform)``, or ``None``."""
+
+        entry = self._entries.get((kind, platform))
+        return None if entry is None else entry[1]
+
+    def entries(self) -> Mapping[tuple[str, str], str]:
+        """Return a read-only ``(kind, platform) → module`` view of the table."""
+
+        return MappingProxyType(
+            {key: module for key, (module, _service) in self._entries.items()}
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -791,6 +899,45 @@ class ModuleTasks:
         return self._tasks.abandon(task, name=name, owner=self._module)
 
 
+class ModuleServices:
+    """A module's own access to the service registry.
+
+    Publication carries the bound module name, so a module cannot publish under
+    another module's name. Without a registry, ``available`` is ``False``,
+    ``resolve`` answers ``None``, ``entries`` is empty and ``publish`` raises —
+    a publisher tests ``available`` instead of provoking the error.
+    """
+
+    __slots__ = ("_module", "_registry")
+
+    def __init__(self, registry: Any, module: str) -> None:
+        self._registry = registry
+        self._module = _require_text(module, "module services.module")
+
+    @property
+    def module(self) -> str:
+        return self._module
+
+    @property
+    def available(self) -> bool:
+        return self._registry is not None
+
+    def publish(self, kind: str, platform: str, service: Any) -> None:
+        if self._registry is None:
+            raise RuntimeContextError("runtime context: no service registry")
+        self._registry.publish(kind, platform, service, module=self._module)
+
+    def resolve(self, kind: str, platform: str) -> Any:
+        if self._registry is None:
+            return None
+        return self._registry.resolve(kind, platform)
+
+    def entries(self) -> Mapping[tuple[str, str], str]:
+        if self._registry is None:
+            return MappingProxyType({})
+        return self._registry.entries()
+
+
 class ModuleSupervision:
     """A module's supervision surface: the facade plus its own health calls.
 
@@ -885,6 +1032,7 @@ class RuntimeContext:
     clock: Clock = time.monotonic
     rng: RandomSource = None
     health: ModuleHealth = None  # type: ignore[assignment]
+    services: Any = None
     runtime_api: int = RUNTIME_API
 
     def __post_init__(self) -> None:
@@ -918,6 +1066,10 @@ class RuntimeContext:
             _require_surface(self.attachments, ("put", "get"), "attachments")
         if self.scheduler is not None:
             _require_surface(self.scheduler, ("admit",), "scheduler")
+        if self.services is not None:
+            _require_surface(
+                self.services, ("publish", "resolve", "entries"), "services"
+            )
 
         if not callable(self.clock):
             raise RuntimeContextError("runtime context: field 'clock': must be callable")
@@ -946,7 +1098,8 @@ class RuntimeContext:
 
         The shared collaborators are passed through unchanged; the three
         surfaces a module writes to — its action registrations, its supervised
-        tasks and its own health — arrive already bound to its name.
+        tasks, its own health and its service publications — arrive already
+        bound to its name.
         """
 
         name = _require_text(module, "runtime context.for_module.module")
@@ -956,6 +1109,7 @@ class RuntimeContext:
             actions=ModuleActions(self.actions, name),
             tasks=ModuleTasks(self.tasks, name),
             supervision=ModuleSupervision(self.supervision, self.health, name),
+            services=ModuleServices(self.services, name),
         )
 
 
@@ -984,6 +1138,7 @@ class ModuleContext:
     actions: ModuleActions
     tasks: ModuleTasks
     supervision: ModuleSupervision
+    services: ModuleServices
 
     @property
     def runtime_api(self) -> int:
