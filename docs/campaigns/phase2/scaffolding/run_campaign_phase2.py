@@ -303,6 +303,14 @@ def main():
                     halted = f"{step}: post-merge tests RED ({tail})"
                 break
             low = out.lower()
+            # A non-zero exit may be an INFRA failure, not a code rejection: P11's review died because
+            # the REVIEWER's window saturated mid-step (2026-09-22). Probe the reviewer first and wait
+            # for its reset instead of halting the whole campaign.
+            r_ok, r_reset = codex_ok()
+            if not r_ok:
+                when = datetime.datetime.fromtimestamp(r_reset).strftime("%H:%M") if r_reset else "?"
+                log(f"{step}: REVIEWER window exhausted (reset {when}) — waiting for it, then retrying")
+                continue
             if "429" in out or "usage limit" in low or "rate limit" in low:
                 log(f"{step}: DEV rate-limited — waiting for a window, then retrying")
                 continue
