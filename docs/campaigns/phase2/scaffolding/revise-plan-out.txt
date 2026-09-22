@@ -1,0 +1,194 @@
+# plan.md amendment — round 2 findings P1–P3 (branch plan/phase2-audio/2, working tree)
+
+Only `plan.md` changed (`git status`: ` M plan.md`; 61 insertions, 24 deletions). Spec, code and every other
+file untouched. All 21 step ids, their order, `Files:` and `Dependencies:` lines are byte-identical; no new step
+id was needed. Earlier resolutions (round 1 P1–P5) are intact — none of their sentences were edited.
+
+## Sections and steps changed
+
+1. Intro paragraph — one added sentence announcing "round 2" (challenger findings on this plan, resolved in
+   place in P4, P11, P13, P16 with no new step id).
+2. `## Review findings addressed` — new sub-table `### Round 2 — challenger findings on this plan` with one row
+   per finding (severity, steps, resolution), so a reader sees the three resolutions without diffing steps.
+3. Decision 1 (deadline convention) — two insertions: the 1-s `skipped:deadline` reserve is R3's own and bounds
+   only the transcription window; and a bold paragraph placing `audio.capture`'s transcription phase outside the
+   interruption-record rule.
+4. Decision 4 (service registry shape) — rewritten: three-method surface, `available` on the facade, publishers
+   test `available`.
+5. P4 Description / Tests / Risks — `entries` joins the required surface; facade gains `available`; the Risks
+   sentence "must not demand `entries` (a two-method fake registry stays valid)" is replaced by its opposite.
+6. P11 Description / Tests / Risks — the transcription bound, a new "Deadline boundary during transcription"
+   paragraph, a new "Boundary (round 2, P1)" test block, and the Risks sentence "a `CancelledError` during the
+   request ends `cancelled`…" replaced.
+7. P13 Description / Tests — guard on the underlying registry (`available`), default-context test block.
+8. P16 Description / Tests — consumer calls `entries()`/`resolve()` only, no concrete-class check; new
+   "Accepted-surface proof" test through `stream_control.prepare`.
+9. P21 Description, gate step (4) only — the AC41 subtraction exemption now names R3's two reserves.
+10. Caller tables — `ServiceRegistry` table: rows for the direct `RuntimeContext(` constructions, twitch
+    `activate`, fixture `activate`, `stream_control.prepare`; provider-convention table: `audio_input` row.
+
+## Exact wording of each resolution
+
+### P1 (blocker, P11) — transcription deadline path
+
+Round-2 table row (verbatim):
+> **The stored capture always wins.** Once `attachments.put` has returned the capture is complete (R3): the
+> module authors no interruption record after that point and never releases the segment itself. The
+> transcription request is bounded by `min(timeout_seconds, transcription_window)` with
+> `transcription_window = (expiry − now) − 1 s` — R3's own `skipped:deadline` reserve, which refuses to *start*
+> a request in the last second and, by the same constant, closes a *running* one — so the record is always
+> `success` with its `audio_ref`, stamped at the latest `expiry − 1 s`, strictly `< expires_at`, and adopted by
+> the phase 1 in-time rule (`test_a_confirmation_landing_in_time_survives_a_late_adoption`). R10 is not
+> involved on this path: its late adoption governs the recorder half (P10, `capture_timed_out`) and could not
+> help here — a late `success` is never adopted, and a `timeout`/`error` record would lose the capture R3
+> requires. The three triggers that abandon a pending request (its bound, `drain()`, a `CancelledError` after
+> storing) all end `success` + `transcription_status: "failed:stt_timed_out"`; only a call still recording
+> reaches `expiry`. The 1 s never moves the recorder's kill, which stays at `expiry` (AC39); P21 step 4 exempts
+> both R3 reserves. Tested through the real executor at `t = 98.99` / `99.0` / adoption parked to `100.5`, with
+> the attachment still leased and `COUNTER_ACTION_TIMEOUTS == 0`.
+
+P11 Description, bound (replaces "bounded by `min(timeout_seconds, expiry − now)` on the sleeper (the remaining
+time, not a constant)"):
+> bounded on the sleeper by `min(timeout_seconds, transcription_window)` where
+> `transcription_window = (expiry − now) − 1 s` is the time left before R3's `skipped:deadline` reserve — the
+> same 1 s that refuses to *start* a request also closes a *running* one (round 2, P1; no other constant)
+
+P11 Description, new boundary paragraph:
+> **Deadline boundary during transcription (round 2, P1):** once `attachments.put` has returned, the capture is
+> complete — the segment is leased to the run and the observation carries its `audio_ref` whatever happens to
+> the transcription (R3) — so from that point the module authors no interruption record and never releases the
+> segment itself (the run's cleanup does). The call budget therefore cannot expire *during* a transcription
+> request: the request's bound is the transcription window, so the latest a record can be stamped is
+> `expiry − 1 s`, strictly `< expires_at`, and the executor adopts it through the phase 1 in-time rule (a
+> `success` stamped before `expires_at` is adopted however late the executor resumes —
+> `test_a_confirmation_landing_in_time_survives_a_late_adoption`); R10's late-interruption adoption is not
+> involved on this path — it governs the recorder half (P10) and could not help here, since a late `success` is
+> never adopted and a `timeout`/`error` record would lose the capture R3 requires. The three triggers that can
+> abandon a pending request all end the same way — `success` with the `audio_ref`, `transcription` absent,
+> `transcription_status: "failed:stt_timed_out"` (no answer within the time the request was allowed): (i) the
+> bound fires, whether `timeout_seconds` or the window closing; (ii) `drain(deadline_seconds)` — a call in its
+> transcription phase is not cancelled and kills nothing, its request may complete within `min(its bound, the
+> drain deadline)` on the clock and is abandoned when the drain deadline passes first; (iii) a `CancelledError`
+> reaching the invoke after storing — caught, the request abandoned, the `success` returned normally (only a
+> `CancelledError` *before* storing ends `cancelled`, P10). Which outcome wins at the boundary is thus fixed:
+> the stored capture always does, and `expiry` itself is reached only by a call still recording (P10,
+> `capture_timed_out` under R10). The 1-s reserve bounds the transcription request only and never the
+> recorder's kill, which stays at `expiry` exactly (AC39, AC41).
+
+P11 Tests, new block "Boundary (round 2, P1)": through the real executor, call deadline `t = 100.0`, segment
+stored at `t = 95.0`, held transport, `timeout_seconds: 10` → at `98.99` still running (1 request, 0 records);
+at `99.0` `success` with `audio_ref` (`size == 96 044`), `transcription_status == "failed:stt_timed_out"`,
+`provider_completed_at == 99.0 < expires_at`, `action.completed` `status: success`, one record,
+`COUNTER_ACTION_TIMEOUTS == 0`, 0 kills, attachment still leased; the same with adoption parked to `100.5`;
+stored at `99.5` → `skipped:deadline`, 0 requests; drain at `96.0` (`deadline_seconds: 2`) with release at
+`97.0` → `ok`, still held at `98.0` → `success` + `failed:stt_timed_out`, drain within deadline, 0 kills; direct
+provider cancellation at `96.0` after storing → `success` + `failed:stt_timed_out`, 0 kills, 1 attachment
+(contrasted with the same cancellation during recording → `cancelled`, 0 attachments, 1 kill, P10).
+
+P11 Risks (replaces "a `CancelledError` during the request ends `cancelled` with the stored bytes released…"):
+> after storing, no trigger — bound, drain or `CancelledError` — may turn the record into
+> `cancelled`/`timeout`/`error` or release the segment (R3: the capture stays `success`; round 2, P1); the
+> window check and the request bound use the single 1-s reserve, named for R3's `skipped:deadline` and
+> matching none of the AC41 regex; the `CancelledError` handler returns the `success` without awaiting
+> anything the cancellation could interrupt again (the transport call is abandoned, not awaited).
+
+Decision 1 additions: "the 1 s of R3's `skipped:deadline` is R3's own reserve and bounds the optional
+transcription request's window only, never the recorder's kill (P11, round 2 P1)" and the bold paragraph
+"**The transcription phase of `audio.capture` is outside this rule (round 2, P1):** …" (same content as above).
+
+P21 step (4) (replaces "…other than R3's `capture_too_long` admission check (`(expiry − now) − grace_seconds`);"):
+> …other than R3's two reserves in `modules/audio_input/`: the `capture_too_long` admission check
+> (`(expiry − now) − grace_seconds`) and the transcription window (`(expiry − now) − 1 s`, R3's
+> `skipped:deadline` reserve, P11 — round 2 P1; AC41's letter names only the first, the second is R3's own
+> text), neither of which moves the recorder's kill from `expiry`;
+
+Provider-convention caller table, `audio_input` row: "… — while recording only; after `attachments.put` no
+interruption record: the transcription request is bounded by the transcription window `(expiry − now) − 1 s`
+(R3's `skipped:deadline` reserve) so its `success` is always in time, and bound, drain or `CancelledError`
+there end `success` + `failed:stt_timed_out` (P11, round 2 P1)."
+
+### P2 (major, P13) — publication guard
+
+Round-2 table row (verbatim):
+> The `ModuleServices` facade exposes `available` (true iff `RuntimeContext.services` is bound). Twitch and the
+> fixture platform publish **only when `context.services.available`**, never on the facade's mere presence: a
+> default `RuntimeContext` (`services=None`) hands every module a facade with `available` false, so activation
+> on it publishes nothing and succeeds, and the caller table's "no change" for the five direct
+> `RuntimeContext(` constructions and `core/main.py` stays true; a duplicate publication
+> (`ServiceRegistryError`) is not caught and still fails activation (AC25). Tested directly (default context →
+> `available is False`, 0 publications, activation succeeds, `chat.write` bound) and on the loader path —
+> `tests/test_loader.py::test_fakeplatform_chat_write_equals_twitch_except_for_the_platform`, unchanged,
+> activates both platforms on a context built without `services`.
+
+P13 Description (replaces "when the context carries a `services` facade (a context without one publishes
+nothing)"):
+> `activate` publishes it through `context.services.publish("poll", "twitch", service)` **only when the
+> underlying registry is bound** — `getattr(context, "services", None)` is a facade whose `available` is true
+> (P4; round 2, P2), never on the facade's mere presence: a default `RuntimeContext` (`services=None`) hands
+> every module a facade with `available` false, so activation on it publishes nothing and succeeds, which keeps
+> the caller table's claim that the existing direct `RuntimeContext(` constructions need no change; a
+> `ServiceRegistryError` (duplicate key) is not caught and fails activation (AC25); … Fixture platform: …
+> published under `("poll", "fake")` at `activate` under the same `available` guard
+
+P13 Tests, new block "Default-context guard (round 2, P2)": twitch activated through `_session_factory` on
+`RuntimeContext(bus, actions, supervision, tasks).for_module("twitch")` (no `services`) succeeds with
+`context.services.available is False`, 0 publications, `chat.write` bound; same for the fixture platform; both
+through `ModuleLoader` on such a context — which is exactly what the unchanged
+`test_fakeplatform_chat_write_equals_twitch_except_for_the_platform` already does (its `RuntimeContext(**fields)`
+at tests/test_loader.py:1278 carries no `services`), so its continued pass is the loader-path proof; with a
+registry each module publishes exactly once.
+
+P4: facade gains "`available` → `True` iff the context carries a registry, so a publisher tests it instead of
+provoking the error — round 2, P2"; P4 Tests: "a context without `services` yields a facade with `available is
+False`, `resolve(...) is None`, `entries() == {}` and a `publish` raising `RuntimeContextError`, and one with a
+registry `available is True`". Decision 4 and the services caller table updated accordingly (twitch row:
+"Publish only when `context.services.available` (a bound registry), never on the facade's presence; a default
+context publishes nothing (P13)"; direct-constructions row: "No change (optional field); a module activated on
+one gets a facade with `available` false and publishes nothing (P13 guard, round 2 P2)").
+
+### P3 (major, P4) — one service interface
+
+Round-2 table row (verbatim):
+> **One interface:** `_require_surface(services, ("publish", "resolve", "entries"), "services")`; a two-method
+> collaborator is refused at construction naming `services` and `entries()`; the facade delegates exactly these
+> three calls, and P16 makes only `entries()` and `resolve()` calls on it, with no `isinstance(ServiceRegistry)`.
+> P16 proves the accepted collaborator **through `stream_control.prepare`**: a minimal three-method fake
+> registry (not `ServiceRegistry`) holding `("poll", "fake")` binds `stream.poll.create` to `fake/*/poll` and a
+> create reaches the scripted service, so the producer surface (P4) and the consumer (P16) cannot disagree again.
+
+P4 Description: "`RuntimeContext` gains `services: Any = None`, surface-checked for `publish`/`resolve`/`entries`
+when present — the one accepted interface, the three calls the facade delegates and the only ones a consumer
+may make (round 2, P3)". P4 Tests: "`RuntimeContext(services=object())` and `RuntimeContext(services=<publish
+and resolve only>)` are each refused naming the field `services` and the missing method — `entries()` for the
+second (round 2, P3)". P4 Risks (replaces "must not demand `entries` (a two-method fake registry stays
+valid)"): "`_require_surface` demands exactly `publish`, `resolve`, `entries` — the three calls the facade
+delegates and the only ones a consumer (P16) may make; a fake registry implements all three and there is no
+two-method form (round 2, P3)".
+
+P16 Description: "— `entries()` and `resolve()` are the only two calls the module makes on the facade, both
+members of the three-method surface P4 requires of every registry (round 2, P3), and no `isinstance` check
+names `ServiceRegistry`, so any accepted collaborator works". P16 Tests, new block "Accepted-surface proof
+(round 2, P3)": a minimal three-method fake registry (a test class with `publish`/`resolve`/`entries` only, not
+`ServiceRegistry`) holding `("poll", "fake") → ScriptedPollService`, passed as `RuntimeContext(services=fake)`:
+`prepare` with `polls.enabled: true` binds `stream.poll.create` to `fake/*/poll` and a create reaches the
+scripted service; the two-method form never reaches `prepare` because P4 refuses it at construction.
+`stream_control.prepare` caller-table row: "`entries()` then `resolve()` per platform — the three-method
+surface only, no concrete-class check (P16, round 2 P3)".
+
+## What I could not resolve / flags for the spec owner
+
+- **AC41's exemption list vs. R3's own text.** The P1 resolution reuses R3's 1-s `skipped:deadline` reserve as
+  the transcription request's bound. R3 mandates that 1 s ("under 1 s remains before the call deadline"), but
+  AC41's letter exempts only "R3's `capture_too_long` admission check" from the "no expression subtracting a
+  literal or a setting from the call deadline" rule — so a literal reading of AC41 would already flag R3's own
+  `skipped:deadline` check regardless of this plan. The plan records the gate's reading (P21 step 4: both R3
+  reserves exempt, neither moving the recorder's kill from `expiry`) and says so explicitly; if the spec owner
+  wants AC41's text to match, that is a one-clause spec amendment I did not make (spec untouched, per the
+  constraints). No alternative satisfies R3 and R10 together: a `success` stamped at `expiry` is discarded by
+  R10, and an interruption record would lose the capture R3 requires.
+- **`failed:stt_timed_out` for drain/cancellation abandonment.** R3's `transcription_status` set is closed, so
+  a request abandoned by `drain()` or a `CancelledError` after storing reports `failed:stt_timed_out` ("no
+  answer within the time the request was allowed"). It is the most honest member of the closed set; a
+  dedicated status would need a spec amendment.
+- Frontmatter `version: "1.1"` left as-is (it mirrors the spec version); the amendment is announced in the
+  intro and the round-2 table instead.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate per-step loop specs (Pn-spec.md) for PHASE 1 from the approved plan.
+"""Generate per-step loop specs (Pn-spec.md) for PHASE 2 from the approved plan.
 
 Durable copy: this script and its output live INSIDE the repository
 (`docs/campaigns/phase2/scaffolding/`) so a reboot or a /tmp wipe cannot destroy the campaign
@@ -9,9 +9,9 @@ Mechanical extraction — no rewriting: each step spec carries the plan's own
 Files/Description/Dependencies/Tests/Risks text plus the spec's R/AC references, and the loop
 constraints (test command, atomic commit, no weakened tests).
 
-Root-document guard: the plan's P23/P24 list the repository-root `spec.md` and `plan.md` as targets.
+Root-document guard: the plan's gate step may list the repository-root `spec.md` as a target.
 Those files are the historical v1-MVP documents. Every root-document target is rewritten to the
-phase-1 archive under `docs/campaigns/phase2/`, with an explicit do-not-overwrite note.
+phase-2 archive under `docs/campaigns/phase2/`, with an explicit do-not-overwrite note.
 """
 import pathlib
 import re
@@ -24,14 +24,14 @@ OUT = BASE / 'scaffolding/steps'
 
 ROOT_GUARD = (
     '\n\n**Do not overwrite the repository-root `spec.md` / `plan.md`**: those are the frozen v1-MVP\n'
-    'documents (also archived under `docs/campaigns/v1-mvp/`). The phase-1 specification and plan are\n'
+    'documents (also archived under `docs/campaigns/v1-mvp/`). The phase-2 specification and plan are\n'
     '`docs/campaigns/phase2/spec.md` and `docs/campaigns/phase2/plan.md` — record versioning there and\n'
     'in `docs/README.md`.'
 )
 
 
 def rewrite_root_targets(files: str) -> str:
-    """Point any bare root spec.md/plan.md target at the phase-1 archive."""
+    """Point any bare root spec.md/plan.md target at the phase-2 archive."""
     def sub(m):
         name = m.group(2)
         if name in ('spec.md', 'plan.md'):

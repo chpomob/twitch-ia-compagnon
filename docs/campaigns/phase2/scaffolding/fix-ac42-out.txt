@@ -1,0 +1,66 @@
+# AC42 honesty correction — report
+
+## Files touched
+- `docs/campaigns/phase2/spec.md` — AC42 only (the tail of the criterion, from "and authors the record with no further wait" to the exhausted-window sentence). Nothing else in the file was edited; the pre-existing uncommitted hunks (version 1.2, the `tests/test_audio_input.py` target description, AC41's two-subtraction text) were already in the working tree and are unchanged.
+- `plan.md` — **not changed**. Decision 1 already states the limit exactly as ruled ("A wake delayed by the whole reserve is a loop stalled for a second, outside any module arithmetic (the stamp is the executor's); the phase 1 rule then treats the record as any late `success`, and the README records that limit beside the executor-cancellation one") and P20 already lists "the remote-readiness, executor-cancellation and stalled-wake limits of decision 1". Its existing working-tree modifications predate this task and were not touched.
+
+## The exact new AC42 wording
+
+- AC42 (R3, R10): The transcription window closes without losing the
+  capture. With `transcription.enabled: true`, `timeout_seconds: 10`, the
+  call deadline at `t = 100.0` on the injected clock (`expiry == 100.0`)
+  and a transport that holds its answer, a segment stored at `t = 95.0`
+  opens a window that closes at `t = 99.0` (`expiry − 1 s`, the
+  transcription edge); when the optional transcription has not finished
+  inside that window — the bound fires, or the module's wake from it is
+  delayed — the terminal observation is `success` with its `audio_ref`
+  (`size == 96 044`, the attachment still leased to the run),
+  `transcription` absent and `transcription_status ==
+  "failed:stt_timed_out"`, its `provider_completed_at` strictly `< 100.0`
+  (`< expires_at`, adopted by the phase 1 in-time rule, never through
+  R10), `action.completed` carrying `status: success`, exactly one record
+  for the call, `COUNTER_ACTION_TIMEOUTS == 0` and 0 kills. Two tests
+  drive it through the real executor: (a) the clock driven to the window
+  edge — at `t = 98.99` the call is still running with exactly 1 request
+  and 0 records; at `t = 99.0` the record above, stamped `== 99.0`; the
+  transport's answer released afterwards at `t = 99.5` changes nothing
+  (still one record, `failed:stt_timed_out`, no `transcription`); (b) the
+  transcription finishes late — the clock advanced from `t = 98.0` to
+  `t = 99.6` in one step, so the bound parked at `t = 99.0` wakes the
+  module with the clock already at `99.6`, and the transport's answer is
+  released at that same instant: whether or not the text is already in
+  the module's hands when it wakes, the record is the one above, stamped
+  `== 99.6 < 100.0`, adopted as `success`, the late text not adopted. The
+  module decides on the clock it reads at its wake, not on which event
+  woke it, and authors the record with no further wait. **What the
+  module guarantees** (the two tests above): it never waits on anything
+  scheduled at or after the window edge `expiry − 1 s`, so it authors
+  and returns its observation at or before the edge whenever its wake
+  comes on time, and a wake delayed past the edge by less than the
+  reserve still returns `< expiry`. **Declared limit, not a guarantee:**
+  the completion stamp is not the module's — `core/actions.py::_observe`
+  takes it after the provider returns — so a wake stalled by at least
+  the whole reserve (an event loop frozen for a second or more) lands at
+  or after `expiry`, and the phase 1 rule then treats the record as a
+  late `success` (not adopted; the generic timeout record replaces it).
+  Its cause is the executor
+  stamp, its bound is the reserve (a wake stalled by less than 1 s
+  cannot reach `expiry`), and its only mitigation is the reserve itself;
+  no test can pin it, and the README phase 2 limits clause (P20) records
+  it beside the remote-readiness and executor-cancellation limits. A
+  reader must not take this criterion as "the stamp is always before
+  `expiry`": it is "the module returns at the edge at the latest, and a
+  stall of the whole reserve is a documented residual". A window already
+  exhausted when the transcription would start — a segment stored at
+  `t = 99.0` or at `t = 99.5` (`(expiry − now) − 1 s ≤ 0`) — sends 0
+  requests and reports `skipped:deadline`, still `success` with the
+  `audio_ref`.
+
+
+## What changed inside AC42
+- Removed: "so its stamp is its own decision instant and never `expiry` or later" (the absolute guarantee).
+- Added, in its place: a **module guarantee** paragraph (never waits on anything scheduled at or after the edge `expiry − 1 s`; authors and returns at or before the edge when the wake is on time; a wake delayed by less than the reserve still returns `< expiry`) tied to the two existing tests, and a **declared limit, not a guarantee** paragraph (stamp belongs to `core/actions.py::_observe`, taken after the provider returns; a wake stalled by at least the whole reserve lands at or after `expiry` and is a late `success`, not adopted; cause = executor stamp, bound = the reserve, mitigation = the reserve itself; not pinnable by a test; recorded in the README phase-2 limits clause (P20) beside remote-readiness and executor-cancellation), plus an explicit sentence forbidding the "stamp is always before `expiry`" reading.
+- Kept unchanged: the id `AC42 (R3, R10)`, both tests (a: edge at `t = 98.99` / `99.0`, answer at `99.5`; b: delayed wake `98.0 → 99.6`, either registration order), every assertion on the record (`success`, `audio_ref` `size == 96 044`, attachment leased, `transcription` absent, `failed:stt_timed_out`, `provider_completed_at < 100.0`, `action.completed` `status: success`, one record, `COUNTER_ACTION_TIMEOUTS == 0`, 0 kills), the "decides on the clock, not on which event woke it" rule, and the exhausted-window (`t = 99.0` / `99.5` → `skipped:deadline`) sentence.
+
+## Confirmation
+No other AC id, requirement (R1–R10), decision or plan step was touched. `git diff plan.md` contains only the pre-existing working-tree changes; the only new hunk in the spec is inside AC42.

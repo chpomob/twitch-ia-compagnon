@@ -1,0 +1,37 @@
+{
+  "phase": "revise",
+  "exit_code": 1,
+  "error": "REVISE exited 3: Claude timed out (timeout after 1500s)",
+  "stdout": "",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 3,
+        "elapsed": 1535.6153005610104,
+        "retryable": false,
+        "reason": "permanent",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3083,
+          "completion_tokens": 0,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "revise",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3083,
+      "completion_tokens": 0,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "revise",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}

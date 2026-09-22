@@ -1,0 +1,37 @@
+{
+  "phase": "plan",
+  "exit_code": 0,
+  "commit_sha": "9784bbf0441b2af2f978f936012c3dd3996deaaf",
+  "stdout": "READ: spec.md\nREAD: findings.json\n\nWrote plan.md (spec \"phase2-audio-stream-interaction\" v1.1, findings-input: true). 21 steps P1\u2013P21, contiguous, every step with Files/Description/Dependencies/Tests/Risks, every Files entry a spec target or under docs/campaigns/phase2/, all 37 targets covered, dependencies acyclic and backward-only, full-branch review gate at P21, caller tables (incl. the R10 executor change), requirement coverage R1\u2013R10 and ordering rationale with the shared-file rule.\n\nFindings addressed (mapped in the plan's \"Review findings addressed\" table):\n- P1 (blocker, required policy for polls): P14 establishes and P16 keeps the `required: true` prepare failure naming `stream_control` / `polls.enabled`, with failing and passing tests.\n- P2 (WAV header): P8/P9 write the complete WAV to the player; `played_ms` derives from accepted data bytes via `data_offset`; AC1 48 044 / AC3 128 000 asserted on the runner log.\n- P3 (unordered shared files, websocket prerequisite): explicit edges for every shared file (test_stream_control.py P4\u2192P13\u2192P14\u2192P15\u2192P16, stream_control P14\u2192P15\u2192P16, pyproject P8\u2192P10\u2192P14, ...); P18 depends on P15 directly.\n- P4 (deadline lead \u2014 resolved by the spec amendment R10/AC38\u2013AC41): no module-side lead anywhere; new step P3 amends core/actions.py::_run_invocation to adopt a provider-authored interruption record at/after expires_at (provider-wins-late and timer-wins paths) while late success/refused stay generic and the timer stays in force; tests/test_actions.py pins both sides with the two phase 1 tests unmodified; module halves of AC38/AC39 in P9/P10; AC41 grep in P21.\n- P5 (output ownership): P9 \u2014 the output slot is owned by the player process until `wait` returns (escalation task after a stop); queued-successor tests for cancellation and deadline timeout.\n\nDecisions flagged in the plan: the executor/module meeting at the deadline (module watcher at expiry + CancelledError handler returning the record; status rule timeout-vs-cancelled; executor's external-cancellation branch unchanged, drain via module hook), player runner seam and ownership, private WAV readers, ServiceRegistry shape, R4 omission hunk site, PC profile polls disabled, empty-capabilities degraded trace for transcription-only degradation.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 708.4680201340234,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3183,
+          "completion_tokens": 568,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "plan",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3183,
+      "completion_tokens": 568,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "plan",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}

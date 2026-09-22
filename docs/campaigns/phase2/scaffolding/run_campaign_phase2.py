@@ -54,7 +54,7 @@ GATE_REPORT = CAMPAIGN / os.environ.get("GATE_REPORT", "gate-report-1.md")
 
 TEST_CMD = ".venv/bin/python -m pytest tests/ -q -p no:cacheprovider"
 # Fix rounds (gate findings) are appended after the plan's steps, e.g. EXTRA_STEPS=P24F1,P24F2
-STEP_IDS = [f"P{i}" for i in range(1, 24)] + [
+STEP_IDS = [f"P{i}" for i in range(1, 22)] + [
     s.strip() for s in os.environ.get("EXTRA_STEPS", "").split(",") if s.strip()]
 DEV_CLAUDE_TUI = f"python3 {CLAUDE} --timeout 2700 --hard-timeout 3900 --cwd {REPO}"
 DEV_GLM = "pi -p --provider zai --model glm-5.3 --thinking high"

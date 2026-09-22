@@ -1,6 +1,6 @@
 ---
 name: "phase2-audio-stream-interaction"
-version: "1.2"
+version: "1.1"
 author: "adversarial-spec"
 status: "draft"
 tags: [adversarial, spec]
@@ -56,7 +56,7 @@ targets:
   - file: tests/test_audio_output.py
     description: "New: `audio.speak`/`audio.play` contract — completion, every failure code, voice/output refusal, text and duration bounds, per-output serialization and `resource_busy`, deadline and cancellation stop, prepare readiness per action, `required` policy, default-deny."
   - file: tests/test_audio_input.py
-    description: "New: `audio.capture` contract — segment validation and bounds (32 000 B/s anchor), lease/TTL/cleanup, `capture_too_long`, timeout and cancellation with 0 bytes, transcription success/failure/disabled/unavailable, the transcription window edge and the delayed wake (AC42), on-demand only, readiness, `required`, default-deny."
+    description: "New: `audio.capture` contract — segment validation and bounds (32 000 B/s anchor), lease/TTL/cleanup, `capture_too_long`, timeout and cancellation with 0 bytes, transcription success/failure/disabled/unavailable, on-demand only, readiness, `required`, default-deny."
   - file: tests/test_stream_control.py
     description: "New: scene allowlist, read-back confirmation, `scene_unknown`, `scene_not_applied`, reconciliation and `external_unknown`, reconnection with injected RNG/clock, the websocket provider's handshake/authentication/request-response against an in-process peer, poll bounds, one create per call, `poll_active`, lost confirmation and 5xx → reconciliation or `external_unknown` with 0 second creation, the tracked-table channel cap, per-resource serialization for two sessions, drain behaviour, readiness with an absent provider, `required`."
   - file: tests/test_phase2_scenario.py
@@ -1023,78 +1023,9 @@ rule and is the precondition of AC3 and AC10.
   manifests) matches 0 lines; the three settings schemas declare no
   lead/margin key; the gate review of `git diff <base>..HEAD -- modules/`
   finds no expression subtracting a literal or a setting from the call
-  deadline **other than exactly two**, both in `modules/audio_input/`,
-  both authorized here and each limited to its stated purpose: (i) R3's
-  `capture_too_long` admission check — `seconds > (expiry − now) −
-  grace_seconds`, evaluated once before any process is spawned — refuses
-  a capture that could not finish before the deadline and moves nothing
-  else: a recorder that was admitted is killed at `expiry` exactly
-  (AC39); (ii) the optional transcription window of `audio.capture` —
-  `(expiry − now) − 1 s`, measured once after the segment is stored —
-  which exists for one reason only: the module must wait for the optional
-  transcription before it can author the capture's `success` record
-  carrying its `audio_ref`, and phase 1 adopts a `success` only when its
-  completion stamp is strictly before `expires_at` (AC40), so that record
-  must be stamped before `expiry`; the window never shortens the capture
-  — the recorder's kill stays at `expiry` exactly, AC39 unchanged — it
-  bounds the transcription request only (an exhausted window transcribes
-  nothing, reports it and is still `success`, AC42), and it applies to no
-  other action: not `audio.speak` or `audio.play`, not the scene or poll
-  paths, whose stops, kills and reads happen at `expiry` itself. Any
-  third subtraction, whatever its name — an adoption lead, a deadline
-  margin, an early stop, a deadline lead — is a defect that the grep, the
-  schema check and the diff review each reject; the README's playback and
-  capture sections describe no lead; and AC38's `expiry − 0.05 s` success
-  case passes.
-- AC42 (R3, R10): The transcription window closes without losing the
-  capture. With `transcription.enabled: true`, `timeout_seconds: 10`, the
-  call deadline at `t = 100.0` on the injected clock (`expiry == 100.0`)
-  and a transport that holds its answer, a segment stored at `t = 95.0`
-  opens a window that closes at `t = 99.0` (`expiry − 1 s`, the
-  transcription edge); when the optional transcription has not finished
-  inside that window — the bound fires, or the module's wake from it is
-  delayed — the terminal observation is `success` with its `audio_ref`
-  (`size == 96 044`, the attachment still leased to the run),
-  `transcription` absent and `transcription_status ==
-  "failed:stt_timed_out"`, its `provider_completed_at` strictly `< 100.0`
-  (`< expires_at`, adopted by the phase 1 in-time rule, never through
-  R10), `action.completed` carrying `status: success`, exactly one record
-  for the call, `COUNTER_ACTION_TIMEOUTS == 0` and 0 kills. Two tests
-  drive it through the real executor: (a) the clock driven to the window
-  edge — at `t = 98.99` the call is still running with exactly 1 request
-  and 0 records; at `t = 99.0` the record above, stamped `== 99.0`; the
-  transport's answer released afterwards at `t = 99.5` changes nothing
-  (still one record, `failed:stt_timed_out`, no `transcription`); (b) the
-  transcription finishes late — the clock advanced from `t = 98.0` to
-  `t = 99.6` in one step, so the bound parked at `t = 99.0` wakes the
-  module with the clock already at `99.6`, and the transport's answer is
-  released at that same instant: whether or not the text is already in
-  the module's hands when it wakes, the record is the one above, stamped
-  `== 99.6 < 100.0`, adopted as `success`, the late text not adopted. The
-  module decides on the clock it reads at its wake, not on which event
-  woke it, and authors the record with no further wait. **What the
-  module guarantees** (the two tests above): it never waits on anything
-  scheduled at or after the window edge `expiry − 1 s`, so it authors
-  and returns its observation at or before the edge whenever its wake
-  comes on time, and a wake delayed past the edge by less than the
-  reserve still returns `< expiry`. **Declared limit, not a guarantee:**
-  the completion stamp is not the module's — `core/actions.py::_observe`
-  takes it after the provider returns — so a wake stalled by at least
-  the whole reserve (an event loop frozen for a second or more) lands at
-  or after `expiry`, and the phase 1 rule then treats the record as a
-  late `success` (not adopted; the generic timeout record replaces it).
-  Its cause is the executor
-  stamp, its bound is the reserve (a wake stalled by less than 1 s
-  cannot reach `expiry`), and its only mitigation is the reserve itself;
-  no test can pin it, and the README phase 2 limits clause (P20) records
-  it beside the remote-readiness and executor-cancellation limits. A
-  reader must not take this criterion as "the stamp is always before
-  `expiry`": it is "the module returns at the edge at the latest, and a
-  stall of the whole reserve is a documented residual". A window already
-  exhausted when the transcription would start — a segment stored at
-  `t = 99.0` or at `t = 99.5` (`(expiry − now) − 1 s ≤ 0`) — sends 0
-  requests and reports `skipped:deadline`, still `success` with the
-  `audio_ref`.
+  deadline other than R3's `capture_too_long` admission check; the
+  README's playback and capture sections describe no lead; and AC38's
+  `expiry − 0.05 s` success case passes.
 
 ## Caller enumeration
 
