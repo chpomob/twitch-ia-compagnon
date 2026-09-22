@@ -72,8 +72,9 @@ response, anything else an unsupported shape that ends the run ``error``
 with 0 actions — and never guessed from prose. At ``prepare``, before the
 readiness barrier, the adapter probes each capability of
 ``capabilities.required`` with one bounded request (decision 3): a forced
-call on :data:`~core.contracts.PROBE_TOOL`, and the same with one 1×1 PNG
-image part for ``vision``; a capability not verified stops startup with
+call on :data:`~core.contracts.PROBE_TOOL`, the same with one 1×1 PNG
+image part for ``vision`` and with one 0.25 s silent WAV audio part for
+``audio`` (R4) — at most 3 requests; a capability not verified stops startup with
 ``module 'brain': backend capability '<name>' not verified: <reason>`` —
 never the key, the endpoint or a body — and leaves the module not ready. The
 verified set is :attr:`BrainModule.verified_capabilities`. An ``image_ref``
@@ -200,6 +201,7 @@ import inspect
 import json
 import math
 import re
+import struct
 import sys
 import time
 from collections import OrderedDict, deque
@@ -217,12 +219,16 @@ from core.contracts import (
     BRAIN_ERROR_NOT_A_READ_ACTION,
     BRAIN_ERROR_OBSERVATION_TOO_LARGE,
     BRAIN_ERROR_UNKNOWN_ACTION,
+    CAPABILITY_AUDIO,
+    CAPABILITY_STRUCTURED_OUTPUT,
+    CAPABILITY_VISION,
     DELIVERY_NO_TEXT_ARGUMENT,
     DELIVERY_REASON_EMPTY,
     DELIVERY_REASON_NOT_A_DELIVERY,
     DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS,
     DELIVERY_REASON_TEXT_MAPPING_MISSING,
     DELIVERY_REASON_UNKNOWN_ACTION,
+    PROBE_REASON_AUDIO_REJECTED,
     PROBE_REASON_IMAGE_REJECTED,
     PROBE_REASON_MALFORMED_ARGUMENTS,
     PROBE_REASON_MULTIPLE_TOOL_CALLS,
@@ -376,13 +382,18 @@ _SECONDS = "seconds"
 _ENDPOINT_SCHEMES = frozenset({"http", "https"})
 _ENV_REFERENCE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
 
-CAPABILITY_STRUCTURED_OUTPUT = "structured_output"
-CAPABILITY_VISION = "vision"
-KNOWN_CAPABILITIES = frozenset({CAPABILITY_STRUCTURED_OUTPUT, CAPABILITY_VISION})
-"""The backend capabilities ``capabilities.required`` may name (R2).
+# The capability names are the shared vocabulary of ``core.contracts``;
+# ``CAPABILITY_STRUCTURED_OUTPUT``/``CAPABILITY_VISION``/``CAPABILITY_AUDIO``
+# stay importable from this module as re-exports.
+KNOWN_CAPABILITIES = frozenset(
+    {CAPABILITY_STRUCTURED_OUTPUT, CAPABILITY_VISION, CAPABILITY_AUDIO}
+)
+"""The backend capabilities ``capabilities.required`` may name (R2, R4).
 
 ``structured_output`` is mandatory: the loop needs one tool call or a final
 text per turn, so a list without it is refused at validation (AC10).
+``vision`` and ``audio`` each add one prepare-time probe, so an activation
+sends at most one probe request per known name (AC15).
 """
 
 DELIVERY_MODE_FIXED = "fixed"
@@ -3244,6 +3255,56 @@ _PROBE_PNG = bytes.fromhex(
     "de0000000c49444154789c63606060000000040001f61738550000000049454e"
     "44ae426082"
 )
+
+
+def _silent_wav() -> bytes:
+    """The audio probe's segment (R4): 0.25 s of 16 kHz mono 16-bit silence.
+
+    A canonical RIFF/WAVE file — the 44-byte header then 4 000 zero samples,
+    8 044 bytes — generated rather than shipped, so the probe needs no store,
+    no capture and no file, and is the same on every activation.
+    """
+
+    sample_rate, channels, sample_bytes = 16_000, 1, 2
+    data = bytes(sample_rate // 4 * channels * sample_bytes)
+    fmt = struct.pack(
+        "<HHIIHH",
+        1,  # PCM
+        channels,
+        sample_rate,
+        sample_rate * channels * sample_bytes,
+        channels * sample_bytes,
+        sample_bytes * 8,
+    )
+    return (
+        b"RIFF"
+        + struct.pack("<I", 4 + (8 + len(fmt)) + (8 + len(data)))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
+
+
+_PROBE_WAV = _silent_wav()
+_PART_INPUT_AUDIO = "input_audio"
+_AUDIO_FORMAT_WAV = "wav"
+
+# Which capability one probe request exercises (decision 3, R4): the text
+# probe alone, or the same request plus one image or one audio part.
+_PROBE_KIND_TEXT = "text"
+_PROBE_KIND_IMAGE = "image"
+_PROBE_KIND_AUDIO = "audio"
+
+# The non-2xx statuses that, on the audio probe sent once the text probe
+# passed, mean the request's content was refused — the audio part is the one
+# thing that changed, so it is what was refused (R4, AC15). Any other status
+# keeps ``non_success_status``; the image probe keeps its phase 1 rule.
+_AUDIO_REJECTED_STATUSES = frozenset({400, 415, 422})
+
 _PROBE_MAX_TOKENS = 256
 _PROBE_INSTRUCTION = f"Call the {PROBE_TOOL} tool with ok set to true."
 _PROBE_TOOL_SPEC: dict[str, Any] = {
@@ -3350,7 +3411,11 @@ class _ModelReply:
 
 
 class _NonSuccessResponse(Exception):
-    pass
+    """A non-2xx answer; ``status`` is the integer status, when there was one."""
+
+    def __init__(self, status: int | None = None) -> None:
+        super().__init__()
+        self.status = status
 
 
 class _MalformedResponse(Exception):
@@ -3436,8 +3501,10 @@ class _ModelAdapter:
 
         The forced call on :data:`~core.contracts.PROBE_TOOL` verifies
         ``structured_output``; the same request carrying one 1×1 PNG image
-        part verifies ``vision``, and is only sent once the text probe
-        passed. The first capability not verified raises
+        part verifies ``vision``, and the same carrying one 0.25 s silent WAV
+        audio part verifies ``audio`` — each sent only once the previous
+        probes passed, one request per required name, so at most one per
+        known capability (AC15). The first capability not verified raises
         :class:`BrainModuleError` naming it and the reason (R2), a message
         built from constants alone — never the key, the endpoint or a body.
         Returns the verified set.
@@ -3445,15 +3512,18 @@ class _ModelAdapter:
 
         verified: set[str] = set()
         if CAPABILITY_STRUCTURED_OUTPUT in required:
-            await self._verify(CAPABILITY_STRUCTURED_OUTPUT, image=False)
+            await self._verify(CAPABILITY_STRUCTURED_OUTPUT, kind=_PROBE_KIND_TEXT)
             verified.add(CAPABILITY_STRUCTURED_OUTPUT)
         if CAPABILITY_VISION in required:
-            await self._verify(CAPABILITY_VISION, image=True)
+            await self._verify(CAPABILITY_VISION, kind=_PROBE_KIND_IMAGE)
             verified.add(CAPABILITY_VISION)
+        if CAPABILITY_AUDIO in required:
+            await self._verify(CAPABILITY_AUDIO, kind=_PROBE_KIND_AUDIO)
+            verified.add(CAPABILITY_AUDIO)
         return frozenset(verified)
 
-    async def _verify(self, capability: str, *, image: bool) -> None:
-        reason = await self._probe_reason(image=image)
+    async def _verify(self, capability: str, *, kind: str) -> None:
+        reason = await self._probe_reason(kind=kind)
         if reason is not None:
             self._diagnose(f"brain probe: capability '{capability}' not verified: {reason}")
             raise BrainModuleError(
@@ -3461,14 +3531,26 @@ class _ModelAdapter:
                 f"not verified: {reason}"
             )
 
-    async def _probe_reason(self, *, image: bool) -> str | None:
-        """One probe request; ``None`` when it verified, else the R2 reason."""
+    async def _probe_reason(self, *, kind: str) -> str | None:
+        """One probe request of *kind*; ``None`` when it verified, else the
+        R2/R4 reason — ``image_rejected`` or ``audio_rejected`` by kind."""
 
         content: Any = _PROBE_INSTRUCTION
-        if image:
+        if kind == _PROBE_KIND_IMAGE:
             content = [
                 {"type": _PART_TEXT, "text": _PROBE_INSTRUCTION},
                 {"type": _PART_IMAGE_URL, "image_url": {"url": _data_url("image/png", _PROBE_PNG)}},
+            ]
+        elif kind == _PROBE_KIND_AUDIO:
+            content = [
+                {"type": _PART_TEXT, "text": _PROBE_INSTRUCTION},
+                {
+                    "type": _PART_INPUT_AUDIO,
+                    _PART_INPUT_AUDIO: {
+                        "data": base64.b64encode(_PROBE_WAV).decode("ascii"),
+                        "format": _AUDIO_FORMAT_WAV,
+                    },
+                },
             ]
         body = {
             "model": self._settings.model,
@@ -3483,7 +3565,11 @@ class _ModelAdapter:
             raise
         except (asyncio.TimeoutError, TimeoutError):
             return PROBE_REASON_TIMED_OUT
-        except _NonSuccessResponse:
+        except _NonSuccessResponse as refused:
+            # The kind is consulted before the status rule: a content refusal
+            # of the audio probe names the audio part (AC15).
+            if kind == _PROBE_KIND_AUDIO and refused.status in _AUDIO_REJECTED_STATUSES:
+                return PROBE_REASON_AUDIO_REJECTED
             return PROBE_REASON_NON_SUCCESS_STATUS
         except _MalformedResponse:
             # A 2xx that is not JSON is not the expected shape: no tool call.
@@ -3491,9 +3577,17 @@ class _ModelAdapter:
         except Exception:
             return PROBE_REASON_TRANSPORT_FAILED
 
-        rejected = PROBE_REASON_IMAGE_REJECTED if image else PROBE_REASON_NO_TOOL_CALL
-        if image and _names_image_input(answer):
+        # The image probe keeps its phase 1 rule — an unhonoured forced call
+        # is the image refused; the audio probe names the audio only when
+        # the backend did (a refusing status, an ``error`` naming it), and an
+        # unhonoured forced call stays ``no_tool_call`` (AC15).
+        rejected = (
+            PROBE_REASON_IMAGE_REJECTED if kind == _PROBE_KIND_IMAGE else PROBE_REASON_NO_TOOL_CALL
+        )
+        if kind == _PROBE_KIND_IMAGE and _names_image_input(answer):
             return PROBE_REASON_IMAGE_REJECTED
+        if kind == _PROBE_KIND_AUDIO and _names_audio_input(answer):
+            return PROBE_REASON_AUDIO_REJECTED
         classification = _classify(answer)
         if isinstance(classification, _Proposal):
             if classification.name != PROBE_TOOL:
@@ -3659,7 +3753,9 @@ class _ModelAdapter:
                 or isinstance(status, bool)
                 or not 200 <= status < 300
             ):
-                raise _NonSuccessResponse
+                raise _NonSuccessResponse(
+                    status if isinstance(status, int) and not isinstance(status, bool) else None
+                )
             try:
                 return await _resolve(response.json())
             except asyncio.CancelledError:
@@ -3783,9 +3879,26 @@ def _decode_arguments(raw: Any) -> Mapping[str, Any] | None:
 def _names_image_input(answer: Any) -> bool:
     """Whether a 2xx body's ``error`` names the image input (R2)."""
 
+    lowered = _rendered_error(answer)
+    return lowered is not None and ("image" in lowered or "vision" in lowered)
+
+
+def _names_audio_input(answer: Any) -> bool:
+    """Whether a 2xx body's ``error`` names the audio input (R4)."""
+
+    lowered = _rendered_error(answer)
+    return lowered is not None and "audio" in lowered
+
+
+def _rendered_error(answer: Any) -> str | None:
+    """A 2xx body's ``error`` (message, code, type) lower-cased, or ``None``.
+
+    Only matched against, never logged: the rendering is a body's content.
+    """
+
     error = answer.get("error") if isinstance(answer, Mapping) else None
     if error is None:
-        return False
+        return None
     if isinstance(error, Mapping):
         rendered = " ".join(
             str(value) for value in (error.get("message"), error.get("code"), error.get("type"))
@@ -3793,8 +3906,7 @@ def _names_image_input(answer: Any) -> bool:
         )
     else:
         rendered = str(error)
-    lowered = rendered.lower()
-    return "image" in lowered or "vision" in lowered
+    return rendered.lower()
 
 
 def _tool_definition(spec: Any) -> dict[str, Any]:
@@ -4111,9 +4223,13 @@ def _default_reporter(message: str) -> None:
 
 
 __all__ = [
+    "CAPABILITY_AUDIO",
+    "CAPABILITY_STRUCTURED_OUTPUT",
+    "CAPABILITY_VISION",
     "CHAT_SCOPE",
     "DELIVERY_NOT_ATTEMPTED",
     "FALLBACK_NONE",
+    "KNOWN_CAPABILITIES",
     "MODULE_NAME",
     "PRINCIPAL",
     "TRACE_DELIVERY_RESOLVED",

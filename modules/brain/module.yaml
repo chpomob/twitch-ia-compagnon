@@ -176,10 +176,11 @@ settings_schema:
         - enabled
         - text
     # The backend capabilities the adapter verifies at `prepare`, before the
-    # readiness barrier (R2). `structured_output` is mandatory — the loop
-    # needs one tool call or a final text per turn — and `vision` is the only
-    # other name known; the settings hook holds the list to that vocabulary
-    # as a whole, naming this field.
+    # readiness barrier (R2, R4). `structured_output` is mandatory — the loop
+    # needs one tool call or a final text per turn — and `vision` and `audio`
+    # are the other names known, each adding one probe request (at most 3);
+    # the settings hook holds the list to that vocabulary as a whole, naming
+    # this field.
     capabilities:
       type: object
       properties:
@@ -187,7 +188,9 @@ settings_schema:
           type: array
           items:
             type: string
-          description: Capabilities that must be verified before readiness.
+          description: >-
+            Capabilities that must be verified before readiness, among
+            structured_output (mandatory), vision and audio.
       required:
         - required
     # The terminal delivery step (R1, decision 1): a configured, ordered list

@@ -1,9 +1,10 @@
-"""The brain's model adapter (R2; AC8, AC9, AC12).
+"""The brain's model adapter (R2, R4; AC8, AC9, AC12, AC15).
 
 One Chat Completions adapter: the offered actions travel as tool
 definitions, the answer is classified per decision 2 and never guessed, the
 required backend capabilities are verified by a bounded probe at ``prepare``
-before the readiness barrier (decision 3), and an ``image_ref`` part is read
+before the readiness barrier (decision 3) — ``audio`` by a third probe
+carrying one generated silent WAV part (R4, AC15) — and an ``image_ref`` part is read
 from the attachment store and encoded **only** while the request body is
 built — the encoded bytes exist in the request body and nowhere else (AC12).
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import struct
 from typing import Any
 
 import pytest
@@ -33,12 +35,18 @@ from core.contracts import (
 from conftest import (
     FakeResponse,
     FakeSession,
+    PROBE_KIND_AUDIO,
+    PROBE_KIND_IMAGE,
+    PROBE_KIND_TEXT,
     ManualClock,
+    carries_audio_part,
     carries_image_part,
     events_of,
     final,
     is_probe_request,
+    probe_kind,
     settle,
+    silent_wav,
     text_and_tool_call,
     tool_call,
     tool_calls,
@@ -46,6 +54,7 @@ from conftest import (
 from modules.brain import (
     BRAIN_ERROR_NOT_A_READ_ACTION,
     MODULE_NAME,
+    KNOWN_CAPABILITIES,
     BrainModuleError,
     _Final,
     _ModelAdapter,
@@ -62,8 +71,10 @@ from test_brain import (
     activate_with,
     assert_sanitized,
     completion,
+    copy_settings,
     merge_settings,
 )
+from modules.brain import validate_settings
 
 
 API_KEY = SETTINGS["api_key"]
@@ -72,6 +83,8 @@ MODEL_CALL_SECONDS = LIMITS["budget"]["model_call_seconds"]
 
 STRUCTURED_ONLY = {"capabilities": {"required": ["structured_output"]}}
 WITH_VISION = {"capabilities": {"required": ["structured_output", "vision"]}}
+WITH_AUDIO = {"capabilities": {"required": ["structured_output", "audio"]}}
+WITH_ALL = {"capabilities": {"required": ["structured_output", "vision", "audio"]}}
 
 # A read action offered as a tool (the offered specs are whatever the run
 # body hands the adapter; a spec is rendered by name, description, schema).
@@ -969,3 +982,258 @@ def test_settings_fixture_requires_both_capabilities_by_default() -> None:
     runs behind two answered probes unless it narrows the list."""
 
     assert VALID_SETTINGS["capabilities"]["required"] == ["structured_output", "vision"]
+
+
+# --------------------------------------------------------------------------- #
+# AC15: the audio probe (R4)
+# --------------------------------------------------------------------------- #
+
+
+def audio_parts(body: dict[str, Any]) -> list[dict[str, Any]]:
+    parts = []
+    for message in body["messages"]:
+        content = message.get("content")
+        if isinstance(content, list):
+            parts.extend(part for part in content if part.get("type") == "input_audio")
+    return parts
+
+
+def probe_kinds(harness: Any) -> list[str]:
+    return [probe_kind(call["json"]) for call in harness.probes()]
+
+
+def assert_forced_probe(body: dict[str, Any]) -> None:
+    assert body["model"] == SETTINGS["model"]
+    assert body["tool_choice"] == {"type": "function", "function": {"name": PROBE_TOOL}}
+    assert [tool["function"]["name"] for tool in body["tools"]] == [PROBE_TOOL]
+    assert isinstance(body["max_tokens"], int) and body["max_tokens"] > 0
+
+
+def assert_silent_wav_part(body: dict[str, Any]) -> None:
+    """One ``input_audio`` part: format ``wav``, 8 044 bytes of a 16 kHz mono
+    16-bit RIFF/WAVE segment whose samples are all zero, beside the text
+    instruction and no image part."""
+
+    (part,) = audio_parts(body)
+    assert set(part) == {"type", "input_audio"}
+    assert part["input_audio"]["format"] == "wav"
+    payload = base64.b64decode(part["input_audio"]["data"], validate=True)
+    assert len(payload) == 8044
+    assert payload[:4] == b"RIFF" and payload[8:12] == b"WAVE"
+    assert struct.unpack("<I", payload[4:8])[0] == len(payload) - 8
+    assert payload[12:16] == b"fmt "
+    audio_format, channels, rate, byte_rate, align, bits = struct.unpack(
+        "<HHIIHH", payload[20:36]
+    )
+    assert (audio_format, channels, rate, bits) == (1, 1, 16_000, 16)
+    assert (byte_rate, align) == (32_000, 2)
+    assert payload[36:40] == b"data"
+    assert struct.unpack("<I", payload[40:44])[0] == 8000
+    assert payload[44:] == bytes(8000)
+    assert payload == silent_wav()
+    (message,) = body["messages"]
+    texts = [part for part in message["content"] if part.get("type") == "text"]
+    assert len(texts) == 1 and PROBE_TOOL in texts[0]["text"]
+    assert not carries_image_part(body)
+
+
+class HeldAudioProbeSession(FakeSession):
+    """Answers the text probe at once and holds the audio probe until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        body = kwargs.get("json")
+        if is_probe_request(body) and probe_kind(body) == PROBE_KIND_AUDIO:
+            self.probe_calls.append({"url": url, **kwargs})
+            self.entered.set()
+            await self.release.wait()
+            return self._next_probe_result()
+        return await super().post(url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_ac15_audio_probe_follows_the_text_probe_with_exactly_two_probes() -> None:
+    """AC15 (R4): with ``[structured_output, audio]`` exactly 2 probes, in
+    order text then audio; the audio one forces the probe tool and carries one
+    ``input_audio`` part holding the generated silent WAV; ``audio`` is
+    verified; the probes are in neither ``post_calls`` nor the run's count."""
+
+    harness = await activate_with(
+        FakeResponse(200, completion("Hello")), settings_overrides=WITH_AUDIO
+    )
+    try:
+        assert harness.context.actions.is_ready(MODULE_NAME)
+        assert harness.handle.verified_capabilities == {"structured_output", "audio"}
+        assert probe_kinds(harness) == [PROBE_KIND_TEXT, PROBE_KIND_AUDIO]
+        text_probe, audio_probe = (call["json"] for call in harness.probes())
+        assert_forced_probe(text_probe)
+        assert_forced_probe(audio_probe)
+        assert not carries_audio_part(text_probe)
+        assert_silent_wav_part(audio_probe)
+        assert harness.requests() == []
+        assert harness.session.post_calls == []
+        assert harness.diagnostics == []
+
+        await harness.send()
+        (record,) = await harness.completed()
+        assert record.status == "success"
+        assert record.model_calls == 1
+        assert len(harness.session.post_calls) == 1
+        assert not any(is_probe_request(call["json"]) for call in harness.session.post_calls)
+        assert len(harness.probes()) == 2
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac15_with_vision_too_exactly_three_probes_text_image_audio() -> None:
+    """AC15 (R4): with all three capabilities required exactly 3 probes —
+    one per known name, the bound — in order text, image, audio."""
+
+    harness = await activate_with(settings_overrides=WITH_ALL)
+    try:
+        assert harness.handle.verified_capabilities == KNOWN_CAPABILITIES
+        assert probe_kinds(harness) == [PROBE_KIND_TEXT, PROBE_KIND_IMAGE, PROBE_KIND_AUDIO]
+        assert len(image_parts(harness.probes()[1]["json"])) == 1
+        assert audio_parts(harness.probes()[1]["json"]) == []
+        assert_silent_wav_part(harness.probes()[2]["json"])
+        assert harness.requests() == []
+        await harness.handle.prepare()
+        assert len(harness.probes()) == 3
+    finally:
+        await harness.close()
+
+
+SECRET_BODY = {"error": {"message": f"audio input refused: {API_KEY} at {ENDPOINT}"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (FakeResponse(400, SECRET_BODY), "audio_rejected"),
+        (FakeResponse(415, {"error": f"{API_KEY} {ENDPOINT}"}), "audio_rejected"),
+        (FakeResponse(422, {}), "audio_rejected"),
+        (FakeResponse(500, SECRET_BODY), "non_success_status"),
+        (FakeResponse(404, {}), "non_success_status"),
+        (FakeResponse(200, SECRET_BODY), "audio_rejected"),
+        (FakeResponse(200, {"error": "This model does not accept audio"}), "audio_rejected"),
+        (FakeResponse(200, final(f"I cannot hear anything. {API_KEY}")), "no_tool_call"),
+        (FakeResponse(200, {"choices": [{"message": {"content": ""}}]}), "no_tool_call"),
+        (FakeResponse(200, tool_call("other.tool", {"ok": True})), "no_tool_call"),
+        (FakeResponse(200, ValueError(f"{API_KEY} {ENDPOINT}")), "no_tool_call"),
+        (FakeResponse(200, tool_call(PROBE_TOOL, f'"{API_KEY}"')), "malformed_arguments"),
+        (
+            FakeResponse(
+                200, tool_calls([(PROBE_TOOL, {"ok": True}), (PROBE_TOOL, {"k": API_KEY})])
+            ),
+            "multiple_tool_calls",
+        ),
+        (RuntimeError(f"{API_KEY} {ENDPOINT}"), "transport_failed"),
+    ],
+)
+async def test_ac15_audio_probe_failures_stop_prepare_with_the_exact_diagnostic(
+    answer: Any, reason: str
+) -> None:
+    """AC15 (R4): after the text probe passed, a refusing status (a 400) or a
+    2xx ``error`` naming the audio is ``audio_rejected`` — the kind consulted
+    before the status rule — a text-only answer ``no_tool_call``, other
+    failures their phase 1 reason; the diagnostic keeps the phase 1 form and
+    carries neither the endpoint, the key nor the body; the module stays
+    outside the barrier with 0 scenario requests."""
+
+    session = FakeSession(
+        FakeResponse(200, completion("never sent")),
+        probe_results=[FakeResponse(200, tool_call(PROBE_TOOL, {"ok": True})), answer],
+    )
+    harness = await activate_with(session=session, settings_overrides=WITH_AUDIO, prepare=False)
+    try:
+        failure = await prepare_fails(harness)
+        assert str(failure) == not_verified("audio", reason)
+        assert probe_kinds(harness) == [PROBE_KIND_TEXT, PROBE_KIND_AUDIO]
+        assert "refused" not in str(failure)
+        assert "choices" not in str(failure)
+        assert "hear" not in str(failure)
+        assert_not_ready(harness, str(failure))
+        assert session.post_calls == []
+
+        await harness.send()
+        await settle()
+        assert harness.requests() == []
+        assert harness.records() == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac15_a_held_audio_probe_times_out_on_the_clock() -> None:
+    """AC15 (R4): no answer to the audio probe within
+    ``budget.model_call_seconds`` on the injected clock is ``timed_out``."""
+
+    session = HeldAudioProbeSession()
+    harness = await activate_with(session=session, settings_overrides=WITH_AUDIO, prepare=False)
+    try:
+        preparing = asyncio.create_task(harness.handle.prepare())
+        await asyncio.wait_for(session.entered.wait(), timeout=1)
+        harness.clock.advance(MODEL_CALL_SECONDS - 1)
+        await settle()
+        assert not preparing.done()
+        harness.clock.advance(1)
+        with pytest.raises(BrainModuleError) as raised:
+            await asyncio.wait_for(preparing, timeout=1)
+        assert str(raised.value) == not_verified("audio", "timed_out")
+        assert probe_kinds(harness) == [PROBE_KIND_TEXT, PROBE_KIND_AUDIO]
+        assert_not_ready(harness, str(raised.value))
+    finally:
+        session.release.set()
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "failing", "sent"),
+    [
+        (WITH_AUDIO, "structured_output", [PROBE_KIND_TEXT]),
+        (WITH_ALL, "vision", [PROBE_KIND_TEXT, PROBE_KIND_IMAGE]),
+    ],
+)
+async def test_the_audio_probe_is_sent_only_once_the_previous_probes_passed(
+    overrides: dict[str, Any], failing: str, sent: list[str]
+) -> None:
+    """R4: the first capability not verified stops the sequence — no audio
+    probe follows a failed text or image probe."""
+
+    answers = [FakeResponse(200, tool_call(PROBE_TOOL, {"ok": True}))] * (len(sent) - 1)
+    session = FakeSession(probe_results=[*answers, FakeResponse(503, {})])
+    harness = await activate_with(session=session, settings_overrides=overrides, prepare=False)
+    try:
+        failure = await prepare_fails(harness)
+        assert str(failure) == not_verified(failing, "non_success_status")
+        assert probe_kinds(harness) == sent
+        assert_not_ready(harness, str(failure))
+    finally:
+        await harness.close()
+
+
+def test_ac15_settings_accept_audio_and_still_refuse_an_unknown_name() -> None:
+    """R4: ``capabilities.required`` accepts ``audio``; an unknown name is
+    still refused with one diagnostic naming the field and the three names."""
+
+    assert KNOWN_CAPABILITIES == frozenset({"structured_output", "vision", "audio"})
+    for required in (["structured_output", "audio"], ["structured_output", "vision", "audio"]):
+        accepted = copy_settings(VALID_SETTINGS)
+        accepted["capabilities"]["required"] = required
+        assert validate_settings(accepted) == []
+
+    refused = copy_settings(VALID_SETTINGS)
+    refused["capabilities"]["required"] = ["structured_output", "audio", "smell"]
+    diagnostics = validate_settings(refused)
+    assert diagnostics == [
+        "module 'brain': field 'capabilities.required': names a capability this "
+        "module does not know (known: audio, structured_output, vision)"
+    ]
+    assert_sanitized(diagnostics)

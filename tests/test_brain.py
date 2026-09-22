@@ -768,17 +768,22 @@ def test_ac20_the_queued_wait_may_not_exceed_the_total_run_deadline() -> None:
     [
         (["vision"], "must name 'structured_output'"),
         (
-            ["structured_output", "audio"],
-            "names a capability this module does not know (known: structured_output, vision)",
+            ["structured_output", "smell"],
+            "names a capability this module does not know "
+            "(known: audio, structured_output, vision)",
         ),
     ],
 )
 def test_ac10_capabilities_required_needs_structured_output_and_only_known_names(
     required: list[str], expected: str
 ) -> None:
-    """R2/AC10: both refusals, one diagnostic naming ``capabilities.required``."""
+    """R2/AC10: both refusals, one diagnostic naming ``capabilities.required``.
 
-    assert KNOWN_CAPABILITIES == frozenset({"structured_output", "vision"})
+    Superseded by phase 2 R4 (AC15): ``audio`` is now a known capability, so
+    the unknown name is another one and the known list names all three.
+    """
+
+    assert KNOWN_CAPABILITIES == frozenset({"structured_output", "vision", "audio"})
     invalid = copy_settings(VALID_SETTINGS)
     invalid["capabilities"]["required"] = required
 
