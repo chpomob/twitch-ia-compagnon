@@ -591,17 +591,37 @@ the oldest held request, for the cases where a test lets it arrive.
 """
 
 
+class _FakeBodyStream:
+    """``FakeBytesResponse.content``: the body served by ``read(n)``, then ``b""``."""
+
+    def __init__(self, response: "FakeBytesResponse") -> None:
+        self._response = response
+
+    async def read(self, n: int = -1) -> bytes:
+        response = self._response
+        body = await response.read()
+        start = response._offset
+        end = len(body) if n < 0 else min(len(body), start + n)
+        response._offset = end
+        response.content_reads += 1
+        return body[start:end]
+
+
 class FakeBytesResponse:
-    """An HTTP answer read as bytes (``read``) or as JSON (``json``).
+    """An HTTP answer read as bytes (``read``, or in chunks off ``content``) or as JSON (``json``).
 
     ``body`` is bytes, a text, a JSON-able value, or an exception every read
-    raises (a body lost mid-answer).
+    raises (a body lost mid-answer). ``content`` is the body's stream, as on
+    an ``aiohttp`` response; ``content_reads`` counts the chunks it served.
     """
 
     def __init__(self, status: int, body: Any = b"") -> None:
         self.status = status
         self.body = body
         self.release_calls = 0
+        self.content_reads = 0
+        self._offset = 0
+        self.content = _FakeBodyStream(self)
 
     async def read(self) -> bytes:
         body = _raise_or_return(self.body)
@@ -840,6 +860,8 @@ class FakePlayer:
     stop terminates it at once (exit ``-15``) unless ``ignores_terminate``,
     in which case only the kill after the grace ends it (exit ``-9``).
     ``startable=False`` makes :meth:`RecordingPlayerRunner.start` fail.
+    ``close_error`` is raised by the close (after the exit it causes): a
+    pipe that broke while its buffered tail was flushing.
     """
 
     def __init__(
@@ -851,8 +873,10 @@ class FakePlayer:
         *,
         accept_total: int | None = None,
         holds_exit: bool = False,
+        close_error: BaseException | None = None,
     ) -> None:
         self.accept_limit = accept_limit
+        self.close_error = close_error
         self.exit_code = exit_code
         self.startable = startable
         self.ignores_terminate = ignores_terminate
@@ -916,6 +940,8 @@ class FakePlayer:
         self.stdin_closed = True
         if self.alive and not self.holds_exit:
             self._exit(self.exit_code)
+        if self.close_error is not None:
+            raise self.close_error
 
     def release(self) -> None:
         """Let a blocked or still-playing player exit with ``exit_code``."""

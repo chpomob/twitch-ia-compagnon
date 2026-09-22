@@ -1,0 +1,279 @@
+# Speech and clip playback on a configured output — manifest v2 (R1, R9).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no grant lives here. Both actions are
+# `write`s on the `audio` scope of any platform and any channel: which device
+# plays is the business of the configured *output* (a player command fed the
+# WAV on its standard input), never of the brain and never of a platform, so
+# no platform name appears here. Playback is local: an interrupted call is a
+# certain `timeout`/`cancelled`, never `external_unknown`.
+
+name: audio_output
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# Playback is action-driven: nothing is published and nothing is consumed.
+produces: []
+consumes: []
+middleware: false
+
+# No lifecycle role: the handle takes part in `prepare` (bind the providers,
+# mark ready) and in `close` (withdraw readiness, release the transport).
+lifecycle:
+  roles: []
+
+# The synthesis provider, the voices a call may name, the outputs a segment
+# may be played on, the clips `audio.play` may name, and the bounds every
+# call is held to (R1). The shapes inside `outputs` and `clips` are checked by
+# the declared hook, one diagnostic per field, value-free: no endpoint, key,
+# argv or path is ever echoed. No setting shortens a call's deadline: the
+# player is stopped when the call deadline itself is reached, and
+# `stop_grace_seconds` is the interval between terminating and killing it,
+# after that stop (R10). The reserved `limits` block the entry point hands
+# every enabled module is accepted and not read.
+settings_schema:
+  type: object
+  properties:
+    synthesis:
+      type: object
+      description: >-
+        The speech synthesis HTTP endpoint: one JSON request per call
+        `{model, voice, input, response_format: "wav"}`, whose 2xx body must
+        be a RIFF/WAVE PCM file. No endpoint is assumed: while it is empty
+        the module sends no request.
+      properties:
+        endpoint:
+          type: string
+          description: The synthesis URL; empty until the operator configures one.
+        model:
+          type: string
+          description: The synthesis model name sent in each request.
+        api_key:
+          type: string
+          description: >-
+            Optional bearer credential; sent as an Authorization header when
+            non-empty, redacted from every trace and diagnostic.
+        timeout_seconds:
+          type: number
+          description: >-
+            How long one synthesis request may take before the call ends
+            `timeout` with cause `synthesis`. Default 10.
+        probe:
+          type: boolean
+          description: >-
+            Whether `prepare` verifies the endpoint with one bounded probe
+            synthesis. Default true.
+        probe_text:
+          type: string
+          description: The text the probe synthesis speaks. Default "ready".
+      required:
+        - endpoint
+        - model
+    voices:
+      type: object
+      description: The voices a call may name, and the one used when it names none.
+      properties:
+        allowed:
+          type: array
+          items:
+            type: string
+          description: The allowlist of voice names.
+        default:
+          type: string
+          description: The voice a call that names none is spoken with; one of `allowed`.
+      required:
+        - allowed
+        - default
+    outputs:
+      type: object
+      description: >-
+        The named outputs, each `{player: {argv: [...]}}`: the command started
+        per playback, fed the whole WAV on its standard input.
+    default_output:
+      type: string
+      description: The output a call that names none plays on.
+    clips:
+      type: object
+      description: >-
+        The named clips `audio.play` may play, each `{path}`: a WAV file on
+        this machine, re-read at each call.
+    max_text_chars:
+      type: integer
+      minimum: 1
+      description: The most characters one `audio.speak` text may hold. Default 400.
+    max_speech_seconds:
+      type: number
+      description: The longest segment either action plays. Default 20.
+    max_audio_bytes:
+      type: integer
+      minimum: 1
+      description: The heaviest WAV body either action accepts. Default 5242880.
+    stop_grace_seconds:
+      type: number
+      description: >-
+        After a stop, how long a terminated player may take to exit before it
+        is killed. Default 1.
+    max_waiters:
+      type: integer
+      minimum: 0
+      description: >-
+        How many calls may wait behind a busy output before one more is
+        refused `resource_busy`. Default 1.
+    required:
+      type: boolean
+      description: >-
+        Whether an unavailable dependency at `prepare` fails startup (true)
+        or leaves the affected action unbound (false). Default false.
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point to every
+        enabled module. Not read here: this module owns its own bounds.
+  required:
+    - synthesis
+    - voices
+    - outputs
+    - default_output
+settings_validator: validate_settings
+
+# The synthesis key, when one is configured, is redacted like every
+# declared credential.
+credentials:
+  - synthesis.api_key
+
+actions:
+  - name: audio.speak
+    version: 1
+    description: >-
+      Synthesise the text with an allowed voice and play it on a configured
+      output. Success means the player consumed the whole segment and exited
+      normally. `played_ms` is an estimate: the audio duration of the data
+      bytes the player accepted on its standard input, which may not all have
+      reached the device yet.
+    argument_schema:
+      type: object
+      properties:
+        text:
+          type: string
+          description: The text to speak, 1 to `max_text_chars` characters.
+        voice:
+          type: string
+          description: An allowed voice; omit it for the configured default.
+        output:
+          type: string
+          description: A configured output; omit it for the configured default.
+      required:
+        - text
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        output:
+          type: string
+          description: The output the segment was played on.
+        voice:
+          type: string
+          description: The voice the segment was synthesised with.
+        duration_ms:
+          type: integer
+          minimum: 0
+          description: The segment duration read from its WAV header.
+        played_ms:
+          type: integer
+          minimum: 0
+          description: >-
+            The accepted-bytes estimate: the duration of the data bytes the
+            player accepted, rounded down, never above `duration_ms`.
+        playback:
+          type: string
+          enum:
+            - completed
+          description: The playback state; `completed` on a success.
+      required:
+        - output
+        - voice
+        - duration_ms
+        - played_ms
+        - playback
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - audio.speak
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: audio
+    # Synthesis (10) + the longest speech (20) + the stop grace, and headroom.
+    timeout_seconds: 40
+    # Speaking twice is heard twice.
+    idempotency: none
+    # Delivery capability (R2): this action may close a run as a configured
+    # terminal delivery, the final answer text arriving under `text`.
+    delivery:
+      text_argument: text
+
+  - name: audio.play
+    version: 1
+    description: >-
+      Play a configured clip on a configured output. Success means the player
+      consumed the whole clip and exited normally. `played_ms` is an
+      estimate: the audio duration of the data bytes the player accepted on
+      its standard input, which may not all have reached the device yet.
+    argument_schema:
+      type: object
+      properties:
+        sound:
+          type: string
+          description: The name of a configured clip.
+        output:
+          type: string
+          description: A configured output; omit it for the configured default.
+      required:
+        - sound
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        output:
+          type: string
+          description: The output the clip was played on.
+        sound:
+          type: string
+          description: The clip that was played.
+        duration_ms:
+          type: integer
+          minimum: 0
+          description: The clip duration read from its WAV header.
+        played_ms:
+          type: integer
+          minimum: 0
+          description: >-
+            The accepted-bytes estimate: the duration of the data bytes the
+            player accepted, rounded down, never above `duration_ms`.
+        playback:
+          type: string
+          enum:
+            - completed
+          description: The playback state; `completed` on a success.
+      required:
+        - output
+        - sound
+        - duration_ms
+        - played_ms
+        - playback
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - audio.play
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: audio
+    timeout_seconds: 30
+    idempotency: none
+    # Effect-only delivery (R2): the answer text is not passed; the clip is
+    # named by the delivery entry's own arguments.
+    delivery:
+      text_argument: none
