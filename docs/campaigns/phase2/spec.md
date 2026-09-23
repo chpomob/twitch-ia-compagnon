@@ -1,6 +1,6 @@
 ---
 name: "phase2-audio-stream-interaction"
-version: "1.2"
+version: "1.3"
 author: "adversarial-spec"
 status: "draft"
 tags: [adversarial, spec]
@@ -11,6 +11,8 @@ targets:
     description: "Validate `audio_ref` parts on every terminal observation exactly as `image_ref` (leased to the call's run, unexpired, `size` equal to the stored size) and release them with the run; change the provider-record adoption rule of `_run_provider`/`_run_invocation` (R10): a provider-authored interruption record (`timeout`, `cancelled`, `error`) whose completion stamp is at or after `expires_at` is adopted through the ordinary validation path instead of being replaced by the executor's generic record, while a late `success`/`refused` (or any other non-interruption record) is still discarded and the executor's own timer stays in force when no record arrives; no audio, platform or vendor name."
   - file: core/runtime.py
     description: "Add the optional `services` collaborator of `RuntimeContext` (a bounded registry where a module publishes a shared provider service under a `(kind, platform)` key and another module resolves it at prepare) and its module-scoped facade; the core knows no kind name."
+  - file: core/loader.py
+    description: "(v1.3 reconciliation, landed in P4 `b451e91`) AC25's duplicate-publication diagnostic: when activation fails with a `ServiceConflictError` naming the refused module, append the holding module's name — read back from the service registry and checked against the modules this loader activated, never from the exception text — to the generic `activation failed` refusal; every other activation failure keeps the phase 1 generic refusal. No module, kind or platform name."
   - file: core/main.py
     description: "Build the service registry into the runtime context it assembles; still no module name."
   - file: modules/brain/__init__.py
@@ -75,6 +77,14 @@ targets:
     description: "Rewrite the allowlisted clean-install assertion to 11 manifests; add `--check-config` on the three phase 2 profiles and the full-PC-profile degraded startup with closed loopback ports."
   - file: tests/test_hygiene.py
     description: "Add the check that the README carries the six phase 2 trial rows with their five fields non-empty; sleep and model-literal checks unchanged."
+  - file: tests/test_brain.py
+    description: "(v1.3 reconciliation, landed in P6 `ee9dc94`) Only the phase 1 unknown-capability assertion that R4 supersedes changes (allowlisted below); the phase 2 brain cases live in `tests/test_model_adapter.py`."
+  - file: tests/test_integration.py
+    description: "(v1.3 reconciliation, landed in P19 `23e6e91`) The `_environment()` fixture supplies the variables the R9 PC profile now references (`AUDIO_RECORDER`, `AUDIO_PLAYER`, `AUDIO_CHIME_PATH`, `SCENE_WEBSOCKET_URL` on a closed loopback port, `SCENE_WEBSOCKET_PASSWORD`), each naming an absent device so the three modules degrade and startup continues (R8); no assertion changes."
+  - file: tests/test_proxy_process.py
+    description: "(v1.3 reconciliation, landed in P19 `23e6e91`) The `_agent_profile` helper keeps the phase 1 `screen.capture` topology trial on the R9 agent profile: it drops the three phase 2 device modules, their action rules and their link `actions`, which the two-process test does not exercise (AC35's scenario drives them across the proxy); the test functions themselves are unchanged (AC20)."
+  - file: .gitignore
+    description: "(v1.3 reconciliation, landed in `aaf6983`) Ignore `/docs/campaigns/phase2/scaffolding/spec-out/`, the spec generator's run output for this campaign; no other entry."
   - file: tests/test_phase2_trials.py
     description: "New, opt-in by environment variables and skipped with a reason otherwise: real integration trials against a configured speech-synthesis endpoint, transcription endpoint, playback command, capture command, scene provider URL and platform poll credentials, each recording the outcome the README cites."
 ---
@@ -239,6 +249,21 @@ compares `git diff --name-only <base>..HEAD` against it. **Permitted scope
 beyond the list:** the campaign's own directory `docs/campaigns/phase2/`
 (brief, this spec, the plan, README and `scaffolding/`) may change at any
 step; nothing under it is runtime code, a test, a profile or packaging.
+
+**v1.3 reconciliation (gate 1, F5).** Five files the branch changed were
+missing from v1.2's list and are now declared with the reason each is needed:
+`core/loader.py`, `tests/test_brain.py`, `tests/test_integration.py`,
+`tests/test_proxy_process.py` and `.gitignore`. Four assertion changes outside
+v1.2's eight-entry test allowlist are now allowlisted below. Nothing else is
+permitted by this amendment. The check is falsifiable: with `B` the phase 1
+delivery `7e26038`, every path of `git diff --name-only B..HEAD` that does
+not start with `docs/campaigns/phase2/` must be a `file` of `targets`, e.g.
+
+```
+.venv/bin/python -c "import subprocess, yaml; t = {e['file'] for e in yaml.safe_load(open('docs/campaigns/phase2/spec.md', encoding='utf-8').read().split('---', 2)[1])['targets']}; d = subprocess.run(['git', 'diff', '--name-only', '7e26038..HEAD'], capture_output=True, text=True, check=True).stdout.split(); print([f for f in d if f not in t and not f.startswith('docs/campaigns/phase2/')])"
+```
+
+prints `[]`.
 
 ## Requirements
 
@@ -815,7 +840,12 @@ rule and is the precondition of AC3 and AC10.
 - AC20 (R5): The protocol document's frame table, limits and codes are
   unchanged except the content-type set and the `audio_ref` sentence; the
   `v` field of every frame in the audio tests is 1; the two-process phase 1
-  topology test still passes unchanged.
+  topology test (`tests/test_proxy_process.py::test_ac39_two_process_topology_over_loopback`)
+  still passes with its test body unchanged. Its `_agent_profile` helper
+  (v1.3) reduces the R9 agent profile to the phase 1 `screen.capture` trial,
+  leaving out the three phase 2 device modules, their action rules and link
+  `actions`: it remains a phase 1 topology proof, not a phase 2 two-process
+  proof; the phase 2 actions across the proxy are AC35's.
 - AC21 (R6): With the scripted scene provider holding scenes `Talking` and
   `Gaming`, current `Gaming`, and `allowed: [Talking]`, `stream.scene.set
   {scene: Talking}` under an applicable rule ends `success` with `scene:
@@ -1190,3 +1220,10 @@ shipped manifests.
 - `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set[server]` — asserts the four-name set; R9's server set has nine names.
 - `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set[agent]` — asserts `{screen.capture}`; R9's agent set has five names.
 - `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help` — asserts `len(manifests) == 8`; R9 installs 11.
+
+Added by the v1.3 reconciliation (gate 1, F5), landed before it:
+
+- `tests/test_brain.py::test_ac10_capabilities_required_needs_structured_output_and_only_known_names` — its unknown-capability case uses `audio` and asserts `KNOWN_CAPABILITIES == {structured_output, vision}`; R4/AC15 make `audio` a known capability, so the unknown name becomes `smell` and the known list names all three (P6). Both refusals are still asserted.
+- `tests/test_observations.py::test_probe_tool_and_reasons` — asserts the phase 1 seven-reason `PROBE_REASONS`; R4's third (audio) probe adds `audio_rejected` (P1).
+- `tests/test_observations.py::test_image_ref_fields_are_the_seven_of_r4` — asserts `PART_TYPES == {text, image_ref}`; R4 adds `audio_ref`. The `image_ref` field and content-type assertions are unchanged (P1).
+- `tests/test_profiles.py::test_server_profile_binds_screen_capture_to_the_proxy_provider` — asserts the phase 1 server bindings; R9's server profile also serves the device actions through the proxy and polls locally. Replaced by `tests/test_profiles.py::test_server_profile_binds_the_device_actions_to_the_proxy_and_polls_locally`, which keeps every assertion of the replaced test and adds the new bindings (P19).

@@ -419,7 +419,9 @@ def test_ac34_readme_records_the_phase_2_provider_trials() -> None:
     assert "tests/test_phase2_trials.py" in section
 
     allowlisted = _allowlisted_tests(PHASE2_SPEC.read_text(encoding="utf-8"))
-    assert len(allowlisted) == 8, allowlisted
+    # Spec v1.3 (P22F2, gate 1 F5): the eight v1.2 entries plus the four
+    # reconciled ones.
+    assert len(allowlisted) == 12, allowlisted
     versioning = _section(readme, PHASE2_VERSIONING_TITLE)
     missing = [test for test in allowlisted if f"`{test}`" not in versioning]
     assert missing == [], f"allowlisted tests the versioning section does not name: {missing}"

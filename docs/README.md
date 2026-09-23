@@ -251,14 +251,15 @@ Les six champs ci-dessous sont ceux que R8 exige ; l'AC44 est vérifié par
 ## Versionnement de la spec phase 1 (phase 2)
 
 La phase 2 (branche `feat(phase2)`, commits `25c152e` (P1) à `23e6e91` (P19),
-spec `phase2-audio-stream-interaction` v1.2 archivée dans
+spec `phase2-audio-stream-interaction` v1.3 archivée dans
 [campaigns/phase2/spec.md](campaigns/phase2/spec.md), plan dans
 [campaigns/phase2/plan.md](campaigns/phase2/plan.md), issue de
 [design-v2.md](design-v2.md)) ajoute la voix (synthèse et lecture,
 `audio.speak`/`audio.play`), l'écoute (capture et transcription optionnelle,
 `audio.capture`), les scènes et les sondages de diffusion
 (`stream.scene.set`/`stream.poll.create`). Elle ne remplace de la phase 1
-**que ce que son allowlist nomme** — huit tests, tous réécrits en place — et
+**que ce que son allowlist nomme** — douze tests : les huit de la v1.2,
+réécrits en place, et quatre ajoutés par la réconciliation v1.3 (P22F2) — et
 une règle de l'exécuteur, la précédence de R10 ci-dessous. Comme les sections
 précédentes, celle-ci enregistre **ce qui change et par quoi**, pas une
 nouvelle conformité : les garanties de la phase 0 et de la phase 1 restent en
@@ -282,6 +283,12 @@ propre découvre exactement les manifests livrés — sur les listes de la phase
 Aucune entrée n'a été neutralisée par `skip`, `xfail` ou affaiblissement
 d'assertion.
 
+Les entrées 9 à 12 ont été ajoutées à l'allowlist par la réconciliation v1.3
+de la spec (P22F2, constat F5 de la porte 1) : ces changements avaient été
+faits par les étapes citées sans que l'allowlist v1.2 les nomme (constat G2 de
+P21 ci-dessous). Trois sont réécrits en place ; le douzième est remplacé par un
+test qui garde toutes ses assertions et y ajoute les liaisons de la phase 2.
+
 | # | Test allowlisté (phase 1) | Sort | Ce qui remplace l'assertion de la phase 1 | Exigence(s) phase 2 | Commit |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `tests/test_examples.py::test_manifests_are_unique_and_have_coherent_capabilities` | Réécrit en place | 11 manifests livrés (`audio_output`, `audio_input`, `stream_control` ajoutés) et les déclarations de la phase 2 dans `EXPECTED_MANIFESTS`, au lieu de 8 | R9, AC32, AC33 | `23e6e91` (P19) |
@@ -292,6 +299,10 @@ d'assertion.
 | 6 | `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set[server]` | Réécrit en place | Les neuf actions fournies du serveur, dont cinq par l'allowlist `actions` du proxy | R9, AC32 | `23e6e91` (P19) |
 | 7 | `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set[agent]` | Réécrit en place | Les cinq actions fournies de l'agent au lieu de `{screen.capture}` | R9, AC32 | `23e6e91` (P19) |
 | 8 | `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help` | Réécrit en place | `len(manifests) == 11` au lieu de 8 | R9, AC33 | `23e6e91` (P19) |
+| 9 | `tests/test_brain.py::test_ac10_capabilities_required_needs_structured_output_and_only_known_names` | Réécrit en place | Le nom inconnu devient `smell` et la liste connue nomme `audio, structured_output, vision` ; les deux refus restent assertés | R4, AC15 | `ee9dc94` (P6) |
+| 10 | `tests/test_observations.py::test_probe_tool_and_reasons` | Réécrit en place | `PROBE_REASONS` gagne `audio_rejected` (troisième sonde, audio) | R4 | `25c152e` (P1) |
+| 11 | `tests/test_observations.py::test_image_ref_fields_are_the_seven_of_r4` | Réécrit en place | `PART_TYPES` gagne `audio_ref` ; champs et types de contenu de `image_ref` inchangés | R4 | `25c152e` (P1) |
+| 12 | `tests/test_profiles.py::test_server_profile_binds_screen_capture_to_the_proxy_provider` | Remplacé | `tests/test_profiles.py::test_server_profile_binds_the_device_actions_to_the_proxy_and_polls_locally` : toutes les assertions du test remplacé, plus les actions de périphérique servies par le proxy et les sondages locaux | R9, AC32 | `23e6e91` (P19) |
 
 ### Règle de l'exécuteur : un enregistrement d'interruption tardif fait foi (R10)
 
@@ -357,8 +368,11 @@ autorisées par AC41 et limitées à leur objet : `grace_seconds`, la réserve
 d'admission de `capture_too_long`, évaluée une fois avant tout démarrage
 (elle refuse une capture qui ne pourrait pas finir et ne déplace pas le kill) ;
 et la réserve de transcription de 1 s (`skipped:deadline`), qui borne la seule
-requête de transcription optionnelle après stockage pour que l'enregistrement
-`success` porteur de l'`audio_ref` soit horodaté avant l'échéance. Aucune
+requête de transcription optionnelle après stockage : le module décide et rend
+l'enregistrement `success` porteur de l'`audio_ref` au plus tard à cette
+borne, ce qui atténue — sans le prouver — le risque qu'il soit horodaté à
+l'échéance ou après (voir « Réveil bloqué pendant la transcription » dans les
+limites déclarées). Aucune
 autre action — ni la lecture, ni les scènes, ni les sondages — ne soustrait
 quoi que ce soit de son échéance.
 
@@ -388,14 +402,27 @@ retire la disponibilité et démarre une reconnexion à délai aléatoire borné
   ordinaire du fournisseur ; une annulation de l'appel exécuteur venue
   d'ailleurs garde la comptabilité de la phase 1.
 - **Réveil bloqué pendant la transcription** (décision 1, AC42) :
-  l'horodatage de fin appartient à l'exécuteur (`_observe`), pas au module.
-  Le module rend son `success` à la borne `expiry − 1 s` au plus tard quand son
-  réveil arrive à l'heure, et avant `expiry` pour tout réveil retardé de moins
-  que la réserve ; un réveil retardé de **toute la réserve de 1 s** (boucle
-  gelée une seconde ou plus) est horodaté à `expiry` ou après, et la règle de
-  la phase 1 le traite alors en `success` tardif : non adopté, remplacé par
-  l'enregistrement générique. Aucun test ne peut l'épingler ; sa seule
-  atténuation est la réserve elle-même.
+  ce que le **module** garantit, et que les tests épinglent : il n'attend rien
+  de programmé à la borne `expiry − 1 s` ou après, décide sur l'horloge lue à
+  son réveil, puis écrit et rend l'enregistrement `success` sans autre attente,
+  à cette borne ou avant quand son réveil arrive à l'heure
+  (`tests/test_audio_input.py::test_the_window_edge_abandons_the_request_and_keeps_the_capture`,
+  `test_a_delayed_wake_does_not_adopt_a_late_text`,
+  `test_a_delayed_wake_adopted_late_by_the_executor_is_still_a_success`).
+  La **limite déclarée** : l'horodatage de fin n'appartient pas au module mais
+  à l'exécuteur (`core/actions.py::_observe`), qui le prend après le retour du
+  fournisseur. Le délai réel entre la borne et cet horodatage est le retard du
+  réveil **plus** le temps d'exécution et de préemption écoulé avant
+  l'horodatage (écriture de l'enregistrement, ordonnancement de la boucle,
+  processus suspendu). La réserve de 1 s est donc l'**atténuation, pas une
+  preuve** : elle borne le risque sans garantir l'issue. Dès que ce délai
+  cumulé atteint **toute la réserve** — un réveil retardé d'une seconde, ou un
+  réveil moins retardé suivi d'une préemption qui porte l'horodatage à
+  `expiry` ou après — l'enregistrement est horodaté à l'échéance ou après, et
+  la règle de la phase 1 le traite alors en `success` tardif : non adopté,
+  remplacé par l'enregistrement générique (`timeout`, `timed_out`). Aucun test
+  ne peut l'exclure sur l'horloge réelle ; ce cas n'est ni converti en succès
+  tardif ni compensé par une autre soustraction de l'échéance.
 
 ## Essais d'intégration par fournisseur (phase 2)
 
@@ -450,6 +477,14 @@ modifier.
 | G2 | Assertions de la phase 1 changées hors allowlist : `tests/test_brain.py::test_ac10_capabilities_required_needs_structured_output_and_only_known_names` (`audio` connu), `tests/test_observations.py::test_probe_tool_and_reasons` (`audio_rejected`), `tests/test_observations.py::test_image_ref_fields_are_the_seven_of_r4` (`PART_TYPES` gagne `audio_ref`), `tests/test_profiles.py::test_server_profile_binds_screen_capture_to_the_proxy_provider` remplacé par `test_server_profile_binds_the_device_actions_to_the_proxy_and_polls_locally` (sur-ensemble des assertions) | tests ci-contre | P6, P1, P1, P19 | Changements de contrat légitimes, chacun citant R4 ou R9 dans sa docstring, aucune garantie affaiblie ; non corrigé : l'allowlist de la spec est à compléter |
 | G3 | AC20 « le test de topologie à deux processus passe inchangé » : la fonction de test est identique et verte, mais son assistant `_agent_profile` retire les trois modules de phase 2 du profil agent | `tests/test_proxy_process.py` | P19 | Enregistré ; le scénario de phase 2 à travers le proxy (AC35) couvre ces modules |
 | G4 | Essais par fournisseur : 2 sur 6 réexécutés sur l'arbre de la porte (lecture, capture) ; synthèse et transcription attendent un endpoint d'opérateur, la scène basculerait le logiciel de diffusion en service, les sondages n'ont pas d'identifiant | ce document | P20 | Colonne « Commit » de chaque ligne mise à jour avec la raison |
+
+G1, G2 et G3 sont réconciliés par la spec v1.3 (P22F2, constat F5 de la porte
+1) : les cinq fichiers de G1 sont déclarés dans `targets` avec leur raison, les
+quatre tests de G2 sont les entrées 9 à 12 de l'allowlist ci-dessus, et AC20
+précise que seul le corps du test de topologie reste inchangé, son assistant
+réduisant le profil agent à l'essai `screen.capture` de la phase 1 (G3). La
+comparaison de `git diff --name-only 7e26038..HEAD` avec `targets`, hors
+`docs/campaigns/phase2/`, ne rend plus aucun fichier.
 
 ## Lecture des manifests de runs
 

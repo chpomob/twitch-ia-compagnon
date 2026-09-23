@@ -64,8 +64,14 @@ fixed: *attempt*, then *decide* at the wake, whatever woke the call (the
 answer, the bound, ``drain`` or a ``CancelledError``), on the clock read at
 that instant — an answer in hand before ``transcription_edge`` gives its
 status, anything else abandons the request as ``failed:stt_timed_out`` — then
-*author* the ``success`` record and return it with no further await, so the
-executor's completion stamp is the decision instant, before ``expiry``. A 2xx
+*author* the ``success`` record and return it with no further await, at or
+before the edge. The completion stamp is not the module's: the executor's
+``core/actions.py::_observe`` takes it after the provider returns, so the
+real delay past the edge is the wake delay plus any execution or preemption
+before that stamp. The reserve mitigates that risk, it does not prove the
+outcome: a delay of the whole reserve stamps the record at or after
+``expiry``, a late ``success`` the executor replaces (the README's declared
+limit). A 2xx
 JSON ``{text}`` becomes ``audio_ref.transcription = {text (cut to
 max_chars), transcribed_at, provider_id: "audio-input-stt", truncated}`` and
 ``ok``; a transport failure is ``failed:stt_unavailable``, a non-2xx answer
@@ -1311,8 +1317,10 @@ class AudioInputModule:
             )
         # The capture is complete: from here the record is a ``success`` with
         # its ``audio_ref`` whatever happens to the transcription (R3), and it
-        # is authored and returned with no await after the decision, so the
-        # executor's completion stamp is the decision instant.
+        # is authored and returned with no await after the decision. The
+        # executor's completion stamp (``_observe``) follows the return; on a
+        # real clock it may lag the decision by execution or preemption time,
+        # which the transcription reserve mitigates but cannot rule out.
         status, transcription = await self._transcribe(stored.wav, expiry)
         return stored.observation(status, transcription)
 
