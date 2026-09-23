@@ -69,7 +69,7 @@ def main():
 Plan step `{sid}` of the approved Phase 3 plan for `twitch-ia-compagnon`.
 Authority documents (read them, do not re-derive):
 - Approved plan (this step is the whole scope, nothing more): `docs/campaigns/phase3/plan.md`
-- Approved specification v1.2 (requirement and acceptance-criteria wording): `docs/campaigns/phase3/spec.md`
+- Approved specification (requirement and acceptance-criteria wording): `docs/campaigns/phase3/spec.md`
 - Approved v2 design (rationale): `docs/design-v2.md`
 Repository: `{REPO}` (Python, asyncio, event-bus core + modules). Working tree at `main`.
 
