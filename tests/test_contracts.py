@@ -1,7 +1,15 @@
 import pytest
 
+import dataclasses
+import re
+from pathlib import Path
+
 from core.contracts import (
+    EVENT_KIND_DEFAULT,
+    EVENT_KIND_SET,
+    EVENT_KINDS,
     IMAGE_REF_FIELDS,
+    PLATFORM_NOTICE_KINDS,
     ActionObservation,
     ActionSpec,
     ContractError,
@@ -10,6 +18,7 @@ from core.contracts import (
     TriggerRule,
     sanitize_trace,
     validate_against_schema,
+    validate_event_kind,
     validate_parts,
 )
 
@@ -351,3 +360,110 @@ def test_delivery_text_argument_value_must_be_a_name() -> None:
     with pytest.raises(ContractError) as caught:
         _write_spec({"text_argument": 1})
     assert caught.value.field == "ActionSpec.delivery.text_argument"
+
+
+# --------------------------------------------------------------------------- #
+# Event-kind vocabulary (R1, R6)
+# --------------------------------------------------------------------------- #
+
+
+def test_event_kind_vocabulary_is_the_nine_names_in_order() -> None:
+    assert EVENT_KINDS == (
+        "message",
+        "sub",
+        "resub",
+        "sub_gift",
+        "community_sub_gift",
+        "raid",
+        "follow",
+        "tip",
+        "watch_tick",
+    )
+    assert EVENT_KIND_SET == frozenset(EVENT_KINDS)
+    assert EVENT_KIND_DEFAULT == "message"
+
+
+def test_platform_notice_kinds_exclude_message_and_watch_tick() -> None:
+    """R1 route safety: a notice kind is never an ordinary message or a tick."""
+
+    assert len(PLATFORM_NOTICE_KINDS) == 7
+    assert set(PLATFORM_NOTICE_KINDS) == EVENT_KIND_SET - {"message", "watch_tick"}
+    assert list(PLATFORM_NOTICE_KINDS) == [
+        kind for kind in EVENT_KINDS if kind in PLATFORM_NOTICE_KINDS
+    ]
+
+
+@pytest.mark.parametrize("kind", EVENT_KINDS)
+def test_validate_event_kind_accepts_each_kind(kind: str) -> None:
+    assert validate_event_kind(kind, "payload.kind") == kind
+
+
+def test_validate_event_kind_defaults_none_to_message() -> None:
+    assert validate_event_kind(None, "payload.kind") == "message"
+
+
+@pytest.mark.parametrize("value", ["Raid", "", 1, "announcement", True, ["raid"]])
+def test_validate_event_kind_refuses_and_names_the_field(value: object) -> None:
+    with pytest.raises(ContractError) as caught:
+        validate_event_kind(value, "payload.kind")
+    assert caught.value.field == "payload.kind"
+
+
+# --------------------------------------------------------------------------- #
+# ActionSpec.model_proposable (R5, AC25 core half)
+# --------------------------------------------------------------------------- #
+
+
+def _proposable_spec(
+    model_proposable: object, *, nature: str = "write", delivery: object = None
+) -> ActionSpec:
+    return dataclasses.replace(
+        _write_spec(delivery, nature=nature), model_proposable=model_proposable
+    )
+
+
+def test_model_proposable_defaults_to_false_on_existing_constructions() -> None:
+    assert _write_spec().model_proposable is False
+    assert _write_spec({"text_argument": "text"}).model_proposable is False
+    assert _write_spec(nature="read").model_proposable is False
+    assert _spec({"type": "object"}).model_proposable is False
+
+
+def test_a_write_without_delivery_may_be_model_proposable() -> None:
+    spec = _proposable_spec(True)
+    assert spec.model_proposable is True
+    # The flag is part of equality: a lent spec that lost it is a mismatch.
+    assert spec != _write_spec()
+    assert spec == _proposable_spec(True)
+
+
+def test_a_read_action_is_never_model_proposable() -> None:
+    with pytest.raises(ContractError) as caught:
+        _proposable_spec(True, nature="read")
+    assert caught.value.field == "ActionSpec.model_proposable"
+    assert caught.value.reason == "a read action is never model-proposable"
+
+
+@pytest.mark.parametrize("delivery", [{"text_argument": "text"}, {"text_argument": "none"}])
+def test_a_delivery_capable_action_is_never_model_proposable(delivery: dict) -> None:
+    with pytest.raises(ContractError) as caught:
+        _proposable_spec(True, delivery=delivery)
+    assert caught.value.field == "ActionSpec.model_proposable"
+    assert caught.value.reason == "a delivery-capable action is never model-proposable"
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, None])
+def test_model_proposable_must_be_a_boolean(value: object) -> None:
+    with pytest.raises(ContractError) as caught:
+        _proposable_spec(value)
+    assert caught.value.field == "ActionSpec.model_proposable"
+
+
+def test_contracts_name_no_platform() -> None:
+    """AC39 (core half): the contracts name no platform; P26 scans all of core/."""
+
+    source = (Path(__file__).resolve().parents[1] / "core" / "contracts.py").read_text(
+        encoding="utf-8"
+    )
+    for word in ("kick", "youtube", "twitch"):
+        assert re.findall(rf"\b{word}\b", source, flags=re.IGNORECASE) == [], word

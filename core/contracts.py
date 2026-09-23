@@ -48,6 +48,32 @@ DELIVERY_NO_TEXT_ARGUMENT = "none"
 """The one key of an action's ``delivery`` capability, and the literal that
 declares an effect-only delivery receiving no answer text (R1 decision 1)."""
 
+EVENT_KINDS = (
+    "message",
+    "sub",
+    "resub",
+    "sub_gift",
+    "community_sub_gift",
+    "raid",
+    "follow",
+    "tip",
+    "watch_tick",
+)
+"""The closed, ordered vocabulary of an input event's ``payload.kind``
+(R1, R6). It names what happened, never which source produced it."""
+
+EVENT_KIND_SET = frozenset(EVENT_KINDS)
+"""Membership view of :data:`EVENT_KINDS`."""
+
+EVENT_KIND_DEFAULT = "message"
+"""The kind of an event that carries none (every phase-2 event)."""
+
+PLATFORM_NOTICE_KINDS = tuple(
+    kind for kind in EVENT_KINDS if kind not in ("message", "watch_tick")
+)
+"""The community-notice kinds: every kind except an ordinary message and the
+continuous-capture tick (R1 route safety)."""
+
 IDEMPOTENCY_POLICIES = frozenset({"none", "key", "natural"})
 """How a provider behaves when the same call is replayed.
 
@@ -467,6 +493,9 @@ __all__ = [
     "DELIVERY_REASON_UNKNOWN_ACTION",
     "DELIVERY_RESOLUTION_REASONS",
     "DIAGNOSTIC_COUNTERS",
+    "EVENT_KINDS",
+    "EVENT_KIND_DEFAULT",
+    "EVENT_KIND_SET",
     "FRAME_ATTACHMENT",
     "FRAME_ATTACHMENT_ACK",
     "FRAME_CALL",
@@ -483,6 +512,7 @@ __all__ = [
     "IMAGE_REF_FIELDS",
     "INTERNAL_TRACE_TYPES",
     "PART_TYPES",
+    "PLATFORM_NOTICE_KINDS",
     "PART_TYPE_AUDIO_REF",
     "PART_TYPE_IMAGE_REF",
     "PART_TYPE_TEXT",
@@ -562,6 +592,7 @@ __all__ = [
     "sanitize_trace",
     "trace_size",
     "validate_against_schema",
+    "validate_event_kind",
     "validate_parts",
     "validate_schema",
 ]
@@ -1032,6 +1063,11 @@ class ActionSpec:
     #: maps into its arguments; it is never offered to the model. A ``read``
     #: action cannot deliver anything, so the field is refused on one.
     delivery: Mapping[str, Any] | None = None
+    #: Whether the model may propose this action as a tool call (R5). Only an
+    #: authorized ``write`` action without a delivery capability can be: a
+    #: read is already offered through its nature, and the delivery remains
+    #: the configured terminal step that the model never selects.
+    model_proposable: bool = False
 
     def __post_init__(self) -> None:
         _validate_action_name(self.name, "ActionSpec.name")
@@ -1094,6 +1130,18 @@ class ActionSpec:
                 self,
                 "delivery",
                 _validate_delivery(self.delivery, self.nature, self.argument_schema),
+            )
+
+        if not isinstance(self.model_proposable, bool):
+            raise ContractError("ActionSpec.model_proposable", "must be a boolean")
+        if self.model_proposable and self.nature == "read":
+            raise ContractError(
+                "ActionSpec.model_proposable", "a read action is never model-proposable"
+            )
+        if self.model_proposable and self.delivery is not None:
+            raise ContractError(
+                "ActionSpec.model_proposable",
+                "a delivery-capable action is never model-proposable",
             )
 
     @property
@@ -1182,6 +1230,23 @@ def _validate_dotted_name(value: Any, field: str, *, minimum_segments: int) -> N
             raise ContractError(field, f"has an invalid segment in {value!r}")
         if not all(char.isalnum() or char == "_" for char in segment):
             raise ContractError(field, f"has an invalid segment in {value!r}")
+
+
+def validate_event_kind(value: Any, field: str) -> str:
+    """Return the event kind ``value`` names, :data:`EVENT_KIND_DEFAULT` for ``None``.
+
+    A non-string or a name outside :data:`EVENT_KINDS` (case-sensitive)
+    raises :class:`ContractError` naming ``field``.
+    """
+
+    if value is None:
+        return EVENT_KIND_DEFAULT
+    if not isinstance(value, str):
+        raise ContractError(field, f"must be a string, got {type(value).__name__}")
+    if value not in EVENT_KIND_SET:
+        allowed = ", ".join(EVENT_KINDS)
+        raise ContractError(field, f"must be one of {allowed}, got {value!r}")
+    return value
 
 
 def _validate_action_name(value: Any, field: str) -> None:
