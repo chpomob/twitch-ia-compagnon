@@ -4,6 +4,8 @@ import dataclasses
 import re
 from pathlib import Path
 
+import yaml
+
 from core.contracts import (
     EVENT_KIND_DEFAULT,
     EVENT_KIND_SET,
@@ -21,6 +23,8 @@ from core.contracts import (
     validate_event_kind,
     validate_parts,
 )
+from core.loader import ModuleLoader, ModuleLoadError
+from core.runtime import RUNTIME_API
 
 
 def _spec(result_schema: dict) -> ActionSpec:
@@ -467,3 +471,145 @@ def test_contracts_name_no_platform() -> None:
     )
     for word in ("kick", "youtube", "twitch"):
         assert re.findall(rf"\b{word}\b", source, flags=re.IGNORECASE) == [], word
+
+
+# ---------------------------------------------------------------------------
+# Loader discovery of model_proposable (R5, AC25 discovery half)
+# ---------------------------------------------------------------------------
+
+_REPOSITORY = Path(__file__).resolve().parents[1]
+
+
+def _manifest_action(**overrides: object) -> dict:
+    action: dict = {
+        "name": "moderation.request",
+        "version": 1,
+        "description": "ask for one moderation step",
+        "argument_schema": _TEXT_ARGUMENTS,
+        "result_schema": {"type": "object"},
+        "nature": "write",
+        "required_permissions": ["moderation.request"],
+        "supported_destinations": [
+            {"platform": "fake", "channel_id": "*", "scope": "chat"}
+        ],
+        "timeout_seconds": 1,
+        "idempotency": "none",
+    }
+    action.update(overrides)
+    return action
+
+
+def _modules_root(root: Path, action: dict, *, directory: str = "proposer") -> Path:
+    module = root / directory
+    module.mkdir()
+    manifest = {
+        "name": directory,
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": [],
+        "consumes": [],
+        "middleware": False,
+        "actions": [action],
+    }
+    (module / "module.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    return root
+
+
+async def _discover(root: Path) -> ModuleLoader:
+    """Discover every module under *root*, activating none."""
+
+    loader = ModuleLoader(object(), root, environ={})
+    assert await loader.activate_enabled({"enabled_modules": [], "modules": {}}) == []
+    return loader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"nature": "read"},
+        {"delivery": {"text_argument": "text"}},
+        {"delivery": {"text_argument": "none"}},
+    ],
+    ids=["read", "delivery", "effect-only-delivery"],
+)
+async def test_discovery_refuses_model_proposable_naming_module_and_action(
+    tmp_path: Path, overrides: dict
+) -> None:
+    root = _modules_root(
+        tmp_path, _manifest_action(model_proposable=True, **overrides)
+    )
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await _discover(root)
+
+    message = str(caught.value)
+    assert message.startswith(
+        "module 'proposer': field 'actions[0].model_proposable': "
+    )
+    assert "'moderation.request'" in message
+    assert "never model-proposable" in message
+
+
+@pytest.mark.asyncio
+async def test_discovery_accepts_model_proposable_on_a_delivery_less_write(
+    tmp_path: Path,
+) -> None:
+    loader = await _discover(_modules_root(tmp_path, _manifest_action(model_proposable=True)))
+
+    (spec,) = loader.discovered["proposer"].declaration.actions
+    assert spec.name == "moderation.request"
+    assert spec.model_proposable is True
+
+
+@pytest.mark.asyncio
+async def test_discovery_defaults_model_proposable_to_false(tmp_path: Path) -> None:
+    loader = await _discover(_modules_root(tmp_path, _manifest_action()))
+
+    (spec,) = loader.discovered["proposer"].declaration.actions
+    assert spec.model_proposable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["yes", 1, None])
+async def test_discovery_refuses_a_non_boolean_model_proposable(
+    tmp_path: Path, value: object
+) -> None:
+    root = _modules_root(tmp_path, _manifest_action(model_proposable=value))
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await _discover(root)
+
+    assert str(caught.value).startswith(
+        "module 'proposer': field 'actions[0].model_proposable': "
+        "action 'moderation.request': "
+    )
+
+
+@pytest.mark.asyncio
+async def test_discovery_still_refuses_any_other_unknown_action_key(
+    tmp_path: Path,
+) -> None:
+    root = _modules_root(tmp_path, _manifest_action(foo=1))
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await _discover(root)
+
+    assert str(caught.value) == (
+        "module 'proposer': field 'actions[0]': declares unknown keys: foo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_shipped_manifest_discovers_with_model_proposable_false() -> None:
+    loader = await _discover(_REPOSITORY / "modules")
+
+    specs = [
+        spec
+        for module in loader.discovered.values()
+        if module.declaration is not None
+        for spec in module.declaration.actions
+    ]
+    assert specs
+    assert [spec.name for spec in specs if spec.model_proposable] == []

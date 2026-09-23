@@ -195,6 +195,7 @@ _ACTION_KEYS: frozenset[str] = frozenset(
         "timeout_seconds",
         "idempotency",
         "delivery",
+        "model_proposable",
     }
 )
 
@@ -1772,15 +1773,20 @@ def _manifest_actions(name: str, manifest: Mapping[str, Any]) -> tuple[ActionSpe
                 timeout_seconds=entry.get("timeout_seconds"),
                 idempotency=entry.get("idempotency"),
                 delivery=entry.get("delivery"),
+                model_proposable=entry.get("model_proposable", False),
             )
         except ModuleLoadError:
             raise
         except ContractError as exc:
             # The contract names the field it refused (``ActionSpec.delivery``
             # on a ``read`` action, AC58): the diagnostic names that field of
-            # this very action rather than the whole entry.
+            # this very action rather than the whole entry, and the action by
+            # name once its name was accepted (``model_proposable`` on a read
+            # or a delivery-capable action, AC25).
             raise _field_error(
-                name, _action_field(field_name, exc), _sanitised_reason(exc.reason)
+                name,
+                _action_field(field_name, exc),
+                _sanitised_reason(_action_reason(entry.get("name"), exc)),
             ) from None
         except (TypeError, ValueError) as exc:
             raise _field_error(name, field_name, _sanitised_reason(str(exc))) from None
@@ -1807,6 +1813,18 @@ def _action_field(field_name: str, exc: ContractError) -> str:
     if isinstance(field, str) and field.startswith(_ACTION_SPEC_FIELD_PREFIX):
         return f"{field_name}.{field[len(_ACTION_SPEC_FIELD_PREFIX):]}"
     return field_name
+
+
+def _action_reason(action: Any, exc: ContractError) -> str:
+    """The refusal of an ``ActionSpec``, naming the action it refused.
+
+    A refused name is not repeated: the field already says what is wrong
+    with it, and the value itself is never echoed.
+    """
+
+    if getattr(exc, "field", None) == "ActionSpec.name" or not isinstance(action, str):
+        return exc.reason
+    return f"action {action!r}: {exc.reason}"
 
 
 def _destination(name: str, field_name: str, value: Any) -> Destination:
