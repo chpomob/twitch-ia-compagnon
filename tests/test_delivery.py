@@ -1443,7 +1443,7 @@ async def test_a_send_confirmed_before_a_cancelled_entry_stays_in_the_record() -
 # yield, so every scenario fixes ``enabled_modules`` explicitly. Nothing
 # sleeps: the clock is injected and every wait is a bounded number of turns.
 
-from core.actions import ERROR_NO_PROVIDER, ERROR_PROVIDER_NOT_READY
+from core.actions import ERROR_PROVIDER_NOT_READY
 from core.attachments import AttachmentStore
 from core.contracts import PROXY_ERROR_PROXY_DISCONNECTED
 from conftest import (
@@ -1932,12 +1932,10 @@ async def test_ac7_a_failed_speech_probe_fails_the_speech_entry_and_writes_no_me
     past the probe, no player), the other entries keep their outcomes and
     memory is not written.
 
-    The code is the executor's ``error no_provider``, not the ``refused
-    provider_not_ready`` AC7 names for this cause: readiness is per module
-    in the registry, and ``audio_output`` binds ``audio.play`` — the
-    deviation P9 pinned in ``test_a_failing_probe_leaves_speak_unbound_and_
-    play_bound`` and reported; it is asserted here as observed so the delivery
-    list's behaviour on that path is fixed either way (see the P17 report)."""
+    The speech entry is ``refused provider_not_ready``, the code AC7 names
+    for this cause, although ``audio_output`` stays ready for ``audio.play``
+    (gate 1 F1: this test once pinned the executor's ``error no_provider``
+    as observed; that was the defect, not the contract)."""
 
     harness = await activate_phase2(
         final(T),
@@ -1955,7 +1953,7 @@ async def test_ac7_a_failed_speech_probe_fails_the_speech_entry_and_writes_no_me
 
         assert outcomes == {
             CHAT_WRITE: ("success", None),
-            AUDIO_SPEAK: ("error", ERROR_NO_PROVIDER),
+            AUDIO_SPEAK: ("refused", ERROR_PROVIDER_NOT_READY),
             AUDIO_PLAY: ("error", ERROR_INVALID_ARGUMENTS),
             SCENE_SET: ("error", ERROR_INVALID_ARGUMENTS),
         }

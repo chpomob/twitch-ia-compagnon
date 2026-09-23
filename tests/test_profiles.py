@@ -69,6 +69,7 @@ from conftest import (
     wav_bytes,
 )
 from modules.audio_input import TRANSCRIPTION_DEGRADED_REASON
+from modules.audio_output import SYNTHESIS_NOT_CONFIGURED_REASON, SYNTHESIS_PROBE_FAILED_REASON
 from modules.capture import SCREEN_CAPTURE_PROVIDER
 from modules.proxy import PROVIDER_NAME as PROXY_PROVIDER
 from test_examples import (
@@ -369,6 +370,26 @@ async def _capture(started: Any) -> Any:
     return await started.runtime.context.executor.invoke(call)
 
 
+async def _speak(started: Any) -> Any:
+    """One ``audio.speak`` on the served channel, through the executor."""
+
+    channel = started.environ["TWITCH_BROADCASTER_ID"]
+    call = ActionCall(
+        action_name="audio.speak",
+        action_version=1,
+        arguments={"text": "hello"},
+        conversation_id="conversation-ac43",
+        run_id="run-ac43",
+        call_id="call-ac43-speak",
+        source_event_id="source-ac43",
+        destination=Destination("twitch", channel, "audio"),
+        principal="brain",
+        deadline=started.runtime.clock() + 60,
+        message_id="source-ac43",
+    )
+    return await started.runtime.context.executor.invoke(call)
+
+
 def _assert_speak_named_not_ready(started: Any, environ: Mapping[str, str], *extra: str) -> str:
     """AC43's not-ready shape: startup succeeded, ``audio.speak`` declared
     and unbound, named alone by ``audio_output``'s one ``module.degraded``
@@ -409,7 +430,19 @@ async def test_ac43_with_no_speech_endpoint_audio_speak_is_named_not_ready_with_
         PC_PROFILE, environ, model=_chat_scenario_model(), device_seams=edges
     )
     try:
-        _assert_speak_named_not_ready(started, environ)
+        reason = _assert_speak_named_not_ready(started, environ)
+        # Gate 1 F3: the empty endpoint has its own reason, distinct from the
+        # unreachable one below.
+        assert reason == SYNTHESIS_NOT_CONFIGURED_REASON
+        assert reason != SYNTHESIS_PROBE_FAILED_REASON
+        assert edges.requests() == 0
+        assert edges.runner.starts == []
+
+        # Gate 1 F1: a call to the unbound action is refused, not an error.
+        invocations = started.runtime.context.executor.provider_invocations
+        speech = await _speak(started)
+        assert (speech.status, speech.error["code"]) == ("refused", "provider_not_ready")
+        assert started.runtime.context.executor.provider_invocations == invocations
         assert edges.requests() == 0
         assert edges.runner.starts == []
 
@@ -463,9 +496,13 @@ async def test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not
         timeout=60,
     )
     try:
-        _assert_speak_named_not_ready(
+        reason = _assert_speak_named_not_ready(
             started, environ, "configured-speech-model", "configured-transcription-model"
         )
+        # Gate 1 F3: a configured endpoint that failed its probe is named
+        # distinctly from an absent one.
+        assert reason == SYNTHESIS_PROBE_FAILED_REASON
+        assert reason != SYNTHESIS_NOT_CONFIGURED_REASON
         assert edges.runner.starts == []
     finally:
         await started.stop()

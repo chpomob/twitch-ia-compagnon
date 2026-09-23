@@ -146,6 +146,13 @@ ERROR_PLAYBACK_FAILED = "playback_failed"
 ERROR_RESOURCE_BUSY = "resource_busy"
 _ERROR_PROVIDER_CLOSED = "provider_closed"
 
+#: The value-free ``module.degraded`` reasons (AC29, AC43). An absent
+#: endpoint and a configured one that failed its probe are distinct: the
+#: first sent nothing, the second attempted its one readiness probe.
+NO_OUTPUT_DEGRADED_REASON = f"{MODULE_NAME}: no output player resolves to an executable"
+SYNTHESIS_NOT_CONFIGURED_REASON = f"{MODULE_NAME}: no speech synthesis endpoint is configured"
+SYNTHESIS_PROBE_FAILED_REASON = f"{MODULE_NAME}: speech synthesis failed its readiness probe"
+
 #: The reserved setting the entry point hands its accepted ``limits`` block
 #: over in (``core.main.LIMITS_KEY``). Accepted, never read.
 _ACCEPTED_LIMITS_SETTING = "limits"
@@ -877,15 +884,18 @@ class AudioOutputModule:
         ``timeout_seconds`` on the sleeper, never played — must answer a
         parseable WAV; with ``probe: false`` no request is sent and the
         endpoint is left unverified (it surfaces on the first call as
-        ``tts_unavailable``). ``audio.play`` is bound when an output is
-        usable, ``audio.speak`` when in addition the probe succeeded or is
-        off; the module is marked ready when at least one is bound, and the
+        ``tts_unavailable``). An empty ``synthesis.endpoint`` is never
+        ready, whatever ``probe`` says, and sends nothing (AC43).
+        ``audio.play`` is bound when an output is usable, ``audio.speak``
+        when in addition the endpoint is configured and the probe succeeded
+        or is off; the module is marked ready when at least one is bound, and the
         unbound ones are reported once through ``module.degraded`` with a
-        value-free reason. With no usable output both actions are still
-        registered but the module is not ready, so a call is refused
-        ``provider_not_ready`` before the provider. ``required: true`` turns
-        an unusable output or a failed probe into a failed ``prepare`` naming
-        the field.
+        value-free reason — distinct for an absent endpoint and a failed
+        probe. With no usable output both actions are still registered but
+        the module is not ready; either way a call to an unavailable action
+        is refused ``provider_not_ready`` before the provider. ``required:
+        true`` turns an unusable output, an empty endpoint or a failed probe
+        into a failed ``prepare`` naming the field.
         """
 
         if self._prepared or self._closed:
@@ -904,8 +914,12 @@ class AudioOutputModule:
         self._usable = frozenset(usable)
         self._slots = {name: _OutputSlot() for name in usable}
 
-        synthesis_ok = True
-        if settings.probe and usable:
+        # An empty endpoint is never ready, whatever the probe setting: the
+        # probe verifies a configured endpoint, it cannot configure an absent
+        # one (AC43). Nothing is sent for it.
+        endpoint_configured = bool(settings.endpoint)
+        synthesis_ok = endpoint_configured
+        if settings.probe and usable and endpoint_configured:
             synthesis_ok = await self._probe()
         elif settings.probe:
             synthesis_ok = False
@@ -939,11 +953,12 @@ class AudioOutputModule:
             name for name, bound in ((SPEAK_ACTION, speak), (PLAY_ACTION, play)) if not bound
         ]
         if unbound:
-            reason = (
-                f"{MODULE_NAME}: no output player resolves to an executable"
-                if not usable
-                else f"{MODULE_NAME}: speech synthesis is unavailable"
-            )
+            if not usable:
+                reason = NO_OUTPUT_DEGRADED_REASON
+            elif not endpoint_configured:
+                reason = SYNTHESIS_NOT_CONFIGURED_REASON
+            else:
+                reason = SYNTHESIS_PROBE_FAILED_REASON
             await self._report_degraded(reason, unbound)
         if speak or play:
             self._actions.mark_ready()
@@ -1830,11 +1845,14 @@ __all__ = [
     "ERROR_VOICE_NOT_ALLOWED",
     "MANIFEST_PATH",
     "MODULE_NAME",
+    "NO_OUTPUT_DEGRADED_REASON",
     "PLAYBACK_COMPLETED",
     "PLAY_ACTION",
     "PROVIDER_NAME",
     "READ_CHUNK_BYTES",
     "SPEAK_ACTION",
+    "SYNTHESIS_NOT_CONFIGURED_REASON",
+    "SYNTHESIS_PROBE_FAILED_REASON",
     "WRITE_CHUNK_BYTES",
     "AudioOutputModule",
     "AudioOutputModuleError",

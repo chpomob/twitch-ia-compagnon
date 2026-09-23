@@ -79,6 +79,8 @@ from modules.audio_output import (
     PROVIDER_NAME,
     READ_CHUNK_BYTES,
     SPEAK_ACTION,
+    SYNTHESIS_NOT_CONFIGURED_REASON,
+    SYNTHESIS_PROBE_FAILED_REASON,
     WRITE_CHUNK_BYTES,
     AudioOutputModule,
     AudioOutputModuleError,
@@ -818,17 +820,48 @@ async def test_a_text_outside_one_to_max_text_chars_is_invalid_arguments() -> No
     assert DEFAULT_MAX_TEXT_CHARS == 400
 
 
-async def test_an_empty_endpoint_sends_no_request_and_is_tts_unavailable() -> None:
-    """Arbiter decision 22/09: no endpoint is assumed — an empty one never
-    produces a request to some implicit address."""
+@pytest.mark.parametrize("probe", [False, True])
+async def test_an_empty_endpoint_sends_no_request_and_leaves_speak_unbound(probe: bool) -> None:
+    """Arbiter decision 22/09, AC43: no endpoint is assumed — an empty one
+    never produces a request to some implicit address, and it is never ready
+    whatever ``probe`` says (gate 1 F2: with ``probe: false`` it used to be
+    bound and fail at call time as ``tts_unavailable``). ``audio.speak`` is
+    unbound with the not-configured reason, ``audio.play`` stays ready, and a
+    call is ``refused provider_not_ready`` with 0 provider invocations."""
 
-    h = await harness(wav_bytes(1.5), synthesis={"endpoint": ""})
+    h = await harness(wav_bytes(1.5), synthesis={"endpoint": "", "probe": probe})
     try:
-        assert_failure(await h.speak(text="hello"), "error", ERROR_TTS_UNAVAILABLE)
+        ready = h.runtime.actions.registered_ready()
+        assert SPEAK_ACTION not in ready
+        assert PLAY_ACTION in ready
+        (degraded,) = degraded_events(h)
+        assert degraded["capabilities"] == [SPEAK_ACTION]
+        assert degraded["reason"] == SYNTHESIS_NOT_CONFIGURED_REASON
+        assert_failure(await h.speak(text="hello"), "refused", "provider_not_ready")
+        assert h.runtime.executor.provider_invocations == 0
         assert h.transport.requests == []
         assert h.transport.factory_calls == 0
+        assert h.runner.starts == []
     finally:
         await h.handle.close()
+
+
+@pytest.mark.parametrize("probe", [False, True])
+async def test_required_with_an_empty_endpoint_fails_prepare_naming_the_field(probe: bool) -> None:
+    """AC43/AC29: ``required: true`` cannot be satisfied by an absent
+    endpoint, probe or not: ``prepare`` raises naming ``synthesis.endpoint``
+    and nothing was sent."""
+
+    h = await harness(
+        wav_bytes(1.5), synthesis={"endpoint": "", "probe": probe}, required=True, prepare=False
+    )
+    with pytest.raises(AudioOutputModuleError) as refused:
+        await h.handle.prepare()
+    assert str(refused.value) == "audio_output prepare: field 'synthesis.endpoint' unavailable"
+    assert h.transport.requests == []
+    assert h.transport.factory_calls == 0
+    assert SPEAK_ACTION not in h.runtime.actions.registered_ready()
+    await h.handle.close()
 
 
 async def test_without_a_rule_neither_action_reaches_the_provider(tmp_path: Path) -> None:
@@ -1763,10 +1796,10 @@ async def test_a_failing_probe_leaves_speak_unbound_and_play_bound(failure: str)
     ``module.degraded`` naming ``["audio.speak"]`` whose reason carries
     neither the endpoint nor the key; no player is started by the probe.
 
-    A call to the unbound ``audio.speak`` reaches no provider (0
-    invocations). The registry's readiness is per module, so with
-    ``audio.play`` ready it answers ``error no_provider`` rather than
-    ``refused provider_not_ready`` — see the step report."""
+    A call to the unbound ``audio.speak`` is ``refused provider_not_ready``
+    with 0 provider invocations and no further request, while ``audio.play``
+    stays ready (gate 1 F1: the ``error no_provider`` this test once
+    accepted is not the AC29 outcome)."""
 
     answer: Any = ConnectionError(f"cannot reach {ENDPOINT} with {API_KEY}")
     if failure == "timeout":
@@ -1794,12 +1827,56 @@ async def test_a_failing_probe_leaves_speak_unbound_and_play_bound(failure: str)
         assert degraded["capabilities"] == [SPEAK_ACTION]
         assert_value_free(h, degraded["reason"])
 
+        assert degraded["reason"] == SYNTHESIS_PROBE_FAILED_REASON
+
         observation = await h.speak(text="hello")
-        assert observation.status in ("refused", "error")
-        assert observation.error["code"] == "no_provider"
+        assert_failure(observation, "refused", "provider_not_ready")
         assert h.runtime.executor.provider_invocations == 0
+        assert len(h.transport.requests) == 1
+        assert h.runner.starts == []
     finally:
         await shutdown(h)
+
+
+async def test_gate_1_x1_readiness_outcome_and_reason_counterexamples() -> None:
+    """Gate 1 X1 (F1–F3), its expectations inverted to the normative ones.
+
+    With a usable output: an empty endpoint with ``probe: false`` or ``probe:
+    true``, and a configured unreachable endpoint with ``probe: true``, all
+    leave ``audio.speak`` not ready; each call is ``refused
+    provider_not_ready`` with 0 provider invocations (the empty endpoint 0
+    requests, the unreachable one only its readiness probe); and the empty
+    and unreachable cases carry distinct value-free reasons."""
+
+    rows = []
+    cases = [
+        ("", False, wav_bytes(1)),
+        ("", True, wav_bytes(1)),
+        ("http://speech.invalid/configured", True, ConnectionError("unreachable")),
+    ]
+    for endpoint, probe, answer in cases:
+        h = await harness(answer, synthesis={"endpoint": endpoint, "probe": probe})
+        try:
+            ready = SPEAK_ACTION in h.runtime.actions.registered_ready()
+            reasons = [event["reason"] for event in degraded_events(h)]
+            observation = await h.speak(text="hello")
+            rows.append(
+                (
+                    ready,
+                    reasons,
+                    observation.status,
+                    observation.error["code"],
+                    len(h.transport.requests),
+                    h.runtime.executor.provider_invocations,
+                )
+            )
+            assert_value_free(h, *reasons)
+        finally:
+            await h.handle.close()
+    assert rows[0] == (False, [SYNTHESIS_NOT_CONFIGURED_REASON], "refused", "provider_not_ready", 0, 0)
+    assert rows[1] == (False, [SYNTHESIS_NOT_CONFIGURED_REASON], "refused", "provider_not_ready", 0, 0)
+    assert rows[2] == (False, [SYNTHESIS_PROBE_FAILED_REASON], "refused", "provider_not_ready", 1, 0)
+    assert SYNTHESIS_NOT_CONFIGURED_REASON != SYNTHESIS_PROBE_FAILED_REASON
 
 
 async def test_a_succeeding_probe_binds_both_actions_without_degradation() -> None:

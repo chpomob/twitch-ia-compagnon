@@ -2113,7 +2113,9 @@ async def test_polls_enabled_without_a_service_degrades_the_poll_action_only() -
     """AC29 / finding P1 (``required: false``): ``polls.enabled: true`` with
     no poll service → ``stream.poll.create`` discovered and unbound with one
     ``module.degraded`` (reason ``"no poll service published"``), the scene
-    action bound and the module ready."""
+    action bound and the module ready. A call to the unbound poll action is
+    ``refused provider_not_ready`` with 0 provider invocations although the
+    module is ready for the scene (gate 1 F1)."""
 
     h = await scene_harness(polls={"enabled": True})
     try:
@@ -2124,6 +2126,12 @@ async def test_polls_enabled_without_a_service_degrades_the_poll_action_only() -
         assert h.runtime.actions.bindings(POLL_ACTION) == ()
         assert POLL_ACTION not in h.runtime.actions.registered_ready()
         assert SCENE_ACTION in h.runtime.actions.registered_ready()
+
+        grant_poll(h.runtime)
+        observation = await h.runtime.executor.invoke(poll_call("unbound-poll-1"))
+        assert observation.status == "refused", observation
+        assert observation.error["code"] == ERROR_PROVIDER_NOT_READY
+        assert h.runtime.executor.provider_invocations == 0
     finally:
         await h.handle.close()
 

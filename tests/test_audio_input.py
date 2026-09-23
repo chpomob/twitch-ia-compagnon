@@ -1061,8 +1061,12 @@ async def test_no_usable_source_leaves_the_action_unbound_and_degraded(tmp_path:
     assert payload["capabilities"] == [CAPTURE_ACTION]
     assert str(tmp_path) not in payload["reason"]
 
+    # Gate 1 F1: an unbound action is ``refused provider_not_ready`` (AC29),
+    # not the union with ``error`` this test once accepted.
     observation = await h.capture(seconds=1)
-    assert observation.status in {"refused", "error"}
+    assert observation.status == "refused"
+    assert observation.error["code"] == "provider_not_ready"
+    assert h.runtime.executor.provider_invocations == 0
     assert h.invocations == []
     assert runner.spawn_count == 0
 

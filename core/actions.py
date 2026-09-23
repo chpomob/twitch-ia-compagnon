@@ -1119,7 +1119,17 @@ class ActionExecutor:
             except AmbiguousBindingError as exc:
                 pending = ("error", ERROR_NO_PROVIDER, str(exc))
             else:
-                if binding is None:
+                if binding is None and not self._registry.bindings(call.action_name):
+                    # Declared but bound nowhere: the module that declares it
+                    # left it unbound because a dependency is unavailable (R8,
+                    # AC29). That is a capability declining to act, like a
+                    # module that is not ready — not an unserved destination.
+                    pending = (
+                        "refused",
+                        ERROR_PROVIDER_NOT_READY,
+                        f"no provider is ready to provide {call.action_name!r}",
+                    )
+                elif binding is None:
                     pending = (
                         "error",
                         ERROR_NO_PROVIDER,
