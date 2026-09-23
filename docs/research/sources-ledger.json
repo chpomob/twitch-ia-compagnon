@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": 1,
+      "url": "https://github.com/hbschlac/twitch-community-research",
+      "title": "Twitch Community Intelligence - 1183 retours publics, 10 themes de douleur",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 2,
+      "url": "https://raw.githubusercontent.com/hbschlac/twitch-community-research/main/data/raw-feedback.json",
+      "title": "Dataset brut 1183 items analyse localement pour cette recherche",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 3,
+      "url": "https://raw.githubusercontent.com/hbschlac/twitch-community-research/main/data/snapshot.json",
+      "title": "Snapshot d analyse - frequences par theme et repartition createur/viewer",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 4,
+      "url": "https://www.getailicia.com/ai-licia-for-twitch",
+      "title": "ai_licia - page produit Twitch (vision, personnalite, memoire, voix)",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 5,
+      "url": "https://www.getailicia.com/pricing",
+      "title": "ai_licia - tarifs 2026 (tiers par streams/semaine et personnages)",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 6,
+      "url": "https://www.getailicia.com/post/top-5-twitch-streaming-tools-in-2026",
+      "title": "ai_licia - Top 5 Twitch tools 2026 (surcharge d outils)",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 7,
+      "url": "https://www.getailicia.com",
+      "title": "ai_licia - accueil (Actions: clips, scenes OBS, actions en jeu)",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 8,
+      "url": "https://www.questie.ai/twitch-streamers",
+      "title": "Questie AI - page Twitch (co-host qui regarde le gameplay, dead air)",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 9,
+      "url": "https://contentcreators.com/tools/streamchatai",
+      "title": "StreamChat AI - moderation IA + engagement, 11 500 streamers",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 10,
+      "url": "https://www.jenova.ai/en/resources/ai-streaming-assistant-202605",
+      "title": "Jenova mai 2026 - assistant de production, Streamlabs ASA, marche 4,2-12,3 Md",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 11,
+      "url": "https://www.tubefilter.com/2026/09/15/twitch-generative-ai-stream-coach-creator-assistant",
+      "title": "Tubefilter 15/09/2026 - Twitch Stream Coach, coaching post-stream",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 12,
+      "url": "https://kotaku.com/twitch-ai-stream-coach-tool-ai-content-training-opt-out-2000733578",
+      "title": "Kotaku 11/09/2026 - defiance des createurs envers l IA de plateforme",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 13,
+      "url": "https://streamscharts.com/news/automating-your-broadcast-best-ai-tools-live-streamers-2026",
+      "title": "Streams Charts - panorama des outils IA de diffusion 2026",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 14,
+      "url": "https://presenc.ai/research/best-ai-tools-for-twitch-streamers-2026",
+      "title": "Presenc - panorama 2026 des outils IA pour streamers",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 15,
+      "url": "https://gamedayroundup.com/streamer-burnout-2026",
+      "title": "Game Day Roundup 2026 - burnout des streamers et charge mentale",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 16,
+      "url": "https://www.reddit.com/r/streamerbot/comments/1kkn4rc/streamerbot_wishlist",
+      "title": "r/streamerbot - fil StreamerBot Wishlist (demandes d automatisation)",
+      "accessed": "2026-09-23"
+    },
+    {
+      "id": 17,
+      "url": "https://murf.ai/blog/twitch-text-to-speech",
+      "title": "Murf - guide TTS Twitch 2026 (usage reel du TTS par les viewers)",
+      "accessed": "2026-09-23"
+    }
+  ]
+}
