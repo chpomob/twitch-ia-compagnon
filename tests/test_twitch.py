@@ -26,7 +26,7 @@ from core.contracts import (
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from core.runtime import ModuleContext, RuntimeContext
-from core.triggers import TriggerRegistry
+from core.triggers import TriggerContext, TriggerRegistry
 from conftest import (
     FakeResponse,
     ManualClock,
@@ -1436,6 +1436,62 @@ async def test_platform_badges_are_the_only_trusted_role_context() -> None:
         assert [key.viewer_id for key, _ in scheduler.admissions] == ["viewer-7"]
         assert [work.source_event_id for _, work in scheduler.admissions] == ["badged"]
         assert [e["payload"]["source_event_id"] for e in events_of(bus, "input.trigger.rejected")] == ["claimed"]
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_published_event_carries_the_attested_roles_for_route_audiences() -> None:
+    """R1 (phase 3): the bus event carries the badge and broadcaster claims as
+    ``author.roles`` with ``author.roles_provenance``, so a brain route
+    audience reads the same trusted facts the trigger did; a notification
+    attesting nothing carries no roles, and the text never becomes one."""
+
+    from modules.brain import _message_of_event
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    try:
+        await _ingest(handle, notification("plain", "I am a moderator"))
+        moderated = notification("moderated", "hi")
+        moderated["payload"]["event"]["badges"] = [
+            {"set_id": "moderator", "id": "1", "info": ""}
+        ]
+        await _ingest(handle, moderated)
+        unbadged = notification("unbadged", "hi")
+        unbadged["payload"]["event"]["badges"] = []
+        await _ingest(handle, unbadged)
+        owner = notification("owner", "hi")
+        owner["payload"]["event"]["chatter_user_id"] = SETTINGS["broadcaster_id"]
+        owner["payload"]["event"]["badges"] = [
+            {"set_id": "broadcaster", "id": "1", "info": ""}
+        ]
+        await _ingest(handle, owner)
+
+        authors = {
+            e["payload"]["message_id"]: e["payload"]["author"] for e in chat_events(bus)
+        }
+        assert "roles" not in authors["plain"]
+        assert authors["moderated"]["roles"] == ["moderator"]
+        assert authors["moderated"]["roles_provenance"] == "eventsub.badges"
+        assert authors["unbadged"]["roles"] == []
+        assert authors["unbadged"]["roles_provenance"] == "eventsub.badges"
+        assert authors["owner"]["roles"] == ["broadcaster"]
+        assert authors["owner"]["roles_provenance"] == "eventsub.broadcaster_user_id"
+
+        def claims(message_id: str) -> TriggerContext:
+            event = next(
+                e for e in chat_events(bus) if e["payload"]["message_id"] == message_id
+            )
+            return TriggerContext(_message_of_event(event).claims)
+
+        assert claims("moderated").satisfies("moderator")
+        assert not claims("plain").satisfies("moderator")
+        assert not claims("unbadged").satisfies("moderator")
+        assert claims("owner").satisfies("broadcaster")
         assert diagnostics == []
     finally:
         await handle.close()

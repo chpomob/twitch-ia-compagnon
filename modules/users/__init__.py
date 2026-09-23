@@ -28,9 +28,9 @@ stays listed for, so no partial list is ever presented as the audience
 them carried ``author.roles`` as a list of strings **and**
 ``author.roles_provenance`` as a non-empty string; an untagged role attests
 nothing and is not recorded. An author whose events never carried both has
-no ``roles`` key at all — absent, not empty (AC28). The shipped platform
-module emits no roles today, so its authors carry none; the fake platform
-fixture emits them for the tests.
+no ``roles`` key at all — absent, not empty (AC28). A platform input
+attests roles only from what its platform attached to the notification; a
+notification attesting none leaves its author without them.
 
 **Pagination.** Authors are ordered by ``last_seen`` descending, then
 ``user_id`` ascending. The ``cursor`` handed back in ``page.next_cursor`` is

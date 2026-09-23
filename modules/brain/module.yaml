@@ -246,6 +246,82 @@ settings_schema:
             selected per destination, keyed by `<platform>/<channel_id>`.
       required:
         - mode
+    # Presence (R1), both optional: absent, the system instructions and the
+    # delivery path are exactly those of phase 2. The schema subset has no
+    # length or count keywords, so the bounds stated in the descriptions —
+    # persona and instructions at most 2000 characters, at most 16 routes,
+    # a command of at most 32 characters, unique route names — are enforced
+    # by the settings hook, naming the field.
+    persona:
+      type: string
+      description: >-
+        Replaces the opening identity line of the system instructions, at
+        most 2000 characters; the fixed lines about tools and plain-text
+        output are always kept.
+    routes:
+      type: array
+      description: >-
+        At most 16 routes, evaluated in order once per run from the
+        triggering event; the first match wins, and with none the
+        destination's list and the plain instructions apply.
+      items:
+        type: object
+        properties:
+          name:
+            type: string
+            description: Unique name of the route, used in startup diagnostics.
+          match:
+            type: object
+            properties:
+              kinds:
+                type: array
+                items:
+                  type: string
+                  enum:
+                    - message
+                    - sub
+                    - resub
+                    - sub_gift
+                    - community_sub_gift
+                    - raid
+                    - follow
+                    - tip
+                    - watch_tick
+                description: Non-empty list of event kinds the route matches.
+              command:
+                type: string
+                description: >-
+                  One token of at most 32 characters the event text must
+                  start with, compared case-insensitively as a whole token.
+              audience:
+                type: string
+                enum:
+                  - broadcaster
+                  - moderators
+                  - vips
+                  - subscribers
+                  - everyone
+                description: >-
+                  Satisfied only by a role the platform attested with a
+                  provenance, never by the text.
+            required:
+              - kinds
+          instructions:
+            type: string
+            description: >-
+              Appended to the system instructions of a matched run, at most
+              2000 characters.
+          delivery:
+            type: object
+            description: >-
+              A delivery list of the shape above (`mode`, `actions`,
+              `preference`) used instead of the destination's list. A list
+              holding an effect that receives no answer text needs
+              `match.audience` broadcaster or moderators, or platform notice
+              kinds only; otherwise startup fails naming the route.
+        required:
+          - name
+          - match
   required:
     - endpoint
     - model

@@ -41,22 +41,27 @@ from core.actions import (
 from core.admission import REASON_CANCELLED, REASON_RUN_DEADLINE
 from core.bus import EventBus
 from core.contracts import (
+    EVENT_KINDS,
     PROBE_TOOL,
     TRACE_ACTION_COMPLETED,
     TRACE_ACTION_STARTED,
     TRACE_BRAIN_ADMISSION_ACCEPTED,
     TRACE_BRAIN_RUN_COMPLETED,
     TRACE_BRAIN_RUN_STARTED,
+    TRACE_MODULE_DEGRADED,
     WILDCARD,
     ActionSpec,
     ActionObservation,
     Counters,
     Destination,
     SessionKey,
+    TriggerPolicy,
+    TriggerRule,
 )
 from core.lifecycle import PhaseCoordinator, SupervisedTasks
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext, Supervision
+from core.triggers import TriggerRegistry
 from conftest import (
     FAIL_AFTER_EMISSION,
     FAIL_BEFORE_EMISSION,
@@ -70,9 +75,11 @@ from conftest import (
     SENT,
     TIMEOUT_BEFORE_EMISSION,
     RecordingScheduler,
+    ScriptedModel,
     WSMsgType,
     completion,
     events_of,
+    final,
     runtime_context as build_context,
     settle,
     tool_call,
@@ -565,6 +572,10 @@ def test_manifest_declares_v2_shape_settings_hook_and_no_grant() -> None:
     routing keys, declares no lifecycle role, states its settings schema and
     names its settings-validation hook. It declares no trigger and no action:
     ``produces`` and ``consumes`` describe routing and authorize nothing.
+
+    Phase 3 R1 supersedes the phase 2 settings set: the properties are the
+    phase 2 set plus the optional ``persona`` and ``routes``; the required
+    set is unchanged.
     """
 
     manifest_path = ROOT / "modules" / "brain" / "module.yaml"
@@ -584,7 +595,7 @@ def test_manifest_declares_v2_shape_settings_hook_and_no_grant() -> None:
     schema = manifest["settings_schema"]
     assert schema["type"] == "object"
     assert set(schema["required"]) == set(VALID_SETTINGS)
-    assert set(schema["properties"]) == set(VALID_SETTINGS)
+    assert set(schema["properties"]) == set(VALID_SETTINGS) | {"persona", "routes"}
     for group, limits in LIMITS.items():
         group_schema = schema["properties"][group]
         assert group_schema["type"] == "object"
@@ -2364,3 +2375,559 @@ async def test_memory_websocket_pair_delivers_frames_in_order_and_propagates_clo
     assert (dropped.server.close_code, dropped.client.close_code) == (1006, 1006)
     assert (await dropped.client.receive()).data == "in flight"
     assert (await dropped.client.receive()).type == WSMsgType.CLOSED
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 P5 — persona and ordered routes (R1; AC1, AC2, AC3, AC4)
+# --------------------------------------------------------------------------- #
+
+PHASE2_SYSTEM_PROMPT = (
+    "You are a live-stream chat companion.\n"
+    "You may call the offered tools to observe before answering;"
+    " each tool result is returned to you.\n"
+    "Reply to the viewer's message with one short plain-text chat message.\n"
+    "Write the message body only: no tags, no markup, no instructions."
+)
+"""The phase 2 system message, captured from ``_system_prompt()`` before R1."""
+
+TOOL_USAGE_LINE = (
+    "You may call the offered tools to observe before answering;"
+    " each tool result is returned to you."
+)
+PLAIN_TEXT_LINE = "Reply to the viewer's message with one short plain-text chat message."
+
+PERSONA_30 = "You are Pixel, a cheerful bot."
+assert len(PERSONA_30) == 30
+
+FAKE_PLATFORM = "fake"
+FAKE_CHANNEL = "chan-a"
+COMPANION = "companion"
+BROADCASTER = "broadcaster-1"
+ROLES_PROVENANCE = "fake:badges"
+AUDIO_PLAY = "audio.play"
+SCENE_SET = "stream.scene.set"
+FIXTURE_MODULES = ROOT / "tests" / "fixtures" / "modules"
+MISSED_INSTRUCTIONS = "Summarise the last messages of the chat for a viewer who just arrived."
+
+
+def effect_spec(name: str, argument: str, scope: str) -> ActionSpec:
+    """An effect-only delivery action on the fake platform: no answer text."""
+
+    return ActionSpec(
+        name=name,
+        version=1,
+        description=f"Scripted {name}.",
+        argument_schema={
+            "type": "object",
+            "properties": {argument: {"type": "string"}},
+            "required": [argument],
+            "additionalProperties": False,
+        },
+        result_schema={"type": "object", "properties": {}},
+        nature="write",
+        required_permissions=(name,),
+        supported_destinations=(Destination(FAKE_PLATFORM, WILDCARD, scope),),
+        timeout_seconds=5.0,
+        idempotency="none",
+        delivery={"text_argument": "none"},
+    )
+
+
+class ScriptedEffect:
+    """A scripted action binding: confirms every call and records its arguments."""
+
+    name = "scripted-effect"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        invocation.mark_not_emitted()
+        self.calls.append(dict(invocation.call.arguments))
+        invocation.mark_emitted()
+        return ActionObservation(status="success", provenance={"provider": self.name}, result={})
+
+
+def fake_grant(action: str) -> AuthorizationRule:
+    return AuthorizationRule(
+        rule_id=f"brain-{action}",
+        action_name=action,
+        principals=(PRINCIPAL,),
+        granted_permissions=(action,),
+    )
+
+
+@dataclass
+class FakePlatformHarness:
+    """The fake platform and the shipped brain, loaded by the real loader."""
+
+    context: RuntimeContext
+    brain: Any
+    platform: Any
+    session: Any
+    transport: Any
+    effects: dict[str, ScriptedEffect]
+    diagnostics: list[str]
+
+    async def drive(self, *, text: str = "", kind: str | None = None, author: Any = None) -> Any:
+        """One message (or notice) through the fake platform; the run's record."""
+
+        before = len(self.brain.scheduler.run_records())
+        if kind is None:
+            published = await self.platform.inject(
+                {
+                    "channel_id": FAKE_CHANNEL,
+                    "author": author if author is not None else {"id": VIEWER},
+                    "message_id": f"m-{before}",
+                    "text": text,
+                }
+            )
+        else:
+            published = await self.platform.inject_notice(kind, author, text)
+        assert published is not None
+        await wait_until(lambda: len(self.brain.scheduler.run_records()) > before)
+        await wait_until(
+            lambda: len(events_of(self.context.bus, TRACE_BRAIN_RUN_COMPLETED)) > before
+        )
+        return list(self.brain.scheduler.run_records().values())[-1]
+
+    def system(self, index: int = -1) -> str:
+        return self.session.requests()[index]["messages"][0]["content"]
+
+    def delivered_actions(self) -> list[str]:
+        payload = events_of(self.context.bus, TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
+        return [entry["action"] for entry in payload["deliveries"]]
+
+    async def close(self) -> None:
+        await self.brain.close()
+        await self.platform.close()
+
+
+async def activate_fake_platform(
+    *bodies: Any,
+    brain_overrides: dict[str, Any] | None = None,
+    notice_kinds: tuple[str, ...] = (),
+    prepare: bool = True,
+) -> FakePlatformHarness:
+    """The fake platform, two scripted effects and the shipped brain on one runtime.
+
+    The fake input's trigger policy accepts every event kind, so a route —
+    not the trigger — is what a scenario exercises; ``audio.play`` and
+    ``stream.scene.set`` are scripted effect bindings granted to the brain.
+    """
+
+    clock = ManualClock()
+    actions = (CHAT_WRITE, AUDIO_PLAY, SCENE_SET)
+    policy = AuthorizationPolicy([fake_grant(action) for action in actions])
+    context = build_context(
+        clock=clock,
+        trigger_registry=TriggerRegistry(companion_name=COMPANION),
+        authorization=policy,
+    )
+    effects = {AUDIO_PLAY: ScriptedEffect(), SCENE_SET: ScriptedEffect()}
+    context.actions.register(effect_spec(AUDIO_PLAY, "sound", "audio"), effects[AUDIO_PLAY], module="effects")
+    context.actions.register(effect_spec(SCENE_SET, "scene", "scene"), effects[SCENE_SET], module="effects")
+    context.actions.mark_ready("effects")
+
+    diagnostics: list[str] = []
+    transport = SimpleNamespace(outcomes=[], sends=[])
+    fixtures = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    (platform,) = await fixtures.activate_enabled(
+        {
+            "enabled_modules": ["fakeplatform"],
+            "modules": {
+                "fakeplatform": {
+                    "channel_ids": [FAKE_CHANNEL],
+                    "companion_name": COMPANION,
+                    "transport": transport,
+                    "notices": {"kinds": list(notice_kinds)},
+                    "diagnostic_reporter": diagnostics.append,
+                }
+            },
+        }
+    )
+    context.triggers.registry.configure(
+        "fakeplatform",
+        TriggerPolicy(
+            rules=(TriggerRule(type="event_kind", parameters={"kinds": list(EVENT_KINDS)}),)
+        ),
+    )
+
+    session = ScriptedModel(*bodies)
+    settings = merge_settings(brain_overrides)
+    settings.update(
+        {
+            "_session_factory": lambda: session,
+            "_sleeper": clock.sleep,
+            "diagnostic_reporter": diagnostics.append,
+        }
+    )
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    (brain,) = await loader.activate_enabled(
+        {"enabled_modules": ["brain"], "modules": {"brain": settings}}
+    )
+    harness = FakePlatformHarness(
+        context, brain.handle, platform.handle, session, transport, effects, diagnostics
+    )
+    await harness.platform.prepare()
+    if prepare:
+        await harness.brain.prepare()
+    return harness
+
+
+def raid_route() -> dict[str, Any]:
+    """Route A of AC3: raids thank in chat and play the chime."""
+
+    return {
+        "name": "thanks-raid",
+        "match": {"kinds": ["raid"]},
+        "delivery": {
+            "mode": "fixed",
+            "actions": [
+                {"action": CHAT_WRITE, "text_argument": "text"},
+                {"action": AUDIO_PLAY, "text_argument": "none", "arguments": {"sound": "chime"}},
+            ],
+        },
+    }
+
+
+def missed_route() -> dict[str, Any]:
+    """Route B of AC3: ``!missed`` adds its instructions, delivery unchanged."""
+
+    return {
+        "name": "missed",
+        "match": {"kinds": ["message"], "command": "!missed"},
+        "instructions": MISSED_INSTRUCTIONS,
+    }
+
+
+def brb_route(audience: str | None = None) -> dict[str, Any]:
+    """The AC4 scene route; unsafe without a privileged audience."""
+
+    match: dict[str, Any] = {"kinds": ["message"], "command": "!brb"}
+    if audience is not None:
+        match["audience"] = audience
+    return {
+        "name": "brb",
+        "match": match,
+        "delivery": {
+            "mode": "fixed",
+            "actions": [
+                {"action": SCENE_SET, "text_argument": "none", "arguments": {"scene": "Break"}}
+            ],
+        },
+    }
+
+
+def trusted_broadcaster() -> dict[str, Any]:
+    return {"id": BROADCASTER, "roles": ["broadcaster"], "roles_provenance": ROLES_PROVENANCE}
+
+
+def brain_module_of(handle: Any) -> Any:
+    """The brain package the loader imported under its private name."""
+
+    return sys.modules[type(handle).__module__]
+
+
+@pytest.mark.asyncio
+async def test_ac1_without_persona_or_routes_the_system_message_is_the_phase2_text() -> None:
+    """AC1: with neither ``persona`` nor ``routes``, the system message of a
+    run is byte-identical to the phase 2 golden, on the twitch-shaped
+    harness and on the fake platform, and ``_system_prompt`` returns the
+    untouched constant."""
+
+    twitch = await activate_with(completion("Hi."))
+    try:
+        await twitch.send()
+        await twitch.completed()
+        system = twitch.prompt(0)[0]
+        assert system["role"] == "system"
+        assert system["content"].encode("utf-8") == PHASE2_SYSTEM_PROMPT.encode("utf-8")
+        assert twitch.handle._system_prompt() is sys.modules["modules.brain"]._SYSTEM_PROMPT
+    finally:
+        await twitch.close()
+
+    fake = await activate_fake_platform(final("Hi."))
+    try:
+        await fake.drive(text=f"{COMPANION}, hello")
+        assert fake.system(0).encode("utf-8") == PHASE2_SYSTEM_PROMPT.encode("utf-8")
+        assert fake.delivered_actions() == [CHAT_WRITE]
+    finally:
+        await fake.close()
+
+
+@pytest.mark.asyncio
+async def test_ac2_a_persona_replaces_only_the_identity_line() -> None:
+    """AC2: a 30-character persona is the first line of the system message and
+    both fixed lines — tool usage and plain-text output — are still present."""
+
+    harness = await activate_with(completion("Hi."), settings_overrides={"persona": PERSONA_30})
+    try:
+        await harness.send()
+        await harness.completed()
+        lines = harness.prompt(0)[0]["content"].split("\n")
+        assert lines[0] == PERSONA_30
+        assert [line in lines for line in (TOOL_USAGE_LINE, PLAIN_TEXT_LINE)] == [True, True]
+        assert "You are a live-stream chat companion." not in lines
+        assert lines[1:] == PHASE2_SYSTEM_PROMPT.split("\n")[1:]
+    finally:
+        await harness.close()
+
+
+def presence_settings(**overrides: Any) -> dict[str, Any]:
+    settings = copy_settings(VALID_SETTINGS)
+    settings.update(overrides)
+    return settings
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field_name"),
+    [
+        ({"persona": "p" * 2001}, "persona"),
+        (
+            {"routes": [{"name": f"r{i}", "match": {"kinds": ["message"]}} for i in range(17)]},
+            "routes",
+        ),
+        (
+            {
+                "routes": [
+                    {"name": "same", "match": {"kinds": ["message"]}},
+                    {"name": "same", "match": {"kinds": ["raid"]}},
+                ]
+            },
+            "routes[1].name",
+        ),
+        (
+            {"routes": [{"name": "long", "match": {"kinds": ["message"], "command": "!" + "c" * 32}}]},
+            "routes[0].match.command",
+        ),
+        (
+            {"routes": [{"name": "i", "match": {"kinds": ["message"]}, "instructions": "x" * 2001}]},
+            "routes[0].instructions",
+        ),
+        (
+            {"routes": [{"name": "k", "match": {"kinds": ["message", "hug"]}}]},
+            "routes[0].match.kinds",
+        ),
+        ({"routes": [{"name": "e", "match": {"kinds": []}}]}, "routes[0].match.kinds"),
+        (
+            {"routes": [{"name": "w", "match": {"kinds": ["message"], "command": "!a b"}}]},
+            "routes[0].match.command",
+        ),
+        (
+            {"routes": [{"name": "a", "match": {"kinds": ["message"], "audience": "admins"}}]},
+            "routes[0].match.audience",
+        ),
+    ],
+    ids=[
+        "persona-2001",
+        "17-routes",
+        "duplicate-name",
+        "command-33",
+        "instructions-2001",
+        "unknown-kind",
+        "empty-kinds",
+        "command-two-tokens",
+        "unknown-audience",
+    ],
+)
+def test_ac2_settings_hook_refuses_each_oversized_or_malformed_presence_field(
+    overrides: dict[str, Any], field_name: str
+) -> None:
+    """AC2 (validator half; the ``--check-config`` exit 2 runs in P22): each
+    case is refused with exactly one diagnostic naming the field."""
+
+    diagnostics = validate_settings(presence_settings(**overrides))
+    assert diagnostics == [diagnostics[0]]
+    assert f"field {field_name!r}:" in diagnostics[0]
+    assert diagnostics[0].startswith(f"module {MODULE_NAME!r}:")
+
+
+def test_presence_settings_at_their_bounds_are_accepted_and_parsed() -> None:
+    """R1: a 2000-character persona, 16 routes, a 32-character command and
+    2000-character instructions are accepted, and parse in order."""
+
+    routes = [{"name": f"r{i}", "match": {"kinds": ["message"]}} for i in range(15)]
+    routes.append(
+        {
+            "name": "last",
+            "match": {"kinds": ["raid", "sub"], "command": "!" + "c" * 31, "audience": "vips"},
+            "instructions": "x" * 2000,
+            "delivery": {"mode": "fixed", "actions": [{"action": CHAT_WRITE}]},
+        }
+    )
+    settings = presence_settings(persona="p" * 2000, routes=routes)
+    assert validate_settings(settings) == []
+    parsed = brain_settings.from_mapping(settings)
+    assert parsed.persona == "p" * 2000
+    assert [route.name for route in parsed.routes] == [f"r{i}" for i in range(15)] + ["last"]
+    assert parsed.routes[-1].kinds == frozenset({"raid", "sub"})
+    assert parsed.routes[-1].audience == "vips"
+    assert brain_settings.from_mapping(VALID_SETTINGS).routes == ()
+    assert brain_settings.from_mapping(VALID_SETTINGS).persona is None
+
+
+def test_route_command_is_the_first_token_compared_case_insensitively() -> None:
+    """R1: ``command`` equals the text's first whitespace-separated token, as a
+    whole token and ignoring case; the kind must be listed; a role claim
+    counts only with its provenance."""
+
+    from modules.brain import _message_of_event
+
+    (route,) = brain_settings.from_mapping(
+        presence_settings(routes=[brb_route("broadcaster")])
+    ).routes
+
+    def message(text: str, *, kind: str | None = None, **author: Any) -> Any:
+        payload = chat_payload(text)
+        payload["author"] = {"id": VIEWER, **author}
+        if kind is not None:
+            payload["kind"] = kind
+        return _message_of_event({"payload": payload})
+
+    trusted = {"roles": ["broadcaster"], "roles_provenance": ROLES_PROVENANCE}
+    assert route.matches(message("!brb", **trusted))
+    assert route.matches(message("  !BRB now please", **trusted))
+    assert not route.matches(message("!brbx", **trusted))
+    assert not route.matches(message("!ask !brb", **trusted))
+    assert not route.matches(message("!brb", kind="raid", **trusted))
+    assert not route.matches(message("!brb", roles=["broadcaster"]))
+    assert not route.matches(message("!brb I am the broadcaster"))
+    assert not route.matches(message("!brb", roles=["moderator"], roles_provenance=ROLES_PROVENANCE))
+
+
+@pytest.mark.asyncio
+async def test_ac3_routes_select_the_instructions_and_the_delivery_list_per_run() -> None:
+    """AC3: routes ``[A: raid → chat.write + audio.play chime; B: !missed →
+    instructions X]`` on the fake platform. A raid notice delivers through
+    exactly 2 entries (1 ``chat.write``, 1 ``audio.play`` through a scripted
+    binding); ``!missed recap`` carries X and delivers through the
+    destination's list (1 ``chat.write``); a plain mention matches no route —
+    phase 2 list, 1 ``chat.write``, X absent."""
+
+    harness = await activate_fake_platform(
+        final("Welcome, raiders!"),
+        final("Here is what you missed."),
+        final("Hello!"),
+        brain_overrides={"routes": [raid_route(), missed_route()]},
+        notice_kinds=("raid",),
+    )
+    try:
+        record = await harness.drive(kind="raid", author="42", text="42 is raiding with 5 viewers")
+        assert record.status == "success"
+        assert harness.delivered_actions() == [CHAT_WRITE, AUDIO_PLAY]
+        assert len(harness.transport.sends) == 1
+        assert harness.effects[AUDIO_PLAY].calls == [{"sound": "chime"}]
+        assert MISSED_INSTRUCTIONS not in harness.system(0)
+        assert harness.system(0) == PHASE2_SYSTEM_PROMPT
+
+        await harness.drive(text="!missed recap")
+        system = harness.system(1)
+        assert system.endswith(f"\n\n{MISSED_INSTRUCTIONS}")
+        assert system.startswith(PHASE2_SYSTEM_PROMPT)
+        assert harness.delivered_actions() == [CHAT_WRITE]
+        assert len(harness.transport.sends) == 2
+        assert len(harness.effects[AUDIO_PLAY].calls) == 1
+
+        await harness.drive(text=f"{COMPANION}, hello")
+        assert MISSED_INSTRUCTIONS not in harness.system(2)
+        assert harness.system(2) == PHASE2_SYSTEM_PROMPT
+        assert harness.delivered_actions() == [CHAT_WRITE]
+        assert len(harness.transport.sends) == 3
+        assert len(harness.effects[AUDIO_PLAY].calls) == 1
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac4_an_effect_route_reachable_by_any_viewer_fails_prepare_naming_it() -> None:
+    """AC4: a ``!brb`` route delivering ``stream.scene.set`` with no audience
+    fails startup naming the route, before readiness and with the module
+    reported degraded; the same list on a notice-only route is accepted."""
+
+    harness = await activate_fake_platform(
+        brain_overrides={"routes": [missed_route(), brb_route()]}, prepare=False
+    )
+    try:
+        brain_module = brain_module_of(harness.brain)
+        with pytest.raises(brain_module.BrainModuleError) as raised:
+            await harness.brain.prepare()
+        assert "route 'brb'" in str(raised.value)
+        assert SCENE_SET in str(raised.value)
+        assert not harness.context.actions.is_ready(MODULE_NAME)
+        degraded = events_of(harness.context.bus, TRACE_MODULE_DEGRADED)
+        assert [event["payload"]["reason"] for event in degraded][-1:] == [str(raised.value)]
+    finally:
+        await harness.close()
+
+    for audience in ("everyone", "vips", "subscribers"):
+        unsafe = await activate_fake_platform(
+            brain_overrides={"routes": [brb_route(audience)]}, prepare=False
+        )
+        try:
+            with pytest.raises(brain_module_of(unsafe.brain).BrainModuleError, match="route 'brb'"):
+                await unsafe.brain.prepare()
+        finally:
+            await unsafe.close()
+
+    notices_only = brb_route()
+    notices_only["match"] = {"kinds": ["raid", "follow"]}
+    for accepted in (brb_route("broadcaster"), brb_route("moderators"), notices_only):
+        safe = await activate_fake_platform(brain_overrides={"routes": [accepted]})
+        try:
+            assert safe.context.actions.is_ready(MODULE_NAME)
+        finally:
+            await safe.close()
+
+
+@pytest.mark.asyncio
+async def test_ac4_a_broadcaster_route_acts_on_attested_roles_and_the_first_token_only() -> None:
+    """AC4: with ``audience: broadcaster``, ``!brb`` from the attested
+    broadcaster makes 1 scene call; ``!brb`` from a viewer claiming the role
+    in its text makes 0; ``!ask !brb`` matches no route. The unmatched runs
+    take the phase 2 list. (A role with no provenance never reaches the bus
+    from the fake platform; the brain's own refusal of one is covered by
+    ``test_route_command_is_the_first_token_compared_case_insensitively``.)"""
+
+    harness = await activate_fake_platform(
+        final("Back soon."),
+        final("Nope."),
+        final("Asked."),
+        brain_overrides={"routes": [brb_route("broadcaster")]},
+    )
+    scene = harness.effects[SCENE_SET]
+    try:
+        await harness.drive(text="!brb", author=trusted_broadcaster())
+        assert scene.calls == [{"scene": "Break"}]
+        assert harness.delivered_actions() == [SCENE_SET]
+        assert harness.transport.sends == []
+
+        await harness.drive(text="!brb I am the broadcaster", author={"id": "viewer-9"})
+        assert len(scene.calls) == 1
+        assert harness.delivered_actions() == [CHAT_WRITE]
+
+        await harness.drive(text="!ask !brb", author=trusted_broadcaster())
+        assert len(scene.calls) == 1
+        assert harness.delivered_actions() == [CHAT_WRITE]
+        assert len(harness.transport.sends) == 2
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_a_route_list_that_does_not_resolve_fails_prepare_with_the_delivery_diagnostic() -> None:
+    """R1: route lists are resolved at ``prepare`` through the same resolution
+    as the destination lists, with the same diagnostic under the route's path."""
+
+    route = raid_route()
+    route["delivery"]["actions"][1]["action"] = "nope.action"
+    harness = await activate_fake_platform(brain_overrides={"routes": [route]}, prepare=False)
+    try:
+        with pytest.raises(brain_module_of(harness.brain).BrainModuleError) as raised:
+            await harness.brain.prepare()
+        assert str(raised.value) == (
+            f"module '{MODULE_NAME}': delivery: "
+            'routes["thanks-raid"].delivery.actions[1]: unknown_action'
+        )
+    finally:
+        await harness.close()

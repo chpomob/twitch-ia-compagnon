@@ -271,6 +271,10 @@ class _Notification:
     engine's authenticity invariant and is never published, fed or admitted.
     ``claims`` are the platform-attested facts about the author, each tagged
     with its provenance, and are the only context a role predicate may read.
+    ``roles_attested`` is true when the platform attested the author's roles
+    at all (a badge list, or the chatter being the broadcaster); only then does
+    the event carry ``author.roles`` with ``author.roles_provenance``, so a
+    route audience downstream reads the same trusted facts as the trigger.
     """
 
     channel_id: str
@@ -279,6 +283,7 @@ class _Notification:
     message_id: str
     text: str
     claims: tuple[TrustedClaim, ...]
+    roles_attested: bool = False
 
     def event(self) -> dict[str, Any]:
         """The schema-version-2 bus event this notification normalises to."""
@@ -288,6 +293,9 @@ class _Notification:
             author["id"] = self.author_id
         if self.author_name is not None:
             author["display_name"] = self.author_name
+        if self.author_id is not None and self.roles_attested:
+            author["roles"] = [claim.name for claim in self.claims]
+            author["roles_provenance"] = _roles_provenance(self.claims)
         payload: dict[str, Any] = {
             "platform": PLATFORM,
             "channel_id": self.channel_id,
@@ -1990,7 +1998,23 @@ def _normalize_notification(envelope: Mapping[str, Any]) -> _Notification:
         message_id=message_id,
         text=text,
         claims=_trusted_claims(event, author_id, channel_id),
+        roles_attested=isinstance(event.get("badges"), (list, tuple))
+        or (author_id is not None and author_id == channel_id),
     )
+
+
+def _roles_provenance(claims: tuple[TrustedClaim, ...]) -> str:
+    """The single provenance tag the event's ``author.roles`` carries.
+
+    The distinct provenances of the claims, joined by ``+`` in claim order; an
+    attested badge list naming no role is tagged with the badge provenance.
+    """
+
+    provenances: list[str] = []
+    for claim in claims:
+        if claim.provenance and claim.provenance not in provenances:
+            provenances.append(claim.provenance)
+    return "+".join(provenances) or _BADGE_PROVENANCE
 
 
 def _trusted_claims(

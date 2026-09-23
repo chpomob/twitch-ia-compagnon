@@ -185,6 +185,18 @@ under the run's own call ids, and the record carries one outcome per entry
 status, else ``success`` when all succeeded, else the first non-success in
 list order. Nothing here names a platform or a delivery module (AC56).
 
+**Presence: persona and routes** (phase 3 R1). Both settings are optional;
+with neither, the system message is the phase 2 constant itself and every
+run takes the destination's list. A ``persona`` replaces the opening
+identity line only. The ordered ``routes`` are matched once per run from
+the triggering event — its ``payload.kind``, the first token of its text,
+and the roles its ``author`` carries with a ``roles_provenance`` — and the
+first match adds its ``instructions`` as a paragraph of the system message
+and, when it declares one, delivers through its own list, resolved at
+``prepare`` like the others. A route list holding an effect entry (one that
+receives no answer text) must be reachable only by the broadcaster, the
+moderators or platform notices, or startup fails naming the route.
+
 **Conversation memory** (R3, R6). Keyed by
 :class:`~core.contracts.SessionKey` ``(platform, channel_id, viewer_id)``, so
 one viewer on two platforms or in two channels holds two memories and two
@@ -233,6 +245,10 @@ from core.contracts import (
     DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS,
     DELIVERY_REASON_TEXT_MAPPING_MISSING,
     DELIVERY_REASON_UNKNOWN_ACTION,
+    EVENT_KIND_DEFAULT,
+    EVENT_KIND_SET,
+    EVENT_KINDS,
+    PLATFORM_NOTICE_KINDS,
     PROBE_REASON_AUDIO_REJECTED,
     PROBE_REASON_IMAGE_REJECTED,
     PROBE_REASON_MALFORMED_ARGUMENTS,
@@ -250,13 +266,16 @@ from core.contracts import (
     ActionCall,
     ActionObservation,
     Destination,
+    ContractError,
     SessionKey,
     observation_size,
+    validate_event_kind,
 )
 # The canonical rendering the policy content hash and the trace size run on:
 # a repeated proposal is judged on the same unambiguous rendering of its
 # arguments (R3), never on a serialiser's insertion order.
 from core.contracts import _canonical_text
+from core.triggers import AUDIENCE_CLAIMS, TriggerContext, TrustedClaim
 
 try:  # Keep the module importable for transport-injected contract tests.
     import aiohttp
@@ -419,6 +438,24 @@ _DELIVERY_LIST_KEYS = frozenset({"mode", "actions", "preference"})
 _DELIVERY_GROUP_KEYS = _DELIVERY_LIST_KEYS | {"overrides"}
 _FALLBACK_KEYS = frozenset({"enabled", "text"})
 _CAPABILITIES_KEYS = frozenset({"required"})
+_ROUTE_KEYS = frozenset({"name", "match", "instructions", "delivery"})
+_ROUTE_MATCH_KEYS = frozenset({"kinds", "command", "audience"})
+
+PERSONA_MAX_CHARS = 2000
+"""Longest ``persona`` accepted: it replaces the opening identity line (R1)."""
+
+ROUTES_MAX = 16
+"""Most ``routes`` a configuration may declare, evaluated in order (R1)."""
+
+ROUTE_INSTRUCTIONS_MAX_CHARS = 2000
+"""Longest ``routes[].instructions`` accepted (R1)."""
+
+ROUTE_COMMAND_MAX_CHARS = 32
+"""Longest ``routes[].match.command`` accepted: one token (R1)."""
+
+ROUTE_PRIVILEGED_AUDIENCES = frozenset({"broadcaster", "moderators"})
+"""The audiences that allow a route to deliver an effect beyond the answer
+text on viewer-authored events (R1 route safety)."""
 
 #: The reserved setting the entry point hands its accepted ``limits`` block
 #: over in (``core.main.LIMITS_KEY``): the groups it carries are the values
@@ -487,6 +524,17 @@ def validate_settings(settings: Any) -> list[str]:
     the same shape, AC53). What only the discovered catalog can decide —
     whether an entry names a delivery-capable action, whether its text
     argument exists — is resolved at ``prepare``, not here.
+
+    The optional presence keys (R1) are checked on the same terms:
+    ``persona`` a non-empty text of at most :data:`PERSONA_MAX_CHARS`
+    characters, ``routes`` a list of at most :data:`ROUTES_MAX` routes, each
+    with a unique ``name``, a ``match`` whose ``kinds`` are a non-empty
+    subset of :data:`~core.contracts.EVENT_KINDS`, whose ``command`` is one
+    token of at most :data:`ROUTE_COMMAND_MAX_CHARS` characters and whose
+    ``audience`` is a known audience, ``instructions`` of at most
+    :data:`ROUTE_INSTRUCTIONS_MAX_CHARS` characters and a ``delivery`` list
+    of the shape above. The route safety rule needs the catalog and is
+    enforced at ``prepare``.
     """
 
     if not isinstance(settings, Mapping):
@@ -555,6 +603,8 @@ def validate_settings(settings: Any) -> list[str]:
     _validate_fallback(settings.get("fallback"), diagnostics)
     _validate_capabilities(settings.get("capabilities"), diagnostics)
     _validate_delivery(settings.get("delivery"), diagnostics)
+    _validate_persona(settings.get("persona"), diagnostics)
+    _validate_routes(settings.get("routes"), diagnostics)
     return diagnostics
 
 
@@ -734,6 +784,124 @@ def _validate_delivery_entry(entry: Any, prefix: str, diagnostics: list[str]) ->
     if "arguments" in entry and not isinstance(entry["arguments"], Mapping):
         diagnostics.append(
             _setting_diagnostic(f"{prefix}.arguments", "must be a mapping of arguments")
+        )
+
+
+def _validate_persona(persona: Any, diagnostics: list[str]) -> None:
+    """``persona`` (R1): absent, or a non-empty text of bounded length."""
+
+    if persona is None:
+        return
+    if not isinstance(persona, str) or not persona.strip():
+        diagnostics.append(_setting_diagnostic("persona", "must be a non-empty string"))
+    elif len(persona) > PERSONA_MAX_CHARS:
+        diagnostics.append(
+            _setting_diagnostic("persona", f"must be at most {PERSONA_MAX_CHARS} characters")
+        )
+
+
+def _validate_routes(routes: Any, diagnostics: list[str]) -> None:
+    """``routes`` (R1): absent, or an ordered list of at most :data:`ROUTES_MAX` routes.
+
+    Every route is checked, even past the cap, so one configuration reports
+    every offending field at once; names are compared after stripping, and a
+    repeated one is reported on the later route.
+    """
+
+    if routes is None:
+        return
+    if not isinstance(routes, Sequence) or isinstance(routes, (str, bytes)):
+        diagnostics.append(_setting_diagnostic("routes", "must be a list of routes"))
+        return
+    if len(routes) > ROUTES_MAX:
+        diagnostics.append(_setting_diagnostic("routes", f"must hold at most {ROUTES_MAX} routes"))
+    seen: dict[str, int] = {}
+    for index, route in enumerate(routes):
+        prefix = f"routes[{index}]"
+        if not isinstance(route, Mapping):
+            diagnostics.append(_setting_diagnostic(prefix, "must be a mapping"))
+            continue
+        _refuse_unknown_keys(route, _ROUTE_KEYS, prefix, diagnostics)
+        name = route.get("name")
+        if name is None:
+            diagnostics.append(_setting_diagnostic(f"{prefix}.name", "is required"))
+        elif not isinstance(name, str) or not name.strip():
+            diagnostics.append(_setting_diagnostic(f"{prefix}.name", "must be a non-empty string"))
+        elif name.strip() in seen:
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{prefix}.name", f"duplicates routes[{seen[name.strip()]}].name"
+                )
+            )
+        else:
+            seen[name.strip()] = index
+        _validate_route_match(route.get("match"), f"{prefix}.match", diagnostics)
+        instructions = route.get("instructions")
+        if instructions is not None:
+            if not isinstance(instructions, str) or not instructions.strip():
+                diagnostics.append(
+                    _setting_diagnostic(f"{prefix}.instructions", "must be a non-empty string")
+                )
+            elif len(instructions) > ROUTE_INSTRUCTIONS_MAX_CHARS:
+                diagnostics.append(
+                    _setting_diagnostic(
+                        f"{prefix}.instructions",
+                        f"must be at most {ROUTE_INSTRUCTIONS_MAX_CHARS} characters",
+                    )
+                )
+        delivery = route.get("delivery")
+        if delivery is not None:
+            if not isinstance(delivery, Mapping):
+                diagnostics.append(_setting_diagnostic(f"{prefix}.delivery", "must be a mapping"))
+            else:
+                _refuse_unknown_keys(
+                    delivery, _DELIVERY_LIST_KEYS, f"{prefix}.delivery", diagnostics
+                )
+                _validate_delivery_list(delivery, f"{prefix}.delivery", diagnostics)
+
+
+def _validate_route_match(match: Any, prefix: str, diagnostics: list[str]) -> None:
+    """One route's ``match``: ``kinds`` required, ``command`` and ``audience`` optional."""
+
+    if match is None:
+        diagnostics.append(_setting_diagnostic(prefix, "is required"))
+        return
+    if not isinstance(match, Mapping):
+        diagnostics.append(_setting_diagnostic(prefix, "must be a mapping"))
+        return
+    _refuse_unknown_keys(match, _ROUTE_MATCH_KEYS, prefix, diagnostics)
+    kinds = match.get("kinds")
+    if kinds is None:
+        diagnostics.append(_setting_diagnostic(f"{prefix}.kinds", "is required"))
+    elif not _is_name_list(kinds) or not kinds:
+        diagnostics.append(
+            _setting_diagnostic(f"{prefix}.kinds", "must be a non-empty list of event kinds")
+        )
+    elif not set(kinds) <= EVENT_KIND_SET:
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{prefix}.kinds",
+                f"names an unknown event kind (known: {', '.join(EVENT_KINDS)})",
+            )
+        )
+    command = match.get("command")
+    if command is not None:
+        if not isinstance(command, str) or not command or command.split() != [command]:
+            diagnostics.append(
+                _setting_diagnostic(f"{prefix}.command", "must be one token without whitespace")
+            )
+        elif len(command) > ROUTE_COMMAND_MAX_CHARS:
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{prefix}.command", f"must be at most {ROUTE_COMMAND_MAX_CHARS} characters"
+                )
+            )
+    audience = match.get("audience")
+    if audience is not None and (not isinstance(audience, str) or audience not in AUDIENCE_CLAIMS):
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{prefix}.audience", f"must be one of {', '.join(sorted(AUDIENCE_CLAIMS))}"
+            )
         )
 
 
@@ -986,6 +1154,73 @@ class _DeliveryConfig:
 
     def for_destination(self, platform: str, channel_id: str) -> _DeliveryList:
         return self.overrides.get(_destination_key(platform, channel_id), self.default)
+
+
+@dataclass(frozen=True, slots=True)
+class _Route:
+    """One configured route (R1): a match, and what it changes for its run.
+
+    ``kinds`` must hold the triggering event's kind; ``command``, when set,
+    must equal the event text's first whitespace-separated token, compared
+    case-insensitively as a whole token; ``audience``, when set, is satisfied
+    only by a provenance-tagged role claim the event carries, on the trigger
+    engine's audience vocabulary (:data:`~core.triggers.AUDIENCE_CLAIMS`),
+    never by the text. ``instructions`` are appended to the system
+    instructions of the run and ``delivery`` replaces the destination's list
+    for it; both are optional.
+    """
+
+    name: str
+    kinds: frozenset[str]
+    command: str | None
+    audience: str | None
+    instructions: str | None
+    delivery: _DeliveryList | None
+
+    @classmethod
+    def from_mapping(cls, route: Mapping[str, Any]) -> "_Route":
+        match = route["match"]
+        instructions = route.get("instructions")
+        delivery = route.get("delivery")
+        return cls(
+            name=route["name"].strip(),
+            kinds=frozenset(match["kinds"]),
+            command=match.get("command"),
+            audience=match.get("audience"),
+            instructions=None if instructions is None else instructions.strip(),
+            delivery=None if delivery is None else _DeliveryList.from_mapping(delivery),
+        )
+
+    def matches(self, message: "_Message") -> bool:
+        if message.kind not in self.kinds:
+            return False
+        if self.command is not None:
+            tokens = message.text.split(maxsplit=1)
+            if not tokens or tokens[0].casefold() != self.command.casefold():
+                return False
+        if self.audience is not None:
+            claim = AUDIENCE_CLAIMS[self.audience]
+            if claim is not None and not TriggerContext(message.claims).satisfies(claim):
+                return False
+        return True
+
+    @property
+    def viewer_reachable(self) -> bool:
+        """Whether a viewer who holds no privileged role can trigger this route.
+
+        False when the audience is ``broadcaster`` or ``moderators``, or when
+        every kind is a platform-authored notice (R1 route safety).
+        """
+
+        return self.audience not in ROUTE_PRIVILEGED_AUDIENCES and not (
+            self.kinds <= frozenset(PLATFORM_NOTICE_KINDS)
+        )
+
+
+def _route_path(name: str) -> str:
+    """The diagnostic path of a route's delivery list: ``routes["<name>"].delivery``."""
+
+    return f'routes["{name}"].{_DELIVERY_PATH}'
 
 
 def _destination_key(platform: str, channel_id: str) -> str:
@@ -1344,6 +1579,8 @@ class _Settings:
     fallback: _Fallback
     capabilities: frozenset[str]
     delivery: _DeliveryConfig
+    persona: str | None = None
+    routes: tuple[_Route, ...] = ()
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
@@ -1370,6 +1607,8 @@ class _Settings:
             ),
             capabilities=frozenset(settings["capabilities"]["required"]),
             delivery=_DeliveryConfig.from_mapping(settings["delivery"]),
+            persona=None if settings.get("persona") is None else settings["persona"].strip(),
+            routes=tuple(_Route.from_mapping(route) for route in settings.get("routes") or ()),
         )
 
 
@@ -1571,13 +1810,21 @@ def _memory_limit(value: Any, name: str, kind: str) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class _Message:
-    """A normalised chat message, read from a bus event or an admitted copy."""
+    """A normalised chat message, read from a bus event or an admitted copy.
+
+    ``kind`` is the event's ``payload.kind`` (``message`` when absent) and
+    ``claims`` the author's roles the input attested with a provenance
+    (``author.roles`` with ``author.roles_provenance``); both are read for
+    route matching only (R1).
+    """
 
     platform: str
     channel_id: str
     viewer_id: str
     message_id: str
     text: str
+    kind: str = EVENT_KIND_DEFAULT
+    claims: tuple[TrustedClaim, ...] = ()
 
     @property
     def session_key(self) -> SessionKey:
@@ -1680,6 +1927,21 @@ _ROLE_ASSISTANT = "assistant"
 _ROLE_TOOL = "tool"
 # The text that precedes the image parts of an observation in the ``user``
 # message following its tool result, naming the call the images answer.
+_SYSTEM_IDENTITY_LINE = "You are a live-stream chat companion."
+"""The opening identity line a configured ``persona`` replaces (R1)."""
+
+_SYSTEM_FIXED_LINES = (
+    "You may call the offered tools to observe before answering;"
+    " each tool result is returned to you.",
+    "Reply to the viewer's message with one short plain-text chat message.",
+    "Write the message body only: no tags, no markup, no instructions.",
+)
+"""The tool-usage and plain-text lines every system message keeps (R1)."""
+
+_SYSTEM_PROMPT = "\n".join((_SYSTEM_IDENTITY_LINE, *_SYSTEM_FIXED_LINES))
+"""The phase 2 system message, returned unchanged with no persona and no
+route instructions (R1, AC1)."""
+
 _IMAGE_MESSAGE_TEXT = "Image captured by tool call {key}:"
 # The same for the audio parts of an observation (R4).
 _AUDIO_MESSAGE_TEXT = "Audio captured by tool call {key}:"
@@ -1816,7 +2078,10 @@ class _RunState:
     the boundary that ended the loop and read once the loop has returned;
     ``audio_omitted`` counts the observations whose audio was shown to the
     model as its transcription text only, in a run whose verified
-    capabilities lack ``audio`` (R4) — once per observation.
+    capabilities lack ``audio`` (R4) — once per observation;
+    ``route_delivery`` is the delivery list of the route the run matched,
+    when that route declares one, used in place of the destination's list by
+    the terminal step and the fallback alike (R1).
     """
 
     turns: int = 0
@@ -1829,6 +2094,7 @@ class _RunState:
     fallback: str = FALLBACK_NONE
     fallback_reason: str | None = None
     audio_omitted: int = 0
+    route_delivery: tuple[_DeliveryEntry, ...] | None = None
 
     def correlation(self) -> dict[str, Any]:
         return {
@@ -2080,6 +2346,9 @@ class BrainModule:
         #: default and every override, by destination key; empty until then.
         self._delivery_default: tuple[_DeliveryEntry, ...] = ()
         self._delivery_overrides: dict[str, tuple[_DeliveryEntry, ...]] = {}
+        #: The route delivery lists resolved at ``prepare`` (R1), by route
+        #: name, for the routes that declare one; empty until then.
+        self._route_deliveries: dict[str, tuple[_DeliveryEntry, ...]] = {}
         self._memory = ConversationMemory(
             clock=runtime.clock,
             **{
@@ -2176,16 +2445,18 @@ class BrainModule:
             return
         try:
             default, overrides, ignored = self._resolve_deliveries()
+            routes = self._resolve_route_deliveries()
             self.verified_capabilities = await self._adapter.probe(self._settings.capabilities)
         except BrainModuleError as failure:
             await self._report_degraded(str(failure))
             raise
         self._delivery_default = default
         self._delivery_overrides = overrides
+        self._route_deliveries = routes
         if self._owns_scheduler:
             await self._scheduler.start()
         self._bus.subscribe(_INPUT_EVENT, self.handle_chat_message)
-        await self._publish_resolved_delivery(default, overrides, ignored)
+        await self._publish_resolved_delivery(default, overrides, ignored, routes)
         self._actions.mark_ready()
         self._prepared = True
 
@@ -2224,22 +2495,29 @@ class BrainModule:
         default: tuple[_DeliveryEntry, ...],
         overrides: Mapping[str, tuple[_DeliveryEntry, ...]],
         ignored: tuple[str, ...],
+        routes: Mapping[str, tuple[_DeliveryEntry, ...]],
     ) -> None:
         """The one ``brain.delivery.resolved`` trace of this activation (R1).
 
         Action names only — what will be invoked, in order, per list — and
-        the preference names that matched nothing. A lost trace is diagnosed
-        and changes nothing: the resolution stands whether or not it was
+        the preference names that matched nothing; the route lists, by route
+        name, only when a route declares one, so a configuration without
+        routes announces the phase 2 payload. A lost trace is diagnosed and
+        changes nothing: the resolution stands whether or not it was
         announced.
         """
 
-        payload = {
+        payload: dict[str, Any] = {
             "default": [entry.action for entry in default],
             "overrides": {
                 key: [entry.action for entry in entries] for key, entries in overrides.items()
             },
             "ignored": list(ignored),
         }
+        if routes:
+            payload["routes"] = {
+                name: [entry.action for entry in entries] for name, entries in routes.items()
+            }
         try:
             await _resolve(self._supervision.emit(TRACE_DELIVERY_RESOLVED, payload))
         except asyncio.CancelledError:
@@ -2247,12 +2525,64 @@ class BrainModule:
         except Exception:
             self._diagnose("brain delivery: resolved trace lost")
 
+    def _resolve_route_deliveries(self) -> dict[str, tuple[_DeliveryEntry, ...]]:
+        """Every route's delivery list against the discovered catalog, then its safety (R1).
+
+        Resolved in route order through :func:`_resolve_delivery`, with the
+        same diagnostics under the path ``routes["<name>"].delivery``. A
+        resolved list holding an effect entry — one that receives no answer
+        text — on a route a viewer without a privileged role can reach (see
+        :attr:`_Route.viewer_reachable`) stops startup naming the route: a
+        chat command may not move the stream unless the broadcaster or a
+        moderator sent it, or a platform notice did.
+        """
+
+        routes = [
+            (route, route.delivery) for route in self._settings.routes if route.delivery is not None
+        ]
+        if not routes:
+            return {}
+        try:
+            catalog = dict(self._actions.discovered())
+        except Exception:
+            self._diagnose("brain actions: discovered catalog unavailable")
+            raise _DeliveryResolutionError(
+                _route_path(routes[0][0].name), DELIVERY_REASON_UNKNOWN_ACTION
+            ) from None
+        resolved: dict[str, tuple[_DeliveryEntry, ...]] = {}
+        for route, delivery in routes:
+            entries = _resolve_delivery(delivery, catalog, path=_route_path(route.name))
+            effects = [entry.action for entry in entries if not entry.receives_text]
+            if effects and route.viewer_reachable:
+                raise BrainModuleError(
+                    f"module {MODULE_NAME!r}: route {route.name!r}: delivery action "
+                    f"{effects[0]!r} is an effect: the route must declare match.audience "
+                    "broadcaster or moderators, or match platform notice kinds only"
+                )
+            resolved[route.name] = entries
+        return resolved
+
     def _delivery_for(self, platform: str, channel_id: str) -> tuple[_DeliveryEntry, ...]:
         """The run's resolved list: its destination's override, else the default."""
 
         return self._delivery_overrides.get(
             _destination_key(platform, channel_id), self._delivery_default
         )
+
+    def _run_delivery(self, message: _Message, state: "_RunState") -> tuple[_DeliveryEntry, ...]:
+        """The list a run delivers through: its route's, else its destination's (R1)."""
+
+        if state.route_delivery is not None:
+            return state.route_delivery
+        return self._delivery_for(message.platform, message.channel_id)
+
+    def _route_for(self, message: _Message) -> _Route | None:
+        """The first configured route *message* matches, or ``None`` (R1)."""
+
+        for route in self._settings.routes:
+            if route.matches(message):
+                return route
+        return None
 
     async def _report_degraded(self, reason: str) -> None:
         """Report the module ``degraded`` with *reason* when the surface has it."""
@@ -2364,12 +2694,17 @@ class BrainModule:
             )
 
         key: SessionKey = run.session_key
+        # The route is matched once, from the triggering event, and holds
+        # for the whole run: its instructions and its delivery list (R1).
+        route = self._route_for(message)
         transcript = _Transcript(
-            system=self._system_prompt(),
+            system=self._system_prompt(route),
             user=_format_user_context(message),
             history=self._memory.recall(key),
         )
-        state = _RunState()
+        state = _RunState(
+            route_delivery=None if route is None else self._route_deliveries.get(route.name)
+        )
         try:
             outcome = await self._loop(run, message, key, transcript, state)
             if state.fallback_reason is not None:
@@ -2750,7 +3085,7 @@ class BrainModule:
         """
 
         run.checkpoint()
-        entries = self._delivery_for(key.platform, key.channel_id)
+        entries = self._run_delivery(message, state)
         deliveries = await self._deliver_all(
             run,
             reply,
@@ -2851,7 +3186,7 @@ class BrainModule:
         was reached.
         """
 
-        entries = self._delivery_for(message.platform, message.channel_id)
+        entries = self._run_delivery(message, state)
         deliveries = await self._fallback(
             run, entries, state, message.recipient, state.fallback_reason or ""
         )
@@ -3061,24 +3396,31 @@ class BrainModule:
             output_tokens=limit - input_tokens,
         )
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, route: _Route | None = None) -> str:
         """The instructions. The offered actions travel as tools, not as text.
 
         No ``[send:`` tag and no action listing: what the model may call is
         the request's ``tools`` list (R2), and the reply is delivered by the
         runtime, never by an encoding of the text. No action is named here,
         so a new read action needs no new wording.
+
+        With no ``persona`` and no matched route's ``instructions`` the phase
+        2 text is returned as is, the very constant (R1, AC1). A ``persona``
+        replaces the opening identity line only; the fixed lines about tools
+        and plain-text output always follow it; the matched route's
+        ``instructions`` are appended as their own paragraph.
         """
 
-        return "\n".join(
-            (
-                "You are a live-stream chat companion.",
-                "You may call the offered tools to observe before answering;"
-                " each tool result is returned to you.",
-                "Reply to the viewer's message with one short plain-text chat message.",
-                "Write the message body only: no tags, no markup, no instructions.",
-            )
+        persona = self._settings.persona
+        instructions = route.instructions if route is not None else None
+        if persona is None and instructions is None:
+            return _SYSTEM_PROMPT
+        prompt = "\n".join(
+            (_SYSTEM_IDENTITY_LINE if persona is None else persona, *_SYSTEM_FIXED_LINES)
         )
+        if instructions is not None:
+            prompt = f"{prompt}\n\n{instructions}"
+        return prompt
 
     def _catalog(self) -> Mapping[str, Any]:
         """The discovered catalog, read afresh; empty when it cannot be read."""
@@ -4199,6 +4541,10 @@ def _message_of_event(event: Any) -> _Message:
     text = payload.get("text")
     if not all(_is_text(value) for value in (platform, channel_id, message_id, text)):
         raise ValueError
+    try:
+        kind = validate_event_kind(payload.get("kind"), "payload.kind")
+    except ContractError:
+        raise ValueError from None
     author = payload.get("author")
     viewer_id = author.get("id") if isinstance(author, Mapping) else None
     if not _is_text(viewer_id):
@@ -4209,7 +4555,24 @@ def _message_of_event(event: Any) -> _Message:
         viewer_id=viewer_id,
         message_id=message_id,
         text=text,
+        kind=kind,
+        claims=_attested_claims(author),
     )
+
+
+def _attested_claims(author: Mapping[str, Any]) -> tuple[TrustedClaim, ...]:
+    """The author's roles as provenance-tagged claims; none without a provenance.
+
+    Only ``author.roles`` (a list of role names) together with a non-empty
+    ``author.roles_provenance`` attests anything: a role list with no
+    provenance, like anything in the message text, satisfies no audience.
+    """
+
+    roles = author.get("roles")
+    provenance = author.get("roles_provenance")
+    if not _is_text(provenance) or not isinstance(roles, (list, tuple)):
+        return ()
+    return tuple(TrustedClaim(role, provenance=provenance) for role in roles if _is_text(role))
 
 
 def _message_of_work(work: Any) -> _Message:
