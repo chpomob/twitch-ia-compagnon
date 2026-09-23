@@ -1,6 +1,7 @@
 """The ``viewer_memory`` store and module (phase 3 R3; AC13–AC18, AC19 chat half),
-and its ``memory.recall`` / ``memory.record`` actions through the executor
-(phase 3 R4; AC16 recall half, AC22 module half).
+its offline command (AC19 CLI half), and its ``memory.recall`` /
+``memory.record`` actions through the executor (phase 3 R4; AC16 recall half,
+AC22 module half).
 
 The store API is driven directly on an injected wall clock; the module goes
 through a :func:`~conftest.runtime_context` (or the loader and the phase
@@ -17,6 +18,9 @@ import json
 import os
 import re
 import shutil
+import socket
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +42,7 @@ from core.runtime import RuntimeContext
 from core.triggers import TriggerRegistry
 from fixtures.modules import fakeplatform
 from modules import viewer_memory
+from modules.viewer_memory.__main__ import main as memory_command
 from modules.viewer_memory import (
     DEFAULT_RETENTION_DAYS,
     FACT_MEMORY_REMOVED,
@@ -1158,3 +1163,158 @@ async def test_the_actions_are_bound_ready_and_withdrawn_at_close(tmp_path: Path
     assert {RECALL_ACTION, RECORD_ACTION} <= set(registry.registered_ready())
     await h.handle.close()
     assert not {RECALL_ACTION, RECORD_ACTION} & set(registry.registered_ready())
+
+
+# --------------------------------------------------------------------------- #
+# The offline command (R3; AC19 CLI half)
+# --------------------------------------------------------------------------- #
+
+
+def command_config(tmp_path: Path, directory: Any, **settings: Any) -> Path:
+    """A profile whose other modules hold unresolved ``${…}`` secrets."""
+
+    config = {
+        "enabled_modules": ["twitch", "viewer_memory"],
+        "modules": {
+            "twitch": {"client_secret": "${TWITCH_CLIENT_SECRET}"},
+            "viewer_memory": {"directory": str(directory), "limits": {}, **settings},
+        },
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def no_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the offline command opened a socket")
+
+    monkeypatch.setattr(socket, "socket", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+
+
+def three_viewers_and_notes(directory: Path) -> tuple[list[Path], Path]:
+    paths = [
+        write_memory(directory, ("twitch", "c1", "v1")),
+        write_memory(directory, ("twitch", "c1", "v2")),
+        write_memory(directory, ("kick", "c1", "v1")),
+    ]
+    notes = directory / "notes.txt"
+    notes.write_text("keep me", encoding="utf-8")
+    return paths, notes
+
+
+def test_ac19_cli_forget_removes_exactly_the_one_hashed_file(
+    tmp_path: Path, no_socket: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory, json_names = memory_directory(tmp_path)
+    paths, notes = three_viewers_and_notes(directory)
+    config = command_config(tmp_path, directory)
+    argv = ["forget", "--config", str(config), "--platform", "twitch", "--channel", "c1",
+            "--viewer", "v1"]
+
+    assert memory_command(argv) == 0
+    assert capsys.readouterr().out == "removed=1\n"
+    assert json_names() == sorted(path.name for path in paths[1:])
+    assert notes.read_text(encoding="utf-8") == "keep me"
+
+    assert memory_command(argv) == 0
+    assert capsys.readouterr().out == "removed=0\n"
+    assert len(json_names()) == 2
+
+
+def test_ac19_cli_forget_all_keeps_unrelated_files(
+    tmp_path: Path, no_socket: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory, json_names = memory_directory(tmp_path)
+    _, notes = three_viewers_and_notes(directory)
+    unrelated = directory / "settings.json"
+    unrelated.write_text("{}", encoding="utf-8")
+    config = command_config(tmp_path, directory)
+
+    assert memory_command(["forget-all", "--config", str(config)]) == 0
+    assert capsys.readouterr().out == "removed=3\n"
+    assert [name for name in json_names() if NAME_PATTERN.match(name)] == []
+    assert json_names() == ["settings.json"]
+    assert notes.read_text(encoding="utf-8") == "keep me"
+
+
+def test_ac19_cli_stats_prints_the_count_and_bytes(
+    tmp_path: Path, no_socket: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory, _ = memory_directory(tmp_path)
+    paths, _ = three_viewers_and_notes(directory)
+    config = command_config(tmp_path, directory)
+    expected = sum(path.stat().st_size for path in paths)
+
+    assert memory_command(["stats", "--config", str(config)]) == 0
+    assert capsys.readouterr().out == f"files=3 bytes={expected}\n"
+    # An absent directory has no memory file; nothing is created.
+    absent = command_config(tmp_path, tmp_path / "absent")
+    assert memory_command(["stats", "--config", str(absent)]) == 0
+    assert capsys.readouterr().out == "files=0 bytes=0\n"
+    assert not (tmp_path / "absent").exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,  # no file
+        "modules: [unclosed",  # not YAML
+        "- a list",  # not a mapping
+        "modules:\n  twitch: {}\n",  # no viewer_memory subtree
+        "modules:\n  viewer_memory:\n    retention_days: 30\n",  # no directory
+        "modules:\n  viewer_memory:\n    directory: d\n    max_files: 0\n",
+        "modules:\n  viewer_memory:\n    directory: d\n    max_file_bytes: 4096\n"
+        "    max_total_bytes: 1024\n",
+        "modules:\n  viewer_memory:\n    directory: d\n    colour: blue\n",
+        "modules:\n  viewer_memory:\n    directory: ${MEMORY_DIR}\n",
+    ],
+)
+def test_ac19_cli_an_invalid_configuration_exits_2(
+    tmp_path: Path, no_socket: None, capsys: pytest.CaptureFixture[str], content: str | None
+) -> None:
+    directory, json_names = memory_directory(tmp_path)
+    paths, _ = three_viewers_and_notes(directory)
+    config = tmp_path / "config.yaml"
+    if content is not None:
+        config.write_text(content, encoding="utf-8")
+
+    for argv in (["stats"], ["forget-all"]):
+        assert memory_command([*argv, "--config", str(config)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "viewer_memory" in captured.err
+    assert "MEMORY_DIR" not in captured.err
+    assert len(json_names()) == len(paths)
+
+
+def test_ac19_cli_the_module_entry_runs_without_a_network_client(tmp_path: Path) -> None:
+    """``python -m modules.viewer_memory`` runs in a fresh interpreter; its
+    import trace shows no ``aiohttp``, and no ``${…}`` secret is needed."""
+
+    directory, _ = memory_directory(tmp_path)
+    paths, _ = three_viewers_and_notes(directory)
+    config = command_config(tmp_path, directory)
+    environment = {
+        key: value for key, value in os.environ.items() if key != "TWITCH_CLIENT_SECRET"
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-X", "importtime", "-m", "modules.viewer_memory", "stats",
+         "--config", str(config)],
+        cwd=REPOSITORY,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    expected = sum(path.stat().st_size for path in paths)
+    assert completed.stdout == f"files=3 bytes={expected}\n"
+    imported = {line.rsplit("|", 1)[-1].strip() for line in completed.stderr.splitlines()}
+    assert not {name for name in imported if name.split(".")[0] == "aiohttp"}
+    assert "yaml" in imported
