@@ -53,6 +53,30 @@ attested ``author.id`` outside the reserved ``:`` namespace — deletes that
 author's file for the event's platform and channel (``erased``). The module
 consumes the event itself, so this happens whatever the trigger decides.
 
+**Actions** (R4). ``memory.recall`` (read) and ``memory.record`` (write, not
+model-proposable, no delivery) are bound at ``prepare`` over the declared
+``*/*/memory`` destinations. Their viewer is the run's session viewer: the
+call's ``conversation_id`` — the brain passes ``SessionKey.serialize()`` — is
+parsed back into ``(platform, channel_id, viewer_id)`` by
+:func:`parse_conversation_id`. An unparsable id, a viewer in the reserved
+``:`` namespace (``system:watch``) or a key naming another platform or
+channel than the destination ends ``error no_viewer``. No argument names a
+viewer: ``memory.recall`` takes none and ``memory.record`` only the exchange
+data, both with ``additionalProperties: false``, so the executor refuses an
+identity argument before the provider runs.
+
+A recall of an absent or expired record is ``{known: false}``. Otherwise it
+is ``known``, ``display_name``, ``first_seen``, ``last_seen``,
+``interactions``, the notes newest first and ``truncated``, fitted by
+:func:`fit_recall` to ``max_recall_bytes`` as the UTF-8 bytes of the exact
+serialization returned as the observation's text part — the size the
+executor's ``observation_size`` counts. Notes are left out oldest first,
+then ``display_name`` is shortened by whole characters from its end;
+``truncated`` is true when anything was left out. A recall that returns a
+record is a use (``use_count`` + 1, ``last_used`` now). A record creates or
+updates the file through :meth:`MemoryStore.record`, with its bounds and
+eviction.
+
 **Facts.** Every eviction pass, expiry pass, corrupt pass and erasure
 publishes one ``memory.removed`` fact carrying ``reason`` and ``count`` only —
 no viewer identifier, no file name.
@@ -78,10 +102,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core.contracts import EVENT_KIND_DEFAULT
+import yaml
+
+from core.contracts import (
+    EVENT_KIND_DEFAULT,
+    PART_TYPE_TEXT,
+    ActionObservation,
+    ActionSpec,
+    ContractError,
+    Destination,
+    SessionKey,
+)
 
 
 MODULE_NAME = "viewer_memory"
+MANIFEST_PATH = Path(__file__).with_name("module.yaml")
+
+#: The two actions this module provides (R4), and the provider serving both.
+RECALL_ACTION = "memory.recall"
+RECORD_ACTION = "memory.record"
+PROVIDER_NAME = "viewer_memory"
+MEMORY_SCOPE = "memory"
+
+#: The session has no platform viewer (a watch run), or none on this channel.
+ERROR_NO_VIEWER = "no_viewer"
+ERROR_INVALID_ARGUMENTS = "invalid_arguments"
+ERROR_STORE_FAILED = "store_failed"
+_ERROR_PROVIDER_CLOSED = "provider_closed"
 
 #: The fact every removal pass publishes.
 FACT_MEMORY_REMOVED = "memory.removed"
@@ -113,6 +160,8 @@ MAX_NOTES_BOUNDS = (1, 100)
 DEFAULT_SWEEP_INTERVAL_SECONDS = 3600
 SWEEP_INTERVAL_BOUNDS = (60, 86400)
 DEFAULT_FORGET_COMMAND = "!forgetme"
+DEFAULT_MAX_RECALL_BYTES = 1024
+MAX_RECALL_BYTES_BOUNDS = (512, 8192)
 
 _SECONDS_PER_DAY = 86400
 _TEMPORARY_PREFIX = ".viewer-memory-"
@@ -148,6 +197,7 @@ _SETTING_MAX_TOTAL_BYTES = "max_total_bytes"
 _SETTING_MAX_NOTES = "max_notes"
 _SETTING_SWEEP_INTERVAL = "sweep_interval_seconds"
 _SETTING_FORGET_COMMAND = "forget_command"
+_SETTING_MAX_RECALL_BYTES = "max_recall_bytes"
 _SETTINGS = frozenset(
     {
         _SETTING_DIRECTORY,
@@ -158,6 +208,7 @@ _SETTINGS = frozenset(
         _SETTING_MAX_NOTES,
         _SETTING_SWEEP_INTERVAL,
         _SETTING_FORGET_COMMAND,
+        _SETTING_MAX_RECALL_BYTES,
     }
 )
 _INTEGER_SETTINGS = (
@@ -167,6 +218,7 @@ _INTEGER_SETTINGS = (
     (_SETTING_MAX_TOTAL_BYTES, (MAX_FILE_BYTES_BOUNDS[0], MAX_TOTAL_BYTES_CEILING)),
     (_SETTING_MAX_NOTES, MAX_NOTES_BOUNDS),
     (_SETTING_SWEEP_INTERVAL, SWEEP_INTERVAL_BOUNDS),
+    (_SETTING_MAX_RECALL_BYTES, MAX_RECALL_BYTES_BOUNDS),
 )
 
 _SEAM_SLEEPER = "_sleeper"
@@ -279,6 +331,7 @@ class MemorySettings:
     max_notes: int = DEFAULT_MAX_NOTES
     sweep_interval_seconds: int = DEFAULT_SWEEP_INTERVAL_SECONDS
     forget_command: str = DEFAULT_FORGET_COMMAND
+    max_recall_bytes: int = DEFAULT_MAX_RECALL_BYTES
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "MemorySettings":
@@ -299,6 +352,9 @@ class MemorySettings:
                 settings.get(_SETTING_SWEEP_INTERVAL, DEFAULT_SWEEP_INTERVAL_SECONDS)
             ),
             forget_command=str(settings.get(_SETTING_FORGET_COMMAND, DEFAULT_FORGET_COMMAND)),
+            max_recall_bytes=int(
+                settings.get(_SETTING_MAX_RECALL_BYTES, DEFAULT_MAX_RECALL_BYTES)
+            ),
         )
 
     @property
@@ -602,6 +658,21 @@ class MemoryStore:
         removed = self._write(name, record, raw)
         return record, removed
 
+    def use(self, platform: str, channel_id: str, viewer_id: str) -> dict[str, int]:
+        """Count one use of the viewer's retained record: ``use_count`` + 1,
+        ``last_used`` now. Nothing else changes; an absent or expired record
+        is left alone. Returns the removals the write needed."""
+
+        existing = self.read(platform, channel_id, viewer_id)
+        if existing is None:
+            return {}
+        record = dict(existing)
+        record["notes"] = list(existing["notes"])
+        record["use_count"] += 1
+        record["last_used"] = format_timestamp(self._wall_clock())
+        raw = self._fit(record)
+        return self._write(memory_file_name(platform, channel_id, viewer_id), record, raw)
+
     def forget(self, platform: str, channel_id: str, viewer_id: str) -> int:
         """Delete the viewer's file; the number of files deleted (0 or 1)."""
 
@@ -751,8 +822,23 @@ class MemoryStore:
 # --------------------------------------------------------------------------- #
 
 
+class _MemoryActionProvider:
+    """The provider bound to both memory actions: hands each call to the module."""
+
+    __slots__ = ("_module",)
+
+    name = PROVIDER_NAME
+
+    def __init__(self, module: "ViewerMemoryModule") -> None:
+        self._module = module
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        return await self._module._invoke(invocation)
+
+
 class ViewerMemoryModule:
-    """The v2 handle: scan at ``prepare``, sweep, erase on the chat command."""
+    """The v2 handle: scan and bind at ``prepare``, sweep, recall and record,
+    erase on the chat command."""
 
     def __init__(
         self,
@@ -763,6 +849,8 @@ class ViewerMemoryModule:
         wall_clock: WallClock,
     ) -> None:
         self._bus = context.bus
+        self._actions = context.actions
+        self._provider = _MemoryActionProvider(self)
         self._supervision = getattr(context, "supervision", None)
         self._tasks = getattr(context, "tasks", None)
         self._settings = settings
@@ -802,8 +890,18 @@ class ViewerMemoryModule:
                 f"{MODULE_NAME} prepare: the memory directory could not be scanned"
             ) from None
         await self._publish_removed(removed)
+        try:
+            for action_name in (RECALL_ACTION, RECORD_ACTION):
+                self._actions.register(
+                    _declared_spec(action_name), self._provider, provider_name=PROVIDER_NAME
+                )
+        except ViewerMemoryError:
+            raise
+        except Exception:
+            raise ViewerMemoryError(f"{MODULE_NAME} prepare: action binding failed") from None
         self._bus.subscribe(_CHAT_EVENT, self.handle_chat_message)
         self._prepared = True
+        self._actions.mark_ready()
 
     async def start_inputs(self) -> None:
         """After the readiness barrier: start the sweep, a supervised task."""
@@ -825,6 +923,8 @@ class ViewerMemoryModule:
             return
         self._closed = True
         self._stopping = True
+        if self._prepared:
+            self._actions.mark_not_ready()
         await self._stop_sweep()
 
     async def _stop_sweep(self) -> None:
@@ -886,6 +986,92 @@ class ViewerMemoryModule:
         count = self._store.forget(platform, channel_id, viewer_id)
         await self._publish_removed({REASON_ERASED: count} if count else {})
         return count
+
+    # -- the actions (R4) ----------------------------------------------------- #
+
+    async def _invoke(self, invocation: Any) -> ActionObservation:
+        """Serve one ``memory.recall`` or ``memory.record`` call.
+
+        The executor has already checked the arguments against the declared
+        schema, so no identity argument reaches here.
+        """
+
+        call = invocation.call
+        destination = call.destination
+        action_name = call.action_name
+        provenance = {
+            "provider": PROVIDER_NAME,
+            "platform": destination.platform,
+            "channel_id": destination.channel_id,
+            "route": action_name,
+        }
+        if self._closed or not self._prepared:
+            return _failure(provenance, _ERROR_PROVIDER_CLOSED, "the memory store is closed")
+        key = parse_conversation_id(call.conversation_id)
+        if key is None or key[:2] != (destination.platform, destination.channel_id):
+            return _failure(
+                provenance, ERROR_NO_VIEWER, "the session has no platform viewer on this channel"
+            )
+        if action_name == RECALL_ACTION:
+            return await self._recall(key, provenance)
+        return await self._record(key, call.arguments, provenance)
+
+    async def _recall(self, key: MemoryKey, provenance: Mapping[str, Any]) -> ActionObservation:
+        try:
+            stored = self._store.read(*key)
+        except OSError:
+            return _failure(provenance, ERROR_STORE_FAILED, "the memory could not be read")
+        if stored is None:
+            result: dict[str, Any] = {"known": False}
+            text = _render(result)
+        else:
+            result, text = fit_recall(stored, self._settings.max_recall_bytes)
+            # A recall that returns a record is a use; a failed use loses the
+            # count, never the answer.
+            try:
+                removed = self._store.use(*key)
+            except MemoryStoreError as error:
+                removed = error.removed
+                self._diagnose("use: not recorded")
+            except OSError:
+                removed = {}
+                self._diagnose("use: not recorded")
+            await self._publish_removed(removed)
+        return ActionObservation(
+            status="success",
+            provenance=provenance,
+            result=result,
+            parts=({"type": PART_TYPE_TEXT, "text": text},),
+        )
+
+    async def _record(
+        self, key: MemoryKey, arguments: Mapping[str, Any], provenance: Mapping[str, Any]
+    ) -> ActionObservation:
+        # The schema subset has no length keyword: the text bounds are here.
+        for field_name in ("viewer_text", "reply_text"):
+            value = arguments.get(field_name)
+            if value is not None and len(value) > NOTE_TEXT_MAX_CHARS:
+                return _failure(
+                    provenance,
+                    ERROR_INVALID_ARGUMENTS,
+                    f"{field_name} must be at most {NOTE_TEXT_MAX_CHARS} characters",
+                )
+        note = {
+            name: arguments[name]
+            for name in ("viewer_text", "reply_text", "delivery")
+            if name in arguments
+        }
+        try:
+            record = await self.record(
+                *key, display_name=arguments.get("display_name"), note=note
+            )
+        except (MemoryStoreError, OSError):
+            return _failure(provenance, ERROR_STORE_FAILED, "the memory could not be written")
+        return ActionObservation(
+            status="success",
+            provenance=provenance,
+            result={"interactions": record["interactions"], "notes": len(record["notes"])},
+        )
 
     # -- the erasure command -------------------------------------------------- #
 
@@ -962,6 +1148,146 @@ def _forget_key(event: Any, command: str) -> MemoryKey | None:
 
 
 # --------------------------------------------------------------------------- #
+# The session viewer and the recall observation
+# --------------------------------------------------------------------------- #
+
+
+def parse_conversation_id(conversation_id: Any) -> MemoryKey | None:
+    """The platform viewer of a ``SessionKey.serialize()`` string, or ``None``.
+
+    The inverse of the length-prefixed ``<n>:<platform>|<n>:<channel>|<n>:
+    <viewer>`` form; only the canonical serialization of a valid key is
+    accepted. ``None`` too for a viewer in the reserved ``:`` namespace
+    (``system:watch``): no platform author identifier contains it.
+    """
+
+    if not isinstance(conversation_id, str):
+        return None
+    parts: list[str] = []
+    position = 0
+    while position < len(conversation_id) and len(parts) < 3:
+        separator = conversation_id.find(":", position)
+        digits = conversation_id[position:separator] if separator >= 0 else ""
+        if not digits.isascii() or not digits.isdigit():
+            return None
+        start = separator + 1
+        end = start + int(digits)
+        if end > len(conversation_id):
+            return None
+        parts.append(conversation_id[start:end])
+        position = end + 1
+    if len(parts) != 3:
+        return None
+    try:
+        key = SessionKey(*parts)
+    except ContractError:
+        return None
+    if key.serialize() != conversation_id:
+        return None
+    if _RESERVED_SEPARATOR in key.viewer_id:
+        return None
+    return key.platform, key.channel_id, key.viewer_id
+
+
+def _render(result: Mapping[str, Any]) -> str:
+    """The observation text of a recall: the compact JSON of its result."""
+
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def fit_recall(record: Mapping[str, Any], limit: int) -> tuple[dict[str, Any], str]:
+    """The recall result of *record* within *limit* UTF-8 bytes, and its text.
+
+    The metadata is always kept; the notes, newest first, are left out
+    oldest first, then ``display_name`` is shortened by whole characters
+    from its end. ``truncated`` says whether anything was left out. The
+    size is that of the returned text, exactly what the observation carries.
+    """
+
+    notes = [dict(note) for note in reversed(record["notes"])]
+    result: dict[str, Any] = {
+        "known": True,
+        "display_name": record["display_name"],
+        "first_seen": record["first_seen"],
+        "last_seen": record["last_seen"],
+        "interactions": record["interactions"],
+        "notes": notes,
+        "truncated": False,
+    }
+
+    def size() -> int:
+        return len(_render(result).encode("utf-8"))
+
+    if size() > limit:
+        result["truncated"] = True
+        while notes and size() > limit:
+            notes.pop()
+        name = result["display_name"]
+        if size() > limit and name:
+            # Shorten by whole characters: the longest prefix that fits.
+            low, high = 0, len(name)
+            while low < high:
+                middle = (low + high + 1) // 2
+                result["display_name"] = name[:middle]
+                if size() <= limit:
+                    low = middle
+                else:
+                    high = middle - 1
+            result["display_name"] = name[:low]
+    return result, _render(result)
+
+
+def _failure(provenance: Mapping[str, Any], code: str, message: str) -> ActionObservation:
+    return ActionObservation(
+        status="error",
+        provenance=provenance,
+        error={"code": code, "message": message, "retryable": False},
+    )
+
+
+def _declared_spec(action_name: str) -> ActionSpec:
+    """Build *action_name*'s contract from the colocated manifest.
+
+    The spec registered at ``prepare`` must equal the one the loader declared
+    at discovery, field for field: reading the same file keeps the two from
+    drifting, and the registry refuses a redeclaration that differs.
+    """
+
+    try:
+        manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in manifest["actions"]
+            if isinstance(item, Mapping) and item.get("name") == action_name
+        )
+        return ActionSpec(
+            name=entry["name"],
+            version=entry["version"],
+            description=entry["description"],
+            argument_schema=entry["argument_schema"],
+            result_schema=entry["result_schema"],
+            nature=entry["nature"],
+            required_permissions=tuple(entry.get("required_permissions", ())),
+            supported_destinations=tuple(
+                Destination(
+                    platform=item.get("platform"),
+                    channel_id=item.get("channel_id"),
+                    scope=item.get("scope"),
+                )
+                for item in entry["supported_destinations"]
+            ),
+            timeout_seconds=entry["timeout_seconds"],
+            idempotency=entry["idempotency"],
+            delivery=entry.get("delivery"),
+            model_proposable=entry.get("model_proposable", False),
+        )
+    except Exception:
+        raise ViewerMemoryError(
+            f"{MODULE_NAME} prepare: manifest declaration of {action_name!r} is invalid"
+        ) from None
+
+
+# --------------------------------------------------------------------------- #
 # Activation
 # --------------------------------------------------------------------------- #
 
@@ -972,8 +1298,14 @@ async def activate(context: Any, settings: Mapping[str, Any], catalog: Any) -> V
     del catalog  # Nothing is declared from the catalog.
     bus = getattr(context, "bus", None)
     tasks = getattr(context, "tasks", None)
-    if not callable(getattr(bus, "subscribe", None)) or not callable(
-        getattr(tasks, "spawn", None)
+    actions = getattr(context, "actions", None)
+    if (
+        not callable(getattr(bus, "subscribe", None))
+        or not callable(getattr(tasks, "spawn", None))
+        or not all(
+            callable(getattr(actions, method, None))
+            for method in ("register", "mark_ready", "mark_not_ready")
+        )
     ):
         raise ViewerMemoryError(f"{MODULE_NAME} activation: runtime context is invalid")
     if not isinstance(settings, Mapping):
@@ -989,6 +1321,7 @@ async def activate(context: Any, settings: Mapping[str, Any], catalog: Any) -> V
 
 __all__ = [
     "DEFAULT_FORGET_COMMAND",
+    "DEFAULT_MAX_RECALL_BYTES",
     "DEFAULT_MAX_FILE_BYTES",
     "DEFAULT_MAX_FILES",
     "DEFAULT_MAX_NOTES",
@@ -997,11 +1330,16 @@ __all__ = [
     "DEFAULT_SWEEP_INTERVAL_SECONDS",
     "DELIVERY_VALUES",
     "DISPLAY_NAME_MAX_CHARS",
+    "ERROR_NO_VIEWER",
     "FACT_MEMORY_REMOVED",
     "MEMORY_FILE_PATTERN",
+    "MANIFEST_PATH",
     "MEMORY_FORMAT",
     "MODULE_NAME",
     "NOTE_TEXT_MAX_CHARS",
+    "PROVIDER_NAME",
+    "RECALL_ACTION",
+    "RECORD_ACTION",
     "REASON_CORRUPT",
     "REASON_ERASED",
     "REASON_EVICTED",
@@ -1013,8 +1351,10 @@ __all__ = [
     "ViewerMemoryError",
     "ViewerMemoryModule",
     "activate",
+    "fit_recall",
     "format_timestamp",
     "memory_file_name",
+    "parse_conversation_id",
     "parse_timestamp",
     "validate_settings",
 ]

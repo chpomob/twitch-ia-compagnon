@@ -363,8 +363,8 @@ DECLARATION_KEYS = {
     "audio_input": {"actions", "credentials"},
     "stream_control": {"actions", "credentials"},
     "clips": {"actions"},
-    # Phase 3 R3 (plan P10): the store declares no action yet (P11 does).
-    "viewer_memory": set(),
+    # Phase 3 R4 (plan P11): the store declares its recall and record.
+    "viewer_memory": {"actions"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -376,6 +376,7 @@ DECLARED_ACTIONS = {
     "audio_output": {"audio.speak", "audio.play"},
     "stream_control": {"stream.scene.set", "stream.poll.create"},
     "clips": {"stream.clip.create"},
+    "viewer_memory": {"memory.recall", "memory.record"},
 }
 
 #: The credentials each manifest declares, by dotted setting path (R8).
@@ -516,8 +517,10 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     ``twitch`` (allowlisted, plan decision 11); phase 3's R2 adds the
     ``clips`` manifest and its ``stream.clip.create`` (allowlisted, running
     value of plan step P9: 12 manifests, 10 action names); phase 3's R3 adds
-    the ``viewer_memory`` manifest with no action yet (allowlisted, running
-    value of plan step P10: 13 manifests, 10 action names).
+    the ``viewer_memory`` manifest (allowlisted, running value of plan step
+    P10: 13 manifests, 10 action names); phase 3's R4 adds its
+    ``memory.recall`` and ``memory.record`` (allowlisted, running value of
+    plan step P11: 13 manifests, 12 action names).
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -581,12 +584,17 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     for module_name in ("proxy", "agent_link"):
         assert "actions" not in manifests[module_name]
     declared = set().union(*DECLARED_ACTIONS.values())
-    # Phase 3 R2 (plan P9): `clips` is shipped and enabled by no phase 2
-    # profile, so the catalog is the PC profile's set plus its one action.
-    assert declared == PROVIDED_ACTIONS["pc"] | {"stream.clip.create"}
-    assert len(declared) == 10
+    # Phase 3 R2 (plan P9) and R4 (plan P11): `clips` and `viewer_memory`
+    # are shipped and enabled by no phase 2 profile, so the catalog is the PC
+    # profile's set plus their actions.
+    assert declared == PROVIDED_ACTIONS["pc"] | {
+        "stream.clip.create",
+        "memory.recall",
+        "memory.record",
+    }
+    assert len(declared) == 12
     # The catalog's actions are declared once each, by one manifest.
-    assert sum(len(names) for names in DECLARED_ACTIONS.values()) == 10
+    assert sum(len(names) for names in DECLARED_ACTIONS.values()) == 12
 
 
 @pytest.mark.parametrize("profile", sorted(PROFILES))
@@ -1482,8 +1490,10 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
     with 1 send; its registered-ready view is exactly {``chat.read``,
     ``users.read``, ``screen.capture``, ``chat.write``} and the brain offers
     no phase 2 action, while the catalog of discovered manifests declares
-    the 10 actions — phase 3's R2 adds ``stream.clip.create`` to the 9 of
-    phase 2 (allowlisted, running value of plan step P9)."""
+    the 12 actions — phase 3's R2 adds ``stream.clip.create`` to the 9 of
+    phase 2 (allowlisted, running value of plan step P9) and R4 adds
+    ``memory.recall`` and ``memory.record`` (running value of plan step
+    P11)."""
 
     path = _chat_only_profile(tmp_path)
     environ = _phase1_environ(path)
@@ -1502,8 +1512,12 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
         assert set(started.registry.registered_ready()) == PHASE1_ACTIONS
         assert set(started.registry.discovered()) == PHASE1_ACTIONS
         catalog = started.catalog_actions()
-        assert len(catalog) == 10
-        assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS | {"stream.clip.create"}
+        assert len(catalog) == 12
+        assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS | {
+            "stream.clip.create",
+            "memory.recall",
+            "memory.record",
+        }
 
         completed = await started.chat_scenario()
         _assert_the_chat_scenario_ran(started, completed)

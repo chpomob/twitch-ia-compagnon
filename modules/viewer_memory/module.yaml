@@ -4,7 +4,9 @@
 # activation. It declares shapes only: no grant lives here. The module keeps
 # one small JSON file per `(platform, channel_id, viewer_id)` in a configured
 # directory, bounded in count, bytes, notes and age. No platform name appears
-# here. The recall and record actions are declared by a later step.
+# here. It provides `memory.recall` and `memory.record` (R4): the viewer of
+# both is the run's session viewer, read from the call's `conversation_id`,
+# never an argument.
 
 name: viewer_memory
 manifest_version: 2
@@ -79,6 +81,14 @@ settings_schema:
       minimum: 60
       maximum: 86400
       description: How often expired records are swept. Default 3600.
+    max_recall_bytes:
+      type: integer
+      minimum: 512
+      maximum: 8192
+      description: >-
+        The most UTF-8 bytes a recall observation serializes to; notes are
+        left out oldest first, then the display name is shortened, to fit.
+        Default 1024.
     forget_command:
       type: string
       description: >-
@@ -93,3 +103,123 @@ settings_schema:
   required:
     - directory
 settings_validator: validate_settings
+
+# The viewer of both actions is the session's, from the call's
+# `conversation_id`; no argument names a viewer, platform or channel, so an
+# identity argument is refused as invalid before the provider runs. A
+# session without a platform viewer (a reserved `:` identity, as a watch
+# run's) ends `error no_viewer`.
+actions:
+  - name: memory.recall
+    version: 1
+    description: >-
+      Recall what is remembered of the viewer of this conversation: whether
+      they are known, their display name, when they were first and last seen,
+      how many exchanges they had, and the most recent notes first.
+    # No arguments: the session names the viewer.
+    argument_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        known:
+          type: boolean
+        display_name:
+          type: string
+        first_seen:
+          type: string
+          description: UTC, ISO 8601 with microseconds.
+        last_seen:
+          type: string
+          description: UTC, ISO 8601 with microseconds.
+        interactions:
+          type: integer
+        notes:
+          type: array
+          description: The retained notes, the most recent first.
+          items:
+            type: object
+            properties:
+              at:
+                type: string
+              viewer_text:
+                type: string
+              reply_text:
+                type: string
+              delivery:
+                type: string
+                enum:
+                  - confirmed
+                  - unconfirmed
+                  - none
+            required:
+              - at
+              - viewer_text
+              - delivery
+            additionalProperties: false
+        truncated:
+          type: boolean
+          description: True when a note or part of the display name was left out.
+      required:
+        - known
+      additionalProperties: false
+    nature: read
+    required_permissions:
+      - memory.recall
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: memory
+    timeout_seconds: 5
+    idempotency: natural
+  - name: memory.record
+    version: 1
+    description: >-
+      Record one exchange with the viewer of this conversation. Called by the
+      runtime after the delivery, never proposed by the model.
+    # The exchange data only: no viewer, platform or channel property.
+    argument_schema:
+      type: object
+      properties:
+        viewer_text:
+          type: string
+          description: The triggering text, at most 200 characters.
+        reply_text:
+          type: string
+          description: The delivered text, at most 200 characters.
+        delivery:
+          type: string
+          enum:
+            - confirmed
+            - unconfirmed
+            - none
+        display_name:
+          type: string
+          description: The viewer's display name; stored cut to 64 characters.
+      required:
+        - viewer_text
+        - delivery
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        interactions:
+          type: integer
+        notes:
+          type: integer
+          description: The notes the file keeps after this record.
+      required:
+        - interactions
+        - notes
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - memory.record
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: memory
+    timeout_seconds: 5
+    idempotency: none

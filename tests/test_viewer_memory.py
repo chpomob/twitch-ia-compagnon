@@ -1,4 +1,6 @@
-"""The ``viewer_memory`` store and module (phase 3 R3; AC13–AC18, AC19 chat half).
+"""The ``viewer_memory`` store and module (phase 3 R3; AC13–AC18, AC19 chat half),
+and its ``memory.recall`` / ``memory.record`` actions through the executor
+(phase 3 R4; AC16 recall half, AC22 module half).
 
 The store API is driven directly on an injected wall clock; the module goes
 through a :func:`~conftest.runtime_context` (or the loader and the phase
@@ -28,6 +30,8 @@ from conftest import (
     settle,
     trace_texts,
 )
+from core.actions import AuthorizationRule
+from core.contracts import ActionCall, ActionObservation, Destination, SessionKey, observation_size
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from core.runtime import RuntimeContext
@@ -40,6 +44,8 @@ from modules.viewer_memory import (
     MemorySettings,
     MemoryStore,
     MemoryStoreError,
+    RECALL_ACTION,
+    RECORD_ACTION,
     ViewerMemoryError,
     ViewerMemoryModule,
     activate,
@@ -797,3 +803,358 @@ async def test_the_sweep_runs_as_a_supervised_task_until_close(tmp_path: Path) -
     await handle.start_inputs()
     assert "viewer_memory" not in list(runtime.tasks.owners())
     await handle.close()
+
+
+# -- R4: memory.recall and memory.record through the executor -------------- #
+
+
+MEMORY_CHANNEL = "chan-m"
+MEMORY_DESTINATION = Destination("fake", MEMORY_CHANNEL, "memory")
+VIEWER = "v1"
+METADATA_KEYS = {"known", "display_name", "first_seen", "last_seen", "interactions"}
+
+
+class MemoryHarness:
+    """The module prepared on a runtime whose executor the test drives, with
+    both memory actions granted (default deny otherwise)."""
+
+    def __init__(self, runtime: RuntimeContext, handle: ViewerMemoryModule, clock: ManualClock) -> None:
+        self.runtime = runtime
+        self.handle = handle
+        self.clock = clock
+        self._calls = 0
+
+    async def invoke(
+        self,
+        action_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        conversation_id: str | None = None,
+    ) -> ActionObservation:
+        self._calls += 1
+        if conversation_id is None:
+            conversation_id = SessionKey("fake", MEMORY_CHANNEL, VIEWER).serialize()
+        call = ActionCall(
+            action_name=action_name,
+            action_version=1,
+            arguments=arguments or {},
+            conversation_id=conversation_id,
+            run_id="run-1",
+            call_id=f"memory-call-{self._calls}",
+            source_event_id="source-1",
+            destination=MEMORY_DESTINATION,
+            principal="brain",
+            deadline=self.clock.now + 100.0,
+            message_id="source-1",
+        )
+        return await self.runtime.executor.invoke(call)
+
+    async def record(self, viewer_text: str = "hello", **arguments: Any) -> ActionObservation:
+        return await self.invoke(
+            RECORD_ACTION, {"viewer_text": viewer_text, "delivery": "none", **arguments}
+        )
+
+    async def recall(self, **options: Any) -> ActionObservation:
+        return await self.invoke(RECALL_ACTION, **options)
+
+    def stored(self) -> dict[str, Any]:
+        path = self.handle.store.path_of("fake", MEMORY_CHANNEL, VIEWER)
+        return json.loads(path.read_bytes().decode("utf-8"))
+
+
+async def memory_harness(tmp_path: Path, **settings: Any) -> MemoryHarness:
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, _ = memory_directory(tmp_path)
+    handle = await module_for(runtime, clock, directory, **settings)
+    await handle.prepare()
+    for action_name in (RECALL_ACTION, RECORD_ACTION):
+        runtime.actions._authorization.grant(
+            AuthorizationRule(
+                rule_id=f"grant-{action_name}",
+                action_name=action_name,
+                granted_permissions=(action_name,),
+            )
+        )
+    return MemoryHarness(runtime, handle, clock)
+
+
+def recall_text(observation: ActionObservation) -> str:
+    [part] = observation.parts
+    assert part["type"] == "text"
+    return part["text"]
+
+
+def test_the_manifest_declares_both_memory_actions() -> None:
+    """R4: ``memory.recall`` is a read with no argument; ``memory.record`` a
+    write with no delivery, not model-proposable, timeout 5 s; both over
+    ``*/*/memory`` under their own permission; and no identity property."""
+
+    recall = viewer_memory._declared_spec(RECALL_ACTION)
+    record = viewer_memory._declared_spec(RECORD_ACTION)
+    assert recall.nature == "read" and record.nature == "write"
+    assert recall.required_permissions == ("memory.recall",)
+    assert record.required_permissions == ("memory.record",)
+    for spec in (recall, record):
+        assert spec.supported_destinations == (Destination("*", "*", "memory"),)
+        assert spec.argument_schema["additionalProperties"] is False
+        assert not {"viewer_id", "platform", "channel_id"} & set(spec.argument_schema["properties"])
+    assert dict(recall.argument_schema["properties"]) == {}
+    assert record.delivery is None and record.model_proposable is False
+    assert record.timeout_seconds == 5
+    assert set(record.argument_schema["properties"]) == {
+        "viewer_text", "reply_text", "delivery", "display_name"
+    }
+    assert set(record.argument_schema["required"]) == {"viewer_text", "delivery"}
+
+
+def test_ac22_max_recall_bytes_is_bounded_by_the_validator(tmp_path: Path) -> None:
+    """AC22: ``max_recall_bytes: 511`` is rejected; 512 and 8192 are not."""
+
+    base = {"directory": str(tmp_path)}
+    assert validate_settings({**base, "max_recall_bytes": 511}) == [
+        "module 'viewer_memory': field 'max_recall_bytes': must be an integer from 512 to 8192"
+    ]
+    assert validate_settings({**base, "max_recall_bytes": 8193}) != []
+    assert validate_settings({**base, "max_recall_bytes": 512}) == []
+    assert validate_settings({**base, "max_recall_bytes": 8192}) == []
+    assert MemorySettings.from_mapping(base).max_recall_bytes == 1024
+
+
+@pytest.mark.asyncio
+async def test_ac22_an_identity_argument_is_refused_before_the_provider(tmp_path: Path) -> None:
+    """AC22: ``viewer_id`` (and any identity argument) is refused as invalid
+    with 0 provider invocations, on ``memory.record`` alongside valid
+    exchange data and on ``memory.recall`` (schema ``{}``)."""
+
+    h = await memory_harness(tmp_path)
+    try:
+        executor = h.runtime.executor
+        for arguments in (
+            {"viewer_id": "v2"},
+            {"platform": "fake"},
+            {"channel_id": MEMORY_CHANNEL},
+        ):
+            observation = await h.record(**arguments)
+            assert observation.status == "error", observation
+            assert observation.error["code"] == "invalid_arguments"
+        observation = await h.recall(arguments={"viewer_id": "v2"})
+        assert observation.status == "error"
+        assert observation.error["code"] == "invalid_arguments"
+        assert executor.provider_invocations == 0
+        assert h.handle.store.stats() == (0, 0)
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac22_record_accepts_the_exchange_data(tmp_path: Path) -> None:
+    """AC22: ``memory.record`` with only ``viewer_text`` and ``delivery``
+    succeeds, and with ``reply_text`` and ``display_name`` added too; an
+    80-character name is stored as its first 64."""
+
+    h = await memory_harness(tmp_path)
+    try:
+        first = await h.invoke(RECORD_ACTION, {"viewer_text": "hi", "delivery": "none"})
+        assert first.status == "success", first
+        assert dict(first.result) == {"interactions": 1, "notes": 1}
+        name = "".join(chr(ord("a") + index % 26) for index in range(80))
+        second = await h.invoke(
+            RECORD_ACTION,
+            {
+                "viewer_text": "again",
+                "reply_text": "hello",
+                "delivery": "confirmed",
+                "display_name": name,
+            },
+        )
+        assert second.status == "success", second
+        stored = h.stored()
+        assert stored["display_name"] == name[:64]
+        assert stored["interactions"] == 2 and stored["use_count"] == 2
+        assert stored["notes"][-1] == {
+            "at": stored["last_seen"],
+            "viewer_text": "again",
+            "reply_text": "hello",
+            "delivery": "confirmed",
+        }
+        assert "reply_text" not in stored["notes"][0]
+        too_long = await h.record("x" * 201)
+        assert too_long.status == "error" and too_long.error["code"] == "invalid_arguments"
+        assert h.stored()["interactions"] == 2
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac22_twelve_notes_fit_1024_bytes_newest_first(tmp_path: Path) -> None:
+    """AC22: 12 notes of 200 characters at ``max_recall_bytes: 1024`` give a
+    serialized result of at most 1024 bytes, most recent notes first, with
+    ``truncated: true`` — measured as the executor measures the observation."""
+
+    h = await memory_harness(tmp_path, max_notes=12, max_file_bytes=8192)
+    try:
+        for index in range(12):
+            h.clock.advance(1.0)
+            assert (await h.record(f"{index:03d}" + "n" * 197)).status == "success"
+        observation = await h.recall()
+        assert observation.status == "success", observation
+        text = recall_text(observation)
+        assert observation_size(observation.parts) == len(text.encode("utf-8")) <= 1024
+        result = json.loads(text)
+        assert result == dict(observation.result) | {
+            "notes": [dict(note) for note in observation.result["notes"]]
+        }
+        assert result["known"] is True and result["truncated"] is True
+        assert result["interactions"] == 12
+        kept = [note["viewer_text"][:3] for note in result["notes"]]
+        assert kept and len(kept) < 12
+        assert kept == [f"{index:03d}" for index in range(11, 11 - len(kept), -1)]
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac22_a_wide_name_and_ten_notes_fit_512_bytes(tmp_path: Path) -> None:
+    """AC22: a stored ``display_name`` of 64 four-byte characters and 10
+    notes of 200 characters at ``max_recall_bytes: 512`` give at most 512
+    bytes, every metadata key, ``truncated: true`` and a ``display_name``
+    that is a prefix of the stored one."""
+
+    h = await memory_harness(tmp_path, max_recall_bytes=512)
+    try:
+        for index in range(10):
+            observation = await h.record("t" * 200, display_name=WIDE * 64)
+            assert observation.status == "success", observation
+        assert h.stored()["display_name"] == WIDE * 64
+        assert len(h.stored()["notes"]) == 10
+        observation = await h.recall()
+        text = recall_text(observation)
+        assert len(text.encode("utf-8")) <= 512
+        result = json.loads(text)
+        assert METADATA_KEYS <= set(result)
+        assert result["truncated"] is True
+        assert (WIDE * 64).startswith(result["display_name"])
+    finally:
+        await h.handle.close()
+
+
+def test_fit_recall_shortens_the_name_by_whole_characters_last() -> None:
+    """R4: when the metadata alone is over the limit, the notes are all gone
+    and ``display_name`` is cut from its end by whole characters, to the
+    longest prefix that fits; the result never exceeds the limit."""
+
+    record = {
+        "display_name": WIDE * 200,
+        "first_seen": at(0.0),
+        "last_seen": at(1.0),
+        "interactions": 3,
+        "notes": notes_of(3, "z" * 50),
+    }
+    result, text = viewer_memory.fit_recall(record, 512)
+    size = len(text.encode("utf-8"))
+    assert size <= 512 and result["notes"] == [] and result["truncated"] is True
+    name = result["display_name"]
+    assert name and (WIDE * 200).startswith(name) and len(name) < 200
+    # One more character would not fit.
+    longer = json.loads(text) | {"display_name": WIDE * (len(name) + 1)}
+    assert len(json.dumps(longer, ensure_ascii=False, separators=(",", ":")).encode()) > 512
+    small = dict(record, display_name="ok", notes=notes_of(1, "z"))
+    result, _ = viewer_memory.fit_recall(small, 1024)
+    assert result["truncated"] is False and len(result["notes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_ac22_a_watch_session_has_no_viewer(tmp_path: Path) -> None:
+    """AC22: a ``system:watch`` conversation — or an unparsable one, or a
+    session on another channel — ends ``error no_viewer`` and stores nothing."""
+
+    h = await memory_harness(tmp_path)
+    try:
+        for conversation_id in (
+            SessionKey("fake", MEMORY_CHANNEL, "system:watch").serialize(),
+            "not-a-session",
+            "1:f|6:chan-m|2:v1",
+            SessionKey("fake", "other", VIEWER).serialize(),
+        ):
+            for action_name, arguments in (
+                (RECALL_ACTION, {}),
+                (RECORD_ACTION, {"viewer_text": "hi", "delivery": "none"}),
+            ):
+                observation = await h.invoke(
+                    action_name, arguments, conversation_id=conversation_id
+                )
+                assert observation.status == "error", (conversation_id, observation)
+                assert observation.error["code"] == viewer_memory.ERROR_NO_VIEWER
+        assert h.handle.store.stats() == (0, 0)
+    finally:
+        await h.handle.close()
+
+
+def test_parse_conversation_id_inverts_the_session_key() -> None:
+    key = SessionKey("fa|ke", "c:1", "v|2:")
+    assert viewer_memory.parse_conversation_id(
+        SessionKey("fa|ke", "c:1", "v|2").serialize()
+    ) == ("fa|ke", "c:1", "v|2")
+    # A viewer in the reserved `:` namespace is no platform viewer.
+    assert viewer_memory.parse_conversation_id(key.serialize()) is None
+    for value in ("", "01:f|1:c|1:v", "1:f|1:c|1:v|", "1:f|1:c", None, "1:f|0:|1:v"):
+        assert viewer_memory.parse_conversation_id(value) is None, value
+
+
+@pytest.mark.asyncio
+async def test_ac16_recall_of_an_expired_record_is_unknown(tmp_path: Path) -> None:
+    """AC16 (recall half): 29 days after ``last_seen`` the recall is known;
+    at 30 days + 1 s it is ``{known: false}``."""
+
+    h = await memory_harness(tmp_path)
+    try:
+        unknown = await h.recall()
+        assert dict(unknown.result) == {"known": False}
+        assert recall_text(unknown) == '{"known":false}'
+        assert h.handle.store.stats() == (0, 0)
+
+        assert (await h.record()).status == "success"
+        h.clock.advance(29 * DAY)
+        assert (await h.recall()).result["known"] is True
+        # The recall at 29 days is a use, not a sighting: last_seen stays.
+        h.clock.advance(1 * DAY + 1.0)
+        observation = await h.recall()
+        assert observation.status == "success"
+        assert dict(observation.result) == {"known": False}
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_recall_is_a_use(tmp_path: Path) -> None:
+    """R4: a recall that returns a record increments ``use_count`` and moves
+    ``last_used``; nothing else of the file changes."""
+
+    h = await memory_harness(tmp_path)
+    try:
+        await h.record(display_name="Viewer")
+        before = h.stored()
+        assert before["use_count"] == 1
+        h.clock.advance(10.0)
+        observation = await h.recall()
+        assert observation.result["known"] is True
+        assert observation.result["display_name"] == "Viewer"
+        assert observation.result["truncated"] is False
+        after = h.stored()
+        assert after["use_count"] == 2
+        assert after["last_used"] == at(START + 10.0)
+        assert after["last_used"] > before["last_used"]
+        unchanged = {key for key in after if key not in {"use_count", "last_used"}}
+        assert {key: after[key] for key in unchanged} == {key: before[key] for key in unchanged}
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_the_actions_are_bound_ready_and_withdrawn_at_close(tmp_path: Path) -> None:
+    h = await memory_harness(tmp_path)
+    registry = h.runtime.actions
+    assert {RECALL_ACTION, RECORD_ACTION} <= set(registry.registered_ready())
+    await h.handle.close()
+    assert not {RECALL_ACTION, RECORD_ACTION} & set(registry.registered_ready())
