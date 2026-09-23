@@ -8,6 +8,14 @@ executed counterexamples (`X1`..`X4`); two fix steps have since landed.
 explicitly authorized and required. Create, stage or modify nothing else — no `git add`, no commits, no other
 file.
 
+## Known-good anchors (do NOT report these as findings)
+
+- The normative error code for an unsupported action version is **`action_version_mismatch`**
+  (`core/actions.py:206`, `ERROR_VERSION_MISMATCH`, established in phase 0 step P7). An earlier run of this
+  gate assumed `version_mismatch` and produced a false positive: the status is `error` with the code above.
+- The two fix commits are `7f462cf` (P22F1: F1–F3) and `fa0847e` (P22F2: F4–F5); the full suite is green at
+  1891 passed / 12 skipped with the project virtualenv.
+
 ## Your job
 
 1. **Verify each finding of gate 1**, from the code AND a RUNNING test, citing `file:line` and the executed test
