@@ -418,9 +418,9 @@ DECLARATION_KEYS = {
     # Phase 3 R7 (plans P18, P19): the kick chat input declares its triggers,
     # its credentials and its `chat.write`.
     "kick": {"triggers", "actions", "credentials"},
-    # Phase 3 R7 (plan P20): the youtube chat input declares its triggers and
-    # credentials; its `chat.write` is declared by plan step P21.
-    "youtube": {"triggers", "credentials"},
+    # Phase 3 R7 (plans P20, P21): the youtube chat input declares its
+    # triggers, its credentials and its `chat.write`.
+    "youtube": {"triggers", "actions", "credentials"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -437,6 +437,8 @@ DECLARED_ACTIONS = {
     # Phase 3 R7 (plan P19): kick declares the same `chat.write` over its
     # own destinations — a second declarer, not a new action name.
     "kick": {"chat.write"},
+    # Phase 3 R7 (plan P21): youtube is the third declarer of `chat.write`.
+    "youtube": {"chat.write"},
 }
 
 #: The credentials each manifest declares, by dotted setting path (R8).
@@ -595,8 +597,11 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     manifest except ``chat.write``, declared by exactly twitch and kick —
     while the manifest count and the action-name count stay as they were;
     then the ``youtube`` input manifest, which declares triggers and
-    credentials and, until plan step P21, no action (allowlisted, running
-    value of plan step P20: 17 manifests, 13 action names).
+    credentials (allowlisted, running value of plan step P20: 17 manifests,
+    13 action names), then its ``chat.write`` (plan step P21, decision 11):
+    the multiplicity assertion moves to the running value — ``chat.write``
+    is declared by exactly twitch, kick and youtube — and nothing else
+    changes.
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -672,13 +677,13 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     assert len(declared) == 13
     # Phase 3 R7 (plan P19, decision 11), superseding "declared once each, by
     # one manifest": each action name has exactly one declaring manifest,
-    # except `chat.write`, declared by exactly twitch and kick (running value;
-    # P21 adds youtube, P23 pins the final value).
+    # except `chat.write`, declared by exactly twitch, kick and youtube
+    # (running value of P21; P23 pins the final value).
     declarers = {
         name: {module for module, names in DECLARED_ACTIONS.items() if name in names}
         for name in declared
     }
-    assert declarers.pop("chat.write") == {"twitch", "kick"}
+    assert declarers.pop("chat.write") == {"twitch", "kick", "youtube"}
     assert all(len(modules) == 1 for modules in declarers.values()), declarers
 
 
@@ -1579,10 +1584,11 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
     phase 2 (allowlisted, running value of plan step P9), R4 adds
     ``memory.recall`` and ``memory.record`` (running value of plan step
     P11) and R5 adds ``moderation.request`` (running value of plan step
-    P14). Phase 3's R7 (plan step P19, decision 11) makes kick a second
-    declarer of ``chat.write``: the catalog still names 13 actions, each
-    declared once except ``chat.write``, declared twice (twitch and
-    kick)."""
+    P14). Phase 3's R7 (plan steps P19 and P21, decision 11) makes kick,
+    then youtube, further declarers of ``chat.write``: the catalog still
+    names 13 actions, each declared once except ``chat.write``, declared
+    three times (twitch, kick and youtube; running value of plan step
+    P21)."""
 
     path = _chat_only_profile(tmp_path)
     environ = _phase1_environ(path)
@@ -1602,7 +1608,7 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
         assert set(started.registry.discovered()) == PHASE1_ACTIONS
         catalog = started.catalog_actions()
         assert len(set(catalog)) == 13
-        assert catalog.count("chat.write") == 2
+        assert catalog.count("chat.write") == 3
         assert all(catalog.count(name) == 1 for name in set(catalog) - {"chat.write"})
         assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS | {
             "stream.clip.create",

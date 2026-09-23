@@ -19,10 +19,10 @@ consumes: []
 middleware: false
 
 # Lifecycle role, never the module name, decides what each phase asks of this
-# module (R4). An `input` is a producer: `prepare` makes no request (an access
-# token is obtained only when a request needs one), `start_inputs` starts one
-# poller per channel after the readiness barrier, `stop_inputs` stops them and
-# `close` releases the transport.
+# module (R4). An `input` is a producer: `prepare` binds `chat.write` and
+# makes no request (an access token is obtained only when a request needs
+# one), `start_inputs` starts one poller per channel after the readiness
+# barrier, `stop_inputs` stops them and `close` releases the transport.
 lifecycle:
   roles:
     - input
@@ -218,3 +218,65 @@ triggers:
         parameters:
           keywords:
             - "${companion_name}"
+
+# The chat send this module serves (R7), the same contract the other chat
+# platforms declare, over this platform's own destinations. One call is one
+# insert request to the live chat of the channel's active broadcast, never
+# retried; the platform caps a message at 200 characters and has no reply
+# thread, so `parent_message_id` is accepted and not forwarded.
+actions:
+  - name: chat.write
+    version: 1
+    description: Send one chat message to a channel, optionally as a reply.
+    argument_schema:
+      type: object
+      properties:
+        text:
+          type: string
+          description: Message body; must not be blank.
+        parent_message_id:
+          type: string
+          description: Identifier of the message being replied to, when any.
+      required:
+        - text
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        message_id:
+          type: string
+          description: Identifier the platform assigned to the delivered message.
+        destination:
+          type: object
+          properties:
+            platform:
+              type: string
+            channel_id:
+              type: string
+          required:
+            - platform
+            - channel_id
+          additionalProperties: false
+      required:
+        - message_id
+        - destination
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - chat.write
+    supported_destinations:
+      - platform: youtube
+        channel_id: "*"
+        scope: chat
+    # One send request is bounded by this budget; on expiry the executor
+    # reports `timeout` when nothing was emitted and `external_unknown` when
+    # the request left and no confirmation came back.
+    timeout_seconds: 10
+    # The platform offers no replay key: a repeated call may duplicate the
+    # message, so no blind retry follows an uncertain outcome.
+    idempotency: none
+    # Delivery capability (R1 decision 1): this action may close a run as a
+    # configured terminal delivery, the final answer text arriving under
+    # `text`. The model is never offered it; configuration selects it.
+    delivery:
+      text_argument: text
