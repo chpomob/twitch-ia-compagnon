@@ -73,6 +73,7 @@ from typing import Any
 from .contracts import (
     COUNTER_DEDUP_EVICTIONS,
     COUNTER_TRIGGER_REJECTIONS,
+    EVENT_KINDS,
     INTERNAL_TRACE_TYPES,
     ContractError,
     Counters,
@@ -80,6 +81,7 @@ from .contracts import (
     TriggerRule,
     TriggerSpec,
     TriggerTypeDeclaration,
+    validate_event_kind,
 )
 
 __all__ = [
@@ -97,6 +99,7 @@ __all__ = [
     "REASON_SELF_AUTHORED",
     "REASON_UNAUTHENTICATED",
     "TRIGGER_TYPE_AUDIENCE",
+    "TRIGGER_TYPE_EVENT_KIND",
     "TRIGGER_TYPE_KEYWORD",
     "TRIGGER_TYPE_PROBABILITY",
     "TriggerContext",
@@ -125,6 +128,7 @@ fields have no agreed meaning and the engine refuses to read them.
 TRIGGER_TYPE_PROBABILITY = "probability"
 TRIGGER_TYPE_AUDIENCE = "audience"
 TRIGGER_TYPE_KEYWORD = "keyword"
+TRIGGER_TYPE_EVENT_KIND = "event_kind"
 
 COMPANION_NAME_SETTING = "companion_name"
 """The input module setting :data:`COMPANION_NAME_TOKEN` resolves from.
@@ -212,8 +216,28 @@ BUILTIN_TRIGGER_TYPES: tuple[TriggerTypeDeclaration, ...] = (
             "additionalProperties": False,
         },
     ),
+    TriggerTypeDeclaration(
+        name=TRIGGER_TYPE_EVENT_KIND,
+        parameter_schema={
+            "type": "object",
+            "properties": {
+                "kinds": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(EVENT_KINDS)},
+                }
+            },
+            "required": ["kinds"],
+            "additionalProperties": False,
+        },
+    ),
 )
-"""The three types this engine can execute, with their canonical schemas.
+"""The four types this engine can execute, with their canonical schemas.
+
+The ``event_kind`` schema also carries ``minItems: 1`` and
+``uniqueItems: true`` on ``kinds`` (R1). The schema subset of
+:func:`~core.contracts.validate_schema` has neither keyword, so both are
+enforced by :func:`_validate_builtin_rule`, which every configured and default
+policy passes through at registration and again before evaluation.
 
 A module declares the subset it supports in its manifest and may narrow a
 schema — a stricter ``maximum`` on a probability, a shorter audience
@@ -594,6 +618,7 @@ class _Normalized:
     author_id: str
     message_id: str
     text: str
+    kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -902,6 +927,7 @@ class TriggerEngine:
                 _evaluate_rule(
                     rule,
                     text=normalized.text,
+                    kind=normalized.kind,
                     context=context,
                     rng=rng,
                     companion_name=self._registry.companion_name_for(
@@ -1074,6 +1100,19 @@ def _normalize(event: Any) -> _Normalized:
             source_event_id=message_id,
         )
 
+    # An absent kind is an ordinary message (every phase-2 event); anything
+    # outside the closed vocabulary is refused, never read as "no kind".
+    try:
+        kind = validate_event_kind(payload.get("kind"), "payload.kind")
+    except ContractError:
+        raise _InvariantRejection(
+            f"{REASON_INVALID_PAYLOAD}:payload.kind",
+            input_name=input_name,
+            platform=platform,
+            channel_id=channel_id,
+            source_event_id=message_id,
+        ) from None
+
     return _Normalized(
         input_name=input_name,
         platform=platform,
@@ -1081,6 +1120,7 @@ def _normalize(event: Any) -> _Normalized:
         author_id=author_id,
         message_id=message_id,
         text=text,
+        kind=kind,
     )
 
 
@@ -1093,6 +1133,7 @@ def _evaluate_rule(
     rule: TriggerRule,
     *,
     text: str,
+    kind: str,
     context: TriggerContext,
     rng: RandomSource,
     companion_name: str | None,
@@ -1103,7 +1144,9 @@ def _evaluate_rule(
     Dispatch is explicit rather than table-driven so each evaluator can take
     exactly what it is allowed to read: ``_evaluate_audience`` is never handed
     the message text, which is what makes "body text never satisfies a role
-    predicate" a property of the signature instead of a promise (AC4).
+    predicate" a property of the signature instead of a promise (AC4), and
+    ``_evaluate_event_kind`` is handed neither the text nor the random source,
+    so it can neither read the body nor shift a draw count.
     """
 
     _validate_builtin_rule(rule, companion_name=companion_name, label=label)
@@ -1114,6 +1157,8 @@ def _evaluate_rule(
         return _evaluate_audience(parameters, context)
     if rule.type == TRIGGER_TYPE_KEYWORD:
         return _evaluate_keyword(parameters, text, companion_name, label=label)
+    if rule.type == TRIGGER_TYPE_EVENT_KIND:
+        return _evaluate_event_kind(parameters, kind)
     # Unreachable while every built-in name has a branch above; a built-in
     # added without one must fail loudly rather than decide by default.
     raise ContractError(
@@ -1171,14 +1216,30 @@ def _evaluate_keyword(
     Case-insensitive substring matching over the normalised text only. The
     companion-name token is resolved from configuration here, so the default
     policy carries no name of its own.
+
+    An event with empty text — a community notice carries none — never
+    matches, whatever the keywords, the companion-name default included (R1).
     """
 
     keywords = _resolved_keywords(parameters, companion_name, label=f"{label}.parameters")
+    if not text:
+        return _Outcome(False, "keyword_no_text")
     lowered = text.casefold()
     for keyword in keywords:
         if keyword.casefold() in lowered:
             return _Outcome(True, "keyword_match")
     return _Outcome(False, "keyword_no_match")
+
+
+def _evaluate_event_kind(parameters: Mapping[str, Any], kind: str) -> _Outcome:
+    """Test the normalised event's kind for membership in ``kinds`` (R1, R6).
+
+    Pure and draw-free: it receives neither the text nor the random source.
+    """
+
+    if kind in parameters["kinds"]:
+        return _Outcome(True, f"event_kind_{kind}")
+    return _Outcome(False, "event_kind_no_match")
 
 
 def _combine(combination: str, outcomes: Sequence[_Outcome]) -> tuple[bool, str]:
@@ -1225,6 +1286,19 @@ def _validate_builtin_rule(
         _resolved_keywords(
             rule.parameters, companion_name, label=f"{label}.parameters"
         )
+    if rule.type == TRIGGER_TYPE_EVENT_KIND:
+        kinds = rule.parameters["kinds"]
+        if not kinds:
+            raise ContractError(
+                f"{label}.parameters.kinds", "must list at least one event kind"
+            )
+        seen: set[str] = set()
+        for index, kind in enumerate(kinds):
+            if kind in seen:
+                raise ContractError(
+                    f"{label}.parameters.kinds[{index}]", f"repeats {kind!r}"
+                )
+            seen.add(kind)
 
 
 def _resolved_keywords(

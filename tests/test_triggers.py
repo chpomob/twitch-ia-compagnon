@@ -20,6 +20,7 @@ from conftest import runtime_context
 from core.contracts import (
     COUNTER_DEDUP_EVICTIONS,
     COUNTER_TRIGGER_REJECTIONS,
+    EVENT_KINDS,
     INTERNAL_TRACE_TYPES,
     REQUIRED_COUNTERS,
     TRACE_ACTION_COMPLETED,
@@ -37,10 +38,12 @@ from core.triggers import (
     BUILTIN_TRIGGER_TYPES,
     COMPANION_NAME_TOKEN,
     REASON_INTERNAL_TRACE,
+    REASON_INVALID_PAYLOAD,
     REASON_NOT_NORMALIZED,
     REASON_SELF_AUTHORED,
     REASON_UNAUTHENTICATED,
     TRIGGER_TYPE_AUDIENCE,
+    TRIGGER_TYPE_EVENT_KIND,
     TRIGGER_TYPE_KEYWORD,
     TRIGGER_TYPE_PROBABILITY,
     TriggerContext,
@@ -818,6 +821,182 @@ def test_an_input_with_no_applicable_policy_rejects_rather_than_accepts() -> Non
 
     assert decision.accepted is False
     assert decision.policy_version is None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 P2 — the ``event_kind`` built-in (R1, R6; AC3, AC5, AC29 policies)
+# --------------------------------------------------------------------------- #
+
+
+def _event_kind_rule(*kinds: str) -> TriggerRule:
+    return TriggerRule(type=TRIGGER_TYPE_EVENT_KIND, parameters={"kinds": list(kinds)})
+
+
+def _event_kind_policy(*kinds: str) -> TriggerPolicy:
+    return TriggerPolicy(rules=(_event_kind_rule(*kinds),))
+
+
+def _notice(*, message_id: str, kind, text: str = "", author_id: str = "42") -> dict:
+    """A normalised event of *kind*; ``kind=None`` leaves the field absent."""
+
+    event = _message(message_id=message_id, text=text, author_id=author_id)
+    if kind is not None:
+        event["payload"]["kind"] = kind
+    return event
+
+
+def test_event_kind_is_a_builtin_with_a_closed_non_empty_unique_schema() -> None:
+    """R1: the fourth built-in type, its ``kinds`` drawn from the vocabulary."""
+
+    by_name = {declaration.name: declaration for declaration in BUILTIN_TRIGGER_TYPES}
+    schema = by_name[TRIGGER_TYPE_EVENT_KIND].parameter_schema
+    assert list(schema["required"]) == ["kinds"]
+    assert schema["additionalProperties"] is False
+    kinds = schema["properties"]["kinds"]
+    assert kinds["type"] == "array"
+    assert list(kinds["items"]["enum"]) == list(EVENT_KINDS)
+
+
+def test_event_kind_rule_matches_on_kind_alone_and_draws_nothing() -> None:
+    """AC5 policy: ``event_kind [raid]`` admits a raid, not a message, 0 draws."""
+
+    registry = _registry()
+    registry.configure(CHAT_INPUT, _event_kind_policy("raid"))
+    rng = _Rng((0.5,))
+    engine = _engine(registry, rng=rng)
+
+    raid = engine.evaluate(_notice(message_id="n1", kind="raid"))
+    assert raid.accepted is True
+    assert rng.draws == 0
+    message = engine.evaluate(_notice(message_id="n2", kind="message", text="raid"))
+    assert message.accepted is False
+    assert rng.draws == 0
+    absent = engine.evaluate(_notice(message_id="n3", kind=None, text="raid"))
+    assert absent.accepted is False
+    assert rng.draws == 0
+
+
+def test_any_of_composes_a_command_keyword_with_notice_kinds() -> None:
+    """AC3 policy: ``any_of [keyword !ask, event_kind [raid, sub]]``."""
+
+    registry = _registry()
+    registry.configure(
+        CHAT_INPUT,
+        TriggerPolicy(
+            rules=(
+                TriggerRule(type=TRIGGER_TYPE_KEYWORD, parameters={"keywords": ["!ask"]}),
+                _event_kind_rule("raid", "sub"),
+            ),
+            combination="any_of",
+        ),
+    )
+    rng = _Rng((0.5,))
+    engine = _engine(registry, rng=rng)
+
+    assert engine.evaluate(_message(message_id="m1", text="!ask x")).accepted is True
+    assert engine.evaluate(_notice(message_id="n1", kind="sub")).accepted is True
+    assert engine.evaluate(_message(message_id="m2", text="hello there")).accepted is False
+    assert rng.draws == 0
+
+
+def test_all_of_composes_a_trusted_audience_with_the_message_kind() -> None:
+    """AC29 policy: ``all_of [audience moderators, event_kind [message]]``."""
+
+    registry = _registry()
+    registry.configure(
+        CHAT_INPUT,
+        TriggerPolicy(
+            rules=(
+                TriggerRule(
+                    type=TRIGGER_TYPE_AUDIENCE, parameters={"audience": "moderators"}
+                ),
+                _event_kind_rule("message"),
+            ),
+            combination="all_of",
+        ),
+    )
+    rng = _Rng((0.5,))
+    engine = _engine(registry, rng=rng)
+    moderator = TriggerContext((TrustedClaim(name="moderator", provenance="twitch.eventsub"),))
+
+    trusted = engine.evaluate(
+        _message(message_id="m1", text="!watch"), context=moderator
+    )
+    untrusted = engine.evaluate(
+        _message(message_id="m2", text="!watch"),
+        context=TriggerContext((TrustedClaim(name="moderator"),)),
+    )
+
+    assert trusted.accepted is True
+    assert untrusted.accepted is False
+    assert rng.draws == 0
+
+
+@pytest.mark.parametrize(
+    ("kinds", "field"),
+    [
+        (["announcement"], "parameters.kinds[0]"),
+        ([], "parameters.kinds"),
+        (["raid", "raid"], "parameters.kinds[1]"),
+    ],
+)
+def test_an_invalid_event_kind_policy_is_refused_at_registration(kinds, field) -> None:
+    """R1: outside the vocabulary, empty or repeated ``kinds`` names the field."""
+
+    registry = _registry()
+    transport = _Transport()
+
+    with pytest.raises(ContractError) as error:
+        _startup(
+            registry, [(CHAT_INPUT, None, _event_kind_policy(*kinds))], transport
+        )
+
+    assert f"triggers.{CHAT_INPUT}.policy.rules[0].{field}" in str(error.value)
+    assert transport.opened == 0
+
+
+def test_an_invalid_event_kind_default_policy_is_refused_at_register() -> None:
+    """R1: a module default is held to the same schema as a configured policy."""
+
+    registry = TriggerRegistry(companion_name=COMPANION_NAME)
+
+    with pytest.raises(ContractError) as error:
+        registry.register(
+            CHAT_INPUT, _chat_spec(default_policy=_event_kind_policy("raid", "raid"))
+        )
+
+    assert f"triggers.{CHAT_INPUT}.default_policy.rules[0].parameters.kinds[1]" in str(
+        error.value
+    )
+
+
+def test_a_keyword_rule_never_matches_an_event_without_text() -> None:
+    """R1: an empty-text notice never satisfies a keyword rule, default included."""
+
+    for policy in (companion_mention_policy(), _keyword_policy("!ask", "a")):
+        registry = _registry()
+        registry.configure(CHAT_INPUT, policy)
+        engine = _engine(registry)
+
+        decision = engine.evaluate(_notice(message_id="n1", kind="follow"))
+
+        assert decision.accepted is False
+        assert decision.reason == "rejected:keyword_no_text"
+
+
+def test_an_event_with_an_unknown_kind_is_refused_as_invalid_payload() -> None:
+    """R1: ``payload.kind`` outside the vocabulary is an invariant rejection."""
+
+    engine = _accept_everything_engine()
+
+    decision = engine.evaluate(_notice(message_id="n1", kind="bogus"))
+
+    assert decision.accepted is False
+    assert decision.reason == f"{REASON_INVALID_PAYLOAD}:payload.kind"
+    assert decision.input_name == CHAT_INPUT
+    assert decision.channel_id == DEFAULT_CHANNEL
+    assert decision.source_event_id == "n1"
+    assert engine.rule_evaluations == 0
 
 
 # --------------------------------------------------------------------------- #
