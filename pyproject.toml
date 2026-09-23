@@ -48,6 +48,7 @@ modules = ["*/module.yaml"]
 "modules.stream_control" = ["module.yaml"]
 "modules.clips" = ["module.yaml"]
 "modules.viewer_memory" = ["module.yaml"]
+"modules.moderation" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -106,6 +106,7 @@ MODULE_NAMES = (
     "stream_control",
     "clips",
     "viewer_memory",
+    "moderation",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -344,6 +345,16 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": ["input"]},
         "settings_validator": "validate_settings",
     },
+    "moderation": {
+        "name": "moderation",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": [],
+        "consumes": ["channel.chat.message"],
+        "middleware": False,
+        "lifecycle": {"roles": []},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
 # R8): only the chat input declares triggers; the input and the six
@@ -365,6 +376,8 @@ DECLARATION_KEYS = {
     "clips": {"actions"},
     # Phase 3 R4 (plan P11): the store declares its recall and record.
     "viewer_memory": {"actions"},
+    # Phase 3 R5 (plan P14): the one model-proposable write.
+    "moderation": {"actions"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -377,6 +390,7 @@ DECLARED_ACTIONS = {
     "stream_control": {"stream.scene.set", "stream.poll.create"},
     "clips": {"stream.clip.create"},
     "viewer_memory": {"memory.recall", "memory.record"},
+    "moderation": {"moderation.request"},
 }
 
 #: The credentials each manifest declares, by dotted setting path (R8).
@@ -520,7 +534,9 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     the ``viewer_memory`` manifest (allowlisted, running value of plan step
     P10: 13 manifests, 10 action names); phase 3's R4 adds its
     ``memory.recall`` and ``memory.record`` (allowlisted, running value of
-    plan step P11: 13 manifests, 12 action names).
+    plan step P11: 13 manifests, 12 action names); phase 3's R5 adds the
+    ``moderation`` manifest and its ``moderation.request`` (allowlisted,
+    running value of plan step P14: 14 manifests, 13 action names).
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -538,7 +554,7 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 13
+    assert len(names) == 14
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():
@@ -584,17 +600,18 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     for module_name in ("proxy", "agent_link"):
         assert "actions" not in manifests[module_name]
     declared = set().union(*DECLARED_ACTIONS.values())
-    # Phase 3 R2 (plan P9) and R4 (plan P11): `clips` and `viewer_memory`
-    # are shipped and enabled by no phase 2 profile, so the catalog is the PC
-    # profile's set plus their actions.
+    # Phase 3 R2 (plan P9), R4 (plan P11) and R5 (plan P14): `clips`,
+    # `viewer_memory` and `moderation` are shipped and enabled by no phase 2
+    # profile, so the catalog is the PC profile's set plus their actions.
     assert declared == PROVIDED_ACTIONS["pc"] | {
         "stream.clip.create",
         "memory.recall",
         "memory.record",
+        "moderation.request",
     }
-    assert len(declared) == 12
+    assert len(declared) == 13
     # The catalog's actions are declared once each, by one manifest.
-    assert sum(len(names) for names in DECLARED_ACTIONS.values()) == 12
+    assert sum(len(names) for names in DECLARED_ACTIONS.values()) == 13
 
 
 @pytest.mark.parametrize("profile", sorted(PROFILES))
@@ -1490,10 +1507,11 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
     with 1 send; its registered-ready view is exactly {``chat.read``,
     ``users.read``, ``screen.capture``, ``chat.write``} and the brain offers
     no phase 2 action, while the catalog of discovered manifests declares
-    the 12 actions — phase 3's R2 adds ``stream.clip.create`` to the 9 of
-    phase 2 (allowlisted, running value of plan step P9) and R4 adds
+    the 13 actions — phase 3's R2 adds ``stream.clip.create`` to the 9 of
+    phase 2 (allowlisted, running value of plan step P9), R4 adds
     ``memory.recall`` and ``memory.record`` (running value of plan step
-    P11)."""
+    P11) and R5 adds ``moderation.request`` (running value of plan step
+    P14)."""
 
     path = _chat_only_profile(tmp_path)
     environ = _phase1_environ(path)
@@ -1512,11 +1530,12 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
         assert set(started.registry.registered_ready()) == PHASE1_ACTIONS
         assert set(started.registry.discovered()) == PHASE1_ACTIONS
         catalog = started.catalog_actions()
-        assert len(catalog) == 12
+        assert len(catalog) == 13
         assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS | {
             "stream.clip.create",
             "memory.recall",
             "memory.record",
+            "moderation.request",
         }
 
         completed = await started.chat_scenario()

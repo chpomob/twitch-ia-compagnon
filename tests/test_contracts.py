@@ -602,7 +602,8 @@ async def test_discovery_still_refuses_any_other_unknown_action_key(
 
 
 @pytest.mark.asyncio
-async def test_every_shipped_manifest_discovers_with_model_proposable_false() -> None:
+async def test_only_moderation_request_is_model_proposable() -> None:
+    """R5/P14: moderation.request is the only shipped model-proposable action."""
     loader = await _discover(_REPOSITORY / "modules")
 
     specs = [
@@ -612,4 +613,6 @@ async def test_every_shipped_manifest_discovers_with_model_proposable_false() ->
         for spec in module.declaration.actions
     ]
     assert specs
-    assert [spec.name for spec in specs if spec.model_proposable] == []
+    assert [spec.name for spec in specs if spec.model_proposable] == [
+        "moderation.request"
+    ]

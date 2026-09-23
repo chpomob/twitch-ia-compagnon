@@ -104,7 +104,7 @@ UNSET_DIAGNOSTIC = "modules.twitch.access_token: environment reference is unreso
 #: The names R8 requires a clean environment to discover, in its order, and
 #: the three phase 2's R9 ships beside them (allowlisted: 8 → 11), and the
 #: phase 3 manifests as each step adds one (allowlisted; P9: ``clips``, 12;
-#: P10: ``viewer_memory``, 13).
+#: P10: ``viewer_memory``, 13; P14: ``moderation``, 14).
 SHIPPED_MANIFESTS = (
     "twitch",
     "brain",
@@ -119,6 +119,7 @@ SHIPPED_MANIFESTS = (
     "stream_control",
     "clips",
     "viewer_memory",
+    "moderation",
 )
 #: The three package-data lines phase 2 adds (R9, AC33).
 PHASE2_PACKAGE_DATA = ("modules.audio_output", "modules.audio_input", "modules.stream_control")
@@ -896,8 +897,9 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     and the checkout removed from ``sys.path``, a configuration with
     ``modules_directory: builtin`` discovers exactly the 11 shipped
     manifests (phase 2 adds three: the former count of 8 is allowlisted;
-    phase 3's R8 ships ``clips`` from plan step P9 on: 12, and
-    ``viewer_memory`` from P10 on: 13, allowlisted)
+    phase 3's R8 ships ``clips`` from plan step P9 on: 12,
+    ``viewer_memory`` from P10 on: 13, and ``moderation`` from P14 on: 14,
+    allowlisted)
     and the installed console script answers ``--help`` with status 0.
 
     The checkout is installed from a pristine copy of its sources: pip
@@ -977,7 +979,7 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     assert report["core"].startswith(installed + os.sep), report
     assert report["modules_directory"] == str((target / "modules").resolve()), report
     assert report["manifests"] == sorted(SHIPPED_MANIFESTS), report
-    assert len(report["manifests"]) == 13
+    assert len(report["manifests"]) == 14
     assert set(report["manifests"]) == set(MODULE_NAMES)
 
     launcher = target / "bin" / CONSOLE_SCRIPT
@@ -1020,10 +1022,10 @@ def test_install_test_skips_only_when_pip_is_unavailable() -> None:
 def test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency() -> None:
     """AC33 (R9): ``pyproject.toml`` carries the ``modules.audio_output``,
     ``modules.audio_input`` and ``modules.stream_control`` package-data
-    lines beside the eight of phase 1 — one per shipped manifest, the 13
+    lines beside the eight of phase 1 — one per shipped manifest, the 14
     the install test discovers now that phase 3's R8 ships ``clips`` (plan
-    step P9) and ``viewer_memory`` (plan step P10; allowlisted running
-    value) — and the runtime dependency list is
+    step P9), ``viewer_memory`` (plan step P10) and ``moderation`` (plan
+    step P14; allowlisted running value) — and the runtime dependency list is
     still ``aiohttp`` and ``PyYAML`` only."""
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -1034,7 +1036,7 @@ def test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency() -> 
         child.name for child in (ROOT / "modules").iterdir() if (child / "module.yaml").is_file()
     )
     assert shipped == sorted(SHIPPED_MANIFESTS) == sorted(MODULE_NAMES)
-    assert len(shipped) == 13
+    assert len(shipped) == 14
     assert sorted(key for key in package_data if key.startswith("modules.")) == sorted(
         f"modules.{name}" for name in shipped
     )
