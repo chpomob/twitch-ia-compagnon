@@ -18,10 +18,48 @@ deletion and a timeout whose duration is at least 1 s and at most
 
 - ``alert`` records the request — ``success`` with disposition ``alerted`` —
   and sends 0 platform requests;
-- ``propose`` is declared with its ``propose.*`` settings; its proposal table
-  and approval commands arrive with plan step P15, and until then a request
-  in that mode is ``refused mode_unavailable`` with 0 platform requests;
+- ``propose`` stores a proposal and sends 0 platform requests — ``success``
+  with disposition ``proposed`` and its ``proposal_id`` — unless the
+  operation is listed in ``propose.auto_apply`` (default empty): then the
+  request is applied at once through :meth:`ModerationModule.apply`, and its
+  outcome is the request's;
 - ``act`` applies the request at once through :meth:`ModerationModule.apply`.
+
+**The proposal table** (mode ``propose``, plan step P15). A proposal is keyed
+by ``(platform, channel_id, proposal_id)`` — the channel is part of the
+lookup key, so a command naming an id of another channel finds nothing. Ids
+are short words from an injected id source (``_id_source``; six hexadecimal
+characters by default), never reused while pending in their channel. The
+table holds at most ``propose.max_pending`` proposals (1–256, default 32):
+a new one evicts the proposal closest to expiry, which publishes its
+``expired`` fact. Each proposal lives ``propose.proposal_ttl_seconds``
+(30–3600, default 300) on the injected clock; a supervised expiry sweep,
+spawned at ``prepare`` when a mode ``propose`` is configured, publishes one
+``expired`` fact per proposal whose instant passed, and a command reaching a
+due proposal before the sweep expires it first.
+
+**The commands.** A chat event of kind ``message`` whose text is
+``<approve_command> <id>`` (default ``!modok``) or ``<reject_command> <id>``
+(default ``!modno``), authored by a trusted ``broadcaster`` or ``moderator``
+(roles attested by ``author.roles_provenance``) in the proposal's own
+channel, decides it:
+
+- an approval applies the proposal through :meth:`ModerationModule.apply` —
+  the same path, lock and reservation as ``act`` — with the strict rules
+  evaluated against the state **at approval** (a message that left the chat
+  context since is ``target_unknown``). The proposal is removed from the
+  table inside the channel's locked check-and-reserve section, so a second
+  approval of the same id finds none. It publishes one fact: ``applied``,
+  the refusal, or the error. The application runs outside the publisher's
+  chain and is bounded by the action's ``timeout_seconds`` on the sleeper;
+- a rejection removes the proposal and publishes one ``rejected`` fact;
+- an unknown id or an untrusted author does nothing but count
+  (:attr:`ModerationModule.ignored_commands`).
+
+A decision fact outside a call (an approval, a rejection, an expiry) carries
+the proposal's request and its ``proposal_id``; a rejection or an expiry is
+``success`` with disposition ``rejected``/``expired`` and sent nothing.
+Pending proposals are not persisted: a restart forgets them.
 
 **The application** — the one path every application takes (P15's approvals
 and ``auto_apply`` call the same method). The strict rules are checked in the
@@ -90,15 +128,17 @@ it. A call the executor refuses before the provider runs (``not_authorized``,
 ``invalid_arguments`` against the schema, the brain's ``run_limit``) never
 reaches this module and publishes none.
 
-**Seams, for the tests.** ``_sleeper`` (the drain's wait, ``asyncio.sleep``
-by default) is read from *settings* at ``activate`` and never from a
-configuration file.
+**Seams, for the tests.** ``_sleeper`` (the drain's wait, the expiry sweep's
+and the approval bound's sleep, ``asyncio.sleep`` by default) and
+``_id_source`` (a callable returning a proposal id) are read from *settings*
+at ``activate`` and never from a configuration file.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import secrets
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -145,6 +185,20 @@ OPERATIONS = (OPERATION_DELETE_MESSAGE, OPERATION_TIMEOUT)
 DISPOSITION_ALERTED = "alerted"
 DISPOSITION_PROPOSED = "proposed"
 DISPOSITION_APPLIED = "applied"
+DISPOSITION_REJECTED = "rejected"
+DISPOSITION_EXPIRED = "expired"
+
+#: What a decision fact outside a call says the proposal met.
+DECISION_APPROVED = "approved"
+DECISION_REJECTED = "rejected"
+DECISION_EXPIRED = "expired"
+
+#: The trusted roles whose commands decide a proposal (R5).
+COMMAND_ROLES = frozenset({"broadcaster", "moderator"})
+
+# Why a command did nothing, counted by :attr:`ModerationModule.ignored_commands`.
+IGNORED_UNKNOWN_ID = "unknown_id"
+IGNORED_UNTRUSTED = "untrusted"
 
 # The strict rules, in the order they are checked (R5).
 REFUSAL_OPERATION_NOT_ALLOWED = "operation_not_allowed"
@@ -166,9 +220,8 @@ STRICT_RULES = (
 
 ERROR_PLATFORM_REJECTED = "platform_rejected"
 ERROR_RATE_LIMITED_PLATFORM = "rate_limited_platform"
-#: Mode ``propose`` before its proposal table exists (plan step P15).
-ERROR_MODE_UNAVAILABLE = "mode_unavailable"
 _ERROR_PROVIDER_CLOSED = "provider_closed"
+_ERROR_TIMEOUT = "timeout"
 
 # The classified answers a moderation service returns.
 ANSWER_OK = "ok"
@@ -237,9 +290,14 @@ _PROPOSE_SETTINGS = frozenset(
 )
 
 _SEAM_SLEEPER = "_sleeper"
-_SEAMS = frozenset({_SEAM_SLEEPER})
+_SEAM_ID_SOURCE = "_id_source"
+_SEAMS = frozenset({_SEAM_SLEEPER, _SEAM_ID_SOURCE})
+
+#: How many fresh ids a proposal draws before a counter suffix disambiguates.
+_ID_ATTEMPTS = 8
 
 Sleeper = Callable[[float], Awaitable[Any]]
+IdSource = Callable[[], str]
 ChannelKey = tuple[str, str]
 
 
@@ -274,8 +332,9 @@ def validate_settings(settings: Any) -> list[str]:
             diagnostics.append(
                 _setting_diagnostic(str(field_name), "is not a setting this module declares")
             )
-    if _SEAM_SLEEPER in settings and not callable(settings[_SEAM_SLEEPER]):
-        diagnostics.append(_setting_diagnostic(_SEAM_SLEEPER, "must be callable"))
+    for seam in (_SEAM_SLEEPER, _SEAM_ID_SOURCE):
+        if seam in settings and not callable(settings[seam]):
+            diagnostics.append(_setting_diagnostic(seam, "must be callable"))
     if _SETTING_MODE in settings and settings[_SETTING_MODE] not in MODES:
         diagnostics.append(_setting_diagnostic(_SETTING_MODE, "must be one of alert, propose, act"))
     if _SETTING_CHANNELS in settings:
@@ -428,7 +487,7 @@ def _positive_int(value: Any) -> int | None:
 
 @dataclass(frozen=True, slots=True)
 class ProposeSettings:
-    """The ``propose.*`` settings; read by the proposal table (plan step P15)."""
+    """The ``propose.*`` settings, read by the proposal table."""
 
     max_pending: int
     proposal_ttl_seconds: int
@@ -496,6 +555,12 @@ class ModerationSettings:
 
         return self.channel_modes.get((platform, channel_id), self.mode)
 
+    @property
+    def proposes(self) -> bool:
+        """Whether mode ``propose`` is reachable on some channel."""
+
+        return self.mode == MODE_PROPOSE or MODE_PROPOSE in self.channel_modes.values()
+
 
 # --------------------------------------------------------------------------- #
 # Requests, targets and outcomes
@@ -552,6 +617,20 @@ class ApplicationOutcome:
     code: str | None = None
     message: str = ""
     requests: int = 0
+    proposal_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Proposal:
+    """One pending proposal: the request, its channel, and when it expires."""
+
+    proposal_id: str
+    key: ChannelKey
+    request: ModerationRequest
+    target_author_id: str | None
+    expires_at: float
+    run_id: str | None = None
+    call_id: str | None = None
 
 
 class _Uncertain:
@@ -595,10 +674,18 @@ class _ModerationActionProvider:
 class ModerationModule:
     """The v2 handle: resolve and bind at ``prepare``, index the chat, moderate."""
 
-    def __init__(self, context: Any, settings: ModerationSettings, *, sleeper: Sleeper) -> None:
+    def __init__(
+        self,
+        context: Any,
+        settings: ModerationSettings,
+        *,
+        sleeper: Sleeper,
+        id_source: IdSource | None = None,
+    ) -> None:
         self._bus = context.bus
         self._actions = context.actions
         self._supervision = getattr(context, "supervision", None)
+        self._tasks = getattr(context, "tasks", None)
         self._services = getattr(context, "services", None)
         self._executor = getattr(context, "executor", None)
         self._chat: Any = None
@@ -606,6 +693,7 @@ class ModerationModule:
         self._clock: Callable[[], float] = getattr(context, "clock", None) or time.monotonic
         self._settings = settings
         self._sleeper = sleeper
+        self._id_source: IdSource = id_source or _random_id
         self._provider = _ModerationActionProvider(self)
         # ``platform → moderation service``, resolved once at ``prepare``.
         self._moderation_services: dict[str, Any] = {}
@@ -624,6 +712,22 @@ class ModerationModule:
         self._calls: set[asyncio.Future[None]] = set()
         # The fact publications handed to the loop and not yet finished.
         self._fact_tasks: set[asyncio.Future[None]] = set()
+        # ``(platform, channel_id, proposal_id) → proposal``, at most
+        # ``propose.max_pending`` of them.
+        self._proposals: dict[tuple[str, str, str], Proposal] = {}
+        # Set when a proposal is stored, so an idle expiry sweep wakes.
+        self._proposal_added = asyncio.Event()
+        self._sweep_task: Any = None
+        # The approvals running outside the publisher's chain.
+        self._approvals: set[asyncio.Future[None]] = set()
+        # The works an approval ended without awaiting: cancelled, retained
+        # until they finish.
+        self._detached: set[asyncio.Future[Any]] = set()
+        self._ignored = {IGNORED_UNKNOWN_ID: 0, IGNORED_UNTRUSTED: 0}
+        # The bound of one approval's application: the action's timeout,
+        # read from the manifest at ``prepare``.
+        self._approval_timeout = 10.0
+        self._id_counter = 0
         self._diagnostics: list[str] = []
         self._prepared = False
         self._draining = False
@@ -653,6 +757,21 @@ class ModerationModule:
 
         return tuple(self._prune_window((platform, channel_id), self._clock()))
 
+    def pending(self, platform: str, channel_id: str) -> tuple[str, ...]:
+        """The ids of the channel's pending proposals, in the order stored."""
+
+        return tuple(
+            proposal.proposal_id
+            for proposal in self._proposals.values()
+            if proposal.key == (platform, channel_id)
+        )
+
+    @property
+    def ignored_commands(self) -> Mapping[str, int]:
+        """How many commands did nothing: ``unknown_id`` and ``untrusted``."""
+
+        return dict(self._ignored)
+
     # -- lifecycle hooks ---------------------------------------------------- #
 
     async def prepare(self) -> None:
@@ -663,13 +782,17 @@ class ModerationModule:
         self._chat = getattr(self._context, "chat", None)
         self._moderation_services, self._companions = self._resolve_services()
         try:
-            self._actions.register(_declared_spec(), self._provider, provider_name=PROVIDER_NAME)
+            spec = _declared_spec()
+            self._approval_timeout = float(spec.timeout_seconds)
+            self._actions.register(spec, self._provider, provider_name=PROVIDER_NAME)
         except ModerationModuleError:
             raise
         except Exception:
             raise ModerationModuleError(f"{MODULE_NAME} prepare: action binding failed") from None
         self._bus.subscribe(_CHAT_EVENT, self.handle_chat_message)
         self._prepared = True
+        if self._settings.proposes:
+            self._start_sweep()
         self._actions.mark_ready()
 
     def _resolve_services(self) -> tuple[dict[str, Any], dict[str, frozenset[str]]]:
@@ -705,6 +828,7 @@ class ModerationModule:
         """Refuse new requests; give the ones in flight the drain deadline."""
 
         self._draining = True
+        await self._stop_sweep()
         pending = self._pending_calls()
         if not pending:
             return
@@ -725,11 +849,20 @@ class ModerationModule:
         self._draining = True
         if self._prepared:
             self._actions.mark_not_ready()
+        await self._stop_sweep()
+        approvals = {task for task in self._approvals if not task.done()}
+        for task in approvals:
+            task.cancel()
+        if approvals:
+            # Bounded: an approval never awaits once its wait is interrupted.
+            await asyncio.wait(approvals)
+        for task in list(self._detached):
+            task.cancel()
         if self._fact_tasks:
             await asyncio.wait(set(self._fact_tasks))
 
-    def _pending_calls(self) -> set[asyncio.Future[None]]:
-        return {call for call in self._calls if not call.done()}
+    def _pending_calls(self) -> set[asyncio.Future[Any]]:
+        return {call for call in self._calls | self._approvals if not call.done()}
 
     # -- the message index (plan decision 7) --------------------------------- #
 
@@ -743,27 +876,36 @@ class ModerationModule:
         if self._closed or not self._prepared:
             return
         try:
-            self._index_event(event)
+            indexed = self._index_event(event)
         except Exception:  # noqa: BLE001 - a consumer must not fail the publisher
             self._diagnose("index: failed")
+            return
+        if indexed is None:
+            return
+        try:
+            self._handle_command(*indexed)
+        except Exception:  # noqa: BLE001 - a consumer must not fail the publisher
+            self._diagnose("command: failed")
 
-    def _index_event(self, event: Any) -> None:
+    def _index_event(self, event: Any) -> tuple[ChannelKey, str, frozenset[str], Any] | None:
+        """Index one ordinary message; return ``(channel, author, roles, text)``."""
+
         payload = event.get("payload") if isinstance(event, Mapping) else None
         if not isinstance(payload, Mapping):
-            return
+            return None
         kind = payload.get("kind", EVENT_KIND_DEFAULT)
         if kind is not None and kind != EVENT_KIND_DEFAULT:
-            # A notice is never a moderation target (plan decision 2).
-            return
+            # A notice is never a moderation target nor a command (plan decision 2).
+            return None
         platform = payload.get("platform")
         channel_id = payload.get("channel_id")
         message_id = payload.get("message_id")
         author = payload.get("author")
         author_id = author.get("id") if isinstance(author, Mapping) else None
         if not all(_is_text(part) for part in (platform, channel_id, message_id, author_id)):
-            return
+            return None
         if _RESERVED_SEPARATOR in author_id:
-            return
+            return None
         roles: frozenset[str] = frozenset()
         claimed = author.get("roles")
         if _is_text(author.get("roles_provenance")) and isinstance(claimed, (list, tuple)):
@@ -780,6 +922,7 @@ class ModerationModule:
             messages.popitem(last=False)
         while len(self._index) > self._settings.index_max_channels:
             self._index.popitem(last=False)
+        return key, author_id, roles, payload.get("text")
 
     def _target(self, key: ChannelKey, message_id: str) -> _Target | None:
         messages = self._index.get(key)
@@ -796,6 +939,224 @@ class ModerationModule:
             self._diagnose("chat context: read failed")
             return False
         return any(getattr(record, "message_id", None) == message_id for record in records)
+
+    # -- the proposal table --------------------------------------------------- #
+
+    def _propose(self, key: ChannelKey, request: ModerationRequest, call: Any) -> Proposal:
+        """Store one proposal; evict the one closest to expiry when full."""
+
+        self._expire_due()
+        settings = self._settings.propose
+        while len(self._proposals) >= settings.max_pending:
+            victim = min(self._proposals, key=lambda item: self._proposals[item].expires_at)
+            self._publish_expired(self._proposals.pop(victim))
+        target = self._target(key, request.message_id)
+        proposal = Proposal(
+            proposal_id=self._new_id(key),
+            key=key,
+            request=request,
+            target_author_id=None if target is None else target.author_id,
+            expires_at=self._clock() + settings.proposal_ttl_seconds,
+            run_id=getattr(call, "run_id", None),
+            call_id=getattr(call, "call_id", None),
+        )
+        self._proposals[(key[0], key[1], proposal.proposal_id)] = proposal
+        self._proposal_added.set()
+        return proposal
+
+    def _new_id(self, key: ChannelKey) -> str:
+        """A short id no pending proposal of the channel holds."""
+
+        for _ in range(_ID_ATTEMPTS):
+            try:
+                candidate = self._id_source()
+            except Exception:  # noqa: BLE001 - an unusable source falls back below
+                candidate = None
+            if _is_command(candidate) and (key[0], key[1], candidate) not in self._proposals:
+                return candidate
+        while True:
+            self._id_counter += 1
+            candidate = f"p{self._id_counter}"
+            if (key[0], key[1], candidate) not in self._proposals:
+                return candidate
+
+    def _expire_due(self) -> None:
+        """Publish one ``expired`` fact per proposal whose instant passed."""
+
+        now = self._clock()
+        for table_key in [
+            item for item, proposal in self._proposals.items() if proposal.expires_at <= now
+        ]:
+            self._publish_expired(self._proposals.pop(table_key))
+
+    def _publish_expired(self, proposal: Proposal) -> None:
+        fact = _proposal_fact(proposal, DECISION_EXPIRED)
+        fact.update(status="success", disposition=DISPOSITION_EXPIRED)
+        self._publish(fact)
+
+    def _start_sweep(self) -> None:
+        spawn = getattr(self._tasks, "spawn", None)
+        loop = self._sweep_loop()
+        if callable(spawn):
+            self._sweep_task = spawn(loop, name=f"{MODULE_NAME}-expiry")
+        else:
+            self._sweep_task = asyncio.ensure_future(loop)
+
+    async def _stop_sweep(self) -> None:
+        task = self._sweep_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _sweep_loop(self) -> None:
+        """Expire proposals on the injected clock, sleeping until the nearest."""
+
+        while not self._draining:
+            try:
+                self._expire_due()
+            except Exception:  # noqa: BLE001 - the sweep outlives one failed pass
+                self._diagnose("expiry: failed")
+            if not self._proposals:
+                self._proposal_added.clear()
+                await self._proposal_added.wait()
+                continue
+            nearest = min(proposal.expires_at for proposal in self._proposals.values())
+            await self._sleeper(max(nearest - self._clock(), 0.0))
+
+    # -- the approval and rejection commands ---------------------------------- #
+
+    def _handle_command(
+        self, key: ChannelKey, author_id: str, roles: frozenset[str], text: Any
+    ) -> None:
+        if not isinstance(text, str):
+            return
+        words = text.split()
+        propose = self._settings.propose
+        if len(words) != 2 or words[0] not in (propose.approve_command, propose.reject_command):
+            return
+        if self._draining:
+            return
+        command, proposal_id = words
+        if not roles & COMMAND_ROLES:
+            self._ignored[IGNORED_UNTRUSTED] += 1
+            return
+        self._expire_due()
+        # The channel is part of the key: an id of another channel is unknown.
+        table_key = (key[0], key[1], proposal_id)
+        proposal = self._proposals.get(table_key)
+        if proposal is None:
+            self._ignored[IGNORED_UNKNOWN_ID] += 1
+            return
+        if command == propose.reject_command:
+            del self._proposals[table_key]
+            fact = _proposal_fact(proposal, DECISION_REJECTED, author_id)
+            fact.update(status="success", disposition=DISPOSITION_REJECTED)
+            self._publish(fact)
+            return
+        # Outside the publisher's chain: the platform request is awaited.
+        task = asyncio.ensure_future(self._approve(table_key, proposal, author_id))
+        self._approvals.add(task)
+        task.add_done_callback(self._approvals.discard)
+
+    async def _approve(
+        self, table_key: tuple[str, str, str], proposal: Proposal, author_id: str
+    ) -> None:
+        """Apply one approved proposal; publish its one fact.
+
+        The proposal leaves the table inside the channel's locked
+        check-and-reserve section: a concurrent second approval finds none.
+        The application is bounded by the action's timeout on the sleeper.
+        """
+
+        state = {"claimed": False, "emitted": False, "concluded": False}
+
+        def claim() -> bool:
+            # A work that outlived its approval never takes the proposal.
+            if state["concluded"] or self._proposals.get(table_key) is not proposal:
+                return False
+            del self._proposals[table_key]
+            state["claimed"] = True
+            return True
+
+        def mark_emitted() -> None:
+            if not state["concluded"]:
+                state["emitted"] = True
+
+        work = asyncio.ensure_future(
+            self._apply(proposal.key, proposal.request, mark_emitted=mark_emitted, claim=claim)
+        )
+        timer = asyncio.ensure_future(self._sleeper(self._approval_timeout))
+        interrupted = False
+        try:
+            await asyncio.wait({work, timer}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            interrupted = True
+        # From here nothing awaits: the decision and its one fact are made in
+        # this step, so neither a cancellation nor a service that holds on to
+        # its cancellation can delay or suppress them.
+        state["concluded"] = True
+        outcome: ApplicationOutcome | None = None
+        failed = False
+        if work.done() and not work.cancelled():
+            if work.exception() is None:
+                outcome = work.result()
+            else:
+                failed = True
+                self._diagnose("approval: failed")
+        self._detach(work)
+        self._detach(timer)
+        if outcome is None and not state["claimed"]:
+            # Nothing was taken from the table: an approval that found no
+            # proposal, or one interrupted before its turn.
+            if not interrupted and not failed:
+                self._ignored[IGNORED_UNKNOWN_ID] += 1
+            if interrupted:
+                raise asyncio.CancelledError
+            return
+        if outcome is None:
+            outcome = (
+                ApplicationOutcome(
+                    "external_unknown",
+                    code=ERROR_EXTERNAL_UNKNOWN,
+                    message="the request left and its answer is lost",
+                    requests=1,
+                )
+                if state["emitted"]
+                else ApplicationOutcome(
+                    "cancelled" if interrupted else "error",
+                    code=ERROR_CANCELLED if interrupted else _ERROR_TIMEOUT,
+                    message="the approval ended before its request left",
+                )
+            )
+        fact = _proposal_fact(proposal, DECISION_APPROVED, author_id)
+        target = self._target(proposal.key, proposal.request.message_id)
+        if target is not None:
+            fact["target_author_id"] = target.author_id
+        fact.update(status=outcome.status, disposition=outcome.disposition, code=outcome.code)
+        self._publish(fact)
+        if interrupted:
+            raise asyncio.CancelledError
+
+    def _detach(self, task: "asyncio.Future[Any]") -> None:
+        """Cancel *task* without waiting; keep it supervised until it ends.
+
+        An approval's bound is its timeout: a work still running then is not
+        awaited, only retained so its end is observed and a late failure is
+        diagnosed.
+        """
+
+        if task.done():
+            if not task.cancelled():
+                task.exception()
+            return
+        task.cancel()
+        self._detached.add(task)
+        task.add_done_callback(self._detached_ended)
+
+    def _detached_ended(self, task: "asyncio.Future[Any]") -> None:
+        self._detached.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self._diagnose("approval: failed after its end")
 
     # -- moderation.request --------------------------------------------------- #
 
@@ -865,13 +1226,14 @@ class ModerationModule:
             fact["target_author_id"] = target.author_id
         if mode == MODE_ALERT:
             outcome = ApplicationOutcome("success", disposition=DISPOSITION_ALERTED)
-        elif mode == MODE_PROPOSE:
+        elif mode == MODE_PROPOSE and request.operation not in self._settings.propose.auto_apply:
+            proposal = self._propose(key, request, invocation.call)
+            fact["proposal_id"] = proposal.proposal_id
             outcome = ApplicationOutcome(
-                "refused",
-                code=ERROR_MODE_UNAVAILABLE,
-                message="mode propose is not available yet: nothing was sent",
+                "success", disposition=DISPOSITION_PROPOSED, proposal_id=proposal.proposal_id
             )
         else:
+            # ``act``, or a ``propose`` operation listed in ``auto_apply``.
             outcome = await self.apply(key, request, mark_emitted=invocation.mark_emitted)
         return _observation(provenance, outcome, request)
 
@@ -890,12 +1252,31 @@ class ModerationModule:
         sent. A refusal sends nothing; a reservation is never rolled back.
         """
 
+        outcome = await self._apply(key, request, mark_emitted=mark_emitted)
+        assert outcome is not None  # no claim, so never unclaimed
+        return outcome
+
+    async def _apply(
+        self,
+        key: ChannelKey,
+        request: ModerationRequest,
+        *,
+        mark_emitted: Callable[[], Any] | None = None,
+        claim: Callable[[], bool] | None = None,
+    ) -> ApplicationOutcome | None:
+        """:meth:`apply`, with *claim* run first inside the locked section.
+
+        ``None`` when *claim* returns false: nothing was checked or reserved.
+        """
+
         channel_lock = self._locks.get(key)
         if channel_lock is None:
             channel_lock = self._locks[key] = _ChannelLock()
         channel_lock.users += 1
         try:
             async with channel_lock.lock:
+                if claim is not None and not claim():
+                    return None
                 refusal, prepared = self._check_and_reserve(key, request)
         finally:
             channel_lock.users -= 1
@@ -1036,6 +1417,11 @@ class ModerationModule:
             fact.update(status=status, code=ERROR_EXTERNAL_UNKNOWN if emitted else ERROR_CANCELLED)
         else:
             fact.update(_observed(observation))
+        self._publish(fact)
+
+    def _publish(self, fact: Mapping[str, Any]) -> None:
+        """Hand one decision fact to the loop; ``close`` waits for it."""
+
         task = asyncio.ensure_future(self._emit_fact(fact))
         self._fact_tasks.add(task)
         task.add_done_callback(self._fact_tasks.discard)
@@ -1158,6 +1544,7 @@ def _observation(
                 "disposition": outcome.disposition,
                 "operation": request.operation,
                 "message_id": request.message_id,
+                **({"proposal_id": outcome.proposal_id} if outcome.proposal_id else {}),
             },
         )
     return ActionObservation(
@@ -1191,6 +1578,41 @@ def _fact_base(
     if isinstance(duration, int) and not isinstance(duration, bool):
         fact["duration_seconds"] = duration
     return fact
+
+
+def _proposal_fact(
+    proposal: Proposal, decision: str, decided_by: str | None = None
+) -> dict[str, Any]:
+    """What a decision fact outside a call states about *proposal*."""
+
+    request = proposal.request
+    fact: dict[str, Any] = {
+        "mode": MODE_PROPOSE,
+        "status": None,
+        "disposition": None,
+        "code": None,
+        "operation": request.operation,
+        "platform": proposal.key[0],
+        "channel_id": proposal.key[1],
+        "message_id": request.message_id,
+        "target_author_id": proposal.target_author_id,
+        "reason": request.reason[:REASON_MAX_CHARS],
+        "run_id": proposal.run_id,
+        "call_id": proposal.call_id,
+        "proposal_id": proposal.proposal_id,
+        "decision": decision,
+    }
+    if request.duration_seconds is not None:
+        fact["duration_seconds"] = request.duration_seconds
+    if decided_by is not None:
+        fact["decided_by"] = decided_by
+    return fact
+
+
+def _random_id() -> str:
+    """The default id source: six hexadecimal characters."""
+
+    return secrets.token_hex(3)
 
 
 def _text_or_none(value: Any) -> str | None:
@@ -1261,6 +1683,7 @@ async def activate(
         context,
         ModerationSettings.from_mapping(settings),
         sleeper=settings.get(_SEAM_SLEEPER, asyncio.sleep),
+        id_source=settings.get(_SEAM_ID_SOURCE),
     )
 
 
@@ -1322,9 +1745,16 @@ __all__ = [
     "DEFAULT_REJECT_COMMAND",
     "DEFAULT_WINDOW_SECONDS",
     "DISPOSITION_ALERTED",
+    "COMMAND_ROLES",
+    "DECISION_APPROVED",
+    "DECISION_EXPIRED",
+    "DECISION_REJECTED",
     "DISPOSITION_APPLIED",
+    "DISPOSITION_EXPIRED",
     "DISPOSITION_PROPOSED",
-    "ERROR_MODE_UNAVAILABLE",
+    "DISPOSITION_REJECTED",
+    "IGNORED_UNKNOWN_ID",
+    "IGNORED_UNTRUSTED",
     "ERROR_PLATFORM_REJECTED",
     "ERROR_RATE_LIMITED_PLATFORM",
     "FACT_MODERATION_DECISION",
@@ -1356,6 +1786,7 @@ __all__ = [
     "ModerationModuleError",
     "ModerationRequest",
     "ModerationSettings",
+    "Proposal",
     "ProposeSettings",
     "activate",
     "validate_settings",

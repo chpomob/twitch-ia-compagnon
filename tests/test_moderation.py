@@ -1,5 +1,5 @@
 """``moderation.request`` through the ``moderation`` module (phase 3 R5; AC24,
-AC25, AC27 without Kick, AC28 core cases).
+AC25, AC26, AC27 without Kick, AC28).
 
 Every call goes through the real executor under a real authorization policy
 on a :class:`~conftest.ManualClock`. The moderation service is a
@@ -10,18 +10,20 @@ module's own service over a scripted HTTP session. The target messages reach
 the module the way a platform delivers them: fed to the chat context, then
 published as ``channel.chat.message``. No positive-duration sleep.
 
-Every case also checks the no-silent-outcome rule of R5: the module publishes
-exactly one ``moderation.decision`` fact per request that reaches it.
+Every case also checks the no-silent-outcome rule of R5 (AC28): a shared
+fixture asserts, for every harness a case built, that the number of
+``moderation.decision`` facts equals the requests, approvals, rejections and
+expiries the case drove.
 
 The Kick-named case of AC27 (``delete_message`` on kick →
-``platform_unsupported``) runs with the kick module (plan step P19); the
-propose mode and the per-channel override of AC28 are plan step P15's.
+``platform_unsupported``) runs with the kick module (plan step P19).
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import itertools
 import json
 import re
 from collections import deque
@@ -99,6 +101,24 @@ def clean_fakeplatform():
     fakeplatform.reset()
 
 
+#: Every harness the running case built, for :func:`no_silent_outcome`.
+_HARNESSES: list["ModerationHarness"] = []
+
+
+@pytest.fixture(autouse=True)
+def no_silent_outcome():
+    """AC28: over every AC24–AC28 case, the ``moderation.decision`` facts
+    number the requests, approvals, rejections and expiries — the shared
+    counter each harness keeps, checked once the case is over."""
+
+    _HARNESSES.clear()
+    yield
+    harnesses = list(_HARNESSES)
+    _HARNESSES.clear()
+    for harness in harnesses:
+        harness.assert_one_fact_per_request()
+
+
 class CompanionModerationService(ScriptedModerationService):
     """A scripted service stating the companion's own author identity."""
 
@@ -115,6 +135,24 @@ class BlockingModerationService(ScriptedModerationService):
     async def apply(self, operation: str, **arguments: Any) -> Any:
         answer = await super().apply(operation, **arguments)
         await self.release.wait()
+        return answer
+
+
+class StubbornModerationService(ScriptedModerationService):
+    """Records each request, then holds its answer through any cancellation
+    until ``release`` is set."""
+
+    def __init__(self, **options: Any) -> None:
+        super().__init__(**options)
+        self.release = asyncio.Event()
+
+    async def apply(self, operation: str, **arguments: Any) -> Any:
+        answer = await super().apply(operation, **arguments)
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                continue
         return answer
 
 
@@ -150,6 +188,11 @@ class ModerationHarness:
         self.platform = platform
         self.edge = edge
         self.calls = 0
+        # The decisions outside a call a case drove, each owing one fact.
+        self.approvals = 0
+        self.rejections = 0
+        self.expiries = 0
+        self._commands = 0
 
     async def say(
         self,
@@ -230,13 +273,44 @@ class ModerationHarness:
     def start(self, message_id: str, **options: Any) -> "asyncio.Future[ActionObservation]":
         return asyncio.ensure_future(self.runtime.executor.invoke(self.call(message_id, **options)))
 
+    async def command(
+        self,
+        text: str,
+        author: str,
+        *,
+        roles: list[str] | None = None,
+        channel: str = CHANNEL,
+        counts: str | None = None,
+        provenance: str | None = ROLES_PROVENANCE,
+    ) -> None:
+        """One chat command; *counts* names the decision it owes a fact for
+        (``approval`` or ``rejection``), ``None`` when it must do nothing."""
+
+        self._commands += 1
+        if counts == "approval":
+            self.approvals += 1
+        elif counts == "rejection":
+            self.rejections += 1
+        else:
+            assert counts is None, counts
+        await self.say(
+            f"command-{self._commands}",
+            author,
+            roles=roles,
+            provenance=provenance,
+            channel=channel,
+            text=text,
+        )
+        await settle()
+
     def facts(self) -> list[dict[str, Any]]:
         return [event["payload"] for event in events_of(self.runtime.bus, FACT_MODERATION_DECISION)]
 
     def assert_one_fact_per_request(self) -> None:
-        """R5, AC28: no silent outcome — one fact per request that reached the module."""
+        """R5, AC28: no silent outcome — one fact per request that reached the
+        module, per approval, per rejection and per expiry."""
 
-        assert len(self.facts()) == self.calls
+        assert len(self.facts()) == self.calls + self.approvals + self.rejections + self.expiries
 
     async def close(self) -> None:
         await self.handle.close()
@@ -280,13 +354,18 @@ async def moderation_harness(
         await edge.prepare()
     elif service is not False:
         runtime.for_module(platform).services.publish("moderation", platform, service)
+    ids = (f"p-{number}" for number in itertools.count(1))
     handle = await activate_moderation(
-        runtime.for_module("moderation"), {"_sleeper": clock.sleep, **settings}, {}
+        runtime.for_module("moderation"),
+        {"_sleeper": clock.sleep, "_id_source": lambda: next(ids), **settings},
+        {},
     )
     await handle.prepare()
     if grant:
         runtime.actions._authorization.grant(moderation_rule())
-    return ModerationHarness(runtime, handle, service, clock, platform, edge)
+    harness = ModerationHarness(runtime, handle, service, clock, platform, edge)
+    _HARNESSES.append(harness)
+    return harness
 
 
 def assert_refused(observation: ActionObservation, code: str) -> None:
@@ -465,27 +544,8 @@ async def test_a_call_the_executor_refuses_never_reaches_the_module() -> None:
         await h.say("m-1", "viewer-7")
         assert_refused(await h.request("m-1"), "not_authorized")
         assert h.service.requests == [] and h.facts() == []
-    finally:
-        await h.close()
-
-
-@pytest.mark.asyncio
-async def test_propose_is_refused_until_its_table_exists_with_no_request() -> None:
-    """Plan P14/P15: mode ``propose`` is declared now; until P15 adds its
-    proposal table a request in it sends 0 requests and still publishes its
-    fact. A per-channel override is resolved per request."""
-
-    h = await moderation_harness(mode="propose", channels={f"fake/{OTHER_CHANNEL}": {"mode": "act"}})
-    try:
-        await h.say("m-1", "viewer-7")
-        await h.say("m-2", "viewer-8", channel=OTHER_CHANNEL)
-        assert_refused(await h.request("m-1"), "mode_unavailable")
-        assert h.service.requests == []
-        applied = await h.request("m-2", channel=OTHER_CHANNEL)
-        assert applied.result["disposition"] == "applied"
-        assert len(h.service.requests) == 1
-        assert [fact["mode"] for fact in h.facts()] == ["propose", "act"]
-        h.assert_one_fact_per_request()
+        # The executor's refusal never reached the module: it owes no fact.
+        h.calls -= 1
     finally:
         await h.close()
 
@@ -1249,6 +1309,588 @@ async def test_two_concurrent_requests_on_two_channels_both_send() -> None:
         h.assert_one_fact_per_request()
     finally:
         service.release.set()
+        await h.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC26 — mode propose: proposals, commands, expiry, eviction, auto_apply
+# --------------------------------------------------------------------------- #
+
+BROADCASTER = "streamer-1"
+MODERATOR = "mod-1"
+PROPOSE = {"mode": "propose"}
+
+
+async def proposed(h: ModerationHarness, message_id: str, **options: Any) -> str:
+    """One request in mode ``propose``: its proposal id, after 0 requests."""
+
+    before = len(h.service.requests)
+    observation = await h.request(message_id, **options)
+    assert observation.status == "success", observation
+    assert observation.result["disposition"] == "proposed"
+    assert len(h.service.requests) == before
+    return observation.result["proposal_id"]
+
+
+@pytest.mark.asyncio
+async def test_ac26_a_request_in_mode_propose_yields_a_proposal_id_and_no_request() -> None:
+    """AC26: a request in mode ``propose`` ends ``success`` disposition
+    ``proposed`` with a proposal id from the injected id source, sends 0
+    platform requests, and its one fact carries the id.
+
+    Supersedes P14's interim ``refused mode_unavailable`` for mode
+    ``propose`` (R5, AC26: plan step P15 adds the proposal table)."""
+
+    h = await moderation_harness(**PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        observation = await h.request("m-1")
+        assert observation.status == "success", observation
+        assert observation.result == {
+            "disposition": "proposed",
+            "operation": "delete_message",
+            "message_id": "m-1",
+            "proposal_id": "p-1",
+        }
+        assert h.service.requests == []
+        assert h.handle.pending("fake", CHANNEL) == ("p-1",)
+        (fact,) = h.facts()
+        assert (fact["mode"], fact["status"], fact["disposition"]) == (
+            "propose",
+            "success",
+            "proposed",
+        )
+        assert fact["proposal_id"] == "p-1" and fact["target_author_id"] == "viewer-7"
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac26_the_broadcaster_approves_with_one_request_and_applied() -> None:
+    """AC26: ``!modok <id>`` from the trusted broadcaster applies the
+    proposal — 1 platform request, one fact ``applied`` naming the approver;
+    the proposal leaves the table, so a second approval does nothing."""
+
+    h = await moderation_harness(**PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1", reason="spam link")
+        await h.command(
+            f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"], counts="approval"
+        )
+        (sent,) = h.service.requests
+        assert (sent["operation"], sent["message_id"], sent["target_author_id"]) == (
+            "delete_message",
+            "m-1",
+            "viewer-7",
+        )
+        assert sent["reason"] == "spam link"
+        approval = h.facts()[-1]
+        assert (approval["decision"], approval["status"], approval["disposition"]) == (
+            "approved",
+            "success",
+            "applied",
+        )
+        assert approval["proposal_id"] == proposal_id and approval["decided_by"] == BROADCASTER
+        assert approval["call_id"] == h.facts()[0]["call_id"]
+        assert h.handle.pending("fake", CHANNEL) == ()
+        assert h.handle.window("fake", CHANNEL) == (START,)
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"])
+        assert len(h.service.requests) == 1
+        assert h.handle.ignored_commands["unknown_id"] == 1
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac26_an_approval_without_a_trusted_role_applies_nothing() -> None:
+    """AC26: the same command from a viewer (no trusted role), from a VIP, or
+    naming the id from another channel applies nothing — 0 requests, no fact, counted — and the proposal still
+    waits for the broadcaster."""
+
+    h = await moderation_harness(**PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        await h.command(f"!modok {proposal_id}", "viewer-8")
+        await h.command(f"!modok {proposal_id}", "vip-1", roles=["vip"])
+        assert h.handle.ignored_commands["untrusted"] == 2
+        # The channel is part of the lookup key.
+        await h.command(
+            f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"], channel=OTHER_CHANNEL
+        )
+        await h.command(f"!modno {proposal_id}", MODERATOR, roles=["moderator"], channel=OTHER_CHANNEL)
+        assert h.handle.ignored_commands["unknown_id"] == 2
+        # Neither a command word alone nor a longer line is a command.
+        await h.command("!modok", BROADCASTER, roles=["broadcaster"])
+        await h.command(f"!modok {proposal_id} now", BROADCASTER, roles=["broadcaster"])
+        assert h.service.requests == [] and len(h.facts()) == 1
+        assert h.handle.pending("fake", CHANNEL) == (proposal_id,)
+        await h.command(
+            f"!modok {proposal_id}", MODERATOR, roles=["moderator"], counts="approval"
+        )
+        assert len(h.service.requests) == 1
+        assert h.facts()[-1]["disposition"] == "applied"
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_no_platform_attested_decide_nothing() -> None:
+    """AC26: a broadcaster role without ``author.roles_provenance`` is not
+    trusted — the approval is counted and applies nothing."""
+
+    h = await moderation_harness(platform="twitch", **PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        await h.command(f"!modok {proposal_id}", "viewer-9", roles=["broadcaster"], provenance=None)
+        assert h.handle.ignored_commands["untrusted"] == 1
+        assert h.service.requests == [] and len(h.facts()) == 1
+        assert h.handle.pending("twitch", CHANNEL) == (proposal_id,)
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac26_a_moderator_rejection_discards_the_proposal() -> None:
+    """AC26: ``!modno <id>`` from a trusted moderator discards the proposal —
+    one ``rejected`` fact, 0 requests; a later approval finds nothing."""
+
+    h = await moderation_harness(**PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        await h.command(f"!modno {proposal_id}", MODERATOR, roles=["moderator"], counts="rejection")
+        rejection = h.facts()[-1]
+        assert (rejection["decision"], rejection["status"], rejection["disposition"]) == (
+            "rejected",
+            "success",
+            "rejected",
+        )
+        assert rejection["decided_by"] == MODERATOR and rejection["code"] is None
+        assert h.handle.pending("fake", CHANNEL) == ()
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"])
+        assert h.service.requests == []
+        assert h.handle.ignored_commands["unknown_id"] == 1
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac26_an_unapproved_proposal_expires_after_300_seconds() -> None:
+    """AC26: on the injected clock an unapproved proposal still waits at
+    299 s and expires at 300 s with exactly 1 ``expired`` fact, published by
+    the supervised sweep; an approval after it applies nothing."""
+
+    h = await moderation_harness(**PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        h.clock.advance(299.0)
+        await settle()
+        assert len(h.facts()) == 1 and h.handle.pending("fake", CHANNEL) == (proposal_id,)
+        h.clock.advance(1.0)
+        await settle()
+        h.expiries += 1
+        expired = [fact for fact in h.facts() if fact["disposition"] == "expired"]
+        assert len(expired) == 1
+        assert (expired[0]["decision"], expired[0]["status"]) == ("expired", "success")
+        assert expired[0]["proposal_id"] == proposal_id
+        assert h.handle.pending("fake", CHANNEL) == ()
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"])
+        h.clock.advance(3600.0)
+        await settle()
+        assert h.service.requests == [] and len(expired) == 1
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac26_the_ttl_is_configurable_and_the_sweep_follows_new_proposals() -> None:
+    """``proposal_ttl_seconds``: each proposal expires on its own instant,
+    also when it was stored while the sweep was idle."""
+
+    h = await moderation_harness(mode="propose", propose={"proposal_ttl_seconds": 30})
+    try:
+        await h.say("m-1", "viewer-7")
+        await h.say("m-2", "viewer-8")
+        first = await proposed(h, "m-1")
+        h.clock.advance(20.0)
+        second = await proposed(h, "m-2")
+        h.clock.advance(10.0)
+        await settle()
+        h.expiries += 1
+        assert h.handle.pending("fake", CHANNEL) == (second,)
+        h.clock.advance(20.0)
+        await settle()
+        h.expiries += 1
+        assert [fact["proposal_id"] for fact in h.facts() if fact["disposition"] == "expired"] == [
+            first,
+            second,
+        ]
+        # The idle sweep wakes for a proposal stored later.
+        await h.say("m-3", "viewer-9")
+        third = await proposed(h, "m-3")
+        h.clock.advance(30.0)
+        await settle()
+        h.expiries += 1
+        assert h.facts()[-1]["proposal_id"] == third
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac26_with_max_pending_2_a_third_proposal_evicts_the_closest_to_expiry() -> None:
+    """AC26: with ``max_pending: 2`` the third proposal evicts the one
+    closest to expiry, which publishes its ``expired`` fact."""
+
+    h = await moderation_harness(mode="propose", propose={"max_pending": 2})
+    try:
+        for index in range(1, 4):
+            await h.say(f"m-{index}", f"viewer-{index}")
+        first = await proposed(h, "m-1")
+        h.clock.advance(10.0)
+        second = await proposed(h, "m-2", channel=CHANNEL)
+        h.clock.advance(10.0)
+        third = await proposed(h, "m-3")
+        h.expiries += 1
+        assert h.handle.pending("fake", CHANNEL) == (second, third)
+        (evicted,) = [fact for fact in h.facts() if fact["disposition"] == "expired"]
+        assert evicted["proposal_id"] == first and evicted["message_id"] == "m-1"
+        await h.command(f"!modok {first}", BROADCASTER, roles=["broadcaster"])
+        assert h.service.requests == []
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac26_auto_apply_applies_a_delete_at_once_under_the_strict_rules() -> None:
+    """AC26: ``auto_apply: [delete_message]`` applies a delete at once — 1
+    request, ``applied``, nothing stored — under the strict rules (a
+    protected author is still ``target_protected`` with 0 requests); an
+    operation outside ``auto_apply`` is still proposed."""
+
+    h = await moderation_harness(
+        mode="propose",
+        act={"operations": ["delete_message", "timeout"]},
+        propose={"auto_apply": ["delete_message"]},
+    )
+    try:
+        await h.say("m-1", "viewer-7")
+        await h.say("m-2", "mod-2", roles=["moderator"])
+        await h.say("m-3", "viewer-9")
+        observation = await h.request("m-1")
+        assert observation.status == "success" and observation.result["disposition"] == "applied"
+        assert len(h.service.requests) == 1
+        assert h.handle.pending("fake", CHANNEL) == ()
+        assert_refused(await h.request("m-2"), "target_protected")
+        assert len(h.service.requests) == 1
+        assert await proposed(h, "m-3", operation="timeout", duration=60) == "p-1"
+        assert [fact["mode"] for fact in h.facts()] == ["propose"] * 3
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_checks_the_strict_rules_on_the_state_at_approval() -> None:
+    """Plan P15 risk: the rules read the state at approval — a message that
+    left the chat context since the proposal is ``target_unknown``, and an
+    operation outside ``act.operations`` is ``operation_not_allowed``; each
+    approval sends 0 requests and publishes its one fact."""
+
+    h = await moderation_harness(mode="propose", chat_max_messages=2)
+    try:
+        await h.say("m-1", "viewer-7")
+        stale = await proposed(h, "m-1")
+        await h.say("m-2", "viewer-8")
+        timeout = await proposed(h, "m-2", operation="timeout", duration=60)
+        await h.say("m-3", "viewer-9")
+        await h.command(f"!modok {stale}", BROADCASTER, roles=["broadcaster"], counts="approval")
+        await h.command(f"!modok {timeout}", BROADCASTER, roles=["broadcaster"], counts="approval")
+        refusals = [fact for fact in h.facts() if fact.get("decision") == "approved"]
+        assert [(fact["status"], fact["code"]) for fact in refusals] == [
+            ("refused", "target_unknown"),
+            ("refused", "operation_not_allowed"),
+        ]
+        assert h.service.requests == []
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_outcomes_map_like_act() -> None:
+    """An approval's request maps as ``act`` does (``platform_rejected``)."""
+
+    service = CompanionModerationService(outcomes=["rejected"])
+    h = await moderation_harness(service, **PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"], counts="approval")
+        approval = h.facts()[-1]
+        assert (approval["status"], approval["code"]) == ("error", "platform_rejected")
+        assert len(service.requests) == 1
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_an_approval_whose_request_hangs_is_bounded_and_external_unknown() -> None:
+    """An approval is bounded by the action's timeout on the sleeper: a
+    request still pending then ends ``external_unknown`` with its one fact."""
+
+    service = BlockingModerationService()
+    h = await moderation_harness(service, **PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"], counts="approval")
+        assert len(service.requests) == 1 and len(h.facts()) == 1
+        h.clock.advance(10.0)
+        await settle()
+        approval = h.facts()[-1]
+        assert (approval["status"], approval["code"]) == (
+            "external_unknown",
+            "external_effect_unknown",
+        )
+    finally:
+        service.release.set()
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_an_approval_whose_service_holds_its_cancellation_is_still_bounded() -> None:
+    """The approval's timeout bounds its fact: a service that holds on to its
+    cancellation does not delay the ``external_unknown`` fact, nor ``close``."""
+
+    service = StubbornModerationService()
+    h = await moderation_harness(service, **PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"], counts="approval")
+        assert len(service.requests) == 1
+        h.clock.advance(10.0)
+        await settle()
+        approval = h.facts()[-1]
+        assert (approval["decision"], approval["status"], approval["code"]) == (
+            "approved",
+            "external_unknown",
+            "external_effect_unknown",
+        )
+        await asyncio.wait_for(h.close(), 1.0)
+        h.assert_one_fact_per_request()
+    finally:
+        service.release.set()
+        await settle()
+
+
+@pytest.mark.asyncio
+async def test_close_during_an_approval_in_flight_still_publishes_its_one_fact() -> None:
+    """A cleanup cancellation of an approval whose request left publishes its
+    one decision, ``external_unknown``, even when the service holds on."""
+
+    service = StubbornModerationService()
+    h = await moderation_harness(service, **PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"], counts="approval")
+        assert len(service.requests) == 1
+        await asyncio.wait_for(h.close(), 1.0)
+        await settle()
+        approval = h.facts()[-1]
+        assert (approval["decision"], approval["status"]) == ("approved", "external_unknown")
+        h.assert_one_fact_per_request()
+        assert h.handle.pending("fake", CHANNEL) == ()
+    finally:
+        service.release.set()
+        await settle()
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_or_repeated_id_falls_back_to_a_fresh_one() -> None:
+    """Ids stay unique per channel whatever the injected source returns."""
+
+    h = await moderation_harness(mode="propose", _id_source=lambda: "same")
+    try:
+        await h.say("m-1", "viewer-7")
+        await h.say("m-2", "viewer-8")
+        first = await proposed(h, "m-1")
+        second = await proposed(h, "m-2")
+        assert first == "same" and second != first
+        assert h.handle.pending("fake", CHANNEL) == (first, second)
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_and_auto_apply_launched_together_send_one_request() -> None:
+    """AC26 concurrency (F-P2): with the blocking service and
+    ``max_actions_per_window: 1``, an approval of proposal A and an
+    ``auto_apply`` request launched together give exactly 1 request and 1
+    ``rate_limited`` fact — both go through the one locked
+    check-and-reserve."""
+
+    service = BlockingModerationService()
+    h = await moderation_harness(
+        service,
+        mode="propose",
+        max_actions_per_window=1,
+        act={"operations": ["delete_message", "timeout"]},
+        propose={"auto_apply": ["delete_message"]},
+    )
+    try:
+        await h.say("m-1", "viewer-7")
+        await h.say("m-2", "viewer-8")
+        proposal_a = await proposed(h, "m-1", operation="timeout", duration=60)
+        h.approvals += 1
+        auto = h.start("m-2")
+        approve = asyncio.ensure_future(
+            h.say("command-a", BROADCASTER, roles=["broadcaster"], text=f"!modok {proposal_a}")
+        )
+        await wait_until(lambda: len(h.facts()) == 2)
+        await settle()
+        assert len(service.requests) == 1
+        (refusal,) = [fact for fact in h.facts() if fact["status"] == "refused"]
+        assert refusal["code"] == "rate_limited"
+        service.release.set()
+        await approve
+        await auto
+        await settle()
+        assert len(service.requests) == 1
+        outcomes = sorted(
+            fact["disposition"] or fact["code"] for fact in h.facts()[1:]
+        )
+        assert outcomes == ["applied", "rate_limited"]
+    finally:
+        service.release.set()
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_two_approvals_of_one_proposal_launched_together_send_one_request() -> None:
+    """AC26 concurrency (F-P2): two ``!modok <id>`` for the same proposal
+    launched together give 1 request — the proposal leaves the table under
+    the channel lock before the application, so the second approval finds
+    an unknown id."""
+
+    service = BlockingModerationService()
+    h = await moderation_harness(service, **PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        proposal_id = await proposed(h, "m-1")
+        h.approvals += 1
+        both = asyncio.ensure_future(
+            asyncio.gather(
+                h.say("command-a", BROADCASTER, roles=["broadcaster"], text=f"!modok {proposal_id}"),
+                h.say("command-b", MODERATOR, roles=["moderator"], text=f"!modok {proposal_id}"),
+            )
+        )
+        await both
+        await wait_until(lambda: len(service.requests) == 1)
+        await settle()
+        assert len(service.requests) == 1
+        assert h.handle.ignored_commands["unknown_id"] == 1
+        service.release.set()
+        await settle()
+        assert len(service.requests) == 1
+        assert h.facts()[-1]["disposition"] == "applied"
+    finally:
+        service.release.set()
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_the_drain_stops_the_sweep_and_waits_for_an_approval_in_flight() -> None:
+    """Phase lifecycle: the drain stops the expiry sweep and ignores new
+    commands, and gives an approval in flight the drain deadline."""
+
+    service = BlockingModerationService()
+    h = await moderation_harness(service, **PROPOSE)
+    try:
+        await h.say("m-1", "viewer-7")
+        await h.say("m-2", "viewer-8")
+        first = await proposed(h, "m-1")
+        second = await proposed(h, "m-2")
+        await h.command(f"!modok {first}", BROADCASTER, roles=["broadcaster"], counts="approval")
+        drain = asyncio.ensure_future(h.handle.drain(5.0))
+        await settle()
+        assert not drain.done()
+        await h.command(f"!modok {second}", BROADCASTER, roles=["broadcaster"])
+        assert len(service.requests) == 1
+        service.release.set()
+        await drain
+        await settle()
+        assert h.facts()[-1]["disposition"] == "applied"
+        h.clock.advance(3600.0)
+        await settle()
+        assert h.handle.pending("fake", CHANNEL) == (second,)
+    finally:
+        service.release.set()
+        await h.close()
+
+
+# --------------------------------------------------------------------------- #
+# AC28 — the per-channel override
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac28_the_override_twitch_c2_act_leaves_twitch_c1_in_alert() -> None:
+    """AC28: with the per-channel override ``twitch/c2: act`` and no
+    ``mode``, a delete on ``twitch/c1`` is ``alerted`` with 0 requests and
+    one on ``twitch/c2`` is ``applied`` with 1 request — the mode is
+    resolved per request."""
+
+    h = await moderation_harness(platform="twitch", channels={"twitch/c2": {"mode": "act"}})
+    try:
+        await h.say("m-1", "viewer-7", channel="c1")
+        await h.say("m-2", "viewer-8", channel="c2")
+        alerted = await h.request("m-1", channel="c1")
+        assert alerted.result["disposition"] == "alerted"
+        assert h.service.requests == []
+        applied = await h.request("m-2", channel="c2")
+        assert applied.result["disposition"] == "applied"
+        (sent,) = h.service.requests
+        assert sent["channel_id"] == "c2"
+        assert [(fact["channel_id"], fact["mode"]) for fact in h.facts()] == [
+            ("c1", "alert"),
+            ("c2", "act"),
+        ]
+        # c1 stays in alert after c2 acted.
+        await h.say("m-3", "viewer-9", channel="c1")
+        assert (await h.request("m-3", channel="c1")).result["disposition"] == "alerted"
+        assert len(h.service.requests) == 1
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_a_propose_override_proposes_on_its_channel_only() -> None:
+    """An override to ``propose`` on one channel proposes there, and its
+    approval command is read in that channel only."""
+
+    h = await moderation_harness(mode="act", channels={f"fake/{OTHER_CHANNEL}": {"mode": "propose"}})
+    try:
+        await h.say("m-1", "viewer-7")
+        await h.say("m-2", "viewer-8", channel=OTHER_CHANNEL)
+        assert (await h.request("m-1")).result["disposition"] == "applied"
+        proposal_id = await proposed(h, "m-2", channel=OTHER_CHANNEL)
+        assert h.handle.pending("fake", OTHER_CHANNEL) == (proposal_id,)
+        await h.command(f"!modok {proposal_id}", BROADCASTER, roles=["broadcaster"])
+        assert len(h.service.requests) == 1
+        await h.command(
+            f"!modok {proposal_id}",
+            BROADCASTER,
+            roles=["broadcaster"],
+            channel=OTHER_CHANNEL,
+            counts="approval",
+        )
+        assert len(h.service.requests) == 2
+        assert h.facts()[-1]["disposition"] == "applied"
+    finally:
         await h.close()
 
 

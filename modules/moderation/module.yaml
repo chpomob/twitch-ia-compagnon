@@ -23,8 +23,10 @@ consumes:
 middleware: false
 
 # No lifecycle role: the handle takes part in `prepare` (resolve the
-# moderation services, index the chat, bind, mark ready), `drain` (refuse new
-# requests, wait for the ones in flight) and `close` (withdraw readiness).
+# moderation services, index the chat, bind, spawn the supervised proposal
+# expiry sweep when a mode `propose` is configured, mark ready), `drain` (stop
+# the sweep, refuse new requests and commands, wait for the requests and
+# approvals in flight) and `close` (withdraw readiness).
 lifecycle:
   roles: []
 
@@ -92,11 +94,38 @@ settings_schema:
     propose:
       type: object
       description: >-
-        The proposal settings of mode `propose`: `max_pending` (1–256,
-        default 32), `proposal_ttl_seconds` (30–3600, default 300),
-        `auto_apply` (operations applied at once, default empty),
-        `approve_command` (default `!modok`) and `reject_command` (default
-        `!modno`).
+        The proposal settings of mode `propose`. A proposal is applied by
+        `<approve_command> <id>` or discarded by `<reject_command> <id>`,
+        authored in its own channel by a trusted broadcaster or moderator.
+      properties:
+        max_pending:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: >-
+            How many proposals may wait; a new one evicts the one closest to
+            expiry, which is recorded `expired`. Default 32.
+        proposal_ttl_seconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          description: How long a proposal waits before it expires. Default 300.
+        auto_apply:
+          type: array
+          items:
+            type: string
+            enum:
+              - delete_message
+              - timeout
+          description: >-
+            The operations applied at once, under the strict rules, instead of
+            waiting for an approval. Default empty.
+        approve_command:
+          type: string
+          description: The chat command that applies a proposal. Default `!modok`.
+        reject_command:
+          type: string
+          description: The chat command that discards a proposal. Default `!modno`.
     limits:
       type: object
       description: >-
