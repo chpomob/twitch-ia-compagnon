@@ -50,6 +50,7 @@ modules = ["*/module.yaml"]
 "modules.viewer_memory" = ["module.yaml"]
 "modules.moderation" = ["module.yaml"]
 "modules.watch" = ["module.yaml"]
+"modules.kick" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

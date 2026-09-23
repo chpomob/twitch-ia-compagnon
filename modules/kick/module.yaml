@@ -1,0 +1,214 @@
+# Kick signed-webhook chat input — manifest v2 (phase 3 R7).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no credential, no companion name and no
+# grant lives here. The platform posts its events to a local listener this
+# module runs; reaching that listener over public HTTPS is a deployment
+# prerequisite, not something this module provides.
+
+name: kick
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+produces:
+  - channel.chat.message
+consumes: []
+middleware: false
+
+# Lifecycle role, never the module name, decides what each phase asks of this
+# module (R4). An `input` is a producer: `prepare` reads the platform public
+# key (configured, or fetched once), `start_inputs` binds the listener after
+# the readiness barrier, `stop_inputs` unbinds it and `close` releases the
+# transport.
+lifecycle:
+  roles:
+    - input
+
+# Business settings belong to the module (R7). The schema states the shape;
+# the declared hook, defined by the module package, checks each field and
+# reports one diagnostic per offending field naming module and field, with
+# no configured value echoed back.
+settings_schema:
+  type: object
+  properties:
+    client_secret:
+      type: string
+      description: Application secret, resolved from an environment reference.
+    access_token:
+      type: string
+      description: User token authorising the webhook subscriptions and sends.
+    listener:
+      type: object
+      description: >-
+        The local address the webhook listener binds. The platform must reach
+        it over public HTTPS (a reverse proxy or tunnel in front of it).
+      properties:
+        host:
+          type: string
+          description: Interface to bind, for example `127.0.0.1`.
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: Port to bind; `0` lets the system choose one.
+      required:
+        - host
+        - port
+      additionalProperties: false
+    public_key:
+      type: string
+      description: >-
+        The platform's webhook signing key as a PEM public key. Absent, it is
+        fetched once at preparation from the platform's public-key endpoint.
+    channels:
+      type: array
+      description: >-
+        The broadcaster user identifiers whose events are ingested; an
+        authentic delivery for another channel is ignored and counted.
+      items:
+        type: string
+    companion_name:
+      type: string
+      description: >-
+        The name viewers use to address the companion, also its account name
+        on the platform (anti-echo). Configuration owns this value; the
+        default trigger policy below refers to it by token only.
+    bot_user_id:
+      type: string
+      description: >-
+        The companion's own account identifier, when known; a message it
+        authored is dropped before anything else (anti-echo).
+    notices:
+      type: object
+      description: >-
+        Community notices (R1). Absent or empty, only chat messages are
+        ingested. A listed kind is fed to the chat context, trigger-evaluated
+        and admitted like a message; an unlisted or unmapped event type is
+        ignored and counted.
+      properties:
+        kinds:
+          type: array
+          description: The notice kinds this module ingests (default none).
+          items:
+            type: string
+            enum:
+              - sub
+              - resub
+              - sub_gift
+              - follow
+      additionalProperties: false
+    dedup:
+      type: object
+      description: >-
+        The bounded window of delivery message identifiers; a delivery whose
+        identifier is still retained is refused as a duplicate.
+      properties:
+        max_entries:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          description: How many identifiers are retained. Default 4096.
+        window_seconds:
+          type: integer
+          minimum: 300
+          maximum: 86400
+          description: >-
+            How long an identifier is retained, never shorter than the 300 s
+            timestamp tolerance. Default 600.
+      additionalProperties: false
+  required:
+    - client_secret
+    - access_token
+    - listener
+    - channels
+    - companion_name
+settings_validator: validate_settings
+
+# The settings above that are credentials (R8). Their accepted values —
+# literal or resolved from `${NAME}` — are redacted from every supervision
+# trace and lost-trace diagnostic before this module is activated. The
+# public key is not a secret and the channel identifiers are what traces
+# correlate by, so neither is declared.
+credentials:
+  - client_secret
+  - access_token
+
+# Trigger declaration for the chat input (R1, R7): the same types, operators
+# and default as the other chat inputs.
+triggers:
+  types:
+    - name: probability
+      parameter_schema:
+        type: object
+        properties:
+          probability:
+            type: number
+            minimum: 0
+            maximum: 1
+        required:
+          - probability
+        additionalProperties: false
+    - name: audience
+      parameter_schema:
+        type: object
+        properties:
+          audience:
+            type: string
+            enum:
+              - broadcaster
+              - everyone
+              - moderators
+              - subscribers
+              - vips
+        required:
+          - audience
+        additionalProperties: false
+    - name: keyword
+      parameter_schema:
+        type: object
+        properties:
+          keywords:
+            type: array
+            items:
+              type: string
+        required:
+          - keywords
+        additionalProperties: false
+    # Selects on the normalised event's kind (R1): `message` for a chat
+    # message, the notice kind for a community notice.
+    - name: event_kind
+      parameter_schema:
+        type: object
+        properties:
+          kinds:
+            type: array
+            items:
+              type: string
+              enum:
+                - message
+                - sub
+                - resub
+                - sub_gift
+                - community_sub_gift
+                - raid
+                - follow
+                - tip
+                - watch_tick
+        required:
+          - kinds
+        additionalProperties: false
+  combinations:
+    - all_of
+    - any_of
+    - none_of
+  # "The message text mentions the configured companion name"; the
+  # `${companion_name}` token is resolved by the trigger registry.
+  default_policy:
+    combination: all_of
+    rules:
+      - type: keyword
+        parameters:
+          keywords:
+            - "${companion_name}"

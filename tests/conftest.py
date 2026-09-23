@@ -32,7 +32,10 @@ seams, the Helix answers of the twitch clip and moderation endpoints
 (:func:`helix_clip_created`, :func:`helix_clip_listed`,
 :func:`helix_clips_empty`, :func:`helix_refusal`, :func:`helix_not_live`,
 :func:`helix_message_deleted`, :func:`helix_timeout_applied`), and a
-viewer-memory directory (:func:`memory_directory`). A suite that mocked the
+viewer-memory directory (:func:`memory_directory`), and the Kick webhook
+edge: a fixed, test-only RSA key pair (:data:`KICK_TEST_KEY`) and a
+:class:`SignedWebhookSender` that signs deliveries with it and posts them
+through an in-process ``aiohttp`` test client. A suite that mocked the
 executor would hide AC19's executor-confirmed delivery, so the executor is
 never mocked here.
 
@@ -59,7 +62,9 @@ motivated it (P24).
 from __future__ import annotations
 
 import asyncio
+import base64
 import errno
+import hashlib
 import json
 import random
 import struct
@@ -67,6 +72,7 @@ import zlib
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
@@ -2223,6 +2229,176 @@ def trace_texts(bus: EventBus) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# The Kick webhook edge (phase 3 P18): a signed delivery, standard library only
+# --------------------------------------------------------------------------- #
+
+
+class KickTestKey(NamedTuple):
+    """An RSA key pair for the Kick webhook suite: **TEST-ONLY, NEVER A SECRET**.
+
+    Generated once for this repository's tests and published with them on
+    purpose; it signs nothing but in-process test deliveries. ``public_pem``
+    is what a module is configured with (a SubjectPublicKeyInfo PEM),
+    ``private_exponent`` is what :class:`SignedWebhookSender` signs with.
+    """
+
+    public_pem: str
+    modulus: int
+    public_exponent: int
+    private_exponent: int
+
+    @property
+    def size_bytes(self) -> int:
+        return (self.modulus.bit_length() + 7) // 8
+
+
+#: TEST-ONLY RSA-2048 key pair (see :class:`KickTestKey`).
+KICK_TEST_KEY = KickTestKey(
+    public_pem=(
+        "-----BEGIN PUBLIC KEY-----\n"
+        "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqWl5WKQUnFyDRgT7Fkkh\n"
+        "5+nhXOlq6g7ZeDt2w9kDYFg1+zJtEDRIQHe7F/Xeap9VOQrRcasIX+7g1AxXvVbJ\n"
+        "ZwzoTQ9N/igYZgrsoPKQz+tbLCJe1PvDPn6X8aTiqon8sgRKOSzdZ2Zhb9b7gN/W\n"
+        "wzM2fofbezjgsV4bA6gRhbJ1tF/wTA00LMyUvWO2P7m6KVmg77eyOVS/EL4gUhqR\n"
+        "ZPHBZ2Q7zZbW6tFagKnL1u0S35I/bQKqvHQDTj6V34vhS+cd02kAVATwAFbnKyEV\n"
+        "/HO6ToMOziucvFlTG3dXhk5ZpB6eTvCVWURHjn9S0y60UkayljSYviIF73KjfnD9\n"
+        "8QIDAQAB\n"
+        "-----END PUBLIC KEY-----\n"
+    ),
+    modulus=int(
+        "a9697958a4149c5c834604fb164921e7e9e15ce96aea0ed9783b76c3d9036058"
+        "35fb326d1034484077bb17f5de6a9f55390ad171ab085feee0d40c57bd56c967"
+        "0ce84d0f4dfe2818660aeca0f290cfeb5b2c225ed4fbc33e7e97f1a4e2aa89fc"
+        "b2044a392cdd6766616fd6fb80dfd6c333367e87db7b38e0b15e1b03a81185b2"
+        "75b45ff04c0d342ccc94bd63b63fb9ba2959a0efb7b23954bf10be20521a9164"
+        "f1c167643bcd96d6ead15a80a9cbd6ed12df923f6d02aabc74034e3e95df8be1"
+        "4be71dd369005404f00056e72b2115fc73ba4e830ece2b9cbc59531b7757864e"
+        "59a41e9e4ef0955944478e7f52d32eb45246b2963498be2205ef72a37e70fdf1",
+        16,
+    ),
+    public_exponent=65537,
+    private_exponent=int(
+        "5bc2ffb15d9eb45affd7eb56bd697b6e0ca6bf16c78c63e2b357322b3edeaf4e"
+        "d85e699fdd891421a738b5efbd3b6f764fe16634f57921cd580643713ae34950"
+        "0213c9b9a27b29e89d4d0982dc20481ea951ac844544e12a76938295d7189c89"
+        "3d3b49a0d286523d884575e2e0995dd0796ae8fa598dd2ef11e3712a77dc95d7"
+        "83b7da99b8ec82ef4308f387467797533cdff053f2fc9bd6098545785da56183"
+        "71bff4e242c1e4c3a3c4e9add148c8f4af1103193c41fda30ee514bc6ff9021e"
+        "dbfa5af355cb7dbf9ff7ded5bb4087f4f7010c5ea7d5c7828cfc31870f0da3d6"
+        "b22190977eb3a8ed8c6e7e068123f621ac70c4b050e2aa0f2afaeaddb224a69",
+        16,
+    ),
+)
+
+#: The DER DigestInfo prefix of SHA-256 (RFC 8017 §9.2), restated here so the
+#: sender signs without importing the module under test.
+SHA256_DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+class SignedWebhookSender:
+    """Signs and posts Kick webhook deliveries as the platform would.
+
+    The signature is RSASSA-PKCS1-v1_5/SHA-256 over ``message id + "." +
+    timestamp + "." + raw body``, computed as ``pow(m, d, n)`` with *key*;
+    the timestamp is RFC 3339 UTC read from *clock* (epoch seconds, so a
+    :class:`ManualClock` built on an epoch drives it). :meth:`post` sends
+    through an in-process ``aiohttp`` test client (``TestClient``) — nothing
+    leaves the process. Every header and the body can be overridden, so a
+    suite forges a bad signature, a stale timestamp or a duplicate id on
+    purpose.
+    """
+
+    def __init__(self, key: KickTestKey, clock: Callable[[], float]) -> None:
+        self.key = key
+        self.clock = clock
+        self._sequence = 0
+
+    def next_message_id(self) -> str:
+        self._sequence += 1
+        return f"kick-delivery-{self._sequence}"
+
+    def timestamp(self, at: float | None = None) -> str:
+        instant = self.clock() if at is None else at
+        moment = datetime.fromtimestamp(instant, tz=timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def encode(self, message: bytes, digest_info_prefix: bytes = SHA256_DIGEST_INFO_PREFIX) -> bytes:
+        """The EMSA-PKCS1-v1_5 encoding of SHA-256(*message*); a suite forges
+        a wrong DigestInfo by passing another *digest_info_prefix*."""
+
+        digest_info = digest_info_prefix + hashlib.sha256(message).digest()
+        size = self.key.size_bytes
+        return b"\x00\x01" + b"\xff" * (size - len(digest_info) - 3) + b"\x00" + digest_info
+
+    def sign_encoded(self, encoded: bytes) -> str:
+        """``pow(m, d, n)`` of an encoded message, base64."""
+
+        value = pow(int.from_bytes(encoded, "big"), self.key.private_exponent, self.key.modulus)
+        return base64.b64encode(value.to_bytes(self.key.size_bytes, "big")).decode("ascii")
+
+    def sign(self, message_id: str, timestamp: str, body: bytes) -> str:
+        content = message_id.encode("utf-8") + b"." + timestamp.encode("utf-8") + b"." + body
+        return self.sign_encoded(self.encode(content))
+
+    def headers(
+        self,
+        event_type: str,
+        body: bytes,
+        *,
+        message_id: str | None = None,
+        timestamp: str | None = None,
+        signature: str | None = None,
+    ) -> dict[str, str]:
+        """The delivery headers: signed over *body* unless *signature* is given."""
+
+        delivery_id = message_id if message_id is not None else self.next_message_id()
+        stamp = timestamp if timestamp is not None else self.timestamp()
+        return {
+            "Content-Type": "application/json",
+            "Kick-Event-Message-Id": delivery_id,
+            "Kick-Event-Subscription-Id": "subscription-test",
+            "Kick-Event-Message-Timestamp": stamp,
+            "Kick-Event-Type": event_type,
+            "Kick-Event-Version": "1",
+            "Kick-Event-Signature": (
+                signature if signature is not None else self.sign(delivery_id, stamp, body)
+            ),
+        }
+
+    @staticmethod
+    def body(payload: Any) -> bytes:
+        if isinstance(payload, (bytes, bytearray)):
+            return bytes(payload)
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    async def post(
+        self,
+        client: Any,
+        event_type: str,
+        payload: Any,
+        *,
+        path: str = "/",
+        message_id: str | None = None,
+        timestamp: str | None = None,
+        signature: str | None = None,
+    ) -> int:
+        """Post one delivery through *client* (an ``aiohttp`` ``TestClient``,
+        or a client session given a full URL as *path*); return the status."""
+
+        body = self.body(payload)
+        headers = self.headers(
+            event_type,
+            body,
+            message_id=message_id,
+            timestamp=timestamp,
+            signature=signature,
+        )
+        async with client.post(path, data=body, headers=headers) as response:
+            await response.read()
+            return response.status
+
+
+# --------------------------------------------------------------------------- #
 # Self-checks: every suite imports this file, so a broken double fails the run
 # --------------------------------------------------------------------------- #
 
@@ -2275,6 +2451,14 @@ def _self_check() -> None:
         (directory / "a.json").write_text("{}", encoding="utf-8")
         (directory / "notes.txt").write_text("", encoding="utf-8")
         assert json_names() == ["a.json", "b.json"]
+
+    # The test-only Kick key pair is a pair: d inverts e modulo n.
+    key = KICK_TEST_KEY
+    assert key.modulus.bit_length() == 2048 and key.size_bytes == 256
+    assert pow(pow(0x1234567, key.private_exponent, key.modulus), key.public_exponent, key.modulus) == 0x1234567
+    sender = SignedWebhookSender(key, ManualClock(1_700_000_000.0))
+    assert sender.timestamp() == "2023-11-14T22:13:20Z"
+    assert base64.b64decode(sender.sign("id", "t", b"{}")).__len__() == 256
 
 
 async def _self_check_phase3_services() -> None:
