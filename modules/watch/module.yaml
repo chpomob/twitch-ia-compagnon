@@ -1,0 +1,113 @@
+# Configurable continuous capture: the `watch` trigger — manifest v2 (phase 3 R6).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no action and no grant live here. The
+# module emits `watch_tick` events while a watch session of a configured
+# channel is active; a session starts only on the exact start command from a
+# trusted audience, or at startup when `activation: startup` is configured
+# explicitly. No platform name appears here.
+
+name: watch
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# The module reads chat messages for its start and stop commands only. It
+# publishes its `watch.state` facts through supervision, not as a routed
+# event, and a tick is never published as a chat message.
+produces: []
+consumes:
+  - channel.chat.message
+middleware: false
+
+# The input role: the tick schedulers run from `start_inputs` (after the
+# readiness barrier) until `stop_inputs`, which ends every active session.
+lifecycle:
+  roles:
+    - input
+
+# The shapes are checked by the declared hook, one value-free diagnostic per
+# field, including the cross-check `max_ticks_per_hour <= 3600 //
+# interval_seconds`.
+settings_schema:
+  type: object
+  properties:
+    channels:
+      type: array
+      items:
+        type: string
+      description: >-
+        The watched channels, 1 to 4 entries of `<platform>/<channel_id>`.
+    interval_seconds:
+      type: integer
+      minimum: 15
+      maximum: 3600
+      description: The time between two ticks of an active session. Default 60.
+    max_ticks_per_hour:
+      type: integer
+      minimum: 1
+      maximum: 240
+      description: >-
+        The most ticks one channel emits in any sliding hour, at most
+        3600 // `interval_seconds`; a tick over it is skipped and counted.
+        Default 30.
+    max_active_seconds:
+      type: integer
+      minimum: 60
+      maximum: 14400
+      description: How long a session lasts before it stops itself. Default 3600.
+    activation:
+      type: string
+      enum:
+        - command
+        - startup
+      description: >-
+        `command` (the default) starts a session only on `start_command`;
+        `startup` also starts one per channel when inputs start.
+    start_command:
+      type: string
+      description: The exact chat text that starts a session. Default `!watch`.
+    stop_command:
+      type: string
+      description: The exact chat text that stops a session. Default `!unwatch`.
+    command_audience:
+      type: string
+      enum:
+        - broadcaster
+        - moderators
+      description: >-
+        Who may start and stop a session: the trusted broadcaster (the
+        default), or also the trusted moderators.
+    prompt_text:
+      type: string
+      description: The text a tick carries, at most 500 characters.
+  required:
+    - channels
+settings_validator: validate_settings
+
+# A tick is trigger-evaluated with this module's policy (plan step P17).
+triggers:
+  types:
+    - name: event_kind
+      parameter_schema:
+        type: object
+        properties:
+          kinds:
+            type: array
+            items:
+              type: string
+              enum:
+                - watch_tick
+        required:
+          - kinds
+        additionalProperties: false
+  combinations:
+    - all_of
+  default_policy:
+    combination: all_of
+    rules:
+      - type: event_kind
+        parameters:
+          kinds:
+            - watch_tick

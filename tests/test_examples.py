@@ -107,6 +107,7 @@ MODULE_NAMES = (
     "clips",
     "viewer_memory",
     "moderation",
+    "watch",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -355,9 +356,20 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": []},
         "settings_validator": "validate_settings",
     },
+    "watch": {
+        "name": "watch",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": [],
+        "consumes": ["channel.chat.message"],
+        "middleware": False,
+        "lifecycle": {"roles": ["input"]},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
-# R8): only the chat input declares triggers; the input and the six
+# R8): only the chat input — and, from phase 3's R6, the watch input —
+# declares triggers; the chat input and the six
 # capability modules declare their actions; the two transport modules
 # declare a credential and no action (R7: the proxy binds allowlisted
 # actions from the catalog, it declares none of its own).
@@ -378,6 +390,9 @@ DECLARATION_KEYS = {
     "viewer_memory": {"actions"},
     # Phase 3 R5 (plan P14): the one model-proposable write.
     "moderation": {"actions"},
+    # Phase 3 R6 (plan P16): the watch input declares its `event_kind`
+    # trigger type and no action.
+    "watch": {"triggers"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -536,14 +551,17 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     ``memory.recall`` and ``memory.record`` (allowlisted, running value of
     plan step P11: 13 manifests, 12 action names); phase 3's R5 adds the
     ``moderation`` manifest and its ``moderation.request`` (allowlisted,
-    running value of plan step P14: 14 manifests, 13 action names).
+    running value of plan step P14: 14 manifests, 13 action names); phase
+    3's R6 adds the ``watch`` input manifest, which declares triggers and no
+    action (allowlisted, running value of plan step P16: 15 manifests, 13
+    action names).
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
     declares the routing keys exactly as before, the runtime contract it is
     built against, its lifecycle roles, a settings schema and a settings
-    hook its package really implements. Only the chat input declares
-    triggers; it and the six capability modules declare their actions (two
+    hook its package really implements. Only the chat input and the
+    ``watch`` input (phase 3 R6) declare triggers; it and the six capability modules declare their actions (two
     each for ``audio_output`` and ``stream_control``); the two transport
     modules declare a credential and no action. The manifests carry no key
     beyond those, so nothing is declared that the runtime does not read.
@@ -554,7 +572,7 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 14
+    assert len(names) == 15
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():
