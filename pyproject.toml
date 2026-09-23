@@ -51,6 +51,7 @@ modules = ["*/module.yaml"]
 "modules.moderation" = ["module.yaml"]
 "modules.watch" = ["module.yaml"]
 "modules.kick" = ["module.yaml"]
+"modules.youtube" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

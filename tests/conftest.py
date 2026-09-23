@@ -35,7 +35,11 @@ seams, the Helix answers of the twitch clip and moderation endpoints
 viewer-memory directory (:func:`memory_directory`), and the Kick webhook
 edge: a fixed, test-only RSA key pair (:data:`KICK_TEST_KEY`) and a
 :class:`SignedWebhookSender` that signs deliveries with it and posts them
-through an in-process ``aiohttp`` test client. A suite that mocked the
+through an in-process ``aiohttp`` test client, and the YouTube edge (P20): a
+:class:`ScriptedTokenEndpoint` issuing, refusing or losing access tokens with
+a request log, and a :class:`ScriptedLiveChatAPI` answering the broadcast
+lookup, list pages carrying ``pollingIntervalMillis`` and the insert, delete
+and ban requests, with a per-endpoint request count. A suite that mocked the
 executor would hide AC19's executor-confirmed delivery, so the executor is
 never mocked here.
 
@@ -124,6 +128,11 @@ class ManualClock:
         except asyncio.CancelledError:
             self._waiters = [item for item in self._waiters if item is not entry]
             raise
+
+    def next_deadline(self) -> float | None:
+        """The earliest instant a parked sleeper wakes at; ``None`` when none is."""
+
+        return min((deadline for deadline, _ in self._waiters), default=None)
 
     def advance(self, delta: float) -> None:
         self.now += delta
@@ -2399,6 +2408,216 @@ class SignedWebhookSender:
 
 
 # --------------------------------------------------------------------------- #
+# The YouTube edge (phase 3 P20): a token endpoint and a live-chat API
+# --------------------------------------------------------------------------- #
+
+
+TOKEN_ISSUED = "issue"
+TOKEN_REFUSED = "refuse"
+TOKEN_LOST = "lost"
+TOKEN_SERVER_ERROR = "server_error"
+
+
+class ScriptedTokenEndpoint:
+    """The OAuth token endpoint a refresh token is exchanged at.
+
+    ``script`` answers the exchanges in order, then every later one with a
+    fresh token of ``default_lifetime`` seconds. An entry is a lifetime in
+    seconds (an ``int``: a token ``access-<n>`` is issued), or
+    :data:`TOKEN_REFUSED` (400 ``invalid_grant``), :data:`TOKEN_LOST` (the
+    answer never arrives) or :data:`TOKEN_SERVER_ERROR` (a 503). ``requests``
+    logs each exchange with its instant on *clock* and its grant type — never
+    the client secret; ``issued`` logs each token issued with its expiry.
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float],
+        *script: Any,
+        default_lifetime: int = 3600,
+    ) -> None:
+        self.clock = clock
+        self.script = list(script)
+        self.default_lifetime = default_lifetime
+        self.requests: list[dict[str, Any]] = []
+        self.issued: list[dict[str, Any]] = []
+
+    @property
+    def refreshes(self) -> int:
+        return len(self.requests)
+
+    def answer(self, data: Any) -> Any:
+        form = dict(data) if isinstance(data, Mapping) else {}
+        self.requests.append(
+            {
+                "at": self.clock(),
+                "grant_type": form.get("grant_type"),
+                "refresh_token": form.get("refresh_token"),
+                "client_id": form.get("client_id"),
+                "has_client_secret": bool(form.get("client_secret")),
+            }
+        )
+        entry = self.script.pop(0) if self.script else self.default_lifetime
+        if entry == TOKEN_REFUSED:
+            return FakeResponse(
+                400, {"error": "invalid_grant", "error_description": "Token has been revoked."}
+            )
+        if entry == TOKEN_LOST:
+            return ConnectionError("token endpoint unreachable")
+        if entry == TOKEN_SERVER_ERROR:
+            return FakeResponse(503, {"error": "backend_error"})
+        token = f"access-{len(self.issued) + 1}"
+        self.issued.append({"token": token, "at": self.clock(), "expires_at": self.clock() + entry})
+        return FakeResponse(
+            200,
+            {"access_token": token, "expires_in": entry, "token_type": "Bearer", "scope": "youtube"},
+        )
+
+    def valid_at(self, token: str, instant: float) -> bool:
+        """Whether *token* was issued here and had not expired at *instant*."""
+
+        return any(
+            entry["token"] == token and entry["at"] <= instant < entry["expires_at"]
+            for entry in self.issued
+        )
+
+
+LIVE_CHAT_ENDPOINTS = ("broadcast_lookup", "list", "insert", "delete", "ban")
+
+
+class ScriptedLiveChatAPI:
+    """The live-chat API and, through *token_endpoint*, the token exchange:
+    the injected session of the youtube module.
+
+    Requests are routed by URL: ``…/token`` to *token_endpoint*,
+    ``…/liveBroadcasts`` to the broadcast lookup, ``…/liveChat/messages`` to
+    list (GET), insert (POST) or delete (DELETE), ``…/liveChat/bans`` to ban.
+    ``broadcasts`` maps a channel id to the ``liveChatId`` of its active
+    broadcast (absent: no active broadcast). A list answers the next of
+    ``pages`` (a page body, a :class:`FakeResponse` or an exception), then a
+    default empty page carrying ``polling_interval_ms``. Insert, delete and
+    ban answer the next of their scripted answers, then a 200/204 success.
+    ``counts`` is the per-endpoint request count; ``requests`` logs every API
+    request with its endpoint, instant on *clock*, bearer token and params.
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float],
+        *,
+        token_endpoint: ScriptedTokenEndpoint | None = None,
+        broadcasts: Mapping[str, str] | None = None,
+        polling_interval_ms: int = 5000,
+        pages: Sequence[Any] = (),
+        lookups: Sequence[Any] = (),
+        inserts: Sequence[Any] = (),
+        deletes: Sequence[Any] = (),
+        bans: Sequence[Any] = (),
+    ) -> None:
+        self.clock = clock
+        self.token_endpoint = token_endpoint
+        self.broadcasts = dict(broadcasts or {})
+        self.polling_interval_ms = polling_interval_ms
+        self.pages = list(pages)
+        self.lookups = list(lookups)
+        self.answers: dict[str, list[Any]] = {
+            "insert": list(inserts),
+            "delete": list(deletes),
+            "ban": list(bans),
+        }
+        self.counts: dict[str, int] = {name: 0 for name in LIVE_CHAT_ENDPOINTS}
+        self.requests: list[dict[str, Any]] = []
+        self.close_calls = 0
+        self._page_sequence = 0
+
+    def times(self, endpoint: str) -> list[float]:
+        return [request["at"] for request in self.requests if request["endpoint"] == endpoint]
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if url.endswith("/liveBroadcasts"):
+            return _raise_or_return(self._lookup(kwargs))
+        if url.endswith("/liveChat/messages"):
+            return _raise_or_return(self._list(kwargs))
+        raise AssertionError(f"unexpected GET {url}")
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        if url.endswith("/token"):
+            assert self.token_endpoint is not None, "no token endpoint scripted"
+            return _raise_or_return(self.token_endpoint.answer(kwargs.get("data")))
+        if url.endswith("/liveChat/messages"):
+            return _raise_or_return(self._write("insert", kwargs, 200))
+        if url.endswith("/liveChat/bans"):
+            return _raise_or_return(self._write("ban", kwargs, 200))
+        raise AssertionError(f"unexpected POST {url}")
+
+    async def delete(self, url: str, **kwargs: Any) -> Any:
+        if url.endswith("/liveChat/messages"):
+            return _raise_or_return(self._write("delete", kwargs, 204))
+        raise AssertionError(f"unexpected DELETE {url}")
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    def _record(self, endpoint: str, kwargs: Mapping[str, Any]) -> None:
+        self.counts[endpoint] += 1
+        headers = kwargs.get("headers") or {}
+        authorization = headers.get("Authorization", "")
+        self.requests.append(
+            {
+                "endpoint": endpoint,
+                "at": self.clock(),
+                "token": authorization.removeprefix("Bearer "),
+                "params": dict(kwargs.get("params") or {}),
+                "json": kwargs.get("json"),
+            }
+        )
+
+    def _lookup(self, kwargs: Mapping[str, Any]) -> Any:
+        self._record("broadcast_lookup", kwargs)
+        if self.lookups:
+            return _as_answer(self.lookups.pop(0))
+        items = [
+            {
+                "id": f"broadcast-{channel_id}",
+                "snippet": {"channelId": channel_id, "liveChatId": live_chat_id},
+            }
+            for channel_id, live_chat_id in self.broadcasts.items()
+        ]
+        return FakeResponse(200, {"kind": "youtube#liveBroadcastListResponse", "items": items})
+
+    def _list(self, kwargs: Mapping[str, Any]) -> Any:
+        self._record("list", kwargs)
+        if self.pages:
+            return _as_answer(self.pages.pop(0))
+        self._page_sequence += 1
+        return FakeResponse(
+            200,
+            {
+                "kind": "youtube#liveChatMessageListResponse",
+                "items": [],
+                "nextPageToken": f"page-{self._page_sequence}",
+                "pollingIntervalMillis": self.polling_interval_ms,
+            },
+        )
+
+    def _write(self, endpoint: str, kwargs: Mapping[str, Any], status: int) -> Any:
+        self._record(endpoint, kwargs)
+        scripted = self.answers[endpoint]
+        if scripted:
+            return _as_answer(scripted.pop(0))
+        return FakeResponse(status, {"id": f"{endpoint}-{self.counts[endpoint]}"} if status == 200 else None)
+
+
+def _as_answer(entry: Any) -> Any:
+    """A scripted entry as an answer: a response or exception passes through,
+    a body becomes a 200 :class:`FakeResponse`."""
+
+    if isinstance(entry, (FakeResponse, BaseException)):
+        return entry
+    return FakeResponse(200, entry)
+
+
+# --------------------------------------------------------------------------- #
 # Self-checks: every suite imports this file, so a broken double fails the run
 # --------------------------------------------------------------------------- #
 
@@ -2460,6 +2679,13 @@ def _self_check() -> None:
     assert sender.timestamp() == "2023-11-14T22:13:20Z"
     assert base64.b64decode(sender.sign("id", "t", b"{}")).__len__() == 256
 
+    # The YouTube edge answers by URL and counts per endpoint.
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_self_check_youtube_edge())
+    finally:
+        loop.close()
+
 
 async def _self_check_phase3_services() -> None:
     clock = ManualClock(10.0)
@@ -2510,6 +2736,28 @@ async def _self_check_phase3_services() -> None:
     else:
         raise AssertionError("an unoffered operation must not pass silently")
     assert len(moderation.requests) == 5 and moderation.requests[0]["at"] == 11.0
+
+
+async def _self_check_youtube_edge() -> None:
+    clock = ManualClock(50.0)
+    tokens = ScriptedTokenEndpoint(clock, 3600, TOKEN_REFUSED)
+    api = ScriptedLiveChatAPI(
+        clock, token_endpoint=tokens, broadcasts={"UC1": "chat-1"}, polling_interval_ms=2000
+    )
+    issued = await api.post("https://token.example/token", data={"grant_type": "refresh_token"})
+    assert issued.status == 200 and issued.body["access_token"] == "access-1"
+    assert tokens.valid_at("access-1", 3649.0) and not tokens.valid_at("access-1", 3650.0)
+    refused = await api.post("https://token.example/token", data={})
+    assert refused.status == 400 and tokens.refreshes == 2
+    lookup = await api.get("https://api.example/liveBroadcasts", headers={"Authorization": "Bearer t"})
+    assert lookup.body["items"][0]["snippet"]["liveChatId"] == "chat-1"
+    page = await api.get("https://api.example/liveChat/messages", params={"liveChatId": "chat-1"})
+    assert page.body["pollingIntervalMillis"] == 2000 and page.body["nextPageToken"] == "page-1"
+    assert (await api.post("https://api.example/liveChat/messages", json={})).status == 200
+    assert (await api.delete("https://api.example/liveChat/messages", params={"id": "m"})).status == 204
+    assert (await api.post("https://api.example/liveChat/bans", json={})).status == 200
+    assert api.counts == {"broadcast_lookup": 1, "list": 1, "insert": 1, "delete": 1, "ban": 1}
+    assert api.requests[0]["token"] == "t" and api.times("list") == [50.0]
 
 
 _self_check()

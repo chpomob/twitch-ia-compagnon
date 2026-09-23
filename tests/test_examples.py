@@ -109,6 +109,7 @@ MODULE_NAMES = (
     "moderation",
     "watch",
     "kick",
+    "youtube",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -377,6 +378,16 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": ["input"]},
         "settings_validator": "validate_settings",
     },
+    "youtube": {
+        "name": "youtube",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": ["channel.chat.message"],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": ["input"]},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
 # R8): only the chat input — and, from phase 3's R6, the watch input —
@@ -407,6 +418,9 @@ DECLARATION_KEYS = {
     # Phase 3 R7 (plans P18, P19): the kick chat input declares its triggers,
     # its credentials and its `chat.write`.
     "kick": {"triggers", "actions", "credentials"},
+    # Phase 3 R7 (plan P20): the youtube chat input declares its triggers and
+    # credentials; its `chat.write` is declared by plan step P21.
+    "youtube": {"triggers", "credentials"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -435,6 +449,7 @@ SECRET_SETTINGS = {
     "audio_input": ("transcription.api_key",),
     "stream_control": ("scenes.provider.password",),
     "kick": ("client_secret", "access_token"),
+    "youtube": ("client_secret", "refresh_token"),
 }
 #: The optional credentials shipped unconfigured — empty, never a literal —
 #: with the speech and transcription endpoints they go with (AC43).
@@ -578,7 +593,10 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     step P19, decision 11): the one multiplicity assertion is rewritten to
     the running value — every action name is declared by exactly one
     manifest except ``chat.write``, declared by exactly twitch and kick —
-    while the manifest count and the action-name count stay as they were.
+    while the manifest count and the action-name count stay as they were;
+    then the ``youtube`` input manifest, which declares triggers and
+    credentials and, until plan step P21, no action (allowlisted, running
+    value of plan step P20: 17 manifests, 13 action names).
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -596,7 +614,7 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 16
+    assert len(names) == 17
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():
