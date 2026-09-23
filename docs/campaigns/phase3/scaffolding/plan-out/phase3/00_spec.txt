@@ -1,0 +1,822 @@
+---
+name: "phase3-presence-memory-platforms"
+version: "1.0"
+author: "adversarial-spec"
+status: "draft"
+tags: [adversarial, spec]
+targets:
+  - file: core/contracts.py
+    description: "Add the closed event-kind vocabulary (`message`, `sub`, `resub`, `sub_gift`, `community_sub_gift`, `raid`, `follow`, `tip`, `watch_tick`), the optional `model_proposable` flag of an action spec (refused on a read action and on a delivery-capable action), and the validation of the optional `kind` field of a normalized input event; no platform, vendor or module name."
+  - file: core/triggers.py
+    description: "Add the built-in trigger type `event_kind` (parameter `kinds`: a non-empty list drawn from the event-kind vocabulary) evaluated against the normalized event's kind, deterministic, drawing 0 random values, composable with the existing types and operators; a keyword rule never matches an event without text."
+  - file: core/loader.py
+    description: "Accept the `model_proposable` key in a manifest action entry and hand it to the action spec; every other unknown key is still refused as today."
+  - file: modules/brain/__init__.py
+    description: "Configurable persona text and ordered routes (match on event kind, optional leading command token, optional trusted audience) selecting extra instructions and a delivery list per run; runs admitted from a watch tick act under principal `brain.watch`; offer a write action to the model only when its spec is `model_proposable` and the authorized view grants it; after the terminal delivery, hand the exchange to `memory.record` when bound and granted, never changing the run's terminal status."
+  - file: modules/brain/module.yaml
+    description: "Declare the optional `persona` and `routes` settings; everything else unchanged."
+  - file: modules/twitch/__init__.py
+    description: "Opt-in community notices (sub, resub, sub_gift, community_sub_gift, raid from the chat-notification subscription; follow from the follow subscription) normalized with their kind, fed to the chat context, trigger-evaluated and admitted like messages; publish a `clip` service and a `moderation` service (delete_message, timeout) in the runtime service registry; refuse an author identity containing `:`."
+  - file: modules/twitch/module.yaml
+    description: "Declare the optional `notices` setting and the `event_kind` trigger type; default policy, action and credentials unchanged."
+  - file: modules/clips/__init__.py
+    description: "New module providing `stream.clip.create` through the `clip` service each platform module publishes: local per-channel cooldown, per-channel serialization, one create request per call, confirmation lookup inside a 15 s window, the failure taxonomy, readiness per platform and the `required` startup policy (default false)."
+  - file: modules/clips/module.yaml
+    description: "Manifest v2 declaring `stream.clip.create` (write, permission `stream.clip`, destinations `*/*/clip`, delivery `text_argument: none`, timeout 20 s, idempotency none), the `min_interval_seconds`, `max_waiters` and `required` settings and its validator; no grant."
+  - file: modules/moderation/__init__.py
+    description: "New module providing `moderation.request` with the three configurable modes (`alert`, `propose`, `act`; default `alert`), the strict act rules, the bounded proposal table with approval/rejection commands from trusted broadcaster or moderators, platform execution through the `moderation` service, and one `moderation.decision` fact per request."
+  - file: modules/moderation/module.yaml
+    description: "Manifest v2 declaring `moderation.request` (write, `model_proposable: true`, permission `moderation.request`, destinations `*/*/moderation`, no delivery, idempotency none), consuming `channel.chat.message` for the approval commands, the mode/rules/proposal settings and its validator; no grant."
+  - file: modules/viewer_memory/__init__.py
+    description: "New optional module: one bounded JSON memory file per (platform, channel, viewer) in a configured directory, retention (default 30 days), total-size and file-count bounds with the least-recently-used / least-used / oldest eviction analysis, the `memory.recall` read and `memory.record` write actions, viewer self-erasure by chat command, startup scan and periodic sweep."
+  - file: modules/viewer_memory/module.yaml
+    description: "Manifest v2 declaring `memory.recall` (read, permission `memory.recall`, destinations `*/*/memory`) and `memory.record` (write, permission `memory.record`, destinations `*/*/memory`, no delivery, not model-proposable, timeout 5 s), the `max_recall_bytes` setting (512–8192), consuming `channel.chat.message` for the erasure command, the bound settings and its validator; no grant."
+  - file: modules/viewer_memory/__main__.py
+    description: "Offline operator command: `forget` one viewer, `forget-all`, and `stats`, reading only the memory directory named by a configuration file, opening no network transport."
+  - file: modules/watch/__init__.py
+    description: "New optional input module emitting `watch_tick` events per configured channel at a bounded cadence while a watch session is active (started by an explicit trusted command or by explicit startup activation), with ticks-per-hour and active-duration caps, at most one watch run in flight per channel, trigger evaluation and direct admission, and `watch.state` facts."
+  - file: modules/watch/module.yaml
+    description: "Manifest v2 with lifecycle role `input`, consuming `channel.chat.message` for the start/stop commands, declaring the `event_kind` trigger type with default policy `event_kind: [watch_tick]`, the cadence/budget/activation settings and its validator; no action, no grant."
+  - file: modules/kick/__init__.py
+    description: "New platform module: signed webhook ingestion (chat messages, follows, subscriptions, gifts) with signature, timestamp-skew and duplicate checks, normalization with trusted badges, trigger evaluation and admission, `chat.write` through the platform chat endpoint, a `moderation` service offering `timeout` only, rate-limit handling, no clip or poll service."
+  - file: modules/kick/module.yaml
+    description: "Manifest v2 (role `input`) declaring the chat triggers (probability, audience, keyword, event_kind), `chat.write` for platform `kick`, the credentials (`client_secret`, `access_token`), webhook listener and public-key settings and its validator."
+  - file: modules/youtube/__init__.py
+    description: "New platform module: OAuth refresh-token authentication, live-chat polling honouring the server interval and a configured minimum, a local daily quota ledger with a write reserve, normalization with trusted author details and member/tip notices, `chat.write` (at most 200 characters), a `moderation` service (delete_message, timeout), no clip or poll service, degradation on quota exhaustion or refresh failure."
+  - file: modules/youtube/module.yaml
+    description: "Manifest v2 (role `input`) declaring the chat triggers (probability, audience, keyword, event_kind), `chat.write` for platform `youtube`, the credentials (`client_secret`, `refresh_token`), polling and quota settings and its validator."
+  - file: presence.yaml.example
+    description: "New shipped profile (the presence pack): twitch with notices, chat_context, users, audio_output, stream_control, clips, viewer_memory, moderation in mode `alert`, watch listed but inactive until commanded, brain with persona and routes; explicit grants for every action it uses; 0 literal secrets."
+  - file: pyproject.toml
+    description: "Add the six `modules.<name>` package-data lines (`clips`, `moderation`, `viewer_memory`, `watch`, `kick`, `youtube`) so a clean install discovers 17 manifests; runtime dependencies unchanged (`aiohttp`, `PyYAML`)."
+  - file: docs/README.md
+    description: "Add the phase 3 section: versioning (fate of every allowlisted test), the presence pack table (configuration vs code), the per-platform capability matrix with the named API limits, the memory model and erasure paths, the moderation modes, the watch trigger, the declared limits, and the six per-provider trial records."
+  - file: tests/conftest.py
+    description: "Add shared doubles: scripted clip and moderation services, a signed-webhook sender with a test RSA key pair, a scripted live-chat API with quota accounting, a scripted token endpoint, and a temporary memory directory helper."
+  - file: tests/fixtures/modules/fakeplatform/__init__.py
+    description: "Publish scripted `clip` and `moderation` services for platform `fake` and feed scripted notices with a kind, so every phase 3 contract is exercised on a second platform."
+  - file: tests/fixtures/modules/fakeplatform/module.yaml
+    description: "Declare the `event_kind` trigger type and the optional notice feed fields; `chat.write` unchanged."
+  - file: tests/test_triggers.py
+    description: "Add the `event_kind` type: matching and non-matching kinds, 0 random draws, combination with keyword/audience, refusal of an undeclared kind name."
+  - file: tests/test_contracts.py
+    description: "Add the event-kind vocabulary and the `model_proposable` refusals (read action, delivery-capable action)."
+  - file: tests/test_brain.py
+    description: "Rewrite the allowlisted manifest assertion; add persona, routes, the `brain.watch` principal, the proposable-write offer rule and the post-delivery memory step."
+  - file: tests/test_twitch.py
+    description: "Rewrite the allowlisted manifest assertion; add notices (mapping, opt-in subscriptions, anonymous gifts, degraded follow subscription), the clip and moderation services, and the `:` identity refusal."
+  - file: tests/test_clips.py
+    description: "New: the `stream.clip.create` contract on twitch and on the fake platform."
+  - file: tests/test_moderation.py
+    description: "New: modes, strict rules, proposals, approval commands, platform outcomes, facts."
+  - file: tests/test_viewer_memory.py
+    description: "New: file format and naming, bounds, retention, eviction order, erasure paths, recall budget, record rules, CLI."
+  - file: tests/test_watch.py
+    description: "New: activation, cadence, caps, in-flight rule, principal, state facts, shutdown."
+  - file: tests/test_kick.py
+    description: "New: webhook verification and ingestion, chat send, moderation service, rate limits, capability view."
+  - file: tests/test_youtube.py
+    description: "New: token refresh, polling cadence, quota ledger and reserve, ingestion, chat send, moderation service, degradation."
+  - file: tests/test_presence_pack.py
+    description: "New: the shipped presence profile end to end with scripted model and fake transports."
+  - file: tests/test_phase3_trials.py
+    description: "New, opt-in by environment variables and skipped with a reason otherwise: real trials of platform clips, platform moderation, community notices, the Kick adapter, the YouTube adapter and the screen watch."
+  - file: tests/test_examples.py
+    description: "Rewrite the two allowlisted assertions to the phase 3 catalog (17 manifests, 13 distinct action names, `chat.write` declared by three platform manifests)."
+  - file: tests/test_profiles.py
+    description: "Rewrite the two allowlisted assertions to 17 manifests and 17 package-data lines; add `--check-config` on `presence.yaml.example`."
+  - file: tests/test_hygiene.py
+    description: "Add the check that the README carries the six phase 3 trial rows with their five fields and that the versioning section names every phase 3 allowlisted test."
+---
+
+# Phase 3 — Presence, viewer memory, moderation and platforms
+
+## Problem
+
+Phases 0–2 are delivered and gated (`main` green: 1891 passed, 12 skipped;
+11 shipped manifests). The companion can read the chat and the users, look at
+the screen, listen, speak, play clips, switch scenes and create polls, behind
+default-deny authorization, bounded admission, explicit terminal outcomes and
+a configured delivery list. `docs/design-v2.md` §6 ends with "Phase 3+ —
+seulement selon l'usage observé"; the demand research
+(`docs/research/usage-createurs-assistant-ia-2026.md`) is that observation.
+It ranks, on the creator side, clips/highlights first (63 items), then
+welcome/engagement/raids (43), alerts (33), voice (26), automation (21) and
+moderation (11) (§3.2), shows that competitors sell long-term memory ("it
+remembers me", §3.3, [4][9]) and "watching" co-hosts (§3.3, [8]), and
+concludes that our differentiator is configurability, local execution and
+control (§1).
+
+Five gaps separate that demand from the delivered product:
+
+1. **Presence is not a shipped path.** The research (§6) says the presence
+   pack is "configuration, not code" — but the system prompt is a constant,
+   there is one delivery list per destination whatever the event, and the
+   platform module ingests chat messages only: no sub, gift, raid or follow
+   reaches a trigger. Parts of the pack are configuration; parts are not.
+2. **No clip primitive** exists, although it is the first creator demand.
+3. **Nothing is remembered across runs**: the core is volatile by design
+   (§3.5); a memory needs an optional module with declared retention, bounds
+   and erasure.
+4. **Moderation** is out of the model's toolset, and the operator decided it
+   may act under strict, configurable rules.
+5. **Only one real platform** is supported, and the operator decided Kick and
+   YouTube now.
+
+Authority: `docs/design-v2.md` (§2.2 sessions, §2.4 triggers, §3.2–§3.5
+actions/observations/budgets/memories, §4.1 manifests, §4.4 starters, §6);
+the research report cited above; `docs/proxy-protocol.md` (protocol v1,
+unchanged by this phase); `docs/campaigns/phase{1,2}/{spec.md,plan.md}`. The
+repository-root `spec.md`/`plan.md` of the historical MVP are not modified by
+the implementation; this phase's documents are archived under
+`docs/campaigns/phase3/`.
+
+### Operator decisions (2026-09-23) — requirements, not suggestions
+
+1. Scope "1 b + c": the presence pack **including clips**, and the viewer
+   memory.
+2. Moderation "2 c, configurable": the model may act under strict rules; the
+   behaviours are configurable per streamer — at minimum alert only / propose
+   and let a rule or the streamer apply / act under strict rules.
+3. Screen watching "3 b si demandé, configurable": a continuous capture
+   allowed **when requested**, as a configurable trigger with its own cadence
+   and budget, never a default.
+4. Memory "4 a": default retention **30 days**; retention, total size and
+   **number of memory files** configurable; at a maximum, the system analyses
+   the least-used / oldest and deletes.
+5. Platforms "5 b": Kick and YouTube adapters now.
+
+### Decisions this spec settles
+
+Each is a contract; the plan chooses the code.
+
+1. **Presence = configuration plus two small code enablers.** The enablers
+   are (a) a configurable persona text and ordered **routes** in the brain —
+   a route matches the triggering event's kind, optionally a leading command
+   token and a trusted audience, and selects extra instructions and a
+   delivery list for that run; and (b) **community notices** ingested by the
+   platform modules. Everything else in the pack is shipped configuration
+   (`presence.yaml.example`), prompts and grants. What still needs code is
+   listed, not hidden (R1, README table): a poll whose question and options
+   come from a chat command, channel-point redemptions, announcing the clip
+   link in the chat, thanking an anonymous gifter.
+2. **Event kinds are a closed, platform-neutral vocabulary**: `message`,
+   `sub`, `resub`, `sub_gift`, `community_sub_gift`, `raid`, `follow`, `tip`,
+   `watch_tick`. A new built-in trigger type `event_kind` selects on it; a
+   configured policy can combine it with the existing types
+   (`any_of: [keyword !ask, event_kind [raid, sub]]`).
+3. **Clips are an effect-only write action**, `stream.clip.create`, served by
+   a new `clips` module through a `clip` service each platform publishes
+   (the phase 2 poll pattern). Trigger surfaces: a route's delivery entry (a
+   streamer/moderator command or a platform notice) and any executor caller
+   with an applicable rule. The model never proposes a clip; channel-point
+   redemptions are not delivered.
+4. **Moderation is the one designed exception to "writes stay out of the
+   model's toolset"**: a manifest may flag a write action
+   `model_proposable: true`; only `moderation.request` carries it; the brain
+   offers such an action only when authorized, the executor re-checks every
+   call, and the moderation module's configured mode decides what the request
+   does. The shipped default mode is `alert` (0 platform effect). Permanent
+   bans are never available.
+5. **Memory = files owned by an optional module.** One JSON file per viewer
+   of a channel; bounded per file, in total bytes and in file count; retention
+   30 days by default; eviction by an explicit, test-pinned ordering; recall
+   is a read action offered to the model; recording is a write performed by
+   the brain after the terminal delivery, never by the model.
+6. **Watching is an input, not a background capture.** A new `watch` module
+   emits `watch_tick` events only while a watch session was explicitly
+   requested; a tick goes through the trigger engine and admission like any
+   input; the run it starts may call the existing on-demand `screen.capture`.
+   Watch runs act under their own principal `brain.watch`, so every action
+   they use needs its own rule.
+7. **Platform capabilities are declared honestly.** A platform module
+   publishes a service or declares an action only where its public API offers
+   the operation; the capability view shows the rest as unbound with a named
+   reason. Twitch: chat, notices, clips, polls, moderation (delete, timeout).
+   Kick: chat via signed webhooks, notices (follow, sub, resub, gifts),
+   moderation (timeout only). YouTube: chat via polling under a daily quota,
+   notices (member, milestone, gift, tip), moderation (delete, timeout).
+   Neither Kick nor YouTube publishes a clip or poll service.
+
+### Standing constraints
+
+- Phase 0–2 guarantees stay in force: bounded admission and retention, the
+  phase lifecycle, explicit terminal outcomes (`success`/`refused`/`error`/
+  `timeout`/`cancelled`/`external_unknown`), default-deny authorization
+  including reads, one action per run turn, one global startup and one global
+  shutdown deadline, redaction of declared credentials, an uncertain external
+  outcome never memorized or reported as a confirmed effect, no blind retry
+  after an uncertain effect.
+- No platform, vendor, module or device name is added to `core/`; every new
+  module starts and stops through its manifest and `enabled_modules`.
+- Runtime dependencies remain `aiohttp` and `PyYAML` (the webhook signature
+  check is implementable with standard-library integer arithmetic and
+  hashing).
+- Tests never use a positive-duration sleep; clocks, RNG, transports,
+  webhook senders and token endpoints are injected.
+- `docs/proxy-protocol.md` protocol v1 is unchanged: the new actions run on
+  the brain host; watch runs reach a proxied `screen.capture` exactly as chat
+  runs do.
+- The three phase 2 profiles (`config.yaml.example`,
+  `config.server.yaml.example`, `agent.yaml.example`) are **not modified**;
+  the phase 3 features ship in the new `presence.yaml.example`.
+
+### Target list and permitted scope
+
+The `targets` list is the complete set of repository files this phase creates
+or modifies. **Permitted scope beyond the list:** `docs/campaigns/phase3/`
+(brief, spec, plan, scaffolding) and the working-tree `.gitignore` entry for
+the campaign's spec output; nothing there is runtime code, a test, a profile
+or packaging. `docs/design-v2.md`, `docs/proxy-protocol.md`, the three phase 2
+profiles and the repository-root `spec.md`/`plan.md` are untouched by the
+implementation steps.
+
+### Requirement classification
+
+All eight requirements below are non-trivial (each branches at runtime or
+crosses a network, filesystem or trust boundary); the count is 8, at the cap.
+
+## Requirements
+
+- R1: **Presence pack — persona, routes, community notices and a shipped
+  profile.** (a) The brain accepts an optional `persona` text (at most 2000
+  characters) that replaces the opening identity line of the system
+  instructions, and an optional ordered `routes` list (at most 16 entries).
+  Each route has a unique `name`, a `match` (`kinds`: a non-empty subset of
+  the event-kind vocabulary; optional `command`: one token of at most 32
+  characters the event text must start with, compared case-insensitively as a
+  whole token; optional `audience`: `broadcaster`, `moderators`, `vips`,
+  `subscribers` or `everyone`, satisfied only by trusted role claims with
+  provenance), optional `instructions` (at most 2000 characters) added to the
+  system instructions of that run, and an optional `delivery` group of the
+  existing delivery shape used instead of the destination's list. The first
+  matching route wins; with no match the phase 2 behaviour applies unchanged.
+  The fixed instructions about tools and plain-text output are always kept.
+  With neither `persona` nor `routes` configured, the system instructions are
+  byte-identical to phase 2. A route whose delivery list contains any write
+  action other than `chat.write` and `audio.speak` must either declare
+  `audience` `broadcaster` or `moderators`, or match only platform-authored
+  notice kinds (every kind except `message` and `watch_tick`); otherwise
+  startup fails naming the route. (b) The platform module ingests community
+  notices when its `notices.kinds` setting lists them (default: none, so the
+  phase 2 subscriptions are unchanged): Twitch maps `sub`, `resub`,
+  `sub_gift`, `community_sub_gift` and `raid` from its chat-notification
+  subscription and `follow` from its follow subscription (which requires the
+  moderator follower-read scope; a rejected follow subscription degrades the
+  `follow` notices only, naming them, and chat continues). A notice carries
+  its kind, its author as the viewer identity (the raider, the gifter, the
+  follower), the platform's system text and trusted provenance; it is fed to
+  the channel's chat context, trigger-evaluated and admitted exactly like a
+  message. Other platform notice types are ignored and counted. A notice with
+  no trusted author (an anonymous gift) is fed to the chat context but never
+  admitted. (c) `presence.yaml.example` ships a working presence configuration
+  (persona; routes for mention replies, a "what did I miss?" summary command,
+  translation, thanks on notices with a jingle, broadcaster-only scene
+  commands for starting soon / break / ending, a moderator clip command, a
+  commanded watch; explicit grants for every action used), and the README
+  states per presence item whether it is configuration or needed code.
+
+- R2: **Live clips: `stream.clip.create`.** A new optional module `clips`
+  provides the write action `stream.clip.create` (version 1, permission
+  `stream.clip`, destinations `*/*/clip`, effect-only delivery capability,
+  call timeout 20 s, no idempotency key, not model-proposable, no arguments).
+  It is bound for platform `p` iff a `clip` service is published for `p`; the
+  capability view names every other enabled platform as unbound with reason
+  `platform_unsupported`. One call issues **at most one** create request. A
+  local per-channel cooldown (`min_interval_seconds`, default 30, range
+  5–3600, measured on the injected clock from the last create request sent)
+  refuses an earlier call with `refused cooldown` and 0 requests. Calls on
+  one channel are serialized with at most `max_waiters` (default 4, range
+  1–64) waiting; one more is refused `resource_busy`. After the platform
+  accepts the create request, the clip is confirmed by looking it up within a
+  15-second window from that acceptance. Terminal outcomes: `success` with
+  `clip_id`, `url` and `confirmed_at` when the lookup finds the clip;
+  `error clip_not_created` when the full 15-second window elapses without it;
+  `error channel_offline` when the platform refuses because the channel is
+  not live; `error platform_rejected` for an authentication, scope or
+  validation refusal; `error rate_limited` for a platform rate refusal (no
+  retry); `external_unknown` (cause `confirmation_lost`) when the create
+  request was sent and its response is lost, is a server error, or the call
+  deadline arrives before the window closes; `timeout` when the deadline
+  arrives before any request left. A boolean `required` setting (default
+  false, the same meaning as the phase 2 `audio_output`/`audio_input`
+  `required` setting) decides startup when no enabled platform publishes a
+  `clip` service at prepare: `true` fails startup with a diagnostic naming
+  `clips` and reason `platform_unsupported`; `false` leaves the action unbound
+  on every platform and startup continues. A non-boolean value is rejected by
+  the validator. The `action.completed` trace of a clip
+  call carries the status, the code and, on success, the `clip_id`, and never
+  a credential. Twitch publishes the `clip` service; Kick and YouTube do not.
+
+- R3: **Viewer memory store: files, bounds, retention, eviction, erasure.** A
+  new optional module `viewer_memory` keeps **one memory file per
+  `(platform, channel_id, viewer_id)`** in a configured `directory`. A memory
+  file is a UTF-8 JSON object with `format: 1`, the three key fields,
+  `display_name`, `first_seen`, `last_seen`, `last_used` (UTC timestamps),
+  `use_count`, `interactions` and `notes` (each note: `at`, `viewer_text` of
+  at most 200 characters, optional `reply_text` of at most 200 characters,
+  `delivery` = `confirmed`, `unconfirmed` or `none`; `at`, `viewer_text`
+  and `delivery` are present in every note); `display_name` holds at most 64
+  characters (a longer platform name is cut to its first 64 characters on
+  write); its name is the hexadecimal
+  SHA-256 of a collision-free serialization of the key plus `.json`, so no
+  platform identifier appears in a file name. Settings and defaults:
+  `retention_days` 30 (1–365), `max_files` 1000 (1–100000), `max_total_bytes`
+  16777216 (at least `max_file_bytes`, at most 1073741824), `max_file_bytes`
+  4096 (512–65536), `max_notes` 10 (1–100), `sweep_interval_seconds` 3600
+  (60–86400), `forget_command` `!forgetme` (empty disables it). A write is
+  atomic (a reader never sees a partial file). A note that would push a file
+  over `max_notes` or `max_file_bytes` drops that file's oldest notes first.
+  A **use** of a record is a recall that returned it or a record that updated
+  it; each use increments `use_count` and sets `last_used`. **Eviction
+  analysis:** before a write that would make the file count exceed
+  `max_files` or the total bytes exceed `max_total_bytes`, the candidates are
+  every memory file except the one being written, ordered ascending by
+  (`last_used`, `use_count`, `first_seen`, file name); candidates are deleted
+  in that order until both bounds hold after the write; each deletion is
+  counted. **Retention:** a record whose `last_seen` is older than
+  `retention_days` is deleted at prepare and at every sweep, and is never
+  returned by a recall. At prepare the module scans the directory: files not
+  named like memory files are neither read, counted nor deleted; malformed or
+  oversized memory files are deleted and counted; if the retained files still
+  exceed a bound (configuration lowered), the eviction analysis runs before
+  readiness. **Erasure:** (a) a chat message whose text is exactly the
+  `forget_command` token deletes its trusted author's file for that platform
+  and channel, whatever the trigger decides; (b) the offline command
+  `python -m modules.viewer_memory forget --config <file> --platform <p>
+  --channel <c> --viewer <v>` deletes one file, `forget-all --config <file>`
+  deletes every memory file of the directory, `stats --config <file>` prints
+  the file count and total bytes; the command opens no network transport and
+  exits 0 on success and 2 on an invalid configuration. Every eviction,
+  expiry and erasure publishes one `memory.removed` fact carrying the reason
+  (`evicted`, `expired`, `corrupt`, `erased`) and the count, and no viewer
+  identifier.
+
+- R4: **Viewer memory in runs: recall and record.** `viewer_memory` provides
+  `memory.recall` (read, permission `memory.recall`, destinations
+  `*/*/memory`, no arguments) and `memory.record` (write, permission
+  `memory.record`, destinations `*/*/memory`, no delivery capability, not
+  model-proposable, call timeout 5 s). The viewer of both calls is the run's session viewer,
+  supplied by the runtime, never an argument; a session without a platform
+  viewer (a watch run) gets `error no_viewer`. A recall returns `known:
+  false` for a viewer without a retained record, otherwise `known: true`,
+  `display_name`, `first_seen`, `last_seen`, `interactions` and the most
+  recent notes first, serialized within `max_recall_bytes` (default 1024,
+  range 512–8192) with `truncated: true` when anything was left out. The
+  metadata fields are never omitted: notes are left out first (oldest
+  first); if the metadata alone still exceeds the limit, `display_name` is
+  shortened by whole characters from its end until the result fits (the
+  512-byte minimum always holds the metadata with an empty `display_name`);
+  the result is never over `max_recall_bytes`; the
+  observation counts toward the run's observation and token budgets. After
+  the terminal delivery of every run whose session has a platform viewer, the
+  brain calls `memory.record` once when the action is bound and a rule grants
+  it, passing the triggering text (first 200 characters) and, only when every
+  required delivery entry ended `success`, the delivered text (first 200
+  characters) with `delivery: confirmed`; a delivery that ended
+  `external_unknown` is recorded with `delivery: unconfirmed` and no reply
+  text; a failed or absent delivery records a note with `at`, `viewer_text`,
+  `delivery: none` and no reply text. The record
+  step uses the run's remaining deadline and one action call of its budget;
+  it is skipped (and traced as skipped) when the run has no action call left
+  in its budget or less than the 5 s `memory.record` call timeout of
+  deadline left, and never changes
+  the run's terminal status or delivery outcome. `memory.record` is never
+  offered to the model.
+
+- R5: **Configurable moderation under strict rules.** A new optional module
+  `moderation` provides `moderation.request` (version 1, write, permission
+  `moderation.request`, destinations `*/*/moderation`, no delivery,
+  idempotency none, `model_proposable: true`), arguments `operation`
+  (`delete_message` or `timeout`), `message_id`, `reason` (at most 200
+  characters) and, for `timeout` only, `duration_seconds`. The brain offers a
+  write action to the model **only** when its spec is `model_proposable` and
+  the authorized view grants it; the core refuses the flag on a read action
+  and on a delivery-capable action. At most one `moderation.request` is
+  executed per run; a second is `refused run_limit`. Setting `mode` —
+  `alert`, `propose` or `act`, **default `alert`**, overridable per
+  `<platform>/<channel_id>` — decides: **alert** records the request and
+  sends 0 platform requests (disposition `alerted`); **propose** stores a
+  proposal (bounded by `max_pending`, default 32, range 1–256, oldest expiry
+  first when full; TTL `proposal_ttl_seconds`, default 300, range 30–3600)
+  and sends 0 platform requests (disposition `proposed`, `proposal_id`); a
+  proposal is applied only by a chat command `<approve_command> <id>`
+  (default `!modok`) or rejected by `<reject_command> <id>` (default
+  `!modno`) authored in the same channel by a trusted broadcaster or
+  moderator, or applied at once when its operation is listed in
+  `propose.auto_apply` (default empty); **act** applies at once. Every
+  application — act, approval or auto-apply — first passes the **strict
+  rules**, each failure being `refused` with its code and 0 platform
+  requests: `operation_not_allowed` (not in `act.operations`, default
+  `[delete_message]`), `target_unknown` (the message is not in the channel's
+  retained chat context), `target_protected` (its author holds a trusted
+  broadcaster, moderator or VIP role, or is the companion — not
+  configurable), `duration_out_of_range` (outside 1 to `max_timeout_seconds`,
+  default 300, range 1–3600, after the platform's unit rounding),
+  `rate_limited` (`max_actions_per_window`, default 3, range 1–20, already
+  applied in the channel within `window_seconds`, default 600, range
+  60–86400), `target_cooldown` (the same author was acted on within
+  `per_target_cooldown_seconds`, default 600, range 0–86400),
+  `platform_unsupported` (the platform's `moderation` service does not offer
+  the operation). An allowed application sends exactly one platform request
+  through the platform's `moderation` service, never retried: confirmation →
+  disposition `applied`; a platform refusal → `error platform_rejected`; a
+  platform rate refusal → `error rate_limited_platform`; a lost response, a
+  server error or the deadline after sending → `external_unknown`. No
+  operation bans permanently. **No silent action:** every request, whatever
+  its mode and outcome, and every approval, rejection and expiry, publishes
+  exactly one `moderation.decision` fact (mode, disposition or status, code,
+  operation, platform, channel, message id, target author id, bounded
+  reason), which the audit module records.
+
+- R6: **Configurable continuous capture: the `watch` trigger.** A new
+  optional input module `watch` (never enabled in the phase 2 profiles)
+  emits, for each configured channel (at most 4), `watch_tick` events while a
+  **watch session** is active. A session starts only (a) on a chat message
+  whose text is exactly `start_command` (default `!watch`) authored in that
+  channel by a trusted audience of `command_audience` (`broadcaster`, the
+  default, or `moderators`), or (b) at startup when `activation: startup` is
+  configured explicitly (default `activation: command`). It stops on
+  `stop_command` (default `!unwatch`) from that audience, after
+  `max_active_seconds` (default 3600, range 60–14400), or at `stop_inputs`.
+  Ticks are emitted every `interval_seconds` (default 60, range 15–3600) on
+  the injected clock, at most `max_ticks_per_hour` (default 30, range 1–240,
+  and at most 3600 / `interval_seconds`) per channel in any sliding hour; a
+  tick due while a watch run of that channel is queued or running is skipped
+  and counted, so at most one watch run per channel is in flight. A tick is a
+  normalized event of kind `watch_tick`, text `prompt_text` (at most 500
+  characters), author the reserved identity `system:watch`; every platform
+  module refuses a platform author identity containing `:`, so no viewer can
+  share that session. A tick is never fed to the chat context or the users
+  directory; it is trigger-evaluated (the module declares `event_kind` with
+  default policy `event_kind: [watch_tick]`) and admitted by the module.
+  Every call of a run admitted from a tick is made under principal
+  `brain.watch`, so a watch run can capture, speak or write only through
+  rules that name `brain.watch`; `screen.capture` is served by the same
+  provider as on-demand captures. Session changes publish `watch.state`
+  facts (`active` or `inactive`, with reason `command`, `startup`,
+  `max_active`, `shutdown`).
+
+- R7: **Kick and YouTube platform modules.** Two new optional platform
+  modules, `kick` and `youtube`, speak the same contracts as `twitch`:
+  normalized schema-2 chat events with `platform` `kick` or `youtube`, the
+  chat context feed, trigger evaluation (types `probability`, `audience`,
+  `keyword`, `event_kind`; default policy "mentions `companion_name`"),
+  admission, anti-echo of the companion's own identity, bounded dedup, and
+  `chat.write` for their platform (destinations `kick/*/chat` and
+  `youtube/*/chat`). **Kick:** events arrive as signed webhooks on a
+  configured local listener (the platform must reach it over public HTTPS —
+  a deployment prerequisite documented, not provided); a delivery is accepted
+  only when its RSA-SHA256 signature over `message id . timestamp . raw body`
+  verifies against the configured or fetched platform public key, its
+  timestamp is within 300 s of the injected clock, its body is at most 65536
+  bytes and its message id is not a duplicate inside the retained window;
+  anything else is answered with a refusal status and counted, never
+  published. Chat messages (at most 500 characters sent), follows,
+  subscriptions, renewals and gifts are mapped to `message`, `follow`,
+  `sub`, `resub`, `sub_gift`; badges give trusted roles. Its `moderation`
+  service offers `timeout` only (durations rounded up to whole minutes, 1 to
+  10080); no clip or poll service. **YouTube:** authentication by a
+  configured refresh token exchanged for access tokens before expiry (a
+  refused refresh degrades the module naming `auth_refresh_failed`); the
+  live chat of the channel's active broadcast is polled at max(server-given
+  interval, `min_poll_interval_seconds`, default 5, range 1–60); every API
+  request is charged to a local daily quota ledger (`quota.daily_units` and a
+  configured per-operation cost table, reset at 00:00 America/Los_Angeles on
+  the injected clock) that keeps `quota.write_reserve_units` for sends: a
+  read that would dip into the reserve is not issued and the module reports
+  `quota_exhausted`; a send is refused `quota_exhausted` with 0 requests when
+  the remaining units are below its cost. Author details give trusted roles
+  (owner → broadcaster, moderator → moderators, member → subscribers);
+  member, milestone, gift and paid-message events map to `sub`, `resub`,
+  `sub_gift`, `tip`. Sends are at most 200 characters (longer: `error
+  text_too_long`, 0 requests). Its `moderation` service offers
+  `delete_message` and `timeout`; no clip or poll service. **Both:** a
+  platform rate refusal ends a send `error rate_limited` and blocks further
+  sends on that platform until the announced retry time (refused
+  `rate_limited`, 0 requests); an uncertain send ends `external_unknown`,
+  never retried; no platform literal enters `core/` or the brain.
+
+- R8: **Documentation, packaging and per-provider trial records.** `pyproject.toml`
+  ships the six new manifests (17 in total) with runtime dependencies
+  unchanged; `presence.yaml.example` passes `--check-config`; `docs/README.md`
+  gains a phase 3 section in the phase 1/2 style: the versioning subsection
+  naming every test of this spec's allowlist with its fate, the presence
+  table (each item: configuration or code, and which module), the platform
+  capability matrix with the API limits named (Kick webhook reachability and
+  timeout-only moderation; YouTube daily quota, polling and 200-character
+  sends; no clip or poll API on either), the memory model (file format,
+  bounds, eviction order, erasure paths, and the honest limits: plain
+  unencrypted local files, per platform-and-channel identities never merged,
+  a crash may lose the last write), the moderation modes and strict rules
+  with the shipped default `alert`, the watch trigger, and a trial table with
+  exactly six rows — clips de plateforme, modération de plateforme,
+  notifications communautaires, Kick, YouTube, veille d'écran — each with
+  commit, settings shape without secret values, outcome (a cited
+  `PHASE3-TRIAL` line or "Non exécuté" with its reason), limits and date,
+  produced by the opt-in `tests/test_phase3_trials.py`.
+
+## Acceptance criteria
+
+- AC1 (R1): With no `persona` and no `routes`, the system message of a run
+  equals the phase 2 text byte for byte (0 differing bytes) on twitch and on
+  the fake platform.
+- AC2 (R1): With `persona` set to a 30-character text, the first line of the
+  system message is that text, and the tool-usage and plain-text lines are
+  still present (2 of 2); a `persona` of 2001 characters, 17 routes, two
+  routes with the same `name`, or a `command` of 33 characters each fails
+  `--check-config` with exit 2 naming the field.
+- AC3 (R1): With routes `[A: kinds [raid] → delivery [chat.write, audio.play
+  chime]; B: kinds [message], command "!missed" → instructions X]`, a raid
+  notice run delivers through exactly 2 entries (1 `chat.write`, 1
+  `audio.play`), a `!missed recap` message run's system message contains X
+  and delivers through the destination's list (1 `chat.write`), and a plain
+  mention run matches no route (phase 2 list, 1 `chat.write`, X absent).
+- AC4 (R1): A route `kinds [message], command "!brb"` with a delivery entry
+  `stream.scene.set {scene: Break}` and no `audience` fails startup naming
+  the route; with `audience: broadcaster`, a `!brb` message from the trusted
+  broadcaster produces 1 scene call, while `!brb` from a viewer claiming the
+  broadcaster role in its text (no provenance) produces 0 scene calls; a
+  message `!ask !brb` from anyone matches no `!brb` route (command is the
+  first token only).
+- AC5 (R1): With `notices.kinds` unset, the twitch module creates exactly the
+  phase 2 subscriptions (1: chat messages); with `[sub, raid, follow]` it
+  creates 3; a raid notification from viewer 42 yields one event of kind
+  `raid` with author `42`, one chat-context entry and, under policy
+  `event_kind [raid]`, 1 admitted run in session `(twitch, <channel>, 42)`;
+  an `announcement` notice yields 0 events and increments the ignored counter
+  by 1; an anonymous community gift yields 1 chat-context entry and 0
+  admissions; a rejected follow subscription yields 1 `module.degraded`
+  naming `follow` and chat messages are still admitted.
+- AC6 (R1): `tests/test_presence_pack.py` starts `presence.yaml.example` with
+  scripted model and fake transports and observes: raid → 1 `chat.write` + 1
+  `audio.play`; `!missed` → the model's first call is `chat.read` and 1
+  `chat.write`; broadcaster `!brb` → 1 `stream.scene.set` with scene `Break`;
+  moderator `!clip` → 1 `stream.clip.create`; viewer `!brb` → 0 scene calls;
+  a second visit of the same viewer → the `memory.recall` observation has
+  `known: true`; broadcaster `!watch` → 1 `watch.state active` fact. The
+  profile contains 0 literal credentials and passes `--check-config` with
+  exit 0.
+- AC7 (R1): The README presence table has one row per presence item (at
+  least 11: welcome, thanks, summary, translation, polls, scenes, voice,
+  jingles, screen reactions, clips, memory) and each row's "configuration or
+  code" cell is non-empty; the rows for chat-command polls and channel-point
+  redemptions say "code".
+- AC8 (R2): On the fake platform with a scripted clip service confirming at
+  the first lookup, an authorized call ends `success` with non-empty
+  `clip_id`, `url` and `confirmed_at`, after exactly 1 create request; with
+  no rule, the call is `refused` and the service receives 0 requests.
+- AC9 (R2): With `min_interval_seconds: 30`, a second call 29 s (injected
+  clock) after the first create request is `refused cooldown` with 0
+  requests, and a call at 30 s sends 1 request.
+- AC10 (R2): Scripted outcomes map to: lookup empty until 15 s after
+  acceptance → `error clip_not_created` with 1 create request and 0 second
+  create; offline refusal → `error channel_offline`; auth refusal → `error
+  platform_rejected`; rate refusal → `error rate_limited`; response lost
+  after sending → `external_unknown` cause `confirmation_lost`; call deadline
+  at 12 s while the window is open → `external_unknown`; deadline before any
+  request → `timeout` with 0 requests. Every case sends at most 1 create
+  request.
+- AC11 (R2): Five concurrent calls on one channel with `max_waiters: 4` and
+  `min_interval_seconds: 5` on a clock that does not advance: 1 sends its
+  create request, 4 wait and, once resumed, each ends `refused cooldown` with
+  0 requests, and a sixth concurrent call is `refused resource_busy`; exactly
+  1 create request is sent in total and requests never overlap in time.
+- AC12 (R2): With twitch and kick enabled, `stream.clip.create` is ready for
+  `twitch/*/clip` and unbound for kick with reason `platform_unsupported`;
+  the `action.completed` trace of a successful call carries the `clip_id` and
+  none of the configured credential values (0 occurrences). With only kick
+  enabled, `required: true` makes startup fail with a diagnostic naming
+  `clips` and `platform_unsupported`; `required` unset (default false) lets
+  startup complete with `stream.clip.create` unbound on kick; `required:
+  "yes"` is rejected by the validator.
+- AC13 (R3): After recording viewer `v1` on `(twitch, c1)`, the directory
+  holds exactly 1 file whose name matches `^[0-9a-f]{64}\.json$`, does not
+  contain `v1` or `c1`, and whose content parses as JSON with `format == 1`
+  and the three key fields; the same viewer id on `(kick, c1)` yields a
+  second, distinct file.
+- AC14 (R3): With `max_files: 3` and files A, B, C with (`last_used`,
+  `use_count`) = (t10, 5), (t5, 9), (t5, 2), recording a new viewer D
+  deletes exactly C (oldest `last_used`, then lower `use_count`), leaves 3
+  files, and publishes 1 `memory.removed` fact with reason `evicted` and
+  count 1; when B and C tie on both keys, the one with the older
+  `first_seen` is deleted; when those tie too, the lexicographically smaller
+  file name.
+- AC15 (R3): With `max_total_bytes: 8192` and `max_file_bytes: 4096`, a write
+  that would raise the total above 8192 deletes candidates in the AC14 order
+  until total ≤ 8192 after the write, never deleting the file being written.
+- AC16 (R3): With `retention_days: 30`, a record whose `last_seen` is 30 days
+  + 1 s old (injected clock) is not returned by a recall (`known: false`) and
+  is deleted at the next sweep; one at 29 days is returned. With no
+  `retention_days` configured the effective retention is 30 days.
+- AC17 (R3): With `max_notes: 10`, the 11th note of a viewer drops the oldest
+  note (10 remain); a file is never larger than `max_file_bytes` after any
+  write (checked over 50 writes of 200-character notes with
+  `max_file_bytes: 1024`).
+- AC18 (R3): At prepare, a directory holding 1 malformed memory file, 1
+  oversized memory file and 1 unrelated `notes.txt` ends with the two memory
+  files deleted (count 2, reason `corrupt`) and `notes.txt` unchanged; a
+  directory of 5 valid files with `max_files: 3` holds 3 files before
+  readiness.
+- AC19 (R3): A chat message `!forgetme` from trusted author `v1` deletes
+  `v1`'s file for that platform and channel (1 `memory.removed` reason
+  `erased`, no viewer id in the fact) even when the trigger rejects the
+  message; `!forgetme please` deletes nothing. `forget` deletes exactly 1
+  file, `forget-all` leaves 0 memory files and keeps unrelated files, `stats`
+  prints the file count and total bytes, and each exits 0 without opening a
+  socket; an invalid configuration exits 2.
+- AC20 (R4): A first run of viewer `v1` whose model calls `memory.recall`
+  observes `known: false`; after that run delivered `hello` with `success`,
+  a second run's recall observes `known: true`, `interactions: 1` and one
+  note whose `reply_text` is `hello` and `delivery` is `confirmed`.
+- AC21 (R4): When the delivery ends `external_unknown`, the recorded note has
+  `delivery: unconfirmed` and no `reply_text`; when it ends `error`, the note
+  has `at`, `viewer_text`, `delivery: none` and no `reply_text`; in all three cases the run's terminal status and
+  delivery outcome are identical to the same run without `viewer_memory`.
+- AC22 (R4): `memory.recall` and `memory.record` accept no argument (an
+  argument `viewer_id` is refused as invalid before the provider is
+  invoked); `memory.record` never appears in the model's offered tools
+  (0 occurrences over a run where it is granted); with 12 notes of 200
+  characters and `max_recall_bytes: 1024`, the serialized recall result is at
+  most 1024 bytes, holds the most recent notes first and has `truncated:
+  true`; with a stored `display_name` of 64 four-byte characters, 10 notes
+  of 200 characters and `max_recall_bytes: 512`, the result is at most 512
+  bytes, holds `known`, `display_name`, `first_seen`, `last_seen` and
+  `interactions`, has `truncated: true` and a `display_name` that is a
+  prefix of the stored one; a platform name of 80 characters is stored as
+  its first 64; `max_recall_bytes: 511` is rejected by the validator; a
+  watch run's recall ends `error no_viewer`.
+- AC23 (R4): After delivery, when the run has 0 action calls remaining in
+  its budget (all used), or 4.9 s of deadline remaining (injected clock,
+  below the 5 s `memory.record` timeout), `memory.record` is not called and
+  the run record states it was skipped; with 1 action call remaining and
+  5 s of deadline remaining it is called exactly once.
+- AC24 (R5): With no `mode` configured, a granted `moderation.request`
+  `delete_message` ends `success` disposition `alerted`, the platform
+  moderation service receives 0 requests, and 1 `moderation.decision` fact
+  is published.
+- AC25 (R5): The model is offered `moderation.request` only when a rule
+  grants it; a write action without `model_proposable` (e.g. `chat.write`,
+  granted) is offered 0 times; a manifest declaring `model_proposable: true`
+  on a read action or on a delivery-capable action fails discovery naming the
+  module and the action; a second `moderation.request` in the same run is
+  `refused run_limit`.
+- AC26 (R5): In mode `propose`, a request yields a proposal id and 0 platform
+  requests; `!modok <id>` from the trusted broadcaster applies it (1
+  platform request, disposition `applied`); the same command from a viewer
+  (no trusted role) applies nothing; `!modno <id>` from a moderator discards
+  it; an unapproved proposal expires after 300 s (injected clock) with 1
+  `moderation.decision` fact of disposition `expired`; with `max_pending: 2`
+  a third proposal evicts the one closest to expiry; `auto_apply:
+  [delete_message]` applies a delete at once under the strict rules.
+- AC27 (R5): In mode `act`, each strict rule refuses with its code and 0
+  platform requests: a timeout while `operations` is `[delete_message]` →
+  `operation_not_allowed`; an unknown message id → `target_unknown`; a
+  message by a trusted moderator, VIP, the broadcaster or the companion →
+  `target_protected`; `duration_seconds` 301 with `max_timeout_seconds: 300`
+  → `duration_out_of_range`; the 4th application within 600 s with
+  `max_actions_per_window: 3` → `rate_limited`; a second action on the same
+  author within 600 s → `target_cooldown`; `delete_message` on kick →
+  `platform_unsupported`.
+- AC28 (R5): In mode `act`, an allowed delete sends exactly 1 platform
+  request and ends `applied`; a platform refusal → `error platform_rejected`;
+  a rate refusal → `error rate_limited_platform`; a lost response →
+  `external_unknown` with 0 second request. A per-channel override
+  `twitch/c2: act` leaves `twitch/c1` in `alert`. Over all AC24–AC28 cases,
+  the number of `moderation.decision` facts equals the number of requests,
+  approvals, rejections and expiries (no silent outcome).
+- AC29 (R6): With `watch` enabled and `activation` unset, 0 ticks are emitted
+  over 600 s (injected clock); after `!watch` from the trusted broadcaster,
+  ticks are emitted at 60 s intervals (10 ticks over 600 s with
+  `interval_seconds: 60`); `!watch` from a viewer (no trusted role) starts
+  nothing; `!unwatch` stops ticks (0 further ticks); with `activation:
+  startup` ticks start without a command.
+- AC30 (R6): `interval_seconds: 14`, `max_ticks_per_hour: 241`,
+  `max_ticks_per_hour: 100` with `interval_seconds: 60` (above 3600/60 = 60),
+  `max_active_seconds: 59` and 5 channels each fail `--check-config` with
+  exit 2 naming the field.
+- AC31 (R6): With `interval_seconds: 15` and `max_ticks_per_hour: 10`, at
+  most 10 ticks are emitted in any 3600 s window; a session started at t0
+  with `max_active_seconds: 600` emits no tick after t0 + 600 s and publishes
+  `watch.state inactive` reason `max_active`; a tick due while the previous
+  watch run of that channel is still running is skipped (skip counter + 1,
+  runs in flight ≤ 1).
+- AC32 (R6): A tick yields 0 chat-context entries and 0 users-directory
+  entries; its run's `screen.capture` call is made under principal
+  `brain.watch`: with a rule granting `screen.capture` to `brain` only, the
+  capture tool is not offered in the watch run (0 capture calls) while a chat
+  run of the same channel is offered it; with a rule naming `brain.watch`,
+  the watch run captures through the same provider (1 provider invocation).
+  A twitch, kick or youtube event whose author id contains `:` yields 0
+  admissions and increments the invalid counter by 1.
+- AC33 (R6): Shutdown during an active session stops ticks at `stop_inputs`
+  (0 ticks after it), publishes `watch.state inactive` reason `shutdown`, and
+  completes within the global shutdown deadline.
+- AC34 (R7): A Kick webhook delivery signed with the test key and a timestamp
+  within 300 s is published once as a `kick` chat event and admitted per
+  policy; a bad signature, a timestamp 301 s old, a 65537-byte body, or a
+  duplicate message id is refused, counted, and yields 0 events; the listener
+  runs on the configured host and port.
+- AC35 (R7): Kick `chat.write` of a 500-character text sends 1 request; 501
+  characters → `error text_too_long` with 0 requests; a 429 with a retry time
+  of 30 s → `error rate_limited`, and a send 29 s later is `refused
+  rate_limited` with 0 requests; Kick badges `broadcaster`, `moderator`,
+  `vip`, `subscriber` satisfy the matching `audience` rules; Kick follow,
+  subscription, renewal and gift events map to `follow`, `sub`, `resub`,
+  `sub_gift`; a Kick timeout of 90 s is sent as 2 minutes and one of 10081
+  minutes is refused by the Kick moderation service with 0 requests.
+- AC36 (R7): YouTube: with a scripted token endpoint issuing a 3600 s token,
+  a refresh happens before expiry and none before it is needed; a refused
+  refresh yields 1 `module.degraded` naming `auth_refresh_failed`; polling
+  follows max(server interval 2000 ms, `min_poll_interval_seconds: 5`) = 5 s
+  (at most 12 list requests per 60 s of injected clock) and max(8000 ms, 5 s)
+  = 8 s when the server asks for longer.
+- AC37 (R7): With `quota.daily_units: 100`, a list cost of 5, a send cost of
+  50 and `write_reserve_units: 50`, the module issues exactly 10 list
+  requests, then reports `quota_exhausted` and issues 0 more reads while a
+  send still succeeds (1 send request); a second send is `refused
+  quota_exhausted` with 0 requests; after 00:00 America/Los_Angeles on the
+  injected clock, reads resume.
+- AC38 (R7): YouTube `chat.write` of 200 characters sends 1 request; 201 →
+  `error text_too_long` with 0 requests; owner, moderator and member author
+  details satisfy `broadcaster`, `moderators` and `subscribers`; member,
+  milestone, gift and paid-message events map to `sub`, `resub`, `sub_gift`,
+  `tip`; its moderation service performs `delete_message` and `timeout`
+  (1 request each).
+- AC39 (R7): With twitch, kick and youtube enabled together, `chat.write` has
+  exactly 3 bindings on disjoint destinations (`twitch/*/chat`,
+  `kick/*/chat`, `youtube/*/chat`); the same viewer id on two platforms gets
+  two sessions; `stream.poll.create` and `stream.clip.create` are unbound for
+  kick and youtube with reason `platform_unsupported`; a scan of `core/`
+  finds 0 occurrences of `kick` and `youtube` (case-insensitive, as words).
+- AC40 (R8): A clean install discovers exactly 17 manifests and
+  `pyproject.toml` has exactly 17 `modules.<name>` package-data lines, with
+  runtime dependencies exactly `aiohttp` and `PyYAML`.
+- AC41 (R8): The README phase 3 trial table has exactly the six rows in the
+  R8 order, each with 5 non-empty fields, a commit hash of 7–40 hex
+  characters, no secret value in the settings shape, an outcome containing
+  `PHASE3-TRIAL` or `Non exécuté`, a `YYYY-MM-DD` date; the section names
+  `tests/test_phase3_trials.py`; the versioning subsection names all 6 tests
+  of this spec's allowlist.
+- AC42 (R8): The three phase 2 profiles are byte-identical to their state at
+  the phase 3 base commit (0 changed bytes), and the full suite passes with
+  the project virtualenv with 0 positive-duration sleeps.
+
+## Caller enumeration
+
+Search method: `grep -rn` over `core/`, `modules/`, `tests/` for each changed
+symbol or manifest key, plus the manifest catalogue under `modules/*/module.yaml`.
+Blind spot: callers reaching a spec through dynamic attribute access are not
+detected by grep; the loader is the only constructor of manifest action specs.
+
+### Action spec gains optional `model_proposable` (core/contracts.py, core/loader.py)
+
+| File | Function/Method | Migration Note |
+|------|----------------|----------------|
+| core/loader.py | manifest action parsing (`_ACTION_KEYS` and the action-entry parser) | Accept the key, pass it to the spec; default false keeps every existing manifest unchanged. |
+| modules/brain/__init__.py | `_offered_tools` | Offer a write only when `model_proposable` and authorized; reads unchanged. |
+| tests/test_contracts.py | action spec construction tests | Unchanged (default false); new refusal tests added. |
+
+### Built-in trigger types gain `event_kind` (core/triggers.py)
+
+| File | Function/Method | Migration Note |
+|------|----------------|----------------|
+| core/triggers.py | `TriggerRegistry.register`, `_evaluate_rule`, `_validate_builtin_rule` | Add the type; existing three unchanged. |
+| modules/twitch/module.yaml, tests/fixtures/modules/fakeplatform/module.yaml | `triggers.types` | Declare `event_kind`. |
+| tests/test_triggers.py | tests iterating `BUILTIN_TRIGGER_TYPES` | They filter by name; unaffected. |
+
+### Brain settings gain optional `persona` and `routes`; run principal per event kind
+
+| File | Function/Method | Migration Note |
+|------|----------------|----------------|
+| modules/brain/module.yaml, modules/brain/__init__.py | settings schema, `validate_settings`, `_system_prompt`, delivery resolution | Optional keys; absent → phase 2 behaviour (AC1). |
+| config.yaml.example, config.server.yaml.example | brain settings | None: the keys are optional; files unchanged (AC42). |
+| tests/test_brain.py | `test_manifest_declares_v2_shape_settings_hook_and_no_grant` | Allowlisted: property set grows by 2. |
+
+### Runtime service registry: new kinds `clip` and `moderation`
+
+| File | Function/Method | Migration Note |
+|------|----------------|----------------|
+| modules/twitch/__init__.py | activation (publishes `poll` today) | Also publish `clip` and `moderation`. |
+| modules/kick/__init__.py, modules/youtube/__init__.py | activation | Publish `moderation` only. |
+| tests/fixtures/modules/fakeplatform/__init__.py | activation | Publish scripted `clip` and `moderation`. |
+| modules/clips/__init__.py, modules/moderation/__init__.py | prepare | Resolve per platform. |
+| tests/test_stream_control.py | registry `entries()` equalities | Use the fake platform's own registry fixture with poll only; unaffected. |
+
+### Manifest catalogue: 11 → 17 shipped manifests; `chat.write` declared by 3 manifests
+
+| File | Function/Method | Migration Note |
+|------|----------------|----------------|
+| tests/test_examples.py | `test_manifests_are_unique_and_have_coherent_capabilities`, `test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario` | Allowlisted: counts and declared-action sets change. |
+| tests/test_profiles.py | `test_installed_distribution_discovers_the_shipped_manifests_and_answers_help`, `test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency` | Allowlisted: 11 → 17. |
+| tests/test_twitch.py | `test_manifest_declares_twitch_source_and_sink` | Allowlisted: settings property set and trigger types grow. |
+| config*.example, agent.yaml.example | enabled modules and grants | Unchanged: the new modules are not enabled there. |
+
+## Test failure allowlist
+
+- `tests/test_examples.py::test_manifests_are_unique_and_have_coherent_capabilities` — asserts 11 manifests, 9 declared actions each declared once, and the twitch manifest's exact keys; R2, R3, R4, R5, R6, R7 add six manifests and four action names, R7 declares `chat.write` in `kick` and `youtube`, and R1 adds the `event_kind` trigger type and the `notices` setting to `twitch`.
+- `tests/test_examples.py::test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario` — asserts the catalog of discovered manifests declares exactly 9 actions; R2, R4 and R5 add `stream.clip.create`, `memory.recall`, `memory.record` and `moderation.request` (13).
+- `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help` — asserts 11 manifests in a clean install; R8 ships 17.
+- `tests/test_profiles.py::test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency` — asserts 11 package-data lines; R8 requires 17 (dependency assertion unchanged).
+- `tests/test_twitch.py::test_manifest_declares_twitch_source_and_sink` — asserts the settings properties equal the phase 2 set and the trigger types equal {probability, audience, keyword}; R1 adds `notices` and `event_kind`.
+- `tests/test_brain.py::test_manifest_declares_v2_shape_settings_hook_and_no_grant` — asserts the settings properties equal the phase 2 set; R1 adds `persona` and `routes`.

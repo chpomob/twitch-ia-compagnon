@@ -1,0 +1,37 @@
+{
+  "phase": "plan",
+  "exit_code": 0,
+  "commit_sha": "1210afc2530577b5df1ed93e33099131e56b2d85",
+  "stdout": "READ: spec.md\n\nI wrote the Phase 3 implementation plan to `plan.md` in the workdir. It has 26 steps, P1\u2013P26, numbered with no gaps.\n\n**Coverage**\n- Every step has all five fields: Files, Description, Dependencies, Tests and Risks.\n- No step depends on a later step.\n- Requirements R1\u2013R8 and acceptance criteria AC1\u2013AC42 each map to at least one step.\n- Every spec target appears in a step. Every file a step lists is either a spec target or under `docs/campaigns/phase3/`.\n- There is no `findings.json` input, so the frontmatter says `findings-input: false`. The `findings.json` in the workdir is from the MVP campaign and was not used.\n\n**Step order**\n- Core first (P1\u2013P3): the event kinds, the new trigger type and `model_proposable`.\n- Then the fixture platform (P4) and the brain (P5\u2013P6), followed by Twitch (P7\u2013P8).\n- Then clips (P9), viewer memory (P10\u2013P13), moderation (P14\u2013P15), screen watch (P16\u2013P17), Kick (P18\u2013P19) and YouTube (P20\u2013P21).\n- Last come the presence profile (P22), packaging (P23), the opt-in trials (P24) and the README (P25).\n- P26 is the full-branch review gate, run over the whole diff.\n\n**Decisions the plan makes that the spec leaves open**\n- **Notices:** they travel as ordinary chat events with a `kind` field. The chat-context and users modules are not targets, so the notices must fit the existing event shape. Every new command reads only real chat messages.\n- **One moderation request per run:** the brain enforces this for any model-proposable action, so no module name is added to the brain.\n- **Memory:** the viewer is read from the run's conversation id, never from an argument.\n- **Moderation:** the chat context stores no roles, so the module keeps its own index of message authors and their roles.\n- **Kick:** webhook signatures are checked with the standard library only.\n- **YouTube:** the quota-day reset at midnight Los Angeles time is computed from the US daylight-saving rule. The standard `zoneinfo` module needs the `tzdata` package on Windows, which would add a dependency.\n\n**One point to check early:** AC39 needs `stream.poll.create` to report `platform_unsupported` for Kick and YouTube. That reason comes from `modules/stream_control`, which is not a target. P21 checks it first and flags it as a spec gap if it differs.\n\nThe plan also includes the caller tables and a shared-file ordering list.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 438.1189891860122,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3170,
+          "completion_tokens": 588,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "plan",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3170,
+      "completion_tokens": 588,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "plan",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}

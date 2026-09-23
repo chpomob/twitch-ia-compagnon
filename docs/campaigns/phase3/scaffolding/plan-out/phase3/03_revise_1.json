@@ -1,0 +1,37 @@
+{
+  "phase": "revise",
+  "exit_code": 0,
+  "commit_sha": "99bdefdb3fb4dc427bce1a2353a6a1dd295f3d68",
+  "stdout": "READ: findings.json\nplan.md revised on disk (step ids P1\u2013P26 unchanged, findings-input: true): F-P1 explicit absent-delivery branch + test in P13; F-P2 per-channel lock with check-and-reserve semantics + concurrency tests in P14/P15; F-P3 tests/test_examples.py added to P19 with the chat.write {twitch, kick} assertion, chain updated, P21 notes its {twitch, kick, youtube} update; F-P4 decision 6 and P11 separate recall ({}) from record (exchange data only, no identity args).",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 57.562791775912046,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3083,
+          "completion_tokens": 120,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "revise",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3083,
+      "completion_tokens": 120,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "revise",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}
