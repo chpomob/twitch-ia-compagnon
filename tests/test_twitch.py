@@ -12,6 +12,8 @@ from core.actions import AuthorizationPolicy, AuthorizationRule
 from core.bus import EventBus
 from core.context import ChatContext
 from core.contracts import (
+    EVENT_KINDS,
+    TRACE_MODULE_DEGRADED,
     COUNTER_DEDUP_EVICTIONS,
     COUNTER_LOST_TRACES,
     COUNTER_TRIGGER_REJECTIONS,
@@ -42,6 +44,7 @@ from modules.twitch import (
     EVENTSUB_URL,
     HELIX_CHAT_URL,
     MANIFEST_PATH,
+    NOTICE_KINDS,
     PLATFORM,
     TOKEN_VALIDATION_URL,
     TwitchModule,
@@ -198,6 +201,7 @@ def runtime_context(
     scheduler: Any = None,
     declare_triggers: bool = True,
     authorization: AuthorizationPolicy | None = None,
+    policy: TriggerPolicy | None = None,
 ) -> RuntimeContext:
     """The shared fixture (``conftest.runtime_context``) carrying this
     module's declarations: the manifest's trigger spec registered for the
@@ -207,6 +211,7 @@ def runtime_context(
     the loader would; a test that runs the real loader passes ``False`` so
     the loader can register it itself. The executor, supervision, counters
     and tasks are the shared assembly — no twitch-specific wiring here.
+    ``policy`` is a configured trigger policy for the ``twitch`` input.
     """
 
     registry = TriggerRegistry(companion_name=SETTINGS["companion_name"])
@@ -214,6 +219,8 @@ def runtime_context(
         registry.register(
             "twitch", manifest_trigger_spec(), companion_name=SETTINGS["companion_name"]
         )
+        if policy is not None:
+            registry.configure("twitch", policy)
     target_clock = clock if clock is not None else ManualClock()
     return build_context(
         bus,
@@ -286,11 +293,16 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     """R7/R1/R5: the manifest is v2 — the former 4-key equality is superseded.
 
     It declares the runtime contract it is built against, the ``input`` role,
-    a settings schema and the hook this package implements, the three trigger
+    a settings schema and the hook this package implements, the trigger
     types with their parameter schemas, the combination operators, exactly
     one default policy that names the companion only by token, and the
     ``chat.write`` action contract carrying the delivery capability under
     ``text`` (R1 decision 1, AC58) and nothing else.
+
+    Rewritten by phase 3 R1 (plan P7): the settings gain the optional
+    ``notices`` (its ``kinds`` the six Twitch notice kinds, not required) and
+    the trigger types gain ``event_kind`` with the built-in schema; the
+    default policy, the action and the credentials are unchanged.
     """
 
     from core.runtime import RUNTIME_API
@@ -308,15 +320,31 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
 
     schema = manifest["settings_schema"]
     assert set(schema["required"]) == set(SETTINGS)
-    assert set(schema["properties"]) == set(SETTINGS)
+    assert set(schema["properties"]) == set(SETTINGS) | {"notices"}
+    notices = schema["properties"]["notices"]
+    assert notices["type"] == "object"
+    assert set(notices["properties"]) == {"kinds"}
+    assert notices["properties"]["kinds"]["items"]["enum"] == list(NOTICE_KINDS)
+    assert notices["properties"]["kinds"]["items"]["enum"] == [
+        "sub", "resub", "sub_gift", "community_sub_gift", "raid", "follow",
+    ]
     assert manifest["settings_validator"] == "validate_settings"
     assert callable(validate_settings)
+    assert manifest["credentials"] == ["client_id", "client_secret", "access_token"]
 
     triggers = manifest["triggers"]
     declared = {declaration["name"]: declaration for declaration in triggers["types"]}
-    assert set(declared) == {"probability", "audience", "keyword"}
+    assert set(declared) == {"probability", "audience", "keyword", "event_kind"}
     for declaration in declared.values():
         assert declaration["parameter_schema"]["type"] == "object"
+    assert declared["event_kind"]["parameter_schema"] == {
+        "type": "object",
+        "properties": {
+            "kinds": {"type": "array", "items": {"type": "string", "enum": list(EVENT_KINDS)}}
+        },
+        "required": ["kinds"],
+        "additionalProperties": False,
+    }
     assert set(triggers["combinations"]) == {"all_of", "any_of", "none_of"}
     default_policy = triggers["default_policy"]
     assert default_policy == {
@@ -2202,3 +2230,545 @@ async def test_provider_binding_is_the_manifest_contract_and_refuses_ambiguity()
         assert_sanitized(diagnostics)
     finally:
         await ambiguous.close()
+
+
+# --------------------------------------------------------------------------- #
+# Community notices, opt-in subscriptions and the ``:`` identity refusal
+# (phase 3 R1, R6 — AC5, AC32 twitch half)
+# --------------------------------------------------------------------------- #
+
+# EventSub envelopes as the public reference documents them
+# (``channel.chat.notification`` v1 and ``channel.follow`` v2); the field
+# names are the ones the mapping reads.
+
+
+def chat_notice(
+    message_id: str,
+    notice_type: str,
+    *,
+    chatter_id: str = "viewer-7",
+    anonymous: bool = False,
+    system_message: str = "a community notice",
+    **blocks: Any,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "broadcaster_user_id": SETTINGS["broadcaster_id"],
+        "broadcaster_user_login": "streamer",
+        "broadcaster_user_name": "Streamer",
+        "chatter_user_id": chatter_id,
+        "chatter_user_login": "chatter",
+        "chatter_user_name": "Chatter",
+        "chatter_is_anonymous": anonymous,
+        "color": "",
+        "badges": [],
+        "system_message": system_message,
+        "message_id": message_id,
+        "message": {"text": "", "fragments": []},
+        "notice_type": notice_type,
+    }
+    for name in (
+        "sub",
+        "resub",
+        "sub_gift",
+        "community_sub_gift",
+        "gift_paid_upgrade",
+        "prime_paid_upgrade",
+        "pay_it_forward",
+        "raid",
+        "unraid",
+        "announcement",
+        "bits_badge_tier",
+        "charity_donation",
+    ):
+        event[name] = blocks.get(name)
+    return {
+        "metadata": {
+            "message_id": f"envelope-{message_id}",
+            "message_type": "notification",
+            "message_timestamp": "2026-09-23T12:00:00.000000000Z",
+            "subscription_type": "channel.chat.notification",
+            "subscription_version": "1",
+        },
+        "payload": {
+            "subscription": {"type": "channel.chat.notification", "version": "1"},
+            "event": event,
+        },
+    }
+
+
+def raid_notice(message_id: str, raider_id: str = "42") -> dict[str, Any]:
+    return chat_notice(
+        message_id,
+        "raid",
+        chatter_id=raider_id,
+        system_message="Raider is raiding with a party of 3.",
+        raid={
+            "user_id": raider_id,
+            "user_name": "Raider",
+            "user_login": "raider",
+            "viewer_count": 3,
+            "profile_image_url": "https://example.invalid/raider.png",
+        },
+    )
+
+
+def anonymous_community_gift(message_id: str) -> dict[str, Any]:
+    return chat_notice(
+        message_id,
+        "community_sub_gift",
+        chatter_id="274598607",
+        anonymous=True,
+        system_message="An anonymous user is gifting 5 Tier 1 Subs to the community!",
+        community_sub_gift={
+            "id": "community-gift-1",
+            "total": 5,
+            "sub_tier": "1000",
+            "cumulative_total": None,
+        },
+    )
+
+
+def follow_notice(message_id: str, follower_id: str = "55") -> dict[str, Any]:
+    return {
+        "metadata": {
+            "message_id": message_id,
+            "message_type": "notification",
+            "message_timestamp": "2026-09-23T12:00:00.000000000Z",
+            "subscription_type": "channel.follow",
+            "subscription_version": "2",
+        },
+        "payload": {
+            "subscription": {"type": "channel.follow", "version": "2"},
+            "event": {
+                "user_id": follower_id,
+                "user_login": "follower",
+                "user_name": "Follower",
+                "broadcaster_user_id": SETTINGS["broadcaster_id"],
+                "broadcaster_user_login": "streamer",
+                "broadcaster_user_name": "Streamer",
+                "followed_at": "2026-09-23T12:00:00.000000000Z",
+            },
+        },
+    }
+
+
+def event_kind_policy(*kinds: str) -> TriggerPolicy:
+    return TriggerPolicy(
+        rules=(TriggerRule(type="event_kind", parameters={"kinds": list(kinds)}),),
+        combination="all_of",
+    )
+
+
+async def activate_notices(
+    session: FakeSession,
+    context: ModuleContext,
+    kinds: list[str] | None,
+) -> tuple[TwitchModule, list[str]]:
+    diagnostics: list[str] = []
+    settings: dict[str, Any] = {
+        **SETTINGS,
+        "_session_factory": lambda: session,
+        "_retry_delay": no_delay,
+        "diagnostic_reporter": diagnostics.append,
+    }
+    if kinds is not None:
+        settings["notices"] = {"kinds": kinds}
+    return await start_module(settings, context.bus, context), diagnostics
+
+
+def subscription_requests(session: FakeSession) -> list[dict[str, Any]]:
+    return [
+        call["json"] for call in session.post_calls if call["url"] == EVENTSUB_SUBSCRIPTIONS_URL
+    ]
+
+
+def accepted_subscription() -> FakeResponse:
+    return FakeResponse(202, {"data": [{"id": "subscription"}]})
+
+
+@pytest.mark.asyncio
+async def test_notice_kinds_select_the_subscriptions() -> None:
+    """AC5 (R1): with ``notices.kinds`` unset exactly the phase 2 subscription
+    (chat messages); with ``[sub, raid, follow]`` 3 — chat messages, chat
+    notifications and follows (version 2, the bot account as the moderator
+    reading followers)."""
+
+    unset = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, _ = await activate_notices(unset, module_context(), None)
+    await handle.close()
+    (only,) = subscription_requests(unset)
+    assert only == {
+        "type": "channel.chat.message",
+        "version": "1",
+        "condition": {
+            "broadcaster_user_id": SETTINGS["broadcaster_id"],
+            "user_id": SETTINGS["bot_user_id"],
+        },
+        "transport": {"method": "websocket", "session_id": "one"},
+    }
+
+    listed = FakeSession(
+        [FakeWebSocket(welcome("two"))],
+        subscriptions=[accepted_subscription() for _ in range(3)],
+    )
+    handle, diagnostics = await activate_notices(
+        listed, module_context(), ["sub", "raid", "follow"]
+    )
+    await handle.close()
+    requests = subscription_requests(listed)
+    assert len(requests) == 3
+    assert [(r["type"], r["version"]) for r in requests] == [
+        ("channel.chat.message", "1"),
+        ("channel.chat.notification", "1"),
+        ("channel.follow", "2"),
+    ]
+    assert requests[1]["condition"] == requests[0]["condition"]
+    assert requests[2]["condition"] == {
+        "broadcaster_user_id": SETTINGS["broadcaster_id"],
+        "moderator_user_id": SETTINGS["bot_user_id"],
+    }
+    assert all(r["transport"]["session_id"] == "two" for r in requests)
+    assert diagnostics == []
+
+    # One kind of each subscription selects exactly that subscription.
+    follow_only = FakeSession(
+        [FakeWebSocket(welcome("three"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, _ = await activate_notices(follow_only, module_context(), ["follow"])
+    await handle.close()
+    assert [r["type"] for r in subscription_requests(follow_only)] == [
+        "channel.chat.message",
+        "channel.follow",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_raid_is_one_raid_event_fed_and_admitted_for_the_raider() -> None:
+    """AC5 (R1): a raid from viewer 42 → one event of kind ``raid`` with author
+    ``42`` (the raider of the event's raid block) and the system text, one
+    chat-context entry and, under ``event_kind [raid]``, 1 admitted run in
+    session ``(twitch, <channel>, 42)``."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler, policy=event_kind_policy("raid"))
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, diagnostics = await activate_notices(session, context, ["raid"])
+    try:
+        await _ingest(handle, raid_notice("raid-1", "42"))
+
+        (event,) = chat_events(context.bus)
+        payload = event["payload"]
+        assert payload["kind"] == "raid"
+        assert payload["author"]["id"] == "42"
+        assert payload["author"]["display_name"] == "Raider"
+        assert payload["text"] == "Raider is raiding with a party of 3."
+        assert payload["message_id"] == "raid-1"
+        assert event["metadata"] == {"source": "twitch", "schema_version": 2}
+
+        (record,) = context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10)
+        assert (record.author_id, record.message_id) == ("42", "raid-1")
+
+        (accepted,) = events_of(context.bus, "input.trigger.accepted")
+        assert accepted["payload"]["reason"] == "accepted:event_kind_raid"
+        ((session_key, work),) = scheduler.admissions
+        assert session_key == SessionKey("twitch", SETTINGS["broadcaster_id"], "42")
+        assert work.payload["payload"]["kind"] == "raid"
+
+        # A chat message does not match the raid-only policy.
+        await _ingest(handle, notification("plain-1", "Hello Companion"))
+        assert len(scheduler.admissions) == 1
+        assert handle.counts == {"invalid": 0, "notices_ignored": 0}
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_the_raid_author_is_read_from_the_raid_block() -> None:
+    """R1: the raid's author is the raider the raid block names, whatever the
+    chatter fields say."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler, policy=event_kind_policy("raid"))
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, _ = await activate_notices(session, context, ["raid"])
+    try:
+        envelope = raid_notice("raid-2", "42")
+        del envelope["payload"]["event"]["chatter_user_id"]
+        await _ingest(handle, envelope)
+        ((session_key, _work),) = scheduler.admissions
+        assert session_key.viewer_id == "42"
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_other_and_unlisted_notice_types_are_ignored_and_counted() -> None:
+    """AC5 (R1): an ``announcement`` yields 0 events and ``notices_ignored`` + 1;
+    a mapped kind that ``notices.kinds`` does not list is ignored the same way."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler, policy=event_kind_policy("raid"))
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, diagnostics = await activate_notices(session, context, ["raid"])
+    try:
+        await _ingest(
+            handle,
+            chat_notice(
+                "announce-1",
+                "announcement",
+                system_message="",
+                announcement={"color": "PRIMARY"},
+            ),
+        )
+        assert chat_events(context.bus) == []
+        assert handle.counts["notices_ignored"] == 1
+
+        await _ingest(
+            handle,
+            chat_notice("sub-1", "sub", sub={"sub_tier": "1000", "is_prime": False}),
+        )
+        assert chat_events(context.bus) == []
+        assert handle.counts == {"invalid": 0, "notices_ignored": 2}
+        assert context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10) == ()
+        assert scheduler.admissions == []
+        assert events_of(context.bus, "input.trigger.accepted") == []
+        assert events_of(context.bus, "input.trigger.rejected") == []
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_an_anonymous_community_gift_is_fed_and_never_admitted() -> None:
+    """AC5 (R1, plan decision 3): an anonymous community gift yields 1
+    chat-context entry under ``system:anonymous`` and 0 admissions, even under
+    a policy selecting its kind; a redelivery feeds nothing more."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(
+        scheduler=scheduler, policy=event_kind_policy("community_sub_gift")
+    )
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, diagnostics = await activate_notices(session, context, ["community_sub_gift"])
+    try:
+        await _ingest(handle, anonymous_community_gift("gift-1"))
+        await _ingest(handle, anonymous_community_gift("gift-1"))
+
+        (record,) = context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10)
+        assert record.author_id == "system:anonymous"
+        assert record.text.startswith("An anonymous user is gifting")
+        (event,) = chat_events(context.bus)
+        assert event["payload"]["kind"] == "community_sub_gift"
+        assert event["payload"]["author"] == {"id": "system:anonymous"}
+        assert scheduler.admissions == []
+        assert events_of(context.bus, "input.trigger.accepted") == []
+        assert events_of(context.bus, "input.trigger.rejected") == []
+        assert handle.counts == {"invalid": 0, "notices_ignored": 0}
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_follow_is_a_follow_notice_of_the_follower() -> None:
+    """R1: a ``channel.follow`` event is a ``follow`` notice authored by the
+    follower, identified by the EventSub envelope, deduplicated on it."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler, policy=event_kind_policy("follow"))
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, diagnostics = await activate_notices(session, context, ["follow"])
+    try:
+        await _ingest(handle, follow_notice("follow-envelope-1", "55"))
+        await _ingest(handle, follow_notice("follow-envelope-1", "55"))
+
+        (event,) = chat_events(context.bus)
+        assert event["payload"]["kind"] == "follow"
+        assert event["payload"]["author"]["id"] == "55"
+        assert event["payload"]["message_id"] == "follow-envelope-1"
+        ((session_key, _work),) = scheduler.admissions
+        assert session_key == SessionKey("twitch", SETTINGS["broadcaster_id"], "55")
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_follow_subscription_degrades_follow_and_chat_continues() -> None:
+    """AC5 (R1): a rejected follow subscription (non-2xx) yields 1
+    ``module.degraded`` naming ``follow`` and its reason; startup completes,
+    and a subsequent chat message is still admitted."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    websocket = FakeWebSocket(welcome("one"))
+    session = FakeSession(
+        [websocket],
+        subscriptions=[
+            accepted_subscription(),
+            FakeResponse(403, {"message": "subscription missing proper authorization"}),
+        ],
+    )
+    handle, diagnostics = await activate_notices(session, context, ["follow"])
+    try:
+        (degraded,) = events_of(context.bus, TRACE_MODULE_DEGRADED)
+        assert degraded["payload"]["module"] == "twitch"
+        assert degraded["payload"]["capabilities"] == ["follow"]
+        assert degraded["payload"]["reason"] == "follow subscription rejected (status 403)"
+        assert diagnostics == ["twitch follow subscription: rejected (status 403)"]
+
+        websocket.feed(notification("after-1", "Hello Companion"))
+        await wait_until(lambda: len(scheduler.admissions) == 1)
+        ((session_key, _work),) = scheduler.admissions
+        assert session_key == SessionKey("twitch", SETTINGS["broadcaster_id"], "viewer-7")
+        assert len(events_of(context.bus, TRACE_MODULE_DEGRADED)) == 1
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_notice_subscription_degrades_its_kinds_and_chat_continues() -> None:
+    """R1: a revoked follow subscription degrades ``follow`` only; the socket
+    keeps delivering chat, while a revoked chat subscription still stops it."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    websocket = FakeWebSocket(welcome("one"))
+    session = FakeSession(
+        [websocket],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, _ = await activate_notices(session, context, ["follow"])
+    try:
+        websocket.feed(
+            {
+                "metadata": {"message_type": "revocation"},
+                "payload": {"subscription": {"type": "channel.follow", "status": "authorization_revoked"}},
+            }
+        )
+        websocket.feed(notification("after-1", "Hello Companion"))
+        await wait_until(lambda: len(scheduler.admissions) == 1)
+        (degraded,) = events_of(context.bus, TRACE_MODULE_DEGRADED)
+        assert degraded["payload"]["capabilities"] == ["follow"]
+        assert degraded["payload"]["reason"] == "follow subscription revoked"
+        assert websocket.close_calls == 0
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_each_revoked_notice_subscription_reports_its_own_degradation() -> None:
+    """R1: with both notice subscriptions listed, revoking one then the other
+    yields 2 ``module.degraded`` events with distinct reasons, so the second
+    loss is not deduplicated into the first."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    websocket = FakeWebSocket(welcome("one"))
+    session = FakeSession(
+        [websocket],
+        subscriptions=[accepted_subscription() for _ in range(3)],
+    )
+    handle, _ = await activate_notices(session, context, ["raid", "follow"])
+    try:
+        for subscription_type in ("channel.follow", "channel.chat.notification"):
+            websocket.feed(
+                {
+                    "metadata": {"message_type": "revocation"},
+                    "payload": {
+                        "subscription": {
+                            "type": subscription_type,
+                            "status": "authorization_revoked",
+                        }
+                    },
+                }
+            )
+        websocket.feed(notification("after-1", "Hello Companion"))
+        await wait_until(lambda: len(scheduler.admissions) == 1)
+        follow, chat_notification = events_of(context.bus, TRACE_MODULE_DEGRADED)
+        assert follow["payload"]["capabilities"] == ["follow"]
+        assert follow["payload"]["reason"] == "follow subscription revoked"
+        assert chat_notification["payload"]["capabilities"] == ["raid"]
+        assert chat_notification["payload"]["reason"] == (
+            "chat notification subscription revoked"
+        )
+        assert websocket.close_calls == 0
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserved", ["x:y", "system:anonymous", "system:watch"])
+async def test_an_author_identifier_containing_a_colon_is_refused_and_counted(
+    reserved: str,
+) -> None:
+    """AC32 twitch half (R6): an author id containing ``:`` yields 0
+    admissions and the invalid counter + 1 — no feed, no publication, no
+    decision — for a chat message and for a notice alike."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, _ = await activate_notices(session, context, ["raid"])
+    try:
+        message = notification("colon-1", "Hello Companion")
+        message["payload"]["event"]["chatter_user_id"] = reserved
+        await _ingest(handle, message)
+
+        assert scheduler.admissions == []
+        assert handle.counts["invalid"] == 1
+        assert chat_events(context.bus) == []
+        assert context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10) == ()
+        assert events_of(context.bus, "input.trigger.accepted") == []
+        assert events_of(context.bus, "input.trigger.rejected") == []
+
+        await _ingest(handle, raid_notice("colon-raid", reserved))
+        assert scheduler.admissions == []
+        assert handle.counts == {"invalid": 2, "notices_ignored": 0}
+
+        # A valid author on the same input is still admitted.
+        await _ingest(handle, notification("valid-1", "Hello Companion"))
+        assert len(scheduler.admissions) == 1
+    finally:
+        await handle.close()
+
+
+@pytest.mark.parametrize(
+    ("notices", "field"),
+    [
+        ("raid", "notices"),
+        ({"kinds": ["raid"], "extra": True}, "notices"),
+        ({"kinds": "raid"}, "notices.kinds"),
+        ({"kinds": ["announcement"]}, "notices.kinds"),
+        ({"kinds": ["tip"]}, "notices.kinds"),
+        ({"kinds": ["raid", "raid"]}, "notices.kinds"),
+    ],
+)
+def test_settings_hook_refuses_an_invalid_notices_setting(notices: Any, field: str) -> None:
+    """R1: ``notices.kinds`` lists Twitch notice kinds only, each once; the
+    diagnostic names the field and echoes no value."""
+
+    (diagnostic,) = validate_settings({**SETTINGS, "notices": notices})
+    assert f"field {field!r}" in diagnostic
+    assert validate_settings({**SETTINGS, "notices": {"kinds": list(NOTICE_KINDS)}}) == []
+    assert validate_settings({**SETTINGS, "notices": {}}) == []

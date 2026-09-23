@@ -52,6 +52,31 @@ settings_schema:
       description: >-
         The name viewers use to address the companion. Configuration owns this
         value; the default trigger policy below refers to it by token only.
+    notices:
+      type: object
+      description: >-
+        Community notices (R1). Absent or empty, only chat messages are
+        subscribed to, as before. A listed chat-notification kind adds the
+        chat-notification subscription; `follow` adds the follow subscription,
+        which needs the moderator follower-read scope for the bot account — a
+        rejected follow subscription degrades `follow` only and chat
+        continues. A listed notice is fed to the chat context,
+        trigger-evaluated and admitted like a message; an unlisted or other
+        notice type is ignored and counted.
+      properties:
+        kinds:
+          type: array
+          description: The notice kinds this module ingests (default none).
+          items:
+            type: string
+            enum:
+              - sub
+              - resub
+              - sub_gift
+              - community_sub_gift
+              - raid
+              - follow
+      additionalProperties: false
   required:
     - client_id
     - client_secret
@@ -114,6 +139,29 @@ triggers:
               type: string
         required:
           - keywords
+        additionalProperties: false
+    # Selects on the normalised event's kind (R1): `message` for a chat
+    # message, the notice kind for a community notice.
+    - name: event_kind
+      parameter_schema:
+        type: object
+        properties:
+          kinds:
+            type: array
+            items:
+              type: string
+              enum:
+                - message
+                - sub
+                - resub
+                - sub_gift
+                - community_sub_gift
+                - raid
+                - follow
+                - tip
+                - watch_tick
+        required:
+          - kinds
         additionalProperties: false
   combinations:
     - all_of

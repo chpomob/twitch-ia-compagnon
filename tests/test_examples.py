@@ -485,7 +485,9 @@ def _string_leaves(value: Any) -> list[str]:
 
 def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     """R7 supersedes the former whole-manifest equality (allowlisted); phase
-    2's R9 extends the catalog from 8 to 11 manifests (allowlisted).
+    2's R9 extends the catalog from 8 to 11 manifests (allowlisted); phase
+    3's R1 adds the ``notices`` setting and the ``event_kind`` trigger type to
+    ``twitch`` (allowlisted, plan decision 11).
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -530,6 +532,17 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     assert type(manifests["audit"]["order"]) is int
     assert isinstance(manifests["twitch"]["triggers"], Mapping)
     assert isinstance(manifests["twitch"]["actions"], list) and manifests["twitch"]["actions"]
+    # Phase 3 R1 (plan P7, decision 11): the twitch manifest gains the
+    # optional `notices` setting and the `event_kind` trigger type; its keys,
+    # required settings and actions are otherwise unchanged.
+    assert "notices" in manifests["twitch"]["settings_schema"]["properties"]
+    assert "notices" not in manifests["twitch"]["settings_schema"]["required"]
+    assert [entry["name"] for entry in manifests["twitch"]["triggers"]["types"]] == [
+        "probability",
+        "audience",
+        "keyword",
+        "event_kind",
+    ]
     for module_name, action_names in DECLARED_ACTIONS.items():
         assert isinstance(manifests[module_name]["actions"], list), module_name
         assert _declared_action_names(manifests[module_name]) == action_names

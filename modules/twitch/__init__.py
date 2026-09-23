@@ -68,6 +68,22 @@ exactly as it was, and ``close`` waits for the outstanding traces inside
 ``DEFAULT_SENT_TRACE_CLOSE_SECONDS`` only, cancelling and counting the rest, so
 a subscriber that never returns can neither grow that set nor hold shutdown.
 
+**Community notices** (R1, R6). ``notices.kinds`` (default none) opts into
+community notices. Activation always subscribes to chat messages; it adds the
+chat-notification subscription iff one of :data:`CHAT_NOTICE_KINDS` is listed
+and the follow subscription (version 2, conditioned on the bot account as the
+moderator reading followers) iff ``follow`` is. A rejected follow
+subscription is one ``module.degraded`` naming the ``follow`` capability, and
+chat continues. A listed notice is normalised into the chat event shape with
+``payload.kind`` set, its author the viewer the platform attests (the raider,
+the gifter, the follower) and its text the platform's system message; it is
+fed, decided and admitted exactly like a message. An unlisted kind or another
+notice type is ignored and counted in ``counts["notices_ignored"]``. An
+anonymous gift is fed and published under :data:`ANONYMOUS_AUTHOR` and never
+decided or admitted. Any platform author identifier containing ``:`` is
+refused before anything happens and counted in ``counts["invalid"]``: the
+reserved identities contain one, so no viewer can hold them.
+
 **Polls** (R7). ``activate`` publishes a poll service under ``(poll, twitch)``
 in the runtime's service registry — only when the context carries one
 (``context.services.available``); a context built without a registry
@@ -84,6 +100,7 @@ import inspect
 import json
 import math
 import sys
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, fields
@@ -100,6 +117,7 @@ from core.contracts import (
     TRACE_CHANNEL_CHAT_SENT,
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
+    EVENT_KIND_DEFAULT,
     ActionObservation,
     ActionSpec,
     Destination,
@@ -151,6 +169,8 @@ CHAT_WRITE_PROVIDER = "twitch-helix-chat"
 """Provider name in bindings and traces; what an ambiguity diagnostic prints."""
 
 _CHAT_EVENT = "channel.chat.message"
+_NOTIFICATION_EVENT = "channel.chat.notification"
+_FOLLOW_EVENT = "channel.follow"
 _CHAT_SEND_EVENT = "channel.chat.send"
 _CHAT_SCOPE = "chat"
 _ROUTE_ACTION = CHAT_WRITE_ACTION
@@ -179,6 +199,36 @@ counted exactly like dropped ones. Overridable through the
 ``_sent_trace_close_seconds`` seam, validated finite at activation.
 """
 _STABLE_CONNECTION_SECONDS = 10.0
+
+CHAT_NOTICE_KINDS: tuple[str, ...] = (
+    "sub",
+    "resub",
+    "sub_gift",
+    "community_sub_gift",
+    "raid",
+)
+"""The notice kinds the chat-notification subscription carries, each named
+after the EventSub ``notice_type`` it maps (R1)."""
+
+FOLLOW_NOTICE_KIND = "follow"
+"""The notice kind the follow subscription carries; also the capability a
+rejected follow subscription degrades (R1)."""
+
+NOTICE_KINDS: tuple[str, ...] = CHAT_NOTICE_KINDS + (FOLLOW_NOTICE_KIND,)
+"""Every kind ``notices.kinds`` may list."""
+
+ANONYMOUS_AUTHOR = "system:anonymous"
+"""The reserved author an anonymous notice is fed under (plan decision 3)."""
+
+ANONYMOUS_DEDUP_MAX_ENTRIES = 256
+"""How many anonymous notice identifiers the reception dedup retains; the
+trigger engine's window never sees them, since they are never decided."""
+
+RESERVED_SEPARATOR = ":"
+"""No platform author identifier may contain it (R6): reserved identities do."""
+
+COUNT_INVALID = "invalid"
+COUNT_NOTICES_IGNORED = "notices_ignored"
 
 POLL_SERVICE_KIND = "poll"
 """The service kind this module publishes its poll service under (R7).
@@ -218,6 +268,18 @@ class TwitchModuleError(RuntimeError):
     """A Twitch operation failure whose text is safe to surface."""
 
 
+class _SubscriptionRefused(TwitchModuleError):
+    """An EventSub subscription the platform refused or never answered.
+
+    ``detail`` is value-free — the HTTP status at most — so it may name the
+    refusal in a health report.
+    """
+
+    def __init__(self, message: str, detail: str) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
 # The business settings this module owns (R7). ``companion_name`` is required
 # here because the manifest's default trigger policy refers to it; the trigger
 # registry, not this module, reads it.
@@ -248,7 +310,35 @@ def validate_settings(settings: Any) -> list[str]:
         value = settings.get(name)
         if not isinstance(value, str) or not value.strip():
             diagnostics.append(_setting_diagnostic(name, "must be a non-empty string"))
+    if settings.get("notices") is not None:
+        diagnostics.extend(_validate_notices(settings["notices"]))
     return diagnostics
+
+
+def _validate_notices(notices: Any) -> list[str]:
+    if not isinstance(notices, Mapping) or set(notices) - {"kinds"}:
+        return [_setting_diagnostic("notices", "must be a mapping of kinds only")]
+    kinds = notices.get("kinds")
+    if kinds is None:
+        return []
+    if (
+        isinstance(kinds, str)
+        or not isinstance(kinds, (list, tuple))
+        or any(kind not in NOTICE_KINDS for kind in kinds)
+    ):
+        return [
+            _setting_diagnostic(
+                "notices.kinds", "must be a list of community-notice kinds"
+            )
+        ]
+    if len(set(kinds)) != len(kinds):
+        return [_setting_diagnostic("notices.kinds", "must be unique")]
+    return []
+
+
+def _notice_kinds(settings: Mapping[str, Any]) -> frozenset[str]:
+    notices = settings.get("notices") or {}
+    return frozenset(notices.get("kinds") or ())
 
 
 def _setting_diagnostic(field_name: str, reason: str) -> str:
@@ -275,6 +365,10 @@ class _Notification:
     at all (a badge list, or the chatter being the broadcaster); only then does
     the event carry ``author.roles`` with ``author.roles_provenance``, so a
     route audience downstream reads the same trusted facts as the trigger.
+    ``kind`` is ``message`` for a chat message and the notice kind for a
+    community notice, published as ``payload.kind`` (plan decision 2).
+    ``anonymous`` marks a notice the platform attributes to no one: its author
+    is :data:`ANONYMOUS_AUTHOR`, and it is never decided or admitted.
     """
 
     channel_id: str
@@ -284,6 +378,8 @@ class _Notification:
     text: str
     claims: tuple[TrustedClaim, ...]
     roles_attested: bool = False
+    kind: str = EVENT_KIND_DEFAULT
+    anonymous: bool = False
 
     def event(self) -> dict[str, Any]:
         """The schema-version-2 bus event this notification normalises to."""
@@ -303,6 +399,9 @@ class _Notification:
             "message_id": self.message_id,
             "text": self.text,
         }
+        if self.kind != EVENT_KIND_DEFAULT:
+            # Only a notice carries a kind: a message keeps the phase 2 shape.
+            payload["kind"] = self.kind
         return {
             "type": _CHAT_EVENT,
             "payload": payload,
@@ -578,6 +677,7 @@ class _Settings:
     access_token: str
     broadcaster_id: str
     bot_user_id: str
+    notice_kinds: frozenset[str] = frozenset()
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
@@ -591,7 +691,14 @@ class _Settings:
         diagnostics = validate_settings(settings)
         if diagnostics:
             raise TwitchModuleError(diagnostics[0])
-        return cls(**{field.name: settings[field.name] for field in fields(cls)})
+        return cls(
+            **{
+                field.name: settings[field.name]
+                for field in fields(cls)
+                if field.name in _REQUIRED_SETTINGS
+            },
+            notice_kinds=_notice_kinds(settings),
+        )
 
 
 class TwitchModule:
@@ -640,6 +747,11 @@ class TwitchModule:
         # Covers normalisation and the dedup decision only (R2): it is released
         # before the publication, the trace and the admission.
         self._publish_lock = asyncio.Lock()
+        # Reception refusals (R1, R6): see :attr:`counts`.
+        self._counts: dict[str, int] = {COUNT_INVALID: 0, COUNT_NOTICES_IGNORED: 0}
+        # Anonymous notices are never decided, so the trigger engine's window
+        # never records them: this bounded window dedups their redeliveries.
+        self._anonymous_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._websocket: Any | None = None
         self._receive_task: asyncio.Task[None] | None = None
         self._handoff_tasks: set[asyncio.Task[None]] = set()
@@ -664,6 +776,14 @@ class TwitchModule:
         """The poll service ``activate`` publishes under ``(poll, twitch)`` (R7)."""
 
         return self._poll_service
+
+    @property
+    def counts(self) -> Mapping[str, int]:
+        """Reception refusals: ``invalid`` (an author identifier containing
+        ``:``) and ``notices_ignored`` (a notice type this module does not map,
+        or a kind ``notices.kinds`` does not list)."""
+
+        return dict(self._counts)
 
     @property
     def send_record(self) -> SendRecord:
@@ -1379,13 +1499,55 @@ class TwitchModule:
             raise TwitchModuleError("twitch websocket welcome failed") from None
 
     async def _subscribe(self, session_id: str) -> None:
+        """Create the subscriptions ``notices.kinds`` selects (R1).
+
+        Chat messages always, as before; chat notifications iff a
+        chat-notification kind is listed; follows iff ``follow`` is. Chat
+        messages and notifications share the chat scopes, so either refused
+        fails the subscription; a refused follow subscription (it needs the
+        moderator follower-read scope) degrades ``follow`` only.
+        """
+
+        chat_condition = {
+            "broadcaster_user_id": self._settings.broadcaster_id,
+            "user_id": self._settings.bot_user_id,
+        }
+        await self._create_subscription(session_id, _CHAT_EVENT, "1", chat_condition)
+        kinds = self._notice_kinds
+        if kinds.intersection(CHAT_NOTICE_KINDS):
+            await self._create_subscription(
+                session_id, _NOTIFICATION_EVENT, "1", chat_condition
+            )
+        if FOLLOW_NOTICE_KIND in kinds:
+            try:
+                await self._create_subscription(
+                    session_id,
+                    _FOLLOW_EVENT,
+                    "2",
+                    {
+                        "broadcaster_user_id": self._settings.broadcaster_id,
+                        "moderator_user_id": self._settings.bot_user_id,
+                    },
+                    label="twitch follow subscription",
+                )
+            except _SubscriptionRefused as failure:
+                await self._report_degraded(
+                    f"follow subscription {failure.detail}", FOLLOW_NOTICE_KIND
+                )
+
+    async def _create_subscription(
+        self,
+        session_id: str,
+        subscription_type: str,
+        version: str,
+        condition: Mapping[str, str],
+        *,
+        label: str = "twitch subscription",
+    ) -> None:
         request_body = {
-            "type": _CHAT_EVENT,
-            "version": "1",
-            "condition": {
-                "broadcaster_user_id": self._settings.broadcaster_id,
-                "user_id": self._settings.bot_user_id,
-            },
+            "type": subscription_type,
+            "version": version,
+            "condition": dict(condition),
             "transport": {"method": "websocket", "session_id": session_id},
         }
         try:
@@ -1400,8 +1562,10 @@ class TwitchModule:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self._diagnose("twitch subscription: request failed")
-            raise TwitchModuleError("twitch subscription failed") from None
+            self._diagnose(f"{label}: request failed")
+            raise _SubscriptionRefused(
+                "twitch subscription failed", "request failed"
+            ) from None
 
         data = body.get("data") if isinstance(body, Mapping) else None
         if (
@@ -1410,10 +1574,29 @@ class TwitchModule:
             or not data
             or not isinstance(data[0], Mapping)
         ):
-            self._diagnose(
-                f"twitch subscription: rejected (status {_safe_status(status)})"
-            )
-            raise TwitchModuleError("twitch subscription rejected")
+            detail = f"rejected (status {_safe_status(status)})"
+            self._diagnose(f"{label}: {detail}")
+            raise _SubscriptionRefused("twitch subscription rejected", detail)
+
+    async def _report_degraded(self, reason: str, *capabilities: str) -> None:
+        """Report *capabilities* degraded on the health surface; chat continues.
+
+        The runtime reports one fact per distinct reason, so a refusal repeated
+        on every reconnection is one ``module.degraded``, not one per socket.
+        """
+
+        degraded = getattr(self._supervision, "degraded", None)
+        if not callable(degraded):
+            self._diagnose(reason)
+            return
+        try:
+            outcome = degraded(reason=reason, capabilities=list(capabilities))
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._diagnose(reason)
 
     async def _receive_forever(self, initial_websocket: Any) -> None:
         websocket = initial_websocket
@@ -1588,6 +1771,22 @@ class TwitchModule:
                         return _ConsumeResult("handoff", reconnect_url=reconnect_url)
                     continue
                 if message_type == "revocation":
+                    revoked = _revoked_notice_kinds(
+                        envelope, self._notice_kinds
+                    )
+                    if revoked:
+                        # Only notices lose their source: chat continues (R1).
+                        # The reason names the subscription, so a second
+                        # revocation is not deduplicated into the first.
+                        source = (
+                            "follow"
+                            if revoked == (FOLLOW_NOTICE_KIND,)
+                            else "chat notification"
+                        )
+                        await self._report_degraded(
+                            f"{source} subscription revoked", *revoked
+                        )
+                        continue
                     return _ConsumeResult(
                         "stop", diagnostic="twitch subscription: revoked"
                     )
@@ -1616,15 +1815,36 @@ class TwitchModule:
         reads the recorded decision, so it runs a model for nothing the
         trigger refused (R1, AC4). A malformed envelope raises ``ValueError``
         for the receiver to report.
+
+        A community notice takes the same route (plan decision 2): an ignored
+        one is only counted, an anonymous one is fed and published but never
+        decided or admitted (decision 3). An author identifier containing
+        ``:`` is refused before anything else and counted (R6).
         """
 
-        notification = _normalize_notification(envelope)
+        notification = _normalize_notification(
+            envelope, self._notice_kinds
+        )
+        if notification is None:
+            # A notice type this module does not map, or a kind not listed.
+            self._counts[COUNT_NOTICES_IGNORED] += 1
+            return
+        if (
+            not notification.anonymous
+            and notification.author_id is not None
+            and RESERVED_SEPARATOR in notification.author_id
+        ):
+            # A reserved identity (R6): no feed, publication, decision or
+            # admission.
+            self._counts[COUNT_INVALID] += 1
+            self._diagnose("twitch notification: reserved author identity refused")
+            return
         # Drop self echoes before they can reach any consumer, feed any
         # context or draw any decision (R1, AC5).
         if self._is_own_message(notification.author_id):
             return
 
-        engine = self._triggers
+        engine = None if notification.anonymous else self._triggers
         async with self._publish_lock:
             if engine is not None and engine.recorded(
                 platform=PLATFORM,
@@ -1635,6 +1855,13 @@ class TwitchModule:
                 # the event was already published, fed and admitted (or
                 # refused). Nothing is repeated (R6, AC22).
                 return
+            if notification.anonymous:
+                seen_key = (notification.channel_id, notification.message_id)
+                if seen_key in self._anonymous_seen:
+                    return
+                self._anonymous_seen[seen_key] = None
+                while len(self._anonymous_seen) > ANONYMOUS_DEDUP_MAX_ENTRIES:
+                    self._anonymous_seen.popitem(last=False)
 
             event = notification.event()
             if notification.author_id is not None:
@@ -1677,6 +1904,12 @@ class TwitchModule:
         await self._trace_decision(decision)
         if decision.accepted and self._scheduler is not None:
             self._admit(notification, event)
+
+    @property
+    def _notice_kinds(self) -> frozenset[str]:
+        # Read like ``bot_user_id`` below: tolerant of partial settings.
+        kinds = getattr(self._settings, "notice_kinds", None)
+        return kinds if isinstance(kinds, frozenset) else frozenset()
 
     def _is_own_message(self, author_id: str | None) -> bool:
         bot_user_id = getattr(self._settings, "bot_user_id", None)
@@ -1963,29 +2196,44 @@ def _declared_chat_write_spec() -> ActionSpec:
         ) from None
 
 
-def _normalize_notification(envelope: Mapping[str, Any]) -> _Notification:
-    """Translate one EventSub chat notification, once, at the boundary (R3).
+def _normalize_notification(
+    envelope: Mapping[str, Any], notice_kinds: frozenset[str] = frozenset()
+) -> _Notification | None:
+    """Translate one EventSub notification, once, at the boundary (R1, R3).
 
-    Raises ``ValueError`` for an envelope that is not a chat notification or
-    lacks the channel, the message identifier or the text. An absent chatter
-    identity is *not* malformed: it is a notification with no trusted viewer
-    identity, which the trigger engine refuses as unauthenticated.
+    A chat message is normalised as before. A chat notification or a follow
+    becomes a notice of its kind when *notice_kinds* lists it; ``None`` means
+    an ignored notice — a ``notice_type`` this module does not map
+    (``announcement``, …) or a kind not listed. Raises ``ValueError`` for an
+    envelope of another subscription, or one lacking the channel, the message
+    identifier or the text. An absent chatter identity on a chat message is
+    *not* malformed: it is a notification with no trusted viewer identity,
+    which the trigger engine refuses as unauthenticated.
     """
 
     metadata = _mapping_at(envelope, "metadata")
+    payload = _mapping_at(envelope, "payload")
     subscription_type = metadata.get("subscription_type")
-    if subscription_type not in (None, _CHAT_EVENT):
+    subscription = payload.get("subscription")
+    declared_type = (
+        subscription.get("type") if isinstance(subscription, Mapping) else None
+    )
+    if (
+        subscription_type is not None
+        and declared_type is not None
+        and subscription_type != declared_type
+    ):
+        raise ValueError
+    kind_of_subscription = subscription_type or declared_type or _CHAT_EVENT
+    event = _mapping_at(payload, "event")
+    if kind_of_subscription == _NOTIFICATION_EVENT:
+        return _normalize_chat_notice(event, notice_kinds)
+    if kind_of_subscription == _FOLLOW_EVENT:
+        return _normalize_follow(event, metadata, notice_kinds)
+    if kind_of_subscription != _CHAT_EVENT:
         raise ValueError
 
-    payload = _mapping_at(envelope, "payload")
-    subscription = payload.get("subscription")
-    if isinstance(subscription, Mapping):
-        declared_type = subscription.get("type")
-        if declared_type not in (None, _CHAT_EVENT):
-            raise ValueError
-    event = _mapping_at(payload, "event")
     message = _mapping_at(event, "message")
-
     channel_id = _required_string(event, "broadcaster_user_id")
     message_id = _required_string(event, "message_id")
     text = _required_string(message, "text", allow_empty=True)
@@ -2001,6 +2249,115 @@ def _normalize_notification(envelope: Mapping[str, Any]) -> _Notification:
         roles_attested=isinstance(event.get("badges"), (list, tuple))
         or (author_id is not None and author_id == channel_id),
     )
+
+
+def _normalize_chat_notice(
+    event: Mapping[str, Any], notice_kinds: frozenset[str]
+) -> _Notification | None:
+    """A ``channel.chat.notification`` event as a notice, or ``None`` (R1).
+
+    The author is the chatter the platform attests — the subscriber, the
+    gifter — except on a raid, whose author is the raider named by the
+    event's ``raid`` block. An anonymous gift (``chatter_is_anonymous``) is
+    attributed to :data:`ANONYMOUS_AUTHOR`. The text is the platform's
+    ``system_message``; the chatter's badges are the only role claims, and
+    only when the author is that chatter.
+    """
+
+    kind = event.get("notice_type")
+    if kind not in CHAT_NOTICE_KINDS or kind not in notice_kinds:
+        return None
+    channel_id = _required_string(event, "broadcaster_user_id")
+    message_id = _required_string(event, "message_id")
+    text = _required_string(event, "system_message", allow_empty=True)
+    chatter_id = _optional_string(event.get("chatter_user_id"))
+    if kind == "raid":
+        raid = _mapping_at(event, "raid")
+        author_id: str | None = _required_string(raid, "user_id")
+        author_name = _optional_string(raid.get("user_name"))
+    elif event.get("chatter_is_anonymous") is True:
+        return _Notification(
+            channel_id=channel_id,
+            author_id=ANONYMOUS_AUTHOR,
+            author_name=None,
+            message_id=message_id,
+            text=text,
+            claims=(),
+            kind=kind,
+            anonymous=True,
+        )
+    else:
+        author_id = chatter_id
+        author_name = _optional_string(event.get("chatter_user_name"))
+    if author_id is not None and author_id == chatter_id:
+        claims = _trusted_claims(event, author_id, channel_id)
+        attested = isinstance(event.get("badges"), (list, tuple)) or (
+            author_id == channel_id
+        )
+    else:
+        claims = _trusted_claims({}, author_id, channel_id)
+        attested = author_id is not None and author_id == channel_id
+    return _Notification(
+        channel_id=channel_id,
+        author_id=author_id,
+        author_name=author_name,
+        message_id=message_id,
+        text=text,
+        claims=claims,
+        roles_attested=attested,
+        kind=kind,
+    )
+
+
+def _normalize_follow(
+    event: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    notice_kinds: frozenset[str],
+) -> _Notification | None:
+    """A ``channel.follow`` event as a ``follow`` notice, or ``None`` (R1).
+
+    The author is the follower. The event carries no message identifier and
+    no system text: the EventSub envelope's ``message_id`` identifies it (a
+    redelivery repeats it) and the text is empty.
+    """
+
+    if FOLLOW_NOTICE_KIND not in notice_kinds:
+        return None
+    channel_id = _required_string(event, "broadcaster_user_id")
+    message_id = _required_string(metadata, "message_id")
+    author_id = _optional_string(event.get("user_id"))
+    return _Notification(
+        channel_id=channel_id,
+        author_id=author_id,
+        author_name=_optional_string(event.get("user_name")),
+        message_id=message_id,
+        text="",
+        claims=_trusted_claims({}, author_id, channel_id),
+        roles_attested=author_id is not None and author_id == channel_id,
+        kind=FOLLOW_NOTICE_KIND,
+    )
+
+
+def _revoked_notice_kinds(
+    envelope: Mapping[str, Any], notice_kinds: frozenset[str]
+) -> tuple[str, ...]:
+    """The listed notice kinds a revocation removes, in declaration order.
+
+    Empty unless the revoked subscription is the chat-notification or the
+    follow one: a revoked chat subscription, or one the envelope does not
+    name, still stops reception.
+    """
+
+    payload = envelope.get("payload")
+    subscription = payload.get("subscription") if isinstance(payload, Mapping) else None
+    revoked_type = (
+        subscription.get("type") if isinstance(subscription, Mapping) else None
+    )
+    if revoked_type == _NOTIFICATION_EVENT:
+        return tuple(kind for kind in CHAT_NOTICE_KINDS if kind in notice_kinds)
+    if revoked_type == _FOLLOW_EVENT and FOLLOW_NOTICE_KIND in notice_kinds:
+        return (FOLLOW_NOTICE_KIND,)
+    return ()
 
 
 def _roles_provenance(claims: tuple[TrustedClaim, ...]) -> str:
