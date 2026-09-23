@@ -90,19 +90,24 @@ loop and one terminal delivery step through the
 memory, then one assistant tool call and one text tool result per
 previous proposal, an observation's ``image_ref`` parts following their
 tool result in a ``user`` message since a ``tool`` message carries text
-only — and, as tools, the ``read`` actions of the registry's
-*authorized* view for the run's destination, re-read every turn, **per
+only — and, as tools, the ``read`` actions — and the ``model_proposable``
+writes (R5) — of the registry's *authorized* view for the run's principal
+and destination, re-read every turn, **per
 action and per declared scope** (:meth:`BrainModule._offered_tools`): a
 capture bound on ``*/*/capture`` is offered by its own scope, a delivery
 action is never offered, whatever the grants (decision 1). The model
 answers with one proposal or a final response (decision 2). A proposal
 naming an action absent from the catalog, or of any nature but ``read``
-— the delivery action included — is refused by this module itself
-(``unknown_action``, ``not_a_read_action``), and one whose arguments are
+that is not ``model_proposable`` — the delivery action included — is
+refused by this module itself (``unknown_action``, ``not_a_read_action``),
+so is a second call of the same model-proposable action in one run
+(``run_limit``), and one whose arguments are
 not a JSON object is a synthetic ``malformed_arguments`` error, each with
 0 executor calls; every other proposal becomes one
 :class:`~core.contracts.ActionCall` — destination ``(run platform, run
-channel_id, the action's declared scope)``, principal :data:`PRINCIPAL`,
+channel_id, the action's declared scope)``, the run's principal
+(:func:`run_principal`: ``brain.watch`` for a ``watch_tick`` run, else
+:data:`PRINCIPAL`, also carried by the run's delivery entries),
 identities and deadline set here — whose observation, text parts and
 ``image_ref`` parts alike, is appended to the transcript and traced as
 ``brain.run.observation`` (references and dimensions only, AC12). The
@@ -286,11 +291,39 @@ except ModuleNotFoundError:  # pragma: no cover - production installs dependenci
 MODULE_NAME = "brain"
 
 PRINCIPAL = MODULE_NAME
-"""The trusted principal every delivery call carries (R5).
+"""The default principal of a run: every call of a run the chat admitted (R5).
 
 The reply is the companion's act, so the rule that authorizes it names this
 module — never the viewer, whose identity keys the session and grants nothing.
+A run's principal is derived once, from its triggering event, by
+:func:`run_principal`; this name is the one it yields for every kind but the
+continuous-capture tick.
 """
+
+WATCH_PRINCIPAL = f"{MODULE_NAME}.watch"
+"""The principal of a run admitted from a ``watch_tick`` event (R6, decision 4).
+
+Every call of such a run — offers, model-proposed calls and delivery entries —
+carries it, so a watch run reads, writes or speaks only through rules that
+name it; a rule naming :data:`PRINCIPAL` alone grants it nothing.
+"""
+
+WATCH_TICK_KIND = "watch_tick"
+"""The event kind whose runs are made under :data:`WATCH_PRINCIPAL`."""
+
+BRAIN_ERROR_RUN_LIMIT = "run_limit"
+"""The code of a second call of the same model-proposable action in one run,
+refused to the model without an executor call (R5, decision 5)."""
+
+
+def run_principal(kind: str | None) -> str:
+    """The principal of a run triggered by an event of *kind* (decision 4).
+
+    ``watch_tick`` → :data:`WATCH_PRINCIPAL`; any other kind, or none, →
+    :data:`PRINCIPAL`. It is fixed for the whole run.
+    """
+
+    return WATCH_PRINCIPAL if kind == WATCH_TICK_KIND else PRINCIPAL
 
 CHAT_SCOPE = "chat"
 """The scope a declaration open to every scope (``*``) is addressed as: the
@@ -2081,9 +2114,13 @@ class _RunState:
     capabilities lack ``audio`` (R4) — once per observation;
     ``route_delivery`` is the delivery list of the route the run matched,
     when that route declares one, used in place of the destination's list by
-    the terminal step and the fallback alike (R1).
+    the terminal step and the fallback alike (R1); ``principal`` is the run's
+    principal (:func:`run_principal`), carried by every call of the run
+    (decision 4); ``proposed_writes`` names the model-proposable actions
+    already executed in the run, each at most once (decision 5).
     """
 
+    principal: str
     turns: int = 0
     action_calls: int = 0
     model_calls: int = 0
@@ -2095,6 +2132,7 @@ class _RunState:
     fallback_reason: str | None = None
     audio_omitted: int = 0
     route_delivery: tuple[_DeliveryEntry, ...] | None = None
+    proposed_writes: set[str] = field(default_factory=set)
 
     def correlation(self) -> dict[str, Any]:
         return {
@@ -2703,7 +2741,8 @@ class BrainModule:
             history=self._memory.recall(key),
         )
         state = _RunState(
-            route_delivery=None if route is None else self._route_deliveries.get(route.name)
+            principal=run_principal(message.kind),
+            route_delivery=None if route is None else self._route_deliveries.get(route.name),
         )
         try:
             outcome = await self._loop(run, message, key, transcript, state)
@@ -2753,7 +2792,7 @@ class BrainModule:
                 return self._reserve_reached(state, "model turn")
 
             run.checkpoint()
-            offered = self._offered_tools(key.platform, key.channel_id)
+            offered = self._offered_tools(key.platform, key.channel_id, state.principal)
             room = budget.max_tokens - state.tokens
             prompt = self._compose(transcript, tuple(offer.spec for offer in offered), room)
             if prompt.output_tokens <= 0:
@@ -2813,11 +2852,13 @@ class BrainModule:
     ) -> RunOutcome | None:
         """One proposal to its observation, or to the outcome that ends the run.
 
-        In this order (R1, R3, R4): a name absent from the discovered catalog
-        is a synthetic ``refused`` (``unknown_action``); a catalog action of
-        any nature but ``read`` — the delivery action included, whatever
-        the grants — a synthetic ``refused`` (``not_a_read_action``);
-        arguments that are not a JSON object a synthetic ``error``
+        In this order (R1, R3, R4, R5): a name absent from the discovered
+        catalog is a synthetic ``refused`` (``unknown_action``); a catalog
+        action of any nature but ``read`` that is not ``model_proposable`` —
+        the delivery action included, whatever the grants — a synthetic
+        ``refused`` (``not_a_read_action``); a model-proposable action the
+        run already executed a synthetic ``refused`` (``run_limit``,
+        decision 5); arguments that are not a JSON object a synthetic ``error``
         (``malformed_arguments``); each with 0 executor calls. Then the
         budgets: the ``(n+1)``-th proposal of the same name and canonical
         arguments with ``n == max_repeated_actions`` is not executed and
@@ -2827,8 +2868,8 @@ class BrainModule:
         and no non-delivery action starts inside it, R3, AC17). Else one
         :class:`~core.contracts.ActionCall` — destination ``(run platform,
         run channel_id, the scope the action was offered on, or its
-        declared scope when it was not offered)``, principal
-        :data:`PRINCIPAL`, the run's identities, ``call_id`` next in the
+        declared scope when it was not offered)``, the run's principal
+        (decision 4), the run's identities, ``call_id`` next in the
         run's counter, deadline ``min(now + action_seconds, total
         deadline)`` — goes to the executor, which refuses by default what no
         rule permits and validates the arguments against the spec. The
@@ -2857,9 +2898,13 @@ class BrainModule:
             observation = _synthetic_observation(
                 _STATUS_REFUSED, BRAIN_ERROR_UNKNOWN_ACTION, route=_ROUTE_SYNTHETIC
             )
-        elif getattr(spec, "nature", None) != _NATURE_READ:
+        elif getattr(spec, "nature", None) != _NATURE_READ and not _is_model_proposable(spec):
             observation = _synthetic_observation(
                 _STATUS_REFUSED, BRAIN_ERROR_NOT_A_READ_ACTION, route=_ROUTE_SYNTHETIC
+            )
+        elif name in state.proposed_writes:
+            observation = _synthetic_observation(
+                _STATUS_REFUSED, BRAIN_ERROR_RUN_LIMIT, route=_ROUTE_SYNTHETIC
             )
         else:
             arguments = _decode_arguments(proposal.raw_arguments)
@@ -2880,7 +2925,7 @@ class BrainModule:
                 call_id = f"{run.run_id}/call-{state.next_call}"
                 try:
                     call = self._action_call(
-                        run, message, spec, arguments, call_id, offered
+                        run, message, spec, arguments, call_id, offered, state.principal
                     )
                 except Exception:
                     # The contract refused what the schema-free decode let
@@ -2892,6 +2937,8 @@ class BrainModule:
                 else:
                     state.next_call += 1
                     state.action_calls += 1
+                    if _is_model_proposable(spec):
+                        state.proposed_writes.add(name)
                     key = call_id
                     observation = self._bounded_observation(
                         await self._invoke(call, step="action")
@@ -2944,8 +2991,10 @@ class BrainModule:
         arguments: Mapping[str, Any],
         call_id: str,
         offered: Sequence[_Offer],
+        principal: str,
     ) -> ActionCall:
-        """One read proposal's call, its identities and deadline the runtime's."""
+        """One proposal's call under the run's *principal*; its identities and
+        deadline the runtime's."""
 
         scope = next((offer.scope for offer in offered if offer.spec.name == spec.name), None)
         if scope is None:
@@ -2965,7 +3014,7 @@ class BrainModule:
             call_id=call_id,
             source_event_id=run.work.source_event_id,
             destination=destination,
-            principal=PRINCIPAL,
+            principal=principal,
             deadline=min(run.now + self._budget.action_seconds, run.total_deadline),
             message_id=message.message_id,
         )
@@ -3091,6 +3140,7 @@ class BrainModule:
             reply,
             entries,
             recipient=message.recipient,
+            principal=state.principal,
             next_call_index=state.next_call,
             calls_left=state.calls_left(self._budget),
         )
@@ -3241,6 +3291,7 @@ class BrainModule:
             self._settings.fallback.text,
             entries,
             recipient=recipient,
+            principal=state.principal,
             next_call_index=state.next_call,
             calls_left=state.calls_left(self._budget),
         )
@@ -3269,7 +3320,7 @@ class BrainModule:
 
         if not self._settings.fallback.enabled:
             return FALLBACK_SKIPPED_DISABLED
-        if not self._any_authorized(entries, recipient):
+        if not self._any_authorized(entries, recipient, state.principal):
             return FALLBACK_SKIPPED_NOT_AUTHORIZED
         if run.remaining <= 0:
             return FALLBACK_SKIPPED_DEADLINE_EXCEEDED
@@ -3277,13 +3328,15 @@ class BrainModule:
             return FALLBACK_SKIPPED_BUDGET_EXHAUSTED
         return None
 
-    def _any_authorized(self, entries: Sequence[_DeliveryEntry], recipient: _Recipient) -> bool:
-        """Whether at least one entry is in the authorized view of its own scope (R5)."""
+    def _any_authorized(
+        self, entries: Sequence[_DeliveryEntry], recipient: _Recipient, principal: str
+    ) -> bool:
+        """Whether at least one entry is in *principal*'s authorized view of its own scope (R5)."""
 
         for entry in entries:
             destination = entry.destination_for(recipient.platform, recipient.channel_id)
             try:
-                view = self._actions.authorized(principal=PRINCIPAL, destination=destination)
+                view = self._actions.authorized(principal=principal, destination=destination)
             except Exception:
                 self._diagnose("brain actions: authorized view unavailable")
                 continue
@@ -3314,7 +3367,7 @@ class BrainModule:
         stale = _StaleRun(work=work, key=key, remaining=remaining, clock=self._clock)
         entries = self._delivery_for(key.platform, key.channel_id)
         recipient = _recipient_of(work, key)
-        state = _RunState()
+        state = _RunState(principal=_stale_principal(work))
         skip = self._fallback_skip_reason(stale, entries, state, recipient)
         if skip is not None:
             state.fallback = skip
@@ -3432,7 +3485,9 @@ class BrainModule:
             return {}
         return catalog if isinstance(catalog, Mapping) else {}
 
-    def _offered_tools(self, platform: str, channel_id: str) -> tuple[_Offer, ...]:
+    def _offered_tools(
+        self, platform: str, channel_id: str, principal: str
+    ) -> tuple[_Offer, ...]:
         """The read actions of the authorized view, per action and per declared scope (R1, AC6).
 
         Read through the scoped facade the runtime hands every module, and
@@ -3448,7 +3503,11 @@ class BrainModule:
         nothing: default deny expressed as a surface rather than a guess
         about the rules. A delivery action is never offered, whatever the
         grants — the contracts refuse the delivery capability on a read
-        action, so the nature check covers both (decision 1). The specs
+        action, so the nature check covers both (decision 1). A write is
+        offered the same way iff its spec is ``model_proposable`` — which the
+        contracts refuse on a delivery-capable spec — and the view grants it
+        (R5, decision 5); any other write, a delivery action included, never is.
+        Every view is read for the run's *principal* (decision 4). The specs
         become the request's tool definitions at request time, in name
         order.
         """
@@ -3458,13 +3517,15 @@ class BrainModule:
             if (
                 not _is_text(getattr(spec, "name", None))
                 or not isinstance(getattr(spec, "argument_schema", None), Mapping)
-                or getattr(spec, "nature", None) != _NATURE_READ
+                or not (
+                    getattr(spec, "nature", None) == _NATURE_READ or _is_model_proposable(spec)
+                )
             ):
                 continue
             for scope in _declared_scopes(spec):
                 try:
                     view = self._actions.authorized(
-                        principal=PRINCIPAL,
+                        principal=principal,
                         destination=Destination(
                             platform=platform, channel_id=channel_id, scope=scope
                         ),
@@ -3484,6 +3545,7 @@ class BrainModule:
         entries: Sequence[_DeliveryEntry],
         *,
         recipient: _Recipient,
+        principal: str,
         next_call_index: int,
         calls_left: int,
     ) -> tuple[_Delivery, ...]:
@@ -3491,7 +3553,7 @@ class BrainModule:
 
         One executor call per entry — destination ``(recipient platform,
         recipient channel_id, the scope the entry declares for that
-        channel)``, principal :data:`PRINCIPAL`, the run's identities,
+        channel)``, the run's *principal*, the run's identities,
         ``call_id`` continuing the run's counter from *next_call_index*,
         deadline ``min(now + action_seconds, total deadline)`` taken when
         that entry starts — with its own explicit observation. An entry that
@@ -3525,7 +3587,7 @@ class BrainModule:
             call_id = f"{run.run_id}/call-{next_call_index + invoked}"
             invoked += 1
             try:
-                call = self._delivery_call(run, recipient, entry, text, call_id)
+                call = self._delivery_call(run, recipient, entry, text, call_id, principal)
             except Exception:
                 self._diagnose("brain delivery: call could not be built")
                 observation = _synthetic_observation(
@@ -3546,9 +3608,15 @@ class BrainModule:
         return tuple(deliveries)
 
     def _delivery_call(
-        self, run: Any, recipient: _Recipient, entry: _DeliveryEntry, text: str, call_id: str
+        self,
+        run: Any,
+        recipient: _Recipient,
+        entry: _DeliveryEntry,
+        text: str,
+        call_id: str,
+        principal: str,
     ) -> ActionCall:
-        """One delivery entry's call, bounded by the run's budget."""
+        """One delivery entry's call under the run's *principal*, bounded by the run's budget."""
 
         return ActionCall(
             action_name=entry.action,
@@ -3559,7 +3627,7 @@ class BrainModule:
             call_id=call_id,
             source_event_id=run.work.source_event_id,
             destination=entry.destination_for(recipient.platform, recipient.channel_id),
-            principal=PRINCIPAL,
+            principal=principal,
             deadline=min(run.now + self._budget.action_seconds, run.total_deadline),
             message_id=recipient.message_id,
         )
@@ -4581,6 +4649,26 @@ def _message_of_work(work: Any) -> _Message:
     return _message_of_event(getattr(work, "payload", None))
 
 
+def _stale_principal(work: Any) -> str:
+    """The principal of a dropped work's fallback: its event's, as a run's would be."""
+
+    try:
+        kind: str | None = _message_of_work(work).kind
+    except ValueError:
+        kind = None
+    return run_principal(kind)
+
+
+def _is_model_proposable(spec: Any) -> bool:
+    """Whether *spec* is a write the model may propose (R5, decision 5)."""
+
+    return (
+        getattr(spec, "model_proposable", False) is True
+        and getattr(spec, "nature", None) != _NATURE_READ
+        and not _is_delivery_capable(spec)
+    )
+
+
 def _is_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -4759,8 +4847,12 @@ __all__ = [
     "TRACE_DELIVERY_RESOLVED",
     "TRACE_OBSERVATION",
     "WORK_KIND",
+    "WATCH_PRINCIPAL",
+    "WATCH_TICK_KIND",
+    "BRAIN_ERROR_RUN_LIMIT",
     "BrainModule",
     "BrainModuleError",
+    "run_principal",
     "ConversationMemory",
     "Exchange",
     "activate",

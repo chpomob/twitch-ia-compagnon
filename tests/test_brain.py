@@ -94,12 +94,15 @@ from modules.brain import (
     TRACE_DELIVERY_RESOLVED,
     KNOWN_CAPABILITIES,
     MODULE_NAME,
+    BRAIN_ERROR_RUN_LIMIT,
     PRINCIPAL,
+    WATCH_PRINCIPAL,
     BrainModuleError,
     ConversationMemory,
     _estimate_tokens,
     _estimate_tool_tokens,
     activate,
+    run_principal,
     validate_settings,
 )
 
@@ -494,18 +497,21 @@ async def activate_with(
     scheduler: Any = None,
     bus: EventBus | None = None,
     prepare: bool = True,
+    context_factory: Any = None,
 ) -> Harness:
     """Activate the engine on a fresh runtime and run its ``prepare`` phase.
 
     ``prepare`` probes the backend (R2): the shared ``FakeSession`` answers
     each probe with one valid forced tool call unless the caller scripted
     ``probe_results``, and records it apart from the scenario requests.
+    ``context_factory``, given the harness clock and send edge, builds the runtime in
+    place of :func:`runtime_context` for a test that owns its rules.
     """
 
     target_session = session if session is not None else FakeSession(*results)
     target_transport = transport if transport is not None else FakeTransport()
     clock = ManualClock()
-    context = runtime_context(
+    context = context_factory(clock, target_transport) if context_factory is not None else runtime_context(
         bus,
         clock=clock,
         transport=target_transport,
@@ -2929,5 +2935,270 @@ async def test_a_route_list_that_does_not_resolve_fails_prepare_with_the_deliver
             f"module '{MODULE_NAME}': delivery: "
             'routes["thanks-raid"].delivery.actions[1]: unknown_action'
         )
+    finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# P6 — the run principal, model-proposable writes and the run limit (R5, R6)
+# --------------------------------------------------------------------------- #
+
+PROPOSABLE = "test.proposable"
+PROPOSABLE_SCOPE = "effect"
+CAPTURE = "screen.capture"
+CAPTURE_SCOPE = "capture"
+WATCH_AUTHOR = "system:watch"
+
+PROPOSABLE_SPEC = ActionSpec(
+    name=PROPOSABLE,
+    version=1,
+    description="A test-local write the model may propose.",
+    argument_schema={
+        "type": "object",
+        "properties": {"note": {"type": "string"}},
+        "required": ["note"],
+        "additionalProperties": False,
+    },
+    result_schema={"type": "object", "properties": {}},
+    nature="write",
+    required_permissions=(PROPOSABLE,),
+    supported_destinations=(Destination(PLATFORM, WILDCARD, PROPOSABLE_SCOPE),),
+    timeout_seconds=5.0,
+    idempotency="none",
+    model_proposable=True,
+)
+
+CAPTURE_SPEC = ActionSpec(
+    name=CAPTURE,
+    version=1,
+    description="Capture one frame of the stream.",
+    argument_schema={"type": "object", "properties": {}, "additionalProperties": False},
+    result_schema={"type": "object", "properties": {}},
+    nature="read",
+    required_permissions=(CAPTURE,),
+    supported_destinations=(Destination(WILDCARD, WILDCARD, CAPTURE_SCOPE),),
+    timeout_seconds=5.0,
+    idempotency="none",
+)
+
+
+def grant_to(action: str, *principals: str) -> AuthorizationRule:
+    return AuthorizationRule(
+        rule_id=f"{action}-{'-'.join(principals)}",
+        action_name=action,
+        principals=principals,
+        granted_permissions=(PERMISSION if action == CHAT_WRITE else action,),
+    )
+
+
+def owned_rules(*specs: ActionSpec, rules: list[AuthorizationRule]) -> Any:
+    """A context factory: ``chat.write`` over the fake send edge plus *specs*,
+    each bound to a :class:`ScriptedEffect`, under exactly *rules*."""
+
+    providers = {spec.name: ScriptedEffect() for spec in specs}
+
+    def factory(clock: ManualClock, transport: FakeTransport) -> RuntimeContext:
+        policy = AuthorizationPolicy(rules)
+        actions = ActionRegistry(authorization=policy)
+        actions.register(CHAT_WRITE_SPEC, FakeSendProvider(transport), module=SENDER_MODULE)
+        for spec in specs:
+            actions.register(spec, providers[spec.name], module=SENDER_MODULE)
+        actions.mark_ready(SENDER_MODULE)
+        return build_context(clock=clock, authorization=policy, actions=actions)
+
+    factory.providers = providers  # type: ignore[attr-defined]
+    return factory
+
+
+async def publish_kind(harness: Harness, kind: str, *, message_id: str, viewer_id: str) -> None:
+    payload = chat_payload("tick", message_id=message_id, viewer_id=viewer_id)
+    payload["kind"] = kind
+    await harness.bus.publish(INPUT_EVENT, payload, {"source": "test", "schema_version": 2})
+
+
+def run_principals(harness: Harness, run_id: str) -> list[tuple[str, str]]:
+    """``(action, principal)`` of every executor call the run made, in order."""
+
+    return [
+        (event["payload"]["action"], event["payload"]["principal"])
+        for event in harness.traces(TRACE_ACTION_STARTED)
+        if event["payload"]["run_id"] == run_id
+    ]
+
+
+def tool_results(harness: Harness, index: int) -> list[dict[str, Any]]:
+    """The JSON envelopes of the tool results request *index* carried."""
+
+    return [
+        json.loads(message["content"].split("\n", 1)[0])
+        for message in harness.prompt(index)
+        if message["role"] == "tool"
+    ]
+
+
+def test_the_run_principal_is_brain_watch_for_a_watch_tick_only() -> None:
+    """Decision 4: ``watch_tick`` → ``brain.watch``; every other kind → ``brain``."""
+
+    assert WATCH_PRINCIPAL == "brain.watch"
+    assert run_principal("watch_tick") == WATCH_PRINCIPAL
+    assert [run_principal(kind) for kind in EVENT_KINDS if kind != "watch_tick"] == [
+        PRINCIPAL
+    ] * (len(EVENT_KINDS) - 1)
+    assert run_principal(None) == PRINCIPAL == "brain"
+
+
+@pytest.mark.asyncio
+async def test_ac25_a_proposable_write_is_offered_only_when_granted_and_once_per_run() -> None:
+    """AC25 (brain half): a test-local ``model_proposable`` write is offered
+    only with a granting rule; the granted ``chat.write`` is offered 0 times
+    over every request; once granted, a model call to it goes through the
+    executor, and a second call of it in the same run is ``refused
+    run_limit`` with 0 executor invocations — its provider sees 1 call; a
+    proposed ``chat.write`` keeps the phase 2 ``not_a_read_action``."""
+
+    factory = owned_rules(PROPOSABLE_SPEC, rules=[BRAIN_GRANT])
+    harness = await activate_with(
+        FakeResponse(200, completion("Nothing to do.")),
+        FakeResponse(200, tool_call(PROPOSABLE, {"note": "first"})),
+        FakeResponse(200, tool_call(PROPOSABLE, {"note": "second"})),
+        FakeResponse(200, tool_call(CHAT_WRITE, {"text": "sneaky"})),
+        FakeResponse(200, completion("Done.")),
+        context_factory=factory,
+    )
+    provider = factory.providers[PROPOSABLE]
+    try:
+        await harness.send(message_id="ungranted")
+        await harness.completed(1)
+        assert harness.tools(0) == []
+
+        harness.executor._authorization.grant(grant_to(PROPOSABLE, PRINCIPAL))
+        await harness.send(message_id="granted")
+        (_, record) = await harness.completed(2)
+        assert record.status == "success"
+        assert [harness.tools(index) for index in range(1, 5)] == [[PROPOSABLE]] * 4
+        assert all(
+            CHAT_WRITE not in harness.tools(index) for index in range(len(harness.requests()))
+        )
+        assert provider.calls == [{"note": "first"}]
+
+        first, second, sneaky = tool_results(harness, 4)
+        assert first["status"] == "success"
+        assert (second["status"], second["error"]["code"]) == ("refused", BRAIN_ERROR_RUN_LIMIT)
+        assert (sneaky["status"], sneaky["error"]["code"]) == ("refused", "not_a_read_action")
+        # One executor call for the proposal, one for the delivery: neither
+        # the run-limited call nor the chat.write proposal reached it.
+        assert run_principals(harness, record.run_id) == [
+            (PROPOSABLE, PRINCIPAL),
+            (CHAT_WRITE, PRINCIPAL),
+        ]
+        assert harness.executor.outcome(f"{record.run_id}/call-1").status == "success"
+        assert harness.transport.sends[-1]["call_id"] == f"{record.run_id}/call-2"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac32_a_watch_run_is_made_under_brain_watch_and_a_brain_rule_grants_it_nothing() -> None:
+    """AC32 (brain half): with ``screen.capture`` and ``chat.write`` granted
+    to ``brain`` only, a ``watch_tick`` run is offered no capture, its
+    proposed capture is refused by the executor with 0 provider calls and
+    its delivery is refused — every call it made carries ``brain.watch``;
+    a chat run of the same channel is offered the capture and every call
+    of it carries ``brain`` (the phase 2 chat principal is unchanged)."""
+
+    factory = owned_rules(
+        CAPTURE_SPEC, rules=[BRAIN_GRANT, grant_to(CAPTURE, PRINCIPAL)]
+    )
+    harness = await activate_with(
+        FakeResponse(200, tool_call(CAPTURE, {})),
+        FakeResponse(200, completion("Nice view.")),
+        FakeResponse(200, completion("Hello.")),
+        context_factory=factory,
+    )
+    provider = factory.providers[CAPTURE]
+    try:
+        await publish_kind(harness, "watch_tick", message_id="tick-1", viewer_id=WATCH_AUTHOR)
+        (watch,) = await harness.completed(1)
+        assert harness.tools(0) == [] and harness.tools(1) == []
+        assert provider.calls == []
+        (refused,) = tool_results(harness, 1)
+        assert (refused["status"], refused["error"]["code"]) == ("refused", ERROR_NOT_AUTHORIZED)
+        assert run_principals(harness, watch.run_id) == [
+            (CAPTURE, WATCH_PRINCIPAL),
+            (CHAT_WRITE, WATCH_PRINCIPAL),
+        ]
+        assert harness.executor.outcome(f"{watch.run_id}/call-2").status == "refused"
+        assert harness.transport.sends == []
+
+        await harness.send(message_id="chat-1")
+        (_, chat) = await harness.completed(2)
+        assert harness.tools(2) == [CAPTURE]
+        assert run_principals(harness, chat.run_id) == [(CHAT_WRITE, PRINCIPAL)]
+        assert harness.transport.sends[-1]["text"] == "Hello."
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac32_a_rule_naming_brain_watch_lets_the_watch_run_capture_once() -> None:
+    """AC32 (brain half): with ``screen.capture`` and ``chat.write`` granted
+    to ``brain.watch``, the watch run is offered the capture, the provider
+    is invoked once, and every call of the run carries ``brain.watch``."""
+
+    factory = owned_rules(
+        CAPTURE_SPEC,
+        rules=[grant_to(CHAT_WRITE, WATCH_PRINCIPAL), grant_to(CAPTURE, WATCH_PRINCIPAL)],
+    )
+    harness = await activate_with(
+        FakeResponse(200, tool_call(CAPTURE, {})),
+        FakeResponse(200, completion("Nice view.")),
+        context_factory=factory,
+    )
+    try:
+        await publish_kind(harness, "watch_tick", message_id="tick-1", viewer_id=WATCH_AUTHOR)
+        (watch,) = await harness.completed(1)
+        assert watch.status == "success"
+        assert harness.tools(0) == [CAPTURE]
+        assert len(factory.providers[CAPTURE].calls) == 1
+        assert run_principals(harness, watch.run_id) == [
+            (CAPTURE, WATCH_PRINCIPAL),
+            (CHAT_WRITE, WATCH_PRINCIPAL),
+        ]
+        assert harness.transport.sends[-1]["text"] == "Nice view."
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_a_watch_run_fallback_is_authorized_for_brain_watch_not_brain() -> None:
+    """Decision 4: the fallback's delivery entries carry the run's principal.
+    With ``chat.write`` granted to ``brain`` only and one model turn, a
+    watch run's spent budget skips the fallback as ``not_authorized`` with
+    0 sends, while a chat run's fallback is sent under ``brain``."""
+
+    factory = owned_rules(CAPTURE_SPEC, rules=[BRAIN_GRANT])
+    harness = await activate_with(
+        FakeResponse(200, tool_call(CAPTURE, {})),
+        FakeResponse(200, tool_call(CAPTURE, {})),
+        settings_overrides={"budget": {"model_turns": 1}},
+        context_factory=factory,
+    )
+    try:
+        await publish_kind(harness, "watch_tick", message_id="tick-1", viewer_id=WATCH_AUTHOR)
+        (watch,) = await harness.completed(1)
+        await wait_until(lambda: len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) >= 1)
+        assert harness.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]["fallback"] == (
+            "skipped:not_authorized"
+        )
+        assert harness.transport.sends == []
+
+        await harness.send(message_id="chat-1")
+        (_, chat) = await harness.completed(2)
+        await wait_until(lambda: len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) >= 2)
+        assert harness.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]["fallback"] == FALLBACK_SENT
+        assert run_principals(harness, chat.run_id)[-1] == (CHAT_WRITE, PRINCIPAL)
+        assert [send["text"] for send in harness.transport.sends] == [
+            POLICY["fallback"]["text"]
+        ]
     finally:
         await harness.close()
