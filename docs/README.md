@@ -29,6 +29,15 @@ l'enregistre de la même manière, et la section
 [Essai de topologie de la phase 1](#essai-de-topologie-de-la-phase-1-phase-1-topology-trial)
 consigne l'essai PC/serveur exigé avant de décrire cette topologie comme livrée.
 
+La phase 2 (spec `phase2-audio-stream-interaction` v1.2, exigences R1–R10 et
+AC1–AC43) ne remplace de la phase 1 que ce que son allowlist nomme — huit
+tests — et une règle de l'exécuteur (R10). La section
+[Versionnement de la spec phase 1 (phase 2)](#versionnement-de-la-spec-phase-1-phase-2)
+l'enregistre, avec les échéances de la lecture et de la capture et les limites
+déclarées ; la section
+[Essais d'intégration par fournisseur (phase 2)](#essais-dintégration-par-fournisseur-phase-2)
+consigne ce qui a réellement tourné contre chaque fournisseur réel.
+
 ## Étapes, livraisons et preuves
 
 « Livraison » désigne ici le commit historique de l'étape, sans présumer sa
@@ -238,6 +247,176 @@ Les six champs ci-dessous sont ceux que R8 exige ; l'AC44 est vérifié par
 | TLS | **Non utilisé** : `ws://` sur loopback, ce que le validateur du proxy n'accepte que pour une adresse de loopback (une écoute non loopback sans `tls` est refusée à la validation, `tests/test_proxy.py`). Aucun certificat n'a été chargé ; le chemin `wss://` n'est couvert que par la validation des réglages et par le document de protocole. |
 | Résultat observé | **1 passed** (0,73 s d'appel). Dans l'ordre : le brain se déclare prêt après les 2 sondes de capacités ; un agent présentant un mauvais jeton reçoit `auth_failed` (sa sortie d'erreur ne contient aucun jeton) et un appel direct avec ce jeton est fermé avec le code 4401, sans qu'aucun événement le nomme sur le bus ; l'agent valide s'appaire, ce qui déclenche le flux : le run « fichier » se termine avec l'image transférée **par référence** (identifiant d'attachement, jamais un chemin) et reçue par le modèle par valeur ; le run « verrou » démarre sa capture, l'agent est tué (SIGKILL) capture en vol, le run observe `error proxy_disconnected` sans partie image et répond quand même ; l'agent redémarré s'appaire de nouveau, les deux runs réussissent une seconde fois (capture libérée par le verrou) ; les deux processus sortent en `0` sur SIGTERM. Le fichier d'audit, lu après leur sortie, montre 2 appairages du seul agent valide, 4 runs `success`, les transitions `module.degraded`/`module.ready` du proxy autour de la coupure, et ne contient ni jeton ni chemin de fichier. |
 | Limites restantes | Aucun hôte distinct ni réseau réel (loopback seulement) ; pas de TLS de bout en bout ; entrée `fakeplatform` scriptée, pas de plateforme réelle ni de Twitch ; modèle factice scripté (pas d'endpoint réel, pas de vision réelle) ; capture = un PNG fixe et un script Python, pas d'écran ; un seul agent, un seul canal, un seul spectateur, deux messages par appairage ; livraison observée sur le transport fictif de la plateforme fixture ; aucune mesure de latence, de débit ni de tenue dans le temps ; dépend d'un port loopback libre (le module se saute sinon, en nommant la raison) et de signaux POSIX. Un essai sur deux hôtes distincts avec `wss://` reste à faire avant de décrire la topologie comme éprouvée hors laboratoire. |
+
+## Versionnement de la spec phase 1 (phase 2)
+
+La phase 2 (branche `feat(phase2)`, commits `25c152e` (P1) à `23e6e91` (P19),
+spec `phase2-audio-stream-interaction` v1.2 archivée dans
+[campaigns/phase2/spec.md](campaigns/phase2/spec.md), plan dans
+[campaigns/phase2/plan.md](campaigns/phase2/plan.md), issue de
+[design-v2.md](design-v2.md)) ajoute la voix (synthèse et lecture,
+`audio.speak`/`audio.play`), l'écoute (capture et transcription optionnelle,
+`audio.capture`), les scènes et les sondages de diffusion
+(`stream.scene.set`/`stream.poll.create`). Elle ne remplace de la phase 1
+**que ce que son allowlist nomme** — huit tests, tous réécrits en place — et
+une règle de l'exécuteur, la précédence de R10 ci-dessous. Comme les sections
+précédentes, celle-ci enregistre **ce qui change et par quoi**, pas une
+nouvelle conformité : les garanties de la phase 0 et de la phase 1 restent en
+vigueur (admission bornée, cycle de vie par phases, statut terminal explicite,
+défaut-refus lectures comprises, rétention bornée, délai global unique de
+démarrage/arrêt, redaction des secrets configurés, livraison configurée et
+enfichable à l'étape terminale seulement). Vocabulaire : « phase 1 R5 »
+désigne la spec `phase1-agentic`, « phase 2 R10 » la spec de la phase 2. La
+revue de branche P21 n'est pas consignée par cet index.
+
+### Allowlist de la spec phase 2 : sort de chaque test
+
+Les 8 entrées de l'allowlist de la spec `phase2-audio-stream-interaction`
+(section « Test failure allowlist ») portaient les listes de la phase 1 —
+8 manifests livrés, six modules activés sur le PC, quatre actions fournies.
+Chacune est **réécrite en place** (même nom, docstring citant l'exigence de
+remplacement) : la garantie reste la même — le profil active exactement sa
+liste, n'accorde exactement que son ensemble d'actions fournies, l'installation
+propre découvre exactement les manifests livrés — sur les listes de la phase 2.
+Aucune entrée n'a été neutralisée par `skip`, `xfail` ou affaiblissement
+d'assertion.
+
+| # | Test allowlisté (phase 1) | Sort | Ce qui remplace l'assertion de la phase 1 | Exigence(s) phase 2 | Commit |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `tests/test_examples.py::test_manifests_are_unique_and_have_coherent_capabilities` | Réécrit en place | 11 manifests livrés (`audio_output`, `audio_input`, `stream_control` ajoutés) et les déclarations de la phase 2 dans `EXPECTED_MANIFESTS`, au lieu de 8 | R9, AC32, AC33 | `23e6e91` (P19) |
+| 2 | `tests/test_examples.py::test_profile_enables_its_modules_and_contains_no_literal_credentials[pc]` | Réécrit en place | Les neuf modules du profil PC dans l'ordre de R9, au lieu des six de la phase 1 ; 0 secret littéral inchangé | R9, AC32 | `23e6e91` (P19) |
+| 3 | `tests/test_examples.py::test_profile_enables_its_modules_and_contains_no_literal_credentials[server]` | Réécrit en place | `stream_control` ajouté avant `brain` au profil serveur | R9, AC32 | `23e6e91` (P19) |
+| 4 | `tests/test_examples.py::test_profile_enables_its_modules_and_contains_no_literal_credentials[agent]` | Réécrit en place | Cinq modules (`capture`, `audio_input`, `audio_output`, `stream_control`, `agent_link`) au lieu de `[capture, agent_link]` | R9, AC32 | `23e6e91` (P19) |
+| 5 | `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set[pc]` | Réécrit en place | Les neuf actions fournies du profil PC au lieu de quatre | R9, AC32 | `23e6e91` (P19) |
+| 6 | `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set[server]` | Réécrit en place | Les neuf actions fournies du serveur, dont cinq par l'allowlist `actions` du proxy | R9, AC32 | `23e6e91` (P19) |
+| 7 | `tests/test_examples.py::test_profile_grants_exactly_its_provided_action_set[agent]` | Réécrit en place | Les cinq actions fournies de l'agent au lieu de `{screen.capture}` | R9, AC32 | `23e6e91` (P19) |
+| 8 | `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help` | Réécrit en place | `len(manifests) == 11` au lieu de 8 | R9, AC33 | `23e6e91` (P19) |
+
+### Règle de l'exécuteur : un enregistrement d'interruption tardif fait foi (R10)
+
+En phase 1, `core/actions.py::_run_invocation` écartait **tout** enregistrement
+du fournisseur horodaté (`provider_completed_at`) à `expires_at` ou après, et
+publiait son propre enregistrement générique (`timeout`, code `timed_out`,
+message « … timed out with emission … », sans `cause`, `played_ms` ni code du
+module). La phase 2 R10 change exactement ceci (`009dd89`, P3) :
+
+- un **enregistrement d'interruption écrit par le fournisseur** — statut
+  `timeout`, `cancelled` ou `error`, avec sa `cause`, son `played_ms` ou son
+  propre code — horodaté à l'échéance ou après est **adopté** par le chemin
+  ordinaire de validation : parties validées (R4), règle d'émission appliquée
+  sans changement (un `timeout` d'écriture émise devient `external_unknown`),
+  rien d'autre réécrit ; cela vaut aussi quand le minuteur de l'exécuteur a
+  gagné et que le fournisseur annulé répond dans `_cancel_grace` ;
+- **une confirmation tardive n'est toujours jamais un succès** : un `success`,
+  un `refused` ou tout enregistrement qui n'est pas une interruption, horodaté
+  à `expires_at` ou après, est remplacé par l'enregistrement générique ; la
+  frontière reste `>=` sur l'horodatage du fournisseur ;
+- **le minuteur de l'exécuteur reste en vigueur** : un fournisseur qui ne
+  répond jamais est annulé à l'échéance et l'appel se termine par
+  l'enregistrement générique, `COUNTER_ACTION_TIMEOUTS` incrémenté.
+
+Les deux tests de frontière de la phase 1,
+`tests/test_actions.py::test_a_confirmation_landing_after_the_deadline_is_never_a_success`
+et `tests/test_actions.py::test_a_confirmation_landing_in_time_survives_a_late_adoption`,
+restent **inchangés** (AC40). Les deux côtés de la nouvelle règle sont épinglés
+à côté d'eux : `tests/test_actions.py::test_a_late_provider_timeout_is_adopted_verbatim`
+(l'interruption tardive est adoptée, à `== expires_at` et `> expires_at`) et
+`tests/test_actions.py::test_a_late_success_is_still_replaced_by_the_generic_record`
+(la confirmation tardive ne l'est pas), complétés par
+`test_a_late_refusal_is_still_replaced_by_the_generic_record`,
+`test_a_late_timeout_after_emission_ends_external_unknown_as_in_time` et
+`test_a_provider_that_never_answers_is_cut_by_the_timer_at_expiry`.
+
+### Lecture (`audio.speak`, `audio.play`)
+
+Le lecteur configuré reçoit le WAV complet (en-tête et bloc de données) sur
+son entrée standard. Le succès est la lecture terminée : tous les octets
+acceptés, puis sortie 0. `played_ms` est une **estimation par octets
+acceptés** : la durée des octets de données que le tube du lecteur a acceptés
+(l'en-tête ne compte pas), pas une horloge du périphérique — des octets
+acceptés par le tube peuvent ne pas encore avoir atteint la sortie audio.
+
+L'échéance de l'appel est `expiry = min(call.deadline, entrée + timeout_seconds)`,
+la même arithmétique que l'exécuteur, et rien n'en est soustrait. Le lecteur
+est arrêté **à** l'échéance de l'appel, pas avant : à `expiry`, le module
+termine le lecteur et rend `timeout` avec la cause `playback` et le
+`played_ms` atteint, que l'exécuteur adopte (R10). `stop_grace_seconds` court
+**après** cet arrêt (terminaison, puis kill) et ne raccourcit pas l'échéance.
+Un lecteur qui finit à `expiry − 0,05 s` réussit (AC38).
+
+### Capture (`audio.capture`)
+
+Le recorder configuré est démarré à l'appel et terminé à `t0 + seconds` ; le
+segment est tronqué à `seconds` et stocké en pièce jointe louée au run. Le
+recorder est tué **à** l'échéance de l'appel `expiry`, pas avant : un recorder
+qui n'a rien émis quand l'échéance arrive est tué à cet instant et l'appel se
+termine `error capture_timed_out`, adopté par l'exécuteur (R10, AC39).
+Exactement deux quantités sont soustraites de l'échéance, toutes deux
+autorisées par AC41 et limitées à leur objet : `grace_seconds`, la réserve
+d'admission de `capture_too_long`, évaluée une fois avant tout démarrage
+(elle refuse une capture qui ne pourrait pas finir et ne déplace pas le kill) ;
+et la réserve de transcription de 1 s (`skipped:deadline`), qui borne la seule
+requête de transcription optionnelle après stockage pour que l'enregistrement
+`success` porteur de l'`audio_ref` soit horodaté avant l'échéance. Aucune
+autre action — ni la lecture, ni les scènes, ni les sondages — ne soustrait
+quoi que ce soit de son échéance.
+
+### Fournisseur de scènes : protocole filaire
+
+Le type `websocket` de `stream_control` parle **obs-websocket 5** (RPC
+version 1) : poignée de main `Hello` → `Identify` → `Identified` avec
+`rpcVersion: 1` et `eventSubscriptions: 0` (la chaîne d'authentification est
+dérivée du mot de passe, du sel et du défi ; le mot de passe n'est jamais
+envoyé), puis trois paires `Request`/`RequestResponse` appariées par
+`requestId` : `GetSceneList` (sonde de `prepare`), `GetCurrentProgramScene`
+(scène précédente et relecture) et `SetCurrentProgramScene`. Une URL `ws://`
+n'est acceptée que sur loopback ; hors loopback, `wss://`. Une perte de socket
+retire la disponibilité et démarre une reconnexion à délai aléatoire borné.
+
+### Limites déclarées de la phase 2
+
+- **Disponibilité distante** (décision 11) : la vue prête du brain liste une
+  action servie par le proxy comme prête tant qu'un agent qui l'a déclarée
+  est appairé ; si le module n'est pas prêt côté agent, l'appel reçoit
+  `refused provider_not_ready` de l'exécuteur de l'agent. La propagation des
+  changements de disponibilité de l'agent sur le fil est différée.
+- **Annulation externe de l'exécuteur** (décision 1) : la branche
+  `except CancelledError` de `_run_invocation` n'est pas modifiée. L'arrêt
+  coordonné atteint une lecture ou une capture en cours par le hook `drain()`
+  du module, qui arrête le périphérique et rend `cancelled` par le chemin
+  ordinaire du fournisseur ; une annulation de l'appel exécuteur venue
+  d'ailleurs garde la comptabilité de la phase 1.
+- **Réveil bloqué pendant la transcription** (décision 1, AC42) :
+  l'horodatage de fin appartient à l'exécuteur (`_observe`), pas au module.
+  Le module rend son `success` à la borne `expiry − 1 s` au plus tard quand son
+  réveil arrive à l'heure, et avant `expiry` pour tout réveil retardé de moins
+  que la réserve ; un réveil retardé de **toute la réserve de 1 s** (boucle
+  gelée une seconde ou plus) est horodaté à `expiry` ou après, et la règle de
+  la phase 1 le traite alors en `success` tardif : non adopté, remplacé par
+  l'enregistrement générique. Aucun test ne peut l'épingler ; sa seule
+  atténuation est la réserve elle-même.
+
+## Essais d'intégration par fournisseur (phase 2)
+
+Un essai par fournisseur réel, exécuté à la main sur la machine de référence
+le 23 septembre 2026 avec le lanceur opt-in `tests/test_phase2_trials.py`
+(`.venv/bin/python -m pytest tests/test_phase2_trials.py -q -s -p no:cacheprovider`,
+chaque essai activé par sa variable `PHASE2_*`, sauté sinon en nommant la
+variable). Chaque essai active le vrai module avec ses vrais transports et
+exécuteurs de processus, sur l'horloge réelle, et passe par l'exécuteur réel
+sous une autorisation explicite ; le résultat cité est la ligne
+`PHASE2-TRIAL …` qu'il imprime. Les formes de réglages ne contiennent ni
+secret ni jeton : un secret y apparaît comme `<…>` ou `${…}`. AC34 est vérifié
+par `tests/test_hygiene.py`.
+
+| Fournisseur | Commit | Forme des réglages | Résultat | Limites | Date |
+| --- | --- | --- | --- | --- | --- |
+| Synthèse vocale | `23e6e91` (P19 : modules exercés), lanceur de P20 ; la revue P21 réexécute et nomme son commit de porte | `audio_output` : `synthesis {endpoint: http://127.0.0.1:<port>/v1/audio/speech (service local), model: <identifiant listé par le service>, api_key: vide, probe: true puis false}`, `voices {allowed: [default], default: default}`, `outputs.trial.player.argv` = interpréteur lisant stdin jusqu'au bout (puits, aucun périphérique) | Exécuté, **échec explicite** : sonde active, `PHASE2-TRIAL speech synthesis: status=error code=no_provider bound=False player=sink` (la sonde de `prepare` refuse la réponse, `audio.speak` n'est pas lié, 0 lecteur démarré) ; sonde coupée (`PHASE2_SPEECH_PROBE=0`), `PHASE2-TRIAL speech synthesis: status=error code=invalid_audio bound=True player=sink` : le service répond 200 `audio/mpeg` (11 232 octets pour « ready ») malgré `response_format: "wav"`, et le module refuse un corps qui n'est pas RIFF/WAVE PCM | Aucune synthèse lue de bout en bout : le seul service de la machine ne rend pas de WAV ; un endpoint qui honore `wav` reste à essayer ; une phrase courte, latence non mesurée | 2026-09-23 |
+| Transcription | `23e6e91` (P19 : modules exercés), lanceur de P20 ; la revue P21 réexécute et nomme son commit de porte | `audio_input` : `sources.trial {kind: file, path: <WAV silencieux 2 s généré, 16 kHz mono 16 bits>}`, `transcription {enabled: true, endpoint: http://127.0.0.1:<port>/v1/audio/transcriptions (service local), model: <identifiant listé par le service>, language: fr, api_key: vide}` | Exécuté : sonde de `prepare` réussie (transcription non dégradée), puis `PHASE2-TRIAL transcription: status=success source=file transcription_status=ok text_chars=34` — capture `success` avec son `audio_ref` et une transcription de 34 caractères | Entrée silencieuse et pourtant 34 caractères rendus : le service invente du texte sur du silence (contenu non vérifié ni consigné) ; pas de parole réelle ; latence et fenêtre de transcription réelle non mesurées | 2026-09-23 |
+| Commande de lecture | `23e6e91` (P19 : modules exercés), lanceur de P20 ; la revue P21 réexécute et nomme son commit de porte | `audio_output` : `outputs.trial.player.argv: [aplay, -q, -]`, `clips.trial.path: <WAV silencieux 1 s généré, 16 kHz mono 16 bits>`, `synthesis.endpoint` vide (`audio.speak` non lié) | Exécuté : `PHASE2-TRIAL playback command: status=success duration_ms=1000 played_ms=1000` | Silence : rien d'audible vérifié ; `played_ms` est l'estimation par octets acceptés ; l'arrêt à l'échéance n'a pas été provoqué sur le périphérique réel (couvert par AC38 avec le runner injecté) ; une seule sortie, périphérique ALSA par défaut | 2026-09-23 |
+| Commande de capture | `23e6e91` (P19 : modules exercés), lanceur de P20 ; la revue P21 réexécute et nomme son commit de porte | `audio_input` : `sources.trial {kind: command, argv: [arecord, -q, -f, S16_LE, -r, 16000, -c, 1, -t, wav, -]}`, `default_source: trial`, transcription désactivée ; appel `{seconds: 2}` | Exécuté : `PHASE2-TRIAL capture command: status=success size=61426 duration_ms=1918 sample_rate_hz=16000 channels=1 audio_ref=True` | 1 918 ms au lieu de 2 000 : le recorder est terminé à `t0 + 2 s` et son démarrage consomme le reste, le segment garde ce qu'il a émis ; contenu du micro non vérifié ; `capture_timed_out` non provoqué sur le périphérique réel (couvert par AC39) ; périphérique ALSA par défaut | 2026-09-23 |
+| Fournisseur de scènes | `23e6e91` (P19 : modules exercés), lanceur de P20 ; la revue P21 réexécute et nomme son commit de porte | `stream_control` : `scenes.provider {kind: websocket, url: ws://127.0.0.1:4455, password: ${OBS_WEBSOCKET_PASSWORD}}`, `allowed: [Scène, Trial phase2]`, délais de connexion et de requête par défaut (5 s), sondages désactivés ; serveur obs-websocket 5 du logiciel de diffusion installé, authentification exigée | Exécuté, deux passes, chacune une vraie bascule confirmée par relecture : `PHASE2-TRIAL scene provider (restore): status=success scene=Scène previous_scene=Trial phase2 reconciled=False`, puis `PHASE2-TRIAL scene provider: status=success ready=True scene=Scène previous_scene=Scène reconciled=False` et `PHASE2-TRIAL scene provider (restore): status=success scene=Trial phase2 previous_scene=Scène reconciled=False` ; le logiciel finit sur sa scène de départ | Loopback seulement, pas de `wss://` ; perte de socket, reconnexion et réconciliation non provoquées contre le serveur réel (couvertes par le pair en mémoire) ; aucune mesure de latence | 2026-09-23 |
+| Sondages de plateforme | `23e6e91` (P19 : modules exercés), lanceur de P20 ; la revue P21 réexécute et nomme son commit de porte | `twitch {client_id, client_secret, access_token, broadcaster_id, bot_user_id: ${TWITCH_*}}` (jeton avec la portée de gestion des sondages), `stream_control {scenes.provider.kind: none, polls.enabled: true}` ; appel `{question, options: [2], duration_seconds: 15}` sur la chaîne du diffuseur | **Non exécuté** : aucun identifiant de plateforme sur la machine de référence (`PHASE2_POLL_PLATFORM` et les variables `TWITCH_*` absentes) ; créer un sondage exige un jeton portant la portée des sondages sur une chaîne affiliée ou partenaire | Le service de sondage n'est éprouvé que contre le double scripté et le transport HTTP simulé (AC26–AC28) ; aucune requête réelle vers la plateforme | 2026-09-23 |
 
 ## Lecture des manifests de runs
 

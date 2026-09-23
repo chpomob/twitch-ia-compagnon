@@ -23,6 +23,14 @@ Three checks over the files themselves, none over the runtime:
 * AC44: ``docs/README.md`` has the section "Phase 1 topology trial" with its
   six fields — commit, profiles, hosts, TLS, outcome, limits — each with a
   recorded value, the commit one naming a commit hash.
+* AC34 (phase 2 R9): ``docs/README.md`` has the section "Essais
+  d'intégration par fournisseur (phase 2)" whose table holds exactly the six
+  provider rows, each with its five fields — commit, settings shape, outcome,
+  limits, date — recorded; and the section "Versionnement de la spec phase 1
+  (phase 2)" names every test of the phase 2 spec's allowlist, read from the
+  spec itself.
+* AC41 (phase 2 R10): the README's playback and capture subsections describe
+  no lead — none of ``lead``, ``marge``, ``margin`` appears in them.
 * Target list (gate finding F5): the phase 1 spec's ``targets`` front matter
   is the authority on which repository files the phase touches, so every
   file a plan step names must be a target, lie in the permitted scope the
@@ -77,6 +85,34 @@ TRIAL_FIELDS = (
     "TLS",
     "Résultat observé",
     "Limites restantes",
+)
+
+PHASE2_SPEC = ROOT / "docs" / "campaigns" / "phase2" / "spec.md"
+PHASE2_ALLOWLIST_TITLE = "Test failure allowlist"
+PHASE2_VERSIONING_TITLE = "Versionnement de la spec phase 1 (phase 2)"
+PHASE2_TRIAL_TITLE = "Essais d'intégration par fournisseur (phase 2)"
+#: The six providers of phase 2 R9, as the README's table labels them, in
+#: the spec's order: speech synthesis, transcription, playback command,
+#: capture command, scene provider, platform polls.
+PHASE2_TRIAL_ROWS = (
+    "Synthèse vocale",
+    "Transcription",
+    "Commande de lecture",
+    "Commande de capture",
+    "Fournisseur de scènes",
+    "Sondages de plateforme",
+)
+#: The five fields of each row (R9, AC34), after the provider label.
+PHASE2_TRIAL_FIELDS = ("Commit", "Forme des réglages", "Résultat", "Limites", "Date")
+#: The README subsections that state the playback and capture deadlines
+#: (AC41): none may describe a lead, in either language.
+PHASE2_DEADLINE_SUBSECTIONS = ("Lecture (`audio.speak`", "Capture (`audio.capture`")
+LEAD_WORDS = re.compile(r"\b(lead|marge|margin)", re.IGNORECASE)
+#: A settings key naming a secret must be followed by a placeholder
+#: (``<…>``, ``${…}``) or be recorded as empty, never by a value.
+SECRET_SETTING = re.compile(
+    r"\b(api_key|password|access_token|client_secret|token)\s*:\s*(?!<|\$\{|vide\b)[^\s,}]",
+    re.IGNORECASE,
 )
 
 _INSIGNIFICANT = {
@@ -322,6 +358,106 @@ def test_ac44_readme_records_the_phase_1_topology_trial() -> None:
     assert re.search(r"loopback|distinct", values["Hôtes"], re.IGNORECASE)
     assert re.search(r"utilisé|used", values["TLS"], re.IGNORECASE)
     assert "test_ac39_two_process_topology_over_loopback" in section
+
+
+# --------------------------------------------------------------------------- #
+# AC34, AC41 (phase 2)
+# --------------------------------------------------------------------------- #
+
+
+def _table_cells(section: str) -> dict[str, list[str]]:
+    """Every data row of the one table in *section*, keyed by its first cell,
+    the header and the separator excluded."""
+
+    rows = [line for line in section.splitlines() if line.startswith("|")]
+    assert len(rows) >= 2, "the section holds no table"
+    header, separator, *data = rows
+    assert set(separator.replace("|", "").split()) <= {"---"}, separator
+    table: dict[str, list[str]] = {}
+    for row in data:
+        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+        assert cells[0] not in table, f"row {cells[0]!r} appears twice"
+        table[cells[0]] = cells[1:]
+    table[""] = [cell.strip() for cell in header.strip().strip("|").split("|")]
+    return table
+
+
+def _allowlisted_tests(spec: str) -> list[str]:
+    """The test ids the spec's "Test failure allowlist" section lists."""
+
+    section = _section(spec, PHASE2_ALLOWLIST_TITLE)
+    return re.findall(r"^- `(tests/[^`]+)`", section, re.MULTILINE)
+
+
+def _lead_hits(subsection: str) -> list[str]:
+    return [line for line in subsection.splitlines() if LEAD_WORDS.search(line)]
+
+
+def test_ac34_readme_records_the_phase_2_provider_trials() -> None:
+    """AC34 (phase 2 R9): the trial table has exactly the six provider rows,
+    each with its five fields recorded — a commit hash, a settings shape
+    carrying no secret, an outcome that is a cited trial line or "not run"
+    with its reason, the limits, the date — and the versioning section names
+    every test of the phase 2 allowlist."""
+
+    readme = README.read_text(encoding="utf-8")
+    section = _section(readme, PHASE2_TRIAL_TITLE)
+    table = _table_cells(section)
+    header = table.pop("")
+    assert tuple(header[1:]) == PHASE2_TRIAL_FIELDS, header
+    assert tuple(table) == PHASE2_TRIAL_ROWS, list(table)
+    for label, cells in table.items():
+        assert len(cells) == len(PHASE2_TRIAL_FIELDS), (label, cells)
+        values = dict(zip(PHASE2_TRIAL_FIELDS, cells))
+        for name, value in values.items():
+            assert value, f"row {label!r}: field {name!r} has no recorded value"
+        assert re.search(r"`[0-9a-f]{7,40}`", values["Commit"]), (label, values["Commit"])
+        assert not SECRET_SETTING.search(values["Forme des réglages"]), (label, "secret value")
+        outcome = values["Résultat"]
+        assert "PHASE2-TRIAL" in outcome or "Non exécuté" in outcome, (label, outcome)
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", values["Date"]), (label, values["Date"])
+    assert "tests/test_phase2_trials.py" in section
+
+    allowlisted = _allowlisted_tests(PHASE2_SPEC.read_text(encoding="utf-8"))
+    assert len(allowlisted) == 8, allowlisted
+    versioning = _section(readme, PHASE2_VERSIONING_TITLE)
+    missing = [test for test in allowlisted if f"`{test}`" not in versioning]
+    assert missing == [], f"allowlisted tests the versioning section does not name: {missing}"
+
+
+def test_ac41_the_readme_describes_no_lead_for_playback_or_capture() -> None:
+    """AC41 (phase 2 R10): the README's playback and capture subsections say
+    the stop and the kill happen at the call deadline, and none of ``lead``,
+    ``marge``, ``margin`` appears in them."""
+
+    versioning = _section(README.read_text(encoding="utf-8"), PHASE2_VERSIONING_TITLE)
+    for title in PHASE2_DEADLINE_SUBSECTIONS:
+        subsection = _subsection(versioning, title)
+        assert "**à** l'échéance de l'appel" in subsection, title
+        assert _lead_hits(subsection) == [], (title, _lead_hits(subsection))
+
+
+def test_the_phase_2_readme_checks_read_the_documents_shape() -> None:
+    """The parsers and the two word checks themselves, on samples."""
+
+    section = (
+        "## Essais\n\n| Fournisseur | A | B |\n| --- | --- | --- |\n"
+        "| One | x | y |\n| Two | | z |\n"
+    )
+    table = _table_cells(section)
+    assert table == {"One": ["x", "y"], "Two": ["", "z"], "": ["Fournisseur", "A", "B"]}
+    spec = "## Test failure allowlist\n\n- `tests/a.py::t[x]` — why\n- `tests/b.py::u` — why\n## Next\n- `tests/c.py::v`\n"
+    assert _allowlisted_tests(spec) == ["tests/a.py::t[x]", "tests/b.py::u"]
+    assert _lead_hits("stops at the deadline\nno Margin here\nune marge de 0,1 s\nthe lead") == [
+        "no Margin here",
+        "une marge de 0,1 s",
+        "the lead",
+    ]
+    assert _lead_hits("à l'échéance, rien n'en est soustrait") == []
+    assert SECRET_SETTING.search("password: hunter2")
+    assert SECRET_SETTING.search("api_key: sk-1")
+    for shape in ("password: ${OBS_PASSWORD}", "api_key: vide", "access_token: <jeton>"):
+        assert not SECRET_SETTING.search(shape), shape
 
 
 # --------------------------------------------------------------------------- #
