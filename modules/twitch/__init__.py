@@ -91,6 +91,13 @@ publishes nothing and activates exactly as before. The service issues one
 Helix request per call over the send session and credential, and leaves
 reconciliation to its consumer; it adds no action, and ``chat.write`` and the
 chat source are unchanged.
+
+**Clips and moderation** (R2, R5). On the same terms ``activate`` publishes a
+clip service under ``(clip, twitch)`` and a moderation service under
+``(moderation, twitch)``. Each call is one Helix request, never retried, over
+the same session and credential, classified into the shared taxonomy
+(:class:`ClipCreateResult`, :class:`ModerationResult`); a timeout without a
+positive duration is refused before any request, so nothing bans permanently.
 """
 
 from __future__ import annotations
@@ -137,6 +144,9 @@ EVENTSUB_SUBSCRIPTIONS_URL = (
 )
 HELIX_CHAT_URL = "https://api.twitch.tv/helix/chat/messages"
 HELIX_POLLS_URL = "https://api.twitch.tv/helix/polls"
+HELIX_CLIPS_URL = "https://api.twitch.tv/helix/clips"
+HELIX_MODERATION_CHAT_URL = "https://api.twitch.tv/helix/moderation/chat"
+HELIX_MODERATION_BANS_URL = "https://api.twitch.tv/helix/moderation/bans"
 TOKEN_VALIDATION_URL = "https://id.twitch.tv/oauth2/validate"
 
 # Module-level seams make the network client and retry clock replaceable without
@@ -236,6 +246,12 @@ POLL_SERVICE_KIND = "poll"
 The core defines no kind: the name is agreed between the publishing platform
 and the consuming module, the registry never interprets it.
 """
+
+CLIP_SERVICE_KIND = "clip"
+"""The service kind of the clip service (R2), published next to ``poll``."""
+
+MODERATION_SERVICE_KIND = "moderation"
+"""The service kind of the moderation service (R5), published next to ``poll``."""
 
 # EventSub badge set identifiers mapped to the trusted claim they attest. Only
 # a platform-attested badge becomes a claim; nothing in the message body can
@@ -670,6 +686,284 @@ def _epoch_seconds(stamp: Any) -> float | None:
     return parsed.timestamp()
 
 
+# --------------------------------------------------------------------------- #
+# The clip and moderation services (R2, R5)
+# --------------------------------------------------------------------------- #
+
+
+CLIP_ACCEPTED = "accepted"
+CLIP_OFFLINE = "offline"
+OUTCOME_REJECTED = "rejected"
+OUTCOME_RATE = "rate"
+OUTCOME_UNCERTAIN = "uncertain"
+MODERATION_OK = "ok"
+
+MODERATION_OPERATIONS = frozenset({"delete_message", "timeout"})
+"""What the ``moderation`` service offers on this platform (R5)."""
+
+_NOT_LIVE_MARKER = "not live"
+
+
+@dataclass(frozen=True, slots=True)
+class ClipCreateResult:
+    """A classified create answer: ``accepted`` (with ``clip_id`` and
+    ``edit_url``), ``offline``, ``rejected``, ``rate`` or ``uncertain`` (R2)."""
+
+    outcome: str
+    clip_id: str | None = None
+    edit_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModerationResult:
+    """A classified moderation answer: ``ok``, ``rejected``, ``rate`` or
+    ``uncertain`` (R5)."""
+
+    outcome: str
+
+
+class ClipLookupError(Exception):
+    """A lookup whose answer is not an answer: lost, a refusal or malformed.
+
+    The text never carries a body; ``status`` is the platform status when one
+    was read.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass(frozen=True, slots=True)
+class _Exchange:
+    """One Helix request's fate: ``status`` and ``body`` when an answer was
+    read, ``status`` ``None`` when the answer is lost (or never sent)."""
+
+    status: int | None
+    body: Any = None
+    sent: bool = True
+
+
+async def _helix_exchange(
+    module: "TwitchModule", label: str, send: Callable[[Any], Any]
+) -> _Exchange:
+    """Send one request over the module's session; never retried, never raised.
+
+    Diagnostics name the operation and the status only: neither the
+    credential (it lives in the headers) nor the answer body reaches them.
+    """
+
+    if module._closed:
+        module._diagnose(f"{label}: request not sent (closed)")
+        return _Exchange(None, sent=False)
+    try:
+        response = await _resolve(send(module._session))
+    except asyncio.CancelledError:
+        raise
+    except Exception as failure:
+        sent = not _never_sent(failure)
+        module._diagnose(f"{label}: " + ("request lost" if sent else "request not sent"))
+        return _Exchange(None, sent=sent)
+    try:
+        status, body = await _read_response(response)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        module._diagnose(f"{label}: answer lost")
+        return _Exchange(None)
+    if status is None:
+        module._diagnose(f"{label}: answer lost")
+    elif not 200 <= status < 300:
+        module._diagnose(f"{label}: refused (status {status})")
+    return _Exchange(status, body)
+
+
+def _refusal_class(status: int) -> str:
+    """The shared part of the taxonomy for a non-2xx status (R2, R5)."""
+
+    if status == 429:
+        return OUTCOME_RATE
+    if 400 <= status < 500:
+        return OUTCOME_REJECTED
+    return OUTCOME_UNCERTAIN
+
+
+def _says_not_live(body: Any) -> bool:
+    message = body.get("message") if isinstance(body, Mapping) else None
+    return isinstance(message, str) and _NOT_LIVE_MARKER in message.lower()
+
+
+class _TwitchClipService:
+    """The clip service this module publishes under ``(clip, twitch)`` (R2).
+
+    ``create`` is one POST to :data:`HELIX_CLIPS_URL`, never retried, and
+    returns a :class:`ClipCreateResult`: 202 (any 2xx carrying the clip) →
+    ``accepted``; 404 or an answer saying the channel is not live →
+    ``offline``; 400/401/403 (and any other 4xx) → ``rejected``; 429 →
+    ``rate``; a 5xx, a lost or unreadable answer, or a 2xx without the clip →
+    ``uncertain``. A request that provably never left (no connection, a closed
+    handle) is ``uncertain`` too: the taxonomy has no "not sent", and the
+    conservative reading never invites a second create. ``lookup`` is one GET
+    on the clip id: the clip's URL, ``None`` when the platform does not list
+    it yet, :class:`ClipLookupError` otherwise. The token needs the
+    ``clips:edit`` scope; a token without it is ``rejected`` at call time.
+    """
+
+    __slots__ = ("_module",)
+
+    def __init__(self, module: "TwitchModule") -> None:
+        self._module = module
+
+    async def create(self, channel_id: str) -> ClipCreateResult:
+        module = self._module
+        exchange = await _helix_exchange(
+            module,
+            "twitch clip create",
+            lambda session: session.post(
+                HELIX_CLIPS_URL,
+                headers=module._helix_headers(),
+                params={"broadcaster_id": channel_id},
+            ),
+        )
+        status = exchange.status
+        if status is None:
+            return ClipCreateResult(OUTCOME_UNCERTAIN)
+        if 200 <= status < 300:
+            data = exchange.body.get("data") if isinstance(exchange.body, Mapping) else None
+            entry = data[0] if isinstance(data, list) and data else None
+            clip_id = entry.get("id") if isinstance(entry, Mapping) else None
+            edit_url = entry.get("edit_url") if isinstance(entry, Mapping) else None
+            if not isinstance(clip_id, str) or not clip_id:
+                module._diagnose("twitch clip create: malformed response")
+                return ClipCreateResult(OUTCOME_UNCERTAIN)
+            return ClipCreateResult(
+                CLIP_ACCEPTED, clip_id, edit_url if isinstance(edit_url, str) else None
+            )
+        if status == 404 or _says_not_live(exchange.body):
+            return ClipCreateResult(CLIP_OFFLINE)
+        return ClipCreateResult(_refusal_class(status))
+
+    async def lookup(self, clip_id: str) -> str | None:
+        module = self._module
+        exchange = await _helix_exchange(
+            module,
+            "twitch clip lookup",
+            lambda session: session.get(
+                HELIX_CLIPS_URL,
+                headers=module._helix_headers(),
+                params={"id": clip_id},
+            ),
+        )
+        status = exchange.status
+        if status is None:
+            raise ClipLookupError("twitch clip lookup: answer lost")
+        if not 200 <= status < 300:
+            raise ClipLookupError(f"twitch clip lookup: refused (status {status})", status)
+        data = exchange.body.get("data") if isinstance(exchange.body, Mapping) else None
+        if not isinstance(data, list):
+            module._diagnose("twitch clip lookup: malformed response")
+            raise ClipLookupError("twitch clip lookup: malformed response", status)
+        for entry in data:
+            if isinstance(entry, Mapping) and entry.get("id") == clip_id:
+                url = entry.get("url")
+                if isinstance(url, str) and url:
+                    return url
+                module._diagnose("twitch clip lookup: malformed response")
+                raise ClipLookupError("twitch clip lookup: malformed response", status)
+        return None
+
+
+class _TwitchModerationService:
+    """The moderation service this module publishes under ``(moderation,
+    twitch)`` (R5).
+
+    ``operations`` is :data:`MODERATION_OPERATIONS`. ``apply`` sends one
+    request, never retried: ``delete_message`` is a DELETE on
+    :data:`HELIX_MODERATION_CHAT_URL` for the message id; ``timeout`` a POST to
+    :data:`HELIX_MODERATION_BANS_URL` carrying ``duration`` in seconds, as
+    given — the platform's unit is the second, so :meth:`round_duration`
+    changes nothing. A timeout without a positive whole ``duration_seconds``
+    is refused here with 0 requests, so the ban endpoint is never called
+    without a duration: nothing bans permanently. A missing message or target
+    and an operation outside ``operations`` are refused the same way. Any 2xx
+    is ``ok``; 429 ``rate``; another 4xx ``rejected``; a 5xx, a lost answer or
+    a request that never left ``uncertain``. The moderator is the configured
+    bot identity; the token needs ``moderator:manage:chat_messages`` and
+    ``moderator:manage:banned_users``, and a missing scope surfaces as
+    ``rejected``.
+    """
+
+    __slots__ = ("_module",)
+
+    operations = MODERATION_OPERATIONS
+
+    def __init__(self, module: "TwitchModule") -> None:
+        self._module = module
+
+    def round_duration(self, seconds: int) -> int:
+        return seconds
+
+    async def apply(
+        self,
+        operation: str,
+        *,
+        channel_id: str,
+        message_id: str | None = None,
+        target_author_id: str | None = None,
+        duration_seconds: int | None = None,
+        reason: str | None = None,
+    ) -> ModerationResult:
+        module = self._module
+        moderator = {"broadcaster_id": channel_id, "moderator_id": module._settings.bot_user_id}
+        if operation == "delete_message":
+            if not isinstance(message_id, str) or not message_id:
+                module._diagnose("twitch moderation delete_message: refused (no message)")
+                return ModerationResult(OUTCOME_REJECTED)
+            exchange = await _helix_exchange(
+                module,
+                "twitch moderation delete_message",
+                lambda session: session.delete(
+                    HELIX_MODERATION_CHAT_URL,
+                    headers=module._helix_headers(),
+                    params={**moderator, "message_id": message_id},
+                ),
+            )
+        elif operation == "timeout":
+            if (
+                isinstance(duration_seconds, bool)
+                or not isinstance(duration_seconds, int)
+                or duration_seconds <= 0
+            ):
+                # No duration would be a permanent ban on this endpoint (R5).
+                module._diagnose("twitch moderation timeout: refused (no duration)")
+                return ModerationResult(OUTCOME_REJECTED)
+            if not isinstance(target_author_id, str) or not target_author_id:
+                module._diagnose("twitch moderation timeout: refused (no target)")
+                return ModerationResult(OUTCOME_REJECTED)
+            ban: dict[str, Any] = {"user_id": target_author_id, "duration": duration_seconds}
+            if isinstance(reason, str) and reason:
+                ban["reason"] = reason
+            exchange = await _helix_exchange(
+                module,
+                "twitch moderation timeout",
+                lambda session: session.post(
+                    HELIX_MODERATION_BANS_URL,
+                    headers=module._helix_headers(),
+                    params=moderator,
+                    json={"data": ban},
+                ),
+            )
+        else:
+            module._diagnose("twitch moderation: refused (operation not offered)")
+            return ModerationResult(OUTCOME_REJECTED)
+        status = exchange.status
+        if status is None:
+            return ModerationResult(OUTCOME_UNCERTAIN)
+        if 200 <= status < 300:
+            return ModerationResult(MODERATION_OK)
+        return ModerationResult(_refusal_class(status))
+
+
 @dataclass(frozen=True, repr=False, slots=True)
 class _Settings:
     client_id: str
@@ -742,6 +1036,8 @@ class TwitchModule:
         self._retry_delay = retry_delay
         self._provider = _ChatWriteProvider(self)
         self._poll_service = _TwitchPollService(self)
+        self._clip_service = _TwitchClipService(self)
+        self._moderation_service = _TwitchModerationService(self)
         self._send_record = SendRecord()
         self._bound = False
         # Covers normalisation and the dedup decision only (R2): it is released
@@ -776,6 +1072,19 @@ class TwitchModule:
         """The poll service ``activate`` publishes under ``(poll, twitch)`` (R7)."""
 
         return self._poll_service
+
+    @property
+    def clip_service(self) -> _TwitchClipService:
+        """The clip service ``activate`` publishes under ``(clip, twitch)`` (R2)."""
+
+        return self._clip_service
+
+    @property
+    def moderation_service(self) -> _TwitchModerationService:
+        """The moderation service ``activate`` publishes under ``(moderation,
+        twitch)`` (R5)."""
+
+        return self._moderation_service
 
     @property
     def counts(self) -> Mapping[str, int]:
@@ -2061,11 +2370,14 @@ async def activate(
     # Published only on a bound registry: a context built without one hands
     # out a facade whose ``available`` is false, and activation on it stays
     # exactly what it was (R7). A duplicate key is not caught — it fails
-    # activation, the session released first (AC25).
+    # activation, the session released first (AC25). ``clip`` and
+    # ``moderation`` sit next to ``poll`` on the same terms (R2, R5).
     services = getattr(context, "services", None)
     if services is not None and getattr(services, "available", False) is True:
         try:
             services.publish(POLL_SERVICE_KIND, PLATFORM, module.poll_service)
+            services.publish(CLIP_SERVICE_KIND, PLATFORM, module.clip_service)
+            services.publish(MODERATION_SERVICE_KIND, PLATFORM, module.moderation_service)
         except BaseException:
             await _close_session(session)
             raise
@@ -2536,11 +2848,20 @@ def _default_reporter(message: str) -> None:
 __all__ = [
     "CHAT_WRITE_ACTION",
     "CHAT_WRITE_PROVIDER",
+    "CLIP_SERVICE_KIND",
+    "ClipCreateResult",
+    "ClipLookupError",
     "DEFAULT_MAX_PENDING_SENT_TRACES",
     "DEFAULT_SENT_TRACE_CLOSE_SECONDS",
+    "HELIX_CLIPS_URL",
+    "HELIX_MODERATION_BANS_URL",
+    "HELIX_MODERATION_CHAT_URL",
     "HELIX_POLLS_URL",
     "MANIFEST_PATH",
+    "MODERATION_OPERATIONS",
+    "MODERATION_SERVICE_KIND",
     "MODULE_NAME",
+    "ModerationResult",
     "PLATFORM",
     "POLL_SERVICE_KIND",
     "PollMalformedAnswer",

@@ -521,7 +521,11 @@ async def test_the_twitch_poll_service_creates_with_one_post_on_the_configured_c
     try:
         service = registry.resolve("poll", "twitch")
         assert service is handle.poll_service
-        assert dict(registry.entries()) == {("poll", "twitch"): "twitch"}
+        assert dict(registry.entries()) == {
+            ("poll", "twitch"): "twitch",
+            ("clip", "twitch"): "twitch",
+            ("moderation", "twitch"): "twitch",
+        }
 
         poll = await service.create("broadcaster-42", "Next game?", ["A", "B"], 60)
 
@@ -741,8 +745,17 @@ async def test_the_twitch_module_publishes_exactly_once_and_keeps_chat_write(
     _, handle = await activated_twitch(session, context=context.for_module("twitch"))
     try:
         await handle.prepare()
-        assert spy.calls == [("twitch", "poll", "twitch")]
-        assert dict(registry.entries()) == {("poll", "twitch"): "twitch"}
+        # P8 (R2, R5) publishes ``clip`` and ``moderation`` next to ``poll``.
+        assert spy.calls == [
+            ("twitch", "poll", "twitch"),
+            ("twitch", "clip", "twitch"),
+            ("twitch", "moderation", "twitch"),
+        ]
+        assert dict(registry.entries()) == {
+            ("poll", "twitch"): "twitch",
+            ("clip", "twitch"): "twitch",
+            ("moderation", "twitch"): "twitch",
+        }
         assert [binding.module for binding in context.actions.bindings("chat.write")] == [
             "twitch"
         ]

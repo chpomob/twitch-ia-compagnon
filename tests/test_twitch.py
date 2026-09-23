@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,14 +28,22 @@ from core.contracts import (
 )
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
-from core.runtime import ModuleContext, RuntimeContext
+from core.runtime import ModuleContext, RuntimeContext, ServiceRegistryError
 from core.triggers import TriggerContext, TriggerRegistry
 from conftest import (
     FakeResponse,
     ManualClock,
     RecordingScheduler,
     events_of,
+    helix_clip_created,
+    helix_clip_listed,
+    helix_clips_empty,
+    helix_message_deleted,
+    helix_not_live,
+    helix_refusal,
+    helix_timeout_applied,
     runtime_context as build_context,
+    trace_texts,
     wait_until,
 )
 from modules.twitch import (
@@ -43,12 +52,16 @@ from modules.twitch import (
     EVENTSUB_SUBSCRIPTIONS_URL,
     EVENTSUB_URL,
     HELIX_CHAT_URL,
+    HELIX_CLIPS_URL,
+    HELIX_MODERATION_BANS_URL,
+    HELIX_MODERATION_CHAT_URL,
     MANIFEST_PATH,
     NOTICE_KINDS,
     PLATFORM,
     TOKEN_VALIDATION_URL,
     TwitchModule,
     TwitchModuleError,
+    ClipLookupError,
     activate,
     validate_settings,
 )
@@ -2772,3 +2785,372 @@ def test_settings_hook_refuses_an_invalid_notices_setting(notices: Any, field: s
     assert f"field {field!r}" in diagnostic
     assert validate_settings({**SETTINGS, "notices": {"kinds": list(NOTICE_KINDS)}}) == []
     assert validate_settings({**SETTINGS, "notices": {}}) == []
+
+
+
+# --------------------------------------------------------------------------- #
+# The clip and moderation services (R2, R5; P8)
+# --------------------------------------------------------------------------- #
+
+
+BODY_SECRET = "platform-body-must-not-leak"
+
+
+class HelixServiceSession:
+    """The module's HTTP session scripted for the clip and moderation
+    endpoints: every request is recorded as ``(method, url, kwargs)`` and
+    answered by the next scripted :class:`FakeResponse` (or raised)."""
+
+    def __init__(self, *answers: Any) -> None:
+        self.answers = list(answers)
+        self.requests: list[dict[str, Any]] = []
+        self.close_calls = 0
+
+    def _answer(self, method: str, url: str, kwargs: dict[str, Any]) -> Any:
+        assert url in (HELIX_CLIPS_URL, HELIX_MODERATION_CHAT_URL, HELIX_MODERATION_BANS_URL), url
+        self.requests.append({"method": method, "url": url, **kwargs})
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        return self._answer("GET", url, kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        return self._answer("POST", url, kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> Any:
+        return self._answer("DELETE", url, kwargs)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def activate_services(
+    session: HelixServiceSession, context: ModuleContext | None = None
+) -> tuple[TwitchModule, ModuleContext, list[str]]:
+    scoped = context if context is not None else module_context()
+    diagnostics: list[str] = []
+    handle = await activate(
+        scoped,
+        {
+            **SETTINGS,
+            "_session_factory": lambda: session,
+            "_retry_delay": no_delay,
+            "diagnostic_reporter": diagnostics.append,
+        },
+        {},
+    )
+    return handle, scoped, diagnostics
+
+
+def assert_credential_free(bus: EventBus, diagnostics: list[str]) -> None:
+    """No configured credential nor platform body in any trace or diagnostic."""
+
+    texts = trace_texts(bus) + diagnostics
+    for value in (SETTINGS["access_token"], SETTINGS["client_secret"], BODY_SECRET):
+        assert sum(value in text for text in texts) == 0, value
+
+
+def lost_connection() -> Exception:
+    return ConnectionResetError("connection reset after the request left")
+
+
+@pytest.mark.asyncio
+async def test_activation_publishes_clip_and_moderation_next_to_poll() -> None:
+    """R2, R5, AC12 (twitch service): a context with a registry gets ``(clip,
+    twitch)`` and ``(moderation, twitch)``; activation sends nothing."""
+
+    runtime = runtime_context()
+    registry = runtime.services
+    session = HelixServiceSession()
+    handle, _, _ = await activate_services(session, runtime.for_module("twitch"))
+    try:
+        assert dict(registry.entries()) == {
+            ("poll", "twitch"): "twitch",
+            ("clip", "twitch"): "twitch",
+            ("moderation", "twitch"): "twitch",
+        }
+        assert registry.resolve("clip", "twitch") is handle.clip_service
+        moderation = registry.resolve("moderation", "twitch")
+        assert moderation is handle.moderation_service
+        assert moderation.operations == frozenset({"delete_message", "timeout"})
+        assert moderation.round_duration(61) == 61
+        assert session.requests == []
+    finally:
+        await handle.close()
+    assert session.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_activation_on_a_default_context_publishes_nothing_and_succeeds() -> None:
+    """R2, R5: a context without a registry activates exactly as before."""
+
+    runtime = dataclasses.replace(runtime_context(), services=None)
+    scoped = runtime.for_module("twitch")
+    assert scoped.services.available is False
+    session = HelixServiceSession()
+    handle, _, _ = await activate_services(session, scoped)
+    try:
+        assert isinstance(handle, TwitchModule)
+        assert session.requests == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_clip_publication_fails_activation_and_releases_the_session() -> None:
+    runtime = runtime_context()
+    holder = object()
+    runtime.services.publish("clip", "twitch", holder, module="rival")
+    session = HelixServiceSession()
+    with pytest.raises(ServiceRegistryError):
+        await activate_services(session, runtime.for_module("twitch"))
+    assert runtime.services.resolve("clip", "twitch") is holder
+    assert session.close_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        (helix_not_live(), "offline"),
+        (helix_not_live(status=400), "offline"),
+        (helix_refusal(404, BODY_SECRET), "offline"),
+        (helix_refusal(401, BODY_SECRET), "rejected"),
+        (helix_refusal(403, BODY_SECRET), "rejected"),
+        (helix_refusal(400, BODY_SECRET), "rejected"),
+        (helix_refusal(429, BODY_SECRET), "rate"),
+        (helix_refusal(500, BODY_SECRET), "uncertain"),
+        (helix_refusal(503, BODY_SECRET), "uncertain"),
+        (lost_connection(), "uncertain"),
+        (asyncio.TimeoutError(), "uncertain"),
+        (FakeResponse(202, ValueError(BODY_SECRET)), "uncertain"),
+        (FakeResponse(202, {"data": []}), "uncertain"),
+    ],
+    ids=[
+        "404-not-live", "400-not-live", "404", "401", "403", "400", "429", "500",
+        "503", "lost", "timeout", "unreadable-202", "empty-202",
+    ],
+)
+async def test_each_clip_create_answer_maps_to_its_outcome_with_one_request(
+    answer: Any, outcome: str
+) -> None:
+    """R2 (AC12 twitch service): one ``POST helix/clips``, never retried,
+    classified into the taxonomy; nothing of the credential or the body leaks."""
+
+    session = HelixServiceSession(answer)
+    handle, scoped, diagnostics = await activate_services(session)
+    try:
+        result = await handle.clip_service.create("broadcaster-42")
+
+        assert result.outcome == outcome
+        assert result.clip_id is None and result.edit_url is None
+        assert len(session.requests) == 1
+        request = session.requests[0]
+        assert (request["method"], request["url"]) == ("POST", HELIX_CLIPS_URL)
+        assert request["params"] == {"broadcaster_id": "broadcaster-42"}
+        assert_credential_free(scoped.bus, diagnostics)
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_clip_carries_its_id_and_edit_url_and_lookup_finds_it() -> None:
+    """R2: 202 → ``accepted(id, edit_url)``; ``lookup`` is one ``GET
+    helix/clips?id=`` each, ``None`` until the clip is listed."""
+
+    session = HelixServiceSession(
+        helix_clip_created("AwkwardClip", "https://clips.twitch.example/AwkwardClip/edit"),
+        helix_clips_empty(),
+        helix_clip_listed("AwkwardClip", "https://clips.twitch.example/AwkwardClip"),
+    )
+    handle, scoped, diagnostics = await activate_services(session)
+    try:
+        service = handle.clip_service
+        created = await service.create("broadcaster-42")
+        assert (created.outcome, created.clip_id, created.edit_url) == (
+            "accepted",
+            "AwkwardClip",
+            "https://clips.twitch.example/AwkwardClip/edit",
+        )
+        assert len(session.requests) == 1
+        assert session.requests[0]["headers"]["Authorization"] == (
+            f"Bearer {SETTINGS['access_token']}"
+        )
+        assert session.requests[0]["headers"]["Client-Id"] == SETTINGS["client_id"]
+
+        assert await service.lookup("AwkwardClip") is None
+        assert await service.lookup("AwkwardClip") == "https://clips.twitch.example/AwkwardClip"
+        lookups = session.requests[1:]
+        assert [(r["method"], r["url"], r["params"]) for r in lookups] == [
+            ("GET", HELIX_CLIPS_URL, {"id": "AwkwardClip"}),
+        ] * 2
+        assert_credential_free(scoped.bus, diagnostics)
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [helix_refusal(500, BODY_SECRET), helix_refusal(401, BODY_SECRET), lost_connection()],
+    ids=["500", "401", "lost"],
+)
+async def test_a_failed_lookup_raises_once_without_the_body(answer: Any) -> None:
+    session = HelixServiceSession(answer)
+    handle, scoped, diagnostics = await activate_services(session)
+    try:
+        with pytest.raises(ClipLookupError) as failed:
+            await handle.clip_service.lookup("AwkwardClip")
+        assert BODY_SECRET not in str(failed.value)
+        assert len(session.requests) == 1
+        assert_credential_free(scoped.bus, diagnostics)
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        (helix_message_deleted(), "ok"),
+        (helix_refusal(400, BODY_SECRET), "rejected"),
+        (helix_refusal(401, BODY_SECRET), "rejected"),
+        (helix_refusal(403, BODY_SECRET), "rejected"),
+        (helix_refusal(404, BODY_SECRET), "rejected"),
+        (helix_refusal(429, BODY_SECRET), "rate"),
+        (helix_refusal(500, BODY_SECRET), "uncertain"),
+        (lost_connection(), "uncertain"),
+    ],
+    ids=["204", "400", "401", "403", "404", "429", "500", "lost"],
+)
+async def test_each_delete_answer_maps_to_its_outcome_with_one_request(
+    answer: Any, outcome: str
+) -> None:
+    """R5, AC28 (platform half): one ``DELETE helix/moderation/chat`` for the
+    message, moderated by the configured bot identity, never retried."""
+
+    session = HelixServiceSession(answer)
+    handle, scoped, diagnostics = await activate_services(session)
+    try:
+        result = await handle.moderation_service.apply(
+            "delete_message",
+            channel_id="broadcaster-42",
+            message_id="msg-9",
+            target_author_id="viewer-7",
+        )
+
+        assert result.outcome == outcome
+        assert len(session.requests) == 1
+        request = session.requests[0]
+        assert (request["method"], request["url"]) == ("DELETE", HELIX_MODERATION_CHAT_URL)
+        assert request["params"] == {
+            "broadcaster_id": "broadcaster-42",
+            "moderator_id": SETTINGS["bot_user_id"],
+            "message_id": "msg-9",
+        }
+        assert request["headers"]["Authorization"] == f"Bearer {SETTINGS['access_token']}"
+        assert_credential_free(scoped.bus, diagnostics)
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        (helix_timeout_applied("viewer-7", 61), "ok"),
+        (helix_refusal(400, BODY_SECRET), "rejected"),
+        (helix_refusal(403, BODY_SECRET), "rejected"),
+        (helix_refusal(429, BODY_SECRET), "rate"),
+        (helix_refusal(502, BODY_SECRET), "uncertain"),
+        (lost_connection(), "uncertain"),
+    ],
+    ids=["200", "400", "403", "429", "502", "lost"],
+)
+async def test_each_timeout_answer_maps_to_its_outcome_with_one_request(
+    answer: Any, outcome: str
+) -> None:
+    """R5, AC28 (platform half): one ``POST helix/moderation/bans`` carrying
+    the duration in seconds, unrounded."""
+
+    session = HelixServiceSession(answer)
+    handle, scoped, diagnostics = await activate_services(session)
+    try:
+        result = await handle.moderation_service.apply(
+            "timeout",
+            channel_id="broadcaster-42",
+            message_id="msg-9",
+            target_author_id="viewer-7",
+            duration_seconds=61,
+            reason="spam",
+        )
+
+        assert result.outcome == outcome
+        assert len(session.requests) == 1
+        request = session.requests[0]
+        assert (request["method"], request["url"]) == ("POST", HELIX_MODERATION_BANS_URL)
+        assert request["params"] == {
+            "broadcaster_id": "broadcaster-42",
+            "moderator_id": SETTINGS["bot_user_id"],
+        }
+        assert request["json"] == {
+            "data": {"user_id": "viewer-7", "duration": 61, "reason": "spam"}
+        }
+        assert_credential_free(scoped.bus, diagnostics)
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("timeout", {"target_author_id": "viewer-7"}),
+        ("timeout", {"target_author_id": "viewer-7", "duration_seconds": None}),
+        ("timeout", {"target_author_id": "viewer-7", "duration_seconds": 0}),
+        ("timeout", {"target_author_id": "viewer-7", "duration_seconds": -5}),
+        ("timeout", {"target_author_id": "viewer-7", "duration_seconds": 1.5}),
+        ("timeout", {"target_author_id": "viewer-7", "duration_seconds": True}),
+        ("timeout", {"duration_seconds": 60}),
+        ("delete_message", {}),
+        ("ban", {"target_author_id": "viewer-7"}),
+    ],
+    ids=[
+        "no-duration", "none-duration", "zero-duration", "negative-duration",
+        "fractional-duration", "bool-duration", "no-target", "no-message", "ban",
+    ],
+)
+async def test_a_request_without_its_arguments_is_refused_with_zero_requests(
+    operation: str, arguments: dict[str, Any]
+) -> None:
+    """R5: a timeout without a positive whole duration never reaches the ban
+    endpoint (no permanent ban); nothing incomplete is sent."""
+
+    session = HelixServiceSession()
+    handle, scoped, diagnostics = await activate_services(session)
+    try:
+        result = await handle.moderation_service.apply(
+            operation, channel_id="broadcaster-42", **arguments
+        )
+        assert result.outcome == "rejected"
+        assert session.requests == []
+        assert_credential_free(scoped.bus, diagnostics)
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_closed_handle_sends_no_clip_or_moderation_request() -> None:
+    session = HelixServiceSession()
+    handle, _, _ = await activate_services(session)
+    await handle.close()
+
+    assert (await handle.clip_service.create("broadcaster-42")).outcome == "uncertain"
+    moderation = await handle.moderation_service.apply(
+        "delete_message", channel_id="broadcaster-42", message_id="msg-9"
+    )
+    assert moderation.outcome == "uncertain"
+    assert session.requests == []

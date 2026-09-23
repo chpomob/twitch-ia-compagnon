@@ -28,7 +28,11 @@ by default so a publishing module is exercised on the harness (R7). Phase 3
 adds the platform ``clip`` and ``moderation`` services
 (:class:`ScriptedClipService`, :class:`ScriptedModerationService`), handed
 to the fixture platform through its ``clip_service``/``moderation_service``
-seams, and a viewer-memory directory (:func:`memory_directory`). A suite that mocked the
+seams, the Helix answers of the twitch clip and moderation endpoints
+(:func:`helix_clip_created`, :func:`helix_clip_listed`,
+:func:`helix_clips_empty`, :func:`helix_refusal`, :func:`helix_not_live`,
+:func:`helix_message_deleted`, :func:`helix_timeout_applied`), and a
+viewer-memory directory (:func:`memory_directory`). A suite that mocked the
 executor would hide AC19's executor-confirmed delivery, so the executor is
 never mocked here.
 
@@ -1805,6 +1809,94 @@ class ScriptedModerationService:
         if outcome not in _MODERATION_CLASSES:
             raise AssertionError(f"ScriptedModerationService: unknown outcome {outcome!r}")
         return ModerationResult(_MODERATION_CLASSES[outcome], outcome)
+
+
+# --------------------------------------------------------------------------- #
+# Helix answers for the twitch clip and moderation endpoints (phase 3: R2, R5)
+# --------------------------------------------------------------------------- #
+#
+# :class:`FakeResponse` bodies shaped like the platform's answers, for a suite
+# scripting the twitch module's HTTP session. A refusal carries its ``message``
+# in the body only — a module must never echo it.
+
+
+def helix_clip_created(
+    clip_id: str = "clip-1", edit_url: str | None = None, *, status: int = 202
+) -> FakeResponse:
+    """``POST helix/clips`` accepted: the new clip's id and edit URL."""
+
+    return FakeResponse(
+        status,
+        {
+            "data": [
+                {
+                    "id": clip_id,
+                    "edit_url": edit_url or f"https://clips.twitch.example/{clip_id}/edit",
+                }
+            ]
+        },
+    )
+
+
+def helix_clip_listed(clip_id: str = "clip-1", url: str | None = None) -> FakeResponse:
+    """``GET helix/clips?id=`` finding the clip."""
+
+    return FakeResponse(
+        200,
+        {
+            "data": [
+                {
+                    "id": clip_id,
+                    "url": url or f"https://clips.twitch.example/{clip_id}",
+                    "created_at": "2026-09-23T12:00:00Z",
+                }
+            ],
+            "pagination": {},
+        },
+    )
+
+
+def helix_clips_empty() -> FakeResponse:
+    """``GET helix/clips?id=`` before the clip is listed."""
+
+    return FakeResponse(200, {"data": [], "pagination": {}})
+
+
+def helix_refusal(status: int, message: str = "refused") -> FakeResponse:
+    """A Helix error answer: ``{error, status, message}``."""
+
+    return FakeResponse(status, {"error": "Error", "status": status, "message": message})
+
+
+def helix_not_live(status: int = 404) -> FakeResponse:
+    """The platform's refusal to clip a channel that is not live."""
+
+    return helix_refusal(status, "Clipping is not possible for an offline channel: not live")
+
+
+def helix_message_deleted() -> FakeResponse:
+    """``DELETE helix/moderation/chat`` done: 204, no body."""
+
+    return FakeResponse(204, ValueError("no content"))
+
+
+def helix_timeout_applied(user_id: str = "viewer-7", duration: int = 60) -> FakeResponse:
+    """``POST helix/moderation/bans`` with a duration done: the timeout's end."""
+
+    return FakeResponse(
+        200,
+        {
+            "data": [
+                {
+                    "broadcaster_id": "broadcaster-42",
+                    "moderator_id": "bot-24",
+                    "user_id": user_id,
+                    "created_at": "2026-09-23T12:00:00Z",
+                    "end_time": f"2026-09-23T12:{duration // 60:02d}:{duration % 60:02d}Z",
+                }
+            ]
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
