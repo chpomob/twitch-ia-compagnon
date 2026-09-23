@@ -16,7 +16,8 @@ fixture asserts, for every harness a case built, that the number of
 expiries the case drove.
 
 The Kick-named case of AC27 (``delete_message`` on kick →
-``platform_unsupported``) runs with the kick module (plan step P19).
+``platform_unsupported``) runs with the kick module's own service (plan step
+P19), which offers ``timeout`` only.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ import pytest
 import yaml
 
 from conftest import (
+    KICK_TEST_KEY,
+    FakeResponse,
     ManualClock,
     ScriptedModel,
     ScriptedModerationService,
@@ -66,6 +69,7 @@ from modules.moderation import (
     activate as activate_moderation,
     validate_settings,
 )
+from modules.kick import MODERATION_BANS_URL as KICK_BANS_URL, activate as activate_kick
 from modules.twitch import HELIX_MODERATION_CHAT_URL, activate as activate_twitch
 from test_brain import VALID_SETTINGS, copy_settings
 
@@ -1209,6 +1213,94 @@ async def test_ac28_the_twitch_service_deletes_once_and_is_applied() -> None:
     finally:
         await handle.close()
         await twitch.close()
+
+
+KICK_CHANNEL = "4242"
+KICK_SETTINGS = {
+    "client_secret": "never-show-kick-secret",
+    "access_token": "never-show-kick-token",
+    "listener": {"host": "127.0.0.1", "port": 0},
+    "public_key": KICK_TEST_KEY.public_pem,
+    "channels": [KICK_CHANNEL],
+    "companion_name": "Companion",
+}
+
+
+class KickBansSession:
+    """The kick module's HTTP session, scripted for the bans endpoint."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        assert url == KICK_BANS_URL, url
+        self.requests.append(kwargs)
+        return FakeResponse(200, {"data": {}, "message": "OK"})
+
+    async def close(self) -> None:
+        return None
+
+
+async def kick_harness(**settings: Any) -> tuple[ModerationHarness, Any, KickBansSession]:
+    """The moderation module beside the kick module's own service."""
+
+    clock = ManualClock(START)
+    chat = ChatContext(max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=clock)
+    runtime = runtime_context(clock=clock, chat=chat)
+    session = KickBansSession()
+    kick = await activate_kick(
+        runtime.for_module("kick"),
+        {**KICK_SETTINGS, "_session_factory": lambda: session, "_wall_clock": clock},
+        {},
+    )
+    handle = await activate_moderation(
+        runtime.for_module("moderation"), {"_sleeper": clock.sleep, **settings}, {}
+    )
+    await handle.prepare()
+    runtime.actions._authorization.grant(moderation_rule())
+    harness = ModerationHarness(runtime, handle, kick.moderation_service, clock, "kick", None)
+    _HARNESSES.append(harness)
+    return harness, kick, session
+
+
+@pytest.mark.asyncio
+async def test_ac27_delete_message_on_kick_is_platform_unsupported_with_no_request() -> None:
+    """AC27 (the Kick case): in mode ``act``, the kick service offers
+    ``timeout`` only, so a ``delete_message`` on kick is ``refused
+    platform_unsupported`` with 0 platform requests."""
+
+    h, kick, session = await kick_harness(**ACT_BOTH)
+    try:
+        assert h.handle.bound_platforms == ("kick",)
+        await h.say("k-1", "viewer-7", channel=KICK_CHANNEL)
+        assert_refused(await h.request("k-1", channel=KICK_CHANNEL), "platform_unsupported")
+        assert session.requests == []
+        (fact,) = h.facts()
+        assert fact["platform"] == "kick"
+    finally:
+        await h.close()
+        await kick.close()
+
+
+@pytest.mark.asyncio
+async def test_a_90_second_kick_timeout_is_applied_as_2_minutes() -> None:
+    """AC35 through the moderation module: the kick service rounds 90 s up to
+    120 s for the bound check and sends ``duration: 2`` (minutes), once."""
+
+    h, kick, session = await kick_harness(**ACT_BOTH)
+    try:
+        await h.say("k-1", "viewer-7", channel=KICK_CHANNEL)
+        observation = await h.request(
+            "k-1", channel=KICK_CHANNEL, operation="timeout", duration=90
+        )
+        assert observation.status == "success", observation
+        assert observation.result["disposition"] == "applied"
+        (sent,) = session.requests
+        assert sent["json"]["duration"] == 2
+        assert sent["json"]["user_id"] == "viewer-7"
+    finally:
+        await h.close()
+        await kick.close()
 
 
 # --------------------------------------------------------------------------- #

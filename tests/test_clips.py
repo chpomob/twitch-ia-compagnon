@@ -8,7 +8,9 @@ the scripted :class:`~conftest.ScriptedClipService` published by the fixture
 platform (``fake``), or the twitch module's own service over a scripted HTTP
 session (AC12). No positive-duration sleep.
 
-The Kick-named half of AC12 runs with the kick module (plan step P19).
+The Kick-named half of AC12 runs with the kick module (plan step P19): kick
+publishes a moderation service and no clip service, so ``stream.clip.create``
+is unbound for it with ``platform_unsupported``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import pytest
 import yaml
 
 from conftest import (
+    KICK_TEST_KEY,
     ManualClock,
     ScriptedClipService,
     events_of,
@@ -49,6 +52,7 @@ from modules.clips import (
     activate as activate_clips,
     validate_settings,
 )
+from modules.kick import activate as activate_kick
 from modules.twitch import HELIX_CLIPS_URL, activate as activate_twitch
 
 
@@ -68,6 +72,35 @@ TWITCH_SETTINGS = {
     "companion_name": "Companion",
 }
 TWITCH_CREDENTIALS = ("never-show-client-secret", "never-show-access-token")
+
+KICK_CHANNEL = "4242"
+KICK_SETTINGS = {
+    "client_secret": "never-show-kick-secret",
+    "access_token": "never-show-kick-token",
+    "listener": {"host": "127.0.0.1", "port": 0},
+    "public_key": KICK_TEST_KEY.public_pem,
+    "channels": [KICK_CHANNEL],
+    "companion_name": "Companion",
+}
+KICK_CREDENTIALS = ("never-show-kick-secret", "never-show-kick-token")
+
+
+class NoRequestSession:
+    """The kick module's HTTP session: any request is a test failure."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        self.requests += 1
+        raise AssertionError(f"unexpected GET {url}")
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.requests += 1
+        raise AssertionError(f"unexpected POST {url}")
+
+    async def close(self) -> None:
+        return None
 
 
 @pytest.fixture(autouse=True)
@@ -789,6 +822,164 @@ async def test_prepare_under_required_raises_before_anything_is_bound() -> None:
     assert "clips" in str(failed.value) and REASON_PLATFORM_UNSUPPORTED in str(failed.value)
     assert runtime.actions.bindings(CLIP_ACTION) == ()
     await handle.close()
+
+
+# -- AC12, the kick half (plan step P19) ------------------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_ac12_with_twitch_and_kick_clips_are_ready_for_twitch_and_unsupported_on_kick() -> None:
+    """AC12: with twitch and kick enabled, ``stream.clip.create`` is ready for
+    ``twitch/*/clip`` and unbound for kick with ``platform_unsupported`` —
+    kick publishes its moderation service and no clip service; a successful
+    twitch call's ``action.completed`` carries the ``clip_id`` and 0
+    credential values; a call on kick has no provider and makes 0
+    requests."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    twitch_session = HelixClipSession(
+        helix_clip_created("KickFreeClip", "https://clips.twitch.example/KickFreeClip/edit"),
+        helix_clip_listed("KickFreeClip", "https://clips.twitch.example/KickFreeClip"),
+    )
+    kick_session = NoRequestSession()
+    diagnostics: list[str] = []
+    twitch = await activate_twitch(
+        runtime.for_module("twitch"),
+        {
+            **TWITCH_SETTINGS,
+            "_session_factory": lambda: twitch_session,
+            "_retry_delay": _no_delay,
+            "diagnostic_reporter": diagnostics.append,
+        },
+        {},
+    )
+    kick = await activate_kick(
+        runtime.for_module("kick"),
+        {
+            **KICK_SETTINGS,
+            "_session_factory": lambda: kick_session,
+            "_wall_clock": clock,
+            "diagnostic_reporter": diagnostics.append,
+        },
+        {},
+    )
+    handle = await activate_clips(runtime.for_module("clips"), {"_sleeper": clock.sleep}, {})
+    try:
+        assert ("moderation", "kick") in runtime.services.entries()
+        assert ("clip", "kick") not in runtime.services.entries()
+        await handle.prepare()
+        assert handle.bound_platforms == ("twitch",)
+        assert handle.unbound == {"kick": REASON_PLATFORM_UNSUPPORTED}
+        [binding] = runtime.actions.bindings(CLIP_ACTION)
+        assert binding.destination == Destination("twitch", "*", "clip")
+        assert CLIP_ACTION in runtime.actions.registered_ready()
+        [degraded] = [event["payload"] for event in events_of(runtime.bus, "module.degraded")]
+        assert degraded["reason"] == REASON_PLATFORM_UNSUPPORTED
+        assert degraded["platforms"] == ["kick"]
+
+        grant_clips(runtime)
+        h = ClipHarness(runtime, handle, None, clock)
+        observation = await h.create(destination=Destination("twitch", "broadcaster-42", "clip"))
+        assert observation.status == "success", observation
+        completed = [
+            payload for payload in h.completed() if payload["destination"].startswith("twitch/")
+        ]
+        assert completed[0]["clip_id"] == "KickFreeClip"
+
+        refused = await h.create(destination=Destination("kick", KICK_CHANNEL, "clip"))
+        assert refused.status == "error" and refused.error["code"] == "no_provider"
+        assert kick_session.requests == 0
+        assert len(twitch_session.requests) == 2
+
+        texts = trace_texts(runtime.bus) + diagnostics
+        for secret in TWITCH_CREDENTIALS + KICK_CREDENTIALS:
+            assert sum(secret in text for text in texts) == 0, secret
+    finally:
+        await handle.close()
+        await kick.close()
+        await twitch.close()
+
+
+async def loaded_with_kick(
+    tmp_path: Path, clock: ManualClock, *, clips: dict[str, Any]
+) -> tuple[RuntimeContext, list[Any], NoRequestSession]:
+    """``kick`` and ``clips`` activated through the real loader."""
+
+    root = tmp_path / "modules"
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    for name in ("clips", "kick"):
+        shutil.copytree(REPOSITORY / "modules" / name, root / name, ignore=ignore)
+    runtime = runtime_context(
+        clock=clock, trigger_registry=TriggerRegistry(companion_name="Companion")
+    )
+    session = NoRequestSession()
+    loader = ModuleLoader(runtime.bus, root, context=runtime, environ={})
+    modules = {
+        "kick": {**KICK_SETTINGS, "_session_factory": lambda: session, "_wall_clock": clock},
+        "clips": {"_sleeper": clock.sleep, **clips},
+    }
+    activations = await loader.activate_enabled(
+        {"enabled_modules": ["kick", "clips"], "modules": modules}
+    )
+    return runtime, activations, session
+
+
+@pytest.mark.asyncio
+async def test_ac12_with_only_kick_required_true_fails_naming_clips_and_the_reason(
+    tmp_path: Path,
+) -> None:
+    """AC12: with only kick enabled, ``required: true`` makes startup fail
+    with a diagnostic naming ``clips`` (the coordinator's failure) and
+    ``platform_unsupported`` (the module's health trace, for kick)."""
+
+    clock = ManualClock(START)
+    runtime, activations, session = await loaded_with_kick(
+        tmp_path, clock, clips={"required": True}
+    )
+    report = await coordinator_for(runtime, activations, clock).start()
+    assert report.status != 0
+    assert any("'clips'" in failure for failure in report.failures), report.failures
+    reasons = [
+        event["payload"]
+        for event in events_of(runtime.bus, "module.degraded")
+        if event["payload"].get("module") == "clips"
+    ]
+    assert reasons[0]["reason"] == REASON_PLATFORM_UNSUPPORTED
+    assert reasons[0]["platforms"] == ["kick"]
+    assert CLIP_ACTION not in runtime.actions.registered_ready()
+    assert session.requests == 0
+
+
+@pytest.mark.asyncio
+async def test_ac12_with_only_kick_required_unset_starts_with_the_action_unbound(
+    tmp_path: Path,
+) -> None:
+    """AC12: with only kick enabled and ``required`` unset, startup completes
+    with ``stream.clip.create`` declared and unbound on kick
+    (``platform_unsupported``); a call is refused with 0 requests."""
+
+    clock = ManualClock(START)
+    runtime, activations, session = await loaded_with_kick(tmp_path, clock, clips={})
+    coordinator = coordinator_for(runtime, activations, clock)
+    report = await coordinator.start()
+    try:
+        assert report.status == 0, report
+        handle = activations[1].handle
+        assert handle.bound_platforms == ()
+        assert handle.unbound == {"kick": REASON_PLATFORM_UNSUPPORTED}
+        assert CLIP_ACTION in runtime.actions.discovered()
+        assert CLIP_ACTION not in runtime.actions.registered_ready()
+        assert runtime.actions.bindings(CLIP_ACTION) == ()
+        grant_clips(runtime)
+        observation = await ClipHarness(runtime, handle, None, clock).create(
+            destination=Destination("kick", KICK_CHANNEL, "clip")
+        )
+        assert observation.status == "refused"
+        assert observation.error["code"] == "provider_not_ready"
+        assert session.requests == 0
+    finally:
+        await coordinator.stop()
 
 
 # -- Settings and manifest --------------------------------------------------- #

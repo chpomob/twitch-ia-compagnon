@@ -640,13 +640,38 @@ class ActionRegistry:
     # -- declaration ------------------------------------------------------- #
 
     def declare(self, spec: ActionSpec, *, module: str) -> None:
-        """Record *spec* as discovered, as a manifest declares it."""
+        """Record *spec* as discovered, as a manifest declares it.
+
+        A second module may declare an action already declared when the two
+        specifications differ in ``supported_destinations`` alone — the same
+        contract served on another platform, as ``chat.write`` is by each chat
+        platform. The recorded specification then supports the union of both,
+        the first declarer stays its owner, and each provider still binds only
+        the destinations it names. Any other difference is refused.
+        """
 
         if not isinstance(spec, ActionSpec):
             raise ContractError("ActionRegistry.declare", "expects an ActionSpec")
         _require_text(module, "ActionRegistry.declare.module")
         existing = self._specs.get(spec.name)
         if existing is not None and existing != spec:
+            if existing == replace(
+                spec, supported_destinations=existing.supported_destinations
+            ):
+                added = tuple(
+                    destination
+                    for destination in spec.supported_destinations
+                    if destination not in existing.supported_destinations
+                )
+                if added:
+                    self._specs[spec.name] = replace(
+                        existing,
+                        supported_destinations=(
+                            *existing.supported_destinations,
+                            *added,
+                        ),
+                    )
+                return
             raise ActionDeclarationError(
                 f"Action {spec.name!r} is already declared by module "
                 f"{self._modules[spec.name]!r} with a different specification; "
@@ -760,7 +785,11 @@ class ActionRegistry:
                 spec.name,
                 provider,
                 module=module,
-                destinations=destinations,
+                # Default to this declaration's own scopes, never to a union
+                # another module's declaration of the same action widened.
+                destinations=(
+                    spec.supported_destinations if destinations is None else destinations
+                ),
                 provider_name=provider_name,
             )
         except BaseException:

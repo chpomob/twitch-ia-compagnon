@@ -4,11 +4,19 @@ AC34: a delivery signed with the test key and a timestamp within 300 s is
 published once as a ``kick`` chat event and admitted per policy; a bad
 signature, a 301 s-old timestamp, a 65537-byte body and a duplicate message
 id are each refused, counted and yield 0 events; the listener runs on the
-configured host and port. AC35 (this step's part): the badges
+configured host and port. AC35 (plan step P18's part): the badges
 ``broadcaster``, ``moderator``, ``vip`` and ``subscriber`` satisfy the
 matching ``audience`` rules, and follows, subscriptions, renewals and gifts
 map to ``follow``, ``sub``, ``resub`` and ``sub_gift``. AC32 (kick half): an
 author identifier containing ``:`` yields 0 admissions and ``invalid`` + 1.
+
+AC35, the rest (plan step P19): ``chat.write`` of 500 characters sends 1
+request, 501 is ``error text_too_long`` with 0; a 429 announcing 30 s is
+``error rate_limited`` and a send 29 s later ``refused rate_limited`` with 0
+requests; the moderation service sends a 90 s timeout as 2 minutes and
+refuses 10081 minutes with 0 requests. AC39 (kick half): ``chat.write`` is
+bound on ``kick/*/chat`` only, beside twitch's binding, and no clip or poll
+service is published for kick.
 
 Every delivery is signed by :class:`conftest.SignedWebhookSender` with the
 test-only :data:`conftest.KICK_TEST_KEY` and posted through an in-process
@@ -37,21 +45,33 @@ from conftest import (
     SignedWebhookSender,
     events_of,
     runtime_context,
+    settle,
+    trace_texts,
 )
 import modules.kick as kick_module
+from core.actions import AuthorizationRule
 from core.context import ChatContext
-from core.contracts import TriggerPolicy, TriggerRule
+from core.contracts import ActionCall, ActionObservation, Destination, TriggerPolicy, TriggerRule
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext
 from core.triggers import TriggerRegistry
 from modules.kick import (
+    CHAT_URL,
+    CHAT_WRITE_ACTION,
+    DEFAULT_RATE_LIMIT_SECONDS,
     MAX_BODY_BYTES,
+    MAX_RATE_LIMIT_SECONDS,
+    MODERATION_BANS_URL,
     PUBLIC_KEY_URL,
+    RETRY_SOURCE_DEFAULT,
+    RETRY_SOURCE_RESET,
+    RETRY_SOURCE_RETRY_AFTER,
     KickModule,
     KickModuleError,
     activate,
     normalize_delivery,
     parse_public_key,
+    rate_limit_until,
     signed_content,
     validate_settings,
     verify_signature,
@@ -124,16 +144,26 @@ def event_kind_policy(*kinds: str) -> TriggerPolicy:
 
 
 class PublicKeySession:
-    """The injected transport: answers the public-key endpoint, counts calls."""
+    """The injected transport: answers the public-key endpoint and, in order,
+    the POSTs to the chat and bans endpoints; records every call."""
 
-    def __init__(self, *answers: Any) -> None:
+    def __init__(self, *answers: Any, posts: tuple[Any, ...] = ()) -> None:
         self.answers = list(answers)
+        self.post_answers = list(posts)
         self.get_calls: list[str] = []
+        self.posts: list[dict[str, Any]] = []
         self.close_calls = 0
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         self.get_calls.append(url)
         answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.posts.append({"url": url, **kwargs})
+        answer = self.post_answers.pop(0)
         if isinstance(answer, BaseException):
             raise answer
         return answer
@@ -231,7 +261,20 @@ def test_manifest_declares_a_v2_input_with_the_chat_trigger_types() -> None:
     assert manifest["lifecycle"] == {"roles": ["input"]}
     assert manifest["settings_validator"] == "validate_settings"
     assert manifest["credentials"] == ["client_secret", "access_token"]
-    assert "actions" not in manifest
+    # R7 (plan step P19) supersedes P18's "no action": the manifest now
+    # declares exactly `chat.write`, the same contract as twitch's but for
+    # `kick/*/chat`, with the same delivery text mapping.
+    [action] = manifest["actions"]
+    twitch = yaml.safe_load((ROOT / "modules" / "twitch" / "module.yaml").read_text("utf-8"))
+    [twitch_action] = twitch["actions"]
+    assert action["name"] == CHAT_WRITE_ACTION
+    assert action["supported_destinations"] == [
+        {"platform": "kick", "channel_id": "*", "scope": "chat"}
+    ]
+    assert action["delivery"] == {"text_argument": "text"}
+    assert {k: v for k, v in action.items() if k != "supported_destinations"} == {
+        k: v for k, v in twitch_action.items() if k != "supported_destinations"
+    }
     properties = manifest["settings_schema"]["properties"]
     assert {
         "listener", "public_key", "channels", "companion_name", "notices", "dedup",
@@ -738,3 +781,447 @@ async def test_the_dedup_window_is_bounded_by_its_settings() -> None:
         assert harness.module.dedup_size == 1
     finally:
         await harness.close()
+
+
+# -- AC35 (rest): chat.write, the rate limit and the moderation service ----- #
+
+
+class AnswerResponse(FakeResponse):
+    """A scripted API answer with headers."""
+
+    def __init__(self, status: int, body: Any = None, headers: dict[str, str] | None = None) -> None:
+        super().__init__(status, body if body is not None else {})
+        self.headers = headers or {}
+
+
+def sent(message_id: str = "kick-msg-1") -> AnswerResponse:
+    return AnswerResponse(200, {"data": {"is_sent": True, "message_id": message_id}, "message": "OK"})
+
+
+def grant_chat_write(runtime: RuntimeContext) -> None:
+    runtime.actions._authorization.grant(
+        AuthorizationRule(
+            rule_id="grant-chat-write",
+            action_name=CHAT_WRITE_ACTION,
+            granted_permissions=("chat.write",),
+        )
+    )
+
+
+_CALLS = iter(range(1, 1_000_000))
+
+
+async def write(h: Harness, text: str, *, channel: str = CHANNEL, **arguments: Any) -> ActionObservation:
+    number = next(_CALLS)
+    call = ActionCall(
+        action_name=CHAT_WRITE_ACTION,
+        action_version=1,
+        arguments={"text": text, **arguments},
+        conversation_id="conversation-1",
+        run_id=f"run-{number}",
+        call_id=f"call-{number}",
+        source_event_id="source-1",
+        destination=Destination("kick", channel, "chat"),
+        principal="brain",
+        deadline=h.clock.now + 100.0,
+    )
+    return await h.runtime.executor.invoke(call)
+
+
+def chat_posts(session: PublicKeySession) -> list[dict[str, Any]]:
+    return [post for post in session.posts if post["url"] == CHAT_URL]
+
+
+def completed_traces(h: Harness) -> list[dict[str, Any]]:
+    return [event["payload"] for event in events_of(h.runtime.bus, "action.completed")]
+
+
+@pytest.mark.asyncio
+async def test_chat_write_is_bound_on_kick_chat_and_ready_after_prepare() -> None:
+    """R7: ``prepare`` binds the declared ``chat.write`` over
+    ``kick/*/chat`` (one binding) and marks the module ready."""
+
+    h = await start_harness()
+    try:
+        [binding] = h.runtime.actions.bindings(CHAT_WRITE_ACTION)
+        assert binding.destination == Destination("kick", "*", "chat")
+        assert binding.module == "kick"
+        assert CHAT_WRITE_ACTION in h.runtime.actions.registered_ready()
+    finally:
+        await h.close()
+    assert CHAT_WRITE_ACTION not in h.runtime.actions.registered_ready()
+
+
+class TwitchValidationSession:
+    """Twitch's injected transport, answering only the token validation
+    ``prepare`` performs; nothing here starts its inputs."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.get_calls.append(url)
+        return FakeResponse(200, {"client_id": "twitch-client", "user_id": "bot-24"})
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_twitch_and_kick_load_and_prepare_together_on_one_runtime() -> None:
+    """R5/R7: both platforms declare ``chat.write`` with one contract over
+    their own destinations; loading them together records one action
+    supporting both, and each ``prepare`` binds only its own platform."""
+
+    runtime = runtime_context(clock=ManualClock(NOW), trigger_registry=TriggerRegistry())
+    twitch_session = TwitchValidationSession()
+    loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
+    activations = await loader.activate_enabled(
+        {
+            "enabled_modules": ["twitch", "kick"],
+            "modules": {
+                "twitch": {
+                    "client_id": "twitch-client",
+                    "client_secret": "twitch-client-secret-value",
+                    "access_token": "twitch-access-token-value",
+                    "broadcaster_id": "broadcaster-42",
+                    "bot_user_id": "bot-24",
+                    "companion_name": COMPANION,
+                    "_session_factory": lambda: twitch_session,
+                },
+                "kick": {**BASE_SETTINGS, "_session_factory": PublicKeySession},
+            },
+        }
+    )
+    twitch, kick = (activation.handle for activation in activations)
+    try:
+        spec = runtime.actions.discovered()[CHAT_WRITE_ACTION]
+        assert spec.supported_destinations == (
+            Destination("twitch", "*", "chat"),
+            Destination("kick", "*", "chat"),
+        )
+        await twitch.prepare()
+        await kick.prepare()
+        assert [
+            (binding.module, binding.destination)
+            for binding in runtime.actions.bindings(CHAT_WRITE_ACTION)
+        ] == [
+            ("twitch", Destination("twitch", "broadcaster-42", "chat")),
+            ("kick", Destination("kick", "*", "chat")),
+        ]
+        assert CHAT_WRITE_ACTION in runtime.actions.registered_ready()
+    finally:
+        await kick.close()
+        await twitch.close()
+
+
+@pytest.mark.asyncio
+async def test_ac35_500_characters_send_one_request_and_501_send_none() -> None:
+    """AC35: a 500-character text is 1 POST to the chat endpoint, confirmed
+    by the platform's acknowledgement; 501 characters is ``error
+    text_too_long`` with 0 requests."""
+
+    session = PublicKeySession(posts=(sent("kick-msg-1"),))
+    h = await start_harness(session=session)
+    try:
+        grant_chat_write(h.runtime)
+        observation = await write(h, "a" * 500, parent_message_id="parent-9")
+        assert observation.status == "success", observation
+        assert observation.result == {
+            "message_id": "kick-msg-1",
+            "destination": {"platform": "kick", "channel_id": CHANNEL},
+        }
+        [post] = chat_posts(session)
+        assert post["json"] == {
+            "broadcaster_user_id": int(CHANNEL),
+            "content": "a" * 500,
+            "type": "user",
+            "reply_to_message_id": "parent-9",
+        }
+        assert post["headers"]["Authorization"] == "Bearer kick-access-token-value"
+
+        refused = await write(h, "a" * 501)
+        assert refused.status == "error"
+        assert refused.error["code"] == "text_too_long"
+        assert len(session.posts) == 1
+        # The credential reaches the request header only, never a trace.
+        for text in trace_texts(h.runtime.bus) + h.diagnostics:
+            assert "kick-access-token-value" not in text
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_ac35_a_429_blocks_sends_until_the_announced_retry_instant() -> None:
+    """AC35: a 429 with ``Retry-After: 30`` is ``error rate_limited``; a send
+    29 s later is ``refused rate_limited`` with 0 requests; at 30 s the next
+    send leaves. The wait and its source are traced on ``action.completed``."""
+
+    session = PublicKeySession(
+        posts=(AnswerResponse(429, {"message": "Too Many Requests"}, {"Retry-After": "30"}), sent())
+    )
+    h = await start_harness(session=session)
+    try:
+        grant_chat_write(h.runtime)
+        limited = await write(h, "hello")
+        assert limited.status == "error" and limited.error["code"] == "rate_limited"
+        assert len(chat_posts(session)) == 1
+        assert h.module.sends_blocked_until == NOW + 30.0
+        assert completed_traces(h)[-1]["retry_after_seconds"] == 30.0
+        assert completed_traces(h)[-1]["retry_source"] == RETRY_SOURCE_RETRY_AFTER
+
+        h.clock.advance(29.0)
+        blocked = await write(h, "hello again")
+        assert blocked.status == "refused" and blocked.error["code"] == "rate_limited"
+        assert len(chat_posts(session)) == 1
+
+        h.clock.advance(1.0)
+        assert (await write(h, "hello at last")).status == "success"
+        assert len(chat_posts(session)) == 2
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_429_blocks_for_the_bounded_default_and_is_traced() -> None:
+    """Risk (P19): a 429 whose retry instant cannot be read blocks sends for
+    :data:`DEFAULT_RATE_LIMIT_SECONDS`, traced with source ``default`` and
+    diagnosed, value-free."""
+
+    session = PublicKeySession(
+        posts=(AnswerResponse(429, None, {"Retry-After": "soon, maybe"}), sent())
+    )
+    h = await start_harness(session=session)
+    try:
+        grant_chat_write(h.runtime)
+        limited = await write(h, "hello")
+        assert limited.error["code"] == "rate_limited"
+        trace = completed_traces(h)[-1]
+        assert trace["retry_source"] == RETRY_SOURCE_DEFAULT
+        assert trace["retry_after_seconds"] == DEFAULT_RATE_LIMIT_SECONDS
+        assert any("rate-limit answer unreadable" in line for line in h.diagnostics)
+        h.clock.advance(DEFAULT_RATE_LIMIT_SECONDS - 1)
+        assert (await write(h, "still blocked")).status == "refused"
+        h.clock.advance(1)
+        assert (await write(h, "free")).status == "success"
+        assert len(chat_posts(session)) == 2
+    finally:
+        await h.close()
+
+
+@pytest.mark.parametrize(
+    ("headers", "delay", "source"),
+    [
+        ({"Retry-After": "30"}, 30.0, RETRY_SOURCE_RETRY_AFTER),
+        ({"retry-after": "2.5"}, 2.5, RETRY_SOURCE_RETRY_AFTER),
+        ({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, None, RETRY_SOURCE_RETRY_AFTER),
+        ({"X-RateLimit-Reset": str(int(NOW) + 45)}, 45.0, RETRY_SOURCE_RESET),
+        ({"X-RateLimit-Reset": str((int(NOW) + 12) * 1000)}, 12.0, RETRY_SOURCE_RESET),
+        ({"RateLimit-Reset": "20"}, 20.0, RETRY_SOURCE_RESET),
+        ({"X-RateLimit-Reset": "2026-09-23T12:00:00+00:00"}, None, RETRY_SOURCE_RESET),
+        ({"Retry-After": "86400000"}, MAX_RATE_LIMIT_SECONDS, RETRY_SOURCE_RETRY_AFTER),
+        ({"X-RateLimit-Reset": str(int(NOW) - 100)}, 0.0, RETRY_SOURCE_RESET),
+        ({"Retry-After": "-5"}, DEFAULT_RATE_LIMIT_SECONDS, RETRY_SOURCE_DEFAULT),
+        ({"Retry-After": "nan"}, DEFAULT_RATE_LIMIT_SECONDS, RETRY_SOURCE_DEFAULT),
+        ({}, DEFAULT_RATE_LIMIT_SECONDS, RETRY_SOURCE_DEFAULT),
+        (None, DEFAULT_RATE_LIMIT_SECONDS, RETRY_SOURCE_DEFAULT),
+    ],
+)
+def test_the_retry_instant_is_read_defensively(headers: Any, delay: float | None, source: str) -> None:
+    """Risk (P19): ``Retry-After`` in seconds or as a date, a reset header as
+    an epoch instant (seconds or milliseconds), a delay or a time; clamped to
+    ``0..MAX_RATE_LIMIT_SECONDS``; anything unreadable is the default."""
+
+    until, found = rate_limit_until(headers, NOW)
+    assert found == source
+    wait = until - NOW
+    assert 0.0 <= wait <= MAX_RATE_LIMIT_SECONDS
+    if delay is not None:
+        assert wait == pytest.approx(delay)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [AnswerResponse(503), AnswerResponse(502), ConnectionResetError()])
+async def test_a_lost_or_5xx_send_is_external_unknown_and_never_retried(answer: Any) -> None:
+    """R7: a lost answer or a 5xx is ``external_unknown`` after exactly one
+    request; nothing is retried and no block is set."""
+
+    session = PublicKeySession(posts=(answer,))
+    h = await start_harness(session=session)
+    try:
+        grant_chat_write(h.runtime)
+        observation = await write(h, "hello")
+        assert observation.status == "external_unknown", observation
+        assert len(chat_posts(session)) == 1
+        await settle()
+        assert len(chat_posts(session)) == 1
+        assert h.module.sends_blocked_until is None
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "status", "code"),
+    [
+        (AnswerResponse(403, {"message": "Forbidden"}), "error", "platform_rejected"),
+        (AnswerResponse(200, {"data": {"is_sent": False}}), "error", "platform_rejected"),
+        (AnswerResponse(200, {"data": {"is_sent": True}}), "external_unknown", "external_effect_unknown"),
+    ],
+)
+async def test_each_other_answer_is_classified_after_one_request(
+    answer: Any, status: str, code: str
+) -> None:
+    session = PublicKeySession(posts=(answer,))
+    h = await start_harness(session=session)
+    try:
+        grant_chat_write(h.runtime)
+        observation = await write(h, "hello")
+        assert observation.status == status, observation
+        if status == "error":
+            assert observation.error["code"] == code
+        assert len(chat_posts(session)) == 1
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_a_channel_outside_the_configured_ones_is_refused_with_no_request() -> None:
+    session = PublicKeySession()
+    h = await start_harness(session=session)
+    try:
+        grant_chat_write(h.runtime)
+        observation = await write(h, "hello", channel="9999")
+        assert observation.status == "error"
+        assert observation.error["code"] == "unsupported_destination"
+        assert session.posts == []
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_the_moderation_service_is_timeout_only_and_no_clip_or_poll_is_published() -> None:
+    """R2, R5, AC39 (kick half): with a service registry, activation publishes
+    ``(moderation, kick)`` offering ``{timeout}`` and nothing else — no clip,
+    no poll service."""
+
+    h = await start_harness()
+    try:
+        kinds = {key for key in h.runtime.services.entries() if key[1] == "kick"}
+        assert kinds == {("moderation", "kick")}
+        service = h.runtime.services.resolve("moderation", "kick")
+        assert service.operations == frozenset({"timeout"})
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_a_context_without_a_registry_publishes_no_service() -> None:
+    import dataclasses
+
+    runtime = dataclasses.replace(
+        runtime_context(trigger_registry=TriggerRegistry()), services=None
+    )
+    settings = {**BASE_SETTINGS, "_session_factory": PublicKeySession}
+    module = await activate(runtime.for_module("kick"), settings, {})
+    try:
+        assert module.moderation_service.operations == frozenset({"timeout"})
+    finally:
+        await module.close()
+
+
+@pytest.mark.asyncio
+async def test_ac35_a_90_second_timeout_is_sent_as_2_minutes() -> None:
+    """AC35: the duration is rounded **up** to whole minutes; one POST to
+    the bans endpoint, always with a ``duration``."""
+
+    session = PublicKeySession(posts=(AnswerResponse(200, {"data": {}, "message": "OK"}),))
+    h = await start_harness(session=session)
+    try:
+        service = h.module.moderation_service
+        assert service.round_duration(90) == 120
+        assert service.round_duration(60) == 60
+        assert service.round_duration(61) == 120
+        answer = await service.apply(
+            "timeout", channel_id=CHANNEL, target_author_id=VIEWER,
+            duration_seconds=90, reason="spam",
+        )
+        assert answer.outcome == "ok"
+        [post] = session.posts
+        assert post["url"] == MODERATION_BANS_URL
+        assert post["json"] == {
+            "broadcaster_user_id": int(CHANNEL),
+            "user_id": int(VIEWER),
+            "duration": 2,
+            "reason": "spam",
+        }
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("timeout", {"duration_seconds": 10081 * 60}),
+        ("timeout", {"duration_seconds": 10080 * 60 + 1}),
+        ("timeout", {"duration_seconds": 0}),
+        ("timeout", {"duration_seconds": None}),
+        ("timeout", {"duration_seconds": 60, "target_author_id": ""}),
+        ("delete_message", {"message_id": "m-1"}),
+    ],
+)
+async def test_ac35_the_service_refuses_locally_with_no_request(
+    operation: str, arguments: dict[str, Any]
+) -> None:
+    """AC35: 10081 minutes (or anything rounding past 10080) is refused by
+    the service with 0 requests; so is a timeout without a duration (a
+    permanent ban) or a target, and any operation but ``timeout``."""
+
+    session = PublicKeySession()
+    h = await start_harness(session=session)
+    try:
+        answer = await h.module.moderation_service.apply(
+            operation, channel_id=CHANNEL, **{"target_author_id": VIEWER, **arguments}
+        )
+        assert answer.outcome == "rejected"
+        assert session.posts == []
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_the_largest_timeout_is_10080_minutes_and_is_sent() -> None:
+    session = PublicKeySession(posts=(AnswerResponse(200, {}),))
+    h = await start_harness(session=session)
+    try:
+        answer = await h.module.moderation_service.apply(
+            "timeout", channel_id=CHANNEL, target_author_id=VIEWER, duration_seconds=10080 * 60
+        )
+        assert answer.outcome == "ok"
+        assert session.posts[0]["json"]["duration"] == 10080
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        (AnswerResponse(429), "rate"),
+        (AnswerResponse(403), "rejected"),
+        (AnswerResponse(500), "uncertain"),
+        (ConnectionResetError(), "uncertain"),
+    ],
+)
+async def test_each_ban_answer_is_classified_after_one_request(answer: Any, outcome: str) -> None:
+    session = PublicKeySession(posts=(answer,))
+    h = await start_harness(session=session)
+    try:
+        result = await h.module.moderation_service.apply(
+            "timeout", channel_id=CHANNEL, target_author_id=VIEWER, duration_seconds=60
+        )
+        assert result.outcome == outcome
+        assert len(session.posts) == 1
+    finally:
+        await h.close()

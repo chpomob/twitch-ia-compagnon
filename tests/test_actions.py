@@ -41,6 +41,7 @@ from core.actions import (
     ERROR_UNKNOWN_ACTION,
     PROVENANCE_TRACE_FIELDS,
     REASON_NO_RULE,
+    ActionDeclarationError,
     ActionExecutor,
     ActionRegistry,
     AmbiguousBindingError,
@@ -386,6 +387,67 @@ def test_a_provider_claiming_two_overlapping_destinations_at_once_registers_noth
             ],
         )
     assert harness.registry.bindings(WRITE_SPEC.name) == ()
+
+
+def test_a_second_declarer_widening_only_the_destinations_merges_them():
+    """R5: the same contract declared by two modules over disjoint platforms
+    (``chat.write`` by twitch and kick) is one action supporting both; each
+    registration binds only its own declaration's destinations."""
+
+    other_scope = Destination("kick", WILDCARD, "chat")
+    other = replace(WRITE_SPEC, supported_destinations=(other_scope,))
+    harness = Harness()
+    alpha = Provider("alpha-sender", write_success)
+    beta = Provider("beta-sender", write_success)
+
+    harness.registry.register(WRITE_SPEC, alpha, module="alpha")
+    harness.registry.register(other, beta, module="beta")
+    # Redeclaring either half again changes nothing.
+    harness.registry.declare(other, module="beta")
+    harness.registry.declare(WRITE_SPEC, module="alpha")
+
+    merged = harness.registry.discovered()[WRITE_SPEC.name]
+    assert merged == replace(WRITE_SPEC, supported_destinations=(CHAT_SCOPE, other_scope))
+    assert [
+        (b.provider_name, b.destination, b.module)
+        for b in harness.registry.bindings(WRITE_SPEC.name)
+    ] == [("alpha-sender", CHAT_SCOPE, "alpha"), ("beta-sender", other_scope, "beta")]
+
+
+def test_a_second_declarer_differing_beyond_the_destinations_is_refused():
+    """R5: any other difference is still a conflicting declaration, and the
+    refused registration leaves the first one exactly as it was."""
+
+    harness = Harness()
+    harness.declare(WRITE_SPEC, module="alpha")
+    conflicting = replace(
+        WRITE_SPEC,
+        supported_destinations=(Destination("kick", WILDCARD, "chat"),),
+        timeout_seconds=9.0,
+    )
+
+    with pytest.raises(ActionDeclarationError) as raised:
+        harness.registry.register(
+            conflicting, Provider("beta-sender", write_success), module="beta"
+        )
+    assert "'alpha'" in str(raised.value) and "'beta'" in str(raised.value)
+    assert harness.registry.discovered()[WRITE_SPEC.name] == WRITE_SPEC
+    assert harness.registry.bindings(WRITE_SPEC.name) == ()
+
+
+def test_a_refused_binding_reverts_a_merged_declaration():
+    """AC16: a registration whose binding fails restores the declaration it
+    widened, so the other platform's destinations are not left behind."""
+
+    other = replace(
+        WRITE_SPEC, supported_destinations=(Destination("kick", WILDCARD, "chat"),)
+    )
+    harness = Harness()
+    harness.declare(WRITE_SPEC, module="alpha")
+
+    with pytest.raises(ContractError):
+        harness.registry.register(other, object(), module="beta", provider_name="beta")
+    assert harness.registry.discovered()[WRITE_SPEC.name] == WRITE_SPEC
 
 
 async def test_disjoint_bindings_each_receive_exactly_their_own_calls():
