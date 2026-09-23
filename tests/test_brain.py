@@ -20,7 +20,7 @@ import asyncio
 import copy
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3201,4 +3201,546 @@ async def test_a_watch_run_fallback_is_authorized_for_brain_watch_not_brain() ->
             POLICY["fallback"]["text"]
         ]
     finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 R4: the post-delivery ``memory.record`` step
+# --------------------------------------------------------------------------- #
+
+MEMORY_RECALL = "memory.recall"
+MEMORY_RECORD = "memory.record"
+MEMORY_WALL_EPOCH = 1_780_000_000.0
+MEMORY_TRACE_KEYS = ("memory_record", "memory_record_reason", "memory_record_call_id")
+
+
+@dataclass
+class MemoryPlatform:
+    """The fake platform, the real ``viewer_memory`` (or none) and the shipped
+    brain on one runtime, both memory actions granted to ``brain``."""
+
+    context: RuntimeContext
+    brain: Any
+    platform: Any
+    memory: Any | None
+    session: Any
+    transport: Any
+    clock: ManualClock
+
+    async def drive(self, text: str = "hi there") -> tuple[Any, dict[str, Any]]:
+        """One chat message from ``VIEWER``: the run's record and its completed trace."""
+
+        before = len(self.brain.scheduler.run_records())
+        published = await self.platform.inject(
+            {
+                "channel_id": FAKE_CHANNEL,
+                "author": {"id": VIEWER},
+                "message_id": f"m-{before}",
+                "text": text,
+            }
+        )
+        assert published is not None
+        await wait_until(lambda: len(self.brain.scheduler.run_records()) > before)
+        await wait_until(
+            lambda: len(events_of(self.context.bus, TRACE_BRAIN_RUN_COMPLETED)) > before
+        )
+        record = list(self.brain.scheduler.run_records().values())[-1]
+        payload = events_of(self.context.bus, TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
+        return record, dict(payload)
+
+    def record_calls(self, run_id: str) -> list[str]:
+        """The call ids of every ``memory.record`` executor call of *run_id*."""
+
+        return [
+            event["payload"]["call_id"]
+            for event in events_of(self.context.bus, TRACE_ACTION_STARTED)
+            if event["payload"]["action"] == MEMORY_RECORD
+            and event["payload"]["run_id"] == run_id
+        ]
+
+    def stored(self) -> dict[str, Any] | None:
+        assert self.memory is not None
+        return self.memory.store.read(FAKE_PLATFORM, FAKE_CHANNEL, VIEWER)
+
+    async def close(self) -> None:
+        await self.brain.close()
+        if self.memory is not None:
+            await self.memory.close()
+        await self.platform.close()
+
+
+async def activate_memory_platform(
+    tmp_path: Path,
+    *bodies: Any,
+    memory: bool = True,
+    brain_overrides: dict[str, Any] | None = None,
+) -> MemoryPlatform:
+    """The fake platform delivering ``chat.write``, the real ``viewer_memory``
+    storing under *tmp_path* (left out with ``memory=False``, the twin) and
+    the shipped brain on a scripted model, all loaded by the real loader."""
+
+    clock = ManualClock()
+    policy = AuthorizationPolicy(
+        [fake_grant(CHAT_WRITE), fake_grant(MEMORY_RECALL), fake_grant(MEMORY_RECORD)]
+    )
+    context = build_context(
+        clock=clock,
+        trigger_registry=TriggerRegistry(companion_name=COMPANION),
+        authorization=policy,
+    )
+    transport = SimpleNamespace(outcomes=[], sends=[])
+    fixtures = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    (platform,) = await fixtures.activate_enabled(
+        {
+            "enabled_modules": ["fakeplatform"],
+            "modules": {
+                "fakeplatform": {
+                    "channel_ids": [FAKE_CHANNEL],
+                    "companion_name": COMPANION,
+                    "transport": transport,
+                }
+            },
+        }
+    )
+    context.triggers.registry.configure(
+        "fakeplatform",
+        TriggerPolicy(
+            rules=(TriggerRule(type="event_kind", parameters={"kinds": list(EVENT_KINDS)}),)
+        ),
+    )
+    session = ScriptedModel(*bodies)
+    settings = merge_settings(brain_overrides)
+    settings.update(
+        {
+            "_session_factory": lambda: session,
+            "_sleeper": clock.sleep,
+            "diagnostic_reporter": lambda _message: None,
+        }
+    )
+    modules: dict[str, Any] = {"brain": settings}
+    enabled = ["brain"]
+    if memory:
+        enabled.append("viewer_memory")
+        modules["viewer_memory"] = {
+            "directory": str(tmp_path / "memory"),
+            "_sleeper": clock.sleep,
+            "_wall_clock": lambda: MEMORY_WALL_EPOCH + clock.now,
+        }
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    activations = {
+        activation.name: activation.handle
+        for activation in await loader.activate_enabled(
+            {"enabled_modules": enabled, "modules": modules}
+        )
+    }
+    harness = MemoryPlatform(
+        context,
+        activations["brain"],
+        platform.handle,
+        activations.get("viewer_memory"),
+        session,
+        transport,
+        clock,
+    )
+    await harness.platform.prepare()
+    if harness.memory is not None:
+        await harness.memory.prepare()
+    await harness.brain.prepare()
+    return harness
+
+
+def recall_of(harness: MemoryPlatform, record: Any) -> dict[str, Any]:
+    """The result of the run's first call, its ``memory.recall``."""
+
+    observation = harness.context.executor.outcome(f"{record.run_id}/call-1")
+    assert observation is not None and observation.status == "success"
+    return dict(observation.result)
+
+
+# The run's status and delivery outcome, as its completed trace reports them.
+# ``tokens`` is left out on purpose: the twin without ``viewer_memory`` offers
+# no ``memory.recall`` tool, so its prompt estimate is smaller.
+RUN_OUTCOME_FIELDS = (
+    "status",
+    "reason",
+    "delivery",
+    "deliveries",
+    "delivery_error",
+    "sends",
+    "failure",
+    "fallback",
+    "turns",
+    "action_calls",
+    "model_calls",
+)
+
+
+def run_outcome(payload: dict[str, Any]) -> dict[str, Any]:
+    """The outcome fields of *payload*, its run id replaced so twins compare."""
+
+    rendered = json.dumps(
+        {name: payload.get(name, "<absent>") for name in RUN_OUTCOME_FIELDS}, sort_keys=True
+    )
+    return json.loads(rendered.replace(payload["run_id"], "<run>"))
+
+
+@pytest.mark.asyncio
+async def test_ac20_a_delivered_reply_is_recalled_by_the_next_run(tmp_path: Path) -> None:
+    """AC20: the first run's recall observes ``known: false``; after that run
+    delivered ``hello`` with ``success``, the second run's recall observes
+    ``known: true``, ``interactions: 1`` and one note whose ``reply_text`` is
+    ``hello`` and ``delivery`` is ``confirmed``. The record is the run's
+    next call id, after the delivery."""
+
+    harness = await activate_memory_platform(
+        tmp_path,
+        tool_call(MEMORY_RECALL, {}),
+        final("hello"),
+        tool_call(MEMORY_RECALL, {}),
+        final("again"),
+    )
+    try:
+        first, first_trace = await harness.drive("hi there")
+        assert first.status == "success" and first.delivery == "success"
+        assert recall_of(harness, first) == {"known": False}
+        assert [send["text"] for send in harness.transport.sends] == ["hello"]
+        assert harness.record_calls(first.run_id) == [f"{first.run_id}/call-3"]
+        assert first_trace["memory_record"] == "success"
+
+        second, _ = await harness.drive("me again")
+        recalled = recall_of(harness, second)
+        assert recalled["known"] is True
+        assert recalled["interactions"] == 1
+        (note,) = recalled["notes"]
+        assert note["reply_text"] == "hello"
+        assert note["delivery"] == "confirmed"
+        assert note["viewer_text"] == "hi there"
+    finally:
+        await harness.close()
+
+
+async def memory_twin_runs(tmp_path: Path, *, memory: bool) -> tuple[MemoryPlatform, list[dict[str, Any]]]:
+    """Three runs: delivery ``external_unknown``, delivery ``error``, and a
+    model turn with nothing deliverable (0 delivery entries)."""
+
+    harness = await activate_memory_platform(
+        tmp_path / ("with" if memory else "without"),
+        final("maybe sent"),
+        final("never sent"),
+        final(""),
+        memory=memory,
+    )
+    traces = []
+    harness.transport.outcomes.append("FAIL_AFTER_EMISSION")
+    traces.append((await harness.drive("first message"))[1])
+    if memory:
+        unknown = harness.stored()
+        assert unknown is not None
+        harness.unknown = unknown["notes"][-1]  # type: ignore[attr-defined]
+    harness.transport.outcomes.append("FAIL_BEFORE_EMISSION")
+    traces.append((await harness.drive("second message"))[1])
+    if memory:
+        harness.error = harness.stored()["notes"][-1]  # type: ignore[attr-defined,index]
+    traces.append((await harness.drive("third message"))[1])
+    return harness, traces
+
+
+@pytest.mark.asyncio
+async def test_ac21_uncertain_failed_and_absent_deliveries_record_no_reply(tmp_path: Path) -> None:
+    """AC21: an ``external_unknown`` delivery records ``delivery:
+    unconfirmed`` and no ``reply_text``; an ``error`` one a note with ``at``,
+    ``viewer_text``, ``delivery: none`` and no ``reply_text``; a run with 0
+    delivery entries (a model turn with no deliverable text) the same
+    ``none`` note — never ``confirmed``. Each run's status and delivery
+    outcome equal, field by field, those of the twin run without
+    ``viewer_memory``."""
+
+    harness, traces = await memory_twin_runs(tmp_path, memory=True)
+    try:
+        assert [trace["delivery"] for trace in traces] == [
+            "external_unknown",
+            "error",
+            DELIVERY_NOT_ATTEMPTED,
+        ]
+        assert traces[2]["deliveries"] == []
+        assert [trace["memory_record"] for trace in traces] == ["success"] * 3
+
+        unknown = harness.unknown  # type: ignore[attr-defined]
+        assert unknown["delivery"] == "unconfirmed" and "reply_text" not in unknown
+        error = harness.error  # type: ignore[attr-defined]
+        assert set(error) == {"at", "viewer_text", "delivery"}
+        assert (error["viewer_text"], error["delivery"]) == ("second message", "none")
+        stored = harness.stored()
+        assert stored is not None and stored["interactions"] == 3
+        absent = stored["notes"][-1]
+        assert set(absent) == {"at", "viewer_text", "delivery"}
+        assert (absent["viewer_text"], absent["delivery"]) == ("third message", "none")
+    finally:
+        await harness.close()
+
+    twin, twin_traces = await memory_twin_runs(tmp_path, memory=False)
+    try:
+        assert all(not set(MEMORY_TRACE_KEYS) & set(trace) for trace in twin_traces)
+        for with_memory, without in zip(traces, twin_traces, strict=True):
+            assert run_outcome(with_memory) == run_outcome(without)
+    finally:
+        await twin.close()
+
+
+@pytest.mark.asyncio
+async def test_ac21_a_long_exchange_is_recorded_cut_to_200_characters(tmp_path: Path) -> None:
+    """R4: both texts are recorded as their first 200 characters."""
+
+    harness = await activate_memory_platform(tmp_path, final("r" * 250))
+    try:
+        await harness.drive("v" * 300)
+        stored = harness.stored()
+        assert stored is not None
+        (note,) = stored["notes"]
+        assert note["viewer_text"] == "v" * 200
+        assert note["reply_text"] == "r" * 200
+        assert note["delivery"] == "confirmed"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac22_memory_record_is_never_offered_over_a_granted_run(tmp_path: Path) -> None:
+    """AC22 (offer half): over a run where ``memory.record`` is granted and
+    recorded, it occurs 0 times in any model request body, while the
+    granted ``memory.recall`` is offered."""
+
+    harness = await activate_memory_platform(
+        tmp_path, tool_call(MEMORY_RECALL, {}), final("hello")
+    )
+    try:
+        record, trace = await harness.drive()
+        assert trace["memory_record"] == "success"
+        assert len(harness.record_calls(record.run_id)) == 1
+        bodies = harness.session.requests()
+        assert len(bodies) == 2
+        assert all(MEMORY_RECALL in json.dumps(body) for body in bodies)
+        assert sum(json.dumps(body).count(MEMORY_RECORD) for body in bodies) == 0
+    finally:
+        await harness.close()
+
+
+MEMORY_RECORD_PROPOSABLE_SPEC = ActionSpec(
+    name=MEMORY_RECORD,
+    version=1,
+    description="A memory record wrongly declared model-proposable.",
+    argument_schema={
+        "type": "object",
+        "properties": {
+            "viewer_text": {"type": "string"},
+            "reply_text": {"type": "string"},
+            "delivery": {"type": "string"},
+        },
+        "required": ["viewer_text", "delivery"],
+        "additionalProperties": False,
+    },
+    result_schema={"type": "object", "properties": {}},
+    nature="write",
+    required_permissions=(MEMORY_RECORD,),
+    supported_destinations=(Destination(PLATFORM, WILDCARD, "memory"),),
+    timeout_seconds=5.0,
+    idempotency="none",
+    model_proposable=True,
+)
+
+
+@pytest.mark.asyncio
+async def test_ac22_the_record_is_not_offered_even_if_declared_proposable() -> None:
+    """R4 guard: ``memory.record`` is a step of the run, never a tool — a
+    granted declaration claiming ``model_proposable`` is still offered 0
+    times, and the brain records the exchange through it itself."""
+
+    factory = owned_rules(
+        MEMORY_RECORD_PROPOSABLE_SPEC, rules=[BRAIN_GRANT, grant_to(MEMORY_RECORD, PRINCIPAL)]
+    )
+    harness = await activate_with(FakeResponse(200, completion("Hello.")), context_factory=factory)
+    try:
+        await harness.send(message_id="chat-1")
+        (record,) = await harness.completed(1)
+        assert harness.tools(0) == []
+        assert MEMORY_RECORD not in json.dumps(harness.requests()[0]["json"])
+        assert factory.providers[MEMORY_RECORD].calls == [
+            {"viewer_text": "What is up?", "reply_text": "Hello.", "delivery": "confirmed"}
+        ]
+        assert run_principals(harness, record.run_id)[-1] == (MEMORY_RECORD, PRINCIPAL)
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_a_watch_run_records_no_memory() -> None:
+    """R4: a session without a platform viewer (``system:watch``) makes no
+    record call and carries no ``memory_record`` field."""
+
+    factory = owned_rules(
+        MEMORY_RECORD_PROPOSABLE_SPEC,
+        rules=[
+            grant_to(CHAT_WRITE, PRINCIPAL, WATCH_PRINCIPAL),
+            grant_to(MEMORY_RECORD, PRINCIPAL, WATCH_PRINCIPAL),
+        ],
+    )
+    harness = await activate_with(FakeResponse(200, completion("Nice view.")), context_factory=factory)
+    try:
+        await publish_kind(harness, "watch_tick", message_id="tick-1", viewer_id=WATCH_AUTHOR)
+        (watch,) = await harness.completed(1)
+        await wait_until(lambda: len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) >= 1)
+        assert watch.status == "success"
+        assert factory.providers[MEMORY_RECORD].calls == []
+        assert "memory_record" not in harness.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
+    finally:
+        await harness.close()
+
+
+def advance_after_delivery(harness: MemoryPlatform, seconds: float) -> None:
+    """Move the clock by *seconds* once the delivery call has completed — after
+    the executor judged it, so the delivery itself stays a success."""
+
+    def on_completed(event: Any) -> None:
+        if event["payload"].get("action") == CHAT_WRITE:
+            harness.clock.advance(seconds)
+
+    harness.context.bus.subscribe(TRACE_ACTION_COMPLETED, on_completed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_action_calls", "advance", "expected"),
+    [
+        (1, 0.0, {"memory_record": "skipped", "memory_record_reason": "budget_exhausted"}),
+        (2, 115.1, {"memory_record": "skipped", "memory_record_reason": "deadline_too_short"}),
+        (2, 115.0, {"memory_record": "success"}),
+    ],
+    ids=["no-call-left", "4.9s-left", "1-call-and-5s-left"],
+)
+async def test_ac23_the_record_is_skipped_without_a_call_or_5_seconds_left(
+    tmp_path: Path, max_action_calls: int, advance: float, expected: dict[str, Any]
+) -> None:
+    """AC23: after the delivery, with 0 action calls left, or 4.9 s of the
+    run's deadline left (below the 5 s declared ``memory.record`` timeout,
+    on the injected clock), ``memory.record`` is not called and the run's
+    trace states ``memory_record: skipped`` and why; with 1 action call and
+    5 s left it is called exactly once. The run's own outcome is unchanged."""
+
+    harness = await activate_memory_platform(
+        tmp_path,
+        final("hello"),
+        brain_overrides={"budget": {"max_action_calls": max_action_calls}},
+    )
+    advance_after_delivery(harness, advance)
+    try:
+        record, trace = await harness.drive()
+        assert (record.status, record.delivery) == ("success", "success")
+        assert harness.clock.now == pytest.approx(1000.0 + advance)
+        assert {key: trace[key] for key in expected} == expected
+        calls = harness.record_calls(record.run_id)
+        if expected["memory_record"] == "skipped":
+            assert calls == []
+            assert "memory_record_call_id" not in trace
+            assert harness.stored() is None
+        else:
+            assert calls == [f"{record.run_id}/call-2"]
+            stored = harness.stored()
+            assert stored is not None and stored["interactions"] == 1
+        assert trace["action_calls"] == 1
+    finally:
+        await harness.close()
+
+
+MEMORY_RECORD_SPEC = replace(
+    MEMORY_RECORD_PROPOSABLE_SPEC,
+    description="The post-delivery memory record, as declared.",
+    model_proposable=False,
+)
+
+
+class StallingRecord:
+    """A ``memory.record`` binding that holds every call until released."""
+
+    name = "stalling-record"
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        invocation.mark_not_emitted()
+        self.entered.set()
+        await self.release.wait()
+        return ActionObservation(status="success", provenance={"provider": self.name}, result={})
+
+
+def stalled_record_rules(provider: StallingRecord, *, executor_on_clock: bool) -> Any:
+    """A context factory: ``chat.write`` over the fake send edge, *provider*
+    bound to ``memory.record``, both granted to the run principal. With
+    *executor_on_clock* the executor's timer runs on the harness clock;
+    without, it never fires while the test holds that clock — an executor
+    still in flight at its deadline."""
+
+    def factory(clock: ManualClock, transport: FakeTransport) -> RuntimeContext:
+        policy = AuthorizationPolicy([BRAIN_GRANT, grant_to(MEMORY_RECORD, PRINCIPAL)])
+        actions = ActionRegistry(authorization=policy)
+        actions.register(CHAT_WRITE_SPEC, FakeSendProvider(transport), module=SENDER_MODULE)
+        actions.register(MEMORY_RECORD_SPEC, provider, module=SENDER_MODULE)
+        actions.mark_ready(SENDER_MODULE)
+        context = build_context(clock=clock, authorization=policy, actions=actions)
+        if executor_on_clock:
+            executor = ActionExecutor(
+                actions, policy, supervision=context.supervision, clock=clock, sleeper=clock.sleep
+            )
+            context = replace(context, executor=executor)
+        return context
+
+    return factory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("executor_on_clock", "advance"),
+    [(True, 4.0), (False, 4.5)],
+    ids=["executor-times-out", "executor-still-running"],
+)
+async def test_a_record_pending_at_5_seconds_left_leaves_the_run_delivered(
+    executor_on_clock: bool, advance: float
+) -> None:
+    """R4 (review A1): a record called with exactly 5 s of the run left whose
+    provider never answers ends before the run's deadline — at the call's
+    own deadline 1 s before it, or, with the executor still in flight, cut
+    off half a second before it — traced ``memory_record: timeout``. The run
+    stays ``success``/``success``: the scheduler never rewrites it as a
+    run-deadline timeout, even once its deadline has passed."""
+
+    provider = StallingRecord()
+    harness = await activate_with(
+        FakeResponse(200, completion("Hello.")),
+        context_factory=stalled_record_rules(provider, executor_on_clock=executor_on_clock),
+    )
+
+    def on_completed(event: Any) -> None:
+        if event["payload"].get("action") == CHAT_WRITE:
+            harness.clock.advance(115.0)
+
+    harness.bus.subscribe(TRACE_ACTION_COMPLETED, on_completed)
+    try:
+        await harness.send(message_id="chat-1")
+        await wait_until(provider.entered.is_set)
+        assert harness.clock.now == pytest.approx(1115.0)
+        harness.clock.advance(advance)
+        (record,) = await harness.completed(1)
+        await wait_until(lambda: len(harness.traces(TRACE_BRAIN_RUN_COMPLETED)) >= 1)
+        trace = harness.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
+        assert (record.status, record.delivery) == ("success", "success")
+        assert record.reason != REASON_RUN_DEADLINE
+        assert trace["memory_record"] == "timeout"
+        assert trace["memory_record_call_id"] == f"{record.run_id}/call-2"
+        assert harness.clock.now < 1120.0
+        harness.clock.advance(10.0)
+        await settle()
+        assert harness.records() == [record]
+    finally:
+        provider.release.set()
         await harness.close()

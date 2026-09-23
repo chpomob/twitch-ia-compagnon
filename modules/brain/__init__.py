@@ -213,6 +213,18 @@ received the answer text and every entry that did ended ``success``; a
 refused, failed, timed-out or ``external_unknown`` text delivery leaves the
 memory untouched, so the model is never told it said something it did not
 (R5, AC7).
+
+**Viewer memory record** (phase 3 R4). After the terminal step — the final
+response's, the fallback's, or none when the run ended before it — a run
+whose session has a platform viewer calls ``memory.record`` once, when that
+action is in the run principal's authorized view of its declared scope
+(:meth:`BrainModule._record_memory`): the triggering text and a delivery note
+(``confirmed`` with the delivered text when every entry succeeded,
+``unconfirmed`` when one is ``external_unknown``, ``none`` for a failed or
+absent delivery). It spends one action call and the run's remaining deadline
+(less :data:`MEMORY_RECORD_GUARD_SECONDS`, so it is over before the run is),
+is skipped and traced as such when neither suffices, and never changes the
+run's status, delivery or correlation fields. It is never offered as a tool.
 """
 
 from __future__ import annotations
@@ -393,8 +405,51 @@ as ``attachment_id``, ``content_type``, ``size``, ``width`` and ``height``
 never a path.
 """
 
+MEMORY_RECORD_ACTION = "memory.record"
+"""The post-delivery record the brain calls itself (phase 3 R4).
+
+After the terminal step of a run whose session has a platform viewer, one
+call when the action is bound for ``(platform, channel_id, its declared
+scope)`` and the run principal's authorized view grants it. It is never
+offered to the model, whatever its declaration says: it is a step of the
+run, not a tool. Only the action's name is known here — its provider is
+whichever module binds it.
+"""
+
+MEMORY_RECORD_SKIPPED = "skipped"
+"""The ``memory_record`` value of a run whose record step did not call (R4)."""
+
+MEMORY_RECORD_SKIPPED_BUDGET = "budget_exhausted"
+MEMORY_RECORD_SKIPPED_DEADLINE = "deadline_too_short"
+"""The ``memory_record_reason`` of a skipped record step (R4): no action call
+left in the run's budget, or less of the run's deadline left than the
+action's declared ``timeout_seconds``."""
+
+MEMORY_RECORD_GUARD_SECONDS = 1.0
+"""How long before the run's total deadline the record step must be over (R4).
+
+The scheduler ends a run whose body is still running at its total deadline
+``timeout`` whatever the body would have returned, so a record left to run
+up to that deadline could turn a delivered run into a timed-out one. The
+record call's deadline is this much before the run's, and the brain stops
+waiting for it half-way through this guard — a provider that ignores its
+cancellation is let go, traced ``memory_record: timeout``, and the run ends
+with the outcome it already had."""
+
+MEMORY_TEXT_MAX_CHARS = 200
+"""The most characters of the triggering and of the delivered text recorded."""
+
+MEMORY_DELIVERY_CONFIRMED = "confirmed"
+MEMORY_DELIVERY_UNCONFIRMED = "unconfirmed"
+MEMORY_DELIVERY_NONE = "none"
+
+# No platform author identifier contains it: a reserved identity
+# (``system:watch``) does, and has no memory (R4, phase 2 R6).
+_RESERVED_VIEWER_SEPARATOR = ":"
+
 _INPUT_EVENT = "channel.chat.message"
 _STATUS_SUCCESS = "success"
+_STATUS_EXTERNAL_UNKNOWN = "external_unknown"
 _STATUS_REFUSED = "refused"
 _STATUS_ERROR = "error"
 _STATUS_TIMEOUT = "timeout"
@@ -1493,13 +1548,16 @@ class _Delivery:
     call left for it, or reached at or after the total deadline — carries
     neither: its ``status`` is the ``skipped:<reason>`` the step recorded,
     so the list's accounting stays complete without an executor call that
-    never happened.
+    never happened. ``text`` is the text an invoked text entry was handed
+    (``None`` for an effect entry or one never invoked): what the record
+    step reads as the delivered text (R4).
     """
 
     entry: _DeliveryEntry
     status: str
     call_id: str | None = None
     observation: ActionObservation | None = None
+    text: str | None = None
 
     @property
     def invoked(self) -> bool:
@@ -2117,7 +2175,9 @@ class _RunState:
     the terminal step and the fallback alike (R1); ``principal`` is the run's
     principal (:func:`run_principal`), carried by every call of the run
     (decision 4); ``proposed_writes`` names the model-proposable actions
-    already executed in the run, each at most once (decision 5).
+    already executed in the run, each at most once (decision 5);
+    ``deliveries`` are the entries of the run's terminal step — the final
+    response's or the fallback's — read by the memory record step (R4).
     """
 
     principal: str
@@ -2133,6 +2193,7 @@ class _RunState:
     audio_omitted: int = 0
     route_delivery: tuple[_DeliveryEntry, ...] | None = None
     proposed_writes: set[str] = field(default_factory=set)
+    deliveries: tuple[_Delivery, ...] = ()
 
     def correlation(self) -> dict[str, Any]:
         return {
@@ -2748,7 +2809,7 @@ class BrainModule:
             outcome = await self._loop(run, message, key, transcript, state)
             if state.fallback_reason is not None:
                 outcome = await self._fallback_outcome(run, message, state, outcome)
-            return outcome
+            return await self._record_memory(run, message, key, state, outcome)
         finally:
             self._discard_images(transcript.attachment_parts())
 
@@ -3145,6 +3206,7 @@ class BrainModule:
             calls_left=state.calls_left(self._budget),
         )
         state.account(deliveries)
+        state.deliveries = deliveries
         summary = _delivery_summary([delivery.status for delivery in deliveries])
         text_deliveries = [delivery for delivery in deliveries if delivery.entry.receives_text]
         sends = _confirmed_sends(deliveries)
@@ -3170,6 +3232,157 @@ class BrainModule:
             sends=sends,
             correlation=correlation,
         )
+
+    # -- the viewer memory record (phase 3 R4) ------------------------------ #
+
+    async def _record_memory(
+        self,
+        run: Any,
+        message: _Message,
+        key: SessionKey,
+        state: _RunState,
+        outcome: RunOutcome,
+    ) -> RunOutcome:
+        """Record the exchange with the session viewer after the terminal step (R4).
+
+        Only for a platform viewer (a reserved ``:`` identity has no memory),
+        and only when :data:`MEMORY_RECORD_ACTION` is in the run principal's
+        authorized view of ``(platform, channel_id, its declared scope)`` —
+        which holds bound, ready and granted at once. Otherwise *outcome* is
+        returned as it is. The step is skipped — ``memory_record: skipped``
+        and ``memory_record_reason`` in the trace — when no action call is
+        left in the run's budget or less than the action's declared
+        ``timeout_seconds`` of the run's deadline is left; else one executor
+        call carries the triggering text and the delivery note
+        (:meth:`_memory_note`), with the run's identities, principal, next
+        call id and the run's remaining deadline less
+        :data:`MEMORY_RECORD_GUARD_SECONDS` (:meth:`_bounded_record`), so the
+        step is over before the scheduler's deadline can rewrite the run as a
+        timeout. Whatever it ends with is traced as ``memory_record`` (and
+        ``memory_record_call_id``) and never changes the run's status,
+        delivery, sends or any other correlation field; only a cancellation
+        of the run propagates.
+        """
+
+        if _RESERVED_VIEWER_SEPARATOR in key.viewer_id:
+            return outcome
+        spec = self._catalog().get(MEMORY_RECORD_ACTION)
+        if spec is None:
+            return outcome
+        try:
+            destination = _declared_destination(
+                spec.supported_destinations, key.platform, key.channel_id
+            )
+            view = self._actions.authorized(principal=state.principal, destination=destination)
+        except Exception:
+            self._diagnose("brain memory record: authorized view unavailable")
+            return outcome
+        if MEMORY_RECORD_ACTION not in view:
+            return outcome
+
+        extra: dict[str, Any]
+        if state.calls_left(self._budget) <= 0:
+            extra = {
+                "memory_record": MEMORY_RECORD_SKIPPED,
+                "memory_record_reason": MEMORY_RECORD_SKIPPED_BUDGET,
+            }
+        elif run.remaining < float(spec.timeout_seconds):
+            extra = {
+                "memory_record": MEMORY_RECORD_SKIPPED,
+                "memory_record_reason": MEMORY_RECORD_SKIPPED_DEADLINE,
+            }
+        else:
+            call_id = f"{run.run_id}/call-{state.next_call}"
+            state.next_call += 1
+            state.action_calls += 1
+            try:
+                call = ActionCall(
+                    action_name=spec.name,
+                    action_version=spec.version,
+                    arguments=self._memory_note(message, state.deliveries),
+                    conversation_id=run.conversation_id,
+                    run_id=run.run_id,
+                    call_id=call_id,
+                    source_event_id=run.work.source_event_id,
+                    destination=destination,
+                    principal=state.principal,
+                    deadline=run.total_deadline - MEMORY_RECORD_GUARD_SECONDS,
+                    message_id=message.message_id,
+                )
+            except Exception:
+                self._diagnose("brain memory record: call could not be built")
+                status = _STATUS_ERROR
+            else:
+                status = await self._bounded_record(run, call)
+            extra = {"memory_record": status, "memory_record_call_id": call_id}
+        return RunOutcome(
+            status=outcome.status,
+            delivery=outcome.delivery,
+            model_calls=outcome.model_calls,
+            sends=outcome.sends,
+            correlation={**outcome.correlation, **extra},
+        )
+
+    async def _bounded_record(self, run: Any, call: ActionCall) -> str:
+        """The status of the record *call*, over before the run's deadline (R4).
+
+        The executor already ends the call at its deadline,
+        :data:`MEMORY_RECORD_GUARD_SECONDS` before the run's. Should it still
+        be running half-way through that guard — a provider holding on past
+        its cancellation — the call is cancelled and let go, and the step is
+        ``timeout``: the run body must have returned before the scheduler's
+        deadline, or the run it already completed would be rewritten
+        ``timeout``. A cancellation of the run cancels the call with it.
+        """
+
+        record = asyncio.ensure_future(self._invoke(call, step="memory record"))
+        cutoff_at = run.total_deadline - MEMORY_RECORD_GUARD_SECONDS / 2
+        cutoff = asyncio.ensure_future(self._sleep(max(0.0, cutoff_at - run.now)))
+        try:
+            await asyncio.wait({record, cutoff}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            cutoff.cancel()
+            record.cancel()
+            raise
+        cutoff.cancel()
+        if record.done():
+            return record.result().status
+        record.cancel()
+        # Let go, not awaited: its outcome is consumed whenever it ends.
+        record.add_done_callback(lambda task: task.cancelled() or task.exception())
+        self._diagnose("brain memory record: cut off before the run deadline")
+        return _STATUS_TIMEOUT
+
+    @staticmethod
+    def _memory_note(message: _Message, deliveries: Sequence[_Delivery]) -> dict[str, Any]:
+        """The record's arguments over the run's terminal step (R4).
+
+        In this order, the first match winning: no entry at all — no route
+        matched, nothing deliverable, or the run ended before delivery — is
+        ``none`` (checked first: "every entry succeeded" holds vacuously of
+        an empty list); every entry ``success`` is ``confirmed``, with the
+        text a succeeded text entry was handed as ``reply_text``; an entry
+        ``external_unknown`` is ``unconfirmed``; anything else — ``error``,
+        ``timeout``, ``refused``, a skipped entry — is ``none``. Only a
+        confirmed note carries a reply; both texts are cut to
+        :data:`MEMORY_TEXT_MAX_CHARS`.
+        """
+
+        note: dict[str, Any] = {"viewer_text": message.text[:MEMORY_TEXT_MAX_CHARS]}
+        if not deliveries:
+            note["delivery"] = MEMORY_DELIVERY_NONE
+        elif all(delivery.status == _STATUS_SUCCESS for delivery in deliveries):
+            note["delivery"] = MEMORY_DELIVERY_CONFIRMED
+            text = next(
+                (delivery.text for delivery in deliveries if delivery.text is not None), None
+            )
+            if text is not None:
+                note["reply_text"] = text[:MEMORY_TEXT_MAX_CHARS]
+        elif any(delivery.status == _STATUS_EXTERNAL_UNKNOWN for delivery in deliveries):
+            note["delivery"] = MEMORY_DELIVERY_UNCONFIRMED
+        else:
+            note["delivery"] = MEMORY_DELIVERY_NONE
+        return note
 
     def _failed(self, state: _RunState, status: str, failure: str, **extra: Any) -> RunOutcome:
         """The outcome of a run that ended before any delivery."""
@@ -3296,6 +3509,7 @@ class BrainModule:
             calls_left=state.calls_left(self._budget),
         )
         state.account(deliveries)
+        state.deliveries = deliveries
         state.fallback = FALLBACK_SENT
         return deliveries
 
@@ -3514,6 +3728,10 @@ class BrainModule:
 
         offered: dict[str, _Offer] = {}
         for name, spec in sorted(self._catalog().items(), key=lambda item: str(item[0])):
+            if name == MEMORY_RECORD_ACTION:
+                # The record is a step of the run, never a tool (R4): even a
+                # declaration that claimed ``model_proposable`` is not offered.
+                continue
             if (
                 not _is_text(getattr(spec, "name", None))
                 or not isinstance(getattr(spec, "argument_schema", None), Mapping)
@@ -3603,6 +3821,7 @@ class BrainModule:
                     status=observation.status,
                     call_id=call_id,
                     observation=observation,
+                    text=text if entry.receives_text else None,
                 )
             )
         return tuple(deliveries)
