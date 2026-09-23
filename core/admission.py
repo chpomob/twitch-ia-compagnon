@@ -796,6 +796,11 @@ class AdmissionScheduler:
         queue = self._queues.get(session)
         return len(queue) if queue is not None else 0
 
+    def active_run(self, session_key: SessionKey | str) -> str | None:
+        """The ``run_id`` one session is executing right now, ``None`` when idle."""
+
+        return self._active.get(_session_name(session_key))
+
     def run_record(self, run_id: str) -> RunRecord | None:
         """The recorded terminal state of *run_id*, if still retained."""
 

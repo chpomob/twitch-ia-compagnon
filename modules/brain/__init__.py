@@ -323,6 +323,14 @@ name it; a rule naming :data:`PRINCIPAL` alone grants it nothing.
 WATCH_TICK_KIND = "watch_tick"
 """The event kind whose runs are made under :data:`WATCH_PRINCIPAL`."""
 
+ADMISSION_SERVICE_KIND = "admission"
+ADMISSION_SERVICE_SCOPE = "runs"
+"""The service key ``(kind, scope)`` under which the scheduler this module
+owns is published, so a producer that admits its own work — the ``watch``
+ticks — reaches the one scheduler whose run body is :meth:`BrainModule.run`.
+A scheduler shared through the context is its builder's, and is not
+published here."""
+
 BRAIN_ERROR_RUN_LIMIT = "run_limit"
 """The code of a second call of the same model-proposable action in one run,
 refused to the model without an executor call (R5, decision 5)."""
@@ -4760,7 +4768,7 @@ async def activate(
         raise BrainModuleError("brain transport initialization failed") from None
 
     try:
-        return BrainModule(
+        module = BrainModule(
             context,
             parsed,
             session,
@@ -4768,6 +4776,18 @@ async def activate(
             sleeper=sleeper,
             run_id_factory=run_id_factory,
         )
+        # Published only on a bound registry, and only the scheduler owned
+        # here: a context built without one keeps activation as it was.
+        services = getattr(context, "services", None)
+        if (
+            module.owns_scheduler
+            and services is not None
+            and getattr(services, "available", False) is True
+        ):
+            services.publish(
+                ADMISSION_SERVICE_KIND, ADMISSION_SERVICE_SCOPE, module.scheduler
+            )
+        return module
     except BaseException:
         await _close_session(session)
         raise
@@ -5054,6 +5074,8 @@ def _default_reporter(message: str) -> None:
 
 
 __all__ = [
+    "ADMISSION_SERVICE_KIND",
+    "ADMISSION_SERVICE_SCOPE",
     "CAPABILITY_AUDIO",
     "CAPABILITY_STRUCTURED_OUTPUT",
     "CAPABILITY_VISION",

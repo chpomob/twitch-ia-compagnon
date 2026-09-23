@@ -37,9 +37,51 @@ again never resets the hour. When the clock passed several due instants at
 once, one tick is considered and the schedule resumes at the next due instant
 after the clock.
 
-**The hand-off.** In this step an emitted tick goes to the internal emit hook
-:meth:`WatchModule._emit_tick`, which calls the ``_on_tick`` seam when one is
-injected. Plan step P17 wires ticks to trigger evaluation and admission.
+**The tick event** (plan step P17). An emitted tick is one normalised
+schema-version-2 event of kind ``watch_tick`` (:func:`tick_event`): the
+channel's ``platform`` and ``channel_id``, text ``prompt_text``, author the
+reserved identity :data:`TICK_AUTHOR` (``system:watch`` — every platform
+module refuses an author identity containing ``:``, so no viewer shares its
+session), a ``message_id`` from a monotonic per-channel counter and source
+``watch``. It is **never published** on the bus — in particular never as
+``channel.chat.message`` — so it never reaches the chat context, the users
+directory or any command consumer.
+
+**Evaluation and admission.** The tick is decided by the shared trigger
+engine with this module's policy (the manifest's default is ``event_kind:
+[watch_tick]``); the decision is traced as ``input.trigger.accepted`` or
+``input.trigger.rejected``, as an input module traces it. An accepted tick
+is admitted **directly** through the runtime's scheduler,
+``admit(session_key, work)`` — the one the context carries, or else the one
+the brain owns and publishes as the service ``(admission, runs)``
+(:data:`ADMISSION_SERVICE_KIND`, :data:`ADMISSION_SERVICE_SCOPE`),
+resolved at the first admission, once every module is active — with the session key ``(platform,
+channel_id, system:watch)``; the brain makes every call of that run under
+the principal ``brain.watch``. Without a trigger engine nothing is decided
+and without a scheduler nothing is admitted: the tick is then counted
+(:data:`COUNT_NOT_ADMITTED`), never published instead. Every outcome is
+counted per channel (:meth:`WatchModule.counts`).
+
+**The in-flight rule.** At most one watch run per channel is in flight. The
+module keeps the ``run_id`` of the :class:`~core.admission.AdmissionResult`
+of its last admitted tick, per channel, and reads the run's end from the
+scheduler's :meth:`~core.admission.AdmissionScheduler.run_record`: the
+scheduler writes a run's terminal :class:`~core.admission.RunRecord` on
+every exit path, before it publishes ``brain.run.completed``, and records
+nothing else, so a present record means the run ended. That is the
+completion channel this module uses — a synchronous read at the instant a
+tick is due, with no subscription and no ordering against the trace. The
+record store is bounded; a record already evicted when the next tick is
+due reads as absent, so an absent record counts as "ended" as soon as the
+scheduler holds no queued work for the watch session and that session runs
+nothing (``active_run``) — whatever other sessions are doing. A tick due while the run is queued or running is skipped before the
+hourly cap is consulted (it takes no slot of the hour) and counted
+(:data:`COUNT_SKIPPED_IN_FLIGHT`). A scheduler that exposes no
+``run_record`` cannot be followed, and nothing is then held in flight.
+
+**Shutdown.** ``stop_inputs`` cancels every tick scheduler and awaits it,
+then publishes ``watch.state inactive`` reason ``shutdown`` per active
+session; nothing is evaluated, admitted or handed over after it.
 
 **Settings** (checked by :func:`validate_settings`, one value-free diagnostic
 naming the field): ``interval_seconds`` 15–3600 (60), ``max_ticks_per_hour``
@@ -49,9 +91,10 @@ non-empty words), ``command_audience`` and ``prompt_text`` (at most
 :data:`PROMPT_MAX_CHARS` characters).
 
 **Seams, for the tests.** ``_sleeper`` (the scheduler's sleep,
-``asyncio.sleep`` by default) and ``_on_tick`` (a callable receiving
-``(platform, channel_id, instant)``) are read from *settings* at ``activate``
-and never from a configuration file.
+``asyncio.sleep`` by default) and ``_on_tick`` (an observer receiving
+``(platform, channel_id, instant)`` for every emitted tick, before it is
+decided) are read from *settings* at ``activate`` and never from a
+configuration file.
 """
 
 from __future__ import annotations
@@ -64,7 +107,14 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from core.contracts import EVENT_KIND_DEFAULT
+from core.admission import Work
+from core.contracts import (
+    EVENT_KIND_DEFAULT,
+    TRACE_INPUT_TRIGGER_ACCEPTED,
+    TRACE_INPUT_TRIGGER_REJECTED,
+    SessionKey,
+)
+from core.triggers import NORMALIZED_SCHEMA_VERSION
 
 
 MODULE_NAME = "watch"
@@ -110,9 +160,22 @@ COMMAND_MAX_CHARS = 32
 PROMPT_MAX_CHARS = 500
 DEFAULT_PROMPT_TEXT = "Describe briefly what is happening on the stream right now."
 
+#: The kind, author and work kind of a tick (R6).
+TICK_KIND = "watch_tick"
+TICK_AUTHOR = "system:watch"
+TICK_EVENT_TYPE = "watch.tick"
+WORK_KIND = "watch.tick"
+
+#: The service key the brain publishes its owned scheduler under.
+ADMISSION_SERVICE_KIND = "admission"
+ADMISSION_SERVICE_SCOPE = "runs"
+
 #: The counts :attr:`WatchModule.counts` reports, per channel.
 COUNT_EMITTED = "ticks_emitted"
 COUNT_SKIPPED_CAP = "ticks_skipped_cap"
+COUNT_SKIPPED_IN_FLIGHT = "ticks_skipped_in_flight"
+COUNT_ADMITTED = "ticks_admitted"
+COUNT_NOT_ADMITTED = "ticks_not_admitted"
 
 _CHAT_EVENT = "channel.chat.message"
 
@@ -330,10 +393,37 @@ class WatchSettings:
         return AUDIENCE_ROLES[self.command_audience]
 
 
-class _Channel:
-    """One watched channel: its session and its sliding hour of ticks."""
+def tick_event(platform: str, channel_id: str, sequence: int, prompt_text: str) -> dict[str, Any]:
+    """The normalised schema-version-2 event of the channel's tick number *sequence*."""
 
-    __slots__ = ("key", "active", "started_at", "next_due", "task", "stamps", "counts")
+    return {
+        "type": TICK_EVENT_TYPE,
+        "payload": {
+            "platform": platform,
+            "channel_id": channel_id,
+            "author": {"id": TICK_AUTHOR, "display_name": MODULE_NAME},
+            "message_id": f"{MODULE_NAME}-{sequence}",
+            "text": prompt_text,
+            "kind": TICK_KIND,
+        },
+        "metadata": {"source": MODULE_NAME, "schema_version": NORMALIZED_SCHEMA_VERSION},
+    }
+
+
+class _Channel:
+    """One watched channel: its session, its sliding hour of ticks and its run."""
+
+    __slots__ = (
+        "key",
+        "active",
+        "started_at",
+        "next_due",
+        "task",
+        "stamps",
+        "counts",
+        "sequence",
+        "in_flight",
+    )
 
     def __init__(self, key: ChannelKey, max_ticks: int) -> None:
         self.key = key
@@ -344,7 +434,21 @@ class _Channel:
         # The instants of the ticks emitted within the window, oldest first;
         # never more than the cap, since a tick over it is not appended.
         self.stamps: deque[float] = deque(maxlen=max_ticks)
-        self.counts = {COUNT_EMITTED: 0, COUNT_SKIPPED_CAP: 0}
+        self.counts = {
+            COUNT_EMITTED: 0,
+            COUNT_SKIPPED_CAP: 0,
+            COUNT_SKIPPED_IN_FLIGHT: 0,
+            COUNT_ADMITTED: 0,
+            COUNT_NOT_ADMITTED: 0,
+        }
+        # The last tick number handed out: message ids never repeat.
+        self.sequence = 0
+        # The ``run_id`` of the admitted watch run not yet seen ended.
+        self.in_flight: str | None = None
+
+    @property
+    def session_key(self) -> SessionKey:
+        return SessionKey(platform=self.key[0], channel_id=self.key[1], viewer_id=TICK_AUTHOR)
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +470,9 @@ class WatchModule:
         self._bus = context.bus
         self._supervision = getattr(context, "supervision", None)
         self._tasks = getattr(context, "tasks", None)
+        self._triggers = getattr(context, "triggers", None)
+        self._scheduler = getattr(context, "scheduler", None)
+        self._services = getattr(context, "services", None)
         self._clock: Callable[[], float] = getattr(context, "clock", None) or time.monotonic
         self._settings = settings
         self._sleeper = sleeper
@@ -392,7 +499,7 @@ class WatchModule:
         return channel is not None and channel.active
 
     def counts(self, platform: str, channel_id: str) -> Mapping[str, int]:
-        """How many ticks the channel emitted and skipped over the cap."""
+        """How many ticks the channel emitted, skipped (cap, in flight) and admitted."""
 
         channel = self._channels.get((platform, channel_id))
         return {} if channel is None else dict(channel.counts)
@@ -404,6 +511,12 @@ class WatchModule:
         if channel is None:
             return ()
         return tuple(self._prune(channel, self._clock()))
+
+    def in_flight(self, platform: str, channel_id: str) -> int:
+        """How many watch runs of the channel are queued or running: 0 or 1."""
+
+        channel = self._channels.get((platform, channel_id))
+        return int(channel is not None and self._in_flight(channel))
 
     # -- lifecycle hooks ---------------------------------------------------- #
 
@@ -546,22 +659,25 @@ class WatchModule:
                 await self._stop(channel, REASON_MAX_ACTIVE)
                 return
             if now >= channel.next_due:
-                self._due(channel, now)
+                await self._due(channel, now)
                 while channel.next_due <= now:
                     channel.next_due += interval
                 continue
             await self._sleeper(min(channel.next_due, ends_at) - now)
 
-    def _due(self, channel: _Channel, now: float) -> None:
-        """One due tick: emitted under the cap, else skipped and counted."""
+    async def _due(self, channel: _Channel, now: float) -> None:
+        """One due tick: skipped while a run is in flight or over the cap, else emitted."""
 
+        if self._in_flight(channel):
+            channel.counts[COUNT_SKIPPED_IN_FLIGHT] += 1
+            return
         stamps = self._prune(channel, now)
         if len(stamps) >= self._settings.max_ticks_per_hour:
             channel.counts[COUNT_SKIPPED_CAP] += 1
             return
         stamps.append(now)
         channel.counts[COUNT_EMITTED] += 1
-        self._emit_tick(channel.key, now)
+        await self._emit_tick(channel, now)
 
     def _prune(self, channel: _Channel, now: float) -> deque[float]:
         """Drop the instants outside the window ``(now − 3600, now]``."""
@@ -571,16 +687,140 @@ class WatchModule:
             stamps.popleft()
         return stamps
 
-    def _emit_tick(self, key: ChannelKey, now: float) -> None:
-        """The internal emit hook; plan step P17 wires it to the triggers."""
+    async def _emit_tick(self, channel: _Channel, now: float) -> None:
+        """Build the tick, hand it to the observer, decide it, admit it."""
 
+        channel.sequence += 1
+        event = tick_event(*channel.key, channel.sequence, self._settings.prompt_text)
         hook = self._on_tick
-        if hook is None:
+        if hook is not None:
+            try:
+                hook(channel.key[0], channel.key[1], now)
+            except Exception:  # noqa: BLE001 - a failed observer must not stop the session
+                self._diagnose("tick: hand-off failed")
+        engine = self._triggers
+        if engine is None:
+            # Nothing decides, so nothing is admitted: fail closed.
+            channel.counts[COUNT_NOT_ADMITTED] += 1
             return
         try:
-            hook(key[0], key[1], now)
-        except Exception:  # noqa: BLE001 - a failed hand-off must not stop the session
-            self._diagnose("tick: hand-off failed")
+            decision = engine.evaluate(event)
+        except Exception:  # noqa: BLE001 - an undecided tick is never admitted
+            self._diagnose("tick: trigger evaluation failed")
+            channel.counts[COUNT_NOT_ADMITTED] += 1
+            return
+        await self._trace_decision(decision)
+        if not decision.accepted or not channel.active or self._stopping:
+            channel.counts[COUNT_NOT_ADMITTED] += 1
+            return
+        self._admit(channel, event)
+
+    def _admit(self, channel: _Channel, event: Mapping[str, Any]) -> None:
+        """Hand the accepted tick to the scheduler and keep its run as in flight."""
+
+        scheduler = self._admission_target()
+        if scheduler is None:
+            self._diagnose("tick: no scheduler to admit to")
+            channel.counts[COUNT_NOT_ADMITTED] += 1
+            return
+        try:
+            result = scheduler.admit(
+                channel.session_key,
+                Work(
+                    payload=event,
+                    source_event_id=event["payload"]["message_id"],
+                    kind=WORK_KIND,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a closed scheduler must not stop the session
+            self._diagnose("tick: admission failed")
+            channel.counts[COUNT_NOT_ADMITTED] += 1
+            return
+        if getattr(result, "accepted", False) is not True:
+            # A refusal is the scheduler's own traced saturation decision.
+            channel.counts[COUNT_NOT_ADMITTED] += 1
+            return
+        channel.counts[COUNT_ADMITTED] += 1
+        run_id = getattr(result, "run_id", None)
+        channel.in_flight = run_id if _is_text(run_id) else None
+
+    def _admission_target(self) -> Any:
+        """The context's scheduler, else the published one, resolved once."""
+
+        if self._scheduler is None:
+            resolve = getattr(self._services, "resolve", None)
+            if callable(resolve):
+                try:
+                    found = resolve(ADMISSION_SERVICE_KIND, ADMISSION_SERVICE_SCOPE)
+                except Exception:  # noqa: BLE001 - an unreadable registry admits nothing
+                    found = None
+                if callable(getattr(found, "admit", None)):
+                    self._scheduler = found
+        return self._scheduler
+
+    def _in_flight(self, channel: _Channel) -> bool:
+        """Whether the channel's last admitted run is still queued or running.
+
+        Read from the scheduler's terminal record (see the module docstring):
+        present means ended. Absent means in flight, unless the scheduler
+        holds no work of the watch session and runs nothing for it — then
+        the record was evicted from the bounded store and the run ended.
+        """
+
+        run_id = channel.in_flight
+        if run_id is None:
+            return False
+        lookup = getattr(self._scheduler, "run_record", None)
+        if not callable(lookup):
+            channel.in_flight = None
+            return False
+        try:
+            ended = lookup(run_id) is not None or self._session_idle(channel)
+        except Exception:  # noqa: BLE001 - an unreadable record must not hold ticks forever
+            self._diagnose("tick: run record unreadable")
+            ended = True
+        if ended:
+            channel.in_flight = None
+        return not ended
+
+    def _session_idle(self, channel: _Channel) -> bool:
+        """Whether the watch session has nothing queued and nothing running.
+
+        Per session, so another session's traffic never holds the ticks.
+        """
+
+        scheduler = self._scheduler
+        depth = getattr(scheduler, "queue_depth", None)
+        active = getattr(scheduler, "active_run", None)
+        if not callable(depth) or not callable(active):
+            return False
+        return depth(channel.session_key) == 0 and active(channel.session_key) is None
+
+    async def _trace_decision(self, decision: Any) -> None:
+        """Publish the tick's trigger decision as an input's supervision fact."""
+
+        emit = getattr(self._supervision, "emit", None)
+        if not callable(emit) or not getattr(decision, "traceable", True):
+            return
+        event_type = (
+            TRACE_INPUT_TRIGGER_ACCEPTED if decision.accepted else TRACE_INPUT_TRIGGER_REJECTED
+        )
+        payload = {
+            "source_event_id": decision.source_event_id,
+            "input": decision.input_name,
+            "platform": decision.platform,
+            "channel_id": decision.channel_id,
+            "policy_version": decision.policy_version,
+            "reason": decision.reason,
+        }
+        try:
+            outcome = emit(event_type, payload)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a lost trace changes nothing decided
+            self._diagnose("tick: trigger trace not published")
 
     # -- facts ---------------------------------------------------------------- #
 
@@ -645,13 +885,18 @@ async def activate(
 
 __all__ = [
     "ACTIVATIONS",
+    "ADMISSION_SERVICE_KIND",
+    "ADMISSION_SERVICE_SCOPE",
     "ACTIVATION_COMMAND",
     "ACTIVATION_STARTUP",
     "AUDIENCE_BROADCASTER",
     "AUDIENCE_MODERATORS",
     "AUDIENCE_ROLES",
+    "COUNT_ADMITTED",
     "COUNT_EMITTED",
+    "COUNT_NOT_ADMITTED",
     "COUNT_SKIPPED_CAP",
+    "COUNT_SKIPPED_IN_FLIGHT",
     "DEFAULT_ACTIVATION",
     "DEFAULT_COMMAND_AUDIENCE",
     "DEFAULT_INTERVAL_SECONDS",
@@ -670,10 +915,15 @@ __all__ = [
     "REASON_STARTUP",
     "STATE_ACTIVE",
     "STATE_INACTIVE",
+    "TICK_AUTHOR",
+    "TICK_EVENT_TYPE",
+    "TICK_KIND",
     "WINDOW_SECONDS",
+    "WORK_KIND",
     "WatchModule",
     "WatchModuleError",
     "WatchSettings",
     "activate",
+    "tick_event",
     "validate_settings",
 ]
