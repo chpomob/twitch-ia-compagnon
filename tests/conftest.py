@@ -24,7 +24,11 @@ the player behind ``audio_output`` (:class:`RecordingPlayerRunner`,
 provider (:class:`ScriptedSceneProvider`) and a platform poll service
 (:class:`ScriptedPollService`) — every one driven by the injected clock,
 none sleeping. The context carries a :class:`~core.runtime.ServiceRegistry`
-by default so a publishing module is exercised on the harness (R7). A suite that mocked the
+by default so a publishing module is exercised on the harness (R7). Phase 3
+adds the platform ``clip`` and ``moderation`` services
+(:class:`ScriptedClipService`, :class:`ScriptedModerationService`), handed
+to the fixture platform through its ``clip_service``/``moderation_service``
+seams, and a viewer-memory directory (:func:`memory_directory`). A suite that mocked the
 executor would hide AC19's executor-confirmed delivery, so the executor is
 never mocked here.
 
@@ -56,9 +60,11 @@ import json
 import random
 import struct
 import zlib
-from collections.abc import Mapping, Sequence
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
@@ -1545,6 +1551,284 @@ class ScriptedPollService:
 
 
 # --------------------------------------------------------------------------- #
+# Platform clip and moderation services (phase 3: R2, R5)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class ClipCreateResult:
+    """A classified create answer, the taxonomy every platform's clip service
+    returns: ``accepted`` (with ``clip_id``), ``offline``, ``rejected``,
+    ``rate`` or ``uncertain``. ``scripted`` is the outcome that produced it."""
+
+    outcome: str
+    clip_id: str | None = None
+    edit_url: str | None = None
+    scripted: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ModerationResult:
+    """A classified moderation answer: ``ok``, ``rejected``, ``rate`` or
+    ``uncertain``. ``scripted`` is the outcome that produced it."""
+
+    outcome: str
+    scripted: str = ""
+
+
+class _InFlight:
+    """Counts overlapping requests: ``overlap`` is set once two are in flight."""
+
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    @property
+    def overlap(self) -> bool:
+        return self.max_in_flight > 1
+
+    def __enter__(self) -> None:
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+
+    def __exit__(self, *exc: Any) -> None:
+        self.in_flight -= 1
+
+
+_CLIP_CREATE_CLASSES = {
+    "offline": "offline",
+    "auth": "rejected",
+    "rate": "rate",
+    "lost": "uncertain",
+    "server_error": "uncertain",
+}
+
+
+class ScriptedClipService:
+    """A platform ``clip`` service (``create``, ``lookup``) driven by a script.
+
+    ``create(channel_id)`` pops the next create outcome (else
+    ``accepted clip-<n>``) and returns a :class:`ClipCreateResult`:
+
+    - ``accepted <id>`` — ``accepted`` with that ``clip_id``;
+    - ``offline`` → ``offline``; ``auth`` → ``rejected``; ``rate`` →
+      ``rate``; ``lost`` and ``server_error`` → ``uncertain`` (the request
+      left, its answer is not trustworthy);
+    - ``hold`` — the request has left and parks until cancelled or
+      :meth:`release_held` hands it the outcome to apply;
+    - an exception — raised.
+
+    ``lookup(clip_id)`` pops the next lookup outcome (else
+    ``lookup_default``): ``found <url>`` answers that URL, ``found`` alone a
+    URL derived from the id, ``empty`` answers ``None``; an exception is
+    raised.
+
+    Every request lands in ``requests`` as ``{"op", "at", ...}`` stamped by
+    ``clock`` (0.0 without one); ``creates`` counts the create requests, and
+    ``in_flight``/``max_in_flight``/``overlap`` record whether two requests
+    were ever outstanding at once.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Any = None,
+        create: Sequence[Any] = (),
+        lookup: Sequence[Any] = (),
+        lookup_default: str = "found",
+    ) -> None:
+        self._clock = clock
+        self._create_script = list(create)
+        self._lookup_script = list(lookup)
+        self._lookup_default = lookup_default
+        self._flight = _InFlight()
+        self._held: list[asyncio.Future[Any]] = []
+        self.requests: list[dict[str, Any]] = []
+
+    def script_create(self, *outcomes: Any) -> "ScriptedClipService":
+        self._create_script.extend(outcomes)
+        return self
+
+    def script_lookup(self, *outcomes: Any) -> "ScriptedClipService":
+        self._lookup_script.extend(outcomes)
+        return self
+
+    @property
+    def creates(self) -> int:
+        return sum(1 for request in self.requests if request["op"] == "create")
+
+    @property
+    def lookups(self) -> int:
+        return sum(1 for request in self.requests if request["op"] == "lookup")
+
+    @property
+    def in_flight(self) -> int:
+        return self._flight.in_flight
+
+    @property
+    def max_in_flight(self) -> int:
+        return self._flight.max_in_flight
+
+    @property
+    def overlap(self) -> bool:
+        return self._flight.overlap
+
+    def release_held(self, outcome: Any = "accepted") -> None:
+        for waiter in self._held:
+            if not waiter.done():
+                waiter.set_result(outcome)
+                return
+        raise AssertionError("ScriptedClipService: no held create to release")
+
+    def _now(self) -> float:
+        return float(self._clock()) if self._clock is not None else 0.0
+
+    async def create(self, channel_id: str) -> ClipCreateResult:
+        with self._flight:
+            self.requests.append({"op": "create", "channel_id": channel_id, "at": self._now()})
+            number = self.creates
+            outcome = self._create_script.pop(0) if self._create_script else "accepted"
+            if outcome == "hold":
+                waiter: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+                self._held.append(waiter)
+                try:
+                    outcome = await waiter
+                finally:
+                    self._held = [item for item in self._held if item is not waiter]
+            return self._classify_create(outcome, number)
+
+    @staticmethod
+    def _classify_create(outcome: Any, number: int) -> ClipCreateResult:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if not isinstance(outcome, str):
+            raise AssertionError(f"ScriptedClipService: unknown create outcome {outcome!r}")
+        word, _, argument = outcome.partition(" ")
+        if word == "accepted":
+            clip_id = argument.strip() or f"clip-{number}"
+            return ClipCreateResult(
+                "accepted", clip_id, f"https://clips.example/{clip_id}/edit", outcome
+            )
+        if word in _CLIP_CREATE_CLASSES and not argument:
+            return ClipCreateResult(_CLIP_CREATE_CLASSES[word], scripted=outcome)
+        raise AssertionError(f"ScriptedClipService: unknown create outcome {outcome!r}")
+
+    async def lookup(self, clip_id: str) -> str | None:
+        with self._flight:
+            self.requests.append({"op": "lookup", "clip_id": clip_id, "at": self._now()})
+            outcome = self._lookup_script.pop(0) if self._lookup_script else self._lookup_default
+            if isinstance(outcome, BaseException):
+                raise outcome
+            word, _, argument = str(outcome).partition(" ")
+            if word == "found":
+                return argument.strip() or f"https://clips.example/{clip_id}"
+            if word == "empty" and not argument:
+                return None
+            raise AssertionError(f"ScriptedClipService: unknown lookup outcome {outcome!r}")
+
+
+_MODERATION_CLASSES = {
+    "ok": "ok",
+    "rejected": "rejected",
+    "rate": "rate",
+    "lost": "uncertain",
+    "server_error": "uncertain",
+}
+
+DEFAULT_MODERATION_OPERATIONS = frozenset({"delete_message", "timeout"})
+
+
+class ScriptedModerationService:
+    """A platform ``moderation`` service driven by a script.
+
+    ``operations`` is what the platform offers (default ``{delete_message,
+    timeout}``). ``round_duration(seconds)`` is the platform's unit rounding
+    hook: up to a multiple of ``duration_unit_seconds`` (1, no rounding, by
+    default; 60 for a whole-minute platform). ``apply(operation, *,
+    channel_id, ...)`` records the request in ``requests`` stamped by
+    ``clock`` and returns a :class:`ModerationResult` from the next scripted
+    outcome (else ``ok``): ``ok``, ``rejected``, ``rate``, or ``lost`` and
+    ``server_error`` → ``uncertain``; an exception is raised. An operation
+    outside ``operations`` is a caller bug (the module must refuse it
+    ``platform_unsupported`` with 0 requests): it is recorded and raises.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Any = None,
+        operations: Any = DEFAULT_MODERATION_OPERATIONS,
+        outcomes: Sequence[Any] = (),
+        duration_unit_seconds: int = 1,
+    ) -> None:
+        self._clock = clock
+        self.operations = frozenset(operations)
+        self._script = list(outcomes)
+        self._unit = int(duration_unit_seconds)
+        self.requests: list[dict[str, Any]] = []
+
+    def script(self, *outcomes: Any) -> "ScriptedModerationService":
+        self._script.extend(outcomes)
+        return self
+
+    def round_duration(self, seconds: int) -> int:
+        return -(-int(seconds) // self._unit) * self._unit
+
+    async def apply(
+        self,
+        operation: str,
+        *,
+        channel_id: str,
+        message_id: str | None = None,
+        target_author_id: str | None = None,
+        duration_seconds: int | None = None,
+        reason: str | None = None,
+    ) -> ModerationResult:
+        self.requests.append(
+            {
+                "operation": operation,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "target_author_id": target_author_id,
+                "duration_seconds": duration_seconds,
+                "reason": reason,
+                "at": float(self._clock()) if self._clock is not None else 0.0,
+            }
+        )
+        if operation not in self.operations:
+            raise AssertionError(
+                f"ScriptedModerationService: operation {operation!r} is not offered"
+            )
+        outcome = self._script.pop(0) if self._script else "ok"
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome not in _MODERATION_CLASSES:
+            raise AssertionError(f"ScriptedModerationService: unknown outcome {outcome!r}")
+        return ModerationResult(_MODERATION_CLASSES[outcome], outcome)
+
+
+# --------------------------------------------------------------------------- #
+# A viewer-memory directory (phase 3: R3)
+# --------------------------------------------------------------------------- #
+
+
+def memory_directory(tmp_path: Path, name: str = "memory") -> tuple[Path, Callable[[], list[str]]]:
+    """A fresh, empty directory under *tmp_path* and a lister of its ``*.json``.
+
+    The lister returns the sorted names (not paths) of the directory's
+    immediate ``*.json`` files, read anew at every call.
+    """
+
+    directory = tmp_path / name
+    directory.mkdir(parents=True, exist_ok=False)
+
+    def json_names() -> list[str]:
+        return sorted(entry.name for entry in directory.glob("*.json") if entry.is_file())
+
+    return directory, json_names
+
+
+# --------------------------------------------------------------------------- #
 # The in-memory wire between brain and agent (R6)
 # --------------------------------------------------------------------------- #
 
@@ -1886,6 +2170,70 @@ def _self_check() -> None:
     assert everything.offer(segment) == len(segment)
     header_only = FakePlayer(accept_total=20)
     assert header_only.offer(segment) == 20
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_self_check_phase3_services())
+    finally:
+        loop.close()
+    with tempfile.TemporaryDirectory() as scratch:
+        directory, json_names = memory_directory(Path(scratch))
+        assert directory.is_dir() and json_names() == []
+        (directory / "b.json").write_text("{}", encoding="utf-8")
+        (directory / "a.json").write_text("{}", encoding="utf-8")
+        (directory / "notes.txt").write_text("", encoding="utf-8")
+        assert json_names() == ["a.json", "b.json"]
+
+
+async def _self_check_phase3_services() -> None:
+    clock = ManualClock(10.0)
+    clips = ScriptedClipService(
+        clock=clock,
+        create=["accepted c-1", "offline", "auth", "rate", "lost", "server_error"],
+        lookup=["empty", "found https://clips.example/x"],
+    )
+    first = await clips.create("chan")
+    assert (first.outcome, first.clip_id) == ("accepted", "c-1")
+    assert [(await clips.create("chan")).outcome for _ in range(5)] == [
+        "offline", "rejected", "rate", "uncertain", "uncertain",
+    ]
+    clock.advance(1.0)
+    assert await clips.lookup("c-1") is None
+    assert await clips.lookup("c-1") == "https://clips.example/x"
+    assert await clips.lookup("c-1") == "https://clips.example/c-1"
+    assert clips.creates == 6 and clips.lookups == 3
+    assert [request["at"] for request in clips.requests] == [10.0] * 6 + [11.0] * 3
+    assert not clips.overlap and clips.in_flight == 0
+
+    clips.script_create("hold", "hold")
+    held = [asyncio.ensure_future(clips.create("chan")) for _ in range(2)]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert clips.in_flight == 2 and clips.overlap
+    clips.release_held("accepted c-9")
+    clips.release_held("rate")
+    assert (await held[0]).clip_id == "c-9" and (await held[1]).outcome == "rate"
+    assert clips.in_flight == 0
+
+    moderation = ScriptedModerationService(
+        clock=clock, outcomes=["rejected", "rate", "lost", "server_error"]
+    )
+    assert moderation.operations == frozenset({"delete_message", "timeout"})
+    assert moderation.round_duration(61) == 61
+    assert ScriptedModerationService(duration_unit_seconds=60).round_duration(61) == 120
+    outcomes = [
+        (await moderation.apply("delete_message", channel_id="chan", message_id="m")).outcome
+        for _ in range(5)
+    ]
+    assert outcomes == ["rejected", "rate", "uncertain", "uncertain", "ok"]
+    narrow = ScriptedModerationService(operations={"timeout"})
+    try:
+        await narrow.apply("delete_message", channel_id="chan", message_id="m")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("an unoffered operation must not pass silently")
+    assert len(moderation.requests) == 5 and moderation.requests[0]["at"] == 11.0
 
 
 _self_check()

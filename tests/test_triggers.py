@@ -5,18 +5,32 @@ opened, no clock is read and no value is drawn that this file did not inject,
 which is what lets the determinism and "before any transport" criteria be
 asserted at all.
 
-The last section carries the P2 unit assertions the plan attaches to this step:
+The phase 3 P4 section is the exception: it drives the fixture platform end
+to end through the loader on a ``runtime_context`` (notices, reserved
+identities, the published services), still on an injected clock.
+
+A later section carries the P2 unit assertions the plan attaches to this step:
 ``sanitize_trace`` redacts, truncates and refuses a reserved key, and
 ``Counters`` exposes the seven required counters before anything increments
 them (R8, AC28, AC29).
 """
 
 from dataclasses import fields
+from pathlib import Path
 
 import pytest
+import yaml
 
-from conftest import runtime_context
+from conftest import (
+    ManualClock,
+    RecordingScheduler,
+    ScriptedClipService,
+    ScriptedModerationService,
+    events_of,
+    runtime_context,
+)
 
+from core.context import ChatContext
 from core.contracts import (
     COUNTER_DEDUP_EVICTIONS,
     COUNTER_TRIGGER_REJECTIONS,
@@ -27,6 +41,7 @@ from core.contracts import (
     TRUNCATION_KEY,
     ContractError,
     Counters,
+    SessionKey,
     TriggerPolicy,
     TriggerRule,
     TriggerSpec,
@@ -34,6 +49,8 @@ from core.contracts import (
     sanitize_trace,
     trace_size,
 )
+from core.loader import ModuleLoader
+from core.runtime import ServiceRegistry
 from core.triggers import (
     BUILTIN_TRIGGER_TYPES,
     COMPANION_NAME_TOKEN,
@@ -1048,3 +1065,222 @@ def test_counters_expose_the_seven_required_names_before_any_increment() -> None
     assert set(REQUIRED_COUNTERS) <= set(snapshot)
     assert len(REQUIRED_COUNTERS) == 7
     assert all(snapshot[name] == 0 for name in REQUIRED_COUNTERS)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 P4 — notices, reserved identities and services on the fixture
+# platform, end to end through the loader on a ``runtime_context`` (R1, R2,
+# R5, R6)
+# --------------------------------------------------------------------------- #
+
+FIXTURE_MODULES = Path(__file__).parent / "fixtures" / "modules"
+FAKE_CHANNEL = "chan-a"
+FAKE_BASE_SETTINGS = {"channel_ids": [FAKE_CHANNEL], "companion_name": "companion"}
+
+
+async def _fake_platform(settings: dict | None = None, *, services=None):
+    """The fixture platform activated and prepared by the real loader.
+
+    A real trigger engine, a chat context and a recording scheduler on the
+    shared ``runtime_context``; returns ``(context, handle)``.
+    """
+
+    clock = ManualClock()
+    context = runtime_context(
+        clock=clock,
+        trigger_registry=TriggerRegistry(companion_name="companion"),
+        chat=ChatContext(
+            max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=clock
+        ),
+        scheduler=RecordingScheduler(),
+        services=services,
+    )
+    loader = ModuleLoader(context.bus, FIXTURE_MODULES, context=context, environ={})
+    (activation,) = await loader.activate_enabled(
+        {
+            "enabled_modules": ["fakeplatform"],
+            "modules": {"fakeplatform": {**FAKE_BASE_SETTINGS, **(settings or {})}},
+        }
+    )
+    await activation.handle.prepare()
+    return context, activation.handle
+
+
+def _chat_entries(context) -> list:
+    return list(context.chat.read("fake", FAKE_CHANNEL, limit=16))
+
+
+def test_the_fixture_platform_declares_event_kind_notices_and_services() -> None:
+    """R1: the fixture manifest declares ``event_kind`` and the two settings."""
+
+    manifest = yaml.safe_load(
+        (FIXTURE_MODULES / "fakeplatform" / "module.yaml").read_text(encoding="utf-8")
+    )
+    types = [entry["name"] for entry in manifest["triggers"]["types"]]
+    assert TRIGGER_TYPE_EVENT_KIND in types
+    properties = manifest["settings_schema"]["properties"]
+    assert properties["services"]["items"]["enum"] == ["poll", "clip", "moderation"]
+    assert "kinds" in properties["notices"]["properties"]
+
+
+async def test_a_listed_raid_notice_is_fed_and_admitted_under_event_kind_raid() -> None:
+    """AC3/AC5 support: a raid notice, fed and admitted like a message."""
+
+    context, platform = await _fake_platform({"notices": {"kinds": ["raid", "sub_gift"]}})
+    context.triggers.registry.configure("fakeplatform", _event_kind_policy("raid"))
+
+    published = await platform.inject_notice("raid", "raider-7", "raider-7 is raiding")
+
+    assert published is not None
+    assert published["payload"]["kind"] == "raid"
+    assert published["payload"]["author"] == {"id": "raider-7"}
+    assert [entry.author_id for entry in _chat_entries(context)] == ["raider-7"]
+    ((session_key, work),) = context.scheduler.admissions
+    assert session_key == SessionKey("fake", FAKE_CHANNEL, "raider-7")
+    assert work.payload["payload"]["kind"] == "raid"
+    assert len(events_of(context.bus, "channel.chat.message")) == 1
+
+
+async def test_an_authorless_notice_is_fed_as_system_anonymous_and_never_admitted() -> None:
+    """Decision 3: an anonymous gift gives 1 chat-context entry, 0 admissions."""
+
+    context, platform = await _fake_platform({"notices": {"kinds": ["sub_gift"]}})
+    context.triggers.registry.configure("fakeplatform", _event_kind_policy("sub_gift"))
+
+    published = await platform.inject_notice("sub_gift", None, "An anonymous gift")
+
+    assert [entry.author_id for entry in _chat_entries(context)] == ["system:anonymous"]
+    assert context.scheduler.admissions == []
+    assert published is not None and published["payload"]["kind"] == "sub_gift"
+    assert events_of(context.bus, "input.trigger.accepted") == []
+    assert events_of(context.bus, "input.trigger.rejected") == []
+
+
+async def test_a_redelivered_authorless_notice_is_published_once() -> None:
+    """Decision 3: skipping evaluation keeps the reception dedup (A1)."""
+
+    context, platform = await _fake_platform({"notices": {"kinds": ["sub_gift"]}})
+    context.triggers.registry.configure("fakeplatform", _event_kind_policy("sub_gift"))
+
+    first = await platform.inject_notice("sub_gift", None, message_id="gift-1")
+    again = await platform.inject_notice("sub_gift", None, message_id="gift-1")
+
+    assert first is not None and again is None
+    assert len(events_of(context.bus, "channel.chat.message")) == 1
+    assert [entry.author_id for entry in _chat_entries(context)] == ["system:anonymous"]
+    assert context.scheduler.admissions == []
+
+
+async def test_an_unlisted_notice_kind_is_ignored_and_counted() -> None:
+    """R1: ``notices.kinds`` defaults to none; an unlisted kind yields nothing."""
+
+    context, platform = await _fake_platform()
+    context.triggers.registry.configure("fakeplatform", _event_kind_policy("raid"))
+
+    assert await platform.inject_notice("raid", "raider-7") is None
+
+    assert platform.counts["notices_ignored"] == 1
+    assert _chat_entries(context) == [] and context.scheduler.admissions == []
+    assert events_of(context.bus, "channel.chat.message") == []
+
+
+@pytest.mark.parametrize("author", ["a:b", "system:anonymous", "system:watch"])
+async def test_an_author_identity_containing_a_colon_is_refused_and_counted(author) -> None:
+    """R6: 0 admissions, invalid counter + 1, nothing fed or published."""
+
+    context, platform = await _fake_platform({"notices": {"kinds": ["raid"]}})
+    before = platform.counts["invalid"]
+
+    assert (
+        await platform.inject(
+            {
+                "channel_id": FAKE_CHANNEL,
+                "author": author,
+                "message_id": "m-colon",
+                "text": "companion, hello",
+            }
+        )
+        is None
+    )
+    assert await platform.inject_notice("raid", author) is None
+
+    assert platform.counts["invalid"] == before + 2
+    assert context.scheduler.admissions == []
+    assert _chat_entries(context) == []
+    assert events_of(context.bus, "channel.chat.message") == []
+
+
+async def test_a_plain_message_keeps_the_phase_2_event_shape() -> None:
+    """Decision 1: a message carries no ``payload.kind`` and is admitted as before."""
+
+    context, platform = await _fake_platform()
+
+    published = await platform.inject(
+        {"channel_id": FAKE_CHANNEL, "author": "v1", "message_id": "m-1", "text": "companion?"}
+    )
+
+    assert published is not None and "kind" not in published["payload"]
+    assert len(context.scheduler.admissions) == 1
+
+
+async def test_services_poll_publishes_only_the_poll_service() -> None:
+    """R2/R5: ``services: [poll]`` leaves clip and moderation unpublished."""
+
+    registry = ServiceRegistry()
+    _context, platform = await _fake_platform({"services": ["poll"]}, services=registry)
+
+    assert dict(registry.entries()) == {("poll", "fake"): "fakeplatform"}
+    assert platform.clip_service is None and platform.moderation_service is None
+
+
+async def test_the_default_keeps_the_phase_2_registry_shape() -> None:
+    """``services`` absent → ``[poll]``: a fixture built without the setting
+    publishes exactly what phase 2 did (the chosen default shape, P4 risk)."""
+
+    registry = ServiceRegistry()
+    await _fake_platform(services=registry)
+
+    assert dict(registry.entries()) == {("poll", "fake"): "fakeplatform"}
+
+
+async def test_listed_services_publish_the_scripted_clip_and_moderation_doubles() -> None:
+    """R2/R5: listed kinds are published for ``fake``; the seams carry the doubles."""
+
+    registry = ServiceRegistry()
+    clips = ScriptedClipService()
+    moderation = ScriptedModerationService(operations={"timeout"})
+    _context, platform = await _fake_platform(
+        {
+            "services": ["poll", "clip", "moderation"],
+            "clip_service": clips,
+            "moderation_service": moderation,
+        },
+        services=registry,
+    )
+
+    assert dict(registry.entries()) == {
+        ("poll", "fake"): "fakeplatform",
+        ("clip", "fake"): "fakeplatform",
+        ("moderation", "fake"): "fakeplatform",
+    }
+    assert registry.resolve("clip", "fake") is clips is platform.clip_service
+    assert registry.resolve("moderation", "fake") is moderation
+    assert registry.resolve("moderation", "fake").operations == frozenset({"timeout"})
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"services": ["poll", "chat"]},
+        {"services": ["clip", "clip"]},
+        {"services": "poll"},
+        {"notices": {"kinds": ["message"]}},
+        {"notices": {"kinds": ["watch_tick"]}},
+        {"notices": {"kinds": ["raid", "raid"]}},
+    ],
+)
+async def test_invalid_services_or_notice_kinds_fail_activation(settings) -> None:
+    with pytest.raises(Exception) as refused:
+        await _fake_platform(settings)
+    field = next(iter(settings))
+    assert field in str(refused.value)

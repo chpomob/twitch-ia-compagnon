@@ -57,12 +57,42 @@ module-level :data:`POLL_SERVICES` registry (:func:`poll_service_for`,
 cleared by :func:`reset`), is reachable as :attr:`FakePlatform.poll_service`,
 and may be handed in through the ``poll_service`` settings seam. The declared
 actions are unchanged: ``chat.write`` only.
+
+**Phase 3 services** (R2, R5). ``services`` lists the kinds ``activate``
+publishes for platform ``fake`` — ``poll``, ``clip``, ``moderation`` — on a
+bound registry only. Absent, it is ``[poll]``: a fixture built without the
+setting keeps the phase 2 registry shape (the ``entries()`` equalities of
+``tests/test_stream_control.py``); a test wanting the phase 3 services lists
+them. The defaults are :class:`FakeClipService` (every create accepted, every
+lookup found) and :class:`FakeModerationService` (every request confirmed,
+``operations`` ``{delete_message, timeout}``, no duration rounding); a
+scripted double is handed in through the ``clip_service`` and
+``moderation_service`` seams (``tests/conftest.py`` has them). The fixture
+cannot import the harness: it also runs from a copied modules directory in a
+child process.
+
+**Notices** (R1, plan decisions 2 and 3). A fed or injected message may carry
+a ``kind`` (a community-notice kind; absent means ``message``) and, for a
+notice, ``author: null``. A notice is ingested only when its kind is listed in
+``notices.kinds`` (default none), otherwise it is ignored and counted in
+``counts["notices_ignored"]``. An ingested notice is published as
+``channel.chat.message`` with ``payload.kind`` and fed to the chat context; it
+is trigger-evaluated and admitted like a message, except an authorless one,
+which is fed under :data:`ANONYMOUS_AUTHOR`, published under it, and never
+evaluated or admitted. :meth:`FakePlatform.inject_notice` is the shorthand.
+
+**Reserved identities** (R6, plan decision 3). An author identifier
+containing ``:`` is refused before anything happens — no chat-context entry,
+no publication, no evaluation, no admission — and counted in
+``counts["invalid"]``, so no viewer can hold ``system:anonymous`` or
+``system:watch``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -74,12 +104,15 @@ import yaml
 from core.admission import Work
 from core.context import ChatEntry
 from core.contracts import (
+    EVENT_KIND_DEFAULT,
+    PLATFORM_NOTICE_KINDS,
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
     ActionObservation,
     ActionSpec,
     Destination,
     SessionKey,
+    validate_event_kind,
 )
 from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
 
@@ -105,6 +138,18 @@ SUCCESS = "success"
 FAIL_BEFORE_EMISSION = "FAIL_BEFORE_EMISSION"
 FAIL_AFTER_EMISSION = "FAIL_AFTER_EMISSION"
 OUTCOMES = frozenset({SUCCESS, FAIL_BEFORE_EMISSION, FAIL_AFTER_EMISSION})
+
+ANONYMOUS_AUTHOR = "system:anonymous"
+"""The reserved author a notice without a trusted author is fed under (decision 3)."""
+
+ANONYMOUS_DEDUP_MAX_ENTRIES = 256
+"""How many anonymous notice identifiers the reception dedup retains (oldest evicted)."""
+
+RESERVED_SEPARATOR = ":"
+"""No platform author identifier may contain it (R6): reserved identities do."""
+
+COUNT_INVALID = "invalid"
+COUNT_NOTICES_IGNORED = "notices_ignored"
 
 _ERROR_INVALID_ARGUMENTS = "invalid_arguments"
 _ERROR_UNSUPPORTED_DESTINATION = "unsupported_destination"
@@ -382,6 +427,92 @@ def poll_service_for(platform: str = PLATFORM) -> ScriptedPollService:
     return service
 
 
+# --------------------------------------------------------------------------- #
+# The default clip and moderation services (R2, R5)
+# --------------------------------------------------------------------------- #
+
+
+CLIP_SERVICE_KIND = "clip"
+MODERATION_SERVICE_KIND = "moderation"
+SERVICE_KINDS = (POLL_SERVICE_KIND, CLIP_SERVICE_KIND, MODERATION_SERVICE_KIND)
+"""What ``services`` may list, in publication order."""
+
+DEFAULT_SERVICES = (POLL_SERVICE_KIND,)
+"""``services`` when absent: the phase 2 registry shape."""
+
+MODERATION_OPERATIONS = frozenset({"delete_message", "timeout"})
+
+
+@dataclass(frozen=True, slots=True)
+class ClipCreateResult:
+    """A classified create answer: ``accepted`` (with ``clip_id``), ``offline``,
+    ``rejected``, ``rate`` or ``uncertain``."""
+
+    outcome: str
+    clip_id: str | None = None
+    edit_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModerationResult:
+    """A classified moderation answer: ``ok``, ``rejected``, ``rate`` or ``uncertain``."""
+
+    outcome: str
+
+
+class FakeClipService:
+    """Accepts every create and finds every clip; logs the requests."""
+
+    def __init__(self) -> None:
+        self.creates: list[str] = []
+        self.lookups: list[str] = []
+
+    async def create(self, channel_id: str) -> ClipCreateResult:
+        self.creates.append(channel_id)
+        clip_id = f"fake-clip-{len(self.creates)}"
+        return ClipCreateResult("accepted", clip_id, f"https://clips.fake/{clip_id}/edit")
+
+    async def lookup(self, clip_id: str) -> str | None:
+        self.lookups.append(clip_id)
+        return f"https://clips.fake/{clip_id}"
+
+
+class FakeModerationService:
+    """Confirms every request it offers; seconds, no rounding."""
+
+    operations = MODERATION_OPERATIONS
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    def round_duration(self, seconds: int) -> int:
+        return seconds
+
+    async def apply(
+        self,
+        operation: str,
+        *,
+        channel_id: str,
+        message_id: str | None = None,
+        target_author_id: str | None = None,
+        duration_seconds: int | None = None,
+        reason: str | None = None,
+    ) -> ModerationResult:
+        self.requests.append(
+            {
+                "operation": operation,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "target_author_id": target_author_id,
+                "duration_seconds": duration_seconds,
+                "reason": reason,
+            }
+        )
+        if operation not in self.operations:
+            return ModerationResult("rejected")
+        return ModerationResult("ok")
+
+
 def reset() -> None:
     """Forget every registered transport and poll service."""
 
@@ -436,7 +567,65 @@ def validate_settings(settings: Any) -> list[str]:
         diagnostics.append(
             _setting_diagnostic("poll_service", "must expose create() and get()")
         )
+    clip_service = settings.get("clip_service")
+    if clip_service is not None and not all(
+        callable(getattr(clip_service, name, None)) for name in ("create", "lookup")
+    ):
+        diagnostics.append(
+            _setting_diagnostic("clip_service", "must expose create() and lookup()")
+        )
+    moderation_service = settings.get("moderation_service")
+    if moderation_service is not None and not (
+        callable(getattr(moderation_service, "apply", None))
+        and callable(getattr(moderation_service, "round_duration", None))
+        and isinstance(getattr(moderation_service, "operations", None), (set, frozenset))
+    ):
+        diagnostics.append(
+            _setting_diagnostic(
+                "moderation_service",
+                "must expose operations, round_duration() and apply()",
+            )
+        )
+    if settings.get("notices") is not None:
+        diagnostics.extend(_validate_notices(settings["notices"]))
+    if "services" in settings:
+        diagnostics.extend(_validate_services(settings["services"]))
     return diagnostics
+
+
+def _validate_notices(notices: Any) -> list[str]:
+    if not isinstance(notices, Mapping):
+        return [_setting_diagnostic("notices", "must be a mapping")]
+    kinds = notices.get("kinds")
+    if kinds is None:
+        return []
+    if (
+        isinstance(kinds, str)
+        or not isinstance(kinds, (list, tuple))
+        or any(kind not in PLATFORM_NOTICE_KINDS for kind in kinds)
+    ):
+        return [
+            _setting_diagnostic(
+                "notices.kinds", "must be a list of community-notice kinds"
+            )
+        ]
+    if len(set(kinds)) != len(kinds):
+        return [_setting_diagnostic("notices.kinds", "must be unique")]
+    return []
+
+
+def _validate_services(services: Any) -> list[str]:
+    if (
+        isinstance(services, str)
+        or not isinstance(services, (list, tuple))
+        or any(kind not in SERVICE_KINDS for kind in services)
+    ):
+        return [
+            _setting_diagnostic("services", "must be a list of poll, clip, moderation")
+        ]
+    if len(set(services)) != len(services):
+        return [_setting_diagnostic("services", "must be unique")]
+    return []
 
 
 def _validate_feed(feed: Any, channels: set[str]) -> list[str]:
@@ -490,7 +679,21 @@ def _validate_message(message: Any, channels: set[str], label: str) -> list[str]
         )
     if not isinstance(message.get("text"), str):
         diagnostics.append(_setting_diagnostic(f"{label}.text", "must be a string"))
-    diagnostics.extend(_validate_author(message.get("author"), f"{label}.author"))
+    kind = EVENT_KIND_DEFAULT
+    try:
+        kind = validate_event_kind(message.get("kind"), f"{label}.kind")
+    except Exception:
+        diagnostics.append(_setting_diagnostic(f"{label}.kind", "must be an event kind"))
+    else:
+        if kind != EVENT_KIND_DEFAULT and kind not in PLATFORM_NOTICE_KINDS:
+            diagnostics.append(
+                _setting_diagnostic(f"{label}.kind", "is not a platform notice kind")
+            )
+    author = message.get("author")
+    if author is None and kind in PLATFORM_NOTICE_KINDS:
+        # An authorless notice (an anonymous gift): fed, never admitted.
+        return diagnostics
+    diagnostics.extend(_validate_author(author, f"{label}.author"))
     return diagnostics
 
 
@@ -550,12 +753,14 @@ class _Message:
     """One fed or injected message, normalised exactly once (R3)."""
 
     channel_id: str
-    author_id: str
+    author_id: str | None
     display_name: str | None
     roles: tuple[str, ...] | None
     roles_provenance: str | None
     message_id: str
     text: str
+    kind: str = EVENT_KIND_DEFAULT
+    """``message``, or the community-notice kind (published as ``payload.kind``)."""
 
     @classmethod
     def from_mapping(cls, value: Any) -> "_Message":
@@ -571,8 +776,9 @@ class _Message:
         diagnostics = _validate_message(value, set(), "message")
         if diagnostics:
             raise ValueError(diagnostics[0])
-        author = value["author"]
-        if isinstance(author, str):
+        author = value.get("author")
+        kind = validate_event_kind(value.get("kind"), "message.kind")
+        if author is None or isinstance(author, str):
             return cls(
                 channel_id=value["channel_id"],
                 author_id=author,
@@ -581,6 +787,7 @@ class _Message:
                 roles_provenance=None,
                 message_id=value["message_id"],
                 text=value["text"],
+                kind=kind,
             )
         roles = author.get("roles")
         return cls(
@@ -591,6 +798,7 @@ class _Message:
             roles_provenance=author.get("roles_provenance"),
             message_id=value["message_id"],
             text=value["text"],
+            kind=kind,
         )
 
     def with_message_id(self, message_id: str) -> "_Message":
@@ -602,26 +810,43 @@ class _Message:
             roles_provenance=self.roles_provenance,
             message_id=message_id,
             text=self.text,
+            kind=self.kind,
         )
+
+    @property
+    def anonymous(self) -> bool:
+        """A notice without a trusted author: fed, never evaluated or admitted."""
+
+        return self.author_id is None
+
+    @property
+    def fed_author(self) -> str:
+        """The author the chat context and the bus see."""
+
+        return ANONYMOUS_AUTHOR if self.author_id is None else self.author_id
 
     def event(self) -> dict[str, Any]:
         """The schema-version-2 bus event this message normalises to."""
 
-        author: dict[str, Any] = {"id": self.author_id}
+        author: dict[str, Any] = {"id": self.fed_author}
         if self.display_name is not None:
             author["display_name"] = self.display_name
         if self.roles is not None and self.roles_provenance is not None:
             author["roles"] = list(self.roles)
             author["roles_provenance"] = self.roles_provenance
+        payload: dict[str, Any] = {
+            "platform": PLATFORM,
+            "channel_id": self.channel_id,
+            "author": author,
+            "message_id": self.message_id,
+            "text": self.text,
+        }
+        if self.kind != EVENT_KIND_DEFAULT:
+            # Only a notice carries a kind: a message stays the phase 2 shape.
+            payload["kind"] = self.kind
         return {
             "type": CHAT_EVENT,
-            "payload": {
-                "platform": PLATFORM,
-                "channel_id": self.channel_id,
-                "author": author,
-                "message_id": self.message_id,
-                "text": self.text,
-            },
+            "payload": payload,
             "metadata": {
                 "source": MODULE_NAME,
                 "schema_version": NORMALIZED_SCHEMA_VERSION,
@@ -644,6 +869,8 @@ class _Settings:
     companion_name: str
     feed_messages: tuple[_Message, ...]
     after_event: str | None
+    notice_kinds: frozenset[str] = frozenset()
+    services: tuple[str, ...] = DEFAULT_SERVICES
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
@@ -658,6 +885,8 @@ class _Settings:
                 _Message.from_mapping(message) for message in feed.get("messages", ())
             ),
             after_event=feed.get("after_event"),
+            notice_kinds=frozenset((settings.get("notices") or {}).get("kinds") or ()),
+            services=tuple(settings.get("services", DEFAULT_SERVICES)),
         )
 
 
@@ -684,8 +913,17 @@ class FakePlatform:
         settings: _Settings,
         reporter: Any,
         poll_service: Any = None,
+        clip_service: Any = None,
+        moderation_service: Any = None,
     ) -> None:
         self._poll_service = poll_service
+        self._clip_service = clip_service
+        self._moderation_service = moderation_service
+        self._counts = {COUNT_INVALID: 0, COUNT_NOTICES_IGNORED: 0}
+        self._notice_sequence = 0
+        # Anonymous notices skip the trigger engine, hence its dedup window:
+        # their reception dedup is kept here, bounded like the engine's.
+        self._anonymous_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._bus = context.bus
         self._tasks = context.tasks
         self._actions = context.actions
@@ -715,6 +953,25 @@ class FakePlatform:
         """The poll service ``activate`` publishes under ``(poll, fake)``."""
 
         return self._poll_service
+
+    @property
+    def clip_service(self) -> Any:
+        """The service published under ``(clip, fake)`` when ``services`` lists it."""
+
+        return self._clip_service
+
+    @property
+    def moderation_service(self) -> Any:
+        """The service published under ``(moderation, fake)`` when listed."""
+
+        return self._moderation_service
+
+    @property
+    def counts(self) -> Mapping[str, int]:
+        """Reception refusals: ``invalid`` (a reserved author) and
+        ``notices_ignored`` (a notice kind not listed in ``notices.kinds``)."""
+
+        return dict(self._counts)
 
     @property
     def transports(self) -> Mapping[str, FakeChatTransport]:
@@ -869,14 +1126,52 @@ class FakePlatform:
             raise FakePlatformError(f"fakeplatform inject: {exc}") from None
         return await self._drive(parsed)
 
+    async def inject_notice(
+        self,
+        kind: str,
+        author: Any,
+        text: str = "",
+        *,
+        channel_id: str | None = None,
+        message_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Drive one scripted notice ``{kind, author|None, text}`` through reception.
+
+        *author* is an identifier, an author mapping, or ``None`` (an
+        anonymous notice). The channel defaults to the first configured one
+        and the identifier to a fresh ``notice-<n>``.
+        """
+
+        self._notice_sequence += 1
+        return await self.inject(
+            {
+                "channel_id": self._settings.channel_ids[0] if channel_id is None else channel_id,
+                "author": author,
+                "message_id": (
+                    f"notice-{self._notice_sequence}" if message_id is None else message_id
+                ),
+                "text": text,
+                "kind": kind,
+            }
+        )
+
     async def _drive(self, message: _Message) -> dict[str, Any] | None:
         """Normalise, dedup, feed, decide, publish, trace, admit (R1 order)."""
 
         if message.channel_id not in self._settings.channel_ids:
             self._diagnose("fakeplatform reception: unconfigured channel")
             return None
+        if message.author_id is not None and RESERVED_SEPARATOR in message.author_id:
+            # A reserved identity (R6): refused before anything else happens.
+            self._counts[COUNT_INVALID] += 1
+            self._diagnose("fakeplatform reception: reserved author identity refused")
+            return None
+        if message.kind != EVENT_KIND_DEFAULT and message.kind not in self._settings.notice_kinds:
+            self._counts[COUNT_NOTICES_IGNORED] += 1
+            return None
 
-        engine = self._triggers
+        # An authorless notice is fed and published, never evaluated (decision 3).
+        engine = None if message.anonymous else self._triggers
         async with self._publish_lock:
             if engine is not None and engine.recorded(
                 platform=PLATFORM,
@@ -884,6 +1179,13 @@ class FakePlatform:
                 source_event_id=message.message_id,
             ) is not None:
                 return None
+            if engine is None and message.anonymous:
+                seen_key = (message.channel_id, message.message_id)
+                if seen_key in self._anonymous_seen:
+                    return None
+                self._anonymous_seen[seen_key] = None
+                while len(self._anonymous_seen) > ANONYMOUS_DEDUP_MAX_ENTRIES:
+                    self._anonymous_seen.popitem(last=False)
             event = message.event()
             self._feed_chat_context(message)
             decision = None
@@ -923,7 +1225,7 @@ class FakePlatform:
                 PLATFORM,
                 message.channel_id,
                 ChatEntry(
-                    author_id=message.author_id,
+                    author_id=message.fed_author,
                     message_id=message.message_id,
                     text=message.text,
                 ),
@@ -1136,12 +1438,28 @@ async def activate(
         poll_service = poll_service_for(PLATFORM)
     else:
         POLL_SERVICES[PLATFORM] = poll_service
-    # Published only on a bound registry (R7); a duplicate key is not caught
-    # and fails activation (AC25).
+    clip_service = settings.get("clip_service") or FakeClipService()
+    moderation_service = settings.get("moderation_service") or FakeModerationService()
+    offered = {
+        POLL_SERVICE_KIND: poll_service,
+        CLIP_SERVICE_KIND: clip_service,
+        MODERATION_SERVICE_KIND: moderation_service,
+    }
+    # Published only on a bound registry (R7), only the kinds ``services``
+    # lists; a duplicate key is not caught and fails activation (AC25).
     services = getattr(context, "services", None)
     if services is not None and getattr(services, "available", False) is True:
-        services.publish(POLL_SERVICE_KIND, PLATFORM, poll_service)
-    return FakePlatform(context, parsed, reporter, poll_service)
+        for kind in SERVICE_KINDS:
+            if kind in parsed.services:
+                services.publish(kind, PLATFORM, offered[kind])
+    return FakePlatform(
+        context,
+        parsed,
+        reporter,
+        poll_service,
+        clip_service if CLIP_SERVICE_KIND in parsed.services else None,
+        moderation_service if MODERATION_SERVICE_KIND in parsed.services else None,
+    )
 
 
 def _declared_chat_write_spec() -> ActionSpec:

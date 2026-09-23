@@ -68,11 +68,28 @@ settings_schema:
                   The viewer identifier, or an object `{id, display_name?,
                   roles?, roles_provenance?}`; roles are published on the
                   event and offered to the trigger engine as provenance-tagged
-                  claims only together with `roles_provenance`.
+                  claims only together with `roles_provenance`. Null only on
+                  a notice: an anonymous one, fed under `system:anonymous`
+                  and never admitted. An identifier containing `:` is refused
+                  and counted as invalid.
               message_id:
                 type: string
               text:
                 type: string
+              kind:
+                type: string
+                enum:
+                  - message
+                  - sub
+                  - resub
+                  - sub_gift
+                  - community_sub_gift
+                  - raid
+                  - follow
+                  - tip
+                description: >-
+                  Absent means `message`; a community-notice kind is
+                  published as `payload.kind` when `notices.kinds` lists it.
             required:
               - channel_id
               - author
@@ -86,6 +103,39 @@ settings_schema:
       required:
         - messages
       additionalProperties: false
+    notices:
+      type: object
+      description: >-
+        Community notices (R1). A scripted notice whose kind is not listed is
+        ignored and counted; a listed one is fed, trigger-evaluated and
+        admitted like a message.
+      properties:
+        kinds:
+          type: array
+          description: The notice kinds this platform ingests (default none).
+          items:
+            type: string
+            enum:
+              - sub
+              - resub
+              - sub_gift
+              - community_sub_gift
+              - raid
+              - follow
+              - tip
+      additionalProperties: false
+    services:
+      type: array
+      description: >-
+        The runtime services published for platform `fake` on a bound
+        registry. Absent means `[poll]`, the phase 2 registry shape; list
+        `clip` and `moderation` to publish the scripted phase 3 services.
+      items:
+        type: string
+        enum:
+          - poll
+          - clip
+          - moderation
   required:
     - channel_ids
     - companion_name
@@ -134,6 +184,27 @@ triggers:
               type: string
         required:
           - keywords
+        additionalProperties: false
+    - name: event_kind
+      parameter_schema:
+        type: object
+        properties:
+          kinds:
+            type: array
+            items:
+              type: string
+              enum:
+                - message
+                - sub
+                - resub
+                - sub_gift
+                - community_sub_gift
+                - raid
+                - follow
+                - tip
+                - watch_tick
+        required:
+          - kinds
         additionalProperties: false
   combinations:
     - all_of
