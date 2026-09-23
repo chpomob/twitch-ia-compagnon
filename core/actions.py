@@ -135,6 +135,7 @@ __all__ = [
     "ERROR_UNKNOWN_ACTION",
     "ERROR_UNSUPPORTED_DESTINATION",
     "ERROR_VERSION_MISMATCH",
+    "PROVENANCE_TRACE_FIELDS",
     "REASON_NO_RULE",
     "REASON_MISSING_PERMISSION",
     "REASON_RULE_MATCHED",
@@ -197,6 +198,17 @@ EMISSION_EMITTED = "emitted"
 """The provider stated that the effect may already have been emitted."""
 
 EMISSION_STATES = frozenset({EMISSION_UNKNOWN, EMISSION_NOT_EMITTED, EMISSION_EMITTED})
+
+PROVENANCE_TRACE_FIELDS = "trace_fields"
+"""Provenance key under which a provider names extra ``action.completed`` fields.
+
+Its value is a mapping of scalar values (``str``, ``int``, ``float``, ``bool``
+or ``None``) copied into the trace payload — a clip call's ``clip_id``, say.
+A name the executor already sets is never overridden, and any other value is
+dropped, so a provider can add to the trace but never rewrite it.
+"""
+
+_TRACE_FIELD_TYPES = (str, int, float, bool, type(None))
 
 # --------------------------------------------------------------------------- #
 # Normalised error codes
@@ -1747,21 +1759,31 @@ class ActionExecutor:
         self._record(call.call_id, observation)
 
         duration = observation.provenance.get("duration_seconds", self._duration(started_at))
+        payload: dict[str, Any] = {
+            "action": call.action_name,
+            "action_version": call.action_version,
+            "provider": observation.provenance.get("provider"),
+            "call_id": call.call_id,
+            "run_id": call.run_id,
+            "conversation_id": call.conversation_id,
+            "destination": str(call.destination),
+            "status": observation.status,
+            "duration_seconds": duration,
+            "error_code": (observation.error or {}).get("code"),
+        }
+        extra = observation.provenance.get(PROVENANCE_TRACE_FIELDS)
+        if isinstance(extra, Mapping):
+            for name, value in extra.items():
+                if (
+                    isinstance(name, str)
+                    and name not in payload
+                    and isinstance(value, _TRACE_FIELD_TYPES)
+                ):
+                    payload[name] = value
         await self._record_and_emit(
             lambda: self._record(call.call_id, observation),
             TRACE_ACTION_COMPLETED,
-            {
-                "action": call.action_name,
-                "action_version": call.action_version,
-                "provider": observation.provenance.get("provider"),
-                "call_id": call.call_id,
-                "run_id": call.run_id,
-                "conversation_id": call.conversation_id,
-                "destination": str(call.destination),
-                "status": observation.status,
-                "duration_seconds": duration,
-                "error_code": (observation.error or {}).get("code"),
-            },
+            payload,
         )
         # The value returned is the value recorded, whatever the trace did.
         return self._outcomes.get(call.call_id, observation)

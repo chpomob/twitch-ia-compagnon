@@ -39,6 +39,7 @@ from core.actions import (
     ERROR_PROVIDER_NOT_READY,
     ERROR_TIMED_OUT,
     ERROR_UNKNOWN_ACTION,
+    PROVENANCE_TRACE_FIELDS,
     REASON_NO_RULE,
     ActionExecutor,
     ActionRegistry,
@@ -1136,6 +1137,40 @@ async def test_replaying_a_recorded_call_id_reaches_zero_providers():
     assert second is first
     assert len(provider.calls) == 1
     assert len(harness.bus.of_type(TRACE_ACTION_COMPLETED)) == 1
+
+
+async def test_provider_trace_fields_add_to_the_completed_trace_but_never_rewrite_it():
+    """A provider's ``trace_fields`` provenance adds scalar fields to
+    ``action.completed``; an executor-owned name or a non-scalar is dropped."""
+
+    def with_trace_fields(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        return ActionObservation(
+            status="success",
+            provenance={
+                "transport": "fake",
+                PROVENANCE_TRACE_FIELDS: {
+                    "clip_id": "clip-7",
+                    "status": "error",
+                    "nested": {"no": "thanks"},
+                },
+            },
+            result={"message_id": "m-1"},
+        )
+
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    harness.bind(WRITE_SPEC, Provider("sender", with_trace_fields))
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    observation = await harness.executor.invoke(make_call(WRITE_SPEC))
+
+    assert observation.status == "success"
+    [completed] = harness.bus.of_type(TRACE_ACTION_COMPLETED)
+    assert completed["clip_id"] == "clip-7"
+    assert completed["status"] == "success"
+    assert "nested" not in completed
 
 
 async def test_every_invocation_emits_started_and_completed_with_the_correlation():

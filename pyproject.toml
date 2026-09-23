@@ -46,6 +46,7 @@ modules = ["*/module.yaml"]
 "modules.audio_output" = ["module.yaml"]
 "modules.audio_input" = ["module.yaml"]
 "modules.stream_control" = ["module.yaml"]
+"modules.clips" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

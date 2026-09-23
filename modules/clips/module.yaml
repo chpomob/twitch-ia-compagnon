@@ -1,0 +1,102 @@
+# Live clips — manifest v2 (phase 3 R2).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no grant lives here. The one action,
+# `stream.clip.create`, is a `write` served through the `clip` service each
+# platform module publishes in the runtime service registry: it is bound for
+# a platform iff that platform published one. No platform name appears here.
+
+name: clips
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# Action-driven: nothing is published and nothing is consumed.
+produces: []
+consumes: []
+middleware: false
+
+# No lifecycle role: the handle takes part in `prepare` (resolve the clip
+# services, bind, mark ready), `drain` (end the calls in flight) and `close`
+# (withdraw readiness).
+lifecycle:
+  roles: []
+
+# The per-channel cooldown and waiting line, and the `required` policy (R2).
+# The shapes are checked by the declared hook, one value-free diagnostic per
+# field. No setting shortens a call's deadline. The reserved `limits` block the
+# entry point hands every enabled module is accepted and not read.
+settings_schema:
+  type: object
+  properties:
+    min_interval_seconds:
+      type: integer
+      minimum: 5
+      maximum: 3600
+      description: >-
+        The least time, on the runtime clock, between two create requests on
+        one channel; an earlier call is refused `cooldown` with 0 requests.
+        Default 30.
+    max_waiters:
+      type: integer
+      minimum: 1
+      maximum: 64
+      description: >-
+        How many calls may wait behind the one in flight on one channel before
+        one more is refused `resource_busy`. Default 4.
+    required:
+      type: boolean
+      description: >-
+        Whether startup fails when no enabled platform publishes a clip
+        service (true) or continues with the action unbound (false).
+        Default false.
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point to every
+        enabled module. Not read here: this module owns its own bounds.
+settings_validator: validate_settings
+
+actions:
+  - name: stream.clip.create
+    version: 1
+    description: >-
+      Create one clip of the live stream on the destination's channel. At most
+      one create request is sent per call; success means the platform lists
+      the new clip within 15 seconds of accepting the request.
+    # No arguments: the destination names the channel.
+    argument_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+    result_schema:
+      type: object
+      properties:
+        clip_id:
+          type: string
+          description: The platform's identifier of the clip.
+        url:
+          type: string
+          description: Where the clip can be watched.
+        confirmed_at:
+          type: number
+          description: When the lookup found the clip, on the runtime clock.
+      required:
+        - clip_id
+        - url
+        - confirmed_at
+      additionalProperties: false
+    nature: write
+    required_permissions:
+      - stream.clip
+    supported_destinations:
+      - platform: "*"
+        channel_id: "*"
+        scope: clip
+    timeout_seconds: 20
+    # Creating twice makes two clips.
+    idempotency: none
+    # Effect-only delivery: the answer text is not passed.
+    delivery:
+      text_argument: none

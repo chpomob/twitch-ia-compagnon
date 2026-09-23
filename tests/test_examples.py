@@ -104,6 +104,7 @@ MODULE_NAMES = (
     "audio_output",
     "audio_input",
     "stream_control",
+    "clips",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -322,6 +323,16 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": []},
         "settings_validator": "validate_settings",
     },
+    "clips": {
+        "name": "clips",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": [],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": []},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
 # R8): only the chat input declares triggers; the input and the six
@@ -340,6 +351,7 @@ DECLARATION_KEYS = {
     "audio_output": {"actions", "credentials"},
     "audio_input": {"actions", "credentials"},
     "stream_control": {"actions", "credentials"},
+    "clips": {"actions"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -350,6 +362,7 @@ DECLARED_ACTIONS = {
     "audio_input": {"audio.capture"},
     "audio_output": {"audio.speak", "audio.play"},
     "stream_control": {"stream.scene.set", "stream.poll.create"},
+    "clips": {"stream.clip.create"},
 }
 
 #: The credentials each manifest declares, by dotted setting path (R8).
@@ -487,7 +500,9 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     """R7 supersedes the former whole-manifest equality (allowlisted); phase
     2's R9 extends the catalog from 8 to 11 manifests (allowlisted); phase
     3's R1 adds the ``notices`` setting and the ``event_kind`` trigger type to
-    ``twitch`` (allowlisted, plan decision 11).
+    ``twitch`` (allowlisted, plan decision 11); phase 3's R2 adds the
+    ``clips`` manifest and its ``stream.clip.create`` (allowlisted, running
+    value of plan step P9: 12 manifests, 10 action names).
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -505,7 +520,7 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 11
+    assert len(names) == 12
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():
@@ -551,10 +566,12 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     for module_name in ("proxy", "agent_link"):
         assert "actions" not in manifests[module_name]
     declared = set().union(*DECLARED_ACTIONS.values())
-    assert declared == PROVIDED_ACTIONS["pc"]
-    assert len(declared) == 9
+    # Phase 3 R2 (plan P9): `clips` is shipped and enabled by no phase 2
+    # profile, so the catalog is the PC profile's set plus its one action.
+    assert declared == PROVIDED_ACTIONS["pc"] | {"stream.clip.create"}
+    assert len(declared) == 10
     # The catalog's actions are declared once each, by one manifest.
-    assert sum(len(names) for names in DECLARED_ACTIONS.values()) == 9
+    assert sum(len(names) for names in DECLARED_ACTIONS.values()) == 10
 
 
 @pytest.mark.parametrize("profile", sorted(PROFILES))
@@ -1450,7 +1467,8 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
     with 1 send; its registered-ready view is exactly {``chat.read``,
     ``users.read``, ``screen.capture``, ``chat.write``} and the brain offers
     no phase 2 action, while the catalog of discovered manifests declares
-    the 9 actions."""
+    the 10 actions — phase 3's R2 adds ``stream.clip.create`` to the 9 of
+    phase 2 (allowlisted, running value of plan step P9)."""
 
     path = _chat_only_profile(tmp_path)
     environ = _phase1_environ(path)
@@ -1469,8 +1487,8 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
         assert set(started.registry.registered_ready()) == PHASE1_ACTIONS
         assert set(started.registry.discovered()) == PHASE1_ACTIONS
         catalog = started.catalog_actions()
-        assert len(catalog) == 9
-        assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS
+        assert len(catalog) == 10
+        assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS | {"stream.clip.create"}
 
         completed = await started.chat_scenario()
         _assert_the_chat_scenario_ran(started, completed)
