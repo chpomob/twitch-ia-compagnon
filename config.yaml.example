@@ -1,5 +1,6 @@
-# The PC profile (R7): one process on the streaming PC runs the chat input,
-# the brain, the local capture and the observation modules. Copy this file
+# The PC profile (R7, R9): one process on the streaming PC runs the chat
+# input, the brain, the local capture, the audio capture and playback, the
+# stream control and the observation modules. Copy this file
 # to config.yaml, export the referenced environment variables, then run:
 #   python -m core.main --config config.yaml
 # or, once installed, `twitch-ia-compagnon --config config.yaml`; validate
@@ -18,12 +19,20 @@
 modules_directory: ./modules
 
 # Every module enabled here is activated, in this order, through its
-# manifest; the set below is what makes this the PC profile.
+# manifest; the set below is what makes this the PC profile. The three phase 2
+# modules (`audio_input`, `audio_output`, `stream_control`) are optional: each
+# ships with `required: false`, so a dependency that is unavailable at startup
+# leaves its actions unbound — reported once as `module.degraded`, never
+# offered to the brain — and startup continues (R8). Removing the three lines
+# gives the chat-only profile, which behaves exactly as phase 1.
 enabled_modules:
   - twitch
   - chat_context
   - users
   - capture
+  - audio_input
+  - audio_output
+  - stream_control
   - brain
   - audit
 
@@ -79,6 +88,99 @@ modules:
     # on every object it retains.
     max_bytes: 1048576
 
+  # The on-demand audio capture the brain reads through `audio.capture` (R3):
+  # one bounded segment per call, PCM 16-bit, 16 000 Hz, mono, stored in the
+  # run's attachment store and returned by reference. Nothing is recorded in
+  # the background. A `command` source runs `argv` at the call and takes the
+  # WAV it writes on standard output, stopped once the requested duration is
+  # recorded; a `file` source (`kind: file`, `path: <wav>`) re-reads one WAV.
+  audio_input:
+    sources:
+      mic:
+        kind: command
+        # AUDIO_RECORDER names a program writing a 16 kHz mono 16-bit WAV to
+        # standard output until it is stopped; replace "-" with the options
+        # your recorder needs for that format. A program that does not
+        # resolve to an executable leaves `audio.capture` unbound (R8).
+        argv:
+          - ${AUDIO_RECORDER}
+          - "-"
+    default_source: mic
+    # The optional transcription of each stored segment. No provider is
+    # assumed (AC43): while `endpoint` is empty nothing is sent, the
+    # transcription is reported unavailable and every capture still succeeds
+    # with its audio reference. Set the endpoint, the model and — when the
+    # service needs one — the key (an environment reference, e.g.
+    # `api_key: ${TRANSCRIPTION_API_KEY}`) to enable it.
+    transcription:
+      enabled: true
+      endpoint: ""
+      model: ""
+      api_key: ""
+    required: false
+
+  # Speech and clip playback through `audio.speak` and `audio.play` (R1).
+  # Speech is synthesised by an HTTP endpoint answering a WAV; each output is
+  # a player command fed the whole WAV on its standard input; success means
+  # the player consumed the whole segment and exited normally.
+  audio_output:
+    # No provider is assumed (AC43): while `endpoint` is empty no request is
+    # sent, `audio.speak` stays unbound and is named not ready at startup,
+    # and `audio.play` still plays the configured clips. Set the endpoint,
+    # the model and — when the service needs one — the key (an environment
+    # reference, e.g. `api_key: ${SPEECH_API_KEY}`) to enable speech.
+    synthesis:
+      endpoint: ""
+      model: ""
+      api_key: ""
+    # The voices a call may name — names the synthesis service accepts — and
+    # the one used when it names none.
+    voices:
+      allowed:
+        - default
+      default: default
+    outputs:
+      default:
+        player:
+          # AUDIO_PLAYER names a program playing the WAV it reads on standard
+          # input; replace "-" with the options your player needs for that. A
+          # program that does not resolve to an executable leaves both audio
+          # actions unbound (R8).
+          argv:
+            - ${AUDIO_PLAYER}
+            - "-"
+    default_output: default
+    # The clips `audio.play` may name: each a WAV file on this machine,
+    # re-read at each call.
+    clips:
+      chime:
+        path: ${AUDIO_CHIME_PATH}
+    required: false
+
+  # Stream scenes and platform polls through `stream.scene.set` and
+  # `stream.poll.create` (R6, R7). The scene provider is the broadcast
+  # software's websocket interface (protocol version 5): `ws://` is accepted
+  # on a loopback host only, `wss://` anywhere. An unreachable provider at
+  # startup leaves `stream.scene.set` unbound (R8).
+  stream_control:
+    scenes:
+      provider:
+        kind: websocket
+        url: ${SCENE_WEBSOCKET_URL}
+        # Declared as a credential by the manifest: redacted from every trace.
+        password: ${SCENE_WEBSOCKET_PASSWORD}
+      # The scenes a call may switch to, by their exact names.
+      allowed:
+        - Main
+        - Break
+    # Polls are created through the poll service the platform module
+    # publishes. Off here: enable them once the platform token carries the
+    # poll scope; with polls enabled and no service published,
+    # `stream.poll.create` stays unbound (R8).
+    polls:
+      enabled: false
+    required: false
+
   brain:
     endpoint: ${OPENAI_ENDPOINT}
     model: ${OPENAI_MODEL}
@@ -130,11 +232,15 @@ modules:
     # ready (R2): `structured_output` (mandatory — the loop needs one tool
     # call or a final text per turn) and `vision` (the model accepts image
     # observations, such as a screen capture). A capability the backend does
-    # not verify stops startup naming it.
+    # not verify stops startup naming it. `audio` (the model accepts audio
+    # observations, such as an `audio.capture` segment) is verified the same
+    # way when listed; without it a captured segment reaches the model as its
+    # transcription only.
     capabilities:
       required:
         - structured_output
         - vision
+        # - audio
     # The terminal delivery step (R1): the ordered list of actions the final
     # answer is handed to, one authorized executor call per entry, resolved
     # against the enabled modules at startup. `mode: fixed` lists the entries
@@ -144,6 +250,10 @@ modules:
     # enabled action that declares a delivery capability, ordered by an
     # optional `preference` list; `overrides` keyed `<platform>/<channel_id>`
     # select another list per destination.
+    # Speaking the answer too is one more entry, once a synthesis endpoint
+    # is configured above and `audio.speak` is bound:
+    #   - action: audio.speak
+    #     text_argument: text
     delivery:
       mode: fixed
       actions:
@@ -166,7 +276,8 @@ modules:
 
 # Redaction (R8). The credentials proper need no entry here: each module's
 # manifest declares which of its settings are credentials (`credentials:` in
-# modules/twitch/module.yaml and modules/brain/module.yaml), and their
+# modules/twitch/module.yaml, modules/brain/module.yaml and the three phase 2
+# manifests), and their
 # accepted values — literal or resolved — are redacted from every supervision
 # trace and every lost-trace diagnostic before any module is activated,
 # whether or not this block exists. This optional block adds references the
@@ -216,11 +327,14 @@ triggers:
 # writes — and the provider is never invoked for a refused call. Declaring
 # an action in a module manifest grants nothing by itself, and the executor
 # re-evaluates these rules on every call, so removing a rule below refuses
-# the very next call of its action. The four rules grant exactly the
+# the very next call of its action. The nine rules grant exactly the
 # provided-action set of this profile — the actions the enabled manifests
 # declare — to the brain's principal on the served channel: the reads on the
-# channel's `chat` scope, the capture on its `capture` scope, the reply
-# delivery on `chat` (R7).
+# channel's `chat` scope, the screen capture on its `capture` scope, the
+# audio capture and the two playbacks on `audio`, the scene change on
+# `stream`, the poll on `poll`, the reply delivery on `chat` (R7, R9). A rule
+# grants; it binds nothing: an action whose module left it unbound is still
+# refused `provider_not_ready` and never offered to the model (R8).
 actions:
   # The retained transcript of the served channel.
   - rule_id: brain-reads-chat
@@ -261,6 +375,71 @@ actions:
       - read
     granted_permissions:
       - screen.capture
+  # One bounded audio segment, addressed on the served channel's `audio` scope.
+  - rule_id: brain-captures-audio
+    action_name: audio.capture
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - audio.capture
+  # Speech on a configured output, as a tool or as a delivery entry.
+  - rule_id: brain-speaks
+    action_name: audio.speak
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.speak
+  # A configured clip on a configured output.
+  - rule_id: brain-plays-clips
+    action_name: audio.play
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.play
+  # A switch to an allowed scene, on the served channel's `stream` scope.
+  - rule_id: brain-sets-scenes
+    action_name: stream.scene.set
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: stream
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.scene
+  # One poll on the served channel, on its `poll` scope.
+  - rule_id: brain-creates-polls
+    action_name: stream.poll.create
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: poll
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.poll
   # The reply delivery the brain module asks for, on the served channel.
   - rule_id: brain-delivers-chat-replies
     action_name: chat.write

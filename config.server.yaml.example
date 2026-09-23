@@ -1,7 +1,8 @@
-# The server profile (R7): the brain, the chat input and the observation
-# modules run on a server; the screen is captured on the streaming PC by the
-# agent profile (agent.yaml.example), which dials the `proxy` module below
-# and lends it `screen.capture`. Copy this file to config.yaml, export the
+# The server profile (R7, R9): the brain, the chat input, the platform polls
+# and the observation modules run on a server; the screen and the audio are
+# captured, the audio played and the scenes switched on the streaming PC by
+# the agent profile (agent.yaml.example), which dials the `proxy` module below
+# and lends it the five device actions. Copy this file to config.yaml, export the
 # referenced environment variables, then run:
 #   python -m core.main --config config.yaml
 # or, once installed, `twitch-ia-compagnon --config config.yaml`; validate
@@ -21,11 +22,14 @@ modules_directory: ./modules
 
 # Every module enabled here is activated, in this order, through its
 # manifest; the set below is what makes this the server profile: no
-# `capture`, and `proxy` serving `screen.capture` from the paired agent.
+# `capture`, `audio_input` or `audio_output`, `stream_control` serving the
+# platform polls only, and `proxy` serving the five device actions from the
+# paired agent.
 enabled_modules:
   - twitch
   - chat_context
   - users
+  - stream_control
   - brain
   - audit
   - proxy
@@ -56,6 +60,21 @@ modules:
     max_channels: 8
     max_users_per_channel: 500
     max_age_seconds: 3600
+
+  # Platform polls through `stream.poll.create` (R7), created through the
+  # poll service the `twitch` module publishes with its own credential (the
+  # token must carry the poll scope). No scene provider runs here (`kind:
+  # none`): `stream.scene.set` is only declared, so the `proxy` below serves
+  # it from the agent, which switches the scenes on the PC (R6). With polls
+  # enabled and no service published, `stream.poll.create` stays unbound and
+  # startup continues (`required: false`, R8).
+  stream_control:
+    scenes:
+      provider:
+        kind: none
+    polls:
+      enabled: true
+    required: false
 
   brain:
     endpoint: ${OPENAI_ENDPOINT}
@@ -108,11 +127,15 @@ modules:
     # ready (R2): `structured_output` (mandatory — the loop needs one tool
     # call or a final text per turn) and `vision` (the model accepts image
     # observations, such as a screen capture). A capability the backend does
-    # not verify stops startup naming it.
+    # not verify stops startup naming it. `audio` (the model accepts audio
+    # observations, such as an `audio.capture` segment) is verified the same
+    # way when listed; without it a captured segment reaches the model as its
+    # transcription only.
     capabilities:
       required:
         - structured_output
         - vision
+        # - audio
     # The terminal delivery step (R1): the ordered list of actions the final
     # answer is handed to, one authorized executor call per entry, resolved
     # against the enabled modules at startup. `mode: fixed` lists the entries
@@ -122,6 +145,10 @@ modules:
     # enabled action that declares a delivery capability, ordered by an
     # optional `preference` list; `overrides` keyed `<platform>/<channel_id>`
     # select another list per destination.
+    # Speaking the answer too is one more entry, once the agent's synthesis
+    # endpoint is configured and `audio.speak` is served:
+    #   - action: audio.speak
+    #     text_argument: text
     delivery:
       mode: fixed
       actions:
@@ -142,14 +169,16 @@ modules:
       max_records: 1000
       max_bytes: 4194304
 
-  # The brain side of the remote capture (R6, decision 7). The module listens
-  # for exactly one agent, which pairs with the token below and lends the
-  # actions the `actions` allowlist names: the spec of each comes from the
-  # manifest catalog (here `modules/capture/module.yaml`, discovered but not
-  # enabled), the provider is the paired agent, and the brain calls the
-  # executor exactly as it does for a local provider — enabling `capture`
-  # together with this allowlist fails startup with the ambiguity diagnostic
-  # naming both providers (AC41). A listener on a non-loopback host must be
+  # The brain side of the remote device actions (R6, decision 7; R5, R9). The
+  # module listens for exactly one agent, which pairs with the token below and
+  # lends the actions the `actions` allowlist names: the spec of each comes
+  # from the manifest catalog (`modules/capture`, `modules/audio_input`,
+  # `modules/audio_output` and `modules/stream_control`, all discovered, the
+  # last enabled here for its polls only), the provider is the paired agent,
+  # and the brain calls the executor exactly as it does for a local provider
+  # — enabling `capture` (or `audio_input`, `audio_output`, or a scene
+  # provider in `stream_control`) together with this allowlist fails startup
+  # with the ambiguity diagnostic naming both providers (AC41). A listener on a non-loopback host must be
   # TLS: `tls` names the certificate and key files; `ws://` is accepted on
   # loopback only (`host: 127.0.0.1`, `tls` removed).
   proxy:
@@ -165,6 +194,10 @@ modules:
     # The actions the paired agent may lend, and the only ones bound to it.
     actions:
       - screen.capture
+      - audio.capture
+      - audio.speak
+      - audio.play
+      - stream.scene.set
 
 # Redaction (R8). The credentials proper need no entry here: each module's
 # manifest declares which of its settings are credentials (`credentials:` in
@@ -220,14 +253,16 @@ triggers:
 # writes — and the provider is never invoked for a refused call. Declaring
 # an action in a module manifest grants nothing by itself, and the executor
 # re-evaluates these rules on every call, so removing a rule below refuses
-# the very next call of its action. The four rules grant exactly the
+# the very next call of its action. The nine rules grant exactly the
 # provided-action set of this profile — the actions the enabled manifests
-# declare, plus the ones the `proxy` allowlist names — to the brain's principal on the served channel: the reads on the
-# channel's `chat` scope, the capture on its `capture` scope, the reply
-# delivery on `chat` (R7). `screen.capture` is provided here by `proxy`,
-# from its allowlist, and by no enabled manifest; the rule is the same as
-# the PC profile's — which module serves the action is not the rule's
-# concern (decision 7).
+# declare, plus the ones the `proxy` allowlist names — to the brain's
+# principal on the served channel: the reads on the channel's `chat` scope,
+# the screen capture on its `capture` scope, the audio capture and the two
+# playbacks on `audio`, the scene change on `stream`, the poll on `poll`, the
+# reply delivery on `chat` (R7, R9). The five device actions are provided
+# here by `proxy`, from its allowlist; the rules are the same as the PC
+# profile's — which module serves an action is not the rule's concern
+# (decision 7).
 actions:
   # The retained transcript of the served channel.
   - rule_id: brain-reads-chat
@@ -268,6 +303,71 @@ actions:
       - read
     granted_permissions:
       - screen.capture
+  # One bounded audio segment, addressed on the served channel's `audio` scope.
+  - rule_id: brain-captures-audio
+    action_name: audio.capture
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - audio.capture
+  # Speech on a configured output of the agent, as a tool or a delivery entry.
+  - rule_id: brain-speaks
+    action_name: audio.speak
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.speak
+  # A configured clip on a configured output of the agent.
+  - rule_id: brain-plays-clips
+    action_name: audio.play
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.play
+  # A switch to an allowed scene, on the served channel's `stream` scope.
+  - rule_id: brain-sets-scenes
+    action_name: stream.scene.set
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: stream
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.scene
+  # One poll on the served channel, on its `poll` scope.
+  - rule_id: brain-creates-polls
+    action_name: stream.poll.create
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: poll
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.poll
   # The reply delivery the brain module asks for, on the served channel.
   - rule_id: brain-delivers-chat-replies
     action_name: chat.write

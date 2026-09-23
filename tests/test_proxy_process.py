@@ -268,11 +268,25 @@ def _agent_profile(
     """``agent.yaml.example`` as the agent of this trial runs it: two
     capture sources — ``file`` (default) and the gated ``command`` — and the
     link dialing the loopback brain. The grant, the limits and the
-    reconnection settings are the profile's own."""
+    reconnection settings are the profile's own. The trial is the
+    ``screen.capture`` one (AC39): the three phase 2 device modules the
+    profile also enables (R9) are left out with their actions and rules —
+    ``tests/test_phase2_scenario.py`` drives those across the proxy."""
 
     config = _read_yaml(AGENT_PROFILE)
     config["modules_directory"] = str(modules_directory)
-    modules = dict(config["modules"])
+    phase2_devices = ("audio_input", "audio_output", "stream_control")
+    config["enabled_modules"] = [
+        name for name in config["enabled_modules"] if name not in phase2_devices
+    ]
+    config["actions"] = [
+        rule for rule in config["actions"] if rule["action_name"] == SCREEN_CAPTURE
+    ]
+    modules = {
+        name: settings
+        for name, settings in config["modules"].items()
+        if name not in phase2_devices
+    }
     modules["capture"] = {
         **modules["capture"],
         "sources": {
@@ -290,6 +304,7 @@ def _agent_profile(
         "brain_url": brain_url,
         "pairing_token": f"${{{TOKEN_VARIABLE}}}",
         "agent_id": agent_id,
+        "actions": [SCREEN_CAPTURE],
     }
     config["modules"] = modules
     config["secrets"] = [f"${{{TOKEN_VARIABLE}}}"]

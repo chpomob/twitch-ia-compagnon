@@ -1,7 +1,8 @@
-# The PC-agent profile (R7, decision 6): the same entry point runs, on the
-# streaming PC, only the local `capture` module and the `agent_link` module
-# that dials the brain's `proxy` (config.server.yaml.example), pairs with the
-# shared token and lends it `screen.capture`. No brain, no chat input and no
+# The PC-agent profile (R7, decision 6; R9): the same entry point runs, on the
+# streaming PC, only the local device modules — `capture`, `audio_input`,
+# `audio_output`, `stream_control` — and the `agent_link` module that dials
+# the brain's `proxy` (config.server.yaml.example), pairs with the shared
+# token and lends it the five device actions. No brain, no chat input and no
 # model call happen here. Copy this file to agent.yaml, export the referenced
 # environment variables, then run:
 #   python -m core.main --config agent.yaml
@@ -19,9 +20,15 @@
 modules_directory: ./modules
 
 # Every module enabled here is activated, in this order, through its
-# manifest; the pair below is what makes this the agent profile.
+# manifest; the set below is what makes this the agent profile. The three
+# phase 2 modules ship with `required: false`: a dependency unavailable at
+# startup leaves its actions unbound here — a call forwarded to one is
+# refused `provider_not_ready` by this process — and startup continues (R8).
 enabled_modules:
   - capture
+  - audio_input
+  - audio_output
+  - stream_control
   - agent_link
 
 modules:
@@ -50,15 +57,108 @@ modules:
     # on every object it retains.
     max_bytes: 1048576
 
-  # The agent side of the remote capture (R6). The module dials `brain_url`,
-  # presents the pairing token in `hello`, declares the actions listed under
-  # `actions` — each one a local manifest declares and this process serves —
-  # and executes the calls the brain forwards through this process's own
-  # default-deny executor, so the rule under `actions` below is what
-  # authorizes them (the brain's grant does not reach this process). The
-  # connection is retried forever with exponential backoff and full jitter
-  # (decision 9); every forwarded call is executed at most once through the
-  # bounded call table.
+  # The on-demand audio capture the brain reads, through the proxy, as
+  # `audio.capture` (R3): one bounded segment per call, PCM 16-bit, 16 000 Hz,
+  # mono, stored in the store below and transferred to the brain by
+  # reference. Nothing is recorded in
+  # the background. A `command` source runs `argv` at the call and takes the
+  # WAV it writes on standard output, stopped once the requested duration is
+  # recorded; a `file` source (`kind: file`, `path: <wav>`) re-reads one WAV.
+  audio_input:
+    sources:
+      mic:
+        kind: command
+        # AUDIO_RECORDER names a program writing a 16 kHz mono 16-bit WAV to
+        # standard output until it is stopped; replace "-" with the options
+        # your recorder needs for that format. A program that does not
+        # resolve to an executable leaves `audio.capture` unbound (R8).
+        argv:
+          - ${AUDIO_RECORDER}
+          - "-"
+    default_source: mic
+    # The optional transcription of each stored segment. No provider is
+    # assumed (AC43): while `endpoint` is empty nothing is sent, the
+    # transcription is reported unavailable and every capture still succeeds
+    # with its audio reference. Set the endpoint, the model and — when the
+    # service needs one — the key (an environment reference, e.g.
+    # `api_key: ${TRANSCRIPTION_API_KEY}`) to enable it.
+    transcription:
+      enabled: true
+      endpoint: ""
+      model: ""
+      api_key: ""
+    required: false
+
+  # Speech and clip playback through `audio.speak` and `audio.play` (R1).
+  # Speech is synthesised by an HTTP endpoint answering a WAV; each output is
+  # a player command fed the whole WAV on its standard input; success means
+  # the player consumed the whole segment and exited normally.
+  audio_output:
+    # No provider is assumed (AC43): while `endpoint` is empty no request is
+    # sent, `audio.speak` stays unbound and is named not ready at startup,
+    # and `audio.play` still plays the configured clips. Set the endpoint,
+    # the model and — when the service needs one — the key (an environment
+    # reference, e.g. `api_key: ${SPEECH_API_KEY}`) to enable speech.
+    synthesis:
+      endpoint: ""
+      model: ""
+      api_key: ""
+    # The voices a call may name — names the synthesis service accepts — and
+    # the one used when it names none.
+    voices:
+      allowed:
+        - default
+      default: default
+    outputs:
+      default:
+        player:
+          # AUDIO_PLAYER names a program playing the WAV it reads on standard
+          # input; replace "-" with the options your player needs for that. A
+          # program that does not resolve to an executable leaves both audio
+          # actions unbound (R8).
+          argv:
+            - ${AUDIO_PLAYER}
+            - "-"
+    default_output: default
+    # The clips `audio.play` may name: each a WAV file on this machine,
+    # re-read at each call.
+    clips:
+      chime:
+        path: ${AUDIO_CHIME_PATH}
+    required: false
+
+  # Stream scenes the brain switches, through the proxy, with
+  # `stream.scene.set` (R6). The scene provider is the broadcast
+  # software's websocket interface (protocol version 5): `ws://` is accepted
+  # on a loopback host only, `wss://` anywhere. An unreachable provider at
+  # startup leaves `stream.scene.set` unbound (R8).
+  stream_control:
+    scenes:
+      provider:
+        kind: websocket
+        url: ${SCENE_WEBSOCKET_URL}
+        # Declared as a credential by the manifest: redacted from every trace.
+        password: ${SCENE_WEBSOCKET_PASSWORD}
+      # The scenes a call may switch to, by their exact names.
+      allowed:
+        - Main
+        - Break
+    # Polls belong to the platform, which runs on the brain's side: the
+    # server profile creates them. No platform module runs here, so polls
+    # stay disabled.
+    polls:
+      enabled: false
+    required: false
+
+  # The agent side of the remote device actions (R6, R5, R9). The module
+  # dials `brain_url`, presents the pairing token in `hello`, declares the
+  # actions listed under `actions` — each one a local manifest declares and
+  # this process serves — and executes the calls the brain forwards through
+  # this process's own default-deny executor, so the rule under `actions`
+  # below is what authorizes them (the brain's grant does not reach this
+  # process). The connection is retried forever with exponential backoff and
+  # full jitter (decision 9); every forwarded call is executed at most once
+  # through the bounded call table.
   agent_link:
     # `wss://<host>:<port>` for a brain on another machine — a `ws://` URL is
     # accepted on loopback only (`ws://127.0.0.1:8765`), matching the
@@ -71,9 +171,16 @@ modules:
     # How this agent names itself in `hello` and in the brain's traces.
     agent_id: pc-agent
     # The actions lent to the brain; each must be declared by an enabled
-    # local manifest — here `screen.capture` by `capture` above.
+    # local manifest — `screen.capture` by `capture`, `audio.capture` by
+    # `audio_input`, `audio.speak` and `audio.play` by `audio_output`,
+    # `stream.scene.set` by `stream_control` above — and allowlisted by the
+    # server's `proxy.actions`.
     actions:
       - screen.capture
+      - audio.capture
+      - audio.speak
+      - audio.play
+      - stream.scene.set
     # Backoff between dial attempts: initial delay, multiplier and cap, in
     # seconds; the delay drawn is uniform in [0, current] and the sequence
     # resets on a successful pairing.
@@ -88,9 +195,10 @@ modules:
       max_entries: 1024
       ttl_seconds: 300
 
-# Redaction (R8). The pairing token needs no entry here: the `agent_link`
-# manifest declares it as a credential (`credentials:` in
-# modules/agent_link/module.yaml), so its resolved value is redacted from
+# Redaction (R8). The pairing token and the scene provider's password need
+# no entry here: the `agent_link` and `stream_control` manifests declare them
+# as credentials (`credentials:` in modules/agent_link/module.yaml and
+# modules/stream_control/module.yaml), so their resolved values are redacted from
 # every supervision trace and every lost-trace diagnostic whether or not this
 # block exists. Listing it again redacts nothing twice; the brain URL is not
 # listed because it is what traces correlate the pairing by, and it embeds
@@ -101,11 +209,13 @@ secrets:
 # Explicit action authorization rules (R5). Authorization is default-deny in
 # this process exactly as in the brain's: a call the brain forwards is
 # executed only when a rule here applies, and the provider is never invoked
-# for a refused call. The one rule grants exactly the provided-action set of
-# this profile — `screen.capture`, declared by `capture` — to principal
-# `brain`, the principal the forwarded calls carry, on every platform and
-# channel of the `capture` scope, which is the scope the brain addresses a
-# capture on (`*/*/capture`). Removing it refuses the very next capture.
+# for a refused call. The five rules grant exactly the provided-action set
+# of this profile — `screen.capture`, `audio.capture`, `audio.speak`,
+# `audio.play` and `stream.scene.set`, declared by the four device modules —
+# to principal `brain`, the principal the forwarded calls carry, on every
+# platform and channel of the scope the brain addresses each on: `capture`
+# for the screen, `audio` for the three audio actions, `stream` for the
+# scene. Removing one refuses the very next call of its action.
 actions:
   - rule_id: brain-captures-screen
     action_name: screen.capture
@@ -119,15 +229,64 @@ actions:
       - read
     granted_permissions:
       - screen.capture
+  - rule_id: brain-captures-audio
+    action_name: audio.capture
+    destination:
+      platform: "*"
+      channel_id: "*"
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - audio.capture
+  - rule_id: brain-speaks
+    action_name: audio.speak
+    destination:
+      platform: "*"
+      channel_id: "*"
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.speak
+  - rule_id: brain-plays-clips
+    action_name: audio.play
+    destination:
+      platform: "*"
+      channel_id: "*"
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.play
+  - rule_id: brain-sets-scenes
+    action_name: stream.scene.set
+    destination:
+      platform: "*"
+      channel_id: "*"
+      scope: stream
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.scene
 
 # Retention and admission limits (R6). The block is required as a whole for
 # a module built against the versioned runtime, every limit below being
 # finite and positive; startup stops before any transport opens when one is
 # absent, negative, non-numeric or infinite. The group this process acts
-# on is `attachments`: the store every capture is put in before it is
-# transferred to the brain by reference, bounded per object, in objects, in
-# total bytes, per run and in age — `max_object_bytes` is the ceiling
-# `capture.max_bytes` above stays under. The other groups bound surfaces
+# on is `attachments`: the store every screen or audio capture is put in
+# before it is transferred to the brain by reference, bounded per object, in
+# objects, in total bytes, per run and in age — `max_object_bytes` is the
+# ceiling `capture.max_bytes` and `audio_input`'s default `max_bytes` stay
+# under. The other groups bound surfaces
 # this profile keeps idle (no chat input, no brain runs) and are accepted as
 # the runtime's own bounds.
 limits:

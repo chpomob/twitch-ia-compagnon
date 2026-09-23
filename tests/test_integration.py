@@ -413,6 +413,14 @@ def _environment() -> dict[str, str]:
         ),
         "OPENAI_MODEL": "-".join(("model", unique)),
         "OPENAI_API_KEY": "-".join(("key", unique)),
+        # The phase 2 devices of the PC profile (R9), none of them present:
+        # no such recorder or player, and a closed loopback port for the
+        # scene provider — each module degrades and startup continues (R8).
+        "AUDIO_RECORDER": "-".join(("recorder", unique)),
+        "AUDIO_PLAYER": "-".join(("player", unique)),
+        "AUDIO_CHIME_PATH": "-".join(("chime", unique)),
+        "SCENE_WEBSOCKET_URL": "ws://127.0.0.1:1",
+        "SCENE_WEBSOCKET_PASSWORD": "-".join(("scene", unique)),
     }
 
 
