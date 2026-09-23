@@ -7,3 +7,4 @@ __pycache__/
 *.orig
 *.rej
 /docs/campaigns/phase2/scaffolding/spec-out/
+/docs/campaigns/phase3/scaffolding/spec-out/
