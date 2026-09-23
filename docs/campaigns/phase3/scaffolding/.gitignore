@@ -1,0 +1,8 @@
+# Volatile campaign output — durable scaffolding stays tracked, run artefacts do not.
+logs/
+loop-out/
+wip/
+campaign.log
+commit-msg-*.txt
+gate-report-*.md
+wip-*.patch
