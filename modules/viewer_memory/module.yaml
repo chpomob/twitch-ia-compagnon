@@ -1,0 +1,95 @@
+# Viewer memory store — manifest v2 (phase 3 R3).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no grant lives here. The module keeps
+# one small JSON file per `(platform, channel_id, viewer_id)` in a configured
+# directory, bounded in count, bytes, notes and age. No platform name appears
+# here. The recall and record actions are declared by a later step.
+
+name: viewer_memory
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# The module reads chat messages for the erasure command only (`!forgetme`
+# from its trusted author, whatever the trigger decides). It publishes the
+# `memory.removed` facts through supervision, not as a routed event.
+produces: []
+consumes:
+  - channel.chat.message
+middleware: false
+
+# The `input` role, for its one source of work: the periodic retention sweep,
+# a supervised task. `prepare` scans the directory (deletes corrupt and
+# expired files, evicts down to the bounds) and routes the erasure command,
+# all before readiness; `start_inputs`, after the barrier, starts the sweep;
+# `stop_inputs` stops it before the drain, so shutdown never waits on it;
+# `close` stops what still runs.
+lifecycle:
+  roles:
+    - input
+
+# The bounds of the store (R3). The shapes are checked by the declared hook,
+# one value-free diagnostic per field, including the cross-field bound
+# `max_total_bytes >= max_file_bytes`. The reserved `limits` block the entry
+# point hands every enabled module is accepted and not read.
+settings_schema:
+  type: object
+  properties:
+    directory:
+      type: string
+      description: >-
+        The directory the memory files live in. Created at prepare when
+        absent. Only files named like memory files are ever read, counted or
+        deleted there.
+    retention_days:
+      type: integer
+      minimum: 1
+      maximum: 365
+      description: >-
+        A record whose `last_seen` is older than this is deleted at prepare
+        and at every sweep, and is never returned. Default 30.
+    max_files:
+      type: integer
+      minimum: 1
+      maximum: 100000
+      description: The most memory files the directory holds. Default 1000.
+    max_file_bytes:
+      type: integer
+      minimum: 512
+      maximum: 65536
+      description: >-
+        The largest a memory file may be; the oldest notes are dropped to fit.
+        Default 4096.
+    max_total_bytes:
+      type: integer
+      minimum: 512
+      maximum: 1073741824
+      description: >-
+        The most bytes all memory files hold together; at least
+        `max_file_bytes`. Default 16777216.
+    max_notes:
+      type: integer
+      minimum: 1
+      maximum: 100
+      description: The most notes one memory file keeps. Default 10.
+    sweep_interval_seconds:
+      type: integer
+      minimum: 60
+      maximum: 86400
+      description: How often expired records are swept. Default 3600.
+    forget_command:
+      type: string
+      description: >-
+        The exact chat text by which a trusted author erases their own memory
+        file for that platform and channel. Default `!forgetme`; empty
+        disables it.
+    limits:
+      type: object
+      description: >-
+        The accepted `limits` block, handed over by the entry point to every
+        enabled module. Not read here: this module owns its own bounds.
+  required:
+    - directory
+settings_validator: validate_settings

@@ -105,6 +105,7 @@ MODULE_NAMES = (
     "audio_input",
     "stream_control",
     "clips",
+    "viewer_memory",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -333,6 +334,16 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": []},
         "settings_validator": "validate_settings",
     },
+    "viewer_memory": {
+        "name": "viewer_memory",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": [],
+        "consumes": ["channel.chat.message"],
+        "middleware": False,
+        "lifecycle": {"roles": ["input"]},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
 # R8): only the chat input declares triggers; the input and the six
@@ -352,6 +363,8 @@ DECLARATION_KEYS = {
     "audio_input": {"actions", "credentials"},
     "stream_control": {"actions", "credentials"},
     "clips": {"actions"},
+    # Phase 3 R3 (plan P10): the store declares no action yet (P11 does).
+    "viewer_memory": set(),
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -502,7 +515,9 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     3's R1 adds the ``notices`` setting and the ``event_kind`` trigger type to
     ``twitch`` (allowlisted, plan decision 11); phase 3's R2 adds the
     ``clips`` manifest and its ``stream.clip.create`` (allowlisted, running
-    value of plan step P9: 12 manifests, 10 action names).
+    value of plan step P9: 12 manifests, 10 action names); phase 3's R3 adds
+    the ``viewer_memory`` manifest with no action yet (allowlisted, running
+    value of plan step P10: 13 manifests, 10 action names).
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -520,7 +535,7 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 12
+    assert len(names) == 13
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():
