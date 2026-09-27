@@ -1,8 +1,8 @@
 # Phase 1 campaign summary
 
-- steps approved: 5 — P22, P23, P24, P25, P26
+- steps approved: 3 — P27F1, P27F2, P27F3
 - halted: no
 - full-branch gate: REQUEST_CHANGES
-- main HEAD: 8dca52f feat(phase3): P26 — Full-branch review gate before PR delivery
-- final test run: green — 2422 passed, 18 skipped in 49.29s
+- main HEAD: 2f3f094 fix(phase3): P27F3 — model_proposable declared on the wire, AC13 made self-consistent, core scan narrowed or cleaned
+- final test run: green — 2449 passed, 18 skipped in 48.77s
 - log: /media/chpo/HDD-papa/twitch-ia-compagnon/docs/campaigns/phase3/scaffolding/campaign.log
