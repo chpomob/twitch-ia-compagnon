@@ -55,6 +55,7 @@ from core.contracts import ActionCall, ActionObservation, Destination, TriggerPo
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext
 from core.triggers import TriggerRegistry
+from modules.brain import _message_of_work
 from modules.kick import (
     CHAT_URL,
     CHAT_WRITE_ACTION,
@@ -681,6 +682,10 @@ async def test_ac35_each_notice_type_maps_to_its_kind_and_is_admitted_by_kind(
         author = next(value for value in fields.values() if isinstance(value, dict))
         assert payload["author"]["id"] == str(author["user_id"])
         assert len(harness.scheduler.admissions) == 1
+        # The empty-text notice reaches the brain as its kind (gate 1, F1).
+        ((_key, work),) = harness.scheduler.admissions
+        message = _message_of_work(work)
+        assert (message.kind, message.text) == (kind, "")
     finally:
         await harness.close()
 

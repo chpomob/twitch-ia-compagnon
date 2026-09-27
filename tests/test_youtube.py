@@ -80,6 +80,7 @@ from core.contracts import (
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext
 from core.triggers import TriggerRegistry
+from modules.brain import _message_of_work
 from modules.youtube import (
     BANS_URL,
     CHAT_WRITE_ACTION,
@@ -1112,6 +1113,11 @@ async def test_ac38_each_notice_type_maps_to_its_kind_and_is_admitted_by_kind(
         assert payload["message_id"] == f"notice-{kind}"
         assert payload["author"]["id"] == VIEWER
         assert len(h.scheduler.admissions) == 1
+        # The notice, empty text included, reaches the brain as its kind
+        # (gate 1, F1).
+        ((_key, work),) = h.scheduler.admissions
+        message = _message_of_work(work)
+        assert (message.kind, message.text) == (kind, payload["text"])
     finally:
         await h.close()
 

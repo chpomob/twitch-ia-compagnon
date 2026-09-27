@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -735,6 +736,41 @@ async def test_twitch_binds_its_clips_and_a_platform_without_a_service_is_unsupp
     finally:
         await handle.close()
         await twitch.close()
+
+
+def test_a_non_platform_service_scope_is_never_an_enabled_platform() -> None:
+    """R1/R2 (gate 1, F4): the brain's ``(admission, runs)`` scheduler service
+    names no platform, so ``clips`` neither enables nor reports ``runs``."""
+
+    clip = ClipsModule.__new__(ClipsModule)
+    clip._services = SimpleNamespace(
+        entries=lambda: {("admission", "runs"): "brain"}, resolve=lambda *args: None
+    )
+    assert clip._resolve_clip_services() == (set(), {})
+
+
+@pytest.mark.asyncio
+async def test_a_scheduler_service_beside_a_platform_leaves_only_the_platform_unbound() -> None:
+    """R1/R2 (gate 1, F4): with the fixture platform publishing ``poll`` and a
+    scheduler published under ``(admission, runs)``, ``stream.clip.create``
+    is unbound on ``fake`` with ``platform_unsupported`` and nothing else:
+    ``module.degraded`` names ``fake`` only."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    await fakeplatform.activate(
+        runtime.for_module("fakeplatform"), {**FAKE_SETTINGS, "services": ["poll"]}, {}
+    )
+    runtime.for_module("brain").services.publish("admission", "runs", object())
+    handle = await activate_clips(runtime.for_module("clips"), {"_sleeper": clock.sleep}, {})
+    try:
+        await handle.prepare()
+        assert handle.bound_platforms == ()
+        assert handle.unbound == {"fake": REASON_PLATFORM_UNSUPPORTED}
+        [degraded] = [event["payload"] for event in events_of(runtime.bus, "module.degraded")]
+        assert degraded["platforms"] == ["fake"]
+    finally:
+        await handle.close()
 
 
 @pytest.mark.asyncio

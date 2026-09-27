@@ -2802,6 +2802,74 @@ def test_route_command_is_the_first_token_compared_case_insensitively() -> None:
     assert not route.matches(message("!brb", roles=["moderator"], roles_provenance=ROLES_PROVENANCE))
 
 
+@pytest.mark.parametrize(
+    ("platform", "kind"), [("twitch", "follow"), ("kick", "sub"), ("youtube", "sub")]
+)
+def test_an_empty_text_community_notice_is_a_message_of_its_kind(platform: str, kind: str) -> None:
+    """R1 (gate 1, F1): the adapters produce an empty text for a Twitch
+    follow, a Kick notice and a YouTube new member or gift. A notice of a
+    community kind parses with that empty text; its nonempty control parses
+    too, with the same kind."""
+
+    from modules.brain import _message_of_event
+
+    payload = {
+        "platform": platform,
+        "channel_id": "1",
+        "message_id": "m1",
+        "text": "",
+        "kind": kind,
+        "author": {"id": "42"},
+    }
+    message = _message_of_event({"payload": payload})
+    assert (message.kind, message.text, message.platform) == (kind, "", platform)
+    payload["text"] = "A viewer joined"
+    assert _message_of_event({"payload": payload}).kind == kind
+
+
+@pytest.mark.parametrize("kind", [None, "message", "watch_tick"])
+@pytest.mark.parametrize("text", ["", "   ", None, 7])
+def test_a_text_event_without_text_stays_malformed(kind: str | None, text: Any) -> None:
+    """R1, phase 2 (gate 1, F1): an ordinary message (with or without a
+    ``kind``) or a tick with a blank or missing text is still malformed, and
+    so is a notice whose text is not a string."""
+
+    from modules.brain import _message_of_event
+
+    payload = {"platform": "twitch", "channel_id": "1", "message_id": "m1", "text": text,
+               "author": {"id": "42"}}
+    if kind is not None:
+        payload["kind"] = kind
+    with pytest.raises(ValueError):
+        _message_of_event({"payload": payload})
+    if not isinstance(text, str):
+        with pytest.raises(ValueError):
+            _message_of_event({"payload": {**payload, "kind": "follow"}})
+
+
+@pytest.mark.asyncio
+async def test_an_empty_text_follow_notice_reaches_its_route() -> None:
+    """R1 (gate 1, F1): a follow notice with an empty text, as the Twitch
+    adapter produces it, is admitted and runs the thanks route — 1
+    ``chat.write`` and 1 ``audio.play`` — instead of ending
+    ``malformed_work``."""
+
+    route = raid_route()
+    route["match"] = {"kinds": ["raid", "follow"]}
+    harness = await activate_fake_platform(
+        final("Thanks for the follow!"),
+        brain_overrides={"routes": [route]},
+        notice_kinds=("follow",),
+    )
+    try:
+        record = await harness.drive(kind="follow", author="55", text="")
+        assert record.status == "success", record
+        assert harness.delivered_actions() == [CHAT_WRITE, AUDIO_PLAY]
+        assert harness.effects[AUDIO_PLAY].calls == [{"sound": "chime"}]
+    finally:
+        await harness.close()
+
+
 @pytest.mark.asyncio
 async def test_ac3_routes_select_the_instructions_and_the_delivery_list_per_run() -> None:
     """AC3: routes ``[A: raid → chat.write + audio.play chime; B: !missed →

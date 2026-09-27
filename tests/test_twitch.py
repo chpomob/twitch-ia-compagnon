@@ -46,6 +46,7 @@ from conftest import (
     trace_texts,
     wait_until,
 )
+from modules.brain import _message_of_work
 from modules.twitch import (
     CHAT_WRITE_ACTION,
     CHAT_WRITE_PROVIDER,
@@ -2616,9 +2617,12 @@ async def test_a_follow_is_a_follow_notice_of_the_follower() -> None:
         assert event["payload"]["kind"] == "follow"
         assert event["payload"]["author"]["id"] == "55"
         assert event["payload"]["message_id"] == "follow-envelope-1"
-        ((session_key, _work),) = scheduler.admissions
+        ((session_key, work),) = scheduler.admissions
         assert session_key == SessionKey("twitch", SETTINGS["broadcaster_id"], "55")
         assert diagnostics == []
+        # The empty-text follow reaches the brain as a follow (gate 1, F1).
+        message = _message_of_work(work)
+        assert (message.kind, message.text) == ("follow", "")
     finally:
         await handle.close()
 

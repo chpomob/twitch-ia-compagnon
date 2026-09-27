@@ -10,7 +10,10 @@ not list it, or raises when its answer is lost. The answer is read by its
 attributes only, so no platform class is imported here.
 
 **Binding** (R2). ``prepare`` reads ``context.services.entries()``: every
-platform named there is enabled, and the action is bound over
+platform that publishes a platform capability service (a kind in
+:data:`PLATFORM_SERVICE_KINDS`) is enabled — the scope of any other service,
+such as the brain's ``(admission, runs)``, is not a platform — and the action
+is bound over
 ``<platform>/*/clip`` for each one whose ``clip`` service resolves. Every
 other enabled platform is unbound with reason :data:`REASON_PLATFORM_UNSUPPORTED`
 (:attr:`ClipsModule.unbound`, reported once through ``module.degraded``). When
@@ -96,6 +99,11 @@ MANIFEST_PATH = Path(__file__).with_name("module.yaml")
 #: name lives in this module and in the publishers only: the core defines none.
 CLIP_SERVICE_KIND = "clip"
 _CLIP_METHODS = ("create", "lookup")
+#: The service kinds only a platform adapter publishes, under its platform
+#: name: their scopes are the enabled platforms. Any other kind's scope (the
+#: brain's ``(admission, runs)``) names no platform and is never reported as
+#: one (R1/R2 honest capability).
+PLATFORM_SERVICE_KINDS = frozenset({CLIP_SERVICE_KIND, "poll", "moderation"})
 
 DEFAULT_MIN_INTERVAL_SECONDS = 30
 MIN_INTERVAL_BOUNDS = (5, 3600)
@@ -408,8 +416,8 @@ class ClipsModule:
     def _resolve_clip_services(self) -> tuple[set[str], dict[str, Any]]:
         """The enabled platforms, and ``platform → service`` for those with one.
 
-        A platform is enabled when it published any service; its ``(clip,
-        <platform>)`` entry is resolved and kept when it has the two methods.
+        A platform is enabled when it published a platform capability
+        service (:data:`PLATFORM_SERVICE_KINDS`); its ``(clip, <platform>)`` entry is resolved and kept when it has the two methods.
         Reads ``entries()`` and ``resolve()`` of the service facade and
         nothing else; a context without a registry hands out an empty view.
         """
@@ -425,6 +433,8 @@ class ClipsModule:
             if not isinstance(key, tuple) or len(key) != 2:
                 continue
             kind, platform = key
+            if kind not in PLATFORM_SERVICE_KINDS:
+                continue
             if not isinstance(platform, str) or not platform:
                 continue
             enabled.add(platform)
@@ -968,6 +978,7 @@ __all__ = [
     "MAX_WAITERS_BOUNDS",
     "MIN_INTERVAL_BOUNDS",
     "MODULE_NAME",
+    "PLATFORM_SERVICE_KINDS",
     "PROVIDER_NAME",
     "REASON_PLATFORM_UNSUPPORTED",
     "ClipsModule",

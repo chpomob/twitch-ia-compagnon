@@ -4835,6 +4835,10 @@ def _message_of_event(event: Any) -> _Message:
     identity the input module attested at normalisation. An event without it
     raises :class:`_NoTrustedIdentity`, which is a refusal, not a malformed
     event (R3, AC12).
+
+    A community notice (a kind in :data:`PLATFORM_NOTICE_KINDS`) may carry an
+    empty text: a follow, a new member or a gift has no words of its own. Any
+    other kind still needs a nonblank text (R1).
     """
 
     if not isinstance(event, Mapping):
@@ -4846,12 +4850,14 @@ def _message_of_event(event: Any) -> _Message:
     channel_id = payload.get("channel_id")
     message_id = payload.get("message_id")
     text = payload.get("text")
-    if not all(_is_text(value) for value in (platform, channel_id, message_id, text)):
+    if not all(_is_text(value) for value in (platform, channel_id, message_id)):
         raise ValueError
     try:
         kind = validate_event_kind(payload.get("kind"), "payload.kind")
     except ContractError:
         raise ValueError from None
+    if not isinstance(text, str) or (kind not in PLATFORM_NOTICE_KINDS and not text.strip()):
+        raise ValueError
     author = payload.get("author")
     viewer_id = author.get("id") if isinstance(author, Mapping) else None
     if not _is_text(viewer_id):

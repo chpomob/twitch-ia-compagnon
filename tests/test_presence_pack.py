@@ -558,15 +558,15 @@ async def test_ac6_the_presence_pack_runs_every_observation_row(tmp_path: Path) 
         assert presence.report.status == 0, (presence.report, presence.diagnostics)
         degraded = [event["payload"] for event in events_of(presence.bus, TRACE_MODULE_DEGRADED)]
         # The speech endpoint ships empty (no provider assumed): `audio.speak`
-        # is named not ready. Nothing names the platform: its clip service
-        # binds. (`clips` counts every scope of the service registry as a
-        # platform, so the brain's `(admission, runs)` service is reported
-        # as an unsupported platform `runs` — flagged by plan step P22, the
-        # fix belongs to `modules/clips`, outside this step's files.)
+        # is named not ready. Nothing else degrades: the platform's clip
+        # service binds, and the brain's `(admission, runs)` service is no
+        # platform, so `clips` reports no unsupported one (R1/R2).
         by_module = {payload["module"]: payload for payload in degraded}
         assert by_module["audio_output"]["capabilities"] == ["audio.speak"]
-        assert set(by_module) <= {"audio_output", "clips"}, degraded
-        assert "twitch" not in by_module.get("clips", {}).get("platforms", ())
+        assert set(by_module) == {"audio_output"}, degraded
+        clips = next(a.handle for a in presence.activations if a.name == "clips")
+        assert clips.bound_platforms == ("twitch",)
+        assert clips.unbound == {}
         registry = presence.runtime.context.actions
         assert set(registry.registered_ready()) == {
             "chat.read",
