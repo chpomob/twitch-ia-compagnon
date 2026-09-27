@@ -585,7 +585,7 @@ montre le reste non lié avec une raison nommée.
 | `chat.write` | Oui | Oui, ≤ 500 caractères (`text_too_long` au-delà, 0 requête) | Oui, ≤ **200 caractères** (`text_too_long` au-delà, 0 requête) |
 | Notifications (`notices.kinds`) | `sub`, `resub`, `sub_gift`, `community_sub_gift`, `raid`, `follow` | `follow`, `sub`, `resub`, `sub_gift` | `sub` (membre), `resub` (palier), `sub_gift`, `tip` (Super Chat, Super Sticker) |
 | Clips (`stream.clip.create`) | Oui (service `clip`) | **Non** : aucune API de clip ; non lié, `platform_unsupported` | **Non** : aucune API de clip ; non lié, `platform_unsupported` |
-| Sondages (`stream.poll.create`) | Oui (service `poll`, phase 2) | **Non** : aucune API de sondage | **Non** : aucune API de sondage |
+| Sondages (`stream.poll.create`) | Oui (service `poll`, phase 2) | **Non** : aucune API de sondage ; non lié, `platform_unsupported` | **Non** : aucune API de sondage ; non lié, `platform_unsupported` |
 | Modération (service `moderation`) | `delete_message`, `timeout` (en secondes, sans arrondi) | **`timeout` seulement**, durée arrondie **à la minute supérieure**, 1–10 080 minutes | `delete_message`, `timeout` (bannissement `temporary`) |
 | Quota | Aucun registre local ; un refus de débit de la plateforme est `rate_limited` (clips) ou `rate_limited_platform` (modération), jamais rejoué | Limites de débit (`rate_limited`, blocage jusqu'à l'instant annoncé) | **Quota quotidien local** : `quota.daily_units` (défaut 10 000), `quota.write_reserve_units` (défaut 1 000) réservées aux envois, coûts par requête (`list` 5, `insert` 50, `delete` 50, `ban` 50, `broadcast_lookup` 1), remise à zéro à 00:00 America/Los_Angeles ; une lecture qui entamerait la réserve n'est pas émise (`quota_exhausted`), un envoi sans unités est refusé avec 0 requête |
 | Authentification | Jeton d'accès configuré | `client_secret`, `access_token` ; clé publique configurée ou lue une fois au `prepare` | Jeton de rafraîchissement échangé avant expiration ; un refus dégrade le module (`auth_refresh_failed`) |
@@ -633,6 +633,15 @@ ou en dégradation du seul `follow` :
   `retention_days` ; un tel fichier n'est jamais rendu par un rappel. Au
   `prepare`, les fichiers mal formés ou trop gros sont supprimés, les noms
   étrangers ne sont ni lus ni comptés ni supprimés.
+- **Suppression refusée.** Un fichier dont la suppression échoue (répertoire
+  lisible mais non modifiable, par exemple) reste compté dans les deux bornes
+  et est retenté à chaque passe d'éviction et à chaque balayage. Si les
+  bornes ne tiennent toujours pas, l'écriture est refusée et, au `prepare`, le
+  module échoue sans se déclarer prêt, après un `module.degraded` sans valeur
+  (« the memory bounds cannot be met: a deletion failed ») ; un fichier
+  resté sur le disque dans les bornes donne un `module.degraded` (« a memory
+  file could not be deleted »), et un effacement qui échoue est une erreur,
+  jamais un fichier absent (porte 1, F3, corrigé en P27F2).
 - **Chemins d'effacement.** (a) Un message de chat dont le texte est
   exactement `!forgetme` (`forget_command`, vide = désactivé) efface le
   fichier de son auteur attesté pour cette plateforme et cette chaîne, quelle
@@ -739,11 +748,12 @@ seulement pendant une **session** :
 
 ### Limites déclarées de la phase 3
 
-- **Raison de non-liaison des sondages** : `stream_control` ne rapporte pas
-  `platform_unsupported` par plateforme pour `stream.poll.create` ; avec
-  Twitch, Kick et YouTube activés, le sondage n'est lié que pour Twitch et un
+- **Sondages hors Twitch** : avec Twitch, Kick et YouTube activés,
+  `stream.poll.create` n'est lié que pour Twitch ; `stream_control` nomme
+  Kick et YouTube non liés avec la raison `platform_unsupported` (vue
+  `unbound`, un `module.degraded` sans valeur qui liste ces plateformes), et un
   appel sur Kick ou YouTube se termine `error no_provider` avec 0 requête
-  (constat de P21, remis à la porte P26).
+  (porte 1, F2, corrigé en P27F2).
 - **Joignabilité de Kick** : l'écouteur des webhooks est local ; l'exposer en
   HTTPS public est à la charge du déploiement.
 - **Quota YouTube** : le registre est local et remis à zéro à minuit

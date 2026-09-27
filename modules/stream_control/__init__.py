@@ -69,7 +69,11 @@ URL and the password never appear in an observation, an error or a trace.
 ``context.services.entries()``, keeps the ``(poll, <platform>)`` keys and
 resolves each — the only two calls it makes on the service facade — then
 binds ``stream.poll.create`` once over ``<platform>/*/poll`` for every
-platform whose service resolved. A call checks its arguments against the
+platform whose service resolved. Every other enabled platform — one that
+publishes a platform capability service (a kind in
+:data:`PLATFORM_SERVICE_KINDS`) but no poll service — is unbound with reason
+:data:`REASON_PLATFORM_UNSUPPORTED` (:attr:`StreamControlModule.unbound`,
+reported once through ``module.degraded`` naming those platforms; AC39). A call checks its arguments against the
 ``polls`` bounds (``error invalid_arguments``, 0 requests), takes its place
 on the channel (one create in flight per ``(platform, channel_id)``, at most
 ``polls.max_waiters`` waiting, one more ``refused resource_busy``), and
@@ -186,6 +190,11 @@ DEFAULT_MAX_TRACKED_CHANNELS = 256
 #: The service kind a platform publishes its poll service under (R7). The
 #: name lives in this module only: the core defines no kind.
 POLL_SERVICE_KIND = "poll"
+#: The service kinds only a platform publishes, each under ``(<kind>,
+#: <platform>)``: the scope of one of these is an enabled platform (AC39).
+#: The scope of any other service, such as the brain's ``(admission, runs)``,
+#: is not a platform.
+PLATFORM_SERVICE_KINDS = frozenset({"clip", POLL_SERVICE_KIND, "moderation"})
 #: How long a tracked entry outlives its poll: TTL = duration + this (R7).
 POLL_ENTRY_GRACE_SECONDS = 300
 #: The most live entries (active polls or uncertain markers) one channel holds.
@@ -206,6 +215,7 @@ ERROR_POLL_ACTIVE = "poll_active"
 ERROR_POLL_REJECTED = "poll_rejected"
 ERROR_PLATFORM_FORBIDDEN = "platform_forbidden"
 ERROR_PLATFORM_UNAVAILABLE = "platform_unavailable"
+ERROR_PLATFORM_UNSUPPORTED = "platform_unsupported"
 _ERROR_PROVIDER_CLOSED = "provider_closed"
 
 #: The cause of an uncertain outcome once the set command left.
@@ -215,6 +225,9 @@ CAUSE_CONFIRMATION_LOST = "confirmation_lost"
 REASON_SCENE_PROVIDER_UNREACHABLE = f"{MODULE_NAME}: the scene provider is unreachable"
 REASON_SCENE_PROVIDER_DISCONNECTED = f"{MODULE_NAME}: the scene provider is disconnected"
 REASON_NO_POLL_SERVICE = "no poll service published"
+#: Why an enabled platform is unbound for polls: it publishes no poll service
+#: (AC39). Value-free: it names no platform, channel or credential.
+REASON_PLATFORM_UNSUPPORTED = "platform_unsupported"
 
 # Setting names — referenced by name, never by value, in diagnostics.
 _ACCEPTED_LIMITS_SETTING = "limits"
@@ -808,6 +821,9 @@ class StreamControlModule:
         self._poll_provider = _PollActionProvider(self)
         # ``platform → poll service``, resolved once at ``prepare``.
         self._poll_services: dict[str, Any] = {}
+        # ``platform → reason`` for every enabled platform left unbound for
+        # polls while ``polls.enabled`` (AC39).
+        self._poll_unbound: dict[str, str] = {}
         self._poll_table = _PollTable(settings.max_tracked_channels)
         # One slot per ``(platform, channel_id)`` with a call admitted on it;
         # dropped when its last call left.
@@ -836,6 +852,13 @@ class StreamControlModule:
         """The platforms whose poll service resolved at ``prepare``."""
 
         return tuple(sorted(self._poll_services))
+
+    @property
+    def unbound(self) -> Mapping[str, str]:
+        """``platform → reason`` for every enabled platform left unbound for
+        ``stream.poll.create`` (empty while ``polls.enabled`` is false)."""
+
+        return dict(sorted(self._poll_unbound.items()))
 
     def tracked_poll_channels(self) -> frozenset[tuple[str, str]]:
         """The ``(platform, channel_id)`` keys the poll table holds now."""
@@ -873,7 +896,13 @@ class StreamControlModule:
                 )
         # An enabled poll action whose service no platform published is an
         # unavailable dependency like any other (finding P1).
-        poll_services = self._resolve_poll_services() if settings.polls_enabled else {}
+        enabled_platforms, poll_services = (
+            self._resolve_poll_services() if settings.polls_enabled else (set(), {})
+        )
+        poll_unbound = {
+            platform: REASON_PLATFORM_UNSUPPORTED
+            for platform in sorted(enabled_platforms - set(poll_services))
+        }
         polls_unavailable = settings.polls_enabled and not poll_services
         if polls_unavailable and settings.required:
             await self._close_provider()
@@ -913,17 +942,28 @@ class StreamControlModule:
                 f"{MODULE_NAME} prepare: action binding failed"
             ) from None
         self._poll_services = poll_services
+        self._poll_unbound = poll_unbound
         self._prepared = True
 
         if scene_reachable is False:
             await self._report_degraded(REASON_SCENE_PROVIDER_UNREACHABLE, [SCENE_ACTION])
         if polls_unavailable:
-            await self._report_degraded(REASON_NO_POLL_SERVICE, [POLL_ACTION])
+            await self._report_degraded(
+                REASON_NO_POLL_SERVICE, [POLL_ACTION], platforms=sorted(poll_unbound)
+            )
+        elif poll_unbound:
+            await self._report_degraded(
+                REASON_PLATFORM_UNSUPPORTED, [POLL_ACTION], platforms=sorted(poll_unbound)
+            )
         if bound_any:
             self._actions.mark_ready()
 
-    def _resolve_poll_services(self) -> dict[str, Any]:
-        """``platform → service`` for every ``(poll, <platform>)`` published.
+    def _resolve_poll_services(self) -> tuple[set[str], dict[str, Any]]:
+        """The enabled platforms, and ``platform → service`` for every
+        ``(poll, <platform>)`` published.
+
+        A platform is enabled when it published a platform capability service
+        (:data:`PLATFORM_SERVICE_KINDS`).
 
         Reads ``entries()`` and ``resolve()`` of the service facade and
         nothing else, so any collaborator with the accepted three-method
@@ -935,20 +975,24 @@ class StreamControlModule:
         entries = getattr(services, "entries", None)
         resolve = getattr(services, "resolve", None)
         if not callable(entries) or not callable(resolve):
-            return {}
+            return set(), {}
+        enabled: set[str] = set()
         resolved: dict[str, Any] = {}
         for key in list(entries()):
             if not isinstance(key, tuple) or len(key) != 2:
                 continue
             kind, platform = key
-            if kind != POLL_SERVICE_KIND or not isinstance(platform, str) or not platform:
+            if kind not in PLATFORM_SERVICE_KINDS or not isinstance(platform, str) or not platform:
+                continue
+            enabled.add(platform)
+            if kind != POLL_SERVICE_KIND:
                 continue
             service = resolve(kind, platform)
             if service is not None and all(
                 callable(getattr(service, method, None)) for method in _POLL_METHODS
             ):
                 resolved[platform] = service
-        return resolved
+        return enabled, resolved
 
     async def drain(self, deadline_seconds: float) -> None:
         """End waiting calls, give a sent command the drain deadline.
@@ -1042,12 +1086,19 @@ class StreamControlModule:
         scenes = task.result()
         return isinstance(scenes, Sequence) and not isinstance(scenes, str)
 
-    async def _report_degraded(self, reason: str, capabilities: Sequence[str]) -> None:
+    async def _report_degraded(
+        self,
+        reason: str,
+        capabilities: Sequence[str],
+        *,
+        platforms: Sequence[str] = (),
+    ) -> None:
         degraded = getattr(self._supervision, "degraded", None)
         if not callable(degraded):
             return
+        details: dict[str, Any] = {"platforms": list(platforms)} if platforms else {}
         try:
-            outcome = degraded(reason=reason, capabilities=list(capabilities))
+            outcome = degraded(reason=reason, capabilities=list(capabilities), **details)
             if inspect.isawaitable(outcome):
                 await outcome
         except asyncio.CancelledError:
@@ -1350,6 +1401,12 @@ class StreamControlModule:
             destination = invocation.call.destination
             key = (str(destination.platform), str(destination.channel_id))
             service = self._poll_services.get(key[0])
+            if service is None and key[0] in self._poll_unbound:
+                raise _CallFailure(
+                    "error",
+                    ERROR_PLATFORM_UNSUPPORTED,
+                    "the platform publishes no poll service",
+                )
             if service is None:
                 raise _CallFailure(
                     "error",
@@ -2383,6 +2440,7 @@ __all__ = [
     "DEFAULT_REQUEST_TIMEOUT_SECONDS",
     "ERROR_PLATFORM_FORBIDDEN",
     "ERROR_PLATFORM_UNAVAILABLE",
+    "ERROR_PLATFORM_UNSUPPORTED",
     "ERROR_POLL_ACTIVE",
     "ERROR_POLL_REJECTED",
     "ERROR_PROVIDER_UNAVAILABLE",
@@ -2399,12 +2457,14 @@ __all__ = [
     "MAX_POLL_ENTRIES_PER_CHANNEL",
     "MAX_SCENE_NAME_CHARS",
     "MODULE_NAME",
+    "PLATFORM_SERVICE_KINDS",
     "POLL_ACTION",
     "POLL_ENTRY_GRACE_SECONDS",
     "POLL_SERVICE_KIND",
     "POLL_STATE_ACTIVE",
     "PROVIDER_NAME",
     "REASON_NO_POLL_SERVICE",
+    "REASON_PLATFORM_UNSUPPORTED",
     "REASON_SCENE_PROVIDER_DISCONNECTED",
     "REASON_SCENE_PROVIDER_UNREACHABLE",
     "RECONNECT_INITIAL_SECONDS",

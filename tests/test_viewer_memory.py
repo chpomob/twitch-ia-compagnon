@@ -69,6 +69,8 @@ START = 1000.0
 DAY = 86400.0
 #: A four-byte UTF-8 character.
 WIDE = "\U0001d11e"
+#: The real ``os.unlink``, captured before any test patches it.
+REAL_UNLINK = os.unlink
 
 
 class Wall:
@@ -513,6 +515,183 @@ def test_a_failed_eviction_stays_counted_and_refuses_the_write(
     _, removed = store.record("twitch", "c1", "new")
     assert removed == {"evicted": 1}
     assert json_names() == [memory_file_name("twitch", "c1", "new")]
+
+
+def refusing_unlink(monkeypatch: pytest.MonkeyPatch, names: set[str] | None = None) -> list[str]:
+    """Make ``os.unlink`` in the store raise ``PermissionError`` — for every
+    file, or for *names* only — as a directory that allows reads but not
+    removal does. Returns the names whose deletion was attempted and refused."""
+
+    real_unlink = REAL_UNLINK
+    refused: list[str] = []
+
+    def failing_unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        name = Path(path).name
+        if names is None or name in names:
+            refused.append(name)
+            raise PermissionError("denied")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(viewer_memory.os, "unlink", failing_unlink)
+    return refused
+
+
+def test_gate1_f3_a_scan_whose_evictions_fail_refuses_instead_of_exceeding_the_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 1 F3: 5 valid files, ``max_files: 3``, every deletion refused. The
+    scan used to return ``{}`` with 5 files indexed; it now raises
+    :class:`MemoryStoreError` (the bounds cannot be met), the 5 files stay
+    counted — the store never reports fewer files than it holds — and the
+    failures are counted. Once deletion works, the next scan evicts 2."""
+
+    directory, json_names = memory_directory(tmp_path)
+    paths = [
+        write_memory(directory, ("twitch", "c1", f"v{index}"), last_used=float(index))
+        for index in range(5)
+    ]
+    wall = Wall(WALL_EPOCH + 100.0)
+    store = MemoryStore(MemorySettings(directory=directory, max_files=3), wall_clock=wall)
+    refused = refusing_unlink(monkeypatch)
+
+    with pytest.raises(MemoryStoreError, match="bounds cannot be met") as raised:
+        store.scan()
+    assert raised.value.removed == {}
+    assert refused, "an eviction was attempted"
+    assert store.failed_deletions == len(refused)
+    assert len(json_names()) == 5
+    assert store.stats() == (5, sum(path.stat().st_size for path in paths))
+
+    monkeypatch.setattr(viewer_memory.os, "unlink", REAL_UNLINK)
+    assert store.scan() == {"evicted": 2}
+    assert json_names() == sorted(path.name for path in paths[2:])
+    assert store.stats()[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_gate1_f3_prepare_refuses_readiness_and_says_why_when_evictions_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 1 F3, module half: the same directory at ``prepare`` fails the
+    module with :class:`ViewerMemoryError` — no memory action bound, readiness
+    never advertised — after one value-free ``module.degraded`` naming the
+    reason and a diagnostic; no file is deleted and no fact claims one was."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, json_names = memory_directory(tmp_path)
+    for index in range(5):
+        write_memory(directory, ("fake", "chan-a", f"v{index}"), last_used=START + index)
+    handle = await module_for(runtime, clock, directory, max_files=3)
+    refusing_unlink(monkeypatch)
+    try:
+        with pytest.raises(ViewerMemoryError, match="bounds cannot be met"):
+            await handle.prepare()
+        assert len(json_names()) == 5
+        assert removed_facts(runtime) == []
+        degraded = [
+            event["payload"] for event in events_of(runtime.bus, "module.degraded")
+            if event["payload"].get("module") == "viewer_memory"
+        ]
+        assert [payload["reason"] for payload in degraded] == [viewer_memory.REASON_BOUNDS_NOT_MET]
+        assert degraded[0]["capabilities"] == [RECALL_ACTION, RECORD_ACTION]
+        assert any(viewer_memory.REASON_BOUNDS_NOT_MET in text for text in handle.diagnostics)
+        for action in (RECALL_ACTION, RECORD_ACTION):
+            assert runtime.actions.bindings(action) == ()
+            assert action not in runtime.actions.registered_ready()
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_gate1_f3_an_undeletable_corrupt_file_stays_counted_and_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 1 F3 (accounting): a corrupt file whose deletion fails at
+    ``prepare`` is not treated as absent. Within the bounds startup goes on,
+    with one ``module.degraded`` saying a file could not be deleted; the file
+    counts toward ``max_files`` (a write that would need its slot is refused)
+    and the next sweep deletes it once deletion works (1 ``corrupt`` fact)."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, json_names = memory_directory(tmp_path)
+    malformed = directory / ("a" * 64 + ".json")
+    malformed.write_text("{not json", encoding="utf-8")
+    handle = await module_for(runtime, clock, directory, max_files=1)
+    refusing_unlink(monkeypatch, {malformed.name})
+    await handle.prepare()
+    try:
+        assert handle.store.stranded() == (malformed.name,)
+        assert handle.store.stats() == (1, malformed.stat().st_size)
+        degraded = [
+            event["payload"]["reason"] for event in events_of(runtime.bus, "module.degraded")
+            if event["payload"].get("module") == "viewer_memory"
+        ]
+        assert degraded == [viewer_memory.REASON_DELETION_FAILED]
+        with pytest.raises(MemoryStoreError, match="bounds cannot be met"):
+            await handle.record("fake", "chan-a", "v1")
+        assert json_names() == [malformed.name]
+
+        monkeypatch.setattr(viewer_memory.os, "unlink", REAL_UNLINK)
+        assert await handle.sweep() == {"corrupt": 1}
+        assert json_names() == []
+        assert handle.store.stats() == (0, 0)
+        assert removed_facts(runtime) == [{"reason": "corrupt", "count": 1}]
+    finally:
+        await handle.close()
+
+
+def test_gate1_f3_a_failed_erasure_is_an_error_not_an_absent_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 1 F3 (erasure): ``forget`` of a file that cannot be deleted raises
+    :class:`MemoryStoreError` instead of answering 0; the file stays indexed
+    and counted, and a later ``forget`` deletes it."""
+
+    directory, json_names = memory_directory(tmp_path)
+    wall = Wall(WALL_EPOCH + 100.0)
+    path = write_memory(directory, ("twitch", "c1", "v1"), last_used=1.0)
+    store = store_for(directory, wall)
+    refusing_unlink(monkeypatch)
+    with pytest.raises(MemoryStoreError, match="could not be deleted"):
+        store.forget("twitch", "c1", "v1")
+    assert store.indexed() == (path.name,)
+    assert store.stats() == (1, path.stat().st_size)
+    assert store.failed_deletions == 1
+
+    monkeypatch.setattr(viewer_memory.os, "unlink", REAL_UNLINK)
+    assert store.forget("twitch", "c1", "v1") == 1
+    assert store.forget("twitch", "c1", "v1") == 0
+    assert json_names() == []
+
+
+def test_gate1_f3_a_write_over_a_stranded_file_takes_its_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 1 F3 (replacement): a viewer whose corrupt file could not be
+    deleted records again. The write replaces the stranded file in its slot
+    (``max_files`` 1 is not exceeded, nothing is counted twice) and is no
+    longer stranded: a later sweep, with deletion working, keeps it."""
+
+    directory, json_names = memory_directory(tmp_path)
+    wall = Wall(WALL_EPOCH + 100.0)
+    name = memory_file_name("twitch", "c1", "v1")
+    (directory / name).write_text("{not json", encoding="utf-8")
+    refusing_unlink(monkeypatch, {name})
+    store = store_for(directory, wall, max_files=1)
+    assert store.stranded() == (name,)
+
+    record, removed = store.record("twitch", "c1", "v1")
+    assert removed == {}
+    assert store.stranded() == ()
+    assert store.indexed() == (name,)
+    assert store.stats() == (1, (directory / name).stat().st_size)
+
+    monkeypatch.setattr(viewer_memory.os, "unlink", REAL_UNLINK)
+    assert store.sweep() == {}
+    assert json_names() == [name]
+    assert store.read("twitch", "c1", "v1") == record
 
 
 # -- AC18: the prepare scan -------------------------------------------------- #

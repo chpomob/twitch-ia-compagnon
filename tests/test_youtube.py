@@ -1599,6 +1599,20 @@ async def test_ac39_three_platforms_on_one_runtime() -> None:
             "kick": "platform_unsupported", "youtube": "platform_unsupported",
         }
         assert handles["stream_control"].poll_platforms == ("twitch",)
+        # AC39 poll half (gate 1 F2): the poll capability view names kick and
+        # youtube unbound with ``platform_unsupported``, reported once and
+        # value-free on stream_control's health trace.
+        assert handles["stream_control"].unbound == {
+            "kick": "platform_unsupported", "youtube": "platform_unsupported",
+        }
+        poll_degraded = [
+            event["payload"] for event in events_of(runtime.bus, "module.degraded")
+            if event["payload"].get("module") == "stream_control"
+        ]
+        assert poll_degraded == [
+            {**poll_degraded[0], "reason": "platform_unsupported",
+             "capabilities": ["stream.poll.create"], "platforms": ["kick", "youtube"]}
+        ], poll_degraded
         for action in ("stream.clip.create", "stream.poll.create"):
             assert [binding.destination.platform for binding in runtime.actions.bindings(action)] == [
                 "twitch"

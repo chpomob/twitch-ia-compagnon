@@ -1001,6 +1001,7 @@ from modules.stream_control import (  # noqa: E402
     POLL_ACTION,
     PROVIDER_NAME as STREAM_CONTROL_PROVIDER,
     REASON_NO_POLL_SERVICE,
+    REASON_PLATFORM_UNSUPPORTED,
     SCENE_ACTION,
     StreamControlModule,
     StreamControlModuleError,
@@ -3124,6 +3125,51 @@ def assert_poll_success(observation: ActionObservation, *, reconciled: bool) -> 
     assert result["ends_at"] == result["started_at"] + 60
     assert result["reconciled"] is reconciled
     return result
+
+
+# -- AC39: platforms without a poll service ---------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac39_an_enabled_platform_without_a_poll_service_is_unbound_platform_unsupported() -> None:
+    """AC39 poll half (gate 1 F2): a platform that publishes a platform
+    capability service but no poll service is named unbound with reason
+    ``platform_unsupported`` — once, value-free, on ``module.degraded`` — while
+    polls stay bound for the platform that has one. A non-platform scope (the
+    brain's ``(admission, runs)``) is not a platform."""
+
+    h = await poll_harness(prepare=False)
+    try:
+        h.runtime.services.publish("moderation", "other", object(), module="otherplatform")
+        h.runtime.services.publish("admission", "runs", object(), module="brain")
+        await h.handle.prepare()
+        assert h.handle.poll_platforms == ("fake",)
+        assert h.handle.unbound == {"other": REASON_PLATFORM_UNSUPPORTED}
+        assert REASON_PLATFORM_UNSUPPORTED == "platform_unsupported"
+        (degraded,) = h.degraded()
+        assert degraded["reason"] == REASON_PLATFORM_UNSUPPORTED
+        assert degraded["capabilities"] == [POLL_ACTION]
+        assert degraded["platforms"] == ["other"]
+        assert [binding.destination.platform for binding in h.runtime.actions.bindings(POLL_ACTION)] == [
+            "fake"
+        ]
+    finally:
+        await h.handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac39_polls_disabled_name_no_unbound_platform() -> None:
+    """``polls.enabled: false`` leaves the poll action unbound with no trace:
+    no platform is reported ``platform_unsupported`` either."""
+
+    h = await poll_harness(polls={"enabled": False}, prepare=False)
+    try:
+        h.runtime.services.publish("moderation", "other", object(), module="otherplatform")
+        await h.handle.prepare()
+        assert h.handle.unbound == {}
+        assert h.degraded() == []
+    finally:
+        await h.handle.close()
 
 
 # -- AC26: one create, tracked, bounds --------------------------------------- #
