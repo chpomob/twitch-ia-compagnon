@@ -695,6 +695,157 @@ def test_gate1_f3_a_write_over_a_stranded_file_takes_its_place(
     assert store.read("twitch", "c1", "v1") == record
 
 
+def oversized_memory(directory: Path, key: tuple[str, str, str], size: int) -> Path:
+    """A valid memory record for *key* padded with whitespace to *size* bytes."""
+
+    path = write_memory(directory, key)
+    path.write_bytes(path.read_bytes().ljust(size, b" "))
+    return path
+
+
+def memory_degraded(runtime: RuntimeContext) -> list[dict[str, Any]]:
+    return [
+        event["payload"] for event in events_of(runtime.bus, "module.degraded")
+        if event["payload"].get("module") == "viewer_memory"
+    ]
+
+
+def test_gate2_f3_an_undeletable_oversized_file_fails_the_scan_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 2 F3 (per-file bound, store half): one valid record padded to 513
+    bytes with ``max_file_bytes: 512``, its deletion refused. Count and total
+    hold, yet the scan raises :class:`MemoryStoreError` naming the file and
+    the bound; the file stays counted and listed as a failure. Once deletion
+    works the next scan removes it as corrupt."""
+
+    directory, json_names = memory_directory(tmp_path)
+    path = oversized_memory(directory, ("fake", "c", "v0"), 513)
+    store = MemoryStore(
+        MemorySettings(directory=directory, max_file_bytes=512, max_total_bytes=4096),
+        wall_clock=Wall(WALL_EPOCH + 100.0),
+    )
+    refusing_unlink(monkeypatch)
+
+    with pytest.raises(MemoryStoreError, match="bounds cannot be met") as raised:
+        store.scan()
+    message = str(raised.value)
+    assert f"{path.name} is 513 bytes, over max_file_bytes 512" in message
+    assert raised.value.failures == (
+        viewer_memory.DeletionFailure(path.name, viewer_memory.REASON_OVERSIZED, 513),
+    )
+    assert store.scan_failures() == raised.value.failures
+    assert store.stats() == (1, 513)
+    assert json_names() == [path.name]
+
+    monkeypatch.setattr(viewer_memory.os, "unlink", REAL_UNLINK)
+    assert store.scan() == {"corrupt": 1}
+    assert store.scan_failures() == ()
+    assert json_names() == []
+
+
+@pytest.mark.asyncio
+async def test_gate2_f3_prepare_refuses_readiness_over_an_undeletable_oversized_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 2 F3 (per-file bound, module half; the gate's ``per_file`` probe):
+    ``prepare`` fails with :class:`ViewerMemoryError`, no action bound nor
+    ready, after one ``module.degraded`` whose reason is the bounds refusal
+    and whose ``failures`` name the file, why and that it remained; the
+    diagnostics say the same."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, json_names = memory_directory(tmp_path)
+    path = oversized_memory(directory, ("fake", "chan-a", "v0"), 513)
+    handle = await module_for(runtime, clock, directory, max_file_bytes=512, max_total_bytes=4096)
+    refusing_unlink(monkeypatch)
+    try:
+        with pytest.raises(ViewerMemoryError, match="bounds cannot be met") as raised:
+            await handle.prepare()
+        assert path.name in str(raised.value) and "max_file_bytes 512" in str(raised.value)
+        assert json_names() == [path.name]
+        degraded = memory_degraded(runtime)
+        assert [payload["reason"] for payload in degraded] == [viewer_memory.REASON_BOUNDS_NOT_MET]
+        assert degraded[0]["failures"] == [
+            {"file": path.name, "reason": "oversized", "bytes": 513, "remained": True}
+        ]
+        assert any(path.name in text and "remained" in text for text in handle.diagnostics)
+        assert any("over max_file_bytes 512" in text for text in handle.diagnostics)
+        for action in (RECALL_ACTION, RECORD_ACTION):
+            assert runtime.actions.bindings(action) == ()
+            assert action not in runtime.actions.registered_ready()
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_gate2_f3_a_failed_eviction_is_reported_when_others_restore_the_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 2 F3 (never silent; the gate's ``partial_failure`` probe): five
+    valid files, ``max_files: 3``, only the oldest's deletion refused. The
+    next two are evicted in its place and startup goes on — within the
+    bounds — but the failure is reported: one ``module.degraded`` naming the
+    file, ``evicted`` as the reason and that it remained, a diagnostic, and
+    the file still counted. The two removals are a fact."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, json_names = memory_directory(tmp_path)
+    paths = [
+        write_memory(directory, ("fake", "chan-a", f"v{index}"), last_used=float(index))
+        for index in range(5)
+    ]
+    oldest = paths[0]
+    handle = await module_for(runtime, clock, directory, max_files=3)
+    refused = refusing_unlink(monkeypatch, {oldest.name})
+    await handle.prepare()
+    try:
+        assert refused == [oldest.name]
+        assert json_names() == sorted(path.name for path in (oldest, *paths[3:]))
+        assert handle.store.stats() == (3, sum((directory / name).stat().st_size for name in json_names()))
+        assert removed_facts(runtime) == [{"reason": "evicted", "count": 2}]
+        degraded = memory_degraded(runtime)
+        assert [payload["reason"] for payload in degraded] == [viewer_memory.REASON_DELETION_FAILED]
+        assert degraded[0]["failures"] == [
+            {"file": oldest.name, "reason": "evicted",
+             "bytes": oldest.stat().st_size, "remained": True}
+        ]
+        assert any(
+            oldest.name in text and "evicted" in text and "remained" in text
+            for text in handle.diagnostics
+        )
+        for action in (RECALL_ACTION, RECORD_ACTION):
+            assert action in runtime.actions.registered_ready()
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_gate2_f3_a_clean_prepare_reports_no_failure(tmp_path: Path) -> None:
+    """The report is of failures only: a scan whose deletions all succeed
+    publishes its facts and no ``module.degraded``."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, _ = memory_directory(tmp_path)
+    for index in range(5):
+        write_memory(directory, ("fake", "chan-a", f"v{index}"), last_used=float(index))
+    oversized_memory(directory, ("fake", "chan-a", "big"), 513)
+    handle = await module_for(runtime, clock, directory, max_files=3, max_file_bytes=512)
+    await handle.prepare()
+    try:
+        assert handle.store.scan_failures() == ()
+        assert memory_degraded(runtime) == []
+        assert handle.diagnostics == ()
+        assert removed_facts(runtime) == [
+            {"reason": "corrupt", "count": 1}, {"reason": "evicted", "count": 2}
+        ]
+    finally:
+        await handle.close()
+
+
 # -- AC18: the prepare scan -------------------------------------------------- #
 
 

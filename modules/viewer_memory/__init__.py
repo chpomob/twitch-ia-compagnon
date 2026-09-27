@@ -96,11 +96,11 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -243,6 +243,23 @@ class ViewerMemoryError(RuntimeError):
 #: startup refused — or a file stays on disk within them.
 REASON_BOUNDS_NOT_MET = "the memory bounds cannot be met: a deletion failed"
 REASON_DELETION_FAILED = "a memory file could not be deleted"
+#: The reason a :class:`DeletionFailure` names for a file over
+#: ``max_file_bytes`` (read as corrupt). Never a ``memory.removed`` reason: a
+#: removed oversized file is counted as ``corrupt``.
+REASON_OVERSIZED = "oversized"
+
+
+class DeletionFailure(NamedTuple):
+    """A memory file the prepare scan tried and failed to delete, and which
+    is still on disk (counted toward the bounds). *name* is the hashed file
+    name, so it names the file without a configured value."""
+
+    name: str
+    reason: str
+    size: int
+
+    def describe(self) -> str:
+        return f"{self.name} ({self.reason}, {self.size} bytes) could not be deleted and remained"
 
 
 class MemoryStoreError(RuntimeError):
@@ -252,9 +269,17 @@ class MemoryStoreError(RuntimeError):
     (``{reason: count}``), so their facts are still published.
     """
 
-    def __init__(self, message: str, *, removed: Mapping[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        removed: Mapping[str, int] | None = None,
+        failures: Sequence[DeletionFailure] = (),
+    ) -> None:
         super().__init__(message)
         self.removed: dict[str, int] = dict(removed or {})
+        #: The files the operation failed to delete and which remained.
+        self.failures: tuple[DeletionFailure, ...] = tuple(failures)
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +533,9 @@ class MemoryStore:
         self._stranded: dict[str, tuple[str, int]] = {}
         # Deletions that failed since the store was built (value-free).
         self._failed_deletions = 0
+        # ``file name → reason`` of every deletion the last prepare scan tried
+        # and failed, the eviction pass included; see :meth:`scan_failures`.
+        self._scan_attempts: dict[str, str] = {}
 
     @property
     def settings(self) -> MemorySettings:
@@ -535,6 +563,26 @@ class MemoryStore:
 
         return tuple(sorted(self._stranded))
 
+    def scan_failures(self) -> tuple[DeletionFailure, ...]:
+        """The files the last :meth:`scan` failed to delete and which are
+        still on disk, sorted by name — whether or not other deletions then
+        restored the bounds. A failure a later retry of the same scan undid
+        is not listed: that removal is a fact instead."""
+
+        limit = self._settings.max_file_bytes
+        failures = []
+        for name in sorted(self._scan_attempts):
+            if name in self._stranded:
+                size = self._stranded[name][1]
+                reason = REASON_OVERSIZED if size > limit else self._scan_attempts[name]
+            elif name in self._index:
+                size = self._index[name].size
+                reason = self._scan_attempts[name]
+            else:
+                continue
+            failures.append(DeletionFailure(name, reason, size))
+        return tuple(failures)
+
     def indexed(self) -> tuple[str, ...]:
         """The indexed file names, sorted."""
 
@@ -559,16 +607,19 @@ class MemoryStore:
 
         Only memory-named entries are looked at. The directory is created
         when absent. A corrupt or expired file whose deletion fails stays
-        counted (:meth:`stranded`). When the bounds still do not hold after
-        the eviction pass — a deletion failed — :class:`MemoryStoreError` is
-        raised carrying the removals made: the store is never used above its
-        bounds.
+        counted (:meth:`stranded`); every failed deletion is listed by
+        :meth:`scan_failures`. When a bound still does not hold after the
+        eviction pass — the file count or total bytes, or a file over
+        ``max_file_bytes`` that could not be deleted — :class:`MemoryStoreError`
+        is raised naming what is exceeded, carrying the removals made and the
+        failures: the store is never used above its bounds.
         """
 
         self._directory.mkdir(parents=True, exist_ok=True)
         self._index.clear()
         self._total_bytes = 0
         self._stranded.clear()
+        self._scan_attempts.clear()
         removed = {REASON_CORRUPT: 0, REASON_EXPIRED: 0, REASON_EVICTED: 0}
         horizon = self._horizon()
         with os.scandir(self._directory) as entries:
@@ -586,13 +637,33 @@ class MemoryStore:
                 continue
             self._index[entry.name] = index_entry
             self._total_bytes += size
+        exceeded: list[str] = []
         try:
             evicted = self._evict(target=None, new_size=0)
         except MemoryStoreError as error:
+            evicted = error.removed
+            files, total = self.stats()
+            if files > self._settings.max_files:
+                exceeded.append(f"{files} files held, over max_files {self._settings.max_files}")
+            if total > self._settings.max_total_bytes:
+                exceeded.append(
+                    f"{total} bytes held, over max_total_bytes {self._settings.max_total_bytes}"
+                )
+        removed = _merge_removed(removed, evicted)
+        failures = self.scan_failures()
+        exceeded.extend(
+            f"{failure.name} is {failure.size} bytes, over max_file_bytes "
+            f"{self._settings.max_file_bytes}"
+            for failure in failures
+            if failure.reason == REASON_OVERSIZED
+        )
+        if exceeded:
             raise MemoryStoreError(
-                str(error), removed=_merge_removed(removed, error.removed)
-            ) from None
-        return _merge_removed(removed, evicted)
+                f"{MODULE_NAME} scan: the bounds cannot be met: " + "; ".join(exceeded),
+                removed=removed,
+                failures=failures,
+            )
+        return removed
 
     def _discard(self, entry: Any, reason: str, removed: dict[str, int]) -> None:
         """Delete a corrupt or expired scanned file; keep it counted on failure."""
@@ -606,6 +677,7 @@ class MemoryStore:
             except OSError:
                 size = 0
             self._stranded[entry.name] = (reason, int(size))
+            self._scan_attempts[entry.name] = reason
 
     def sweep(self) -> dict[str, int]:
         """Retry the stranded files, then delete every indexed record past
@@ -814,7 +886,8 @@ class MemoryStore:
         """Delete until both bounds hold after the write: the stranded files
         first (retried), then candidates in eviction order.
 
-        Returns ``{reason: count}``. When the bounds still do not hold — a
+        Returns ``{reason: count}``; the prepare scan's failed deletions are
+        kept for :meth:`scan_failures`. When the bounds still do not hold — a
         deletion failed — raises :class:`MemoryStoreError` carrying the
         removals made, for a write (*target*) and for the prepare scan
         (*target* ``None``) alike.
@@ -853,6 +926,10 @@ class MemoryStore:
             # A file that could not be removed stays indexed: it is still on
             # disk, counts toward both bounds and is retried by later passes.
             count += self._delete(name)
+            if target is None and name in self._index:
+                # The prepare scan's failure is reported even when a later
+                # candidate restores the bounds.
+                self._scan_attempts[name] = REASON_EVICTED
         removed = _merge_removed(removed, {REASON_EVICTED: count})
         if over():
             operation = "record" if target is not None else "scan"
@@ -1010,24 +1087,31 @@ class ViewerMemoryModule:
         try:
             removed = self._store.scan()
         except MemoryStoreError as error:
-            # A deletion failed and the bounds do not hold: the removals made
-            # are still facts, and the reason goes on the module's own health
-            # trace first, since the coordinator's failure names the module
-            # only. No action is bound and readiness is never advertised.
+            # A deletion failed and a bound does not hold: the removals made
+            # are still facts, and the reason — with each file that remained
+            # and the bound exceeded — goes on the module's own health trace
+            # first, since the coordinator's failure names the module only.
+            # No action is bound and readiness is never advertised.
             await self._publish_removed(error.removed)
-            self._diagnose(REASON_BOUNDS_NOT_MET)
-            await self._report_degraded(REASON_BOUNDS_NOT_MET)
-            raise ViewerMemoryError(f"{MODULE_NAME} prepare: {REASON_BOUNDS_NOT_MET}") from None
+            self._diagnose_failures(error.failures)
+            detail = str(error).partition(": the bounds cannot be met: ")[2]
+            self._diagnose(f"{REASON_BOUNDS_NOT_MET}: {detail}")
+            await self._report_degraded(REASON_BOUNDS_NOT_MET, error.failures, exceeded=detail)
+            raise ViewerMemoryError(
+                f"{MODULE_NAME} prepare: {REASON_BOUNDS_NOT_MET}: {detail}"
+            ) from None
         except OSError:
             raise ViewerMemoryError(
                 f"{MODULE_NAME} prepare: the memory directory could not be scanned"
             ) from None
         await self._publish_removed(removed)
-        if self._store.stranded():
-            # Within the bounds, but a corrupt or expired file stays on disk:
-            # counted, retried by every sweep, and said.
-            self._diagnose(REASON_DELETION_FAILED)
-            await self._report_degraded(REASON_DELETION_FAILED)
+        failures = self._store.scan_failures()
+        if failures:
+            # Within the bounds — other files were removed instead, or the
+            # file fits them — but a deletion failed and the file stays on
+            # disk: counted, retried by later passes, and said file by file.
+            self._diagnose_failures(failures)
+            await self._report_degraded(REASON_DELETION_FAILED, failures)
         try:
             for action_name in (RECALL_ACTION, RECORD_ACTION):
                 self._actions.register(
@@ -1263,18 +1347,32 @@ class ViewerMemoryModule:
             except Exception:  # noqa: BLE001 - a lost fact must not undo a removal
                 self._diagnose(f"fact {reason}: not published")
 
-    async def _report_degraded(self, reason: str) -> None:
+    async def _report_degraded(
+        self, reason: str, failures: Sequence[DeletionFailure] = (), **details: Any
+    ) -> None:
         degraded = getattr(self._supervision, "degraded", None)
         if not callable(degraded):
             return
+        if failures:
+            details["failures"] = [
+                {"file": failure.name, "reason": failure.reason,
+                 "bytes": failure.size, "remained": True}
+                for failure in failures
+            ]
         try:
-            outcome = degraded(reason=reason, capabilities=[RECALL_ACTION, RECORD_ACTION])
+            outcome = degraded(
+                reason=reason, capabilities=[RECALL_ACTION, RECORD_ACTION], **details
+            )
             if inspect.isawaitable(outcome):
                 await outcome
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a health report must not fail the caller
             self._diagnose("degraded: not published")
+
+    def _diagnose_failures(self, failures: Sequence[DeletionFailure]) -> None:
+        for failure in failures:
+            self._diagnose(f"{REASON_DELETION_FAILED}: {failure.describe()}")
 
     def _diagnose(self, text: str) -> None:
         self._diagnostics.append(f"{MODULE_NAME} {text}")
@@ -1509,7 +1607,9 @@ __all__ = [
     "REASON_ERASED",
     "REASON_EVICTED",
     "REASON_EXPIRED",
+    "REASON_OVERSIZED",
     "TIMESTAMP_FORMAT",
+    "DeletionFailure",
     "MemorySettings",
     "MemoryStore",
     "MemoryStoreError",
