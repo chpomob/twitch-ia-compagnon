@@ -31,6 +31,16 @@ Three checks over the files themselves, none over the runtime:
   spec itself.
 * AC41 (phase 2 R10): the README's playback and capture subsections describe
   no lead — none of ``lead``, ``marge``, ``margin`` appears in them.
+* AC41 (phase 3 R8): the README's phase 3 section names
+  ``tests/test_phase3_trials.py``; its trial table holds exactly the six R8
+  rows in order, each with its five fields recorded (a commit hash, a
+  settings shape carrying no secret, a cited ``PHASE3-TRIAL`` line or "Non
+  exécuté", the limits, a date); and its versioning subsection names every
+  test of the phase 3 spec's allowlist, read from the archived spec
+  ``docs/campaigns/phase3/spec.md``.
+* AC7 (phase 3 R1): the presence table has a row per presence item, each
+  "configuration ou code" cell non-empty and naming a shipped module, the
+  chat-command polls and the channel-point redemptions saying "code".
 * Target list (gate finding F5): the phase 1 spec's ``targets`` front matter
   is the authority on which repository files the phase touches, so every
   file a plan step names must be a target, lie in the permitted scope the
@@ -114,6 +124,49 @@ SECRET_SETTING = re.compile(
     r"\b(api_key|password|access_token|client_secret|token)\s*:\s*(?!<|\$\{|vide\b)[^\s,}]",
     re.IGNORECASE,
 )
+
+PHASE3_SPEC = ROOT / "docs" / "campaigns" / "phase3" / "spec.md"
+PHASE3_SECTION_TITLE = "Phase 3 — présence, mémoire des spectateurs, modération et plateformes"
+PHASE3_VERSIONING_TITLE = "Versionnement de la spec phase 2 (phase 3)"
+PHASE3_PRESENCE_TITLE = "Pack de présence : configuration ou code"
+PHASE3_TRIAL_TITLE = "Essais réels par plateforme (phase 3)"
+PHASE3_TRIALS_FILE = "tests/test_phase3_trials.py"
+#: The six trials of phase 3 R8, as the README's table labels them, in the
+#: spec's order: platform clips, platform moderation, community notices,
+#: Kick, YouTube, screen watch.
+PHASE3_TRIAL_ROWS = (
+    "clips de plateforme",
+    "modération de plateforme",
+    "notifications communautaires",
+    "Kick",
+    "YouTube",
+    "veille d'écran",
+)
+#: The five fields of each row (R8, AC41), after the trial label; the same
+#: labels as the phase 2 table.
+PHASE3_TRIAL_FIELDS = PHASE2_TRIAL_FIELDS
+#: The presence items of AC7 (at least these eleven), plus the three the plan
+#: (P25) adds because they still need code.
+PHASE3_PRESENCE_ITEMS = (
+    "Accueil",
+    "Remerciements",
+    "Résumé (« qu'ai-je manqué ? »)",
+    "Traduction",
+    "Sondages (commande de chat)",
+    "Scènes",
+    "Voix",
+    "Jingles",
+    "Réactions à l'écran",
+    "Clips",
+    "Mémoire",
+    "Récompenses de points de chaîne",
+    "Annonce du lien du clip",
+    "Remerciement d'un donateur anonyme",
+)
+#: The items AC7 requires to say "code": chat-command polls and channel-point
+#: redemptions.
+PHASE3_CODE_ITEMS = ("Sondages (commande de chat)", "Récompenses de points de chaîne")
+PHASE3_PRESENCE_COLUMN = "Configuration ou code"
 
 _INSIGNIFICANT = {
     tokenize.NL,
@@ -460,6 +513,144 @@ def test_the_phase_2_readme_checks_read_the_documents_shape() -> None:
     assert SECRET_SETTING.search("api_key: sk-1")
     for shape in ("password: ${OBS_PASSWORD}", "api_key: vide", "access_token: <jeton>"):
         assert not SECRET_SETTING.search(shape), shape
+
+
+# --------------------------------------------------------------------------- #
+# AC7, AC41 (phase 3)
+# --------------------------------------------------------------------------- #
+
+
+def _trial_row_problems(label: str, values: dict[str, str], marker: str) -> list[str]:
+    """What is wrong with one trial row: an empty field, a commit without a
+    7–40-hex hash, a secret value in the settings shape, an outcome that is
+    neither a cited ``<marker>`` line nor "Non exécuté", a date that is not
+    ``YYYY-MM-DD``."""
+
+    problems = [f"{label}: {name} is empty" for name, value in values.items() if not value]
+    if not re.search(r"`[0-9a-f]{7,40}`", values.get("Commit", "")):
+        problems.append(f"{label}: no commit hash")
+    if SECRET_SETTING.search(values.get("Forme des réglages", "")):
+        problems.append(f"{label}: secret value in the settings shape")
+    outcome = values.get("Résultat", "")
+    if marker not in outcome and "Non exécuté" not in outcome:
+        problems.append(f"{label}: outcome cites no {marker} line and is not 'Non exécuté'")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", values.get("Date", "")):
+        problems.append(f"{label}: date is not YYYY-MM-DD")
+    return problems
+
+
+def _named_modules(cell: str, modules: set[str]) -> list[str]:
+    """The shipped module names *cell* quotes as `` `name` ``, in order."""
+
+    return [name for name in re.findall(r"`([a-z_]+)`", cell) if name in modules]
+
+
+def _is_code(cell: str) -> bool:
+    """A presence cell says "code" when it opens with that word."""
+
+    return re.match(r"code\b", cell, re.IGNORECASE) is not None
+
+
+def test_ac41_readme_records_the_phase_3_trials_and_versioning() -> None:
+    """AC41 (phase 3 R8): the phase 3 trial table has exactly the six rows in
+    the R8 order, each with 5 non-empty fields — a 7–40-hex commit hash, a
+    settings shape with no secret value, an outcome citing a
+    ``PHASE3-TRIAL`` line or "Non exécuté", a ``YYYY-MM-DD`` date; the
+    section names ``tests/test_phase3_trials.py``; and the versioning
+    subsection names all 6 tests of the phase 3 spec's allowlist, read from
+    the archived spec itself."""
+
+    readme = README.read_text(encoding="utf-8")
+    section = _section(readme, PHASE3_SECTION_TITLE)
+    assert PHASE3_TRIALS_FILE in section
+
+    table = _table_cells(_subsection(section, PHASE3_TRIAL_TITLE))
+    header = table.pop("")
+    assert tuple(header[1:]) == PHASE3_TRIAL_FIELDS, header
+    assert tuple(table) == PHASE3_TRIAL_ROWS, list(table)
+    problems: list[str] = []
+    for label, cells in table.items():
+        assert len(cells) == len(PHASE3_TRIAL_FIELDS), (label, cells)
+        values = dict(zip(PHASE3_TRIAL_FIELDS, cells))
+        problems += _trial_row_problems(label, values, "PHASE3-TRIAL")
+    assert problems == [], problems
+
+    allowlisted = _allowlisted_tests(PHASE3_SPEC.read_text(encoding="utf-8"))
+    assert len(allowlisted) == 6, allowlisted
+    versioning = _subsection(section, PHASE3_VERSIONING_TITLE)
+    missing = [test for test in allowlisted if f"`{test}`" not in versioning]
+    assert missing == [], f"allowlisted tests the versioning subsection does not name: {missing}"
+
+
+def test_ac7_readme_presence_table_says_configuration_or_code() -> None:
+    """AC7 (phase 3 R1): the presence table has one row per presence item —
+    at least the eleven of AC7, plus the redemptions, the clip-link
+    announcement and the anonymous-gifter thanks — each "configuration ou
+    code" cell non-empty, saying which of the two and naming the module;
+    the chat-command polls and the channel-point redemptions say "code"."""
+
+    section = _section(README.read_text(encoding="utf-8"), PHASE3_SECTION_TITLE)
+    table = _table_cells(_subsection(section, PHASE3_PRESENCE_TITLE))
+    header = table.pop("")
+    assert PHASE3_PRESENCE_COLUMN in header, header
+    column = header.index(PHASE3_PRESENCE_COLUMN) - 1
+    assert len(table) >= 11, list(table)
+    missing = [item for item in PHASE3_PRESENCE_ITEMS if item not in table]
+    assert missing == [], f"presence items without a row: {missing}"
+
+    modules = {child.name for child in MODULES_DIR.iterdir() if (child / "module.yaml").is_file()}
+    for label, cells in table.items():
+        assert len(cells) == len(header) - 1, (label, cells)
+        assert all(cells), (label, cells)
+        cell = cells[column]
+        assert _is_code(cell) or cell.startswith("Configuration"), (label, cell)
+        assert _named_modules(cell, modules), (label, "names no module", cell)
+    for item in PHASE3_CODE_ITEMS:
+        assert _is_code(table[item][column]), (item, table[item][column])
+
+
+def test_the_phase_3_readme_checks_read_the_documents_shape() -> None:
+    """The phase 3 parsers and row checks themselves, on samples: a trial
+    table inside a ``###`` subsection of a ``##`` section, each kind of bad
+    row, and the presence cell readers."""
+
+    readme = (
+        "## Phase 3 — x\n\nIntro naming tests/test_phase3_trials.py.\n\n"
+        "### Other\n\n| A | B |\n| --- | --- |\n| a | b |\n\n"
+        "### Essais\n\n| Essai | Commit | Résultat |\n| --- | --- | --- |\n"
+        "| one | `abc1234` | ok |\n\n#### Deeper\nstill inside\n\n## Next\n| z | z |\n"
+    )
+    section = _section(readme, "Phase 3")
+    assert "## Next" not in section
+    assert _table_cells(_subsection(section, "Essais")) == {
+        "one": ["`abc1234`", "ok"],
+        "": ["Essai", "Commit", "Résultat"],
+    }
+
+    good = {
+        "Commit": "`0c170ef` (P24)",
+        "Forme des réglages": "`x {client_secret: ${X_SECRET}, refresh_token: ${X_TOKEN}}`",
+        "Résultat": "Exécuté : `PHASE3-TRIAL x commit=0c170ef outcome=success date=2026-09-27`",
+        "Limites": "none measured",
+        "Date": "2026-09-27",
+    }
+    assert _trial_row_problems("x", good, "PHASE3-TRIAL") == []
+    assert _trial_row_problems("x", good | {"Résultat": "**Non exécuté** — why"}, "PHASE3-TRIAL") == []
+    for field, value in (
+        ("Commit", "0c170ef"),
+        ("Commit", "`0c17`"),
+        ("Forme des réglages", "access_token: abc"),
+        ("Résultat", "PHASE2-TRIAL x"),
+        ("Date", "27/09/2026"),
+        ("Limites", ""),
+    ):
+        assert len(_trial_row_problems("x", good | {field: value}, "PHASE3-TRIAL")) == 1, field
+
+    modules = {"clips", "brain", "twitch"}
+    assert _named_modules("Configuration — `clips` et `brain` (route `clip`)", modules) == ["clips", "brain"]
+    assert _named_modules("Configuration — route `thanks`", modules) == []
+    assert _is_code("Code — `twitch`") and _is_code("code seulement")
+    assert not _is_code("Configuration — `brain`") and not _is_code("Codec")
 
 
 # --------------------------------------------------------------------------- #
