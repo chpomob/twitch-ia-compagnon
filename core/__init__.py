@@ -1,4 +1,4 @@
-"""Core services for the Twitch AI companion."""
+"""Core services for the AI stream companion."""
 
 from .bus import EventBus, PublicationError
 from .loader import ModuleActivation, ModuleLoadError, ModuleLoader

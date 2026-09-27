@@ -526,7 +526,9 @@ def spec_declaration(spec: ActionSpec) -> dict[str, Any]:
     """The JSON-shaped declaration of *spec* an agent sends in ``hello`` (§5.1).
 
     Round-trips through :func:`spec_from_declaration` to an equal
-    :class:`~core.contracts.ActionSpec`, ``delivery`` included.
+    :class:`~core.contracts.ActionSpec`, ``delivery`` and ``model_proposable``
+    included. Both optional keys are sent only when set, so a declaration of
+    any other spec is byte-for-byte the phase 2 one.
     """
 
     declaration: dict[str, Any] = {
@@ -546,6 +548,8 @@ def spec_declaration(spec: ActionSpec) -> dict[str, Any]:
     }
     if spec.delivery is not None:
         declaration["delivery"] = _jsonable(spec.delivery)
+    if spec.model_proposable:
+        declaration["model_proposable"] = True
     return declaration
 
 
@@ -582,6 +586,7 @@ def spec_from_declaration(declaration: Any) -> ActionSpec | None:
             timeout_seconds=declaration["timeout_seconds"],
             idempotency=declaration["idempotency"],
             delivery=declaration.get("delivery"),
+            model_proposable=declaration.get("model_proposable", False),
         )
     except (ContractError, KeyError, TypeError, ValueError):
         return None

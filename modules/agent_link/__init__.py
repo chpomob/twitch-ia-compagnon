@@ -472,8 +472,9 @@ def spec_declaration(spec: ActionSpec) -> dict[str, Any]:
 
     Every compared field of the :class:`~core.contracts.ActionSpec` — name,
     version, description, schemas, nature, permissions, destinations,
-    timeout, idempotency and the optional ``delivery`` capability — so the
-    brain's comparison against its catalog finds the declaration identical.
+    timeout, idempotency, the optional ``delivery`` capability and the optional
+    ``model_proposable`` flag (sent only when true) — so the brain's
+    comparison against its catalog finds the declaration identical.
     """
 
     declaration: dict[str, Any] = {
@@ -493,6 +494,8 @@ def spec_declaration(spec: ActionSpec) -> dict[str, Any]:
     }
     if spec.delivery is not None:
         declaration["delivery"] = _jsonable(spec.delivery)
+    if spec.model_proposable:
+        declaration["model_proposable"] = True
     return declaration
 
 

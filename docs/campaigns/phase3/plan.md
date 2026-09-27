@@ -599,8 +599,10 @@ at activation only when `context.services.available`, next to `poll`.
 - **Dependencies:** [P4]
 - **Tests:** (the store API is driven directly; the module goes through a
   `runtime_context`)
-  - AC13: the name regex matches, the name contains neither `v1` nor `c1`,
-    the JSON fields are present, and `(kick, c1)` gives a distinct file.
+  - AC13: the name regex matches, the name equals the key's SHA-256 digest
+    plus `.json` and contains neither `v1` nor a non-hex channel id
+    (`chan-1`), the JSON fields are present, and `(kick, c1)` gives a
+    distinct file (wording aligned with the P27F3 AC13 clarification).
   - AC14: C is deleted, then the `first_seen` tie-break, then the name
     tie-break. The deletion publishes 1 fact with count 1.
   - AC15: the total-bytes bound holds, and the target is never deleted.
@@ -1427,7 +1429,7 @@ base commit, reading all changed files together, not commit by commit.
 | core/contracts.py | `ActionSpec.__post_init__` | New field, default `False`; refusals on read/delivery. |
 | core/loader.py | `_ACTION_KEYS`, `_manifest_actions` | Accept and pass the key (P3). |
 | modules/brain/__init__.py | `_offered_tools`, model-call path | Offer proposable authorized writes; run limit (P6). |
-| modules/proxy/__init__.py, modules/agent_link/__init__.py | spec equality/serialization for lent actions | No change expected: the default is equal on both sides. Verify in P1 that no field list is enumerated by hand; flag if one is. |
+| modules/proxy/__init__.py, modules/agent_link/__init__.py | spec equality/serialization for lent actions | Both enumerate the declared fields by hand (gate F5), so P27F3 carries `model_proposable` on the wire: sent as `true` only when set, rebuilt as `false` when absent (protocol §18); a proposable remote spec now compares equal. |
 | modules/moderation/module.yaml | manifest | The only `true` (P14). |
 | tests/test_contracts.py | spec construction | Unchanged plus new refusals. |
 

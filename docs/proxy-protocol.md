@@ -85,7 +85,8 @@ processed; the connection stays open so the agent can still send its `hello`
    server, where `screen.capture` is served remotely only. A declaration is
    **identical** when name, version, argument
    and result schemas, nature, supported destinations — and, being part of the
-   compared spec, the optional `delivery` capability — are equal. An identical
+   compared spec, the optional `delivery` capability and the optional
+   `model_proposable` flag (§18) — are equal. An identical
    declaration makes that action **ready**; a differing one is excluded with
    `error action_mismatch` (`id` = the `hello` nonce) and leaves the others;
    a declared action absent from the allowlist is ignored.
@@ -124,7 +125,7 @@ agent to brain, "B→A" brain to agent.
 | ----------------- | --------------- | ------- |
 | `agent_id`        | non-empty string | Stable identifier of the agent; becomes `metadata.provider_id` of forwarded events (§15). |
 | `token`           | string          | The pairing token. Never logged, never traced, never echoed. |
-| `actions`         | array of objects | ActionSpec-shaped declarations: `name`, `version`, `description`, `argument_schema`, `result_schema`, `nature`, `required_permissions`, `supported_destinations` (objects `platform`, `channel_id`, `scope`), `timeout_seconds`, `idempotency`, and `delivery` when the action declares the delivery capability. |
+| `actions`         | array of objects | ActionSpec-shaped declarations: `name`, `version`, `description`, `argument_schema`, `result_schema`, `nature`, `required_permissions`, `supported_destinations` (objects `platform`, `channel_id`, `scope`), `timeout_seconds`, `idempotency`, `delivery` when the action declares the delivery capability, and `model_proposable: true` when the action is model-proposable (§18). |
 | `max_frame_bytes` | positive integer | The largest text frame the agent accepts. |
 
 ### 5.2 `welcome` (brain → agent)
@@ -567,3 +568,22 @@ protocol v1 carries without changing its version or its rules:
   provider_not_ready` from the agent's executor at call time. Agent-side
   readiness changes are **not** propagated over the wire in protocol v1; that
   is a recorded limit, deferred to a later protocol revision.
+
+## 18. Phase 3 addendum
+
+Phase 3 (`docs/campaigns/phase3/spec.md`, R5; gate fix P27F3) adds one
+optional, additive key to an `actions` declaration of `hello` (§5.1) without
+changing the version or any rule:
+
+- **`model_proposable`.** An action whose spec is model-proposable (only
+  `moderation.request` ships so) is declared with `model_proposable: true`;
+  the key is absent otherwise, so every phase 2 declaration is unchanged. The
+  brain rebuilds an absent key as `false`. The flag is part of the compared
+  spec (§5 step 4): a remote provider of a proposable action pairs only when
+  it declares the flag, and a declaration that omits it — an older agent —
+  is `error action_mismatch` for that action alone, never a silent pairing
+  of a spec the brain would offer differently to the model. The contract's
+  refusals (never on a `read` action, never with `delivery`) apply to the
+  rebuilt spec, so such a declaration is a mismatch too.
+- **Unchanged.** `v` stays `1`; frame types, limits, error and close codes
+  are those of §5–§17.

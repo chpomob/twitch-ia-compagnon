@@ -1714,3 +1714,28 @@ def test_ac39_core_names_no_platform() -> None:
     assert hits == []
     assert _PLATFORM_WORD.search("a Kick webhook") and _PLATFORM_WORD.search("YOUTUBE")
     assert not _PLATFORM_WORD.search("kicked youtuber")
+
+
+_PLATFORM_OR_VENDOR_WORD = re.compile(
+    r"\b(twitch|kick|youtube|openai|anthropic|gemini)\b", re.IGNORECASE
+)
+
+
+def test_the_broad_core_scan_names_no_platform_or_vendor() -> None:
+    """P27F3 (gate F7): the phase 3 request's broad case-insensitive word scan
+    of ``core/`` — every platform and model vendor — finds 0 occurrences;
+    those names belong in modules and the README, never in the core."""
+
+    hits = [
+        f"{path.relative_to(ROOT)}:{number}"
+        for path in sorted((ROOT / "core").rglob("*"))
+        if path.is_file() and "__pycache__" not in path.parts
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+        )
+        if _PLATFORM_OR_VENDOR_WORD.search(line)
+    ]
+    assert hits == []
+    assert _PLATFORM_OR_VENDOR_WORD.search("the Twitch AI companion")
+    assert _PLATFORM_OR_VENDOR_WORD.search("OpenAI") and _PLATFORM_OR_VENDOR_WORD.search("gemini")
+    assert not _PLATFORM_OR_VENDOR_WORD.search("twitchy anthropics")

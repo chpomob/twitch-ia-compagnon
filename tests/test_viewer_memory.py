@@ -213,7 +213,8 @@ async def test_activation_refuses_invalid_settings_value_free(tmp_path: Path) ->
 
 def test_ac13_one_hashed_file_per_key_with_the_declared_fields(tmp_path: Path) -> None:
     """AC13: recording ``v1`` on ``(twitch, c1)`` gives exactly 1 file whose
-    name matches the pattern and contains neither ``v1`` nor ``c1``, whose
+    name matches the pattern and equals the key's SHA-256 digest plus
+    ``.json`` — it contains neither ``v1`` nor a non-hex channel id — whose
     content is JSON with ``format == 1`` and the key fields; ``(kick, c1)``
     gives a second, distinct file."""
 
@@ -228,11 +229,11 @@ def test_ac13_one_hashed_file_per_key_with_the_declared_fields(tmp_path: Path) -
     assert removed == {}
     [name] = json_names()
     assert NAME_PATTERN.match(name)
-    # The name is the hash of the key and nothing else. ``v`` is not a hex
-    # digit, so ``v1`` can never appear; ``c1`` is two hex digits, and this
-    # very key's digest happens to contain them (``...65dc1a27...``), so the
-    # AC's "no ``c1``" is checked as "no identifier": the name is exactly the
-    # digest, and a channel id with a non-hex character is absent from it.
+    # The name is the hash of the key and nothing else (AC13 as clarified in
+    # P27F3). ``v`` is not a hex digit, so ``v1`` can never appear; ``c1`` is
+    # two hex digits that this very key's digest contains by chance
+    # (``...65dc1a27...``), so for it the AC asks for the name-equals-digest
+    # check, and a channel id with a non-hex character is absent from it.
     assert "v1" not in name
     expected = hashlib.sha256(
         json.dumps(["twitch", "c1", "v1"], ensure_ascii=False, separators=(",", ":")).encode()

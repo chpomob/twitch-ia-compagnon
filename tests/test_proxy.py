@@ -3598,6 +3598,31 @@ def test_agent_link_declaration_round_trips_through_the_brains_comparison_delive
     assert "delivery" not in agent_link.spec_declaration(screen_capture_spec())
 
 
+def test_a_model_proposable_spec_round_trips_on_the_wire_from_both_sides() -> None:
+    """P27F3 (gate F5): ``model_proposable`` is part of the compared spec, so
+    the real ``moderation.request`` spec declared by the agent or the proxy
+    serializer rebuilds, after a JSON trip, into an equal spec; the key is sent
+    only when true, and a declaration without it rebuilds the default."""
+
+    from modules.moderation import _declared_spec
+
+    spec = _declared_spec()
+    assert spec.model_proposable is True
+    for serialize in (spec_declaration, agent_link.spec_declaration):
+        declaration = json.loads(json.dumps(serialize(spec)))
+        assert declaration["model_proposable"] is True
+        restored = spec_from_declaration(declaration)
+        assert restored == spec and restored.model_proposable is True
+        del declaration["model_proposable"]
+        restored = spec_from_declaration(declaration)
+        assert restored is not None and restored.model_proposable is False
+        assert restored != spec
+        for other in (screen_capture_spec(), fake_write_spec()):
+            assert "model_proposable" not in serialize(other)
+    refused = dict(spec_declaration(screen_capture_spec()), model_proposable=True)
+    assert spec_from_declaration(refused) is None
+
+
 async def test_agent_link_hello_carries_the_nonce_the_identity_the_declarations_and_the_bound() -> None:
     """``hello`` includes ``delivery`` on the declared write action and no
     ``delivery`` on the read; the nonce comes from the injected random source."""

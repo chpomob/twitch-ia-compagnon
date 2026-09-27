@@ -214,9 +214,12 @@ Each is a contract; the plan chooses the code.
   hashing).
 - Tests never use a positive-duration sleep; clocks, RNG, transports,
   webhook senders and token endpoints are injected.
-- `docs/proxy-protocol.md` protocol v1 is unchanged: the new actions run on
-  the brain host; watch runs reach a proxied `screen.capture` exactly as chat
-  runs do.
+- `docs/proxy-protocol.md` protocol v1 is unchanged except for one
+  optional, additive declaration key (P27F3, gate F5): an action declared in
+  `hello` carries `model_proposable: true` when its spec is proposable and
+  omits the key otherwise, so a remote provider's spec compares equal to the
+  catalog's (protocol §18); `v` stays `1`. The new actions run on the brain
+  host; watch runs reach a proxied `screen.capture` exactly as chat runs do.
 - The three phase 2 profiles (`config.yaml.example`,
   `config.server.yaml.example`, `agent.yaml.example`) are **not modified**;
   the phase 3 features ship in the new `presence.yaml.example`.
@@ -591,10 +594,17 @@ crosses a network, filesystem or trust boundary); the count is 8, at the cap.
   startup complete with `stream.clip.create` unbound on kick; `required:
   "yes"` is rejected by the validator.
 - AC13 (R3): After recording viewer `v1` on `(twitch, c1)`, the directory
-  holds exactly 1 file whose name matches `^[0-9a-f]{64}\.json$`, does not
-  contain `v1` or `c1`, and whose content parses as JSON with `format == 1`
-  and the three key fields; the same viewer id on `(kick, c1)` yields a
-  second, distinct file.
+  holds exactly 1 file whose name matches `^[0-9a-f]{64}\.json$` and equals
+  the hexadecimal SHA-256 of the key's serialization plus `.json` (so no part
+  of the name is copied from an identifier: it does not contain `v1`, and a
+  channel id with a non-hex character, such as `chan-1`, does not appear in
+  its file name), and whose content parses as JSON with `format == 1` and the
+  three key fields; the same viewer id on `(kick, c1)` yields a second,
+  distinct file. (P27F3 clarification: the earlier wording "does not contain
+  `v1` or `c1`" contradicted the hash example — `c1` is two hex digits and
+  the digest of this very key contains them by chance — so the
+  literal-substring test is kept for `v1`, and the name-equals-digest check
+  replaces it for hex-only identifiers; nothing is relaxed.)
 - AC14 (R3): With `max_files: 3` and files A, B, C with (`last_used`,
   `use_count`) = (t10, 5), (t5, 9), (t5, 2), recording a new viewer D
   deletes exactly C (oldest `last_used`, then lower `use_count`), leaves 3
@@ -776,6 +786,7 @@ detected by grep; the loader is the only constructor of manifest action specs.
 | core/loader.py | manifest action parsing (`_ACTION_KEYS` and the action-entry parser) | Accept the key, pass it to the spec; default false keeps every existing manifest unchanged. |
 | modules/brain/__init__.py | `_offered_tools` | Offer a write only when `model_proposable` and authorized; reads unchanged. |
 | tests/test_contracts.py | action spec construction tests | Unchanged (default false); new refusal tests added. |
+| modules/proxy/__init__.py, modules/agent_link/__init__.py | `spec_declaration`, `spec_from_declaration` (hand-enumerated field lists) | P27F3 (gate F5): carry `model_proposable` as an optional key sent only when true and rebuilt as false when absent (protocol §18); tested by `tests/test_proxy.py::test_a_model_proposable_spec_round_trips_on_the_wire_from_both_sides`. |
 
 ### Built-in trigger types gain `event_kind` (core/triggers.py)
 
