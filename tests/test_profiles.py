@@ -29,7 +29,12 @@ The checks the example suite (``tests/test_examples.py``) does not make:
   every phase 2 endpoint on a closed loopback port and no usable player
   reaches readiness with exactly 3 ``module.degraded`` and still chats
   (AC31); ``pyproject.toml`` ships the three new manifests and no new
-  dependency (AC33).
+  dependency (AC33);
+* phase 3 (R1, R6, R8; plan step P22): ``--check-config`` accepts the
+  presence profile (``presence.yaml.example``) with its own environment and
+  opens 0 sockets (AC6), and refuses with exit 2, naming the field, each
+  temporary variant of it with an oversized or malformed presence setting
+  (AC2) or watch setting (AC30).
 
 No positive-duration sleep: the checks run on fakes, the install test on
 subprocesses that terminate on their own.
@@ -38,6 +43,7 @@ subprocesses that terminate on their own.
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import inspect
 import json
@@ -72,6 +78,7 @@ from modules.audio_input import TRANSCRIPTION_DEGRADED_REASON
 from modules.audio_output import SYNTHESIS_NOT_CONFIGURED_REASON, SYNTHESIS_PROBE_FAILED_REASON
 from modules.capture import SCREEN_CAPTURE_PROVIDER
 from modules.proxy import PROVIDER_NAME as PROXY_PROVIDER
+from test_presence_pack import PRESENCE_PROFILE, presence_environ
 from test_examples import (
     ACTION_SCOPES,
     MODULE_NAMES,
@@ -249,6 +256,179 @@ def test_main_check_config_exits_two_without_the_twitch_token(
     stderr = capsys.readouterr().err
     assert UNSET_DIAGNOSTIC in stderr
     assert all(value not in stderr for value in environ.values())
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 (R1, R6, R8; plan step P22): --check-config on the presence profile
+# --------------------------------------------------------------------------- #
+
+
+async def test_check_config_accepts_the_presence_profile_and_opens_no_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC6 (check-config clause), R8: ``--check-config presence.yaml.example``
+    with the profile's own environment exits 0, reports 0 diagnostics and
+    opens 0 sockets."""
+
+    environ = presence_environ(tmp_path)
+    diagnostics: list[str] = []
+    _refuse_loop_endpoints(monkeypatch)
+    opened = _count_sockets(monkeypatch)
+
+    status = await application.check_config(
+        PRESENCE_PROFILE, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+
+    assert status == 0, diagnostics
+    assert diagnostics == []
+    assert opened == []
+
+
+def test_main_check_config_exits_zero_on_the_presence_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC6 through the command line: ``--config presence.yaml.example
+    --check-config`` with the profile's environment exported returns 0."""
+
+    for name, value in presence_environ(tmp_path).items():
+        monkeypatch.setenv(name, value)
+
+    assert application.main(["--config", str(PRESENCE_PROFILE), "--check-config"]) == 0
+
+
+def _presence_variant(directory: Path, change: Any) -> Path:
+    """The presence profile with *change* applied to a copy of its settings,
+    written next to *directory* with its modules directory made absolute."""
+
+    config = copy.deepcopy(dict(_read_yaml(PRESENCE_PROFILE)))
+    config["modules_directory"] = str(ROOT / "modules")
+    change(config["modules"])
+    path = directory / "presence-variant.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _set_persona(modules: dict[str, Any]) -> None:
+    modules["brain"]["persona"] = "p" * 2001
+
+
+def _seventeen_routes(modules: dict[str, Any]) -> None:
+    routes = modules["brain"]["routes"]
+    routes.extend(
+        {"name": f"extra-{index}", "match": {"kinds": ["message"], "command": f"!x{index}"}}
+        for index in range(17 - len(routes))
+    )
+    assert len(routes) == 17
+
+
+def _duplicate_route_name(modules: dict[str, Any]) -> None:
+    routes = modules["brain"]["routes"]
+    routes.append({"name": routes[0]["name"], "match": {"kinds": ["follow"]}})
+
+
+def _long_command(modules: dict[str, Any]) -> None:
+    modules["brain"]["routes"][1]["match"]["command"] = "!" + "c" * 32
+
+
+def _watch(**changes: Any) -> Any:
+    def change(modules: dict[str, Any]) -> None:
+        modules["watch"].update(changes)
+
+    return change
+
+
+#: AC2 (check-config half): each presence variant and the field it names.
+PRESENCE_VARIANTS = {
+    "persona-2001": (_set_persona, "persona", 2001),
+    "17-routes": (_seventeen_routes, "routes", None),
+    "duplicate-name": (_duplicate_route_name, "routes[9].name", None),
+    "command-33": (_long_command, "routes[1].match.command", 33),
+}
+#: AC30 (check-config half): each watch variant and the field it names.
+WATCH_VARIANTS = {
+    "interval-14": (_watch(interval_seconds=14), "interval_seconds"),
+    "ticks-241": (_watch(max_ticks_per_hour=241), "max_ticks_per_hour"),
+    "ticks-100-at-60": (
+        _watch(max_ticks_per_hour=100, interval_seconds=60),
+        "max_ticks_per_hour",
+    ),
+    "active-59": (_watch(max_active_seconds=59), "max_active_seconds"),
+    "5-channels": (
+        _watch(channels=[f"twitch/channel-{index}" for index in range(5)]),
+        "channels",
+    ),
+}
+
+
+async def _check_variant(path: Path, environ: Mapping[str, str]) -> tuple[int, list[str]]:
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        path, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+    return status, diagnostics
+
+
+@pytest.mark.parametrize("variant", sorted(PRESENCE_VARIANTS))
+async def test_ac2_check_config_refuses_each_oversized_presence_setting_naming_it(
+    variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2 (R1; check-config half, the validator half is
+    ``tests/test_brain.py``): a temporary presence profile with a
+    2001-character persona, 17 routes, two routes with the same name or a
+    33-character command exits 2 with one diagnostic naming the brain and
+    the field — never the configured value — and opens 0 sockets."""
+
+    change, field_name, _length = PRESENCE_VARIANTS[variant]
+    path = _presence_variant(tmp_path, change)
+    opened = _count_sockets(monkeypatch)
+
+    status, diagnostics = await _check_variant(path, presence_environ(tmp_path))
+
+    assert status == 2
+    assert len(diagnostics) == 1, diagnostics
+    assert diagnostics[0].startswith("module 'brain':"), diagnostics
+    assert f"field {field_name!r}:" in diagnostics[0], diagnostics
+    assert "p" * 50 not in diagnostics[0] and "c" * 32 not in diagnostics[0]
+    assert opened == []
+
+
+@pytest.mark.parametrize("variant", sorted(WATCH_VARIANTS))
+async def test_ac30_check_config_refuses_each_invalid_watch_setting_naming_it(
+    variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC30 (R6; check-config half, the validator half is
+    ``tests/test_watch.py``): ``interval_seconds: 14``,
+    ``max_ticks_per_hour: 241``, ``max_ticks_per_hour: 100`` with
+    ``interval_seconds: 60``, ``max_active_seconds: 59`` and 5 channels each
+    make ``--check-config`` on the presence profile exit 2 with one
+    diagnostic naming the watch module and the field, and open 0 sockets."""
+
+    change, field_name = WATCH_VARIANTS[variant]
+    path = _presence_variant(tmp_path, change)
+    opened = _count_sockets(monkeypatch)
+
+    status, diagnostics = await _check_variant(path, presence_environ(tmp_path))
+
+    assert status == 2
+    assert len(diagnostics) == 1, diagnostics
+    # The bounds the manifest schema declares are refused by the loader under
+    # the `settings.` path, the cross-checks by the module's own hook.
+    assert diagnostics[0].startswith("module 'watch': field "), diagnostics
+    assert re.search(rf"field '(settings\.)?{re.escape(field_name)}':", diagnostics[0]), diagnostics
+    assert "channel-4" not in diagnostics[0]
+    assert opened == []
+
+
+async def test_the_presence_variants_differ_from_the_profile_only_by_their_change(
+    tmp_path: Path,
+) -> None:
+    """The variants above are the shipped profile plus one change: the same
+    profile rewritten with no change passes ``--check-config``, so each exit
+    2 is the change's."""
+
+    path = _presence_variant(tmp_path, lambda modules: None)
+    status, diagnostics = await _check_variant(path, presence_environ(tmp_path))
+    assert (status, diagnostics) == (0, [])
 
 
 # --------------------------------------------------------------------------- #
