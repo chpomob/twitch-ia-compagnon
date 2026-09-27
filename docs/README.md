@@ -641,7 +641,13 @@ ou en dégradation du seul `follow` :
   (« the memory bounds cannot be met: a deletion failed ») ; un fichier
   resté sur le disque dans les bornes donne un `module.degraded` (« a memory
   file could not be deleted »), et un effacement qui échoue est une erreur,
-  jamais un fichier absent (porte 1, F3, corrigé en P27F2).
+  jamais un fichier absent (porte 1, F3, corrigé en P27F2). Chaque fichier
+  resté est nommé (nom haché complet, raison, octets, `remained: true`) dans
+  des faits `memory.deletion_failed` par lots de 6 au plus (`batch`,
+  `batches`, `failed`) ; `module.degraded` porte le compte et le premier
+  lot, et les diagnostics comme le message d'erreur restent sous 1024
+  caractères quel que soit le nombre de fichiers (porte 3, F8, corrigé en
+  P29F1).
 - **Chemins d'effacement.** (a) Un message de chat dont le texte est
   exactement `!forgetme` (`forget_command`, vide = désactivé) efface le
   fichier de son auteur attesté pour cette plateforme et cette chaîne, quelle

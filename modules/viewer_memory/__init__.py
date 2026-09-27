@@ -79,7 +79,14 @@ eviction.
 
 **Facts.** Every eviction pass, expiry pass, corrupt pass and erasure
 publishes one ``memory.removed`` fact carrying ``reason`` and ``count`` only —
-no viewer identifier, no file name.
+no viewer identifier, no file name. A deletion the prepare scan could not
+make is reported file by file in ``memory.deletion_failed`` facts: batches of
+at most :data:`FAILURE_BATCH_SIZE` records (hashed file name, reason, bytes,
+``remained: true``) with ``batch``, ``batches`` and ``failed``, so every
+failed file is named whatever their number while no trace, diagnostic or
+error message grows with it. ``module.degraded`` carries the count and the
+first batch; a diagnostic and the error message name at most a few files and
+count the rest.
 
 **Seams, for the tests.** ``_sleeper`` (the sweep's sleep, ``asyncio.sleep``
 by default) and ``_wall_clock`` (epoch seconds, ``time.time`` by default) are
@@ -136,6 +143,19 @@ REASON_EVICTED = "evicted"
 REASON_EXPIRED = "expired"
 REASON_CORRUPT = "corrupt"
 REASON_ERASED = "erased"
+#: The facts that list, batch by batch, the files a scan failed to delete.
+FACT_MEMORY_DELETION_FAILED = "memory.deletion_failed"
+#: Failure records per ``memory.deletion_failed`` batch, per
+#: ``module.degraded`` and per diagnostic pass: a record is at most ~130
+#: trace bytes, so a batch stays well inside the default trace budget.
+FAILURE_BATCH_SIZE = 6
+#: At most this many oversized files are named in the scan's error message;
+#: the others are counted.
+EXCEEDED_FILES_NAMED = 2
+#: What any retained diagnostic and any bounds-refusal message is kept
+#: within, whatever the number of files: each is built from a bounded number
+#: of bounded parts, never joined over every file and then cut.
+DIAGNOSTIC_MAX_CHARS = 1024
 
 MEMORY_FORMAT = 1
 MEMORY_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
@@ -260,6 +280,22 @@ class DeletionFailure(NamedTuple):
 
     def describe(self) -> str:
         return f"{self.name} ({self.reason}, {self.size} bytes) could not be deleted and remained"
+
+    def record(self) -> dict[str, Any]:
+        """The trace record: full file name, reason, bytes, and that it remained."""
+
+        return {"file": self.name, "reason": self.reason, "bytes": self.size, "remained": True}
+
+
+def failure_batches(
+    failures: Sequence[DeletionFailure],
+) -> list[list[dict[str, Any]]]:
+    """*failures* as trace records, in batches of :data:`FAILURE_BATCH_SIZE`."""
+
+    return [
+        [failure.record() for failure in failures[start:start + FAILURE_BATCH_SIZE]]
+        for start in range(0, len(failures), FAILURE_BATCH_SIZE)
+    ]
 
 
 class MemoryStoreError(RuntimeError):
@@ -651,12 +687,19 @@ class MemoryStore:
                 )
         removed = _merge_removed(removed, evicted)
         failures = self.scan_failures()
+        # Bounded before it is built: a few oversized files named, the rest
+        # counted — every one of them is in ``failures``.
+        limit = self._settings.max_file_bytes
+        oversized = [failure for failure in failures if failure.reason == REASON_OVERSIZED]
         exceeded.extend(
-            f"{failure.name} is {failure.size} bytes, over max_file_bytes "
-            f"{self._settings.max_file_bytes}"
-            for failure in failures
-            if failure.reason == REASON_OVERSIZED
+            f"{failure.name} is {failure.size} bytes, over max_file_bytes {limit}"
+            for failure in oversized[:EXCEEDED_FILES_NAMED]
         )
+        if len(oversized) > EXCEEDED_FILES_NAMED:
+            exceeded.append(
+                f"{len(oversized) - EXCEEDED_FILES_NAMED} more files over max_file_bytes "
+                f"{limit} could not be deleted and remained"
+            )
         if exceeded:
             raise MemoryStoreError(
                 f"{MODULE_NAME} scan: the bounds cannot be met: " + "; ".join(exceeded),
@@ -1094,9 +1137,13 @@ class ViewerMemoryModule:
             # No action is bound and readiness is never advertised.
             await self._publish_removed(error.removed)
             self._diagnose_failures(error.failures)
+            # Bounded by construction (:meth:`MemoryStore.scan`): at most
+            # EXCEEDED_FILES_NAMED files named; every failed file is in the
+            # ``memory.deletion_failed`` batches instead.
             detail = str(error).partition(": the bounds cannot be met: ")[2]
             self._diagnose(f"{REASON_BOUNDS_NOT_MET}: {detail}")
             await self._report_degraded(REASON_BOUNDS_NOT_MET, error.failures, exceeded=detail)
+            await self._publish_failures(REASON_BOUNDS_NOT_MET, error.failures)
             raise ViewerMemoryError(
                 f"{MODULE_NAME} prepare: {REASON_BOUNDS_NOT_MET}: {detail}"
             ) from None
@@ -1112,6 +1159,7 @@ class ViewerMemoryModule:
             # disk: counted, retried by later passes, and said file by file.
             self._diagnose_failures(failures)
             await self._report_degraded(REASON_DELETION_FAILED, failures)
+            await self._publish_failures(REASON_DELETION_FAILED, failures)
         try:
             for action_name in (RECALL_ACTION, RECORD_ACTION):
                 self._actions.register(
@@ -1354,11 +1402,11 @@ class ViewerMemoryModule:
         if not callable(degraded):
             return
         if failures:
-            details["failures"] = [
-                {"file": failure.name, "reason": failure.reason,
-                 "bytes": failure.size, "remained": True}
-                for failure in failures
-            ]
+            # The count and the first batch only: module health reports one
+            # fact per reason, so the complete list is the batches'.
+            details["failed_deletions"] = len(failures)
+            details["failure_batches"] = -(-len(failures) // FAILURE_BATCH_SIZE)
+            details["failures"] = failure_batches(failures[:FAILURE_BATCH_SIZE])[0]
         try:
             outcome = degraded(
                 reason=reason, capabilities=[RECALL_ACTION, RECORD_ACTION], **details
@@ -1370,9 +1418,56 @@ class ViewerMemoryModule:
         except Exception:  # noqa: BLE001 - a health report must not fail the caller
             self._diagnose("degraded: not published")
 
+    async def _publish_failures(
+        self, reason: str, failures: Sequence[DeletionFailure]
+    ) -> None:
+        """Every failed file, in ``memory.deletion_failed`` batches.
+
+        Facts, not health states: module health does not repeat a reason it
+        already reported, so each batch is its own fact. A batch that could
+        not be published is counted in one diagnostic.
+        """
+
+        emit = getattr(self._supervision, "emit", None)
+        if not callable(emit) or not failures:
+            return
+        batches = failure_batches(failures)
+        lost = 0
+        for number, records in enumerate(batches, start=1):
+            payload = {
+                "reason": reason,
+                "batch": number,
+                "batches": len(batches),
+                "failed": len(failures),
+                "failures": records,
+            }
+            try:
+                outcome = emit(FACT_MEMORY_DELETION_FAILED, payload)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a lost report must not fail the caller
+                lost += 1
+        if lost:
+            self._diagnose(
+                f"fact {FACT_MEMORY_DELETION_FAILED}: {lost} of {len(batches)} batches "
+                "not published"
+            )
+
     def _diagnose_failures(self, failures: Sequence[DeletionFailure]) -> None:
-        for failure in failures:
+        """One diagnostic per file of the first batch, then one counting the
+        rest: a bounded number of bounded lines, whatever the count."""
+
+        for failure in failures[:FAILURE_BATCH_SIZE]:
             self._diagnose(f"{REASON_DELETION_FAILED}: {failure.describe()}")
+        if len(failures) > FAILURE_BATCH_SIZE:
+            batches = -(-len(failures) // FAILURE_BATCH_SIZE)
+            self._diagnose(
+                f"{REASON_DELETION_FAILED}: {len(failures) - FAILURE_BATCH_SIZE} more files "
+                f"could not be deleted and remained; all {len(failures)} are named in "
+                f"{batches} {FACT_MEMORY_DELETION_FAILED} facts"
+            )
 
     def _diagnose(self, text: str) -> None:
         self._diagnostics.append(f"{MODULE_NAME} {text}")
@@ -1590,9 +1685,13 @@ __all__ = [
     "DEFAULT_RETENTION_DAYS",
     "DEFAULT_SWEEP_INTERVAL_SECONDS",
     "DELIVERY_VALUES",
+    "DIAGNOSTIC_MAX_CHARS",
     "DISPLAY_NAME_MAX_CHARS",
     "ERROR_NO_VIEWER",
+    "EXCEEDED_FILES_NAMED",
+    "FACT_MEMORY_DELETION_FAILED",
     "FACT_MEMORY_REMOVED",
+    "FAILURE_BATCH_SIZE",
     "MEMORY_FILE_PATTERN",
     "MANIFEST_PATH",
     "MEMORY_FORMAT",
@@ -1617,6 +1716,7 @@ __all__ = [
     "ViewerMemoryModule",
     "activate",
     "fit_recall",
+    "failure_batches",
     "format_timestamp",
     "memory_file_name",
     "parse_conversation_id",

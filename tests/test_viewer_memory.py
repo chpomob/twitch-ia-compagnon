@@ -35,7 +35,16 @@ from conftest import (
     trace_texts,
 )
 from core.actions import AuthorizationRule
-from core.contracts import ActionCall, ActionObservation, Destination, SessionKey, observation_size
+from core.contracts import (
+    TRACE_MAX_BYTES,
+    TRUNCATION_KEY,
+    ActionCall,
+    ActionObservation,
+    Destination,
+    SessionKey,
+    observation_size,
+    trace_size,
+)
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from core.runtime import RuntimeContext
@@ -842,6 +851,141 @@ async def test_gate2_f3_a_clean_prepare_reports_no_failure(tmp_path: Path) -> No
         assert removed_facts(runtime) == [
             {"reason": "corrupt", "count": 1}, {"reason": "evicted", "count": 2}
         ]
+    finally:
+        await handle.close()
+
+
+def failure_facts(runtime: RuntimeContext) -> list[dict[str, Any]]:
+    return [
+        event["payload"]
+        for event in events_of(runtime.bus, viewer_memory.FACT_MEMORY_DELETION_FAILED)
+    ]
+
+
+def assert_failures_reported_in_bounded_batches(
+    runtime: RuntimeContext, reason: str, expected: dict[str, tuple[str, int]]
+) -> None:
+    """Every failed file — full name, reason, bytes, ``remained`` — is in
+    exactly one ``memory.deletion_failed`` batch; each batch holds at most
+    :data:`FAILURE_BATCH_SIZE` records and fits the trace budget untruncated."""
+
+    facts = failure_facts(runtime)
+    batches = -(-len(expected) // viewer_memory.FAILURE_BATCH_SIZE)
+    assert [fact["batch"] for fact in facts] == list(range(1, batches + 1))
+    reported: dict[str, tuple[str, int]] = {}
+    for fact in facts:
+        assert TRUNCATION_KEY not in fact
+        assert trace_size(fact) <= TRACE_MAX_BYTES
+        assert fact["reason"] == reason
+        assert fact["batches"] == batches and fact["failed"] == len(expected)
+        assert 1 <= len(fact["failures"]) <= viewer_memory.FAILURE_BATCH_SIZE
+        for record in fact["failures"]:
+            assert set(record) == {"file", "reason", "bytes", "remained"}
+            assert record["remained"] is True
+            assert record["file"] not in reported
+            reported[record["file"]] = (record["reason"], record["bytes"])
+    assert reported == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [32, 256, 2048])
+async def test_gate3_f8_many_undeletable_oversized_files_are_reported_in_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    """Gate 3 F8 (``gate3_unbounded_reports``): *count* valid records padded
+    to 513 bytes, every deletion refused, ``max_files: 3``,
+    ``max_file_bytes: 512``, ``max_total_bytes: 4096``. Startup is refused as
+    before. The retained diagnostics and the error message stay within
+    :data:`DIAGNOSTIC_MAX_CHARS` whatever *count* — they used to grow to
+    223,378 characters at 2048 — and every file is named, with ``oversized``,
+    its bytes and ``remained``, in the untruncated ``memory.deletion_failed``
+    batches; ``module.degraded`` carries the count and the first batch whole."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, json_names = memory_directory(tmp_path)
+    paths = [oversized_memory(directory, ("fake", "chan-a", f"v{index}"), 513) for index in range(count)]
+    handle = await module_for(
+        runtime, clock, directory, max_files=3, max_file_bytes=512, max_total_bytes=4096
+    )
+    refusing_unlink(monkeypatch)
+    try:
+        with pytest.raises(ViewerMemoryError, match="bounds cannot be met") as raised:
+            await handle.prepare()
+        message = str(raised.value)
+        assert len(message) <= viewer_memory.DIAGNOSTIC_MAX_CHARS
+        assert f"{count} files held, over max_files 3" in message
+        assert f"{count - viewer_memory.EXCEEDED_FILES_NAMED} more files over max_file_bytes 512" in message
+        assert handle.diagnostics
+        assert len(handle.diagnostics) <= 16
+        assert max(map(len, handle.diagnostics)) <= viewer_memory.DIAGNOSTIC_MAX_CHARS
+        assert any(f"all {count} are named in" in text for text in handle.diagnostics)
+        assert len(json_names()) == count
+        for action in (RECALL_ACTION, RECORD_ACTION):
+            assert runtime.actions.bindings(action) == ()
+            assert action not in runtime.actions.registered_ready()
+
+        degraded = memory_degraded(runtime)
+        assert [payload["reason"] for payload in degraded] == [viewer_memory.REASON_BOUNDS_NOT_MET]
+        assert TRUNCATION_KEY not in degraded[0]
+        assert degraded[0]["module"] == "viewer_memory"
+        assert degraded[0]["failed_deletions"] == count
+        assert degraded[0]["failures"] == [
+            {"file": path.name, "reason": "oversized", "bytes": 513, "remained": True}
+            for path in sorted(paths, key=lambda item: item.name)[:viewer_memory.FAILURE_BATCH_SIZE]
+        ]
+        assert_failures_reported_in_bounded_batches(
+            runtime,
+            viewer_memory.REASON_BOUNDS_NOT_MET,
+            {path.name: ("oversized", 513) for path in paths},
+        )
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_gate3_f8_every_failed_eviction_is_named_when_others_restore_the_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 3 F8 (``gate3_partial_failure_32``): 70 valid files,
+    ``max_files: 35``, the deletion of the oldest 32 refused. The next 35 are
+    evicted in their place and startup goes on, both actions ready. All 32
+    failed files — 16 of which used to be named nowhere — are in the
+    ``memory.deletion_failed`` batches with ``evicted``, their bytes and
+    ``remained``; the diagnostics stay bounded."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, json_names = memory_directory(tmp_path)
+    paths = [
+        write_memory(directory, ("fake", "chan-a", f"v{index}"), last_used=float(index))
+        for index in range(70)
+    ]
+    oldest = paths[:32]
+    handle = await module_for(runtime, clock, directory, max_files=35)
+    refusing_unlink(monkeypatch, {path.name for path in oldest})
+    await handle.prepare()
+    try:
+        assert json_names() == sorted(path.name for path in (*oldest, *paths[67:]))
+        assert handle.store.stats()[0] == 35
+        assert handle.store.failed_deletions == 32
+        assert removed_facts(runtime) == [{"reason": "evicted", "count": 35}]
+        for action in (RECALL_ACTION, RECORD_ACTION):
+            assert action in runtime.actions.registered_ready()
+
+        degraded = memory_degraded(runtime)
+        assert [payload["reason"] for payload in degraded] == [viewer_memory.REASON_DELETION_FAILED]
+        assert TRUNCATION_KEY not in degraded[0]
+        assert degraded[0]["failed_deletions"] == 32
+        assert len(degraded[0]["failures"]) == viewer_memory.FAILURE_BATCH_SIZE
+        assert_failures_reported_in_bounded_batches(
+            runtime,
+            viewer_memory.REASON_DELETION_FAILED,
+            {path.name: ("evicted", path.stat().st_size) for path in oldest},
+        )
+        assert len(handle.diagnostics) <= 16
+        assert max(map(len, handle.diagnostics)) <= viewer_memory.DIAGNOSTIC_MAX_CHARS
+        assert any("all 32 are named in" in text for text in handle.diagnostics)
     finally:
         await handle.close()
 
