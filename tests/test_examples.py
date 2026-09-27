@@ -576,32 +576,17 @@ def _string_leaves(value: Any) -> list[str]:
 
 def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     """R7 supersedes the former whole-manifest equality (allowlisted); phase
-    2's R9 extends the catalog from 8 to 11 manifests (allowlisted); phase
-    3's R1 adds the ``notices`` setting and the ``event_kind`` trigger type to
-    ``twitch`` (allowlisted, plan decision 11); phase 3's R2 adds the
-    ``clips`` manifest and its ``stream.clip.create`` (allowlisted, running
-    value of plan step P9: 12 manifests, 10 action names); phase 3's R3 adds
-    the ``viewer_memory`` manifest (allowlisted, running value of plan step
-    P10: 13 manifests, 10 action names); phase 3's R4 adds its
-    ``memory.recall`` and ``memory.record`` (allowlisted, running value of
-    plan step P11: 13 manifests, 12 action names); phase 3's R5 adds the
-    ``moderation`` manifest and its ``moderation.request`` (allowlisted,
-    running value of plan step P14: 14 manifests, 13 action names); phase
-    3's R6 adds the ``watch`` input manifest, which declares triggers and no
-    action (allowlisted, running value of plan step P16: 15 manifests, 13
-    action names); phase 3's R7 adds the ``kick`` input manifest, which
-    declares triggers and credentials (allowlisted, running value of plan
-    step P18: 16 manifests, 13 action names), then its ``chat.write`` (plan
-    step P19, decision 11): the one multiplicity assertion is rewritten to
-    the running value — every action name is declared by exactly one
-    manifest except ``chat.write``, declared by exactly twitch and kick —
-    while the manifest count and the action-name count stay as they were;
-    then the ``youtube`` input manifest, which declares triggers and
-    credentials (allowlisted, running value of plan step P20: 17 manifests,
-    13 action names), then its ``chat.write`` (plan step P21, decision 11):
-    the multiplicity assertion moves to the running value — ``chat.write``
-    is declared by exactly twitch, kick and youtube — and nothing else
-    changes.
+    2's R9 extends the catalog from 8 to 11 manifests (allowlisted). Phase
+    3 (plan step P23, R8, AC40) pins the final values, allowlisted: R2, R3,
+    R5, R6 and R7 ship ``clips``, ``viewer_memory``, ``moderation``,
+    ``watch``, ``kick`` and ``youtube`` — exactly 17 manifests; R2, R4 and
+    R5 add ``stream.clip.create``, ``memory.recall``, ``memory.record`` and
+    ``moderation.request`` — exactly 13 action names; R7 (decision 11)
+    supersedes "declared once each": every action name has exactly one
+    declaring manifest except ``chat.write``, declared by exactly twitch,
+    kick and youtube; and R1 (plan step P7) gives ``twitch`` the ``notices``
+    setting and the ``event_kind`` trigger type, its keys otherwise
+    unchanged.
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -678,13 +663,17 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     # Phase 3 R7 (plan P19, decision 11), superseding "declared once each, by
     # one manifest": each action name has exactly one declaring manifest,
     # except `chat.write`, declared by exactly twitch, kick and youtube
-    # (running value of P21; P23 pins the final value).
+    # (final phase 3 value, pinned by plan step P23).
     declarers = {
         name: {module for module, names in DECLARED_ACTIONS.items() if name in names}
         for name in declared
     }
     assert declarers.pop("chat.write") == {"twitch", "kick", "youtube"}
     assert all(len(modules) == 1 for modules in declarers.values()), declarers
+    assert sorted(
+        name for name, manifest in manifests.items()
+        if "chat.write" in _declared_action_names(manifest)
+    ) == ["kick", "twitch", "youtube"]
 
 
 @pytest.mark.parametrize("profile", sorted(PROFILES))
@@ -1580,15 +1569,12 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
     with 1 send; its registered-ready view is exactly {``chat.read``,
     ``users.read``, ``screen.capture``, ``chat.write``} and the brain offers
     no phase 2 action, while the catalog of discovered manifests declares
-    the 13 actions — phase 3's R2 adds ``stream.clip.create`` to the 9 of
-    phase 2 (allowlisted, running value of plan step P9), R4 adds
-    ``memory.recall`` and ``memory.record`` (running value of plan step
-    P11) and R5 adds ``moderation.request`` (running value of plan step
-    P14). Phase 3's R7 (plan steps P19 and P21, decision 11) makes kick,
-    then youtube, further declarers of ``chat.write``: the catalog still
-    names 13 actions, each declared once except ``chat.write``, declared
-    three times (twitch, kick and youtube; running value of plan step
-    P21)."""
+    exactly 13 action names — the final phase 3 value pinned by plan step
+    P23 (allowlisted): phase 3's R2 adds ``stream.clip.create`` to the 9 of
+    phase 2, R4 adds ``memory.recall`` and ``memory.record`` and R5 adds
+    ``moderation.request``; R7 (decision 11) makes kick and youtube further
+    declarers of ``chat.write``, so each name is declared once except
+    ``chat.write``, declared three times (twitch, kick and youtube)."""
 
     path = _chat_only_profile(tmp_path)
     environ = _phase1_environ(path)

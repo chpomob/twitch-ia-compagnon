@@ -1079,13 +1079,12 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     the build backend is imported from the test environment — then, from a
     directory outside the checkout with only the target on ``PYTHONPATH``
     and the checkout removed from ``sys.path``, a configuration with
-    ``modules_directory: builtin`` discovers exactly the 11 shipped
-    manifests (phase 2 adds three: the former count of 8 is allowlisted;
-    phase 3's R8 ships ``clips`` from plan step P9 on: 12,
-    ``viewer_memory`` from P10 on: 13, ``moderation`` from P14 on: 14, and
-    ``watch`` from P16 on: 15, ``kick`` from P18 on: 16, and ``youtube``
-    from P20 on: 17, allowlisted)
-    and the installed console script answers ``--help`` with status 0.
+    ``modules_directory: builtin`` discovers exactly the 17 shipped
+    manifests — phase 3's final value, AC40 (R8), pinned by plan step P23
+    (allowlisted): phase 2's 11 (its three superseded phase 1's 8) plus
+    ``clips``, ``viewer_memory``, ``moderation``, ``watch``, ``kick`` and
+    ``youtube`` — and the installed console script answers ``--help`` with
+    status 0.
 
     The checkout is installed from a pristine copy of its sources: pip
     builds in the source tree, and the ``build/`` directory and the
@@ -1205,15 +1204,15 @@ def test_install_test_skips_only_when_pip_is_unavailable() -> None:
 
 
 def test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency() -> None:
-    """AC33 (R9): ``pyproject.toml`` carries the ``modules.audio_output``,
-    ``modules.audio_input`` and ``modules.stream_control`` package-data
-    lines beside the eight of phase 1 — one per shipped manifest, the 17
-    the install test discovers now that phase 3's R8 ships ``clips`` (plan
-    step P9), ``viewer_memory`` (plan step P10), ``moderation`` (plan step
-    P14), ``watch`` (plan step P16), ``kick`` (plan step P18) and ``youtube``
-    (plan step P20; allowlisted
-    running value) — and the runtime dependency list is
-    still ``aiohttp`` and ``PyYAML`` only."""
+    """AC33 (R9), AC40 (R8): ``pyproject.toml`` carries the
+    ``modules.audio_output``, ``modules.audio_input`` and
+    ``modules.stream_control`` package-data lines beside the eight of phase
+    1, and phase 3's final value pinned by plan step P23 (allowlisted):
+    exactly 17 ``modules.<name>`` lines, one per shipped manifest — phase
+    3's R8 adds ``clips`` (P9), ``viewer_memory`` (P10), ``moderation``
+    (P14), ``watch`` (P16), ``kick`` (P18) and ``youtube`` (P20). The
+    runtime dependency list is still exactly ``aiohttp`` and ``PyYAML``
+    (unchanged)."""
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     package_data = project["tool"]["setuptools"]["package-data"]
@@ -1224,9 +1223,11 @@ def test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency() -> 
     )
     assert shipped == sorted(SHIPPED_MANIFESTS) == sorted(MODULE_NAMES)
     assert len(shipped) == 17
-    assert sorted(key for key in package_data if key.startswith("modules.")) == sorted(
-        f"modules.{name}" for name in shipped
-    )
+    module_lines = sorted(key for key in package_data if key.startswith("modules."))
+    assert len(module_lines) == 17
+    assert module_lines == sorted(f"modules.{name}" for name in shipped)
+    for name in module_lines:
+        assert package_data[name] == ["module.yaml"], name
     assert sorted(
         re.match(r"[A-Za-z0-9_.-]+", spec).group(0).lower()
         for spec in project["project"]["dependencies"]
