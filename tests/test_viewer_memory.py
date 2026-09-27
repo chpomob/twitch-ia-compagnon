@@ -13,6 +13,8 @@ positive-duration sleep.
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import hashlib
 import json
 import os
@@ -21,7 +23,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import tracemalloc
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -988,6 +992,91 @@ async def test_gate3_f8_every_failed_eviction_is_named_when_others_restore_the_b
         assert any("all 32 are named in" in text for text in handle.diagnostics)
     finally:
         await handle.close()
+
+
+#: Gate 4 F8 residual: failure records live at once while the batches are
+#: published — one batch, never the failed-file count.
+LAZY_BATCH_RECORDS = viewer_memory.FAILURE_BATCH_SIZE
+#: The traced bytes ``_publish_failures`` may allocate at its peak, whatever
+#: the failure count (measured ~6,000; eager materialization was 423,832 at
+#: 2048 failures).
+LAZY_BATCH_PEAK_BYTES = 16_384
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [32, 256, 2048])
+async def test_gate4_f8_failure_batches_are_built_one_at_a_time(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    """Gate 4 F8 residual (``gate4_eager_batches``): *count* failures made
+    before tracing, an emitter that retains nothing and whose first emission
+    is suspended. :meth:`DeletionFailure.record` is instrumented: at most
+    :data:`LAZY_BATCH_RECORDS` records exist when the first emission begins
+    — it used to be *count* — no emission starts more than one batch ahead,
+    and the traced peak stays within :data:`LAZY_BATCH_PEAK_BYTES`. Every
+    failure is still emitted exactly once with its identity."""
+
+    failures = tuple(
+        viewer_memory.DeletionFailure(f"{index:064x}.json", viewer_memory.REASON_OVERSIZED, 513)
+        for index in range(count)
+    )
+    built = 0
+    original = viewer_memory.DeletionFailure.record
+
+    def record(failure: viewer_memory.DeletionFailure) -> dict[str, Any]:
+        nonlocal built
+        built += 1
+        return original(failure)
+
+    monkeypatch.setattr(viewer_memory.DeletionFailure, "record", record)
+    released = asyncio.Event()
+    suspended = asyncio.Event()
+    started = 0
+    emitted = 0
+    first: tuple[int, int, int] | None = None
+
+    async def emit(kind: str, payload: dict[str, Any]) -> None:
+        nonlocal first, emitted, started
+        assert kind == viewer_memory.FACT_MEMORY_DELETION_FAILED
+        started += 1
+        # Never more than the batch being emitted is built.
+        assert built <= started * LAZY_BATCH_RECORDS
+        if first is None:
+            first = (built, *tracemalloc.get_traced_memory())
+            suspended.set()
+            await released.wait()
+        assert payload["batches"] == -(-count // LAZY_BATCH_RECORDS)
+        assert len(payload["failures"]) <= LAZY_BATCH_RECORDS
+        # Checked in place, not kept: the emitter retains nothing.
+        for item in payload["failures"]:
+            assert item == {
+                "file": failures[emitted].name, "reason": "oversized", "bytes": 513, "remained": True
+            }
+            emitted += 1
+
+    handle = SimpleNamespace(_supervision=SimpleNamespace(emit=emit), _diagnose=lambda text: None)
+    gc.collect()
+    tracemalloc.start()
+    try:
+        task = asyncio.ensure_future(
+            ViewerMemoryModule._publish_failures(
+                handle, viewer_memory.REASON_BOUNDS_NOT_MET, failures
+            )
+        )
+        await suspended.wait()
+        assert built <= LAZY_BATCH_RECORDS
+        released.set()
+        await task
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert first is not None
+    assert first[0] <= LAZY_BATCH_RECORDS
+    assert first[2] <= LAZY_BATCH_PEAK_BYTES
+    assert peak <= LAZY_BATCH_PEAK_BYTES
+    assert built == count
+    assert emitted == count
 
 
 # -- AC18: the prepare scan -------------------------------------------------- #

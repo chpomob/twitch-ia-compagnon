@@ -103,7 +103,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -287,15 +287,23 @@ class DeletionFailure(NamedTuple):
         return {"file": self.name, "reason": self.reason, "bytes": self.size, "remained": True}
 
 
+def failure_batch_count(failures: Sequence[DeletionFailure]) -> int:
+    """How many :data:`FAILURE_BATCH_SIZE` batches *failures* make."""
+
+    return -(-len(failures) // FAILURE_BATCH_SIZE)
+
+
 def failure_batches(
     failures: Sequence[DeletionFailure],
-) -> list[list[dict[str, Any]]]:
-    """*failures* as trace records, in batches of :data:`FAILURE_BATCH_SIZE`."""
+) -> Iterator[list[dict[str, Any]]]:
+    """*failures* as trace records, in batches of :data:`FAILURE_BATCH_SIZE`.
 
-    return [
-        [failure.record() for failure in failures[start:start + FAILURE_BATCH_SIZE]]
-        for start in range(0, len(failures), FAILURE_BATCH_SIZE)
-    ]
+    Lazy: each batch's records are built only when it is reached, so at most
+    one batch is live whatever the number of failures.
+    """
+
+    for start in range(0, len(failures), FAILURE_BATCH_SIZE):
+        yield [failure.record() for failure in failures[start:start + FAILURE_BATCH_SIZE]]
 
 
 class MemoryStoreError(RuntimeError):
@@ -690,14 +698,20 @@ class MemoryStore:
         # Bounded before it is built: a few oversized files named, the rest
         # counted — every one of them is in ``failures``.
         limit = self._settings.max_file_bytes
-        oversized = [failure for failure in failures if failure.reason == REASON_OVERSIZED]
-        exceeded.extend(
-            f"{failure.name} is {failure.size} bytes, over max_file_bytes {limit}"
-            for failure in oversized[:EXCEEDED_FILES_NAMED]
-        )
-        if len(oversized) > EXCEEDED_FILES_NAMED:
+        # A counter and at most EXCEEDED_FILES_NAMED names: no list that
+        # grows with the number of oversized files.
+        oversized = 0
+        for failure in failures:
+            if failure.reason != REASON_OVERSIZED:
+                continue
+            oversized += 1
+            if oversized <= EXCEEDED_FILES_NAMED:
+                exceeded.append(
+                    f"{failure.name} is {failure.size} bytes, over max_file_bytes {limit}"
+                )
+        if oversized > EXCEEDED_FILES_NAMED:
             exceeded.append(
-                f"{len(oversized) - EXCEEDED_FILES_NAMED} more files over max_file_bytes "
+                f"{oversized - EXCEEDED_FILES_NAMED} more files over max_file_bytes "
                 f"{limit} could not be deleted and remained"
             )
         if exceeded:
@@ -1405,8 +1419,8 @@ class ViewerMemoryModule:
             # The count and the first batch only: module health reports one
             # fact per reason, so the complete list is the batches'.
             details["failed_deletions"] = len(failures)
-            details["failure_batches"] = -(-len(failures) // FAILURE_BATCH_SIZE)
-            details["failures"] = failure_batches(failures[:FAILURE_BATCH_SIZE])[0]
+            details["failure_batches"] = failure_batch_count(failures)
+            details["failures"] = next(failure_batches(failures[:FAILURE_BATCH_SIZE]))
         try:
             outcome = degraded(
                 reason=reason, capabilities=[RECALL_ACTION, RECORD_ACTION], **details
@@ -1431,16 +1445,19 @@ class ViewerMemoryModule:
         emit = getattr(self._supervision, "emit", None)
         if not callable(emit) or not failures:
             return
-        batches = failure_batches(failures)
+        # Counted arithmetically and emitted lazily: one batch of records is
+        # live at a time, however many files failed.
+        batches = failure_batch_count(failures)
         lost = 0
-        for number, records in enumerate(batches, start=1):
+        for number, records in enumerate(failure_batches(failures), start=1):
             payload = {
                 "reason": reason,
                 "batch": number,
-                "batches": len(batches),
+                "batches": batches,
                 "failed": len(failures),
                 "failures": records,
             }
+            del records
             try:
                 outcome = emit(FACT_MEMORY_DELETION_FAILED, payload)
                 if inspect.isawaitable(outcome):
@@ -1449,9 +1466,11 @@ class ViewerMemoryModule:
                 raise
             except Exception:  # noqa: BLE001 - a lost report must not fail the caller
                 lost += 1
+            finally:
+                del payload
         if lost:
             self._diagnose(
-                f"fact {FACT_MEMORY_DELETION_FAILED}: {lost} of {len(batches)} batches "
+                f"fact {FACT_MEMORY_DELETION_FAILED}: {lost} of {batches} batches "
                 "not published"
             )
 
@@ -1462,7 +1481,7 @@ class ViewerMemoryModule:
         for failure in failures[:FAILURE_BATCH_SIZE]:
             self._diagnose(f"{REASON_DELETION_FAILED}: {failure.describe()}")
         if len(failures) > FAILURE_BATCH_SIZE:
-            batches = -(-len(failures) // FAILURE_BATCH_SIZE)
+            batches = failure_batch_count(failures)
             self._diagnose(
                 f"{REASON_DELETION_FAILED}: {len(failures) - FAILURE_BATCH_SIZE} more files "
                 f"could not be deleted and remained; all {len(failures)} are named in "
@@ -1716,6 +1735,7 @@ __all__ = [
     "ViewerMemoryModule",
     "activate",
     "fit_recall",
+    "failure_batch_count",
     "failure_batches",
     "format_timestamp",
     "memory_file_name",
