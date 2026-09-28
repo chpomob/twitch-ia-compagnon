@@ -18,8 +18,8 @@ dedicated ``config-ui`` thread pool (D8).
 The module is split into delimited sections (D3): settings and startup
 checks, authorities, the configuration model, the redaction guard (R8), the
 rendering helpers (R9), the request core and its pages, the draft edits and
-Check (R5), the socket-free event loop (D7), the request bridge and the entry
-point. No section names a module: every page lists or renders what discovery
+Check (R5), Save and remove-override (R6), the socket-free event loop (D7),
+the request bridge and the entry point. No section names a module: every page lists or renders what discovery
 found (A2).
 """
 
@@ -40,10 +40,13 @@ import re
 import secrets
 import selectors
 import sys
+import tempfile
 import threading
 import weakref
+from contextlib import suppress
 from contextvars import ContextVar
 from collections import OrderedDict
+from datetime import datetime, timezone
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -55,12 +58,14 @@ import yaml
 
 from core.actions import ANY_ACTION
 from core.bus import EventBus
+from core.contracts import ContractError, validate_against_schema, validate_schema
 from core.loader import (
     MANIFEST_SETTINGS_SCHEMA_KEY,
     MANIFEST_TRIGGERS_KEY,
     DiscoveredModule,
     ModuleLoader,
     ModuleLoadError,
+    _trigger_policy,
     _validate_manifest,
 )
 from core.main import (
@@ -93,6 +98,7 @@ __all__ = [
     "UIRequest",
     "UIResponse",
     "UISettings",
+    "WriteResult",
     "accepted_authorities",
     "main",
     "serve",
@@ -847,6 +853,34 @@ def _csrf_field(session: _Session) -> str:
     return f'<input type="hidden" name="{CSRF_FIELD}" value="{html.escape(session.csrf_token, quote=True)}">'
 
 
+#: The field carrying the overlay fingerprint a form was rendered from, so a
+#: Save or Remove of a file changed since is refused as stale (R6).
+FINGERPRINT_FIELD = "fingerprint"
+#: The fingerprint of an overlay file that does not exist.
+FINGERPRINT_ABSENT = "absent"
+
+
+def _view_fingerprint(view: ConfigView) -> str:
+    """The overlay fingerprint of *view*: its bytes' SHA-256, or ``absent``.
+
+    An overlay that exists but could not be read has no fingerprint: its
+    forms carry an empty one, which never matches, so nothing overwrites it.
+    """
+
+    if not view.overlay_exists:
+        return FINGERPRINT_ABSENT
+    return view.overlay_digest or ""
+
+
+def _write_guard(session: _Session, view: ConfigView) -> str:
+    """The hidden fields every form that saves or removes carries."""
+
+    return (
+        f"{_csrf_field(session)}"
+        f'<input type="hidden" name="{FINGERPRINT_FIELD}" value="{ident(_view_fingerprint(view))}">'
+    )
+
+
 #: The field naming the page a form was posted from, so Check answers with
 #: that page's view of the diagnostics (R5).
 PAGE_FIELD = "page"
@@ -1413,6 +1447,8 @@ class ConfigUI:
         )
         self.base_path = settings.base_path
         self.overlay_path = settings.overlay_path
+        #: The one file a Save or Remove may replace, resolved once here (R6).
+        self._managed_overlay = settings.overlay_path
         self.status_path = settings.status_path
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._sessions_lock = threading.Lock()
@@ -1427,8 +1463,8 @@ class ConfigUI:
             "/": (frozenset({"GET"}), self._base_page),
             "/core": (frozenset({"GET"}), self._core_page),
             MODULE_PAGE_PREFIX: (frozenset({"GET"}), self._module_page),
-            "/save": (frozenset({"POST"}), self._not_available),
-            "/remove": (frozenset({"POST"}), self._not_available),
+            "/save": (frozenset({"POST"}), self._save_endpoint),
+            "/remove": (frozenset({"POST"}), self._remove_endpoint),
             "/check": (frozenset({"POST"}), self._check_endpoint),
             "/apply": (frozenset({"POST"}), self._not_available),
         }
@@ -1585,8 +1621,8 @@ class ConfigUI:
                 f'<tr data-module="{ident(name)}" data-enabled="{str(is_enabled).lower()}">'
                 f'<td><a href="{MODULE_PAGE_PREFIX}{ident(name)}">{ident(name)}</a></td>'
                 f"<td>{state}"
-                f'<form class="inline" method="post" action="/save">{_csrf_field(session)}'
-                f'<input type="hidden" name="enabled_modules.{ident(name)}" '
+                f'<form class="inline" method="post" action="/save">{_write_guard(session, view)}'
+                f'{_page_field("/")}<input type="hidden" name="enabled_modules.{ident(name)}" '
                 f'value="{str(not is_enabled).lower()}">'
                 f'<button type="submit">{"Disable" if is_enabled else "Enable"}</button>'
                 "</form></td>"
@@ -1639,7 +1675,7 @@ class ConfigUI:
             '<p><a href="/">Back to the configuration</a></p>',
             _diagnostics(view),
             '<section id="modules-directory"><h2>Modules directory</h2>'
-            f'<form method="post" action="/save">{_csrf_field(session)}{_page_field(CORE_PAGE)}'
+            f'<form method="post" action="/save">{_write_guard(session, view)}{_page_field(CORE_PAGE)}'
             '<label>modules_directory '
             f'<input type="text" name="modules_directory" value="{esc(directory)}"></label> '
             f'<span class="origin">origin: {esc(self._origin(view, ("modules_directory",)))}</span> '
@@ -1688,7 +1724,7 @@ class ConfigUI:
             )
         return (
             '<section id="limits"><h2>Limits</h2>'
-            f'<form method="post" action="/save">{_csrf_field(session)}{_page_field(CORE_PAGE)}'
+            f'<form method="post" action="/save">{_write_guard(session, view)}{_page_field(CORE_PAGE)}'
             f"{''.join(groups)}"
             f'<button type="submit">Save</button> {_CHECK_BUTTON}</form></section>'
         )
@@ -1782,7 +1818,7 @@ class ConfigUI:
             '<p><a href="/">Back to the configuration</a></p>',
             _diagnostics(view),
             f'<section id="settings"><h2>Settings</h2>'
-            f'<form id="{form_id}" method="post" action="/save">{_csrf_field(session)}'
+            f'<form id="{form_id}" method="post" action="/save">{_write_guard(session, view)}'
             f"{_page_field(page)}{fields}"
             f'<button type="submit">Save</button> {_CHECK_BUTTON}</form></section>',
         ]
@@ -1842,7 +1878,7 @@ class ConfigUI:
             parts = [
                 f'<fieldset class="channel" data-channel="{esc(_plain(key))}">'
                 f"<legend>Channel {label}</legend>",
-                f'<form method="post" action="/save">{_csrf_field(session)}'
+                f'<form method="post" action="/save">{_write_guard(session, view)}'
                 f"{_page_field(MODULE_PAGE_PREFIX + name)}",
             ]
             if not isinstance(policy, Mapping):
@@ -1896,11 +1932,12 @@ class ConfigUI:
         )
         add = (
             '<form id="add-channel-policy" method="post" action="/save">'
-            f"{_csrf_field(session)}<h3>Add channel policy</h3>"
+            f"{_write_guard(session, view)}{_page_field(MODULE_PAGE_PREFIX + name)}<h3>Add channel policy</h3>"
             f'<input type="hidden" name="add_channel_policy" value="{ident(_path_text(channels_path))}">'
             '<label>Channel <input type="text" name="channel"></label> '
             f'<label>Combination <select name="combination">{combination_options}</select></label> '
             f'<label>Rule type <select name="rule_type">{type_options}</select></label> '
+            '<label>Rule parameters (JSON) <textarea name="parameters" rows="2">{}</textarea></label> '
             '<button type="submit">Add</button></form>'
         )
         content = "".join(policies) or "<p>No channel policy is configured: every channel uses the module default.</p>"
@@ -1944,7 +1981,8 @@ class ConfigUI:
         A field left as its page rendered it is no edit. A trigger-policy
         field is lifted to its whole channel policy (the unit a policy is
         written in, R6); a base-page toggle ``enabled_modules.<name>`` edits
-        the whole ``enabled_modules`` list.
+        the whole ``enabled_modules`` list; the add-channel-policy form makes
+        a new one-rule channel policy.
         """
 
         renderer = self._controls(view)
@@ -1955,6 +1993,8 @@ class ConfigUI:
         problems: list[str] = []
         enabled: list[str] | None = None
         policies: dict[tuple[Any, ...], Any] = {}
+        if _ADD_CHANNEL_POLICY in posted:
+            self._added_policy(view, posted, policies, problems)
         for name, text in posted.items():
             if name in _NOT_SETTING_FIELDS:
                 continue
@@ -1995,6 +2035,44 @@ class ConfigUI:
         ordered.extend(edits.items())
         ordered.extend(policies.items())
         return ordered, problems
+
+    @staticmethod
+    def _added_policy(
+        view: ConfigView,
+        posted: Mapping[str, str],
+        policies: dict[tuple[Any, ...], Any],
+        problems: list[str],
+    ) -> None:
+        """The channel policy the add-channel-policy form posts, as one edit."""
+
+        target = posted[_ADD_CHANNEL_POLICY]
+        inputs = [
+            name
+            for name, module in view.modules.items()
+            if _trigger_types(module.manifest)
+            and _path_text(("triggers", name, "channels")) == target
+        ]
+        if len(inputs) != 1:
+            problems.append(f"{_ADD_CHANNEL_POLICY}: is not a trigger input this UI edits")
+            return
+        channels = ("triggers", inputs[0], "channels")
+        channel = posted.get("channel", "").strip()
+        if not channel:
+            problems.append(f"{_path_text(channels)}: the channel must be a non-empty identifier")
+            return
+        path = (*channels, channel)
+        if view.value(path) is not _MISSING:
+            problems.append(f"{_path_text(path)}: is already configured; edit it instead")
+            return
+        policies[path] = {
+            "combination": posted.get("combination", ""),
+            "rules": [
+                {
+                    "type": posted.get("rule_type", ""),
+                    "parameters": _coerce("json", {}, posted.get("parameters", "") or "{}"),
+                }
+            ],
+        }
 
     def check(
         self,
@@ -2085,6 +2163,222 @@ class ConfigUI:
             )
         return _page(verdict, session, "".join(parts))
 
+    # -- Save and remove-override (R6, A7, A9) ----------------------------------
+
+    def save(
+        self,
+        edits: Sequence[Edit],
+        *,
+        fingerprint: str,
+        page: str = "/",
+        problems: Sequence[str] = (),
+        view: ConfigView | None = None,
+    ) -> WriteResult:
+        """Write *edits* to the overlay, or refuse them all and write nothing.
+
+        The order is fixed: stale detection, then the 6c scope and the
+        protections of every edit (a refusal), then the value checks (the
+        per-field diagnostics). Only when all pass is the overlay replaced,
+        atomically, with the on-disk overlay plus the edits — through
+        :func:`_apply_edits`, the draft Check validates.
+        """
+
+        prepared = self._prepare_write(fingerprint)
+        if isinstance(prepared, WriteResult):
+            return prepared
+        base, overlay = prepared
+        view = self.view() if view is None else view
+        refused = list(problems)
+        invalid: list[str] = []
+        accepted: list[Edit] = []
+        for path, value in edits:
+            path = tuple(path)
+            reason = _scope_refusal(view, path)
+            if reason is not None:
+                refused.append(f"{_path_text(path)}: {reason}")
+                continue
+            value, protection = _protect_save(view, path, value)
+            if protection:
+                refused.extend(protection)
+                continue
+            invalid.extend(_validate_edit(view, path, value))
+            accepted.append((path, value))
+        if refused:
+            return self._refused(WriteResult(OUTCOME_REFUSED, tuple(refused)))
+        if invalid:
+            return self._refused(WriteResult(OUTCOME_INVALID, tuple(invalid)))
+        try:
+            draft = _apply_edits(overlay, accepted)
+        except ValueError as exc:
+            return self._refused(WriteResult(OUTCOME_INVALID, (str(exc),)))
+        if draft == overlay:
+            return WriteResult(OUTCOME_UNCHANGED)
+        paths = tuple(_path_text(path) for path, _ in accepted)
+        return self._commit(draft, OUTCOME_SAVED, page, paths, view)
+
+    def remove(
+        self,
+        path_text: str,
+        *,
+        fingerprint: str,
+        page: str = "/",
+        view: ConfigView | None = None,
+    ) -> WriteResult:
+        """Delete one key path from the overlay, pruning emptied mappings (R6).
+
+        The effective value becomes the base value again; a key the base
+        defines stays defined (A7). Refused, writing nothing, outside the 6c
+        scope, at a protected field, or when a protected descendant's
+        effective text would change.
+        """
+
+        prepared = self._prepare_write(fingerprint)
+        if isinstance(prepared, WriteResult):
+            return prepared
+        base, overlay = prepared
+        view = self.view() if view is None else view
+        candidates = [path for path in _overlay_key_paths(overlay) if _path_text(path) == path_text]
+        if len(candidates) != 1:
+            reason = "is not overridden in the overlay" if not candidates else "is ambiguous"
+            return self._refused(WriteResult(OUTCOME_REFUSED, (f"{path_text}: {reason}",)))
+        path = candidates[0]
+        reason = _scope_refusal(view, path)
+        if reason is not None:
+            return self._refused(WriteResult(OUTCOME_REFUSED, (f"{path_text}: {reason}",)))
+        draft = _remove_path(overlay, path)
+        refusals = _protect_remove(view, path, deep_merge(base, draft))
+        if refusals:
+            return self._refused(WriteResult(OUTCOME_REFUSED, tuple(refusals)))
+        return self._commit(draft, OUTCOME_REMOVED, page, (path_text,), view)
+
+    def _prepare_write(
+        self, fingerprint: str
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]] | WriteResult:
+        """Both files as parsed, or why no write may happen (stale included)."""
+
+        if self.overlay_path is None:
+            return WriteResult(OUTCOME_REFUSED, ("no managed overlay path is configured",))
+        current = _file_fingerprint(self.overlay_path)
+        if current is None:
+            return WriteResult(OUTCOME_FAILED, ("the overlay file is not readable",))
+        if not fingerprint or not _equal(fingerprint, current):
+            return WriteResult(
+                OUTCOME_STALE,
+                ("the overlay file changed on disk since this page was rendered; reload it",),
+            )
+        try:
+            return read_base(self.base_path), read_overlay(self.overlay_path)
+        except OverlayError as exc:
+            return WriteResult(OUTCOME_REFUSED, (str(exc),))
+
+    def _refused(self, result: WriteResult) -> WriteResult:
+        """*result* with every diagnostic value-free and redacted (R8)."""
+
+        return WriteResult(
+            result.outcome,
+            tuple(_redact(_value_free(line), self.secret_values) for line in result.diagnostics),
+        )
+
+    def _commit(
+        self,
+        draft: Mapping[str, Any],
+        outcome: str,
+        page: str,
+        paths: Sequence[str],
+        view: ConfigView,
+    ) -> WriteResult:
+        """Replace the overlay with *draft* and log the operation, never a value.
+
+        A path can carry an operator-chosen key (a channel identifier); the
+        logged page and paths, message and record fields alike, pass the
+        redaction guard with the draft's credential literals included (R8).
+        """
+
+        try:
+            _write_overlay(self.overlay_path, self._managed_overlay, self.base_path, draft)
+        except (OSError, RuntimeError):
+            return WriteResult(OUTCOME_FAILED, ("the overlay file could not be written",))
+        secret_values = set(self.secret_values) | _credential_literals(view, draft)
+        logged_page = _redact(page, secret_values)
+        logged_paths = tuple(_redact(path, secret_values) for path in paths)
+        logger.info(
+            "configuration %s at %s: page %s, setting paths: %s",
+            _OPERATION[outcome],
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            logged_page,
+            ", ".join(logged_paths),
+            extra={
+                "config_ui_operation": _OPERATION[outcome],
+                "config_ui_page": logged_page,
+                "config_ui_paths": logged_paths,
+            },
+        )
+        return WriteResult(outcome, paths=tuple(paths))
+
+    def _posted_page(self, fields: Sequence[tuple[str, str]], view: ConfigView) -> str:
+        """The page a form was posted from: ``/``, ``/core`` or a module page."""
+
+        page = "/"
+        for name, value in fields:
+            if name == PAGE_FIELD:
+                page = value
+        if page == CORE_PAGE:
+            return page
+        if page.startswith(MODULE_PAGE_PREFIX) and page[len(MODULE_PAGE_PREFIX) :] in view.modules:
+            return page
+        return "/"
+
+    def _save_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``POST /save``: write the posting page's edits to the overlay (R6)."""
+
+        fields = _form_fields(request)
+        view = self.view()
+        page = self._posted_page(fields, view)
+        edits, problems = self.parse_edits(view, fields)
+        result = self.save(
+            edits, fingerprint=_posted(fields, FINGERPRINT_FIELD), page=page, problems=problems, view=view
+        )
+        return self._write_response(result, page, session)
+
+    def _remove_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``POST /remove``: delete one override from the overlay (R6, A7)."""
+
+        fields = _form_fields(request)
+        view = self.view()
+        page = self._posted_page(fields, view)
+        result = self.remove(
+            _posted(fields, "path"),
+            fingerprint=_posted(fields, FINGERPRINT_FIELD),
+            page=page,
+            view=view,
+        )
+        return self._write_response(result, page, session)
+
+    @staticmethod
+    def _write_response(result: WriteResult, page: str, session: _Session) -> UIResponse:
+        if result.accepted:
+            return UIResponse(status=303, headers=(("Location", page),))
+        titles = {
+            OUTCOME_UNCHANGED: "Nothing to save",
+            OUTCOME_STALE: "Refused: stale page",
+            OUTCOME_REFUSED: "Refused",
+            OUTCOME_INVALID: "Not saved: invalid values",
+            OUTCOME_FAILED: "Not saved: write failed",
+        }
+        title = titles[result.outcome]
+        items = "".join(f'<li class="diagnostic">{esc(line)}</li>' for line in result.diagnostics)
+        body = (
+            f'<h1 id="outcome" data-outcome="{ident(result.outcome)}">{esc(title)}</h1>'
+            f'<p><a href="{ident(page)}">Back</a> (the overlay file is unchanged)</p>'
+            + (f'<section class="diagnostics" id="write-diagnostics"><ul>{items}</ul></section>' if items else "")
+        )
+        response = _page(title, session, body)
+        return UIResponse(
+            status=_OUTCOME_STATUS[result.outcome],
+            body=response.body,
+            content_type=response.content_type,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Draft edits and Check (R5)
@@ -2106,10 +2400,23 @@ Checker = Callable[[Path, Mapping[str, str], Path | None, Mapping[str, Any]], tu
 
 CHECK_NOT_REACHED = "settings phase not reached"
 
+#: The add-channel-policy form's field naming ``triggers.<input>.channels``.
+_ADD_CHANNEL_POLICY = "add_channel_policy"
+
 #: Posted fields that carry no setting: the guard's token, the page, and the
 #: operations that only Save and Remove perform.
 _NOT_SETTING_FIELDS = frozenset(
-    {CSRF_FIELD, PAGE_FIELD, "path", "add_channel_policy", "channel", "combination", "rule_type"}
+    {
+        CSRF_FIELD,
+        PAGE_FIELD,
+        FINGERPRINT_FIELD,
+        "path",
+        _ADD_CHANNEL_POLICY,
+        "channel",
+        "combination",
+        "rule_type",
+        "parameters",
+    }
 )
 _ENABLED_TOGGLE = "enabled_modules."
 _NEW_ENTRY_NAME = "new_entry_name:"
@@ -2186,9 +2493,9 @@ def _set_path(document: dict[Any, Any], path: Sequence[Any], value: Any) -> None
         node = child
     last = path[-1]
     if isinstance(node, dict):
-        node[last] = copy.deepcopy(value)
+        node[last] = _detached(value)
     elif isinstance(node, list) and isinstance(last, int) and 0 <= last < len(node):
-        node[last] = copy.deepcopy(value)
+        node[last] = _detached(value)
     else:
         raise ValueError(f"{_path_text(path)}: no such item")
 
@@ -2211,10 +2518,25 @@ def _draft_edit(
     if path[0] == "triggers" and len(path) > 4:
         channel = path[:4]
         if channel not in policies:
-            policies[channel] = copy.deepcopy(view.value(channel))
+            policies[channel] = _detached(view.value(channel))
         _set_path(policies[channel], path[4:], value)
     else:
         edits[path] = value
+
+
+def _detached(value: Any) -> Any:
+    """A copy of *value* sharing no container, with itself or with *value*.
+
+    ``copy.deepcopy`` keeps a YAML alias an alias: two paths anchored to one
+    mapping stay one object in the copy, so setting a child through one path
+    would change the other. Every occurrence here gets its own container.
+    """
+
+    if isinstance(value, Mapping):
+        return {key: _detached(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detached(item) for item in value]
+    return copy.deepcopy(value)
 
 
 def _apply_edits(overlay: Mapping[str, Any], edits: Iterable[Edit]) -> dict[str, Any]:
@@ -2224,7 +2546,7 @@ def _apply_edits(overlay: Mapping[str, Any], edits: Iterable[Edit]) -> dict[str,
     would write.
     """
 
-    draft: dict[str, Any] = copy.deepcopy(dict(overlay))
+    draft: dict[str, Any] = _detached(overlay)
     for path, value in edits:
         _set_path(draft, path, value)
     return draft
@@ -2375,6 +2697,427 @@ def _default_checker(
         )
     )
     return status == 0, collected
+
+
+# ---------------------------------------------------------------------------
+# Save and remove-override (R6, A7, A9)
+#
+# A write targets only the 6c scope — ``enabled_modules``,
+# ``modules.<name>.<setting path>``, ``triggers.<input>.channels.<channel>``,
+# ``limits.<group>.<field>`` and ``modules_directory`` — and never a
+# protected field: a declared credential path, or a field whose configured
+# (merged, unresolved) text is a ``${NAME}`` reference. A target that is an
+# ancestor of protected fields must keep each one's configured text exactly,
+# a referenced mapping key included (compared as key text, never resolved).
+# The new overlay is the file as parsed with the edit applied, so a
+# hand-written ``secrets`` or ``actions`` block is kept as parsed (A9); it is
+# written to a temporary file beside the overlay, synced, then renamed over
+# it, so a reader sees the old or the new file, never a partial one.
+# ---------------------------------------------------------------------------
+
+OUTCOME_SAVED = "saved"
+OUTCOME_REMOVED = "removed"
+OUTCOME_UNCHANGED = "unchanged"
+OUTCOME_STALE = "stale"
+OUTCOME_REFUSED = "refused"
+OUTCOME_INVALID = "invalid"
+OUTCOME_FAILED = "failed"
+
+_OPERATION = {OUTCOME_SAVED: "save", OUTCOME_REMOVED: "remove-override"}
+_OUTCOME_STATUS = {
+    OUTCOME_UNCHANGED: 200,
+    OUTCOME_STALE: 409,
+    OUTCOME_REFUSED: 403,
+    OUTCOME_INVALID: 422,
+    OUTCOME_FAILED: 500,
+}
+
+_PROTECTED_REASON = "a protected field must keep its configured text"
+_READ_ONLY_BLOCK = "is read-only in v1"
+_OUTSIDE_SCOPE = "is outside the settings this UI writes"
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    """The outcome of one Save or Remove (R6): value-free diagnostics."""
+
+    outcome: str
+    diagnostics: tuple[str, ...] = ()
+    #: The setting paths an accepted operation touched.
+    paths: tuple[str, ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return self.outcome in (OUTCOME_SAVED, OUTCOME_REMOVED)
+
+
+def _posted(fields: Sequence[tuple[str, str]], name: str) -> str:
+    """The last value posted for *name*, or ``""``."""
+
+    value = ""
+    for key, item in fields:
+        if key == name:
+            value = item
+    return value
+
+
+def _file_fingerprint(path: Path) -> str | None:
+    """The overlay fingerprint on disk; ``None`` when the file cannot be read."""
+
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return FINGERPRINT_ABSENT
+    except OSError:
+        return None
+
+
+_GOT_VALUE = re.compile(r",? got .*\Z", re.S)
+
+
+def _value_free(line: str) -> str:
+    """*line* without the ``got <value>`` tail a contract diagnostic may carry."""
+
+    return _GOT_VALUE.sub("", line)
+
+
+def _scope_refusal(view: ConfigView, path: tuple[Any, ...]) -> str | None:
+    """Why *path* is outside the 6c writing scope, or ``None`` inside it."""
+
+    if not path:
+        return "is not a setting path"
+    head = path[0]
+    if head in (SECRETS_KEY, ACTIONS_KEY):
+        return _READ_ONLY_BLOCK
+    if head in ("enabled_modules", "modules_directory"):
+        return None if len(path) == 1 else _OUTSIDE_SCOPE
+    if head == MODULES_KEY:
+        if len(path) < 3 or path[1] not in view.modules:
+            return "is not a setting of a discovered module"
+        if path[2] == LIMITS_KEY:
+            return LIMITS_NOTICE
+        return None
+    if head == "triggers":
+        module = view.modules.get(path[1]) if len(path) == 4 else None
+        if (
+            module is None
+            or path[2] != "channels"
+            or not _trigger_types(module.manifest)
+            or not isinstance(path[3], str)
+            or not path[3].strip()
+        ):
+            return "is not a whole channel policy of a discovered trigger input"
+        return None
+    if head == LIMITS_KEY:
+        if len(path) == 3 and path[2] in LIMIT_DECLARATION.get(path[1], {}):
+            return None
+        return "is not a declared limit"
+    return _OUTSIDE_SCOPE
+
+
+def _direct_protection(view: ConfigView, path: tuple[Any, ...]) -> list[str]:
+    """Refusals for a target that is, or lies inside, a protected field."""
+
+    for end in range(1, len(path) + 1):
+        prefix = path[:end]
+        inside = end < len(path)
+        if view.is_credential(prefix):
+            where = "is inside" if inside else "is"
+            return [f"{_path_text(path)}: {where} a declared credential"]
+        if reference_name(view.value(prefix)) is not None:
+            where = "is inside a field whose" if inside else "its"
+            return [f"{_path_text(path)}: {where} configured value is a ${{NAME}} reference"]
+    return []
+
+
+def _protected_descendants(
+    view: ConfigView, target: tuple[Any, ...]
+) -> list[tuple[tuple[Any, ...], str]]:
+    """``(relative path, kind)`` of every protected field below *target*.
+
+    ``kind`` is ``value`` for a ``${NAME}`` value, ``key`` for a ``${NAME}``
+    mapping key and ``credential`` for a declared credential path, present or
+    not.
+    """
+
+    found: list[tuple[tuple[Any, ...], str]] = []
+    active: set[int] = set()
+
+    def walk(value: Any, relative: tuple[Any, ...]) -> None:
+        if relative and reference_name(value) is not None:
+            found.append((relative, "value"))
+            return
+        if not isinstance(value, (Mapping, list)) or id(value) in active:
+            return
+        active.add(id(value))
+        items = value.items() if isinstance(value, Mapping) else enumerate(value)
+        for key, item in items:
+            if isinstance(value, Mapping) and reference_name(key) is not None:
+                found.append(((*relative, key), "key"))
+            walk(item, (*relative, key))
+        active.discard(id(value))
+
+    current = view.value(target)
+    if current is not _MISSING:
+        walk(current, ())
+    if target[0] == MODULES_KEY and len(target) >= 2:
+        module = view.modules.get(target[1])
+        declaration = module.declaration if module is not None else None
+        setting = tuple(target[2:])
+        for credential in declaration.credentials if declaration is not None else ():
+            if len(credential) > len(setting) and tuple(credential[: len(setting)]) == setting:
+                found.append((tuple(credential[len(setting) :]), "credential"))
+    return found
+
+
+def _same(left: Any, right: Any) -> bool:
+    """Both absent, or the same configured text of the same type."""
+
+    if left is _MISSING or right is _MISSING:
+        return left is right
+    return type(left) is type(right) and left == right
+
+
+def _protect_save(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[Any, list[str]]:
+    """*value* with hidden credentials restored, and every protection refusal.
+
+    A credential the page showed as :data:`HIDDEN_LITERAL` inside a JSON
+    editor is put back as its configured literal before the comparison.
+    """
+
+    refusals = _direct_protection(view, path)
+    if refusals:
+        return value, refusals
+    current = view.value(path)
+    for relative, kind in _protected_descendants(view, path):
+        configured = _lookup(current, relative) if current is not _MISSING else _MISSING
+        proposed = _lookup(value, relative)
+        if kind == "credential" and proposed == HIDDEN_LITERAL and configured is not _MISSING:
+            value = copy.deepcopy(value)
+            _set_path(value, relative, configured)
+            proposed = configured
+        kept = proposed is not _MISSING if kind == "key" else _same(proposed, configured)
+        if not kept:
+            refusals.append(f"{_path_text((*path, *relative))}: {_PROTECTED_REASON}")
+    return value, refusals
+
+
+def _protect_remove(
+    view: ConfigView, path: tuple[Any, ...], merged_after: Mapping[str, Any]
+) -> list[str]:
+    """Refusals for removing *path* when a protected effective text would change."""
+
+    refusals = _direct_protection(view, path)
+    if refusals:
+        return refusals
+    for relative, kind in _protected_descendants(view, path):
+        full = (*path, *relative)
+        before, after = view.value(full), _lookup(merged_after, full)
+        kept = after is not _MISSING if kind == "key" else _same(after, before)
+        if not kept:
+            refusals.append(f"{_path_text(full)}: {_PROTECTED_REASON}")
+    return refusals
+
+
+def _validate_edit(view: ConfigView, path: tuple[Any, ...], value: Any) -> list[str]:
+    """The per-field diagnostics of one in-scope edit; empty when valid."""
+
+    label = _path_text(path)
+    head = path[0]
+    if head == "enabled_modules":
+        if not isinstance(value, list):
+            return [f"{label}: must be a list of module names"]
+        found: list[str] = []
+        seen: set[str] = set()
+        for index, name in enumerate(value):
+            if not isinstance(name, str):
+                found.append(f"{label}[{index}]: must be a module name")
+            elif name in seen:
+                found.append(f"{label}[{index}]: repeats an enabled module")
+            elif name not in view.modules:
+                found.append(f"{label}[{index}]: is not a discovered module")
+            else:
+                seen.add(name)
+        return found
+    if reference_name(value) is not None and head != "triggers":
+        # Resolved when the configuration loads; Check reports it unresolved.
+        return []
+    if head == "modules_directory":
+        if isinstance(value, str) and value.strip():
+            return []
+        return [f"{label}: must be a non-empty string"]
+    if head == LIMITS_KEY:
+        kind = LIMIT_DECLARATION[path[1]][path[2]]
+        if kind == LIMIT_KIND_COUNT:
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+                return []
+            return [f"{label}: must be a positive integer"]
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0
+        ):
+            return []
+        return [f"{label}: must be a finite positive number"]
+    module = view.modules[path[1]]
+    if head == "triggers":
+        spec = module.declaration.triggers if module.declaration is not None else None
+        try:
+            policy = _trigger_policy(path[1], label, value)
+            if spec is None:
+                return [f"{label}: the module declares no trigger type"]
+            spec.validate_policy(policy, label=label)
+        except ModuleLoadError as exc:
+            return list(exc.diagnostics)
+        except ContractError as exc:
+            return [f"{exc.field}: {exc.reason}"]
+        return []
+    schema = _setting_schema(module.manifest.get(MANIFEST_SETTINGS_SCHEMA_KEY), path[2:])
+    if schema is None:
+        return [f"{label}: is not a declared setting"]
+    found = []
+    try:
+        validate_schema(schema, label=label)
+    except ContractError as exc:
+        return [f"{exc.field}: {exc.reason}"]
+    _validate_setting(value, schema, label, found)
+    return found
+
+
+def _setting_schema(schema: Any, setting: Sequence[Any]) -> Mapping[str, Any] | None:
+    """The ``settings_schema`` node describing *setting*, or ``None``."""
+
+    node = schema
+    for segment in setting:
+        if not isinstance(node, Mapping):
+            return None
+        if isinstance(segment, int) and not isinstance(segment, bool):
+            node = node.get("items")
+            continue
+        properties = node.get("properties")
+        if isinstance(properties, Mapping) and segment in properties:
+            node = properties[segment]
+        elif isinstance(node.get("additionalProperties"), Mapping):
+            node = node["additionalProperties"]
+        else:
+            return None
+    return node if isinstance(node, Mapping) else None
+
+
+#: The schema keywords :func:`_validate_setting` walks itself.
+_CHILD_KEYWORDS = frozenset({"properties", "items", "required", "additionalProperties"})
+
+
+def _validate_setting(value: Any, schema: Mapping[str, Any], label: str, found: list[str]) -> None:
+    """Validate *value* against *schema* through ``core.contracts``.
+
+    A ``${NAME}`` reference anywhere in the value is accepted as it stands:
+    the configuration resolves it before validating, and Check reports it
+    unresolved. The node's own keywords are checked by
+    :func:`validate_against_schema`; its children are walked here so that a
+    reference child is skipped rather than checked as text.
+    """
+
+    if reference_name(value) is not None:
+        return
+    own = {key: item for key, item in schema.items() if key not in _CHILD_KEYWORDS}
+    try:
+        validate_against_schema(value, own, label=label)
+    except ContractError as exc:
+        found.append(f"{exc.field}: {exc.reason}")
+        return
+    object_keywords = {"required", "properties", "additionalProperties"} & set(schema)
+    if object_keywords:
+        if not isinstance(value, Mapping):
+            found.append(f"{label}: must be a mapping")
+            return
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, Mapping) else {}
+        for name in schema.get("required", ()):
+            if name not in value:
+                found.append(f"{label}.{name}: is required and missing")
+        entries = schema.get("additionalProperties")
+        for key, item in value.items():
+            if not isinstance(key, str):
+                found.append(f"{label}: must use string keys")
+            elif key in properties:
+                _validate_setting(item, properties[key], f"{label}.{key}", found)
+            elif entries is False:
+                found.append(f"{label}.{key}: is not an allowed property")
+            elif isinstance(entries, Mapping):
+                _validate_setting(item, entries, f"{label}.{key}", found)
+    if "items" in schema:
+        if not isinstance(value, list):
+            found.append(f"{label}: must be a list")
+            return
+        for index, item in enumerate(value):
+            _validate_setting(item, schema["items"], f"{label}[{index}]", found)
+
+
+def _overlay_key_paths(overlay: Mapping[str, Any]) -> list[tuple[Any, ...]]:
+    """Every mapping-key path of *overlay* (list items are not removable)."""
+
+    found: list[tuple[Any, ...]] = []
+    pending: list[tuple[tuple[Any, ...], Any]] = [((), overlay)]
+    seen: set[int] = set()
+    while pending:
+        prefix, node = pending.pop()
+        if not isinstance(node, Mapping) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        for key, item in node.items():
+            found.append((*prefix, key))
+            pending.append(((*prefix, key), item))
+    return found
+
+
+def _remove_path(overlay: Mapping[str, Any], path: Sequence[Any]) -> dict[str, Any]:
+    """*overlay* without *path*, emptied parent mappings pruned; a copy."""
+
+    draft: dict[str, Any] = _detached(overlay)
+    chain: list[tuple[dict[Any, Any], Any]] = []
+    node: Any = draft
+    for segment in path[:-1]:
+        chain.append((node, segment))
+        node = node[segment]
+    del node[path[-1]]
+    for parent, segment in reversed(chain):
+        if parent[segment] == {}:
+            del parent[segment]
+        else:
+            break
+    return draft
+
+
+def _write_overlay(
+    target: Path | None, managed: Path | None, base: Path, document: Mapping[str, Any]
+) -> None:
+    """Replace the managed overlay with *document*, atomically (R6).
+
+    The target must be the overlay path resolved at startup and never the
+    base. The text goes to a temporary file in the overlay's directory, is
+    synced, then renamed over the overlay; on any failure the temporary file
+    is removed and the previous overlay stays as it was.
+    """
+
+    if target is None or managed is None or target != managed or same_file(target, base):
+        raise RuntimeError("refusing to write a file other than the managed overlay")
+    text = yaml.safe_dump(dict(document), sort_keys=False, allow_unicode=True)
+    directory = target.expanduser().parent
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(text.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target.expanduser())
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(temporary)
+        raise
 
 
 # ---------------------------------------------------------------------------

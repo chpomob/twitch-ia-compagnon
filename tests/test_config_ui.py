@@ -1,6 +1,7 @@
 """The configuration UI: CLI, bind policy, guards and startup refusals (P9);
 the configuration model, base page and core-settings page (P10); the module
-pages generated from each manifest (P11); Check (P12).
+pages generated from each manifest (P11); Check (P12); Save and
+remove-override (P13).
 
 The whole module runs with socket creation patched to raise (AC5): no test
 here binds, connects or even creates a socket. The request core is driven
@@ -483,11 +484,16 @@ def test_ac6_refused_hosts_get_403_even_on_get(host: str | None, config_dir: Pat
     assert ui.handle(_request("POST", "/save", host=host, headers=headers)).status == 403
 
 
+#: What a POST that passed every guard gets from Save with no form: the
+#: handler's stale refusal (R6, P13 replaced the 501 placeholder), never 401/403.
+REACHED_SAVE = 409
+
+
 def test_ac6_origin_accepted_or_absent(config_dir: Path) -> None:
     ui = _ui(config_dir / "config.yaml")
     cookie, csrf = _login(ui)
     for origin in (None, "http://localhost:8765", "http://127.0.0.1:8765", "http://[::1]:8765"):
-        assert _post(ui, "/save", cookie, csrf, origin=origin).status == 501
+        assert _post(ui, "/save", cookie, csrf, origin=origin).status == REACHED_SAVE
 
 
 @pytest.mark.parametrize(
@@ -522,7 +528,7 @@ def test_ac6_port_80_is_implicit_in_host_and_origin(config_dir: Path) -> None:
     for host in ("localhost", "localhost:80", "127.0.0.1"):
         assert ui.handle(_request("GET", "/", host=host, headers={"cookie": cookie})).status == 200
     for origin in ("http://localhost", "http://localhost:80", "http://127.0.0.1"):
-        assert _post(ui, "/save", cookie, csrf, host="localhost", origin=origin).status == 501
+        assert _post(ui, "/save", cookie, csrf, host="localhost", origin=origin).status == REACHED_SAVE
     assert ui.access_url.startswith("http://127.0.0.1:80/?token=")
 
 
@@ -549,7 +555,10 @@ def test_ac6_wildcard_bind_with_an_allowed_host(
     assert ui.handle(_request("GET", "/", host="BOX.lan:8765", headers={"cookie": cookie})).status == 200
     assert ui.handle(_request("GET", "/", host="127.0.0.1:8765", headers={"cookie": cookie})).status == 200
     assert ui.handle(_request("GET", "/", host="other.lan:8765", headers={"cookie": cookie})).status == 403
-    assert _post(ui, "/save", cookie, csrf, host="box.lan:8765", origin="http://box.lan:8765").status == 501
+    assert (
+        _post(ui, "/save", cookie, csrf, host="box.lan:8765", origin="http://box.lan:8765").status
+        == REACHED_SAVE
+    )
     assert _post(ui, "/save", cookie, csrf, host="box.lan:8765", origin="http://other.lan:8765").status == 403
 
 
@@ -2320,3 +2329,771 @@ def test_check_diagnostics_pass_the_redaction_guard(tmp_path: Path) -> None:
     assert secret not in page and typed not in page
     assert _listed(page) == ["module 'amod': field 'token': [hidden] / [hidden] rejected"]
     assert ui.last_check is not None and secret not in "".join(ui.last_check.diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# P13: Save and remove-override (R6, A7, A9; AC24–AC28, AC10)
+# ---------------------------------------------------------------------------
+
+_BASE_GUARDED = re.compile(r"_ac(2[2-8]|10)_")
+
+
+@pytest.fixture(autouse=True)
+def base_bytes_unchanged(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """AC10: after every AC22–AC28 operation the base file's bytes are unchanged.
+
+    Every base file a :class:`ConfigUI` is built over during such a test is
+    recorded when the UI is built and compared at teardown.
+    """
+
+    if not _BASE_GUARDED.search(request.node.name):
+        yield
+        return
+    bases: dict[Path, bytes] = {}
+    original = ConfigUI.__init__
+
+    def recording(self: ConfigUI, settings: UISettings, **kwargs: object) -> None:
+        original(self, settings, **kwargs)  # type: ignore[arg-type]
+        if self.base_path not in bases and self.base_path.is_file():
+            bases[self.base_path] = self.base_path.read_bytes()
+
+    monkeypatch.setattr(ConfigUI, "__init__", recording)
+    yield
+    for path, data in bases.items():
+        assert path.read_bytes() == data, f"the base file {path} was written"
+
+
+def _csrf_of(ui: ConfigUI, cookie: str) -> str:
+    session = ui._session(_request("GET", "/", headers={"cookie": cookie}))
+    assert session is not None
+    return session.csrf_token
+
+
+def _form_fingerprint(ui: ConfigUI, cookie: str, page: str) -> str:
+    """The overlay fingerprint the forms of *page* carry (all of them agree)."""
+
+    html_text = _get(ui, page, cookie).body.decode("utf-8")
+    found = set(re.findall(r'name="fingerprint" value="([^"]*)"', html_text))
+    assert len(found) == 1, found
+    return found.pop()
+
+
+def _write(
+    ui: ConfigUI,
+    cookie: str,
+    route: str,
+    page: str,
+    fields: Sequence[tuple[str, str]],
+    *,
+    fingerprint: str | None = None,
+) -> UIResponse:
+    """POST a Save or Remove form as *page* renders it (its fingerprint included)."""
+
+    from urllib.parse import urlencode
+
+    if fingerprint is None:
+        fingerprint = _form_fingerprint(ui, cookie, page)
+    body = urlencode(
+        [("csrf_token", _csrf_of(ui, cookie)), ("page", page), ("fingerprint", fingerprint), *fields]
+    ).encode("utf-8")
+    return ui.handle(
+        _request(
+            "POST",
+            route,
+            headers={"cookie": cookie, "content-type": "application/x-www-form-urlencoded"},
+            body=body,
+        )
+    )
+
+
+def _written(response: UIResponse) -> list[str]:
+    return _listed(response.body.decode("utf-8"))
+
+
+def _fingerprint(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "absent"
+
+
+def _overlay_doc(path: Path) -> object:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _saves(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if hasattr(record, "config_ui_operation")]
+
+
+def _profile_copy(tmp_path: Path, environ: dict[str, str]) -> tuple[ConfigUI, Path]:
+    """The shipped profile as a base in *tmp_path*, its modules directory absolute."""
+
+    text = (REPO / "config.yaml.example").read_text(encoding="utf-8")
+    assert "modules_directory: ./modules\n" in text
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        text.replace("modules_directory: ./modules\n", f"modules_directory: {REPO / 'modules'}\n"),
+        encoding="utf-8",
+    )
+    ui = ConfigUI(
+        UISettings.from_argv(["--config", str(base), "--status-file", str(tmp_path / "status.json")]),
+        environ=environ,
+    )
+    return ui, base
+
+
+# -- AC24 ---------------------------------------------------------------------
+
+
+def test_ac24_each_save_writes_exactly_its_override_and_logs_paths_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from core.main import load_config
+
+    environ = {name: f"env-value-{index:04d}-c4n4ry" for index, name in enumerate(_profile_variables("config.yaml.example"))}
+    ui, base = _profile_copy(tmp_path, environ)
+    overlay = tmp_path / "config.local.yaml"
+    _write_module(tmp_path / "other", "omod")
+    cookie = _logged_in(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    base_enabled = yaml.safe_load(base.read_text(encoding="utf-8"))["enabled_modules"]
+    assert "audit" in base_enabled
+    expected: dict[str, object] = {}
+    chan2 = {"combination": "any_of", "rules": [{"type": "probability", "parameters": {"probability": 0.5}}]}
+    steps: list[tuple[str, list[tuple[str, str]], dict[str, object], list[str], object, object]] = [
+        (
+            "/module/users",
+            [("modules.users.max_channels", "73591")],
+            {"modules": {"users": {"max_channels": 73591}}},
+            ["modules.users.max_channels"],
+            lambda config: config["modules"]["users"]["max_channels"],
+            73591,
+        ),
+        (
+            "/",
+            [("enabled_modules.audit", "false")],
+            {"enabled_modules": [name for name in base_enabled if name != "audit"]},
+            ["enabled_modules"],
+            lambda config: config["enabled_modules"],
+            [name for name in base_enabled if name != "audit"],
+        ),
+        (
+            "/core",
+            [("limits.dedup.max_entries", "2048")],
+            {"limits": {"dedup": {"max_entries": 2048}}},
+            ["limits.dedup.max_entries"],
+            lambda config: config["limits"]["dedup"],
+            {"max_entries": 2048, "ttl_seconds": 600},
+        ),
+        (
+            "/module/twitch",
+            [
+                ("add_channel_policy", "triggers.twitch.channels"),
+                ("channel", "chan2"),
+                ("combination", "any_of"),
+                ("rule_type", "probability"),
+                ("parameters", '{"probability": 0.5}'),
+            ],
+            {"triggers": {"twitch": {"channels": {"chan2": chan2}}}},
+            ["triggers.twitch.channels.chan2"],
+            lambda config: config["triggers"]["twitch"]["channels"]["chan2"],
+            chan2,
+        ),
+        (
+            "/core",
+            [("modules_directory", "./other")],
+            {"modules_directory": "./other"},
+            ["modules_directory"],
+            lambda config: Path(config["modules_directory"]),
+            (tmp_path / "other").resolve(),
+        ),
+    ]
+    for page, fields, override, paths, read, value in steps:
+        before = len(_saves(caplog))
+        response = _write(ui, cookie, "/save", page, fields)
+        assert response.status == 303, _written(response)
+        assert dict(response.headers)["Location"] == page
+        for key, item in override.items():
+            if isinstance(item, dict) and isinstance(expected.get(key), dict):
+                merged = expected[key]
+                for sub, subitem in item.items():
+                    merged.setdefault(sub, {}).update(subitem)  # type: ignore[union-attr]
+            else:
+                expected[key] = item
+        assert _overlay_doc(overlay) == expected
+        config = load_config(base, environ=environ)
+        assert read(config) == value  # type: ignore[operator]
+        records = _saves(caplog)[before:]
+        assert len(records) == 1
+        record = records[0]
+        assert record.name == "core.config_ui"
+        assert record.config_ui_operation == "save"  # type: ignore[attr-defined]
+        assert list(record.config_ui_paths) == paths  # type: ignore[attr-defined]
+        assert record.config_ui_page == page  # type: ignore[attr-defined]
+        message = record.getMessage()
+        assert all(path in message for path in paths) and page in message
+        assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", message)
+        for text in ("73591", "2048", "./other", "0.5", "probability", "any_of", "audit"):
+            assert text not in message
+        assert not any(value in message for value in environ.values())
+    # The base page now lists the modules discovered in ./other.
+    listed = re.findall(r'<tr data-module="([^"]+)"', _get(ui, "/", cookie).body.decode("utf-8"))
+    assert listed == ["omod"]
+
+
+def test_ac24_every_saving_form_carries_the_overlay_fingerprint(tmp_path: Path) -> None:
+    ui = _module_fixture(tmp_path, "tmod", TRIGGER_MANIFEST)
+    cookie = _logged_in(ui)
+    overlay = tmp_path / "config.local.yaml"
+    for state in ("absent", "present"):
+        if state == "present":
+            overlay.write_text("modules: {tmod: {}}\n", encoding="utf-8")
+        for page in ("/", "/core", "/module/tmod"):
+            text = _get(ui, page, cookie).body.decode("utf-8")
+            forms = re.findall(r'<form[^>]*action="/save".*?</form>', text, re.S)
+            assert forms, page
+            for form in forms:
+                assert f'name="fingerprint" value="{_fingerprint(overlay)}"' in form
+    assert _fingerprint(overlay) != "absent"
+
+
+def test_ac24_a_save_equal_to_the_overlay_writes_and_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {level: 7}\n")
+    cookie = _logged_in(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    before = _snapshot(tmp_path)
+    fingerprint = _fingerprint(tmp_path / "config.local.yaml")
+    result = ui.save([(("modules", "amod", "level"), 7)], fingerprint=fingerprint)
+    assert result.outcome == "unchanged" and _snapshot(tmp_path) == before
+    assert _write(ui, cookie, "/save", "/module/amod", []).status == 200
+    assert _snapshot(tmp_path) == before and _saves(caplog) == []
+
+
+# -- AC25 ---------------------------------------------------------------------
+
+REMOVE_MANIFEST = """settings_schema:
+  type: object
+  properties:
+    S: {type: integer}
+    T: {type: integer}
+"""
+
+
+def test_ac25_remove_override_restores_the_base_value_and_prunes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from core.main import load_config
+
+    ui = _module_fixture(tmp_path, "M", REMOVE_MANIFEST, base="{S: 1}")
+    base = tmp_path / "config.yaml"
+    overlay = tmp_path / "config.local.yaml"
+    cookie = _logged_in(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    assert _write(ui, cookie, "/save", "/module/M", [("modules.M.S", "5"), ("modules.M.T", "6")]).status == 303
+    assert _overlay_doc(overlay) == {"modules": {"M": {"S": 5, "T": 6}}}
+    assert load_config(base, environ={})["modules"]["M"] == {"S": 5, "T": 6}
+    page = _module_html(ui, cookie, "M")
+    assert 'formaction="/remove" name="path" value="modules.M.S">Remove override' in page
+
+    response = _write(ui, cookie, "/remove", "/module/M", [("path", "modules.M.S")])
+    assert response.status == 303
+    assert _overlay_doc(overlay) == {"modules": {"M": {"T": 6}}}
+    assert load_config(base, environ={})["modules"]["M"] == {"S": 1, "T": 6}
+    response = _write(ui, cookie, "/remove", "/module/M", [("path", "modules.M.T")])
+    assert response.status == 303
+    assert _overlay_doc(overlay) == {}  # modules.M, then modules, pruned
+    assert load_config(base, environ={})["modules"]["M"] == {"S": 1}
+    removes = [record for record in _saves(caplog) if record.config_ui_operation == "remove-override"]  # type: ignore[attr-defined]
+    assert [list(record.config_ui_paths) for record in removes] == [["modules.M.S"], ["modules.M.T"]]  # type: ignore[attr-defined]
+
+    before = _snapshot(tmp_path)
+    missing = _write(ui, cookie, "/remove", "/module/M", [("path", "modules.M.S")])
+    assert missing.status == 403 and _written(missing) == ["modules.M.S: is not overridden in the overlay"]
+    assert _snapshot(tmp_path) == before
+
+
+def test_ac25_a_base_channel_policy_offers_no_delete_and_cannot_be_removed(tmp_path: Path) -> None:
+    _write_manifest(tmp_path / "mods", "tmod", TRIGGER_MANIFEST)
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        "modules_directory: ./mods\nenabled_modules: [tmod]\nmodules:\n  tmod: {}\n"
+        "triggers:\n  tmod:\n    channels:\n      from-base:\n        combination: any_of\n"
+        "        rules: [{type: odds, parameters: {odds: 0.5}}]\n",
+        encoding="utf-8",
+    )
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie = _logged_in(ui)
+    triggers = _section(_module_html(ui, cookie, "tmod"), "triggers")
+    assert BASE_ENTRY_NOTE in triggers and "Delete this channel policy" not in triggers
+    # An override of the base policy is removable; the base entry stays (A7).
+    field = "triggers.tmod.channels.from-base.rules[0].parameters.odds"
+    assert _write(ui, cookie, "/save", "/module/tmod", [(field, "0.25")]).status == 303
+    overlay = tmp_path / "config.local.yaml"
+    assert _overlay_doc(overlay)["triggers"]["tmod"]["channels"]["from-base"]["rules"][0]["parameters"] == {"odds": 0.25}  # type: ignore[index]
+    path = "triggers.tmod.channels.from-base"
+    assert _write(ui, cookie, "/remove", "/module/tmod", [("path", path)]).status == 303
+    assert _overlay_doc(overlay) == {}
+    assert ui.view().value(("triggers", "tmod", "channels", "from-base"))["rules"][0]["parameters"] == {"odds": 0.5}
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/remove", "/module/tmod", [("path", path)])
+    assert response.status == 403 and _snapshot(tmp_path) == before
+
+
+# -- AC26 ---------------------------------------------------------------------
+
+AC26_MANIFEST = """settings_schema:
+  type: object
+  properties:
+    level: {type: integer, minimum: 1, maximum: 10}
+    label: {type: string}
+"""
+
+
+@pytest.mark.parametrize(
+    ("page", "fields", "diagnostic"),
+    [
+        ("/module/M", [("modules.M.level", "11")], "modules.M.level: must be <= 10"),
+        ("/module/M", [("modules.M.level", "0")], "modules.M.level: must be >= 1"),
+        ("/module/M", [("modules.M.level", "many")], "modules.M.level: must be of type 'integer'"),
+        ("/core", [("limits.dedup.max_entries", "0")], "limits.dedup.max_entries: must be a positive integer"),
+        ("/core", [("limits.dedup.ttl_seconds", "x")], "limits.dedup.ttl_seconds: must be a finite positive number"),
+        ("/core", [("modules_directory", "")], "modules_directory: must be a non-empty string"),
+        ("/core", [("modules_directory", "   ")], "modules_directory: must be a non-empty string"),
+    ],
+)
+def test_ac26_an_invalid_save_returns_a_field_diagnostic_and_writes_nothing(
+    page: str, fields: list[tuple[str, str]], diagnostic: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ui = _module_fixture(tmp_path, "M", AC26_MANIFEST, base="{level: 3}", overlay="modules: {M: {label: kept}}\n")
+    cookie = _logged_in(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/save", page, fields)
+    assert response.status == 422
+    assert _written(response) == [diagnostic]
+    assert _snapshot(tmp_path) == before and _saves(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("enabled", "diagnostic"),
+    [
+        (["M", "M"], "enabled_modules[1]: repeats an enabled module"),
+        (["M", "nomod"], "enabled_modules[1]: is not a discovered module"),
+        ("M", "enabled_modules: must be a list of module names"),
+    ],
+)
+def test_ac26_enabled_modules_must_be_distinct_discovered_names(
+    enabled: object, diagnostic: str, tmp_path: Path
+) -> None:
+    ui = _module_fixture(tmp_path, "M", AC26_MANIFEST)
+    before = _snapshot(tmp_path)
+    result = ui.save([(("enabled_modules",), enabled)], fingerprint="absent")
+    assert result.outcome == "invalid" and result.diagnostics == (diagnostic,)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("fields", "diagnostic"),
+    [
+        (
+            [("rule_type", "nosuch"), ("combination", "all_of"), ("parameters", "{}")],
+            "triggers.twitch.channels.chan2.rules[0].type: is not declared by the module",
+        ),
+        (
+            [("rule_type", "probability"), ("combination", "all_of"), ("parameters", '{"probability": 1.5}')],
+            "triggers.twitch.channels.chan2.rules[0].parameters.probability: must be <= 1",
+        ),
+        (
+            [("rule_type", "probability"), ("combination", "some_of"), ("parameters", '{"probability": 0.5}')],
+            "field 'triggers.twitch.channels.chan2': TriggerPolicy.combination: must be one of",
+        ),
+    ],
+)
+def test_ac26_an_invalid_twitch_channel_policy_writes_nothing(
+    fields: list[tuple[str, str]], diagnostic: str, tmp_path: Path
+) -> None:
+    ui, _ = _profile_copy(tmp_path, {})
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    response = _write(
+        ui,
+        cookie,
+        "/save",
+        "/module/twitch",
+        [("add_channel_policy", "triggers.twitch.channels"), ("channel", "chan2"), *fields],
+    )
+    assert response.status == 422
+    listed = _written(response)
+    assert len(listed) == 1 and diagnostic in listed[0], listed
+    assert "1.5" not in listed[0] and "some_of" not in listed[0]
+    assert _snapshot(tmp_path) == before
+
+
+def test_ac26_an_operator_the_module_does_not_support_is_refused(tmp_path: Path) -> None:
+    ui = _module_fixture(tmp_path, "tmod", TRIGGER_MANIFEST)
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    response = _write(
+        ui,
+        cookie,
+        "/save",
+        "/module/tmod",
+        [
+            ("add_channel_policy", "triggers.tmod.channels"),
+            ("channel", "c1"),
+            ("combination", "none_of"),  # a known operator tmod does not declare
+            ("rule_type", "odds"),
+            ("parameters", '{"odds": 0.5}'),
+        ],
+    )
+    assert response.status == 422
+    assert _written(response) == [
+        "triggers.tmod.channels.c1.combination: is not declared by the module; declared: all_of, any_of"
+    ]
+    assert _snapshot(tmp_path) == before
+
+
+def test_ac26_a_stale_save_or_remove_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    ui = _module_fixture(tmp_path, "M", AC26_MANIFEST, base="{level: 3}")
+    cookie = _logged_in(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    overlay = tmp_path / "config.local.yaml"
+    rendered = _form_fingerprint(ui, cookie, "/module/M")
+    assert rendered == "absent"
+    overlay.write_text("modules: {M: {level: 4}}\n", encoding="utf-8")  # changed on disk
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/save", "/module/M", [("modules.M.level", "5")], fingerprint=rendered)
+    assert response.status == 409
+    assert "changed on disk" in _written(response)[0]
+    rendered = _form_fingerprint(ui, cookie, "/module/M")
+    overlay.write_text("modules: {M: {level: 6}}\n", encoding="utf-8")
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/remove", "/module/M", [("path", "modules.M.level")], fingerprint=rendered)
+    assert response.status == 409
+    missing = _write(ui, cookie, "/save", "/module/M", [("modules.M.level", "5")], fingerprint="")
+    assert missing.status == 409
+    assert _snapshot(tmp_path) == before and _saves(caplog) == []
+
+
+def test_ac26_an_unparseable_overlay_is_never_overwritten(tmp_path: Path) -> None:
+    ui = _module_fixture(tmp_path, "M", AC26_MANIFEST, base="{level: 3}", overlay="modules: [unclosed\n")
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/save", "/module/M", [("modules.M.level", "5")])
+    assert response.status == 403
+    assert _written(response) == [f"overlay file {tmp_path / 'config.local.yaml'}: is not valid YAML"]
+    assert _snapshot(tmp_path) == before
+
+
+# -- AC27 ---------------------------------------------------------------------
+
+HAND_WRITTEN = (
+    "secrets: ['${HAND_SECRET}']\n"
+    "actions:\n"
+    "  - rule_id: hand-rule\n"
+    "    action_name: x.do\n"
+    "    destination: {platform: '*', channel_id: '*', scope: fixture}\n"
+    "    principals: [someone]\n"
+    "    natures: [write]\n"
+    "    granted_permissions: [x.do]\n"
+    "extra_block: {kept: true}\n"
+    "modules:\n"
+    "  amod: {label: '${LABEL_REF}'}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("edit", "diagnostic"),
+    [
+        ((("secrets",), ["${OTHER}"]), "secrets: is read-only in v1"),
+        ((("secrets", 0), "${OTHER}"), "secrets[0]: is read-only in v1"),
+        ((("actions",), []), "actions: is read-only in v1"),
+        ((("actions", 0, "rule_id"), "changed"), "actions[0].rule_id: is read-only in v1"),
+        ((("actions",), "ADD"), "actions: is read-only in v1"),
+        ((("extra_block",), {"kept": False}), "extra_block: is outside the settings this UI writes"),
+        ((("companion",), "x"), "companion: is outside the settings this UI writes"),
+        ((("modules", "amod", "token"), "a-literal"), "modules.amod.token: is a declared credential"),
+        ((("modules", "amod", "token"), "${NEW_REF}"), "modules.amod.token: is a declared credential"),
+        ((("modules", "amod", "label"), "plain"), "modules.amod.label: its configured value is a ${NAME} reference"),
+        ((("modules", "amod", "limits"), {}), "modules.amod.limits: " + config_ui.LIMITS_NOTICE),
+        ((("modules", "nomod", "x"), 1), "modules.nomod.x: is not a setting of a discovered module"),
+        ((("limits", "dedup", "nope"), 1), "limits.dedup.nope: is not a declared limit"),
+        ((("triggers", "amod", "channels", "c"), {}), "triggers.amod.channels.c: is not a whole channel policy of a discovered trigger input"),
+    ],
+)
+def test_ac27_writes_outside_the_scope_or_at_protected_fields_are_refused(
+    edit: tuple[tuple[object, ...], object], diagnostic: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay=HAND_WRITTEN)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    path, value = edit
+    if value == "ADD":
+        value = [*_overlay_doc(tmp_path / "config.local.yaml")["actions"], {"rule_id": "new"}]  # type: ignore[index]
+    before = _snapshot(tmp_path)
+    result = ui.save([(path, value)], fingerprint=_fingerprint(tmp_path / "config.local.yaml"))
+    assert result.outcome == "refused"
+    assert result.diagnostics == (diagnostic,)
+    assert _snapshot(tmp_path) == before and _saves(caplog) == []
+
+
+@pytest.mark.parametrize("path", ["secrets", "actions", "extra_block", "extra_block.kept", "modules.amod.label"])
+def test_ac27_removing_a_read_only_or_protected_key_is_refused(path: str, tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay=HAND_WRITTEN)
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/remove", "/module/amod", [("path", path)])
+    assert response.status == 403
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        [("secrets", '["${OTHER}"]')],
+        [("actions", "[]")],
+        [("extra_block", "{}")],
+        [("modules.amod.token", "typed-literal-credential")],
+        [("modules.amod.label", "plain")],
+        [("modules.amod.level", "5"), ("modules.amod.token", "typed-literal-credential")],
+    ],
+)
+def test_ac27_posted_protected_or_out_of_scope_fields_are_refused(
+    fields: list[tuple[str, str]], tmp_path: Path
+) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay=HAND_WRITTEN)
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/save", "/module/amod", fields)
+    assert response.status == 403
+    assert "typed-literal-credential" not in response.body.decode("utf-8")
+    assert _snapshot(tmp_path) == before
+
+
+def test_ac27_hand_written_actions_and_secrets_survive_an_unrelated_save(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay=HAND_WRITTEN)
+    overlay = tmp_path / "config.local.yaml"
+    parsed = _overlay_doc(overlay)
+    cookie = _logged_in(ui)
+    assert _write(ui, cookie, "/save", "/module/amod", [("modules.amod.level", "9")]).status == 303
+    after = _overlay_doc(overlay)
+    assert after["actions"] == parsed["actions"]  # type: ignore[index]
+    assert after["secrets"] == parsed["secrets"] == ["${HAND_SECRET}"]  # type: ignore[index]
+    assert after["extra_block"] == parsed["extra_block"]  # type: ignore[index]
+    assert after["modules"] == {"amod": {"label": "${LABEL_REF}", "level": 9}}  # type: ignore[index]
+
+
+def test_ac27_a_save_or_remove_through_a_yaml_alias_leaves_the_other_path_unchanged(
+    tmp_path: Path,
+) -> None:
+    overlay_text = (
+        "actions:\n  rule: &shared {n: 1, k: kept}\n"
+        "modules:\n  M:\n    o: *shared\n"
+    )
+    ui = _module_fixture(tmp_path, "M", ANCESTOR_MANIFEST, overlay=overlay_text)
+    overlay = tmp_path / "config.local.yaml"
+    result = ui.save([(("modules", "M", "o", "n"), 2)], fingerprint=_fingerprint(overlay))
+    assert result.outcome == "saved"
+    after = _overlay_doc(overlay)
+    assert after["actions"] == {"rule": {"n": 1, "k": "kept"}}  # type: ignore[index]
+    assert after["modules"] == {"M": {"o": {"n": 2, "k": "kept"}}}  # type: ignore[index]
+
+    overlay.write_text(overlay_text, encoding="utf-8")
+    result = ui.remove("modules.M.o.n", fingerprint=_fingerprint(overlay))
+    assert result.outcome == "removed"
+    after = _overlay_doc(overlay)
+    assert after["actions"] == {"rule": {"n": 1, "k": "kept"}}  # type: ignore[index]
+    assert after["modules"] == {"M": {"o": {"k": "kept"}}}  # type: ignore[index]
+
+
+CREDENTIAL_TRIGGER_MANIFEST = TRIGGER_MANIFEST.replace(
+    "settings_schema: {type: object, properties: {}}",
+    "settings_schema: {type: object, properties: {token: {type: string}}}\ncredentials: [token]",
+)
+
+
+def test_ac24_a_saved_path_naming_a_secret_is_logged_redacted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    literal = "literal-credential-channel-7c1d"
+    ui = _module_fixture(
+        tmp_path, "tmod", CREDENTIAL_TRIGGER_MANIFEST, overlay=f"modules:\n  tmod: {{token: {literal}}}\n"
+    )
+    cookie = _logged_in(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    response = _write(
+        ui,
+        cookie,
+        "/save",
+        "/module/tmod",
+        [
+            ("add_channel_policy", "triggers.tmod.channels"),
+            ("channel", literal),
+            ("combination", "any_of"),
+            ("rule_type", "odds"),
+            ("parameters", '{"odds": 0.5}'),
+        ],
+    )
+    assert response.status == 303, _written(response)
+    assert literal in _overlay_doc(tmp_path / "config.local.yaml")["triggers"]["tmod"]["channels"]  # type: ignore[index]
+    records = _saves(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert literal not in record.getMessage()
+    assert all(literal not in path for path in record.config_ui_paths)  # type: ignore[attr-defined]
+    assert list(record.config_ui_paths) == ["triggers.tmod.channels.[hidden]"]  # type: ignore[attr-defined]
+    assert literal not in caplog.text
+
+
+ANCESTOR_MANIFEST = """settings_schema:
+  type: object
+  properties:
+    o:
+      type: object
+      properties:
+        k: {type: string}
+        n: {type: integer}
+    c:
+      type: object
+      properties:
+        secret: {type: string}
+        x: {type: integer}
+credentials: [c.secret]
+"""
+
+
+def test_ac27_an_ancestor_save_must_keep_every_protected_descendant(tmp_path: Path) -> None:
+    from core.main import load_config
+
+    ui = _module_fixture(tmp_path, "M", ANCESTOR_MANIFEST, base="{o: {k: '${VAR_K}', n: 1}}")
+    ui.environ = {"VAR_K": "resolved-var-k-value"}
+    overlay = tmp_path / "config.local.yaml"
+    target = ("modules", "M", "o")
+    before = _snapshot(tmp_path)
+    for value in ({"k": "plain", "n": 2}, {"n": 2}, {"k": "${OTHER_K}", "n": 2}):
+        result = ui.save([(target, value)], fingerprint="absent")
+        assert result.outcome == "refused"
+        assert result.diagnostics == ("modules.M.o.k: a protected field must keep its configured text",)
+        assert _snapshot(tmp_path) == before
+    result = ui.save([(target, {"k": "${VAR_K}", "n": 2})], fingerprint="absent")
+    assert result.outcome == "saved"
+    text = overlay.read_text(encoding="utf-8")
+    assert "resolved-var-k-value" not in text
+    assert _overlay_doc(overlay) == {"modules": {"M": {"o": {"k": "${VAR_K}", "n": 2}}}}
+    assert load_config(tmp_path / "config.yaml", environ=ui.environ)["modules"]["M"]["o"] == {
+        "k": "resolved-var-k-value",
+        "n": 2,
+    }
+
+
+def test_ac27_an_ancestor_remove_of_a_credential_literal_is_refused(tmp_path: Path) -> None:
+    literal = "literal-credential-9f2e"
+    ui = _module_fixture(
+        tmp_path, "M", ANCESTOR_MANIFEST, overlay=f"modules:\n  M:\n    c: {{secret: {literal}, x: 1}}\n"
+    )
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    response = _write(ui, cookie, "/remove", "/module/M", [("path", "modules.M.c")])
+    assert response.status == 403
+    assert _written(response) == ["modules.M.c.secret: a protected field must keep its configured text"]
+    assert literal not in response.body.decode("utf-8")
+    assert _snapshot(tmp_path) == before
+    # An ancestor save keeps a hidden credential as its configured literal.
+    result = ui.save(
+        [(("modules", "M", "c"), {"secret": HIDDEN_LITERAL, "x": 2})],
+        fingerprint=_fingerprint(tmp_path / "config.local.yaml"),
+    )
+    assert result.outcome == "saved"
+    assert _overlay_doc(tmp_path / "config.local.yaml") == {"modules": {"M": {"c": {"secret": literal, "x": 2}}}}
+    result = ui.save(
+        [(("modules", "M", "c"), {"secret": "replaced", "x": 2})],
+        fingerprint=_fingerprint(tmp_path / "config.local.yaml"),
+    )
+    assert result.outcome == "refused"
+
+
+def test_ac27_a_referenced_channel_key_is_saved_as_its_reference_text(tmp_path: Path) -> None:
+    environ = {"TWITCH_BROADCASTER_ID": "broadcaster-4471-canary"}
+    ui, base = _profile_copy(tmp_path, environ)
+    overlay = tmp_path / "config.local.yaml"
+    cookie = _logged_in(ui)
+    field = "triggers.twitch.channels.${TWITCH_BROADCASTER_ID}.rules[0].parameters.keywords"
+    response = _write(ui, cookie, "/save", "/module/twitch", [(field, '["!ask", "!q"]')])
+    assert response.status == 303, _written(response)
+    text = overlay.read_text(encoding="utf-8")
+    assert "broadcaster-4471-canary" not in text
+    assert _overlay_doc(overlay) == {
+        "triggers": {
+            "twitch": {
+                "channels": {
+                    "${TWITCH_BROADCASTER_ID}": {
+                        "combination": "all_of",
+                        "rules": [{"type": "keyword", "parameters": {"keywords": ["!ask", "!q"]}}],
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_ac27_a_referenced_mapping_key_is_protected_as_key_text() -> None:
+    """The ancestor rule compares key text: a renamed or resolved key is refused."""
+
+    view = ConfigView(
+        base_path=Path("base.yaml"),
+        overlay_path=Path("base.local.yaml"),
+        overlay_exists=False,
+        overlay_digest=None,
+        overlay_mtime_ns=None,
+        base={},
+        overlay={},
+        merged={"modules_directory": "./m", "modules": {"M": {"map": {"${KEY}": 1, "plain": 2}}}},
+        modules_directory=None,
+        modules={},
+        references={"KEY": True},
+        secret_values=frozenset(),
+    )
+    target = ("modules", "M", "map")
+    kept, refusals = config_ui._protect_save(view, target, {"${KEY}": 5})
+    assert refusals == [] and kept == {"${KEY}": 5}
+    _, refusals = config_ui._protect_save(view, target, {"resolved-key": 1, "plain": 2})
+    assert refusals == ["modules.M.map.${KEY}: a protected field must keep its configured text"]
+
+
+# -- AC28 ---------------------------------------------------------------------
+
+
+def test_ac28_an_interrupted_write_leaves_the_previous_overlay_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay=HAND_WRITTEN)
+    cookie = _logged_in(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    overlay = tmp_path / "config.local.yaml"
+    before = _snapshot(tmp_path)
+    prepared: list[str] = []
+
+    def interrupted(source: object, target: object) -> None:
+        prepared.append(Path(str(source)).read_text(encoding="utf-8"))
+        raise OSError("simulated failure before the replace")
+
+    monkeypatch.setattr(os, "replace", interrupted)
+    response = _write(ui, cookie, "/save", "/module/amod", [("modules.amod.level", "9")])
+    monkeypatch.undo()
+    assert response.status == 500
+    assert prepared and yaml.safe_load(prepared[0])["modules"]["amod"]["level"] == 9
+    assert _snapshot(tmp_path) == before  # no temporary file left, overlay unchanged
+    assert _overlay_doc(overlay)["modules"] == {"amod": {"label": "${LABEL_REF}"}}  # type: ignore[index]
+    assert _saves(caplog) == []
+
+
+def test_ac28_the_write_targets_only_the_managed_overlay(tmp_path: Path) -> None:
+    base = tmp_path / "config.yaml"
+    base.write_text("a: 1\n", encoding="utf-8")
+    overlay = tmp_path / "config.local.yaml"
+    for target, managed in ((base, base), (tmp_path / "other.yaml", overlay), (None, overlay)):
+        with pytest.raises(RuntimeError):
+            config_ui._write_overlay(target, managed, base, {"a": 2})
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["config.yaml"]
+    config_ui._write_overlay(overlay, overlay, base, {"k": "${NAME}", "${KEY}": {"é": 1}})
+    assert yaml.safe_load(overlay.read_text(encoding="utf-8")) == {"k": "${NAME}", "${KEY}": {"é": 1}}
+    assert "é" in overlay.read_text(encoding="utf-8")  # allow_unicode
+    assert base.read_text(encoding="utf-8") == "a: 1\n"
