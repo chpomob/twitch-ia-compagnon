@@ -53,16 +53,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import importlib.util
+import json
 import math
 import os
 import random
 import re
 import signal
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -79,7 +83,13 @@ from .actions import (
 from .attachments import AttachmentStore
 from .bus import EventBus
 from .context import ChatContext
-from .contracts import Counters, Destination, WILDCARD
+from .contracts import (
+    TRACE_MODULE_DEGRADED,
+    TRACE_MODULE_READY,
+    Counters,
+    Destination,
+    WILDCARD,
+)
 from .lifecycle import (
     DEFAULT_CANCEL_GRACE_SECONDS,
     DEFAULT_DRAIN_DEADLINE_SECONDS,
@@ -102,13 +112,22 @@ from .loader import (
     _entry_point,
 )
 from .overlay import (
+    STATUS_FILE_VARIABLE,
     OverlayError,
+    canonical_digest,
     deep_merge,
     read_base,
     read_overlay,
     resolve_overlay_path,
+    status_path_collision,
 )
-from .runtime import RuntimeContext, ServiceRegistry, Supervision
+from .runtime import (
+    MODULE_STATE_DEGRADED,
+    MODULE_STATE_READY,
+    RuntimeContext,
+    ServiceRegistry,
+    Supervision,
+)
 from .triggers import TriggerEngine, TriggerRegistry
 
 
@@ -303,6 +322,29 @@ def load_config(
     group validates its copy against the accepted value (R6).
     """
 
+    return _load_documents(
+        config_path,
+        environ=environ,
+        overlay=overlay,
+        overlay_document=overlay_document,
+    )[1]
+
+
+def _load_documents(
+    config_path: str | os.PathLike[str],
+    *,
+    environ: Mapping[str, str] | None = None,
+    overlay: str | os.PathLike[str] | None = None,
+    overlay_document: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the merged *unresolved* document and the accepted configuration.
+
+    :func:`load_config` is this with the first element dropped. :func:`run`
+    keeps both, from one read of the files: the status record's digest is
+    taken over the merged document before any ``${NAME}`` reference is
+    resolved, so it never depends on, nor reveals, a resolved value (R7).
+    """
+
     try:
         path = Path(config_path).expanduser().resolve()
     except (OSError, RuntimeError, ValueError, TypeError):
@@ -310,9 +352,7 @@ def load_config(
     try:
         base = read_base(path)
         if overlay_document is None:
-            overlay_document = read_overlay(
-                resolve_overlay_path(Path(config_path).expanduser(), overlay)
-            )
+            overlay_document = read_overlay(_overlay_read_path(config_path, overlay))
         elif not isinstance(overlay_document, Mapping):
             raise OverlayError("overlay: must be a mapping")
     except OverlayError as exc:
@@ -320,6 +360,8 @@ def load_config(
     # Relative paths still resolve from the base file's directory: the merge
     # changes the document, never ``path``.
     loaded = deep_merge(base, overlay_document)
+    # The caller's copy: nothing below may reshape the document it digests.
+    unresolved = copy.deepcopy(loaded)
 
     resolver = os.environ if environ is None else environ
     # Every resolution performed, by variable: the secrets block is served
@@ -378,7 +420,7 @@ def load_config(
     raw_modules_directory = config["modules_directory"]
     if raw_modules_directory == MODULES_DIRECTORY_BUILTIN:
         config["modules_directory"] = str(_builtin_modules_directory())
-        return config
+        return unresolved, config
     try:
         modules_directory = Path(raw_modules_directory).expanduser()
         if not modules_directory.is_absolute():
@@ -389,7 +431,7 @@ def load_config(
             "modules_directory: must be a valid path"
         ) from None
 
-    return config
+    return unresolved, config
 
 
 def _overlay_arguments(
@@ -457,13 +499,42 @@ async def run(
     omitted, the one derived from the base file's name is merged (R2).
     """
 
+    # The process start time every status record repeats, taken before
+    # anything else so each record of this process carries the same one (R7).
+    started_at = _utc_timestamp()
     report_ready = ready_reporter or _default_ready_reporter
     report_diagnostic = diagnostic_reporter or _default_diagnostic_reporter
 
+    # A5: the status record path, when the variable names one. It is refused
+    # before the configuration is read or anything else happens when it is a
+    # configuration file, so a collision can never overwrite either file.
+    status_variable = (os.environ if environ is None else environ).get(
+        STATUS_FILE_VARIABLE
+    )
+    # One path object for the check and the writes, so both name one file.
+    status_path = Path(status_variable) if status_variable else None
+    if status_path:
+        try:
+            collision = _status_collision(status_path, config_path, overlay)
+        except Exception:
+            report_diagnostic("status_path_collision: status file could not be checked")
+            return 2
+        if collision is not None:
+            report_diagnostic(collision)
+            return 2
+
     try:
-        config = load_config(
-            config_path, environ=environ, **_overlay_arguments(overlay)
-        )
+        if status_path:
+            unresolved, config = _load_documents(
+                config_path, environ=environ, overlay=overlay
+            )
+            digest = canonical_digest(unresolved)
+            del unresolved
+        else:
+            # Without the variable, the load is exactly the one it was.
+            config = load_config(
+                config_path, environ=environ, **_overlay_arguments(overlay)
+            )
     except ConfigurationError as exc:
         report_diagnostic(str(exc))
         return 2
@@ -572,6 +643,21 @@ async def run(
             report_diagnostic("readiness: could not be reported")
             return 1
 
+        if status_path:
+            publisher = _StatusPublisher(
+                status_path,
+                started_at=started_at,
+                digest=digest,
+                modules=config.get("enabled_modules") or (),
+                health=runtime.context.health,
+            )
+            _publish_status(publisher, report_diagnostic)
+            # D5: the health owner publishes every ready/degraded change on
+            # the bus, after writing the state this publisher reads.
+            handler = _status_handler(publisher, report_diagnostic)
+            runtime.bus.subscribe(TRACE_MODULE_READY, handler)
+            runtime.bus.subscribe(TRACE_MODULE_DEGRADED, handler)
+
         try:
             await stop.wait()
         except asyncio.CancelledError:
@@ -584,6 +670,198 @@ async def run(
         return 1 if report.failures else 0
     finally:
         remove_signal_handlers()
+
+
+def _utc_timestamp() -> str:
+    """Now, in UTC, with millisecond precision and a ``Z`` suffix."""
+
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def _overlay_read_path(
+    config_path: str | os.PathLike[str],
+    overlay: str | os.PathLike[str] | None,
+) -> Path | None:
+    """The overlay path :func:`_load_documents` opens.
+
+    The implicit overlay is derived from the ``~``-expanded base path; an
+    explicit ``--overlay`` path is opened exactly as given. The status
+    collision check uses this same path, so it can never compare a file
+    other than the one that is read (R7).
+    """
+
+    return resolve_overlay_path(Path(config_path).expanduser(), overlay)
+
+
+def _status_collision(
+    status_path: Path,
+    config_path: str | os.PathLike[str],
+    overlay: str | os.PathLike[str] | None,
+) -> str | None:
+    """The diagnostic for a status path naming a configuration file, if any.
+
+    Every path compared is the one the process uses: *status_path* exactly as
+    the publisher writes it, the base file as :func:`read_base` opens it, and
+    the explicit ``--overlay`` or implicit overlay path as
+    :func:`_load_documents` reads it, whether or not that overlay file exists
+    yet (A5, R7).
+    """
+
+    base = Path(config_path).expanduser()
+    overlay_path = _overlay_read_path(config_path, overlay)
+    collision = status_path_collision(status_path, base, overlay_path)
+    if collision is None:
+        return None
+    named = base if collision == "base" else overlay_path
+    return (
+        "status_path_collision: status file collides with the "
+        f"{collision} file {os.fspath(named)}"
+    )
+
+
+def _write_status_record(path: Path, text: str) -> None:
+    """Replace *path* with *text* atomically.
+
+    The content is written to a temporary file in the same directory, flushed
+    and synced, then moved over *path*: a reader sees the previous record or
+    the new one, never a partial one. On any failure the temporary file is
+    removed and the previous record is left as it was (R7, AC34).
+    """
+
+    temporary = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        with temporary as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary.name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary.name)
+        except OSError:
+            pass
+        raise
+
+
+class _StatusPublisher:
+    """Writes this process's status record for the configuration UI (A5, R7).
+
+    Every record describes the configuration the process *loaded*: the
+    enabled modules and the digest are fixed at construction and never
+    re-read from disk, so an overlay edited after startup shows as drift
+    rather than as a changed record. The digest is taken over the merged
+    unresolved document, and a record carries no configured value.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        started_at: str,
+        digest: str,
+        modules: Sequence[str],
+        health: Any,
+        writer: Callable[[Path, str], None] | None = None,
+    ) -> None:
+        self._path = path
+        self._started_at = started_at
+        self._digest = digest
+        self._modules = tuple(modules)
+        self._health = health
+        # Resolved at construction rather than bound as a default, so a test
+        # substituting the module-level writer reaches every publisher.
+        self._writer = _write_status_record if writer is None else writer
+        self._sequence = 0
+        self._published: dict[str, str] | None = None
+
+    @property
+    def modules(self) -> tuple[str, ...]:
+        return self._modules
+
+    def states(self) -> dict[str, str]:
+        """Each enabled module's last ready/degraded state, read now.
+
+        Decision: a module whose health state is ``stopped`` or was never
+        reported is published as ``degraded``. After readiness every enabled
+        module has reported ``ready`` — the coordinator reports readiness only
+        once every ``prepare`` succeeded — so this only covers a module
+        stopping while the process still runs, which is not ``ready``.
+        """
+
+        states: dict[str, str] = {}
+        for name in self._modules:
+            state = self._health.state(name)
+            states[name] = (
+                state
+                if state in (MODULE_STATE_READY, MODULE_STATE_DEGRADED)
+                else MODULE_STATE_DEGRADED
+            )
+        return states
+
+    def changed(self) -> bool:
+        """Whether a module's published state differs from its state now."""
+
+        return self._published != self.states()
+
+    def publish(self) -> None:
+        """Write the next record; the sequence advances only when it is written."""
+
+        states = self.states()
+        sequence = self._sequence + 1
+        record = {
+            "version": 1,
+            "pid": os.getpid(),
+            "started_at": self._started_at,
+            "published_at": _utc_timestamp(),
+            "sequence": sequence,
+            "digest": self._digest,
+            "state": "ready",
+            "modules": {name: {"state": state} for name, state in states.items()},
+        }
+        self._writer(self._path, json.dumps(record, sort_keys=True))
+        self._sequence = sequence
+        self._published = states
+
+
+def _publish_status(publisher: _StatusPublisher, report: Reporter) -> None:
+    """Publish one record; a failure is reported, value-free, and never raised."""
+
+    try:
+        publisher.publish()
+    except Exception:
+        report("status record: could not be written")
+
+
+def _status_handler(
+    publisher: _StatusPublisher, report: Reporter
+) -> Callable[[Mapping[str, Any]], None]:
+    """The bus handler re-publishing on an enabled module's state change.
+
+    It never raises: a handler failure would fail the health owner's own
+    publication, and the status record must never stop the runtime. A
+    ``module.stopped`` is not subscribed to, so shutdown publishes nothing.
+    """
+
+    def handle(event: Mapping[str, Any]) -> None:
+        try:
+            payload = event.get("payload") or {}
+            if payload.get("module") not in publisher.modules:
+                return
+            if not publisher.changed():
+                return
+        except Exception:
+            return
+        _publish_status(publisher, report)
+
+    return handle
 
 
 async def check_config(
