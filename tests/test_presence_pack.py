@@ -427,11 +427,16 @@ class Presence:
         return [event["payload"] for event in events_of(self.bus, TRACE_BRAIN_RUN_COMPLETED)]
 
     async def drive(self, frame: Mapping[str, Any]) -> dict[str, Any]:
-        """Feed one frame and wait for its run's completion record."""
+        """Feed one frame and wait for its run's completion record.
+
+        A run may read a file off the loop (``audio.play`` reads the chime in
+        a worker thread), so the wait has a wall-time floor as well as its turn
+        budget: a slow thread on a loaded machine must not expire it.
+        """
 
         before = len(self.completed())
         self.websocket.feed(frame)
-        await wait_until(lambda: len(self.completed()) == before + 1, turns=20000)
+        await wait_until(lambda: len(self.completed()) == before + 1, turns=20000, seconds=30.0)
         return self.completed()[-1]
 
     async def feed_without_run(self, frame: Mapping[str, Any]) -> None:

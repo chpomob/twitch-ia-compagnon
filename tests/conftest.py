@@ -72,6 +72,7 @@ import hashlib
 import json
 import random
 import struct
+import time
 import zlib
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -2212,10 +2213,24 @@ async def settle(turns: int = 20) -> None:
         await asyncio.sleep(0)
 
 
-async def wait_until(predicate: Any, turns: int = 2000) -> None:
-    for _ in range(turns):
+async def wait_until(predicate: Any, turns: int = 2000, *, seconds: float | None = None) -> None:
+    """Yield bare turns until *predicate* holds, at most *turns* of them.
+
+    A turn count bounds loop-only work, but not work handed to a worker
+    thread (``asyncio.to_thread``): the thread runs in wall time, so a loaded
+    machine can outlast any turn count. *seconds*, when given, is a wall-time
+    floor for such waits: the wait fails only once the turns are spent and
+    that much real time has passed. It never sleeps, and no virtual clock moves.
+    """
+
+    deadline = None if seconds is None else time.monotonic() + seconds
+    spent = 0
+    while True:
         if predicate():
             return
+        spent += 1
+        if spent >= turns and (deadline is None or time.monotonic() >= deadline):
+            break
         await asyncio.sleep(0)
     raise AssertionError("condition did not become true within the turn budget")
 
