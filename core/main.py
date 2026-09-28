@@ -64,9 +64,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
-
-import yaml
 
 from .actions import (
     ACTION_NATURES,
@@ -101,6 +100,13 @@ from .loader import (
     ModuleLoader,
     _declaration,
     _entry_point,
+)
+from .overlay import (
+    OverlayError,
+    deep_merge,
+    read_base,
+    read_overlay,
+    resolve_overlay_path,
 )
 from .runtime import RuntimeContext, ServiceRegistry, Supervision
 from .triggers import TriggerEngine, TriggerRegistry
@@ -225,6 +231,21 @@ value a module runs on is never allowed to differ from the value accepted
 here (R6).
 """
 
+LIMIT_KIND_COUNT = _COUNT
+"""The kind of a limit that is a positive integer."""
+
+LIMIT_KIND_SECONDS = _SECONDS
+"""The kind of a limit that is a finite, strictly positive number of seconds."""
+
+LIMIT_DECLARATION: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {group: MappingProxyType(fields) for group, fields in _LIMITS.items()}
+)
+"""A read-only view of :data:`_LIMITS`: group → field → limit kind.
+
+The configuration UI renders the ``limits`` block from it. The views wrap the
+very mappings :func:`_validate_limits` reads, so the two cannot drift.
+"""
+
 SECRETS_KEY = "secrets"
 """The configuration block naming extra references every trace is redacted of.
 
@@ -246,8 +267,20 @@ def load_config(
     config_path: str | os.PathLike[str],
     *,
     environ: Mapping[str, str] | None = None,
+    overlay: str | os.PathLike[str] | None = None,
+    overlay_document: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Load, expand, and validate one YAML configuration file.
+    """Load, expand, and validate one YAML configuration file and its overlay.
+
+    The overlay is ``overlay`` when given, else the path derived from the
+    base file's name (A1); an absent overlay file, or a base name with no
+    derived overlay, leaves the base alone. ``overlay_document``, when given,
+    is an in-memory draft used instead of any overlay file (D1). The overlay is
+    deep-merged over the base (R2) before any ``${NAME}`` reference is
+    resolved and before validation, so both documents are validated as one.
+    An overlay that cannot be read, is not valid YAML or is not a mapping is a
+    configuration error naming the overlay file, never quoting its content.
+    Neither file is ever written.
 
     Relative module directories are resolved from the configuration file rather
     than from the process working directory; the reserved value
@@ -275,15 +308,18 @@ def load_config(
     except (OSError, RuntimeError, ValueError, TypeError):
         raise ConfigurationError("configuration file: path is not valid") from None
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            loaded = yaml.safe_load(stream)
-    except OSError:
-        raise ConfigurationError("configuration file: is not readable") from None
-    except yaml.YAMLError:
-        raise ConfigurationError("configuration file: is not valid YAML") from None
-
-    if not isinstance(loaded, Mapping):
-        raise ConfigurationError("configuration: must be a mapping")
+        base = read_base(path)
+        if overlay_document is None:
+            overlay_document = read_overlay(
+                resolve_overlay_path(Path(config_path).expanduser(), overlay)
+            )
+        elif not isinstance(overlay_document, Mapping):
+            raise OverlayError("overlay: must be a mapping")
+    except OverlayError as exc:
+        raise ConfigurationError(str(exc)) from None
+    # Relative paths still resolve from the base file's directory: the merge
+    # changes the document, never ``path``.
+    loaded = deep_merge(base, overlay_document)
 
     resolver = os.environ if environ is None else environ
     # Every resolution performed, by variable: the secrets block is served
@@ -356,6 +392,25 @@ def load_config(
     return config
 
 
+def _overlay_arguments(
+    overlay: str | os.PathLike[str] | None,
+    overlay_document: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The overlay keywords actually given, for :func:`load_config`.
+
+    An omitted argument is not forwarded, so a caller that gives none calls
+    ``load_config(path, environ=...)`` exactly as before the overlay existed,
+    and ``load_config`` derives the overlay path itself (A1).
+    """
+
+    arguments: dict[str, Any] = {}
+    if overlay is not None:
+        arguments["overlay"] = overlay
+    if overlay_document is not None:
+        arguments["overlay_document"] = overlay_document
+    return arguments
+
+
 def _builtin_modules_directory() -> Path:
     """The directory of the importable shipped modules package (R8).
 
@@ -392,19 +447,23 @@ async def run(
     environ: Mapping[str, str] | None = None,
     ready_reporter: Reporter | None = None,
     diagnostic_reporter: Reporter | None = None,
+    overlay: str | os.PathLike[str] | None = None,
 ) -> int:
     """Run the application until stopped and return a process-style status.
 
     ``stop_event`` is an injection seam for embedding and tests. When omitted,
     this coroutine owns SIGINT/SIGTERM handlers for the duration of startup,
-    operation, and shutdown.
+    operation, and shutdown. ``overlay`` is the explicit overlay path; when
+    omitted, the one derived from the base file's name is merged (R2).
     """
 
     report_ready = ready_reporter or _default_ready_reporter
     report_diagnostic = diagnostic_reporter or _default_diagnostic_reporter
 
     try:
-        config = load_config(config_path, environ=environ)
+        config = load_config(
+            config_path, environ=environ, **_overlay_arguments(overlay)
+        )
     except ConfigurationError as exc:
         report_diagnostic(str(exc))
         return 2
@@ -532,8 +591,14 @@ async def check_config(
     *,
     environ: Mapping[str, str] | None = None,
     diagnostic_reporter: Reporter | None = None,
+    overlay: str | os.PathLike[str] | None = None,
+    overlay_document: Mapping[str, Any] | None = None,
 ) -> int:
     """Validate a profile without opening a transport; return its status (R7).
+
+    The profile is the base file merged with its overlay exactly as
+    :func:`run` loads it (R2); ``overlay_document`` checks an in-memory draft
+    in place of the overlay file (D1).
 
     Everything :func:`run` checks before it activates the first module is
     checked here, in the same order and through the same code: the
@@ -555,7 +620,11 @@ async def check_config(
     report_diagnostic = diagnostic_reporter or _default_diagnostic_reporter
 
     try:
-        config = load_config(config_path, environ=environ)
+        config = load_config(
+            config_path,
+            environ=environ,
+            **_overlay_arguments(overlay, overlay_document),
+        )
     except ConfigurationError as exc:
         report_diagnostic(str(exc))
         return 2
@@ -671,13 +740,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             "exit 0 (accepted) or 2 (diagnostics)"
         ),
     )
+    parser.add_argument(
+        "--overlay",
+        metavar="PATH",
+        help=(
+            "path to the overlay file merged over the configuration file "
+            "(default: derived from the configuration file's name)"
+        ),
+    )
     arguments = parser.parse_args(argv)
+    # Only an explicit overlay is forwarded: without one, run and the check
+    # derive the overlay path from the configuration file themselves (A1).
+    overlay_argument = _overlay_arguments(arguments.overlay)
 
     if arguments.check_config:
         # Nothing is activated, so there is no cleanup for the watchdog to
         # bound: the check returns its status and the process exits by it.
         try:
-            return asyncio.run(check_config(arguments.config))
+            return asyncio.run(check_config(arguments.config, **overlay_argument))
         except KeyboardInterrupt:
             return 1
         except Exception:
@@ -689,7 +769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     async def execute() -> int:
         try:
-            return await run(arguments.config)
+            return await run(arguments.config, **overlay_argument)
         finally:
             # Keep the deadline active through the runner's executor cleanup.
             arm_shutdown_watchdog()
