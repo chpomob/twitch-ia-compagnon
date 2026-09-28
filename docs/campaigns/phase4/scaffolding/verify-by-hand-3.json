@@ -1,0 +1,20 @@
+{
+ "verdict": "REQUEST_CHANGES",
+ "findings": [
+  {
+   "id": "F1",
+   "status": "RESOLVED",
+   "evidence": "A5, R7 and AC38 (R7, A5) cover resolved absolute paths through explicit arguments, the runtime environment variable and the derived default, requiring status_path_collision and non-zero exit before binding or writing, with unchanged configuration bytes verified; no refusal-route gap remains."
+  },
+  {
+   "id": "F2",
+   "status": "PARTIAL",
+   "evidence": "R7 and AC39 establish non-crashing, distinct unusable-record reporting, unknown drift and no inferred readiness, including unreadable and wrong-shape JSON tests; however, R7 leaves the types/formats of start time, sequence, digest and the per-module container undefined, and omits the overall state used by Apply and AC33 from its required-field list, so incomplete/wrongly typed record classification remains underspecified and the specification is not yet sound enough to plan from."
+  }
+ ],
+ "new_findings": [],
+ "read_files": [
+  "docs/campaigns/phase4/spec.md",
+  "docs/campaigns/phase4/brief.md"
+ ]
+}
