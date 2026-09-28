@@ -3346,16 +3346,18 @@ def test_pyproject_ships_core_and_modules_with_every_manifest() -> None:
 
 
 def test_pyproject_declares_the_console_script_and_the_build_backend_for_tests() -> None:
-    """R8 (AC43): the console script points at ``core.main:main``; the
-    runtime dependencies stay ``aiohttp`` and ``PyYAML``; the ``test`` extra
-    carries the declared build backend (``setuptools>=69``) so the install
-    test can build without isolation or network and a missing backend is an
-    environment error, never a skip."""
+    """R8 (AC43), superseded in part by phase-4 R1/R9 (AC36): the console
+    scripts are exactly ``core.main:main`` plus the configuration UI's
+    ``core.config_ui:main``; the runtime dependencies stay ``aiohttp`` and
+    ``PyYAML``; the ``test`` extra carries the declared build backend
+    (``setuptools>=69``) so the install test can build without isolation or
+    network and a missing backend is an environment error, never a skip."""
 
     project = _pyproject()
 
     assert project["project"]["scripts"] == {
-        "twitch-ia-compagnon": "core.main:main"
+        "twitch-ia-compagnon": "core.main:main",
+        "twitch-ia-compagnon-config-ui": "core.config_ui:main",
     }
     assert project["build-system"]["build-backend"] == "setuptools.build_meta"
     assert sorted(

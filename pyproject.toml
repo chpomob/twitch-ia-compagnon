@@ -27,6 +27,7 @@ test = [
 
 [project.scripts]
 twitch-ia-compagnon = "core.main:main"
+twitch-ia-compagnon-config-ui = "core.config_ui:main"
 
 [tool.setuptools.packages.find]
 include = ["core*", "modules*"]
