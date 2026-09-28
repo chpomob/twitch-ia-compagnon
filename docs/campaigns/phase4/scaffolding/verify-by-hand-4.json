@@ -1,0 +1,21 @@
+{
+ "verdict": "REQUEST_CHANGES",
+ "findings": [
+  {
+   "id": "F2",
+   "status": "RESOLVED",
+   "evidence": "R7 defines all eight required fields, their types and formats, process identity and dead-process classification, digest contents, required overall state ready, and the per-module container, while AC33/AC39/AC40 test publication and strict rejection without repair or partial trust; no requested field or format remains undefined."
+  }
+ ],
+ "new_findings": [
+  {
+   "severity": "major",
+   "title": "Usability requires information unavailable to the reader",
+   "evidence": "R7 requires a usable record to satisfy every format requirement, including modules containing exactly the modules enabled in the configuration the publishing process loaded, but A5 permits externally launched processes and AC32 requires comparison after disk changes; neither the record nor another specified interface supplies that previous configuration, so the UI cannot verify module-container completeness against it. Distinguish reader-verifiable validity checks from publisher obligations. Until clarified, the specification is not sound enough to plan from."
+  }
+ ],
+ "read_files": [
+  "docs/campaigns/phase4/spec.md",
+  "docs/campaigns/phase4/brief.md"
+ ]
+}
