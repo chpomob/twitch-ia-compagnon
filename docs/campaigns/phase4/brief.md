@@ -29,8 +29,13 @@ own configuration page** reachable from a base page, rather than one monolithic 
 - **4a — applying a change is a supervised restart** driven from the UI (no hot reload).
 - **5a — every module page is generated from the module's declared JSON-Schema subset.** Modules
   ship no HTML.
-- **6b — v1 scope**: read + validate + a base page + one page per module + write (everything
-  except secrets) + restart.
+- **6b — v1 scope**: read + validate + a base page + one page per module + write + restart.
+- **6c — the v1 writing scope, decided after the first spec round (amends 6b, binding)**: the UI
+  **writes** `enabled_modules`, `modules.<name>` settings, `triggers`, `limits` and
+  `modules_directory`. The `secrets` block and the `actions` block (the default-deny
+  authorization rules) are **read-only in v1 and displayed read-only**, so that a single
+  mis-click can never widen the set of authorized actions. A specification that quietly narrows
+  the writing scope below 6c, or that widens it into `actions`, is wrong.
 
 ## Requirements (to be refined by the spec)
 
@@ -61,7 +66,12 @@ own configuration page** reachable from a base page, rather than one monolithic 
   understand the overlay identically.
 - **R-UI-8** **Applying**: the UI offers a supervised restart of the main process using a
   declared launch command, reports whether the new configuration was accepted after restart, and
-  always shows whether the running process's configuration matches what is on disk.
+  always shows whether the running process's configuration matches what is on disk. The status
+  record must be published on **every** transition — when the process becomes ready and on each
+  module's ready/degraded change — and acceptance criteria must cover those transitions, not only
+  the creation of the record.
+- **R-UI-11** The `actions` block is displayed read-only, with the reason it cannot be edited in
+  v1, so the operator can see which authorizations exist without being able to change them.
 - **R-UI-9** **Security**: no secret value in any response or log; per-session token; CSRF
   protection on writes; the UI may write only the managed overlay path; every write is logged.
 - **R-UI-10** **No new runtime dependency** beyond aiohttp and PyYAML; the UI must work fully

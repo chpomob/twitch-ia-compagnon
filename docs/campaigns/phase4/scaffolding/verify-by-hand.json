@@ -1,0 +1,41 @@
+{
+ "verdict": "REQUEST_CHANGES",
+ "findings": [
+  {
+   "id": "S1",
+   "status": "RESOLVED",
+   "evidence": "R9 and AC33 explicitly permit configured external URLs as escaped data while prohibiting their use in resource-loading or navigation positions."
+  },
+  {
+   "id": "S2",
+   "status": "RESOLVED",
+   "evidence": "AC35 verifies provenance for overlay values, environment references, explicit base values equal to defaults, unset defaults, and removal of an override."
+  },
+  {
+   "id": "S3",
+   "status": "RESOLVED",
+   "evidence": "A5, AC29 and AC34 specify the watched status path, external-process publication setup, discovery tests and operator documentation."
+  },
+  {
+   "id": "S4",
+   "status": "RESOLVED",
+   "evidence": "A8, R1 and AC36 define wildcard-bind authorities, allowed host names, IPv6 brackets, case matching and browser Origin syntax."
+  }
+ ],
+ "new_findings": [
+  {
+   "severity": "major",
+   "title": "Editing scope contradicts the binding brief",
+   "evidence": "A2 and R6 make triggers, actions, limits and modules_directory read-only, whereas binding decision 6b in the brief requires writing everything except secrets; AC25 enforces this reduced scope. The specification is not sound enough to plan from until this contradiction is resolved."
+  },
+  {
+   "severity": "minor",
+   "title": "Status transition publication lacks acceptance coverage",
+   "evidence": "R7 requires atomic status publication on becoming ready and on every module ready/degraded transition, but AC31 checks only record creation, contents and the environment-variable opt-out; AC18 and AC29 consume supplied records. No acceptance criterion verifies transition-triggered publication or atomic replacement of the status record."
+  }
+ ],
+ "read_files": [
+  "docs/campaigns/phase4/spec.md",
+  "docs/campaigns/phase4/brief.md"
+ ]
+}
