@@ -86,6 +86,8 @@ the transports. The suite must not drop below 2,460 passed / 18 skipped.
 
 - One atomic commit for the whole step when the suite is green; Conventional Commit message
   (`feat(phase4): ...`, `fix(phase4): ...`, `test(phase4): ...`, `refactor(phase4): ...`, `docs(phase4): ...`).
+  The scope MUST be `phase4`: the repository history is full of `feat(phase3):` / `fix(phase2):` commits
+  from earlier phases — do NOT copy that habit. Every commit this campaign makes is `(phase4)`.
 - Keep the phase-0 to phase-3 guarantees in force: bounded admission, phase lifecycle, explicit
   terminal action outcomes, default-deny authorization (reads included), bounded retention, a single
   global startup/shutdown cleanup deadline, redaction of configured secrets in traces and loss
