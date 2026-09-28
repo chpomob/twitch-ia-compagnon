@@ -1,0 +1,51 @@
+{
+ "verdict": "REQUEST_CHANGES",
+ "findings": [
+  {
+   "id": "P1",
+   "status": "RESOLVED",
+   "evidence": "R6 and AC24 cover writes to all five blocks required by amended decision 6c, while R4(c), AC20 and AC27 make secrets and actions read-only."
+  },
+  {
+   "id": "P2",
+   "status": "RESOLVED",
+   "evidence": "R7 and AC33 require and verify publication on process readiness and subsequent module degraded/ready transitions, with AC34 checking atomic replacement."
+  },
+  {
+   "id": "S1",
+   "status": "RESOLVED",
+   "evidence": "AC38 verifies that unsaved edits change Check results in both directions while leaving overlay bytes unchanged."
+  },
+  {
+   "id": "S2",
+   "status": "RESOLVED",
+   "evidence": "R6 explicitly protects descendants during ancestor writes and removals, and AC27 tests preserved references, rejected replacements or omissions, credential-containing ancestor removal, and referenced mapping keys."
+  },
+  {
+   "id": "S3",
+   "status": "RESOLVED",
+   "evidence": "AC32 now starts with a live process and matching digest, then requires an unapplied save that changes the effective configuration before expecting drift."
+  },
+  {
+   "id": "S4",
+   "status": "RESOLVED",
+   "evidence": "A1, R6 and AC27 require startup refusal before binding when no overlay path is derivable, and verify that an explicit overlay path permits startup."
+  }
+ ],
+ "new_findings": [
+  {
+   "severity": "major",
+   "title": "Status-file path can collide with configuration files",
+   "evidence": "A5 accepts --status-file PATH without excluding the base or managed overlay path, and R7 requires the launched runtime to replace that file with a status record; selecting either configuration path therefore destroys configuration and, for the base, contradicts R2's prohibition on writing it. R6 and AC27 only guard overlay-versus-base collisions. The specification is not sound enough to plan from until status-path collisions are addressed."
+  },
+  {
+   "severity": "minor",
+   "title": "Invalid status-record handling is unspecified",
+   "evidence": "R7 and AC32 define unknown for an absent record or dead pid, but specify no behavior for an unreadable, malformed or incomplete existing record at the operator-selected status path; AC34 only prevents partial records during compliant atomic publication."
+  }
+ ],
+ "read_files": [
+  "docs/campaigns/phase4/spec.md",
+  "docs/campaigns/phase4/brief.md"
+ ]
+}
