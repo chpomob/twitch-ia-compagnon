@@ -1,0 +1,15 @@
+{
+ "verdict": "APPROVE",
+ "findings": [
+  {
+   "id": "F3",
+   "status": "RESOLVED",
+   "evidence": "R7's explicit split agrees with my assessment: reader-verifiable checks are readability, regular-file status, size, UTF-8 and JSON validity, duplicate-key rejection, required fields, types, formats, ranges, permitted values and module-entry shape, plus reader-side digest comparison, process liveness and Apply child-pid matching; publisher-only obligations are actual writer identity, authentic and stable start time, actual publication time, sequence initialization and progression, digest fidelity to the loaded configuration, actual readiness, exact loaded enabled-module membership and reported health, and atomic publication; R7 preserves 'never silently repaired', 'never partially trusted' and never evidence of agreement with disk for invalid records, AC39–AC42 test reader behavior, AC33–AC34 and AC43 test publisher obligations, AC42–AC43 are unique and correctly referenced, and the specification is sound enough to plan from."
+  }
+ ],
+ "new_findings": [],
+ "read_files": [
+  "docs/campaigns/phase4/spec.md",
+  "docs/campaigns/phase4/brief.md"
+ ]
+}
