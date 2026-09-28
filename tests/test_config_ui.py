@@ -2,7 +2,8 @@
 the configuration model, base page and core-settings page (P10); the module
 pages generated from each manifest (P11); Check (P12); Save and
 remove-override (P13); the status record reader, drift and running state
-(P14); Apply, the supervised restart (P15).
+(P14); Apply, the supervised restart (P15); the secret-canary sweep and the
+offline-assets URL audit (P16).
 
 The whole module runs with socket creation patched to raise (AC5): no test
 here binds, connects or even creates a socket. The request core is driven
@@ -25,6 +26,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -32,6 +34,7 @@ import sys
 import threading
 import tokenize
 from collections.abc import Iterator, Sequence
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -4237,3 +4240,521 @@ def test_close_forbids_every_later_launch(tmp_path: Path) -> None:
     assert len(launched) == 1 and supervisor.child is None
     with pytest.raises(config_ui.SupervisorClosed):
         supervisor.start()
+
+
+# ---------------------------------------------------------------------------
+# P16: the secret-canary sweep (R8; AC35, AC2) and the offline-assets audit
+# (R9; AC36). One sweep drives every route of the UI over canary values and
+# collects everything it produces: bodies, headers, log records, restart
+# reports and the status records the runtime publishes.
+# ---------------------------------------------------------------------------
+
+CANARY_HEX = secrets.token_hex(6)
+LITERAL_CANARY = f"CANARY-LIT-{CANARY_HEX}-api_key"
+#: A declared credential path (``credentials: [synthesis.api_key]``) of a
+#: module every shipped desktop profile enables.
+LITERAL_MODULE = "audio_output"
+LITERAL_PATH = "modules.audio_output.synthesis.api_key"
+LITERAL_OVERLAY = f"modules:\n  {LITERAL_MODULE}:\n    synthesis:\n      api_key: {LITERAL_CANARY}\n"
+SWEEP_HOOKS = "_config_ui_canary_sweep_hooks"
+
+
+def _all_profile_variables() -> list[str]:
+    """Every variable the 4 shipped profiles reference, as a value or a key."""
+
+    return sorted({name for profile in PROFILES for name in _profile_variables(profile)})
+
+
+def _sweep_environ() -> dict[str, str]:
+    return {name: f"CANARY-ENV-{CANARY_HEX}-{name}" for name in _all_profile_variables()}
+
+
+class _Collector(logging.Handler):
+    """Every ``core.config_ui`` record, as the handlers downstream receive it."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def texts(self) -> list[str]:
+        """Each record's message plus every attribute it carries."""
+
+        return [
+            record.getMessage() + "\n" + repr(sorted(record.__dict__.items(), key=lambda kv: kv[0]))
+            for record in self.records
+        ]
+
+
+@pytest.fixture
+def ui_log() -> Iterator[_Collector]:
+    collector = _Collector()
+    ui_logger = logging.getLogger("core.config_ui")
+    level = ui_logger.level
+    ui_logger.addHandler(collector)
+    ui_logger.setLevel(logging.DEBUG)
+    try:
+        yield collector
+    finally:
+        ui_logger.removeHandler(collector)
+        ui_logger.setLevel(level)
+
+
+class _Sweep:
+    """The responses of one sweep, each labelled with what produced it."""
+
+    def __init__(self, ui: ConfigUI) -> None:
+        self.ui = ui
+        self.responses: list[tuple[str, UIResponse]] = []
+
+    def record(self, label: str, response: UIResponse) -> UIResponse:
+        self.responses.append((label, response))
+        return response
+
+    def get(self, path: str, cookie: str | None, **query: str) -> UIResponse:
+        headers = {} if cookie is None else {"cookie": cookie}
+        return self.record(f"GET {path}", self.ui.handle(_request("GET", path, headers=headers, query=query)))
+
+    def texts(self) -> list[tuple[str, str]]:
+        """Every body and every header value, decoded."""
+
+        found: list[tuple[str, str]] = []
+        for label, response in self.responses:
+            found.append((label, response.body.decode("utf-8")))
+            found += [(f"{label} header {name}", f"{name}: {value}") for name, value in response.headers]
+        return found
+
+
+def _canaries_in(text: str, canaries: Sequence[str]) -> list[str]:
+    return [canary for canary in canaries if canary in text or _html.escape(canary) in text]
+
+
+def _sweep_profile(
+    tmp_path: Path, profile: str, environ: dict[str, str], label: str = "pages"
+) -> tuple[ConfigUI, Path]:
+    """A copy of *profile* (modules directory absolute) plus the literal overlay."""
+
+    text = (REPO / profile).read_text(encoding="utf-8")
+    assert "modules_directory: ./modules\n" in text
+    directory = tmp_path / label / profile.replace(".", "_")
+    directory.mkdir(parents=True)
+    base = directory / "config.yaml"
+    base.write_text(
+        text.replace("modules_directory: ./modules\n", f"modules_directory: {REPO / 'modules'}\n"),
+        encoding="utf-8",
+    )
+    if LITERAL_MODULE in read_base(base)["enabled_modules"]:
+        (directory / "config.local.yaml").write_text(LITERAL_OVERLAY, encoding="utf-8")
+    ui = ConfigUI(
+        UISettings.from_argv(["--config", str(base), "--status-file", str(directory / "status.json")]),
+        environ=environ,
+    )
+    return ui, base
+
+
+def _sweep_pages(sweep: _Sweep, cookie: str) -> dict[str, str]:
+    """The base page, the core page and every module page, all 200."""
+
+    pages: dict[str, str] = {}
+    for path in ("/", "/core", *(f"{MODULE_PAGE_PREFIX}{name}" for name in SHIPPED_MODULES)):
+        response = sweep.get(path, cookie)
+        assert response.status == 200, path
+        pages[path] = response.body.decode("utf-8")
+    return pages
+
+
+# -- the status records of AC33, published with the canary environment ------------
+
+SWEEP_MODULE_SOURCE = f"""
+import {SWEEP_HOOKS} as hooks
+
+
+class Handle:
+    async def prepare(self):
+        return None
+
+    async def close(self):
+        return None
+
+
+async def activate(context, settings, catalog):
+    hooks.contexts[context.module] = context
+    return Handle()
+"""
+
+
+def _publisher_base(root: Path, environ: dict[str, str]) -> Path:
+    """Fixture modules M and N whose settings reference every canary variable,
+    one of them as a mapping key, next to a literal canary; ``secrets`` lists
+    every variable."""
+
+    for name in ("mmod", "nmod"):
+        directory = root / "modules" / name
+        directory.mkdir(parents=True)
+        manifest = {
+            "name": name,
+            "manifest_version": 2,
+            "runtime_api": 2,
+            "produces": [],
+            "consumes": [],
+            "middleware": False,
+            "lifecycle": {"roles": []},
+            "settings_schema": {"type": "object", "properties": {"api_key": {"type": "string"}}},
+            "credentials": ["api_key"],
+        }
+        (directory / "module.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+        (directory / "__init__.py").write_text(SWEEP_MODULE_SOURCE, encoding="utf-8")
+    references = {name.lower(): "${" + name + "}" for name in environ}
+    config = {
+        "modules_directory": "./modules",
+        "enabled_modules": ["mmod", "nmod"],
+        "modules": {
+            "mmod": {**references, "api_key": LITERAL_CANARY},
+            "nmod": {"channels": {"${TWITCH_BROADCASTER_ID}": {"on": True}}},
+        },
+        "secrets": ["${" + name + "}" for name in environ],
+    }
+    base = root / "config.yaml"
+    base.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return base
+
+
+def _publish_ac33_records(
+    tmp_path: Path, environ: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[bytes], list[tuple[str, UIResponse]], frozenset[str]]:
+    """Re-run P4's publisher (``core.main.run``) with the canary environment
+    through the 3 transitions of AC33; after each one the UI reads the record
+    and renders it. Returns the 3 records, the rendered responses and the
+    rendering UI's accepted authorities."""
+
+    import core.main as application
+    from types import SimpleNamespace
+
+    hooks = SimpleNamespace(contexts={})
+    monkeypatch.setitem(sys.modules, SWEEP_HOOKS, hooks)
+    root = tmp_path / "publisher"
+    base = _publisher_base(root, environ)
+    status = root / "status.json"
+    ui = ConfigUI(
+        UISettings.from_argv(["--config", str(base), "--status-file", str(status)]), environ=environ
+    )
+    cookie, _ = _login(ui)
+    records: list[bytes] = []
+    rendered: list[tuple[str, UIResponse]] = []
+    diagnostics: list[str] = []
+
+    def observe() -> None:
+        records.append(status.read_bytes())
+        assert read_status(status).kind == "usable"
+        for path in ("/", f"{MODULE_PAGE_PREFIX}mmod"):
+            response = ui.handle(_request("GET", path, headers={"cookie": cookie}))
+            assert response.status == 200
+            rendered.append((f"status record {len(records)} GET {path}", response))
+        page = ui.handle(_request("GET", f"{MODULE_PAGE_PREFIX}mmod", headers={"cookie": cookie}))
+        assert HIDDEN_LITERAL in _node(page.body.decode("utf-8"), "modules.mmod.api_key")
+
+    async def scenario() -> int:
+        stop = asyncio.Event()
+        ready = asyncio.Event()
+        task = asyncio.create_task(
+            application.run(
+                base,
+                stop,
+                environ={**environ, config_ui.STATUS_FILE_VARIABLE: str(status)},
+                ready_reporter=lambda _message: ready.set(),
+                diagnostic_reporter=diagnostics.append,
+            )
+        )
+        waiting = asyncio.create_task(ready.wait())
+        await asyncio.wait({task, waiting}, return_when=asyncio.FIRST_COMPLETED)
+        waiting.cancel()
+        assert ready.is_set(), diagnostics
+        observe()
+        await hooks.contexts["mmod"].supervision.degraded(reason="fixture degraded")
+        observe()
+        await hooks.contexts["mmod"].supervision.ready()
+        observe()
+        stop.set()
+        return await task
+
+    assert _run_socket_free(scenario()) == 0, diagnostics
+    documents = [json.loads(record) for record in records]
+    assert [document["sequence"] for document in documents] == [1, 2, 3]
+    assert [document["modules"]["mmod"]["state"] for document in documents] == ["ready", "degraded", "ready"]
+    assert all(document["digest"] == on_disk_digest(base, root / "config.local.yaml") for document in documents)
+    return records, rendered, frozenset(ui.authorities)
+
+
+# -- AC36: the URL audit ------------------------------------------------------------
+
+#: Attributes whose value the browser loads, navigates to or submits to.
+URL_ATTRIBUTES = frozenset(
+    {"src", "href", "action", "formaction", "srcset", "poster", "data", "background", "cite", "ping", "manifest"}
+)
+_CSS_URL = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.I | re.S)
+_CSS_IMPORT = re.compile(r"@import\s+(?:url\(\s*)?['\"]?([^'\")\s;]*)", re.I)
+_SCRIPT_URL = re.compile(r"(?:https?:)?//[^\s'\"`<>)]*", re.I)
+
+
+class _UrlAudit(HTMLParser):
+    """The URL-bearing parts of one response, found with ``html.parser``."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.targets: list[str] = []
+        self.styles: list[str] = []
+        self.scripts: list[str] = []
+        self._inside: str | None = None
+
+    @classmethod
+    def of(cls, response: UIResponse) -> "_UrlAudit":
+        audit = cls()
+        audit.feed(response.body.decode("utf-8"))
+        audit.close()
+        return audit
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {name: value or "" for name, value in attrs}
+        for name, value in values.items():
+            if name == "srcset":
+                self.targets += [part.split()[0] for part in value.split(",") if part.split()]
+            elif name in URL_ATTRIBUTES:
+                self.targets.append(value)
+            elif name == "style":
+                self.styles.append(value)
+            elif name.startswith("on"):
+                self.scripts.append(value)
+        if tag == "meta" and values.get("http-equiv", "").lower() == "refresh":
+            self.targets.append(values.get("content", "").partition("url=")[2])
+        if tag in ("script", "style"):
+            self._inside = tag
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == self._inside:
+            self._inside = None
+
+    def handle_data(self, data: str) -> None:
+        if self._inside == "script":
+            self.scripts.append(data)
+        elif self._inside == "style":
+            self.styles.append(data)
+
+
+def _accepted_target(value: str, accepted: frozenset[str]) -> bool:
+    """Relative (no scheme, no authority), or an http(s) URL on an accepted authority."""
+
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(value.strip())
+    if not parsed.scheme and not parsed.netloc:
+        return not value.strip().startswith("//")
+    return parsed.scheme in ("http", "https") and parsed.netloc.lower() in accepted
+
+
+def _url_violations(response: UIResponse, accepted: frozenset[str]) -> list[str]:
+    """Every target of *response* that is neither relative nor accepted (R9)."""
+
+    audit = _UrlAudit.of(response)
+    targets = list(audit.targets)
+    targets += [value for name, value in response.headers if name.lower() in ("location", "refresh", "link")]
+    for style in audit.styles:
+        targets += [match.group(2) for match in _CSS_URL.finditer(style)]
+        targets += [match.group(1) for match in _CSS_IMPORT.finditer(style)]
+    violations = [target for target in targets if not _accepted_target(target, accepted)]
+    for script in audit.scripts:
+        violations += [url for url in _SCRIPT_URL.findall(script) if not _accepted_target(url, accepted)]
+    return violations
+
+
+def test_ac36_the_url_audit_finds_every_external_target() -> None:
+    """The auditor the sweep relies on flags each resource-loading position."""
+
+    accepted = frozenset({"127.0.0.1:8765", "localhost:8765"})
+    external = [
+        '<script src="https://cdn.example.invalid/x.js"></script>',
+        '<link rel="stylesheet" href="//cdn.example.invalid/x.css">',
+        '<form method="post" action="http://evil.example.invalid/save"></form>',
+        '<button formaction="https://evil.example.invalid/">x</button>',
+        '<img srcset="/a.png 1x, https://cdn.example.invalid/b.png 2x">',
+        '<style>body { background: url("https://cdn.example.invalid/b.png"); }</style>',
+        "<style>@import 'https://cdn.example.invalid/x.css';</style>",
+        '<div style="background: url(//cdn.example.invalid/b.png)"></div>',
+        '<script>fetch("https://api.example.invalid/x");</script>',
+        '<a href="javascript:alert(1)">x</a>',
+        '<meta http-equiv="refresh" content="0; url=https://evil.example.invalid/">',
+    ]
+    for markup in external:
+        response = UIResponse(status=200, body=markup.encode("utf-8"), content_type="text/html")
+        assert _url_violations(response, accepted), markup
+    fine = (
+        '<a href="/core">c</a><form action="/save"></form><img src="x.png">'
+        '<a href="http://127.0.0.1:8765/">h</a><style>p { color: red }</style>'
+        '<script>var u = "http://localhost:8765/check";</script>'
+        '<p>https://cdn.example.invalid/x.js is text</p>'
+    )
+    assert _url_violations(UIResponse(status=200, body=fine.encode("utf-8")), accepted) == []
+    moved = UIResponse(status=303, headers=(("Location", "https://evil.example.invalid/"),))
+    assert _url_violations(moved, accepted) == ["https://evil.example.invalid/"]
+
+SWEEP_CHILD = """\
+from pathlib import Path
+
+if Path(BASE).with_name("refuse.flag").exists():
+    sys.stderr.write("config error near " + os.environ["TWITCH_CLIENT_SECRET"] + "\\n")
+    sys.stderr.write("literal " + {literal!r} + " rejected\\n")
+    sys.exit(2)
+publish()
+hold()
+"""
+
+
+def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
+    tmp_path: Path,
+    launched: list[config_ui.Supervisor],
+    ui_log: _Collector,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC35 (R8), with AC2's "the token is in no log record" over the whole capture."""
+
+    environ = _sweep_environ()
+    assert {"TWITCH_BROADCASTER_ID", "TWITCH_CLIENT_SECRET", "OPENAI_API_KEY", "PROXY_PAIRING_TOKEN"} <= set(environ)
+    canaries = [*environ.values(), LITERAL_CANARY]
+    collected: list[tuple[str, str]] = []
+    tokens: list[str] = []
+    reports: list[config_ui.ApplyReport] = []
+    audited: list[tuple[str, UIResponse, frozenset[str]]] = []
+
+    # Every page of every shipped profile, and the unauthenticated answers.
+    for profile in PROFILES:
+        ui, base = _sweep_profile(tmp_path, profile, environ)
+        sweep = _Sweep(ui)
+        sweep.get("/", None, token=ui.token)
+        for path in ("/", "/core", f"{MODULE_PAGE_PREFIX}twitch"):
+            assert sweep.get(path, None).status == 401
+        cookie, csrf = _login(ui)
+        tokens += [ui.token, cookie.split("=", 1)[1], csrf]
+        pages = _sweep_pages(sweep, cookie)
+        # Credential fields show their reference or the hidden-literal text.
+        if "twitch" in read_base(base)["modules"]:
+            twitch = pages[f"{MODULE_PAGE_PREFIX}twitch"]
+            for field_name in ("client_id", "client_secret", "access_token"):
+                node = _node(twitch, f"modules.twitch.{field_name}")
+                assert f"${{TWITCH_{field_name.upper()}}}" in node
+        if (base.parent / "config.local.yaml").exists():
+            node = _node(pages[f"{MODULE_PAGE_PREFIX}{LITERAL_MODULE}"], LITERAL_PATH)
+            assert HIDDEN_LITERAL in node
+        # The renderer keeps every value out by itself: nothing was left for
+        # the redaction guard to hide.
+        for path, page in pages.items():
+            assert config_ui.REDACTED not in page, (profile, path)
+        collected += sweep.texts()
+        audited += [(label, response, frozenset(ui.authorities)) for label, response in sweep.responses]
+
+    # Check, Save, Remove and Apply (accepted, refused twice) on the first
+    # profile, its status record published by a supervised P15 fake child.
+    ui, base = _sweep_profile(tmp_path, "config.yaml.example", {}, "writes")
+    overlay = base.parent / "config.local.yaml"
+    script = tmp_path / "child.py"
+    script.write_text(CHILD_PRELUDE + SWEEP_CHILD.format(literal=LITERAL_CANARY), encoding="utf-8")
+    settings = UISettings.from_argv(
+        [
+            "--config", str(base),
+            "--status-file", str(base.parent / "status.json"),
+            "--", sys.executable, str(script), str(base), str(overlay),
+        ]
+    )
+    supervisor = config_ui.Supervisor(
+        config_ui.default_launch_argv(settings),
+        settings.status_path,
+        stop_grace=STOP_GRACE,
+        apply_window=ACCEPT_WINDOW,
+        environ={**os.environ, **environ},
+    )
+    launched.append(supervisor)
+    ui = ConfigUI(settings, environ=environ, supervisor=supervisor)
+    sweep = _Sweep(ui)
+    cookie, csrf = _login(ui)
+    tokens += [ui.token, cookie.split("=", 1)[1], csrf]
+
+    check = sweep.record("POST /check", ui.handle(_check_request(cookie, csrf, "/")))
+    assert check.status == 200 and _listed(check.body.decode("utf-8"))
+
+    saved = sweep.record(
+        "POST /save", _write(ui, cookie, "/save", "/module/users", [("modules.users.max_channels", "73591")])
+    )
+    assert saved.status == 303, _written(saved)
+    assert LITERAL_CANARY in overlay.read_text(encoding="utf-8")
+    removed = sweep.record(
+        "POST /remove", _write(ui, cookie, "/remove", "/module/users", [("path", "modules.users.max_channels")])
+    )
+    assert removed.status == 303, _written(removed)
+    assert _overlay_doc(overlay) == yaml.safe_load(LITERAL_OVERLAY)
+
+    # Refused by the on-disk Check (the real checker): nothing is started.
+    refused_by_check = sweep.record("POST /apply (check refused)", _post(ui, "/apply", cookie, csrf))
+    assert ui.last_apply is not None and ui.last_apply.check_refused
+    assert refused_by_check.status == 200
+    reports.append(ui.last_apply)
+
+    ui.checker = _passing_checker
+    accepted = sweep.record("POST /apply (accepted)", _post(ui, "/apply", cookie, csrf))
+    assert ui.last_apply is not None and ui.last_apply.outcome == config_ui.APPLY_ACCEPTED
+    assert accepted.status == 200
+    reports.append(ui.last_apply)
+    after_accept = _sweep_pages(sweep, cookie)
+    assert _drift(after_accept["/"]) == DRIFT_IN_SYNC
+    for path, page in after_accept.items():
+        assert config_ui.REDACTED not in page, path
+
+    # Refused by the child: its stderr names a canary, the report hides it.
+    (base.parent / "refuse.flag").write_text("", encoding="utf-8")
+    refused = sweep.record("POST /apply (refused)", _post(ui, "/apply", cookie, csrf))
+    report = ui.last_apply
+    assert report is not None and report.outcome == config_ui.APPLY_REFUSED
+    assert report.exit_status == 2 and not report.check_refused
+    assert "config error near" in report.stderr_tail and config_ui.REDACTED in report.stderr_tail
+    assert refused.status == 200
+    reports.append(report)
+    _sweep_pages(sweep, cookie)
+    collected += sweep.texts()
+    audited += [(label, response, frozenset(ui.authorities)) for label, response in sweep.responses]
+    collected += [(f"restart report {index}", repr(report)) for index, report in enumerate(reports)]
+
+    # Every status record of AC33, published by the runtime with this environment.
+    records, rendered, authorities = _publish_ac33_records(tmp_path, environ, monkeypatch)
+    collected += [(f"status record {index + 1}", record.decode("utf-8")) for index, record in enumerate(records)]
+    collected += [(label, response.body.decode("utf-8")) for label, response in rendered]
+    collected += [
+        (f"{label} header", f"{name}: {value}") for label, response in rendered for name, value in response.headers
+    ]
+    audited += [(label, response, authorities) for label, response in rendered]
+
+    logs = ui_log.texts()
+    assert ui_log.records, "the sweep's saves and applies are logged"
+    assert any("configuration apply refused" in text for text in logs)
+    collected += [(f"log record {index}", text) for index, text in enumerate(logs)]
+
+    leaks = [(label, found) for label, text in collected if (found := _canaries_in(text, canaries))]
+    assert leaks == []
+    # AC2: the token (and every session and CSRF token) is in no log record.
+    for text in logs:
+        for token in tokens:
+            assert token not in text
+    assert len(collected) > 100
+
+    # Every route the UI serves was driven (there is no JSON endpoint: every
+    # route answers HTML or text, and a new one must join this sweep).
+    assert set(ui.routes) == {"/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply"}
+    assert {response.content_type.split(";")[0] for _, response, _ in audited} <= {"text/html", "text/plain"}
+
+    # AC36: no response makes the browser load, run or submit anything from
+    # another host.
+    violations = [
+        (label, violation)
+        for label, response, accepted in audited
+        for violation in _url_violations(response, accepted)
+    ]
+    assert violations == []
+    assert sum(_UrlAudit.of(response).scripts != [] for _, response, _ in audited) > 50
