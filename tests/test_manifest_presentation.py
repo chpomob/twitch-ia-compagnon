@@ -143,6 +143,10 @@ PRESENTED = (
     "capture",
     "chat_context",
     "clips",
+    "kick",
+    "moderation",
+    "proxy",
+    "stream_control",
 )
 
 _DEFAULT_LITERAL = re.compile(r"Default (`[^`]*`|\S+?)\.(\s|$)")
@@ -182,11 +186,19 @@ def _documented_default(node: dict) -> object:
     if match is None:
         return _NO_DEFAULT
     literal = match.group(1)
-    if literal.startswith("`"):
+    quoted = literal.startswith("`")
+    if quoted:
         literal = literal[1:-1]
     if literal == "empty":
         return _EMPTY_BY_TYPE[node["type"]]
-    return yaml.safe_load(literal)
+    try:
+        return yaml.safe_load(literal)
+    except yaml.YAMLError:
+        # A backtick-quoted text that is not a YAML value on its own (a chat
+        # command such as `!modok` reads as a tag) is the string it shows.
+        if quoted:
+            return literal
+        raise
 
 
 def test_extractor_reads_literals_and_ignores_prose() -> None:
@@ -198,6 +210,7 @@ def test_extractor_reads_literals_and_ignores_prose() -> None:
     ]
     assert _documented_default({"type": "array", "description": "Default empty."}) == []
     assert _documented_default({"description": 'Default "ready".'}) == "ready"
+    assert _documented_default({"description": "Default `!modok`."}) == "!modok"
     assert _documented_default({"description": "Default 1.5 seconds."}) is _NO_DEFAULT
     assert _documented_default({"description": "Default behaviour applies."}) is (
         _NO_DEFAULT
@@ -259,3 +272,31 @@ def test_walker_reaches_brain_items_properties() -> None:
         "settings_schema.properties.delivery.properties.actions.items"
         ".properties.text_argument"
     ) in paths
+
+
+def test_moderation_mode_backtick_string_default_is_alert() -> None:
+    node = _settings_schema("moderation")["properties"]["mode"]
+    assert node["default"] == "alert"
+    assert node["description"].endswith("Default `alert`.")
+
+
+def test_moderation_operations_backtick_list_default_is_delete_message() -> None:
+    node = _settings_schema("moderation")["properties"]["act"]["properties"][
+        "operations"
+    ]
+    assert node["default"] == ["delete_message"]
+    assert node["description"].endswith("Default `[delete_message]`.")
+
+
+def test_moderation_auto_apply_empty_default_is_empty_list() -> None:
+    node = _settings_schema("moderation")["properties"]["propose"]["properties"][
+        "auto_apply"
+    ]
+    assert node["default"] == []
+    assert node["description"].endswith("Default empty.")
+
+
+def test_moderation_command_defaults_are_the_command_strings() -> None:
+    propose = _settings_schema("moderation")["properties"]["propose"]["properties"]
+    assert propose["approve_command"]["default"] == "!modok"
+    assert propose["reject_command"]["default"] == "!modno"

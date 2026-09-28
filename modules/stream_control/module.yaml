@@ -34,13 +34,16 @@ lifecycle:
 # reserved `limits` block the entry point hands every enabled module is
 # accepted and not read.
 settings_schema:
+  title: Stream control settings
   type: object
   properties:
     scenes:
+      title: Scenes
       type: object
       description: The scene provider and the scenes `stream.scene.set` may switch to.
       properties:
         provider:
+          title: Provider
           type: object
           description: >-
             Which scene provider serves `stream.scene.set`. With `kind: none`
@@ -48,6 +51,8 @@ settings_schema:
             proxy) may serve it.
           properties:
             kind:
+              title: Kind
+              default: "none"
               type: string
               enum:
                 - none
@@ -57,79 +62,110 @@ settings_schema:
                 `none` (no local provider), `scripted` (an injected provider,
                 for tests) or `websocket`. Default `none`.
             url:
+              title: URL
               type: string
               description: >-
                 The `websocket` provider's address: `ws://` on a loopback host
                 only, `wss://` otherwise.
             password:
+              title: Password
               type: string
               description: >-
                 The `websocket` provider's password, redacted from every trace
                 and diagnostic.
             connect_timeout_seconds:
+              title: Connect timeout seconds
+              default: 5
               type: number
               description: How long the provider may take to connect. Default 5.
             request_timeout_seconds:
+              title: Request timeout seconds
+              default: 5
               type: number
               description: How long one provider request may take. Default 5.
         allowed:
+          title: Allowed
           type: array
           items:
             type: string
           description: The allowlist of scene names (1 to 64 characters each).
         max_waiters:
+          title: Max waiters
+          default: 1
           type: integer
           minimum: 0
           description: >-
             How many calls may wait behind the one set command in flight
             before one more is refused `resource_busy`. Default 1.
     polls:
+      title: Polls
       type: object
       description: The poll bounds `stream.poll.create` holds every call to.
       properties:
         enabled:
+          title: Enabled
+          default: false
           type: boolean
           description: Whether polls are offered at all. Default false.
         max_question_chars:
+          title: Max question chars
+          default: 60
           type: integer
           minimum: 1
           description: The longest question. Default 60.
         min_options:
+          title: Min options
+          default: 2
           type: integer
           minimum: 1
           description: The fewest options. Default 2.
         max_options:
+          title: Max options
+          default: 5
           type: integer
           minimum: 1
           description: The most options. Default 5.
         max_option_chars:
+          title: Max option chars
+          default: 25
           type: integer
           minimum: 1
           description: The longest option. Default 25.
         min_duration_seconds:
+          title: Min duration seconds
+          default: 15
           type: integer
           minimum: 1
           description: The shortest poll. Default 15.
         max_duration_seconds:
+          title: Max duration seconds
+          default: 1800
           type: integer
           minimum: 1
           description: The longest poll. Default 1800.
         max_waiters:
+          title: Max waiters
+          default: 1
           type: integer
           minimum: 0
           description: >-
             How many calls may wait behind the create in flight on one channel
             before one more is refused `resource_busy`. Default 1.
         max_tracked_channels:
+          title: Max tracked channels
+          default: 256
           type: integer
           minimum: 1
           description: The most channels the tracked poll table holds. Default 256.
     required:
+      title: Required
+      default: false
       type: boolean
       description: >-
         Whether an unavailable dependency at `prepare` fails startup (true)
         or leaves the affected action unbound (false). Default false.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every

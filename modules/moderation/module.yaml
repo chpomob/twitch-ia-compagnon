@@ -35,9 +35,12 @@ lifecycle:
 # entry point hands every enabled module is read for its `chat_context`
 # group only: the message index is capped by the transcript's own bounds.
 settings_schema:
+  title: Moderation settings
   type: object
   properties:
     mode:
+      title: Mode
+      default: "alert"
       type: string
       enum:
         - alert
@@ -48,14 +51,18 @@ settings_schema:
         stores a proposal a trusted broadcaster or moderator approves, `act`
         applies it under the strict rules. Default `alert`.
     channels:
+      title: Channels
       type: object
       description: >-
         Per-channel overrides keyed `<platform>/<channel_id>`, each an object
         whose only key is `mode`.
     act:
+      title: Act
       type: object
       properties:
         operations:
+          title: Operations
+          default: ["delete_message"]
           type: array
           items:
             type: string
@@ -66,6 +73,8 @@ settings_schema:
             The operations an application may perform; any other is refused
             `operation_not_allowed`. Default `[delete_message]`.
     max_timeout_seconds:
+      title: Max timeout seconds
+      default: 300
       type: integer
       minimum: 1
       maximum: 3600
@@ -73,6 +82,8 @@ settings_schema:
         The longest timeout, after the platform's unit rounding; a longer or
         a non-positive one is refused `duration_out_of_range`. Default 300.
     max_actions_per_window:
+      title: Max actions per window
+      default: 3
       type: integer
       minimum: 1
       maximum: 20
@@ -80,11 +91,15 @@ settings_schema:
         How many platform requests one channel may send within
         `window_seconds`; one more is refused `rate_limited`. Default 3.
     window_seconds:
+      title: Window seconds
+      default: 600
       type: integer
       minimum: 60
       maximum: 86400
       description: The sliding window `max_actions_per_window` counts in. Default 600.
     per_target_cooldown_seconds:
+      title: Per-target cooldown seconds
+      default: 600
       type: integer
       minimum: 0
       maximum: 86400
@@ -92,6 +107,7 @@ settings_schema:
         The least time between two platform requests aimed at one author of
         one channel; an earlier one is refused `target_cooldown`. Default 600.
     propose:
+      title: Propose
       type: object
       description: >-
         The proposal settings of mode `propose`. A proposal is applied by
@@ -99,6 +115,8 @@ settings_schema:
         authored in its own channel by a trusted broadcaster or moderator.
       properties:
         max_pending:
+          title: Max pending
+          default: 32
           type: integer
           minimum: 1
           maximum: 256
@@ -106,11 +124,15 @@ settings_schema:
             How many proposals may wait; a new one evicts the one closest to
             expiry, which is recorded `expired`. Default 32.
         proposal_ttl_seconds:
+          title: Proposal TTL seconds
+          default: 300
           type: integer
           minimum: 30
           maximum: 3600
           description: How long a proposal waits before it expires. Default 300.
         auto_apply:
+          title: Auto apply
+          default: []
           type: array
           items:
             type: string
@@ -121,12 +143,17 @@ settings_schema:
             The operations applied at once, under the strict rules, instead of
             waiting for an approval. Default empty.
         approve_command:
+          title: Approve command
+          default: "!modok"
           type: string
           description: The chat command that applies a proposal. Default `!modok`.
         reject_command:
+          title: Reject command
+          default: "!modno"
           type: string
           description: The chat command that discards a proposal. Default `!modno`.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every

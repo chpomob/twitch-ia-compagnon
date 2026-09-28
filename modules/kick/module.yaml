@@ -33,24 +33,30 @@ lifecycle:
 # reports one diagnostic per offending field naming module and field, with
 # no configured value echoed back.
 settings_schema:
+  title: Kick settings
   type: object
   properties:
     client_secret:
+      title: Client secret
       type: string
       description: Application secret, resolved from an environment reference.
     access_token:
+      title: Access token
       type: string
       description: User token authorising the webhook subscriptions and sends.
     listener:
+      title: Listener
       type: object
       description: >-
         The local address the webhook listener binds. The platform must reach
         it over public HTTPS (a reverse proxy or tunnel in front of it).
       properties:
         host:
+          title: Host
           type: string
           description: Interface to bind, for example `127.0.0.1`.
         port:
+          title: Port
           type: integer
           minimum: 0
           maximum: 65535
@@ -60,11 +66,13 @@ settings_schema:
         - port
       additionalProperties: false
     public_key:
+      title: Public key
       type: string
       description: >-
         The platform's webhook signing key as a PEM public key. Absent, it is
         fetched once at preparation from the platform's public-key endpoint.
     channels:
+      title: Channels
       type: array
       description: >-
         The broadcaster user identifiers whose events are ingested; an
@@ -72,17 +80,20 @@ settings_schema:
       items:
         type: string
     companion_name:
+      title: Companion name
       type: string
       description: >-
         The name viewers use to address the companion, also its account name
         on the platform (anti-echo). Configuration owns this value; the
         default trigger policy below refers to it by token only.
     bot_user_id:
+      title: Bot user ID
       type: string
       description: >-
         The companion's own account identifier, when known; a message it
         authored is dropped before anything else (anti-echo).
     notices:
+      title: Notices
       type: object
       description: >-
         Community notices (R1). Absent or empty, only chat messages are
@@ -91,6 +102,7 @@ settings_schema:
         ignored and counted.
       properties:
         kinds:
+          title: Kinds
           type: array
           description: The notice kinds this module ingests (default none).
           items:
@@ -102,17 +114,22 @@ settings_schema:
               - follow
       additionalProperties: false
     dedup:
+      title: Deduplication
       type: object
       description: >-
         The bounded window of delivery message identifiers; a delivery whose
         identifier is still retained is refused as a duplicate.
       properties:
         max_entries:
+          title: Max entries
+          default: 4096
           type: integer
           minimum: 1
           maximum: 100000
           description: How many identifiers are retained. Default 4096.
         window_seconds:
+          title: Window seconds
+          default: 600
           type: integer
           minimum: 300
           maximum: 86400

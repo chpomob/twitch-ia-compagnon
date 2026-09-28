@@ -43,18 +43,22 @@ lifecycle:
 # point hands every enabled module is accepted so the binary bound can be
 # tightened to the attachment store's `max_object_bytes`.
 settings_schema:
+  title: Proxy settings
   type: object
   properties:
     listen:
+      title: Listen
       type: object
       description: >-
         Where the WebSocket server listens. A non-loopback `host` is refused
         at validation unless `tls` is configured (R6).
       properties:
         host:
+          title: Host
           type: string
           description: Interface to bind; loopback unless `tls` is configured.
         port:
+          title: Port
           type: integer
           minimum: 1
           maximum: 65535
@@ -63,26 +67,31 @@ settings_schema:
         - host
         - port
     tls:
+      title: TLS
       type: object
       description: >-
         Certificate and private key the listener serves; required for a
         non-loopback `listen.host`. Reference the files, never inline them.
       properties:
         certfile:
+          title: Certificate file
           type: string
           description: Path of the PEM certificate chain.
         keyfile:
+          title: Key file
           type: string
           description: Path of the PEM private key.
       required:
         - certfile
         - keyfile
     pairing_token:
+      title: Pairing token
       type: string
       description: >-
         The shared secret an agent presents in `hello`, compared in constant
         time; resolved from an environment reference.
     actions:
+      title: Actions
       type: array
       items:
         type: string
@@ -91,12 +100,16 @@ settings_schema:
         by a manifest of the catalog (enabled or not), and none may also have
         a local provider.
     max_frame_bytes:
+      title: Max frame bytes
+      default: 1048576
       type: integer
       minimum: 1
       description: >-
         The largest text frame accepted; a larger one is refused
         `frame_too_large` and the connection closed 4413. Default 1048576.
     max_attachment_bytes:
+      title: Max attachment bytes
+      default: 5242880
       type: integer
       minimum: 1
       description: >-
@@ -104,16 +117,22 @@ settings_schema:
         every `call` and in `welcome`; bounded further by the store's
         `max_object_bytes`. Default 5242880.
     heartbeat_seconds:
+      title: Heartbeat seconds
+      default: 15
       type: number
       minimum: 0
       description: Interval between the `ping` frames sent to the agent. Default 15.
     heartbeat_timeout_seconds:
+      title: Heartbeat timeout seconds
+      default: 10
       type: number
       minimum: 0
       description: >-
         How long a `pong` may take before the connection is treated as
         dropped. Default 10.
     late_result_seconds:
+      title: Late result seconds
+      default: 60
       type: number
       minimum: 0
       description: >-
@@ -121,6 +140,7 @@ settings_schema:
         `observation` for it is recognised as late rather than unknown; both
         are ignored and counted. Default 60.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every
