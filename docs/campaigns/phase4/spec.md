@@ -294,27 +294,66 @@ static constraints.
     "accepted" outcome (above), the "in sync"/"differs" drift states and AC30/AC32/AC33 depend on
     `state` being `ready`; no other value is ever accepted.
   - `modules`: JSON object (the per-module container) keyed by module name — each key a
-    non-empty string naming one module enabled in the configuration the process loaded, one
-    entry per enabled module, possibly none. Each value is a JSON object with the required field
-    `state`, a string whose permitted values are exactly `ready` and `degraded` (the module's
-    last ready/degraded transition as reported by its health owner).
+    non-empty string, possibly no key at all. Each value is a JSON object with the required
+    field `state`, a string whose permitted values are exactly `ready` and `degraded`. The
+    publisher fills it with exactly one entry per module enabled in the configuration it loaded,
+    each holding that module's last ready/degraded transition as reported by its health owner
+    (a publisher obligation, below).
   Keys other than the required ones, at the top level or inside a module entry, are ignored:
   never displayed, never used to classify or compare. A usable record's process is **dead**
   when no process with its `pid` exists (a signal-0 probe fails with "no such process"; success
   or "permission denied" means alive) or, when that `pid` is the child this UI launched, when
   the UI has observed that child's exit — the UI's own child handle is authoritative for its
   child. A record of a dead process yields drift "unknown" and no per-module running state.
-  Unusable status record — the classification rule: a record is **usable** only if it satisfies
-  every requirement of the status record format above; anything else is **unusable** — a file
-  present at the status path that cannot be read (I/O or permission error, or not a regular
-  file), exceeds 1 MiB, is not UTF-8, is not a single JSON text, has a duplicate key, is JSON
-  but not an object, lacks any required field (`version`, `pid`, `started_at`, `published_at`,
-  `sequence`, `digest`, `state`, `modules`), holds a field of the wrong type (e.g. a pid that
-  is the string `"123"`, a sequence of `1.5`, a timestamp that is not a string), holds a value
-  outside its permitted set or range (e.g. `version` `2`, `pid` `0`, a timestamp with an offset
-  other than `Z` or an impossible date, a digest in uppercase or of the wrong length, a `state`
-  other than `ready`), or has a malformed container (`modules` not an object, an empty key, an
-  entry that is not an object, lacks `state`, or has a `state` other than `ready`/`degraded`).
+  The status record's requirements fall into two groups, and only the first is checked by
+  the reader (the UI):
+  - **Reader-verifiable validity** — the checks the UI performs from the record alone plus
+    what it can observe itself: the file is readable, a regular file, at most 1 MiB, UTF-8, a
+    single JSON text with no duplicate key and no `NaN`/`Infinity`; the top level is an object
+    carrying every required field (`version`, `pid`, `started_at`, `published_at`, `sequence`,
+    `digest`, `state`, `modules`); every field has its type, format, range and permitted value
+    set as stated above; and the per-module container has its internal shape (an object, every
+    key a non-empty string, every entry an object whose `state` is `ready` or `degraded`). A
+    record is **usable** if and only if it passes every reader-verifiable validity check.
+    Beyond classification the UI makes two further reader-side observations on a usable record,
+    neither of which makes it unusable: it compares `digest` with the on-disk digest it
+    recomputes itself from the base and overlay files it can read (drift: in sync / differs),
+    and it probes the process identity for liveness (a dead process, as defined above, yields
+    drift "unknown" and no per-module running state).
+  - **Publisher obligations** — properties the publishing main process must guarantee but a
+    reader cannot re-derive, because it has no access to what that process actually loaded or
+    did (A5 permits a main process started outside the UI): `pid` is the writer's own pid;
+    `started_at` was taken once before loading the configuration and is identical in all of
+    that process's records; `sequence` starts at `1` and strictly increases per process
+    identity; `published_at` is the actual write time; `digest` is the shared digest function
+    applied to the configuration that process actually loaded (not to the files as they are on
+    disk later); `state` `ready` is written only after the process reported readiness; the
+    per-module container holds exactly the modules enabled in the configuration that process
+    loaded, each with its last reported transition; and every replacement is atomic. These are
+    requirements on the publisher (`core.main` `run`), verified against the publishing side in
+    tests (AC33, AC34, AC43). The reader is never asked to verify them and does not attempt to:
+    it neither classifies a record unusable nor alters its display because, for example, the
+    container's keys differ from the modules enabled on disk (they legitimately differ whenever
+    drift is "differs"). For a usable record the UI trusts the publisher for exactly these
+    properties, and its behaviour depends on that trust in these places: drift "in sync" and
+    Apply's "accepted" rely on `digest` describing the configuration the process loaded; the
+    per-module running state R4 shows relies on the container describing that process's
+    enabled modules — a module page whose module has no entry in the container shows "not
+    reported by the running process" and no running state, and an entry naming a module that
+    has no page is not displayed; the "record's time" relies on `published_at`.
+  Unusable status record — the classification rule: a record is **unusable** when it fails any
+  reader-verifiable validity check — a file present at the status path that cannot be read (I/O
+  or permission error, or not a regular file), exceeds 1 MiB, is not UTF-8, is not a single JSON
+  text, has a duplicate key, is JSON but not an object, lacks any required field (`version`,
+  `pid`, `started_at`, `published_at`, `sequence`, `digest`, `state`, `modules`), holds a field
+  of the wrong type (e.g. a pid that is the string `"123"`, a sequence of `1.5`, a timestamp
+  that is not a string), holds a value outside its permitted set or range (e.g. `version` `2`,
+  `pid` `0`, a timestamp with an offset other than `Z` or an impossible date, a digest in
+  uppercase or of the wrong length, a `state` other than `ready`), or has a malformed container
+  (`modules` not an object, an empty key, an entry that is not an object, lacks `state`, or has
+  a `state` other than `ready`/`degraded`). A breach of a publisher obligation that no
+  reader-verifiable check reveals is a defect of the publisher, caught by the publishing-side
+  tests, not a reason for the reader to reclassify the record.
   An unusable record is never silently repaired (no coercion of `"123"` to `123`, no defaulting
   of a missing field, no truncation or case-folding of a digest), never partially trusted (no
   field of it — pid, digest, module states or time — is displayed or used, even the fields that
@@ -519,11 +558,12 @@ static constraints.
   digest and sequence `s1`; when M's health owner then reports degraded, the record is replaced
   and shows M degraded, N ready and a sequence `s2 > s1`; when M reports ready again, the record
   shows M ready with `s3 > s2` — 3 transitions, 3 distinct published records, each observed in
-  order. Each of the 3 records is classified usable by the R7 rule: `version` `1`, `pid` equal to
-  the process's pid, the same `started_at` in all 3, `published_at` a timestamp, `s1` = `1`,
-  `digest` equal to the on-disk digest the UI computes for the same base and overlay, `state`
-  `ready`, and `modules` with exactly the keys M and N. `run` without the variable writes no
-  file.
+  order. Each of the 3 records passes the UI's reader-verifiable validity checks (R7) and is
+  classified usable, and the publisher obligations hold, checked on the publishing side: `version`
+  `1`, `pid` equal to the process's pid, the same `started_at` in all 3, `published_at` a
+  timestamp, `s1` = `1`, `digest` equal to the on-disk digest the UI computes for the same base
+  and overlay, `state` `ready`, and `modules` with exactly the keys M and N. `run` without the
+  variable writes no file.
 - AC34 (R7): A record replacement interrupted after the new content is prepared but before it
   replaces the file (simulated failure) leaves the previous record intact and parseable; a
   reader repeatedly parsing the status path during the 3 transitions of AC33 never parses a
@@ -590,6 +630,26 @@ static constraints.
   of an exited process shows drift "unknown" and no per-module running state. With a fake
   launch argv whose child writes V with its own pid but `state` `"starting"`, or V with a pid
   other than its own, Apply reports unknown after a window shortened to 1 s, never accepted.
+- AC42 (R7): Reader side — the UI never verifies a publisher obligation. With on-disk
+  `enabled_modules` `[M, N]` (both discovered), each of these records, all passing every
+  reader-verifiable validity check and whose digest equals the on-disk digest, is classified
+  usable and shows drift "in sync" with no "unusable" status: V of AC40 with `modules` `{}`;
+  V with `modules` `{"M": {"state": "ready"}, "Z": {"state": "degraded"}}` where Z is neither
+  enabled nor discovered; V with `sequence` `7`; and V with a `started_at` later than its
+  `published_at`. For each, M's page shows the entry's state when M has one and otherwise "not
+  reported by the running process" with no running state; N's page shows "not reported by the
+  running process"; Z's state appears on no page. With the same records but a digest differing
+  from the on-disk digest, drift is "differs", never "unknown" or "unusable".
+- AC43 (R7): Publisher side — the per-module container and the digest describe the
+  configuration the process loaded, not the files on disk. `run` with the status-file variable
+  set, fixture modules M, N and P all discovered, a base enabling M, N and P and an overlay
+  setting `enabled_modules` to `[M, N]`: the first record's `modules` has exactly the keys M and
+  N (not P) and its `digest` equals the shared digest function applied to that base and overlay.
+  The test then rewrites the overlay on disk to enable only M and changes one of M's settings,
+  without restarting; when N's health owner reports degraded, the next record still has exactly
+  the keys M and N (N degraded), the same `started_at` and `digest` as the first, and a greater
+  `sequence` — and the UI reading it reports drift "differs". A second `run` whose loaded
+  configuration enables no module publishes `modules` `{}`.
 
 ## Test failure allowlist
 
