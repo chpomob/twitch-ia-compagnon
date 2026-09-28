@@ -16,32 +16,57 @@ request bridge (:func:`_to_ui_request`, :func:`_dispatch`) runs it on the
 dedicated ``config-ui`` thread pool (D8).
 
 The module is split into delimited sections (D3): settings and startup
-checks, authorities, the request core, the socket-free event loop (D7), the
-request bridge and the entry point.
+checks, authorities, the configuration model, the redaction guard (R8), the
+rendering helpers (R9), the request core and its pages, the socket-free event
+loop (D7), the request bridge and the entry point. No section names a module:
+every page lists or renders what discovery found (A2).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import hmac
 import html
 import ipaddress
+import json
 import logging
+import os
 import secrets
 import selectors
 import sys
 import threading
+import weakref
+from contextvars import ContextVar
 from collections import OrderedDict
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import parse_qsl
 
+import yaml
+
+from core.actions import ANY_ACTION
+from core.bus import EventBus
+from core.loader import DiscoveredModule, ModuleLoader, ModuleLoadError, _validate_manifest
+from core.main import (
+    _ENV_REFERENCE,
+    ACTIONS_KEY,
+    LIMIT_DECLARATION,
+    LIMIT_KIND_COUNT,
+    MODULES_DIRECTORY_BUILTIN,
+    SECRETS_KEY,
+    _builtin_modules_directory,
+)
 from core.overlay import (
+    OverlayError,
+    deep_merge,
     default_status_path,
+    read_base,
+    read_overlay,
     resolve_overlay_path,
     same_file,
     status_path_collision,
@@ -49,6 +74,7 @@ from core.overlay import (
 
 __all__ = [
     "ConfigUI",
+    "ConfigView",
     "UIRequest",
     "UIResponse",
     "UISettings",
@@ -302,6 +328,541 @@ def _origin_authority(origin: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Configuration model (R2, R4, R8, A3, A9, D6)
+#
+# One immutable snapshot of the configuration as the files on disk describe
+# it: the base and the overlay raw, their merge, the modules discovered from
+# the merged ``modules_directory`` through the loader's own discovery (D6),
+# every ``${NAME}`` the two files reference, and the secret set the
+# redaction guard hides. Nothing here resolves a reference into a page.
+# ---------------------------------------------------------------------------
+
+ORIGIN_OVERLAY = "overlay"
+ORIGIN_BASE = "base"
+ORIGIN_DEFAULT = "default-not-set"
+ORIGIN_REFERENCE = "environment reference"
+
+HIDDEN_LITERAL = "literal value configured (hidden)"
+READ_ONLY_REASON = (
+    "read-only in v1: editing could widen the authorized actions / expose secrets"
+)
+LOCAL_ONLY_STATEMENT = (
+    "This configuration UI is local-only: it edits the configuration files of "
+    "this machine and is never a remote administration channel."
+)
+
+_MISSING: Any = object()
+
+
+def _lookup(document: Any, path: Sequence[Any]) -> Any:
+    """The value at *path* inside *document*, or :data:`_MISSING`."""
+
+    node = document
+    for segment in path:
+        if isinstance(node, Mapping):
+            if segment not in node:
+                return _MISSING
+            node = node[segment]
+        elif isinstance(node, list) and isinstance(segment, int):
+            if not 0 <= segment < len(node):
+                return _MISSING
+            node = node[segment]
+        else:
+            return _MISSING
+    return node
+
+
+def reference_name(value: Any) -> str | None:
+    """The variable a whole-string ``${NAME}`` reference names, else ``None``."""
+
+    if isinstance(value, str):
+        match = _ENV_REFERENCE.fullmatch(value)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _referenced(document: Any) -> list[str]:
+    """Every ``${NAME}`` in *document*, as a value or as a mapping key.
+
+    A pure walk, safe on aliased or recursive YAML; order of first sight.
+    """
+
+    found: dict[str, None] = {}
+    pending: list[Any] = [document]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        name = reference_name(item)
+        if name is not None:
+            found.setdefault(name)
+            continue
+        if isinstance(item, (Mapping, list)):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            if isinstance(item, Mapping):
+                for key, value in reversed(list(item.items())):
+                    pending.append(value)
+                    pending.append(key)
+            else:
+                pending.extend(reversed(item))
+    return list(found)
+
+
+def _discover_valid(directory: Path) -> dict[str, DiscoveredModule]:
+    """The modules of *directory* whose manifest loads, skipping the others.
+
+    The fallback when :meth:`ModuleLoader._discover` refuses the directory as
+    a whole; it applies the same candidate rules, one manifest at a time.
+    """
+
+    discovered: dict[str, DiscoveredModule] = {}
+    try:
+        children = sorted(directory.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return discovered
+    for child in children:
+        manifest_path = child / "module.yaml"
+        try:
+            if child.is_symlink() or not child.is_dir() or not manifest_path.is_file():
+                continue
+            resolved = child.resolve(strict=True)
+            if resolved.parent != directory:
+                continue
+            with manifest_path.open("r", encoding="utf-8") as stream:
+                manifest = yaml.safe_load(stream)
+            declaration = _validate_manifest(child.name, manifest)
+        except (OSError, yaml.YAMLError, ModuleLoadError):
+            continue
+        name = declaration.manifest["name"]
+        if name in discovered:
+            continue
+        discovered[name] = DiscoveredModule(
+            name=name, directory=resolved, manifest=declaration.manifest, declaration=declaration
+        )
+    return discovered
+
+
+def _literals(document: Any) -> list[str]:
+    """Every non-reference scalar in *document*, as text (booleans excluded)."""
+
+    found: list[str] = []
+    pending: list[Any] = [document]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, (Mapping, list)):
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            pending.extend(item.values() if isinstance(item, Mapping) else item)
+        elif isinstance(item, (str, int, float)) and not isinstance(item, bool):
+            if reference_name(item) is None:
+                found.append(str(item))
+    return found
+
+
+def _file_state(path: Path | None) -> tuple[bool, str | None, int | None]:
+    """Whether *path* exists, the SHA-256 of its bytes and its mtime (ns)."""
+
+    if path is None:
+        return False, None, None
+    try:
+        data = path.read_bytes()
+        mtime = path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return False, None, None
+    except OSError:
+        return True, None, None
+    return True, hashlib.sha256(data).hexdigest(), mtime
+
+
+@dataclass(frozen=True)
+class ConfigView:
+    """A snapshot of the configuration the UI renders (R4, R8).
+
+    ``overlay_digest`` and ``overlay_mtime_ns`` describe the overlay bytes the
+    snapshot was read from, so a save can detect a file changed underneath it.
+    ``diagnostics`` are value-free: a file that cannot be read or a manifest
+    that cannot be discovered is reported, never quoted, and the pages still
+    render.
+    """
+
+    base_path: Path
+    overlay_path: Path | None
+    overlay_exists: bool
+    overlay_digest: str | None
+    overlay_mtime_ns: int | None
+    base: Mapping[str, Any]
+    overlay: Mapping[str, Any]
+    merged: Mapping[str, Any]
+    modules_directory: Path | None
+    modules: Mapping[str, DiscoveredModule]
+    references: Mapping[str, bool]
+    secret_values: frozenset[str]
+    diagnostics: tuple[str, ...] = ()
+
+    @classmethod
+    def load(cls, settings: UISettings, environ: Mapping[str, str]) -> ConfigView:
+        """Read both files, merge them, discover modules and collect secrets."""
+
+        diagnostics: list[str] = []
+        base_path = settings.base_path
+        overlay_path = settings.overlay_path
+        try:
+            base: Mapping[str, Any] = read_base(base_path)
+        except OverlayError as exc:
+            diagnostics.append(str(exc))
+            base = {}
+        exists, digest, mtime = _file_state(overlay_path)
+        try:
+            overlay = read_overlay(overlay_path)
+        except OverlayError as exc:
+            diagnostics.append(str(exc))
+            overlay = {}
+        merged = deep_merge(base, overlay)
+
+        modules_directory = cls._modules_directory(base_path, merged, environ, diagnostics)
+        modules: dict[str, DiscoveredModule] = {}
+        complete = True
+        if modules_directory is not None:
+            try:
+                modules = dict(ModuleLoader(EventBus(), modules_directory)._discover())
+            except ModuleLoadError as exc:
+                diagnostics.extend(exc.diagnostics)
+                # One bad manifest must not hide the credential paths of the
+                # valid ones: the secret set is built from what still loads.
+                modules = _discover_valid(modules_directory)
+                complete = False
+
+        names = _referenced(base)
+        names.extend(name for name in _referenced(overlay) if name not in names)
+        references = {name: name in environ for name in names}
+
+        secret_values: set[str] = set()
+        for name in names:
+            if name in environ:
+                secret_values.add(environ[name])
+        for document in (base, overlay):
+            listed = _lookup(document, (SECRETS_KEY,))
+            for entry in listed if isinstance(listed, list) else ():
+                name = reference_name(entry)
+                if name is not None and name in environ:
+                    secret_values.add(environ[name])
+        for name, module in modules.items():
+            declaration = module.declaration
+            for credential in declaration.credentials if declaration is not None else ():
+                for document in (base, overlay):
+                    literal = _lookup(document, ("modules", name, *credential))
+                    if literal is _MISSING or literal is None or isinstance(literal, bool):
+                        continue
+                    if isinstance(literal, (str, int, float)) and reference_name(literal) is None:
+                        secret_values.add(str(literal))
+        if not complete:
+            # A module whose manifest did not load has unknown credential
+            # paths: every literal under its settings is treated as one.
+            for document in (base, overlay):
+                settings_by_module = document.get("modules")
+                if not isinstance(settings_by_module, Mapping):
+                    continue
+                for name, module_settings in settings_by_module.items():
+                    if name not in modules:
+                        secret_values.update(_literals(module_settings))
+
+        return cls(
+            base_path=base_path,
+            overlay_path=overlay_path,
+            overlay_exists=exists,
+            overlay_digest=digest,
+            overlay_mtime_ns=mtime,
+            base=base,
+            overlay=overlay,
+            merged=merged,
+            modules_directory=modules_directory,
+            modules=modules,
+            references=references,
+            secret_values=frozenset(value for value in secret_values if value),
+            diagnostics=tuple(diagnostics),
+        )
+
+    @staticmethod
+    def _modules_directory(
+        base_path: Path,
+        merged: Mapping[str, Any],
+        environ: Mapping[str, str],
+        diagnostics: list[str],
+    ) -> Path | None:
+        """The merged ``modules_directory``, resolved as the runtime resolves it."""
+
+        raw = merged.get("modules_directory")
+        name = reference_name(raw)
+        if name is not None:
+            raw = environ.get(name)
+        if raw == MODULES_DIRECTORY_BUILTIN:
+            try:
+                return _builtin_modules_directory()
+            except Exception:
+                diagnostics.append("modules_directory: the shipped modules package is not available")
+                return None
+        if not isinstance(raw, str) or not raw.strip():
+            diagnostics.append("modules_directory: is not configured")
+            return None
+        try:
+            directory = Path(raw).expanduser()
+            if not directory.is_absolute():
+                directory = base_path.expanduser().resolve().parent / directory
+            return directory.resolve()
+        except (OSError, RuntimeError, ValueError):
+            diagnostics.append("modules_directory: must be a valid path")
+            return None
+
+    # -- queries --------------------------------------------------------------
+
+    def origin(self, path: Sequence[Any]) -> str:
+        """``overlay``, else ``base``, else ``default-not-set`` for *path*."""
+
+        if _lookup(self.overlay, path) is not _MISSING:
+            return ORIGIN_OVERLAY
+        if _lookup(self.base, path) is not _MISSING:
+            return ORIGIN_BASE
+        return ORIGIN_DEFAULT
+
+    def value(self, path: Sequence[Any]) -> Any:
+        """The merged, unresolved value at *path*, or :data:`_MISSING`."""
+
+        return _lookup(self.merged, path)
+
+    def is_credential(self, path: Sequence[Any]) -> bool:
+        """Whether *path* is a declared credential of a discovered module."""
+
+        if len(path) < 3 or path[0] != "modules":
+            return False
+        module = self.modules.get(path[1])
+        if module is None or module.declaration is None:
+            return False
+        return tuple(path[2:]) in module.declaration.credentials
+
+    def display(self, path: Sequence[Any]) -> str | None:
+        """The text shown for the value at *path*; ``None`` when not configured.
+
+        A ``${NAME}`` reference is shown as itself, never resolved; a literal
+        at a credential path is never shown at all.
+        """
+
+        value = self.value(path)
+        if value is _MISSING:
+            return None
+        name = reference_name(value)
+        if name is not None:
+            return f"${{{name}}}"
+        if self.is_credential(path):
+            return HIDDEN_LITERAL
+        return _plain(value)
+
+    def enabled_modules(self) -> list[str]:
+        """The merged ``enabled_modules`` names, in order."""
+
+        listed = self.merged.get("enabled_modules")
+        if not isinstance(listed, list):
+            return []
+        return [name for name in listed if isinstance(name, str)]
+
+    def rules(self) -> list[Any]:
+        """The merged ``actions`` rules, unresolved."""
+
+        rules = self.merged.get(ACTIONS_KEY)
+        return list(rules) if isinstance(rules, list) else []
+
+    def uncovered_actions(self) -> list[tuple[str, str]]:
+        """``(action, module)`` for each action an enabled module declares
+        that no rule covers: none has an equal ``action_name`` or omits it."""
+
+        rules = [rule for rule in self.rules() if isinstance(rule, Mapping)]
+        uncovered: list[tuple[str, str]] = []
+        for name in self.enabled_modules():
+            module = self.modules.get(name)
+            if module is None or module.declaration is None:
+                continue
+            for spec in module.declaration.actions:
+                if not any(
+                    rule.get("action_name", ANY_ACTION) in (ANY_ACTION, None, spec.name)
+                    for rule in rules
+                ):
+                    uncovered.append((spec.name, name))
+        return uncovered
+
+
+def _plain(value: Any) -> str:
+    """A configured value as text: strings as-is, anything else as JSON."""
+
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Redaction guard (R8)
+#
+# Defence in depth: the renderers never place a secret-set value in a page
+# (credentials and references are shown as ``${NAME}`` or as
+# :data:`HIDDEN_LITERAL`); this guard replaces each secret-set value by
+# ``[hidden]`` anyway, in every configured value as :func:`esc` renders it
+# and in every log record. It works on values before they are serialized,
+# never on the finished body or headers, so a secret that happens to equal a
+# path, a field name or any other piece of markup cannot rewrite it; the
+# structural identifiers that build paths and control names (module, limit
+# and variable names) go through :func:`ident`, which never redacts.
+# Only values of at least ``REDACT_MIN_LENGTH`` characters are replaced:
+# redacting a one-character secret such as ``"1"`` would mangle every page,
+# and a shorter secret is still never rendered because the renderers show
+# references only.
+# ---------------------------------------------------------------------------
+
+REDACT_MIN_LENGTH = 4
+REDACTED = "[hidden]"
+
+#: The UI answering the current request; :func:`esc` redacts its secret set
+#: as it stands when the value is rendered (the handler refreshes it first).
+_RENDERING_FOR: ContextVar[ConfigUI | None] = ContextVar("_RENDERING_FOR", default=None)
+
+
+def _redaction_forms(secret_values: Iterable[str]) -> list[str]:
+    """Every form a value can take in a response, longest first."""
+
+    forms: set[str] = set()
+    for value in secret_values:
+        if len(value) < REDACT_MIN_LENGTH:
+            continue
+        forms.add(value)
+        forms.add(html.escape(value, quote=True))
+    return sorted(forms, key=len, reverse=True)
+
+
+def _redact(text: str, secret_values: Iterable[str]) -> str:
+    """*text* with every secret-set value replaced by ``[hidden]``."""
+
+    for form in _redaction_forms(secret_values):
+        text = text.replace(form, REDACTED)
+    return text
+
+
+class _RedactionFilter(logging.Filter):
+    """Redacts the secret set of every live :class:`ConfigUI` from UI log records."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sources: weakref.WeakSet[ConfigUI] = weakref.WeakSet()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        values = [value for source in list(self.sources) for value in source.secret_values]
+        if values:
+            message = record.getMessage()
+            redacted = _redact(message, values)
+            if redacted != message:
+                record.msg, record.args = redacted, None
+        return True
+
+
+_LOG_REDACTION = _RedactionFilter()
+logger.addFilter(_LOG_REDACTION)
+
+
+# ---------------------------------------------------------------------------
+# Rendering (R4, R9)
+#
+# Every configured value goes through :func:`esc`; the CSS and the script are
+# inline constants, every form posts to a relative path and no page names an
+# external URL. No page is written for any module: the base page lists what
+# discovery found.
+# ---------------------------------------------------------------------------
+
+
+def esc(value: Any) -> str:
+    """HTML-escape *value* (quotes included), as text, secret-set values redacted."""
+
+    text = value if isinstance(value, str) else _plain(value)
+    source = _RENDERING_FOR.get()
+    if source is not None:
+        text = _redact(text, source.secret_values)
+    return html.escape(text, quote=True)
+
+
+def ident(name: str) -> str:
+    """HTML-escape a structural identifier, never redacted.
+
+    Module names (discovered directories), limit group and field names (the
+    declaration) and ``${NAME}`` variable names are markup: they build paths,
+    control names and ``data-`` hooks. Redacting one that happens to equal a
+    secret-set value would break a link or a form field, and none of them is
+    a configured value.
+    """
+
+    return html.escape(name, quote=True)
+
+
+_CSS = """
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0 auto; max-width: 60rem; padding: 1rem; line-height: 1.4; }
+table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+th, td { border-bottom: 1px solid #8884; padding: 0.3rem 0.5rem; text-align: left; vertical-align: top; }
+section { margin: 1.5rem 0; }
+.read-only { border-left: 4px solid #c90; padding-left: 0.75rem; }
+.reason, .origin, .kind { color: #777; font-size: 0.9em; }
+.diagnostics { color: #b00; }
+form.inline { display: inline; margin: 0; }
+code { font-family: ui-monospace, monospace; }
+"""
+
+_SCRIPT = """
+document.addEventListener("submit", function (event) {
+  var buttons = event.target.querySelectorAll("button");
+  for (var i = 0; i < buttons.length; i++) { buttons[i].disabled = true; }
+});
+"""
+
+
+def _csrf_field(session: _Session) -> str:
+    return f'<input type="hidden" name="{CSRF_FIELD}" value="{html.escape(session.csrf_token, quote=True)}">'
+
+
+def _page(title: str, session: _Session, body: str) -> UIResponse:
+    document = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<meta name=\"csrf-token\" content=\"{html.escape(session.csrf_token, quote=True)}\">"
+        f"<title>{esc(title)}</title><style>{_CSS}</style></head>"
+        f"<body>{body}<script>{_SCRIPT}</script></body></html>"
+    )
+    return UIResponse(
+        status=200, body=document.encode("utf-8"), content_type="text/html; charset=utf-8"
+    )
+
+
+def _diagnostics(view: ConfigView) -> str:
+    if not view.diagnostics:
+        return ""
+    items = "".join(f"<li>{esc(line)}</li>" for line in view.diagnostics)
+    return f'<section class="diagnostics" id="diagnostics"><h2>Diagnostics</h2><ul>{items}</ul></section>'
+
+
+def _state(is_set: bool) -> str:
+    return "set" if is_set else "unset"
+
+
+def _listing(value: Any) -> str:
+    """A rule field as escaped text, ${NAME} references left unresolved."""
+
+    if value is None:
+        return ""
+    if isinstance(value, Mapping):
+        return "<br>".join(f"{esc(_plain(key))}: {esc(item)}" for key, item in value.items())
+    if isinstance(value, list):
+        return ", ".join(esc(item) for item in value)
+    return esc(value)
+
+
+# ---------------------------------------------------------------------------
 # Request core (D2): guards, sessions, route table
 # ---------------------------------------------------------------------------
 
@@ -336,6 +897,9 @@ Handler = Callable[[UIRequest, _Session], UIResponse]
 
 #: Paths whose requests change state: POST only, Origin- and CSRF-checked.
 STATE_CHANGING_PATHS = frozenset({"/save", "/remove", "/check", "/apply"})
+
+#: Every discovered module's page lives under this prefix (R4b).
+MODULE_PAGE_PREFIX = "/module/"
 
 SESSION_COOKIE = "config_ui_session"
 CSRF_HEADER = "x-csrf-token"
@@ -383,8 +947,16 @@ class ConfigUI:
     mutation lock.
     """
 
-    def __init__(self, settings: UISettings) -> None:
+    def __init__(
+        self, settings: UISettings, *, environ: Mapping[str, str] | None = None
+    ) -> None:
         self.settings = settings
+        #: The UI process's own environment: "set/unset" is judged here, the
+        #: environment a UI-launched main process inherits (A3).
+        self.environ: Mapping[str, str] = os.environ if environ is None else environ
+        #: The secret set of the last configuration snapshot (R8).
+        self.secret_values: frozenset[str] = frozenset()
+        self._secrets_lock = threading.Lock()
         self.token = secrets.token_urlsafe(32)
         self.authorities = accepted_authorities(
             settings.host, settings.port, settings.allowed_hosts
@@ -395,8 +967,11 @@ class ConfigUI:
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._sessions_lock = threading.Lock()
         self._mutation_lock = threading.Lock()
+        _LOG_REDACTION.sources.add(self)
         self.routes: dict[str, tuple[frozenset[str], Handler]] = {
             "/": (frozenset({"GET"}), self._base_page),
+            "/core": (frozenset({"GET"}), self._core_page),
+            MODULE_PAGE_PREFIX: (frozenset({"GET"}), self._module_page),
             "/save": (frozenset({"POST"}), self._not_available),
             "/remove": (frozenset({"POST"}), self._not_available),
             "/check": (frozenset({"POST"}), self._not_available),
@@ -405,6 +980,16 @@ class ConfigUI:
 
     def __repr__(self) -> str:
         return f"ConfigUI(authority={self.access_authority!r})"
+
+    def view(self) -> ConfigView:
+        """Load a fresh configuration snapshot and remember its secret set."""
+
+        view = ConfigView.load(self.settings, self.environ)
+        # A union, so a snapshot loaded concurrently never drops a value an
+        # earlier one still rendered around (R8).
+        with self._secrets_lock:
+            self.secret_values = self.secret_values | view.secret_values
+        return view
 
     @property
     def access_authority(self) -> str:
@@ -454,9 +1039,17 @@ class ConfigUI:
     # -- the guard chain ----------------------------------------------------
 
     def handle(self, request: UIRequest) -> UIResponse:
-        """Answer one request; the guards run before any route handler."""
+        """Answer one request; the guards run before any route handler.
 
-        response = self._guarded(request)
+        Every configured value rendered for it passes the redaction guard
+        (R8): :func:`esc` redacts this UI's secret set.
+        """
+
+        token = _RENDERING_FOR.set(self)
+        try:
+            response = self._guarded(request)
+        finally:
+            _RENDERING_FOR.reset(token)
         return UIResponse(
             status=response.status,
             body=response.body,
@@ -496,6 +1089,8 @@ class ConfigUI:
             if presented is None or not _equal(presented, session.csrf_token):
                 return _text(403, _FORBIDDEN)
         route = self.routes.get(request.path)
+        if route is None and request.path.startswith(MODULE_PAGE_PREFIX):
+            route = self.routes.get(MODULE_PAGE_PREFIX)
         if route is None:
             return _text(404, "404 Not Found")
         methods, handler = route
@@ -508,14 +1103,207 @@ class ConfigUI:
 
     # -- route handlers (placeholders replaced by later steps) --------------
 
+    def _readiness(self, name: str) -> str:
+        """The readiness cell of module *name*: the last Check verdict (R4)."""
+
+        return "not checked yet"
+
     def _base_page(self, request: UIRequest, session: _Session) -> UIResponse:
-        page = (
-            "<!doctype html><html><head><meta charset=\"utf-8\">"
-            f"<meta name=\"csrf-token\" content=\"{html.escape(session.csrf_token)}\">"
-            "<title>Configuration</title></head>"
-            "<body><h1>Configuration</h1></body></html>"
+        """Every discovered module and the configuration's origin (R4a)."""
+
+        view = self.view()
+        enabled = view.enabled_modules()
+        rows: list[str] = []
+        for name in sorted(view.modules):
+            is_enabled = name in enabled
+            state = "enabled" if is_enabled else "disabled"
+            rows.append(
+                f'<tr data-module="{ident(name)}" data-enabled="{str(is_enabled).lower()}">'
+                f'<td><a href="{MODULE_PAGE_PREFIX}{ident(name)}">{ident(name)}</a></td>'
+                f"<td>{state}"
+                f'<form class="inline" method="post" action="/save">{_csrf_field(session)}'
+                f'<input type="hidden" name="enabled_modules.{ident(name)}" '
+                f'value="{str(not is_enabled).lower()}">'
+                f'<button type="submit">{"Disable" if is_enabled else "Enable"}</button>'
+                "</form></td>"
+                f'<td class="readiness">{esc(self._readiness(name))}</td></tr>'
+            )
+        missing = [name for name in enabled if name not in view.modules]
+        missing_note = (
+            "<p class=\"diagnostics\">Enabled but not discovered: "
+            + ", ".join(f"<code>{esc(name)}</code>" for name in missing)
+            + "</p>"
+            if missing
+            else ""
         )
-        return UIResponse(status=200, body=page.encode("utf-8"), content_type="text/html; charset=utf-8")
+        variables = "".join(
+            f'<tr data-variable="{ident(name)}" data-state="{_state(is_set)}">'
+            f"<td><code>${{{ident(name)}}}</code></td><td>{_state(is_set)}</td></tr>"
+            for name, is_set in view.references.items()
+        )
+        overlay_state = "exists" if view.overlay_exists else "absent"
+        overlay_text = "(none)" if view.overlay_path is None else str(view.overlay_path)
+        body = (
+            "<h1>Configuration</h1>"
+            f'<p class="local-only" id="local-only">{esc(LOCAL_ONLY_STATEMENT)}</p>'
+            f"{_diagnostics(view)}"
+            '<section id="origin"><h2>Configuration origin</h2><table>'
+            f'<tr><th>Base file</th><td id="base-path"><code>{esc(str(view.base_path))}</code></td></tr>'
+            f'<tr><th>Overlay file</th><td id="overlay-path"><code>{esc(overlay_text)}</code> '
+            f'<span id="overlay-state">({overlay_state})</span></td></tr>'
+            "</table><h3>Referenced environment variables</h3>"
+            f'<table id="variables"><tr><th>Variable</th><th>State</th></tr>{variables}</table>'
+            "</section>"
+            '<section id="modules"><h2>Modules</h2>'
+            "<table><tr><th>Module</th><th>Enabled</th><th>Readiness</th></tr>"
+            f"{''.join(rows)}</table>{missing_note}</section>"
+            '<section id="actions-bar">'
+            '<p><a href="/core">Core settings</a></p>'
+            f'<form method="post" action="/check">{_csrf_field(session)}'
+            '<button type="submit">Check</button></form></section>'
+        )
+        return _page("Configuration", session, body)
+
+    def _core_page(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``modules_directory``, ``limits`` and, read-only, ``secrets`` and
+        ``actions`` (R4c, A2, A9)."""
+
+        view = self.view()
+        directory = view.display(("modules_directory",)) or ""
+        body = [
+            "<h1>Core settings</h1>",
+            '<p><a href="/">Back to the configuration</a></p>',
+            _diagnostics(view),
+            '<section id="modules-directory"><h2>Modules directory</h2>'
+            f'<form method="post" action="/save">{_csrf_field(session)}'
+            '<label>modules_directory '
+            f'<input type="text" name="modules_directory" value="{esc(directory)}"></label> '
+            f'<span class="origin">origin: {esc(self._origin(view, ("modules_directory",)))}</span> '
+            '<button type="submit">Save</button></form></section>',
+            self._limits_section(view, session),
+            self._secrets_section(view),
+            self._actions_section(view),
+        ]
+        return _page("Core settings", session, "".join(body))
+
+    @staticmethod
+    def _origin(view: ConfigView, path: Sequence[Any]) -> str:
+        """The origin shown for *path*; a ``${NAME}`` value is a reference."""
+
+        origin = view.origin(path)
+        if reference_name(view.value(path)) is not None:
+            return f"{ORIGIN_REFERENCE} ({origin})"
+        return origin
+
+    def _limits_section(self, view: ConfigView, session: _Session) -> str:
+        groups: list[str] = []
+        for group, fields in LIMIT_DECLARATION.items():
+            rows: list[str] = []
+            for field_name, kind in fields.items():
+                path = ("limits", group, field_name)
+                shown = view.display(path)
+                reference = reference_name(view.value(path)) is not None
+                if reference:
+                    control = 'type="text"'
+                elif kind == LIMIT_KIND_COUNT:
+                    control = 'type="number" min="1" step="1"'
+                else:
+                    control = 'type="number" min="0" step="any"'
+                rows.append(
+                    f'<tr data-limit="{ident(group)}.{ident(field_name)}">'
+                    f"<td><label>{ident(field_name)}</label></td>"
+                    f'<td class="kind">{ident(kind)}</td>'
+                    f'<td><input {control} name="limits.{ident(group)}.{ident(field_name)}" '
+                    f'value="{esc(shown or "")}"></td>'
+                    f'<td class="origin">{esc(self._origin(view, path))}</td></tr>'
+                )
+            groups.append(
+                f'<fieldset data-limit-group="{ident(group)}"><legend>{ident(group)}</legend>'
+                "<table><tr><th>Field</th><th>Kind</th><th>Value</th><th>Origin</th></tr>"
+                f"{''.join(rows)}</table></fieldset>"
+            )
+        return (
+            '<section id="limits"><h2>Limits</h2>'
+            f'<form method="post" action="/save">{_csrf_field(session)}'
+            f"{''.join(groups)}"
+            '<button type="submit">Save</button></form></section>'
+        )
+
+    def _secrets_section(self, view: ConfigView) -> str:
+        listed = view.value((SECRETS_KEY,))
+        entries = listed if isinstance(listed, list) else []
+        items: list[str] = []
+        for entry in entries:
+            name = reference_name(entry)
+            if name is None:
+                items.append(f"<li>{esc(HIDDEN_LITERAL)}</li>")
+            else:
+                is_set = view.references.get(name, name in self.environ)
+                items.append(
+                    f'<li data-secret="{ident(name)}"><code>${{{ident(name)}}}</code> '
+                    f"({_state(is_set)})</li>"
+                )
+        content = f"<ul>{''.join(items)}</ul>" if items else "<p>No entry.</p>"
+        return (
+            '<section id="secrets" class="read-only"><h2>Secrets</h2>'
+            f'<p class="reason">{esc(READ_ONLY_REASON)}</p>'
+            f'<p class="origin">origin: {esc(view.origin((SECRETS_KEY,)))}</p>'
+            f"{content}</section>"
+        )
+
+    def _actions_section(self, view: ConfigView) -> str:
+        rules = view.rules()
+        origin = view.origin((ACTIONS_KEY,))
+        rows: list[str] = []
+        for rule in rules:
+            if not isinstance(rule, Mapping):
+                rows.append(f'<tr data-rule="" data-origin="{esc(origin)}"><td colspan="7">invalid rule</td></tr>')
+                continue
+            rule_id = rule.get("rule_id", "")
+            action = rule.get("action_name", ANY_ACTION)
+            action_text = "any" if action in (ANY_ACTION, None) else _plain(action)
+            rows.append(
+                f'<tr data-rule="{esc(_plain(rule_id))}" data-origin="{esc(origin)}">'
+                f"<td><code>{esc(_plain(rule_id))}</code></td>"
+                f"<td>{esc(action_text)}</td>"
+                f"<td>{_listing(rule.get('destination'))}</td>"
+                f"<td>{_listing(rule.get('principals'))}</td>"
+                f"<td>{_listing(rule.get('natures'))}</td>"
+                f"<td>{_listing(rule.get('granted_permissions'))}</td>"
+                f'<td class="origin">{esc(origin)}</td></tr>'
+            )
+        uncovered = view.uncovered_actions()
+        uncovered_items = "".join(
+            f'<li data-uncovered="{esc(action)}"><code>{esc(action)}</code> '
+            f"(declared by {esc(module)})</li>"
+            for action, module in uncovered
+        )
+        uncovered_list = (
+            f'<ul id="uncovered">{uncovered_items}</ul>'
+            if uncovered
+            else '<p id="uncovered">Every declared action is covered by a rule.</p>'
+        )
+        return (
+            '<section id="actions" class="read-only"><h2>Action authorization rules</h2>'
+            f'<p class="reason">{esc(READ_ONLY_REASON)}</p>'
+            f'<p>Rules: <span id="rule-count" data-rule-count="{len(rules)}">{len(rules)}</span> '
+            f'<span class="origin">(origin: {esc(origin)})</span></p>'
+            "<table><tr><th>rule_id</th><th>action_name</th><th>destination</th>"
+            "<th>principals</th><th>natures</th><th>granted permissions</th><th>origin</th></tr>"
+            f"{''.join(rows)}</table>"
+            "<h3>Actions not covered by any rule</h3>"
+            f"{uncovered_list}</section>"
+        )
+
+    def _module_page(self, request: UIRequest, session: _Session) -> UIResponse:
+        """A discovered module's page; the settings controls are generated later."""
+
+        name = request.path[len(MODULE_PAGE_PREFIX) :]
+        view = self.view()
+        if name not in view.modules:
+            return _text(404, "404 Not Found")
+        body = f'<h1>Module {ident(name)}</h1><p><a href="/">Back to the configuration</a></p>'
+        return _page(f"Module {name}", session, body)
 
     def _not_available(self, request: UIRequest, session: _Session) -> UIResponse:
         return _text(501, "501 Not Implemented")

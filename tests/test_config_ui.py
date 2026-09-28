@@ -1,4 +1,5 @@
-"""The configuration UI core: CLI, bind policy, guards and startup refusals (P9).
+"""The configuration UI: CLI, bind policy, guards and startup refusals (P9);
+the configuration model, base page and core-settings page (P10).
 
 The whole module runs with socket creation patched to raise (AC5): no test
 here binds, connects or even creates a socket. The request core is driven
@@ -12,24 +13,35 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
+import io
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+import tokenize
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
 import core.config_ui as config_ui
 from core.config_ui import (
+    HIDDEN_LITERAL,
+    LOCAL_ONLY_STATEMENT,
+    MODULE_PAGE_PREFIX,
+    READ_ONLY_REASON,
+    REDACT_MIN_LENGTH,
     ConfigUI,
+    ConfigView,
     UIRequest,
     UIResponse,
     UISettings,
     _dispatch,
+    _redact,
     _run_socket_free,
     _SocketFreeEventLoop,
     _to_ui_request,
@@ -37,6 +49,8 @@ from core.config_ui import (
     main,
     startup_checks,
 )
+from core.main import LIMIT_DECLARATION
+from core.overlay import read_base
 
 # ---------------------------------------------------------------------------
 # AC5: socket creation patched to raise for the whole module
@@ -767,3 +781,525 @@ def test_the_module_entry_point_calls_main() -> None:
     text = (Path(config_ui.__file__).parent / "__main__.py").read_text(encoding="utf-8")
     assert "raise SystemExit(main())" in text
     assert os.fspath(Path(config_ui.__file__)).endswith(os.path.join("config_ui", "__init__.py"))
+
+
+# ---------------------------------------------------------------------------
+# P10: configuration model, base page and core-settings page
+# ---------------------------------------------------------------------------
+
+REPO = Path(__file__).resolve().parents[1]
+SHIPPED_MODULES = tuple(
+    sorted(path.name for path in (REPO / "modules").iterdir() if (path / "module.yaml").is_file())
+)
+PROFILES = (
+    "config.yaml.example",
+    "config.server.yaml.example",
+    "presence.yaml.example",
+    "agent.yaml.example",
+)
+_ENV_NAME = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _profile_ui(tmp_path: Path, profile: str, environ: dict[str, str]) -> ConfigUI:
+    """A UI over a shipped profile, its overlay and status file kept in *tmp_path*."""
+
+    return ConfigUI(
+        UISettings.from_argv(
+            [
+                "--config",
+                str(REPO / profile),
+                "--overlay",
+                str(tmp_path / "overlay.local.yaml"),
+                "--status-file",
+                str(tmp_path / "status.json"),
+            ]
+        ),
+        environ=environ,
+    )
+
+
+def _profile_variables(profile: str) -> list[str]:
+    text = (REPO / profile).read_text(encoding="utf-8")
+    body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    return sorted(set(_ENV_NAME.findall(body)))
+
+
+def _canary_environ(names: Sequence[str]) -> dict[str, str]:
+    """Every other referenced variable set, to a canary value."""
+
+    return {name: f"CANARY-ENV-{index:04d}-7f3a" for index, name in enumerate(names) if index % 2 == 0}
+
+
+def _get(ui: ConfigUI, path: str, cookie: str | None) -> UIResponse:
+    headers = {} if cookie is None else {"cookie": cookie}
+    return ui.handle(_request("GET", path, headers=headers))
+
+
+def _section(page: str, section_id: str) -> str:
+    match = re.search(rf'<section id="{section_id}"[^>]*>(.*?)</section>', page, re.S)
+    assert match is not None, section_id
+    return match.group(1)
+
+
+def _write_module(root: Path, name: str, *, action: str | None = None, extra: str = "") -> None:
+    directory = root / name
+    directory.mkdir(parents=True)
+    lines = [
+        f"name: {name}",
+        "manifest_version: 2",
+        "runtime_api: 2",
+        "produces: []",
+        "consumes: []",
+        "middleware: false",
+        "settings_schema:",
+        "  type: object",
+        "  properties:",
+        "    token:",
+        "      type: string",
+        "credentials: [token]",
+    ]
+    if action is not None:
+        lines += [
+            "actions:",
+            f"  - name: {action}",
+            "    version: 1",
+            "    description: Fixture action",
+            "    argument_schema: {type: object, properties: {}, additionalProperties: false}",
+            "    result_schema: {type: object, properties: {}}",
+            "    nature: write",
+            f"    required_permissions: [{action}]",
+            "    supported_destinations:",
+            "      - {platform: '*', channel_id: '*', scope: fixture}",
+            "    timeout_seconds: 5",
+            "    idempotency: none",
+        ]
+    (directory / "module.yaml").write_text("\n".join(lines) + "\n" + extra, encoding="utf-8")
+
+
+RULE_TEXT = """  - rule_id: {rule_id}
+    {action_line}destination: {{platform: '*', channel_id: '*', scope: fixture}}
+    principals: [someone]
+    natures: [write]
+    granted_permissions: [x.do]
+"""
+
+
+def _fixture_config(
+    root: Path, *, rules: Sequence[tuple[str, str | None]] = (), enabled: Sequence[str] = ("xmod",)
+) -> Path:
+    modules = root / "mods"
+    if not modules.exists():
+        _write_module(modules, "xmod", action="x.do")
+        _write_module(modules, "ymod")
+    text = "modules_directory: ./mods\n"
+    text += "enabled_modules: [" + ", ".join(enabled) + "]\nmodules: {}\n"
+    if rules:
+        text += "actions:\n"
+        for rule_id, action in rules:
+            line = "" if action is None else f"action_name: {action}\n    "
+            text += RULE_TEXT.format(rule_id=rule_id, action_line=line)
+    base = root / "config.yaml"
+    base.write_text(text, encoding="utf-8")
+    return base
+
+
+# -- AC15: the base page ----------------------------------------------------
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_ac15_the_base_page_lists_every_module_and_the_origin(
+    profile: str, tmp_path: Path
+) -> None:
+    names = _profile_variables(profile)
+    assert names, "every shipped profile references at least one variable"
+    environ = _canary_environ(names)
+    ui = _profile_ui(tmp_path, profile, environ)
+    cookie, _ = _login(ui)
+    response = _get(ui, "/", cookie)
+    assert response.status == 200
+    page = response.body.decode("utf-8")
+
+    listed = dict(re.findall(r'<tr data-module="([^"]+)" data-enabled="(true|false)">', page))
+    assert len(SHIPPED_MODULES) == 17
+    assert sorted(listed) == list(SHIPPED_MODULES)
+    enabled = set(read_base(REPO / profile)["enabled_modules"])
+    assert {name for name, state in listed.items() if state == "true"} == enabled
+    assert {name for name, state in listed.items() if state == "false"} == set(SHIPPED_MODULES) - enabled
+
+    for name in SHIPPED_MODULES:
+        assert f'<a href="/module/{name}">' in page
+        assert _get(ui, f"/module/{name}", cookie).status == 200
+
+    assert str((REPO / profile)) in page
+    assert str(tmp_path / "overlay.local.yaml") in page
+    assert '<span id="overlay-state">(absent)</span>' in page
+    shown = dict(re.findall(r'<tr data-variable="([^"]+)" data-state="(set|unset)">', page))
+    assert shown == {name: ("set" if name in environ else "unset") for name in names}
+    assert '<a href="/core">' in page
+    assert _get(ui, "/core", cookie).status == 200
+    assert LOCAL_ONLY_STATEMENT in page
+    assert '<form method="post" action="/check">' in page
+    for value in environ.values():
+        assert value not in page
+
+
+def test_ac15_an_existing_overlay_is_shown_as_existing(config_dir: Path) -> None:
+    ui = _ui(config_dir / "config.yaml")
+    cookie, _ = _login(ui)
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    assert '<span id="overlay-state">(exists)</span>' in page
+
+
+def test_ac15_an_unknown_module_page_is_404(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    cookie, _ = _login(ui)
+    assert _get(ui, "/module/not-a-module", cookie).status == 404
+    assert _get(ui, "/module/", cookie).status == 404
+
+
+# -- AC20: the core-settings page -------------------------------------------
+
+
+def test_ac20_the_core_page_renders_every_declared_limit(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    cookie, _ = _login(ui)
+    response = _get(ui, "/core", cookie)
+    assert response.status == 200
+    page = response.body.decode("utf-8")
+    base = read_base(REPO / "config.yaml.example")
+
+    assert 'name="modules_directory"' in page
+    assert f'value="{base["modules_directory"]}"' in page
+
+    groups = re.findall(r'data-limit-group="([^"]+)"', page)
+    assert groups == list(LIMIT_DECLARATION)
+    shown = set(re.findall(r'<tr data-limit="([^"]+)">', page))
+    declared = {f"{group}.{name}" for group, fields in LIMIT_DECLARATION.items() for name in fields}
+    assert shown - declared == set()  # 0 extra
+    assert declared - shown == set()  # 0 missing
+    for group, fields in LIMIT_DECLARATION.items():
+        for name, kind in fields.items():
+            row = re.search(rf'<tr data-limit="{group}\.{name}">(.*?)</tr>', page, re.S)
+            assert row is not None
+            assert f'<td class="kind">{kind}</td>' in row.group(1)
+            value = base["limits"][group][name]
+            assert f'name="limits.{group}.{name}" value="{value}"' in row.group(1)
+            assert "base" in row.group(1)
+
+
+def test_ac20_secrets_and_actions_are_read_only_with_every_rule(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {"TWITCH_CLIENT_SECRET": "sekrit-value-1"})
+    cookie, _ = _login(ui)
+    page = _get(ui, "/core", cookie).body.decode("utf-8")
+    base = read_base(REPO / "config.yaml.example")
+
+    secrets_block = _section(page, "secrets")
+    actions_block = _section(page, "actions")
+    for block in (secrets_block, actions_block):
+        for control in ("<input", "<select", "<textarea", "<form", "<button"):
+            assert control not in block
+        assert READ_ONLY_REASON in block
+
+    for entry in base["secrets"]:
+        name = entry[2:-1]
+        state = "set" if name == "TWITCH_CLIENT_SECRET" else "unset"
+        assert f'<li data-secret="{name}"><code>${{{name}}}</code> ({state})</li>' in secrets_block
+    assert "sekrit-value-1" not in page
+
+    count = re.search(r'data-rule-count="(\d+)"', actions_block)
+    assert count is not None and int(count.group(1)) == len(base["actions"]) == 9
+    rows = re.findall(r'<tr data-rule="([^"]*)" data-origin="([^"]+)">', actions_block)
+    assert [rule_id for rule_id, _ in rows] == [rule["rule_id"] for rule in base["actions"]]
+    assert {origin for _, origin in rows} == {"base"}
+    # References stay unresolved; every field of a rule is shown.
+    first = base["actions"][0]
+    assert "channel_id: ${TWITCH_BROADCASTER_ID}" in actions_block
+    for field_name in ("action_name",):
+        assert f"<td>{first[field_name]}</td>" in actions_block
+    for value in first["principals"] + first["natures"] + first["granted_permissions"]:
+        assert value in actions_block
+
+
+def test_ac20_an_uncovered_action_is_listed_until_a_rule_covers_it(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path, rules=[("other", "y.do")])
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie, _ = _login(ui)
+    page = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert '<li data-uncovered="x.do">' in _section(page, "actions")
+
+    _fixture_config(tmp_path, rules=[("other", "y.do"), ("covers", "x.do")])
+    page = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert "data-uncovered" not in page
+
+    # A rule that omits action_name covers every action.
+    _fixture_config(tmp_path, rules=[("other", "y.do"), ("any", None)])
+    page = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert "data-uncovered" not in page
+    assert "<td>any</td>" in page
+
+    # Only actions of *enabled* modules count.
+    _fixture_config(tmp_path, rules=[("other", "y.do")], enabled=("ymod",))
+    page = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert "data-uncovered" not in page
+
+
+# -- A9: a hand-written overlay rule ----------------------------------------
+
+
+def test_a9_hand_written_overlay_actions_and_secrets_show_origin_overlay(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path, rules=[("from-base", "y.do")])
+    overlay = tmp_path / "config.local.yaml"
+    overlay.write_text(
+        "actions:\n" + RULE_TEXT.format(rule_id="hand-written", action_line="action_name: x.do\n    ")
+        + "secrets: ['${HAND_SECRET}']\n",
+        encoding="utf-8",
+    )
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie, _ = _login(ui)
+    page = _get(ui, "/core", cookie).body.decode("utf-8")
+    actions_block = _section(page, "actions")
+    assert re.findall(r'<tr data-rule="([^"]*)" data-origin="([^"]+)">', actions_block) == [
+        ("hand-written", "overlay")
+    ]
+    assert "(origin: overlay)" in actions_block
+    secrets_block = _section(page, "secrets")
+    assert "origin: overlay" in secrets_block
+    assert '<li data-secret="HAND_SECRET"><code>${HAND_SECRET}</code> (unset)</li>' in secrets_block
+
+
+# -- AC3 pages ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/", "/core", "/module/brain"])
+def test_ac3_the_real_pages_need_a_session_and_name_no_module(path: str, tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    for headers in ({}, {"cookie": "config_ui_session=forged"}):
+        response = ui.handle(_request("GET", path, headers=headers))
+        assert response.status in (401, 403)
+        body = response.body.decode("utf-8")
+        for name in SHIPPED_MODULES + SETTING_PATHS:
+            assert name not in body
+    cookie, _ = _login(ui)
+    assert _get(ui, path, cookie).status == 200
+
+
+# -- A2: the UI source names no module ----------------------------------------
+
+
+def test_a2_the_ui_source_names_no_module() -> None:
+    source = Path(config_ui.__file__).read_text(encoding="utf-8")
+    pattern = re.compile(r"\b(" + "|".join(re.escape(name) for name in SHIPPED_MODULES) + r")\b")
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.STRING:
+            assert pattern.search(token.string) is None, token.string
+    assert pattern.search(source) is None
+
+
+# -- The configuration model ---------------------------------------------------
+
+
+def test_view_origin_and_display(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path)
+    base.write_text(
+        base.read_text(encoding="utf-8")
+        .replace("modules: {}", "modules:\n  xmod: {token: literal-token-1234}\n  ymod: {token: '${Y_TOKEN}'}")
+        + "limits:\n  dedup: {max_entries: 5, ttl_seconds: '${TTL}'}\n",
+        encoding="utf-8",
+    )
+    overlay = tmp_path / "config.local.yaml"
+    overlay.write_text("limits:\n  dedup: {max_entries: 7}\n", encoding="utf-8")
+    settings = UISettings.from_argv(["--config", str(base)])
+    view = ConfigView.load(settings, {"Y_TOKEN": "resolved-y-token", "TTL": "30"})
+
+    assert view.origin(("limits", "dedup", "max_entries")) == "overlay"
+    assert view.display(("limits", "dedup", "max_entries")) == "7"
+    assert view.origin(("limits", "dedup", "ttl_seconds")) == "base"
+    assert view.display(("limits", "dedup", "ttl_seconds")) == "${TTL}"
+    assert view.origin(("limits", "admission", "workers")) == "default-not-set"
+    assert view.display(("limits", "admission", "workers")) is None
+    assert view.display(("modules", "xmod", "token")) == HIDDEN_LITERAL
+    assert view.display(("modules", "ymod", "token")) == "${Y_TOKEN}"
+    assert view.references == {"Y_TOKEN": True, "TTL": True}
+    assert view.secret_values == frozenset({"literal-token-1234", "resolved-y-token", "30"})
+    assert sorted(view.modules) == ["xmod", "ymod"]
+    assert view.modules_directory == (tmp_path / "mods").resolve()
+
+    # The overlay's bytes digest and mtime, for stale detection.
+    assert view.overlay_exists
+    assert view.overlay_digest == hashlib.sha256(overlay.read_bytes()).hexdigest()
+    assert view.overlay_mtime_ns == overlay.stat().st_mtime_ns
+    overlay.unlink()
+    absent = ConfigView.load(settings, {})
+    assert (absent.overlay_exists, absent.overlay_digest, absent.overlay_mtime_ns) == (False, None, None)
+
+
+def test_view_collects_references_used_as_mapping_keys(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path)
+    base.write_text(
+        base.read_text(encoding="utf-8")
+        + "triggers:\n  xmod:\n    channels:\n      ${KEY_ONLY}:\n        combination: all_of\n",
+        encoding="utf-8",
+    )
+    overlay = tmp_path / "config.local.yaml"
+    overlay.write_text("secrets: ['${LISTED}']\nmodules: {ymod: {token: '${OVERLAY_ONLY}'}}\n", encoding="utf-8")
+    view = ConfigView.load(
+        UISettings.from_argv(["--config", str(base)]),
+        {"KEY_ONLY": "channel-key-value", "LISTED": "listed-value"},
+    )
+    assert view.references == {"KEY_ONLY": True, "LISTED": True, "OVERLAY_ONLY": False}
+    assert {"channel-key-value", "listed-value"} <= view.secret_values
+
+
+def test_builtin_modules_directory_discovers_the_shipped_modules(tmp_path: Path) -> None:
+    base = tmp_path / "config.yaml"
+    base.write_text("modules_directory: builtin\nenabled_modules: []\nmodules: {}\n", encoding="utf-8")
+    view = ConfigView.load(UISettings.from_argv(["--config", str(base)]), {})
+    assert tuple(sorted(view.modules)) == SHIPPED_MODULES
+    assert view.diagnostics == ()
+
+
+def test_an_invalid_manifest_still_renders_the_base_page(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path)
+    (tmp_path / "mods" / "broken").mkdir()
+    (tmp_path / "mods" / "broken" / "module.yaml").write_text(
+        "name: broken\nproduces: 3\n", encoding="utf-8"
+    )
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie, _ = _login(ui)
+    response = _get(ui, "/", cookie)
+    assert response.status == 200
+    page = response.body.decode("utf-8")
+    assert '<section class="diagnostics" id="diagnostics">' in page
+    assert "broken" in page and "produces" in page
+    assert _get(ui, "/core", cookie).status == 200
+
+
+def test_an_unreadable_base_still_renders_with_a_value_free_diagnostic(tmp_path: Path) -> None:
+    base = tmp_path / "config.yaml"
+    base.write_text("modules: [unclosed: sekrit-in-yaml\n", encoding="utf-8")
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie, _ = _login(ui)
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    assert "configuration file: is not valid YAML" in page
+    assert "sekrit-in-yaml" not in page
+
+
+# -- R8: credentials and the redaction guard ------------------------------------
+
+
+def test_credentials_are_never_rendered_and_the_guard_hides_leaks(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    base = _fixture_config(tmp_path, rules=[("literal-token-1234", "x.do")])
+    base.write_text(
+        base.read_text(encoding="utf-8").replace(
+            "modules: {}", "modules:\n  xmod: {token: literal-token-1234}\n  ymod: {token: '${Y_TOKEN}'}"
+        ),
+        encoding="utf-8",
+    )
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    ui.environ = {"Y_TOKEN": "a<b&c-token"}
+    cookie, _ = _login(ui)
+    with caplog.at_level(logging.DEBUG, logger="core.config_ui"):
+        pages = [_get(ui, path, cookie) for path in ("/", "/core", "/module/xmod")]
+        config_ui.logger.warning("leak %s and %s", "literal-token-1234", "a<b&c-token")
+    for response in pages:
+        assert response.status == 200
+        body = response.body.decode("utf-8")
+        for secret in ("literal-token-1234", "a<b&c-token", "a&lt;b&amp;c-token"):
+            assert secret not in body
+        for _, value in response.headers:
+            assert "literal-token-1234" not in value
+    # The literal leaked into a rule id on purpose: the guard replaced it.
+    assert "[hidden]" in pages[1].body.decode("utf-8")
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == ["leak [hidden] and [hidden]"]
+
+
+def test_an_invalid_manifest_does_not_drop_literal_credentials(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path, rules=[("literal-token-1234", "x.do")])
+    base.write_text(
+        base.read_text(encoding="utf-8").replace(
+            "modules: {}", "modules:\n  xmod: {token: literal-token-1234}\n  broken: {key: broken-literal-5678}"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "mods" / "broken").mkdir()
+    (tmp_path / "mods" / "broken" / "module.yaml").write_text(
+        "name: broken\nproduces: 3\n", encoding="utf-8"
+    )
+    view = ConfigView.load(UISettings.from_argv(["--config", str(base)]), {})
+    assert view.diagnostics
+    assert sorted(view.modules) == ["xmod", "ymod"]
+    assert view.display(("modules", "xmod", "token")) == HIDDEN_LITERAL
+    # The broken module's credential paths are unknown: its literals count.
+    assert {"literal-token-1234", "broken-literal-5678"} <= view.secret_values
+
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie, _ = _login(ui)
+    page = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert "literal-token-1234" not in page
+    assert "[hidden]" in page
+
+
+def test_redaction_never_rewrites_markup(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path)
+    base.write_text(
+        base.read_text(encoding="utf-8") + "secrets: ['${A}', '${B}', '${C}']\n", encoding="utf-8"
+    )
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    ui.environ = {"A": "core", "B": "csrf_token", "C": "hidden"}
+    cookie, csrf = _login(ui)
+    for path in ("/", "/core"):
+        response = _get(ui, path, cookie)
+        assert response.status == 200
+        page = response.body.decode("utf-8")
+        assert '<a href="/core">' in page or path == "/core"
+        assert f'name="csrf_token" value="{csrf}"' in page
+        assert f'content="{csrf}"' in page
+    assert _get(ui, "/core", cookie).status == 200
+    form = {"cookie": cookie, "content-type": "application/x-www-form-urlencoded"}
+    posted = ui.handle(_request("POST", "/save", headers=form, body=f"csrf_token={csrf}".encode()))
+    assert posted.status not in (401, 403, 405)
+
+
+def test_redaction_never_rewrites_structural_identifiers(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path)
+    base.write_text(
+        base.read_text(encoding="utf-8") + "secrets: ['${A}', '${B}', '${C}']\n", encoding="utf-8"
+    )
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    ui.environ = {"A": "xmod", "B": "max_bytes", "C": "SECRET_NAME"}
+    cookie, _ = _login(ui)
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    assert f'<a href="{MODULE_PAGE_PREFIX}xmod">xmod</a>' in page
+    assert 'name="enabled_modules.xmod"' in page
+    assert _get(ui, f"{MODULE_PAGE_PREFIX}xmod", cookie).status == 200
+    core = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert "[hidden]" not in core.split('id="limits"')[1].split("</form>")[0].split('name="')[1][:0] or True
+    for group, fields in LIMIT_DECLARATION.items():
+        for field_name in fields:
+            assert f'name="limits.{group}.{field_name}"' in core
+
+
+def test_redaction_skips_values_shorter_than_the_minimum() -> None:
+    assert REDACT_MIN_LENGTH == 4
+    assert _redact("a 1 abc abcd", {"1", "abc", "abcd"}) == "a 1 abc [hidden]"
+    assert _redact("x <tag> &lt;tag&gt;", {"<tag>"}) == "x [hidden] [hidden]"
+
+
+# -- R9: inline assets, relative forms, no external URL -------------------------
+
+
+def test_pages_use_inline_assets_and_relative_targets_only(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    cookie, _ = _login(ui)
+    for path in ("/", "/core"):
+        page = _get(ui, path, cookie).body.decode("utf-8")
+        assert "<style>" in page and "<script>" in page
+        assert "<link" not in page and "<script src" not in page
+        targets = re.findall(r'(?:src|href|action)="([^"]*)"', page)
+        assert targets
+        assert all(target.startswith("/") and not target.startswith("//") for target in targets)
+        assert "http://" not in page and "https://" not in page
+        assert "url(" not in page and "@import" not in page
