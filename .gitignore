@@ -9,3 +9,6 @@ __pycache__/
 /docs/campaigns/phase2/scaffolding/spec-out/
 /docs/campaigns/phase3/scaffolding/spec-out/
 /docs/campaigns/phase4/scaffolding/artifacts/
+
+# Journaux volatils des pipelines de campagne (phase 4)
+/docs/campaigns/phase4/scaffolding/*.log
