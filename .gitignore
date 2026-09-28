@@ -12,7 +12,3 @@ __pycache__/
 
 # Journaux volatils des pipelines de campagne (phase 4)
 /docs/campaigns/phase4/scaffolding/*.log
-
-# Configuration UI: managed overlay and status record (phase 4)
-*.local.yaml
-*.status.json
