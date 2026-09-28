@@ -17,22 +17,26 @@ dedicated ``config-ui`` thread pool (D8).
 
 The module is split into delimited sections (D3): settings and startup
 checks, authorities, the configuration model, the redaction guard (R8), the
-rendering helpers (R9), the request core and its pages, the socket-free event
-loop (D7), the request bridge and the entry point. No section names a module:
-every page lists or renders what discovery found (A2).
+rendering helpers (R9), the request core and its pages, the draft edits and
+Check (R5), the socket-free event loop (D7), the request bridge and the entry
+point. No section names a module: every page lists or renders what discovery
+found (A2).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import hmac
 import html
 import ipaddress
 import json
 import logging
+import math
 import os
+import re
 import secrets
 import selectors
 import sys
@@ -66,8 +70,10 @@ from core.main import (
     LIMIT_KIND_COUNT,
     LIMITS_KEY,
     MODULES_DIRECTORY_BUILTIN,
+    MODULES_KEY,
     SECRETS_KEY,
     _builtin_modules_directory,
+    check_config,
 )
 from core.overlay import (
     OverlayError,
@@ -81,6 +87,7 @@ from core.overlay import (
 )
 
 __all__ = [
+    "CheckResult",
     "ConfigUI",
     "ConfigView",
     "UIRequest",
@@ -840,6 +847,21 @@ def _csrf_field(session: _Session) -> str:
     return f'<input type="hidden" name="{CSRF_FIELD}" value="{html.escape(session.csrf_token, quote=True)}">'
 
 
+#: The field naming the page a form was posted from, so Check answers with
+#: that page's view of the diagnostics (R5).
+PAGE_FIELD = "page"
+CORE_PAGE = "/core"
+
+#: Posts the enclosing form, unsaved edits included, to Check (R5).
+#: ``formnovalidate``: a value the browser's constraints reject (a number
+#: below its minimum) still reaches Check, whose diagnostics name it.
+_CHECK_BUTTON = '<button type="submit" formaction="/check" formnovalidate>Check</button>'
+
+
+def _page_field(page: str) -> str:
+    return f'<input type="hidden" name="{PAGE_FIELD}" value="{ident(page)}">'
+
+
 def _page(title: str, session: _Session, body: str) -> UIResponse:
     document = (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
@@ -956,17 +978,42 @@ def _key_label(key: Any, view: ConfigView) -> str:
     return f"<code>{esc(_plain(key))}</code>"
 
 
+@dataclass(frozen=True)
+class _Control:
+    """One rendered form control: what its posted text means (R5, R6).
+
+    ``kind`` is how the posted text is read back (see :func:`_coerce`);
+    ``rendered`` is the text the control posts when left untouched, so a
+    posted field equal to it is no edit at all.
+    """
+
+    path: tuple[Any, ...]
+    kind: str
+    rendered: str
+    schema: Mapping[str, Any] = field(default_factory=dict)
+
+
 class _SchemaRenderer:
     """Renders a JSON-schema subset as form controls over one configuration view.
 
     A *live* node edits the configured value at its path and shows its
     current value and origin; a node under an array's ``items`` or a
     mapping's named entries is *descriptive*: it documents the shape the
-    enclosing JSON editor accepts, with no control of its own.
+    enclosing JSON editor accepts, with no control of its own. Every live
+    control is recorded in :attr:`controls` by its field name, so a posted
+    form is read back through the very controls the page rendered.
     """
 
     def __init__(self, view: ConfigView) -> None:
         self.view = view
+        self.controls: dict[str, _Control] = {}
+        #: ``new_entry_*`` field suffix → the mapping path a new entry joins.
+        self.entry_mappings: dict[str, tuple[Any, ...]] = {}
+
+    def register(
+        self, path: Sequence[Any], kind: str, rendered: str, schema: Mapping[str, Any] | None = None
+    ) -> None:
+        self.controls[_path_text(path)] = _Control(tuple(path), kind, rendered, schema or {})
 
     # -- values -------------------------------------------------------------
 
@@ -1158,12 +1205,20 @@ class _SchemaRenderer:
         value = self.view.value(path)
         if reference_name(value) is not None:
             # A reference is edited as its text, whatever the declared type.
+            self.register(path, kind, value, schema)
             return f'<input type="text" name="{name}" value="{esc(value)}">'
         if self.view.is_credential(path):
             # A literal credential is never placed in the page (R8),
             # whatever control its declared type would get (enum, number, ...).
+            # It posts "" when left untouched, whether a literal is configured or not.
+            self.register(path, kind, "", schema)
             return f'<input type="text" name="{name}" value="" placeholder="{esc(HIDDEN_LITERAL)}">'
         if kind == "enum":
+            members = schema["enum"]
+            selected = [member for member in members if value is not _MISSING and value == member]
+            # An unselected <select> posts its first option.
+            chosen = selected[0] if selected else (members[0] if members else "")
+            self.register(path, kind, _plain(chosen), schema)
             options = "".join(
                 f'<option value="{esc(_plain(member))}"'
                 f'{" selected" if value is not _MISSING and value == member else ""}>'
@@ -1173,6 +1228,7 @@ class _SchemaRenderer:
             return f'<select name="{name}">{options}</select>'
         if kind == "boolean":
             checked = " checked" if value is True else ""
+            self.register(path, kind, "true" if value is True else "false", schema)
             return (
                 f'<input type="hidden" name="{name}" value="false">'
                 f'<input type="checkbox" name="{name}" value="true"{checked}>'
@@ -1187,8 +1243,10 @@ class _SchemaRenderer:
                     bounds += f' {attribute}="{esc(_plain(bound))}"'
             step = "1" if kind == "integer" else "any"
             shown = "" if value is _MISSING else _plain(value)
+            self.register(path, kind, shown, schema)
             return f'<input type="number" name="{name}"{bounds} step="{step}" value="{esc(shown)}">'
         shown = "" if value is _MISSING else _plain(value)
+        self.register(path, kind, shown, schema)
         return f'<input type="text" name="{name}" value="{esc(shown)}">'
 
     def _list(
@@ -1201,6 +1259,8 @@ class _SchemaRenderer:
     ) -> str:
         """A list editor: one JSON text area, validated server-side."""
 
+        if live:
+            self.register(path, "json", self._json_text(path), schema)
         editor = (
             f'<textarea name="{ident(_path_text(path))}" data-json="list" rows="3">'
             f"{esc(self._json_text(path))}</textarea>"
@@ -1228,6 +1288,7 @@ class _SchemaRenderer:
                 if key in known:
                     continue
                 entry_path = (*path, key)
+                self.register(entry_path, "json", self._json_text(entry_path), schema)
                 rows.append(
                     f'<div class="entry" data-entry="{esc(_plain(key))}">'
                     f"<label>Entry {_key_label(key, self.view)} "
@@ -1235,6 +1296,7 @@ class _SchemaRenderer:
                     f"{esc(self._json_text(entry_path))}</textarea></label> "
                     f'<span class="origin">origin: {esc(self.origin(entry_path))}</span></div>'
                 )
+            self.entry_mappings[_path_text(path)] = tuple(path)
             prefix = ident(_path_text(path))
             rows.append(
                 f'<div class="entry new">New entry name <input type="text" name="new_entry_name:{prefix}"> '
@@ -1332,7 +1394,11 @@ class ConfigUI:
     """
 
     def __init__(
-        self, settings: UISettings, *, environ: Mapping[str, str] | None = None
+        self,
+        settings: UISettings,
+        *,
+        environ: Mapping[str, str] | None = None,
+        checker: Checker | None = None,
     ) -> None:
         self.settings = settings
         #: The UI process's own environment: "set/unset" is judged here, the
@@ -1351,6 +1417,11 @@ class ConfigUI:
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._sessions_lock = threading.Lock()
         self._mutation_lock = threading.Lock()
+        #: Runs the settings phase of Check; the seam exists for unit tests,
+        #: production always uses :func:`_default_checker` (R5).
+        self.checker: Checker = _default_checker if checker is None else checker
+        #: The verdict of the last Check, shown as readiness (R4).
+        self.last_check: CheckResult | None = None
         _LOG_REDACTION.sources.add(self)
         self.routes: dict[str, tuple[frozenset[str], Handler]] = {
             "/": (frozenset({"GET"}), self._base_page),
@@ -1358,7 +1429,7 @@ class ConfigUI:
             MODULE_PAGE_PREFIX: (frozenset({"GET"}), self._module_page),
             "/save": (frozenset({"POST"}), self._not_available),
             "/remove": (frozenset({"POST"}), self._not_available),
-            "/check": (frozenset({"POST"}), self._not_available),
+            "/check": (frozenset({"POST"}), self._check_endpoint),
             "/apply": (frozenset({"POST"}), self._not_available),
         }
 
@@ -1490,7 +1561,16 @@ class ConfigUI:
     def _readiness(self, name: str) -> str:
         """The readiness cell of module *name*: the last Check verdict (R4)."""
 
-        return "not checked yet"
+        result = self.last_check
+        if result is None:
+            return "not checked yet"
+        if result.passed:
+            return "last Check passed"
+        if result.for_module(name):
+            return "last Check failed"
+        if not result.settings_phase_reached:
+            return f"last Check failed ({CHECK_NOT_REACHED})"
+        return "last Check failed (no diagnostic names this module)"
 
     def _base_page(self, request: UIRequest, session: _Session) -> UIResponse:
         """Every discovered module and the configuration's origin (R4a)."""
@@ -1543,7 +1623,7 @@ class ConfigUI:
             f"{''.join(rows)}</table>{missing_note}</section>"
             '<section id="actions-bar">'
             '<p><a href="/core">Core settings</a></p>'
-            f'<form method="post" action="/check">{_csrf_field(session)}'
+            f'<form method="post" action="/check">{_csrf_field(session)}{_page_field("/")}'
             '<button type="submit">Check</button></form></section>'
         )
         return _page("Configuration", session, body)
@@ -1559,11 +1639,11 @@ class ConfigUI:
             '<p><a href="/">Back to the configuration</a></p>',
             _diagnostics(view),
             '<section id="modules-directory"><h2>Modules directory</h2>'
-            f'<form method="post" action="/save">{_csrf_field(session)}'
+            f'<form method="post" action="/save">{_csrf_field(session)}{_page_field(CORE_PAGE)}'
             '<label>modules_directory '
             f'<input type="text" name="modules_directory" value="{esc(directory)}"></label> '
             f'<span class="origin">origin: {esc(self._origin(view, ("modules_directory",)))}</span> '
-            '<button type="submit">Save</button></form></section>',
+            f'<button type="submit">Save</button> {_CHECK_BUTTON}</form></section>',
             self._limits_section(view, session),
             self._secrets_section(view),
             self._actions_section(view),
@@ -1608,9 +1688,9 @@ class ConfigUI:
             )
         return (
             '<section id="limits"><h2>Limits</h2>'
-            f'<form method="post" action="/save">{_csrf_field(session)}'
+            f'<form method="post" action="/save">{_csrf_field(session)}{_page_field(CORE_PAGE)}'
             f"{''.join(groups)}"
-            '<button type="submit">Save</button></form></section>'
+            f'<button type="submit">Save</button> {_CHECK_BUTTON}</form></section>'
         )
 
     def _secrets_section(self, view: ConfigView) -> str:
@@ -1694,6 +1774,27 @@ class ConfigUI:
         if module is None:
             return _text(404, "404 Not Found")
         renderer = _SchemaRenderer(view)
+        fields = self._module_fields(renderer, name, module)
+        page = f"{MODULE_PAGE_PREFIX}{name}"
+        form_id = "settings-form"
+        body = [
+            f"<h1>Module {ident(name)}</h1>",
+            '<p><a href="/">Back to the configuration</a></p>',
+            _diagnostics(view),
+            f'<section id="settings"><h2>Settings</h2>'
+            f'<form id="{form_id}" method="post" action="/save">{_csrf_field(session)}'
+            f"{_page_field(page)}{fields}"
+            f'<button type="submit">Save</button> {_CHECK_BUTTON}</form></section>',
+        ]
+        declared = _trigger_types(module.manifest)
+        if declared:
+            body.append(self._trigger_section(view, renderer, session, name, module.manifest))
+        return _page(f"Module {name}", session, "".join(body))
+
+    @staticmethod
+    def _module_fields(renderer: _SchemaRenderer, name: str, module: DiscoveredModule) -> str:
+        """The settings controls of module *name*, from its ``settings_schema``."""
+
         root = ("modules", name)
         schema = module.manifest.get(MANIFEST_SETTINGS_SCHEMA_KEY)
         if isinstance(schema, Mapping) and _schema_kind(schema) == "object" and (
@@ -1712,20 +1813,7 @@ class ConfigUI:
             fields = renderer.notice(root, reason, schema)
         else:
             fields = renderer.notice(root, "the manifest declares no settings_schema")
-        form_id = "settings-form"
-        body = [
-            f"<h1>Module {ident(name)}</h1>",
-            '<p><a href="/">Back to the configuration</a></p>',
-            _diagnostics(view),
-            f'<section id="settings"><h2>Settings</h2>'
-            f'<form id="{form_id}" method="post" action="/save">{_csrf_field(session)}'
-            f"{fields}"
-            '<button type="submit">Save</button></form></section>',
-        ]
-        declared = _trigger_types(module.manifest)
-        if declared:
-            body.append(self._trigger_section(view, renderer, session, name, module.manifest))
-        return _page(f"Module {name}", session, "".join(body))
+        return fields
 
     def _trigger_section(
         self,
@@ -1754,12 +1842,19 @@ class ConfigUI:
             parts = [
                 f'<fieldset class="channel" data-channel="{esc(_plain(key))}">'
                 f"<legend>Channel {label}</legend>",
-                f'<form method="post" action="/save">{_csrf_field(session)}',
+                f'<form method="post" action="/save">{_csrf_field(session)}'
+                f"{_page_field(MODULE_PAGE_PREFIX + name)}",
             ]
             if not isinstance(policy, Mapping):
                 parts.append(renderer.notice(path, "the channel policy is not a mapping"))
             else:
                 combination = policy.get("combination", "all_of")
+                renderer.register(
+                    (*path, "combination"),
+                    "enum",
+                    _plain(combination if combination in combinations else (combinations or [""])[0]),
+                    {"enum": combinations},
+                )
                 options = "".join(
                     f'<option value="{ident(item)}"'
                     f'{" selected" if item == combination else ""}>{ident(item)}</option>'
@@ -1783,7 +1878,7 @@ class ConfigUI:
                         f"<legend>Rule {index + 1}: {ident(rule_type)}</legend>"
                         f"{renderer.children(schema, (*rule_path, 'parameters'))}</fieldset>"
                     )
-            parts.append('<button type="submit">Save</button>')
+            parts.append(f'<button type="submit">Save</button> {_CHECK_BUTTON}')
             if _lookup(view.base, path) is not _MISSING:
                 parts.append(f'<p class="note">{esc(BASE_ENTRY_NOTE)}</p>')
             else:
@@ -1813,6 +1908,473 @@ class ConfigUI:
 
     def _not_available(self, request: UIRequest, session: _Session) -> UIResponse:
         return _text(501, "501 Not Implemented")
+
+    # -- Check (R5) -----------------------------------------------------------
+
+    def _controls(self, view: ConfigView) -> _SchemaRenderer:
+        """Every control the pages render over *view*, by field name.
+
+        The module pages are rendered (their HTML discarded) through the same
+        renderer, so a posted field is read back exactly as its page drew it.
+        """
+
+        renderer = _SchemaRenderer(view)
+        placeholder = _Session(csrf_token="")
+        for name, module in view.modules.items():
+            self._module_fields(renderer, name, module)
+            if _trigger_types(module.manifest):
+                self._trigger_section(view, renderer, placeholder, name, module.manifest)
+        directory = ("modules_directory",)
+        renderer.register(directory, "string", view.display(directory) or "")
+        for group, fields in LIMIT_DECLARATION.items():
+            for field_name, kind in fields.items():
+                path = ("limits", group, field_name)
+                renderer.register(
+                    path,
+                    "integer" if kind == LIMIT_KIND_COUNT else "number",
+                    view.display(path) or "",
+                )
+        return renderer
+
+    def parse_edits(
+        self, view: ConfigView, fields: Sequence[tuple[str, str]]
+    ) -> tuple[list[Edit], list[str]]:
+        """The draft edits a posted form makes, and the fields it cannot read.
+
+        A field left as its page rendered it is no edit. A trigger-policy
+        field is lifted to its whole channel policy (the unit a policy is
+        written in, R6); a base-page toggle ``enabled_modules.<name>`` edits
+        the whole ``enabled_modules`` list.
+        """
+
+        renderer = self._controls(view)
+        posted: dict[str, str] = {}
+        for name, value in fields:
+            posted[name] = value  # the last value wins (a checkbox after its hidden twin)
+        edits: dict[tuple[Any, ...], Any] = {}
+        problems: list[str] = []
+        enabled: list[str] | None = None
+        policies: dict[tuple[Any, ...], Any] = {}
+        for name, text in posted.items():
+            if name in _NOT_SETTING_FIELDS:
+                continue
+            if name.startswith(_ENABLED_TOGGLE):
+                module = name[len(_ENABLED_TOGGLE) :]
+                if module not in view.modules or text not in ("true", "false"):
+                    problems.append(f"{name}: is not a module toggle")
+                    continue
+                enabled = list(view.enabled_modules()) if enabled is None else enabled
+                if text == "true" and module not in enabled:
+                    enabled.append(module)
+                elif text == "false":
+                    enabled = [item for item in enabled if item != module]
+                continue
+            if name.startswith(_NEW_ENTRY_NAME):
+                mapping = renderer.entry_mappings.get(name[len(_NEW_ENTRY_NAME) :])
+                if mapping is None:
+                    problems.append(f"{name}: is not a setting this UI edits")
+                elif text:
+                    raw = posted.get(_NEW_ENTRY_VALUE + name[len(_NEW_ENTRY_NAME) :], "")
+                    _draft_edit(edits, policies, view, (*mapping, text), _coerce("json", {}, raw))
+                continue
+            if name.startswith(_NEW_ENTRY_VALUE):
+                if name[len(_NEW_ENTRY_VALUE) :] not in renderer.entry_mappings:
+                    problems.append(f"{name}: is not a setting this UI edits")
+                continue
+            control = renderer.controls.get(name)
+            if control is None:
+                problems.append(f"{name}: is not a setting this UI edits")
+                continue
+            if text == control.rendered:
+                continue
+            value = _coerce(control.kind, control.schema, text)
+            _draft_edit(edits, policies, view, control.path, value)
+        ordered: list[Edit] = []
+        if enabled is not None:
+            ordered.append((("enabled_modules",), enabled))
+        ordered.extend(edits.items())
+        ordered.extend(policies.items())
+        return ordered, problems
+
+    def check(
+        self,
+        edits: Sequence[Edit] = (),
+        *,
+        problems: Sequence[str] = (),
+        view: ConfigView | None = None,
+    ) -> CheckResult:
+        """Validate the draft: the on-disk overlay with *edits* applied (R5).
+
+        Nothing is written, nothing is signalled or started, and no socket is
+        created. First every unresolved ``${NAME}`` of the draft is reported
+        by setting path and variable name; only when there is none does the
+        settings phase run, through ``core.main.check_config`` on the draft.
+        The verdict is remembered for readiness (R4); every diagnostic has
+        passed the redaction guard (R8).
+        """
+
+        view = self.view() if view is None else view
+        secret_values = set(self.secret_values)
+        try:
+            base = read_base(self.base_path)
+            overlay = read_overlay(self.overlay_path)
+            draft = _apply_edits(overlay, edits)
+        except (OverlayError, ValueError) as exc:
+            result = CheckResult(False, (*problems, str(exc)), settings_phase_reached=False)
+        else:
+            merged = deep_merge(base, draft)
+            secret_values.update(_credential_literals(view, draft))
+            unresolved = _unresolved_references(merged, self.environ)
+            if unresolved:
+                result = CheckResult(
+                    False, (*problems, *unresolved), settings_phase_reached=False
+                )
+            else:
+                passed, diagnostics = self.checker(
+                    self.base_path, self.environ, self.overlay_path, draft
+                )
+                result = CheckResult(
+                    passed and not problems,
+                    (*problems, *diagnostics),
+                    settings_phase_reached=True,
+                )
+        result = CheckResult(
+            result.passed,
+            tuple(_redact(line, secret_values) for line in result.diagnostics),
+            result.settings_phase_reached,
+        )
+        self.last_check = result
+        return result
+
+    def _check_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``POST /check``: Check the posting page's draft and report (R5).
+
+        A module page lists the diagnostics naming that module; the base and
+        core-settings pages list all of them.
+        """
+
+        fields = _form_fields(request)
+        view = self.view()
+        page = "/"
+        for name, value in fields:
+            if name == PAGE_FIELD:
+                page = value
+        module: str | None = None
+        if page.startswith(MODULE_PAGE_PREFIX) and page[len(MODULE_PAGE_PREFIX) :] in view.modules:
+            module = page[len(MODULE_PAGE_PREFIX) :]
+        elif page != CORE_PAGE:
+            page = "/"
+        edits, problems = self.parse_edits(view, fields)
+        result = self.check(edits, problems=problems, view=view)
+        shown = result.diagnostics if module is None else result.for_module(module)
+        others = len(result.diagnostics) - len(shown)
+        verdict = "Check passed" if result.passed else "Check failed"
+        items = "".join(f'<li class="diagnostic">{esc(line)}</li>' for line in shown)
+        parts = [
+            f'<h1 id="verdict" data-passed="{str(result.passed).lower()}">{verdict}</h1>',
+            f'<p><a href="{ident(page)}">Back</a> (the edits are not saved)</p>',
+        ]
+        if not result.settings_phase_reached:
+            parts.append(f'<p id="settings-phase">{CHECK_NOT_REACHED}</p>')
+        if shown:
+            parts.append(f'<section class="diagnostics" id="check-diagnostics"><ul>{items}</ul></section>')
+        if others:
+            parts.append(
+                f'<p id="other-diagnostics">{others} other diagnostic(s) name no setting of '
+                "this module; the base page lists all of them.</p>"
+            )
+        return _page(verdict, session, "".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Draft edits and Check (R5)
+#
+# A draft is the on-disk overlay with a page's unsaved edits applied by
+# :func:`_apply_edits`, the one path-setting routine Save uses too. Check
+# never writes it anywhere: it reports every unresolved ``${NAME}`` of the
+# draft, and only when there is none runs ``core.main.check_config`` on it,
+# on a socket-free loop of its own (D7), from a ``config-ui`` worker thread
+# (D8) and never on a running loop.
+# ---------------------------------------------------------------------------
+
+#: One draft edit: a setting path and the value set there.
+Edit = tuple[tuple[Any, ...], Any]
+
+#: The settings phase: ``(base, environ, overlay path, draft)`` → whether
+#: the draft passes, and every diagnostic reported.
+Checker = Callable[[Path, Mapping[str, str], Path | None, Mapping[str, Any]], tuple[bool, list[str]]]
+
+CHECK_NOT_REACHED = "settings phase not reached"
+
+#: Posted fields that carry no setting: the guard's token, the page, and the
+#: operations that only Save and Remove perform.
+_NOT_SETTING_FIELDS = frozenset(
+    {CSRF_FIELD, PAGE_FIELD, "path", "add_channel_policy", "channel", "combination", "rule_type"}
+)
+_ENABLED_TOGGLE = "enabled_modules."
+_NEW_ENTRY_NAME = "new_entry_name:"
+_NEW_ENTRY_VALUE = "new_entry_value:"
+_INTEGER_TEXT = re.compile(r"[+-]?[0-9]+\Z")
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """The verdict of one Check (R5): every diagnostic, value-free."""
+
+    passed: bool
+    diagnostics: tuple[str, ...]
+    #: ``False`` when unresolved references stopped Check before the
+    #: module-settings phase.
+    settings_phase_reached: bool = True
+
+    def for_module(self, name: str) -> tuple[str, ...]:
+        """The diagnostics naming module *name* (what its page lists)."""
+
+        return tuple(line for line in self.diagnostics if _diagnostic_names_module(line, name))
+
+
+def _diagnostic_names_module(diagnostic: str, name: str) -> bool:
+    """Whether *diagnostic* names module *name*.
+
+    The shapes are the ones the check path reports: the loader's
+    ``module 'name': field 'f': reason`` (``_field_diagnostic``, which
+    ``_module_diagnostic`` also returns), a configuration path
+    ``modules.name…`` or ``triggers.name…`` (``load_config`` and the
+    unresolved-reference phase), and a ``name: …`` or ``module name …``
+    prefix.
+    """
+
+    quoted = re.escape(name)
+    if diagnostic.startswith(f"{name}:"):
+        return True
+    if re.match(rf"module\s+['\"]?{quoted}['\"]?(?=[:\s]|\Z)", diagnostic):
+        return True
+    return (
+        re.search(
+            rf"(?<![\w.])(?:{MODULES_KEY}|triggers)\.{quoted}(?=[.:\[\s'\"]|\Z)", diagnostic
+        )
+        is not None
+    )
+
+
+def _child(node: Any, segment: Any) -> Any:
+    if isinstance(node, dict):
+        return node.get(segment)
+    if isinstance(node, list) and isinstance(segment, int) and 0 <= segment < len(node):
+        return node[segment]
+    return None
+
+
+def _set_path(document: dict[Any, Any], path: Sequence[Any], value: Any) -> None:
+    """Set *value* at *path* inside *document*, creating missing mappings.
+
+    A list item is set only where it exists: a path never invents one.
+    """
+
+    if not path:
+        raise ValueError("an edit needs a setting path")
+    node: Any = document
+    for index, segment in enumerate(path[:-1]):
+        following = path[index + 1]
+        wants_list = isinstance(following, int) and not isinstance(following, bool)
+        child = _child(node, segment)
+        if not isinstance(child, list if wants_list else dict):
+            if wants_list or not isinstance(node, dict):
+                raise ValueError(f"{_path_text(path)}: no such item")
+            child = {}
+            node[segment] = child
+        node = child
+    last = path[-1]
+    if isinstance(node, dict):
+        node[last] = copy.deepcopy(value)
+    elif isinstance(node, list) and isinstance(last, int) and 0 <= last < len(node):
+        node[last] = copy.deepcopy(value)
+    else:
+        raise ValueError(f"{_path_text(path)}: no such item")
+
+
+def _draft_edit(
+    edits: dict[tuple[Any, ...], Any],
+    policies: dict[tuple[Any, ...], Any],
+    view: ConfigView,
+    path: tuple[Any, ...],
+    value: Any,
+) -> None:
+    """Record one posted edit at *path*.
+
+    A path inside a trigger channel policy is lifted to the whole policy
+    (the unit a policy is written in, R6): it is set in a copy of the merged
+    policy, so an edit never walks a rule list the overlay does not hold,
+    and several edits to one channel land in the same copy.
+    """
+
+    if path[0] == "triggers" and len(path) > 4:
+        channel = path[:4]
+        if channel not in policies:
+            policies[channel] = copy.deepcopy(view.value(channel))
+        _set_path(policies[channel], path[4:], value)
+    else:
+        edits[path] = value
+
+
+def _apply_edits(overlay: Mapping[str, Any], edits: Iterable[Edit]) -> dict[str, Any]:
+    """*overlay* with each edit's value set at its path; *overlay* is untouched.
+
+    The one path-setting routine: Check validates exactly the draft Save
+    would write.
+    """
+
+    draft: dict[str, Any] = copy.deepcopy(dict(overlay))
+    for path, value in edits:
+        _set_path(draft, path, value)
+    return draft
+
+
+def _coerce(kind: str, schema: Mapping[str, Any], text: str) -> Any:
+    """A posted field's text read as its control's kind.
+
+    A ``${NAME}`` reference stays its text whatever the kind; text that does
+    not read as the kind is kept as text, for validation to report.
+    """
+
+    if reference_name(text) is not None:
+        return text
+    stripped = text.strip()
+    if kind == "integer":
+        return int(stripped) if _INTEGER_TEXT.match(stripped) else text
+    if kind == "number":
+        if _INTEGER_TEXT.match(stripped):
+            return int(stripped)
+        try:
+            number = float(stripped)
+        except ValueError:
+            return text
+        return number if math.isfinite(number) else text
+    if kind == "boolean":
+        return {"true": True, "false": False}.get(text, text)
+    if kind == "enum":
+        members = schema.get("enum")
+        for member in members if isinstance(members, list) else []:
+            if _plain(member) == text:
+                return member
+        return text
+    if kind == "json":
+        try:
+            return json.loads(text)
+        except ValueError:
+            return text
+    return text
+
+
+def _form_fields(request: UIRequest) -> list[tuple[str, str]]:
+    """The fields of a form-encoded body, in order; none for any other body."""
+
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded" or not request.body:
+        return []
+    try:
+        return parse_qsl(request.body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        return []
+
+
+def _scan_references(
+    value: Any,
+    path: tuple[Any, ...],
+    environ: Mapping[str, str],
+    found: list[str],
+    active: set[int],
+) -> None:
+    name = reference_name(value)
+    if name is not None:
+        if name not in environ:
+            found.append(f"{_path_text(path)}: ${{{name}}} is unresolved")
+        return
+    if not isinstance(value, (Mapping, list)) or id(value) in active:
+        return
+    active.add(id(value))
+    try:
+        items = value.items() if isinstance(value, Mapping) else enumerate(value)
+        for key, item in items:
+            key_name = reference_name(key)
+            if key_name is not None and key_name not in environ:
+                found.append(f"{_path_text((*path, key))}: ${{{key_name}}} is unresolved")
+            _scan_references(item, (*path, key), environ, found, active)
+    finally:
+        active.discard(id(value))
+
+
+def _unresolved_references(merged: Mapping[str, Any], environ: Mapping[str, str]) -> list[str]:
+    """``<setting path>: ${NAME} is unresolved`` for each reference of *merged*
+    whose variable *environ* lacks.
+
+    Scanned: every top-level block but ``modules`` and ``secrets``, and the
+    settings of the enabled modules — what ``load_config`` resolves. A
+    variable name is not a secret; its value is never looked at.
+    """
+
+    found: list[str] = []
+    for key, value in merged.items():
+        if key in (MODULES_KEY, SECRETS_KEY):
+            continue
+        _scan_references(value, (key,), environ, found, set())
+    modules = merged.get(MODULES_KEY)
+    enabled = merged.get("enabled_modules")
+    if isinstance(modules, Mapping) and isinstance(enabled, list):
+        for name in dict.fromkeys(item for item in enabled if isinstance(item, str)):
+            if name in modules:
+                _scan_references(modules[name], (MODULES_KEY, name), environ, found, set())
+    return found
+
+
+def _credential_literals(view: ConfigView, draft: Mapping[str, Any]) -> set[str]:
+    """The credential literals a draft carries, for the redaction guard."""
+
+    found: set[str] = set()
+    for name, module in view.modules.items():
+        declaration = module.declaration
+        for credential in declaration.credentials if declaration is not None else ():
+            literal = _lookup(draft, (MODULES_KEY, name, *credential))
+            if (
+                isinstance(literal, (str, int, float))
+                and not isinstance(literal, bool)
+                and reference_name(literal) is None
+            ):
+                found.add(str(literal))
+    return found
+
+
+def _default_checker(
+    base_path: Path,
+    environ: Mapping[str, str],
+    overlay_path: Path | None,
+    draft: Mapping[str, Any],
+) -> tuple[bool, list[str]]:
+    """The settings phase through ``core.main.check_config`` (R5, D7, D8).
+
+    It runs the check on its own socket-free loop, never ``asyncio.run``
+    (whose self-pipe is a socketpair), and refuses to run on a thread that
+    already runs a loop: in production it is reached on a ``config-ui``
+    worker through :func:`_dispatch`.
+    """
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("Check must not run on a running event loop")
+    collected: list[str] = []
+    status = _run_socket_free(
+        check_config(
+            base_path,
+            environ=environ,
+            overlay=overlay_path,
+            overlay_document=draft,
+            diagnostic_reporter=collected.append,
+        )
+    )
+    return status == 0, collected
 
 
 # ---------------------------------------------------------------------------

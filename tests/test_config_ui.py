@@ -1,11 +1,12 @@
 """The configuration UI: CLI, bind policy, guards and startup refusals (P9);
 the configuration model, base page and core-settings page (P10); the module
-pages generated from each manifest (P11).
+pages generated from each manifest (P11); Check (P12).
 
 The whole module runs with socket creation patched to raise (AC5): no test
 here binds, connects or even creates a socket. The request core is driven
-through :meth:`ConfigUI.handle` directly, and the one coroutine the module
-runs (the request bridge, D8) goes through the socket-free loop of D7. There
+through :meth:`ConfigUI.handle` directly, and every coroutine the module
+runs (the request bridge, D8, and Check's ``check_config``) goes through the
+socket-free loop of D7. There
 is deliberately no pytest-asyncio test here: a fixture-provided event loop
 would create its self-pipe socketpair under the patch.
 """
@@ -1816,3 +1817,506 @@ def test_ac3_every_module_page_needs_a_session_and_names_nothing(tmp_path: Path)
         body = response.body.decode("utf-8")
         for word in SHIPPED_MODULES + SETTING_PATHS:
             assert word not in body
+
+
+# ---------------------------------------------------------------------------
+# P12: Check (R5; AC22, AC38, AC23)
+# ---------------------------------------------------------------------------
+
+CHECK_MANIFEST = """settings_schema:
+  type: object
+  properties:
+    level:
+      type: integer
+      minimum: 1
+    label:
+      type: string
+    token:
+      type: string
+credentials: [token]
+"""
+CHECK_ENTRY_POINT = "async def activate(context, settings):\n    return None\n"
+CHECK_ENVIRON = {"A_TOKEN": "a-token-value-0001", "B_TOKEN": "b-token-value-0002"}
+
+
+def _check_fixture(
+    tmp_path: Path,
+    modules: str,
+    *,
+    overlay: str | None = None,
+    environ: dict[str, str] | None = None,
+    extra: str = "",
+    checker: object = None,
+) -> ConfigUI:
+    """Three runnable fixture modules; ``amod`` and ``bmod`` are enabled."""
+
+    for name in ("amod", "bmod", "cmod"):
+        _write_manifest(tmp_path / "mods", name, CHECK_MANIFEST)
+        (tmp_path / "mods" / name / "__init__.py").write_text(CHECK_ENTRY_POINT, encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "modules_directory: ./mods\nenabled_modules: [amod, bmod]\nmodules:\n" + modules + extra,
+        encoding="utf-8",
+    )
+    if overlay is not None:
+        (tmp_path / "config.local.yaml").write_text(overlay, encoding="utf-8")
+    return ConfigUI(
+        UISettings.from_argv(
+            ["--config", str(tmp_path / "config.yaml"), "--status-file", str(tmp_path / "status.json")]
+        ),
+        environ=dict(CHECK_ENVIRON if environ is None else environ),
+        checker=checker,  # type: ignore[arg-type]
+    )
+
+
+VALID_MODULES = (
+    "  amod: {level: 3, token: '${A_TOKEN}'}\n"
+    "  bmod: {level: 4, token: '${B_TOKEN}'}\n"
+    "  cmod: {level: 0, token: '${C_UNSET}'}\n"
+)
+
+
+def _check_request(
+    cookie: str, csrf: str, page: str, fields: Sequence[tuple[str, str]] = ()
+) -> UIRequest:
+    from urllib.parse import urlencode
+
+    body = urlencode([("csrf_token", csrf), ("page", page), *fields]).encode("utf-8")
+    return _request(
+        "POST",
+        "/check",
+        headers={"cookie": cookie, "content-type": "application/x-www-form-urlencoded"},
+        body=body,
+    )
+
+
+def _post_check(
+    ui: ConfigUI, page: str, fields: Sequence[tuple[str, str]] = (), *, cookie: str | None = None
+) -> str:
+    if cookie is None:
+        cookie, csrf = _login(ui)
+    else:
+        session = ui._session(_request("GET", "/", headers={"cookie": cookie}))
+        assert session is not None
+        csrf = session.csrf_token
+    response = ui.handle(_check_request(cookie, csrf, page, fields))
+    assert response.status == 200
+    return response.body.decode("utf-8")
+
+
+def _listed(page: str) -> list[str]:
+    return [_html.unescape(item) for item in re.findall(r'<li class="diagnostic">(.*?)</li>', page, re.S)]
+
+
+def _verdict(page: str) -> bool:
+    match = re.search(r'<h1 id="verdict" data-passed="(true|false)">', page)
+    assert match is not None
+    return match.group(1) == "true"
+
+
+def _refuse_checker(*args: object) -> tuple[bool, list[str]]:
+    raise AssertionError("the settings phase must not be reached")
+
+
+# -- AC22 ---------------------------------------------------------------------
+
+
+def test_ac22_unresolved_references_are_all_reported_and_stop_the_check(tmp_path: Path) -> None:
+    ui = _check_fixture(
+        tmp_path,
+        "  amod: {level: 3, token: '${A_MISSING}', label: '${A_LABEL}'}\n"
+        "  bmod: {level: 4, token: '${B_MISSING}'}\n"
+        "  cmod: {level: 3, token: '${C_MISSING}'}\n",
+        extra="secrets: ['${S_MISSING}']\n",
+        environ={},
+        checker=_refuse_checker,
+    )
+    result = ui.check()
+    assert result.diagnostics == (
+        "modules.amod.token: ${A_MISSING} is unresolved",
+        "modules.amod.label: ${A_LABEL} is unresolved",
+        "modules.bmod.token: ${B_MISSING} is unresolved",
+    )
+    assert not result.passed and not result.settings_phase_reached
+
+    cookie = _logged_in(ui)
+    base = _post_check(ui, "/", cookie=cookie)
+    assert not _verdict(base)
+    assert "settings phase not reached" in base
+    assert sorted(_listed(base)) == sorted(result.diagnostics)
+    assert _listed(_post_check(ui, "/module/amod", cookie=cookie)) == list(result.diagnostics[:2])
+    assert _listed(_post_check(ui, "/module/bmod", cookie=cookie)) == [result.diagnostics[2]]
+    assert _listed(_post_check(ui, "/module/cmod", cookie=cookie)) == []
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+def test_ac22_top_level_references_are_scanned_and_secrets_are_not(tmp_path: Path) -> None:
+    ui = _check_fixture(
+        tmp_path,
+        VALID_MODULES,
+        extra=(
+            "limits:\n  dedup:\n    max_entries: '${LIMIT_MISSING}'\n"
+            "triggers:\n  amod:\n    channels:\n      '${CHANNEL_MISSING}': {rules: []}\n"
+            "secrets: ['${SECRET_MISSING}']\n"
+        ),
+        checker=_refuse_checker,
+    )
+    result = ui.check()
+    assert result.diagnostics == (
+        "limits.dedup.max_entries: ${LIMIT_MISSING} is unresolved",
+        "triggers.amod.channels.${CHANNEL_MISSING}: ${CHANNEL_MISSING} is unresolved",
+    )
+    assert not result.settings_phase_reached
+    assert result.for_module("amod") == result.diagnostics[1:]
+
+
+def test_ac22_every_invalid_setting_is_reported_in_one_check(tmp_path: Path) -> None:
+    """The real checker: both modules' refusals in one run, each page its own."""
+
+    ui = _check_fixture(
+        tmp_path,
+        "  amod: {level: 0, token: '${A_TOKEN}'}\n"
+        "  bmod: {level: -1, token: '${B_TOKEN}'}\n",
+    )
+    cookie = _logged_in(ui)
+    base = _post_check(ui, "/", cookie=cookie)
+    assert not _verdict(base)
+    assert "settings phase not reached" not in base
+    listed = _listed(base)
+    assert len(listed) == 2
+    assert any("'amod'" in line and "level" in line for line in listed)
+    assert any("'bmod'" in line and "level" in line for line in listed)
+    amod = _listed(_post_check(ui, "/module/amod", cookie=cookie))
+    bmod = _listed(_post_check(ui, "/module/bmod", cookie=cookie))
+    assert len(amod) == 1 and "'amod'" in amod[0]
+    assert len(bmod) == 1 and "'bmod'" in bmod[0]
+    assert sorted(amod + bmod) == sorted(listed)
+    core = _post_check(ui, "/core", cookie=cookie)
+    assert sorted(_listed(core)) == sorted(listed)
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+def test_ac22_the_checker_seam_gets_the_draft_and_every_diagnostic_is_kept(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    reported = [
+        "module 'amod': field 'settings.level': must be >= 1",
+        "modules.bmod: must be a mapping",
+        "amod: refused",
+        "runtime: could not be assembled",
+    ]
+
+    def checker(*args: object) -> tuple[bool, list[str]]:
+        calls.append(args)
+        return False, list(reported)
+
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {label: kept}\n", checker=checker)
+    cookie = _logged_in(ui)
+    base = _post_check(ui, "/", [("modules.amod.level", "7")], cookie=cookie)
+    (base_path, environ, overlay_path, draft), = calls
+    assert base_path == tmp_path / "config.yaml"
+    assert overlay_path == tmp_path / "config.local.yaml"
+    assert environ == CHECK_ENVIRON
+    assert draft == {"modules": {"amod": {"label": "kept", "level": 7}}}
+    assert _listed(base) == reported
+    amod = _post_check(ui, "/module/amod", cookie=cookie)
+    assert _listed(amod) == [reported[0], reported[2]]
+    assert "2 other diagnostic(s)" in amod
+    assert _listed(_post_check(ui, "/module/bmod", cookie=cookie)) == [reported[1]]
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "named"),
+    [
+        ("module 'amod': field 'settings.level': must be >= 1", True),
+        ('module "amod": field "x": no', True),
+        ("module amod: refused", True),
+        ("module amod refused its settings", True),
+        ("amod: refused", True),
+        ("modules.amod: must be a mapping", True),
+        ("modules.amod.token: ${X} is unresolved", True),
+        ("modules.amod[0]: bad", True),
+        ("triggers.amod.channels: must be a mapping", True),
+        ("module 'amodx': field 'a': no", False),
+        ("modules.amodx.level: bad", False),
+        ("amodx: refused", False),
+        ("xmodules.amod.level: bad", False),
+        ("enabled_modules[0]: module names must be unique", False),
+        ("runtime: could not be assembled", False),
+    ],
+)
+def test_diagnostic_attribution_follows_the_check_path_shapes(diagnostic: str, named: bool) -> None:
+    assert config_ui._diagnostic_names_module(diagnostic, "amod") is named
+
+
+# -- AC38 ---------------------------------------------------------------------
+
+
+def test_ac38_an_unsaved_invalid_edit_fails_and_writes_nothing(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {level: 2}\n")
+    assert ui.check().passed
+    before = _snapshot(tmp_path)
+    page = _post_check(ui, "/module/amod", [("modules.amod.level", "0")])
+    assert not _verdict(page)
+    listed = _listed(page)
+    assert len(listed) == 1 and "'amod'" in listed[0] and "level" in listed[0]
+    assert _snapshot(tmp_path) == before
+    assert ui.check().passed  # the edit was never saved
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+def test_ac38_an_unsaved_fix_passes_and_writes_nothing(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {level: 0}\n")
+    failing = ui.check()
+    assert not failing.passed and failing.settings_phase_reached
+    assert len(failing.for_module("amod")) == 1
+    before = _snapshot(tmp_path)
+    page = _post_check(ui, "/module/amod", [("modules.amod.level", "5")])
+    assert _verdict(page) and _listed(page) == []
+    assert _snapshot(tmp_path) == before
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+# -- AC23 ---------------------------------------------------------------------
+
+
+def test_ac23_check_signals_nothing_starts_nothing_and_creates_no_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {level: 2}\n")
+    monkeypatch.setattr(subprocess, "Popen", _fail)
+    monkeypatch.setattr(os, "kill", _fail)
+    if hasattr(os, "killpg"):
+        monkeypatch.setattr(os, "killpg", _fail)
+    before = _snapshot(tmp_path)
+    for fields in ([], [("modules.amod.level", "0")], [("modules.bmod.level", "9")]):
+        _post_check(ui, "/module/amod", fields)
+        _post_check(ui, "/", fields)
+    assert _snapshot(tmp_path) == before
+    # The creation patch is still the one installed for the module.
+    assert socket.socket.__init__ is _refuse
+    for name in ("socketpair", "fromfd", "create_connection", "create_server"):
+        assert getattr(socket, name) is _refuse
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+# -- D7 pin and the D8 bridge ---------------------------------------------------
+
+
+def test_d7_the_socket_free_loop_runs_sleep_executor_and_wait_for() -> None:
+    loops: list[asyncio.AbstractEventLoop] = []
+
+    async def scenario() -> tuple[str, str]:
+        loop = asyncio.get_running_loop()
+        loops.append(loop)
+        await asyncio.sleep(0)
+        # The executor thread wakes the loop with call_soon_threadsafe.
+        worker = await loop.run_in_executor(None, lambda: threading.current_thread().name)
+        future: asyncio.Future[str] = loop.create_future()
+        loop.call_soon(future.set_result, "waited")
+        return worker, await asyncio.wait_for(future, timeout=5)
+
+    worker, waited = _run_socket_free(scenario())
+    assert waited == "waited"
+    assert worker != threading.current_thread().name
+    assert isinstance(loops[0], _SocketFreeEventLoop)
+    assert loops[0].is_closed()
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+@pytest.mark.parametrize(("level", "passes"), [("5", True), ("0", False)])
+def test_bridge_check_runs_the_real_checker_from_a_running_loop(
+    level: str, passes: bool, tmp_path: Path
+) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {level: 2}\n")
+    cookie, csrf = _login(ui)
+    request = _check_request(cookie, csrf, "/module/amod", [("modules.amod.level", level)])
+    executor = config_ui.ThreadPoolExecutor(
+        max_workers=config_ui.EXECUTOR_WORKERS,
+        thread_name_prefix=config_ui.EXECUTOR_THREAD_PREFIX,
+    )
+    before = _snapshot(tmp_path)
+
+    async def scenario() -> UIResponse:
+        assert isinstance(asyncio.get_running_loop(), _SocketFreeEventLoop)
+        return await _dispatch(ui, request, executor)
+
+    try:
+        response = _run_socket_free(scenario())
+    finally:
+        executor.shutdown(wait=True)
+    assert response.status == 200
+    page = response.body.decode("utf-8")
+    assert _verdict(page) is passes
+    listed = _listed(page)
+    if passes:
+        assert listed == []
+    else:
+        assert len(listed) == 1 and "'amod'" in listed[0] and "level" in listed[0]
+    assert ui.last_check is not None and ui.last_check.passed is passes
+    assert _snapshot(tmp_path) == before
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+def test_d8_the_default_checker_refuses_to_run_on_a_running_loop(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES)
+
+    async def scenario() -> str:
+        with pytest.raises(RuntimeError, match="Check must not run on a running event loop"):
+            config_ui._default_checker(ui.base_path, ui.environ, ui.overlay_path, {})
+        return "refused"
+
+    assert _run_socket_free(scenario()) == "refused"
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+# -- drafts, pages, readiness and redaction -------------------------------------
+
+
+def test_apply_edits_sets_paths_on_a_copy() -> None:
+    overlay = {"modules": {"amod": {"label": "kept"}}, "actions": [{"rule_id": "r"}]}
+    draft = config_ui._apply_edits(
+        overlay,
+        [
+            (("modules", "amod", "level"), 3),
+            (("modules", "bmod", "nested", "value"), [1]),
+            (("modules_directory",), "./other"),
+        ],
+    )
+    assert draft == {
+        "modules": {"amod": {"label": "kept", "level": 3}, "bmod": {"nested": {"value": [1]}}},
+        "actions": [{"rule_id": "r"}],
+        "modules_directory": "./other",
+    }
+    assert overlay == {"modules": {"amod": {"label": "kept"}}, "actions": [{"rule_id": "r"}]}
+    with pytest.raises(ValueError):
+        config_ui._apply_edits({}, [(("triggers", "x", "rules", 0), 1)])
+
+
+def test_untouched_fields_are_no_edits_and_fields_read_as_their_kind(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {token: literal-secret}\n")
+    view = ui.view()
+    controls = ui._controls(view).controls
+    untouched = [(name, control.rendered) for name, control in controls.items()]
+    assert ("modules.amod.token", "") in untouched  # a credential is never rendered
+    assert ui.parse_edits(view, untouched) == ([], [])
+    edits, problems = ui.parse_edits(
+        view,
+        [
+            ("modules.amod.level", "12"),
+            ("modules.bmod.label", "${SOME_NAME}"),
+            ("limits.dedup.max_entries", "2048"),
+            ("enabled_modules.cmod", "true"),
+            ("enabled_modules.amod", "false"),
+            ("no.such.field", "1"),
+        ],
+    )
+    assert dict(edits) == {
+        ("enabled_modules",): ["bmod", "cmod"],
+        ("modules", "amod", "level"): 12,
+        ("modules", "bmod", "label"): "${SOME_NAME}",
+        ("limits", "dedup", "max_entries"): 2048,
+    }
+    assert problems == ["no.such.field: is not a setting this UI edits"]
+    result = ui.check(edits, problems=problems, view=view)
+    assert not result.passed
+    assert result.diagnostics[0] == "no.such.field: is not a setting this UI edits"
+
+
+def test_a_new_trigger_parameter_entry_is_lifted_to_its_channel_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manifest validator accepts only boolean ``additionalProperties``,
+    so the parameters mapping is registered on the renderer directly."""
+
+    ui = _module_fixture(tmp_path, "tmod", TRIGGER_MANIFEST)
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        base.read_text(encoding="utf-8")
+        + "triggers:\n  tmod:\n    channels:\n      from-base:\n        combination: any_of\n"
+        "        rules: [{type: odds, parameters: {odds: 0.5}}]\n",
+        encoding="utf-8",
+    )
+    view = ui.view()
+    channel = ("triggers", "tmod", "channels", "from-base")
+    parameters = (*channel, "rules", 0, "parameters")
+    controls = ui._controls
+
+    def with_entries(view: ConfigView) -> _SchemaRenderer:
+        renderer = controls(view)
+        renderer.entry_mappings[config_ui._path_text(parameters)] = parameters
+        return renderer
+
+    monkeypatch.setattr(ui, "_controls", with_entries)
+    edits, problems = ui.parse_edits(
+        view,
+        [
+            ("new_entry_name:triggers.tmod.channels.from-base.rules[0].parameters", "extra"),
+            ("new_entry_value:triggers.tmod.channels.from-base.rules[0].parameters", "7"),
+            ("triggers.tmod.channels.from-base.rules[0].parameters.odds", "0.25"),
+        ],
+    )
+    assert problems == []
+    assert edits == [
+        (
+            channel,
+            {"combination": "any_of", "rules": [{"type": "odds", "parameters": {"odds": 0.25, "extra": 7}}]},
+        )
+    ]
+    # The policy lives only in the base: the draft overlay still takes the edit.
+    assert config_ui._apply_edits({}, edits)["triggers"]["tmod"]["channels"]["from-base"]["rules"][0][
+        "parameters"
+    ] == {"odds": 0.25, "extra": 7}
+
+
+def test_check_skips_the_browser_constraints(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES)
+    module = _module_html(ui, _logged_in(ui), "amod")
+    assert '<button type="submit" formaction="/check" formnovalidate>Check</button>' in module
+
+
+def test_every_page_posts_its_draft_to_check(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES)
+    cookie = _logged_in(ui)
+    base = _get(ui, "/", cookie).body.decode("utf-8")
+    assert re.search(r'action="/check">.*?name="page" value="/"', base, re.S)
+    core = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert core.count('formaction="/check"') == 2
+    assert core.count('name="page" value="/core"') == 2
+    module = _module_html(ui, cookie, "amod")
+    settings = _section(module, "settings")
+    assert 'formaction="/check"' in settings and 'name="page" value="/module/amod"' in settings
+
+
+def test_the_last_check_verdict_is_the_readiness(tmp_path: Path) -> None:
+    ui = _check_fixture(tmp_path, VALID_MODULES)
+    cookie = _logged_in(ui)
+
+    def readiness(name: str) -> str:
+        page = _get(ui, "/", cookie).body.decode("utf-8")
+        match = re.search(rf'<tr data-module="{name}".*?<td class="readiness">(.*?)</td>', page, re.S)
+        assert match is not None
+        return _html.unescape(match.group(1))
+
+    assert readiness("amod") == "not checked yet"
+    _post_check(ui, "/", [("modules.amod.level", "0")], cookie=cookie)
+    assert readiness("amod") == "last Check failed"
+    assert readiness("bmod") == "last Check failed (no diagnostic names this module)"
+    _post_check(ui, "/", [("modules.amod.label", "${NOT_SET_ANYWHERE}")], cookie=cookie)
+    assert readiness("bmod") == "last Check failed (settings phase not reached)"
+    _post_check(ui, "/", cookie=cookie)
+    assert readiness("amod") == readiness("bmod") == "last Check passed"
+
+
+def test_check_diagnostics_pass_the_redaction_guard(tmp_path: Path) -> None:
+    secret = CHECK_ENVIRON["A_TOKEN"]
+    typed = "typed-credential-literal"
+
+    def leaky(*args: object) -> tuple[bool, list[str]]:
+        return False, [f"module 'amod': field 'token': {secret} / {typed} rejected"]
+
+    ui = _check_fixture(tmp_path, VALID_MODULES, checker=leaky)
+    page = _post_check(ui, "/module/amod", [("modules.amod.token", typed)])
+    assert secret not in page and typed not in page
+    assert _listed(page) == ["module 'amod': field 'token': [hidden] / [hidden] rejected"]
+    assert ui.last_check is not None and secret not in "".join(ui.last_check.diagnostics)
