@@ -190,7 +190,7 @@ def conventional_message(step):
     """Commit subject for the step.
 
     A spec may pin it with a line `commit: <subject>` (used for FIX rounds whose type differs from
-    the plan step's). Otherwise derive `feat(phase3): <step> — <plan title>`.
+    the plan step's). Otherwise derive `feat(phase4): <step> — <plan title>`.
     """
     try:
         text = (STEPS_DIR / f"{step}-spec.md").read_text(encoding="utf-8")
@@ -200,12 +200,12 @@ def conventional_message(step):
         if line.strip().lower().startswith("commit:"):
             return line.split(":", 1)[1].strip()
     title = re.split(r"\s+\(", step_title(step), maxsplit=1)[0].strip()
-    return f"feat(phase3): {step} — {title}"
+    return f"feat(phase4): {step} — {title}"
 
 
 def run_step(step, dev_cmd, loop_timeout):
     spec = STEPS_DIR / f"{step}-spec.md"
-    feature = f"phase3-{step.lower()}"
+    feature = f"phase4-{step.lower()}"
     cmd = (
         f'python3 {LOOP} --spec {spec} --workdir {REPO} --feature {feature} '
         f'--dev-cmd "{dev_cmd}" --review-cmd "bash {CODEX_REVIEW}" '
