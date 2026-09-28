@@ -42,6 +42,7 @@ import pytest
 import yaml
 
 import core.config_ui as config_ui
+import core.overlay as core_overlay
 from core.config_ui import (
     BASE_ENTRY_NOTE,
     DRIFT_DIFFERS,
@@ -4758,3 +4759,110 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     ]
     assert violations == []
     assert sum(_UrlAudit.of(response).scripts != [] for _, response, _ in audited) > 50
+
+
+# ---------------------------------------------------------------------------
+# AC37: the operator documentation
+# ---------------------------------------------------------------------------
+
+
+def _doc_text() -> str:
+    return (REPO / "docs" / "config-ui.md").read_text(encoding="utf-8")
+
+
+def _squashed(text: str) -> str:
+    """The text with every whitespace run folded to one space (line wrapping)."""
+
+    return re.sub(r"\s+", " ", text)
+
+
+def test_ac37_doc_launch_and_local_only() -> None:
+    """AC37 (R10): the launch command, the console script and local-only."""
+
+    doc = _squashed(_doc_text())
+    assert "python -m core.config_ui --config config.yaml" in doc
+    assert "twitch-ia-compagnon-config-ui" in doc
+    assert "local-only" in doc or "local only" in doc
+    assert "does **not** administer a remote brain over the proxy" in doc
+    # The launch argv after ``--`` and every option the parser declares.
+    assert " -- " in doc
+    for option in ("--config", "--overlay", "--host", "--port", "--allow-non-loopback",
+                   "--allowed-host", "--status-file"):
+        assert f"`{option}" in doc, option
+
+
+def test_ac37_doc_overlay_rule_and_merge() -> None:
+    """AC37 (R10): the A1 path rule with both AC8 examples, AC7, and A7."""
+
+    doc = _squashed(_doc_text())
+    # Both AC8 examples, checked against the implementation too.
+    assert "| `config.yaml` | `config.local.yaml` |" in doc
+    assert "| `presence.yaml.example` | `presence.local.yaml` |" in doc
+    assert core_overlay.implicit_overlay_path("config.yaml").name == "config.local.yaml"
+    assert core_overlay.implicit_overlay_path("presence.yaml.example").name == "presence.local.yaml"
+    assert "`--overlay PATH` overrides this rule" in doc
+    # The AC7 merge example, checked against the implementation too.
+    base = {"a": {"b": 1, "c": [1, 2]}, "d": "x"}
+    overlay = {"a": {"b": 2, "c": [3]}, "e": "y"}
+    assert core_overlay.deep_merge(base, overlay) == {"a": {"b": 2, "c": [3]}, "d": "x", "e": "y"}
+    assert "base `{a: {b: 1, c: [1, 2]}, d: x}`" in doc
+    assert "overlay `{a: {b: 2, c: [3]}, e: y}`" in doc
+    assert "`{a: {b: 2, c: [3]}, d: x, e: y}`" in doc
+    assert "An overlay `a: null` yields `a: null`" in doc
+    assert "the overlay **cannot delete a base key**" in doc
+    assert "comments and formatting in the overlay are not preserved" in doc
+    assert "merged by `--check-config` too" in doc
+
+
+def test_ac37_doc_writable_and_read_only_blocks() -> None:
+    """AC37 (R10, 6c): the 5 writable blocks, the 2 read-only ones, and why."""
+
+    doc = _squashed(_doc_text())
+    writable = doc.split("**5 writable blocks**", 1)[1].split("**2 read-only blocks**", 1)[0]
+    for block in ("enabled_modules", "modules.<name>", "triggers", "limits", "modules_directory"):
+        assert f"- `{block}`" in writable, block
+    read_only = doc.split("**2 read-only blocks**", 1)[1].split("## 5.", 1)[0]
+    assert "- `secrets`" in read_only
+    assert "- `actions`" in read_only
+    assert "a single mis-click can never widen the set of authorized actions or expose a secret" in read_only
+    # The reason the pages display is quoted verbatim.
+    assert READ_ONLY_REASON in read_only
+
+
+def test_ac37_doc_secrets_policy() -> None:
+    """AC37 (R10, R8): the secrets policy."""
+
+    doc = _squashed(_doc_text())
+    policy = doc.split("## 5. Secrets policy", 1)[1].split("## 6.", 1)[0]
+    assert "No secret value appears in any page, response, UI log record, restart report or diagnostic" in policy
+    assert "`${NAME}`" in policy
+    assert HIDDEN_LITERAL in policy
+    assert "set/unset" in policy
+    assert "declared credential path" in policy
+    assert "`secrets` block" in policy
+
+
+def test_ac37_doc_restart_drift_and_status_file() -> None:
+    """AC37 (R10, R7, A4, A5): Apply, drift states and the status-file rule.
+
+    The variable name is read from ``core.overlay`` so the document cannot
+    drift from the constant the runtime and the UI use.
+    """
+
+    doc = _squashed(_doc_text())
+    for outcome in ("**accepted**", "**refused**", "**unknown**"):
+        assert outcome in doc
+    assert f"**{config_ui.DEFAULT_APPLY_WINDOW:g} s**" in doc
+    assert f"stop grace ({config_ui.DEFAULT_STOP_GRACE:g} s)" in doc
+    for state in (DRIFT_IN_SYNC, DRIFT_DIFFERS, DRIFT_UNKNOWN):
+        assert f"**{state}**" in doc
+    assert f"**\"{STATUS_RECORD_UNUSABLE}\"**" in doc
+    assert f'"{NOT_SUPERVISED}"' in doc
+    variable = core_overlay.STATUS_FILE_VARIABLE
+    assert f"`{variable}`" in doc
+    assert f"{variable}=config.yaml.status.json" in doc
+    assert "`<base file name>.status.json`" in doc
+    assert core_overlay.default_status_path("config.yaml").name == "config.yaml.status.json"
+    assert "`config.yaml` → `config.yaml.status.json`" in doc
+    assert "`status_path_collision`" in doc
+
