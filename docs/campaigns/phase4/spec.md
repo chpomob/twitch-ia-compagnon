@@ -6,13 +6,13 @@ status: "draft"
 tags: [adversarial, spec, phase4, config-ui]
 targets:
   - file: core/config_ui/__init__.py
-    description: "New package: the separate configuration-UI process — bind policy, access token and session, Host/Origin/CSRF guards, base page, core-settings page, one generated page per discovered module (settings and trigger policies), read-only secrets/actions views, Check, overlay write/remove within the 6c scope, supervised restart, status-record reading and drift display; names no module."
+    description: "New package: the separate configuration-UI process — bind policy, access token and session, Host/Origin/CSRF guards, base page, core-settings page, one generated page per discovered module (settings and trigger policies), read-only secrets/actions views, Check, overlay write/remove within the 6c scope, supervised restart, status-path collision refusal, status-record reading (including unusable records) and drift display; names no module."
   - file: core/config_ui/__main__.py
     description: "New: `python -m core.config_ui` entry point — parses --config, --overlay, --host, --port, --allow-non-loopback, the repeatable --allowed-host, --status-file and an optional launch argv after `--`, then serves the UI."
   - file: core/overlay.py
     description: "New: the one overlay implementation shared by the runtime and the UI — overlay path derivation (A1), reading/refusing an overlay, and the deep merge with the R2 precedence."
   - file: core/main.py
-    description: "Merge the overlay over the base in load_config/run/check_config and add `--overlay` to the CLI; publish the secret-free status record (A5) when the status-file variable is set, on becoming ready and on every module ready/degraded transition; expose the limit-group table as a public read-only declaration the UI renders from."
+    description: "Merge the overlay over the base in load_config/run/check_config and add `--overlay` to the CLI; publish the secret-free status record (A5) when the status-file variable is set — refusing, with the `status_path_collision` diagnostic and before writing anything, a status path that resolves to the base or overlay file — on becoming ready and on every module ready/degraded transition; expose the limit-group table as a public read-only declaration the UI renders from."
   - file: core/contracts.py
     description: "Accept `default` as a non-constraining schema annotation (beside `title`/`description`) and refuse a `default` that does not satisfy its own schema node."
   - file: modules/agent_link/module.yaml
@@ -58,7 +58,7 @@ targets:
   - file: tests/test_overlay.py
     description: "New: overlay path derivation, merge precedence, removal of an override, refused overlays, and runtime/--check-config parity with the overlay."
   - file: tests/test_status_record.py
-    description: "New: status-record publication on becoming ready and on every module ready/degraded transition, atomic replacement, sequence ordering, opt-out without the variable, and absence of secret values."
+    description: "New: status-record publication on becoming ready and on every module ready/degraded transition, atomic replacement, sequence ordering, opt-out without the variable, refusal of a status path colliding with the base or overlay file, and absence of secret values."
   - file: tests/test_manifest_presentation.py
     description: "New: every settings_schema setting node of the 17 manifests has a title; documented defaults are machine-readable and valid; the `default` annotation contract of core/contracts.py."
   - file: tests/test_users.py
@@ -118,7 +118,15 @@ can never widen the authorized actions (6c).
   sets the variable to that path for every process it launches. A main process started elsewhere
   is visible only if the operator sets the same variable to that same path. Supervision is
   decided by pid: a record whose pid is not the pid of the child this UI launched is "not
-  supervised".
+  supervised". The status path must never be a configuration file (R7): it is compared, as a
+  resolved absolute path (relative paths resolved against the working directory, symbolic links
+  followed, whether or not the file exists yet), against the base file and the managed overlay
+  path (explicit `--overlay` or the implicit A1 path). This applies to `--status-file`, to the
+  derived default, and to the environment variable as the runtime reads it. The derived default
+  can collide only when the overlay path is itself that name (e.g. `--overlay
+  config.yaml.status.json`) or a link to it; in that case the UI refuses to start exactly as for
+  an explicit colliding path — it never substitutes another status path — and the operator must
+  pass a non-colliding `--status-file`.
 - A6. Machine-readable presentation metadata lives inside `settings_schema` as the `title`
   annotation (already accepted by the validator) and a new `default` annotation; no new
   top-level manifest key is introduced, so the loader's manifest allowlists and the
@@ -199,7 +207,8 @@ static constraints.
   `limits` setting, a manifest without `settings_schema`) is shown with an explicit "not editable
   here" notice naming its setting path and, read-only, its unresolved configured text — never
   silently omitted. Readiness is the verdict of the last Check plus, when a status record exists
-  (R7), the running process's per-module ready/degraded state with the record's time.
+  and is usable (R7), the running process's per-module ready/degraded state with the record's
+  time; an unusable record contributes no running state.
 - R5: A Check action, on each module page, on the core-settings page and on the base page,
   validates a draft (the merged on-disk configuration plus the page's unsaved edits) without
   writing the overlay, without signalling or contacting the main process, and without opening a
@@ -240,17 +249,91 @@ static constraints.
   same `--overlay` if given), executed without a shell. Apply is refused unless a Check of the
   on-disk configuration passes. The UI stops the process it launched (terminate, bounded wait,
   then kill), starts the new one with the status-file variable set, and reports within a bounded
-  window (documented default 60 s) one of: accepted (the new process's status record reports
-  ready with a configuration digest equal to the on-disk digest), refused (the process exited;
-  exit status and its value-free diagnostics shown), or unknown (window elapsed). When the
+  window (documented default 60 s) one of: accepted (a usable status record whose `pid` is the
+  pid of the child just launched, whose `state` is `ready` and whose `digest` equals the on-disk
+  digest), refused (the process exited; exit status and its value-free diagnostics shown), or
+  unknown (window elapsed). When the
   status-file variable is set, the main process publishes the status record — replacing it
   atomically — when it becomes ready and again on **every** later module ready/degraded
-  transition, each record containing its pid, start time, a sequence number strictly greater
-  than the previous record's, a digest of the merged unresolved configuration document it
-  loaded, and per-module state; never a resolved or credential value. Every page shows whether
-  disk and the running process agree: in sync, differs, or unknown (no record, or the recorded
-  pid is not alive); a process not launched by this UI is labelled "not supervised" and is never
-  signalled. Status records are read only at the status path of A5.
+  transition, each record conforming to the status record format below; never a resolved or
+  credential value. Every page shows whether disk and the running process agree: in sync,
+  differs, or unknown (no record, an unusable record, or a usable record whose process is dead);
+  a process not launched by this UI is labelled "not supervised" and is never signalled. Status
+  records are read only at the status path of A5.
+  Status record format (record version 1): the file is at most 1 MiB of UTF-8 text holding one
+  JSON object (RFC 8259; the tokens `NaN`/`Infinity` are not JSON, and an object with a duplicate
+  key is malformed). "Integer" below means a JSON number written without fraction or exponent
+  (`1.0` and `1e0` are not integers) and never a JSON boolean; "timestamp" means a JSON string of
+  the form `YYYY-MM-DDTHH:MM:SS` optionally followed by `.` and 1 to 6 digits, then `Z` — a valid
+  calendar date and time in UTC (RFC 3339 with the `Z` offset only, e.g.
+  `2026-09-28T14:03:07.412Z`). The top-level object has exactly these required fields:
+  - `version`: integer, exactly `1`.
+  - `pid`: integer in `1`..`2147483647`, the operating-system process id of the main process
+    that wrote the record.
+  - `started_at`: timestamp, the wall-clock time at which that main process started (taken once,
+    before it loaded its configuration); every record one process publishes carries the same
+    value. The **process identity** of a record is the pair (`pid`, `started_at`).
+  - `published_at`: timestamp, the wall-clock time at which this record was written; this is the
+    "record's time" R4 displays.
+  - `sequence`: integer in `1`..`9007199254740991` (2^53 − 1). The first record a process
+    publishes has sequence `1`; each later record of the same process identity has a sequence
+    strictly greater than the previous one's (the writer adds 1). Sequences are compared only
+    between records of the same process identity; a new process starts again at `1`.
+  - `digest`: string of exactly 64 lowercase hexadecimal characters, the SHA-256 of the UTF-8
+    bytes of the canonical JSON serialization of the merged unresolved configuration document
+    the process loaded — the base deep-merged with the overlay per R2, before any `${NAME}`
+    resolution and before any documented default is applied — serialized with keys sorted,
+    separators `,` and `:` with no whitespace, non-ASCII characters written as themselves, and
+    any value outside the JSON data model (e.g. a YAML timestamp, a non-string mapping key)
+    written as its Python `str()`. One shared function in `core/overlay.py` computes it for both
+    the runtime and the UI, so the "on-disk digest" is that function applied to the current
+    base and overlay files.
+  - `state`: string, the main process's overall state. Its only permitted value in record
+    version 1 is `ready`: the process publishes only after it has reported readiness (above),
+    so every record it writes states that it completed startup and is serving. Apply's
+    "accepted" outcome (above), the "in sync"/"differs" drift states and AC30/AC32/AC33 depend on
+    `state` being `ready`; no other value is ever accepted.
+  - `modules`: JSON object (the per-module container) keyed by module name — each key a
+    non-empty string naming one module enabled in the configuration the process loaded, one
+    entry per enabled module, possibly none. Each value is a JSON object with the required field
+    `state`, a string whose permitted values are exactly `ready` and `degraded` (the module's
+    last ready/degraded transition as reported by its health owner).
+  Keys other than the required ones, at the top level or inside a module entry, are ignored:
+  never displayed, never used to classify or compare. A usable record's process is **dead**
+  when no process with its `pid` exists (a signal-0 probe fails with "no such process"; success
+  or "permission denied" means alive) or, when that `pid` is the child this UI launched, when
+  the UI has observed that child's exit — the UI's own child handle is authoritative for its
+  child. A record of a dead process yields drift "unknown" and no per-module running state.
+  Unusable status record — the classification rule: a record is **usable** only if it satisfies
+  every requirement of the status record format above; anything else is **unusable** — a file
+  present at the status path that cannot be read (I/O or permission error, or not a regular
+  file), exceeds 1 MiB, is not UTF-8, is not a single JSON text, has a duplicate key, is JSON
+  but not an object, lacks any required field (`version`, `pid`, `started_at`, `published_at`,
+  `sequence`, `digest`, `state`, `modules`), holds a field of the wrong type (e.g. a pid that
+  is the string `"123"`, a sequence of `1.5`, a timestamp that is not a string), holds a value
+  outside its permitted set or range (e.g. `version` `2`, `pid` `0`, a timestamp with an offset
+  other than `Z` or an impossible date, a digest in uppercase or of the wrong length, a `state`
+  other than `ready`), or has a malformed container (`modules` not an object, an empty key, an
+  entry that is not an object, lacks `state`, or has a `state` other than `ready`/`degraded`).
+  An unusable record is never silently repaired (no coercion of `"123"` to `123`, no defaulting
+  of a missing field, no truncation or case-folding of a digest), never partially trusted (no
+  field of it — pid, digest, module states or time — is displayed or used, even the fields that
+  are individually well-formed), and never treated as evidence that the running configuration
+  matches disk.
+  Status-path collision: the UI refuses to start, and `core.main` `run` refuses to start when the
+  status-file variable is set, if the status path (A5) resolves to the same file as the base file
+  or the managed overlay path (compared as resolved absolute paths per A5, including the derived
+  default and a path received through the variable). The refusal emits the diagnostic
+  `status_path_collision` naming which file collided (base or overlay) and its path, exits with a
+  non-zero status, and happens before binding any socket, launching any process, starting any
+  module, or creating, truncating or writing any file; neither configuration file is opened for
+  writing. Handling of an unusable record (classified by the rule above): the UI never crashes
+  on it: every page still renders, the record status reads "status record unusable" with a value-free reason (the failing check
+  and, when relevant, the field name and expected type — never the record's content), distinct
+  from "no status record"; the drift state is "unknown" — never "in sync", whatever digest the
+  record appears to hold; no per-module running state or readiness is derived from it; and
+  during Apply an unusable record never counts as accepted (the window keeps waiting for a
+  usable record and ends in unknown if none arrives).
 - R8: No secret value appears in any HTML page, JSON response, UI log record, restart report, or
   diagnostic produced by the UI. Secret values are: the resolved value of every environment
   variable referenced anywhere in the base or overlay (as a value or as a mapping key), the
@@ -436,7 +519,11 @@ static constraints.
   digest and sequence `s1`; when M's health owner then reports degraded, the record is replaced
   and shows M degraded, N ready and a sequence `s2 > s1`; when M reports ready again, the record
   shows M ready with `s3 > s2` — 3 transitions, 3 distinct published records, each observed in
-  order. `run` without the variable writes no file.
+  order. Each of the 3 records is classified usable by the R7 rule: `version` `1`, `pid` equal to
+  the process's pid, the same `started_at` in all 3, `published_at` a timestamp, `s1` = `1`,
+  `digest` equal to the on-disk digest the UI computes for the same base and overlay, `state`
+  `ready`, and `modules` with exactly the keys M and N. `run` without the variable writes no
+  file.
 - AC34 (R7): A record replacement interrupted after the new content is prepared but before it
   replaces the file (simulated failure) leaves the previous record intact and parseable; a
   reader repeatedly parsing the status path during the 3 transitions of AC33 never parses a
@@ -462,6 +549,47 @@ static constraints.
   base key, the list of the 5 writable blocks and the 2 read-only blocks (`secrets`, `actions`)
   with the reason, the secrets policy, the three drift states (in sync, differs, unknown), and
   the status-file variable name with the default status path rule of A5.
+- AC41 (R7, A5): With base `config.yaml` and overlay `config.local.yaml` in a temporary
+  directory, the UI is started with `--status-file` equal to the base path, to the overlay path,
+  to `./sub/../config.local.yaml` (relative, non-normalized), and to a symbolic link pointing at
+  the base; and with no `--status-file` but `--overlay config.yaml.status.json` (derived default
+  colliding with the overlay). Each start exits with a non-zero status and a diagnostic
+  containing `status_path_collision`, binds no socket (as in AC1) and launches no process.
+  `core.main` `run` is started with the status-file variable set to the base path, to the
+  implicit overlay path while that overlay file does not exist, and to the explicit `--overlay`
+  path via a relative spelling; each exits with a non-zero status and `status_path_collision`
+  before any module starts or any socket is bound. After every case, the base and overlay files
+  have byte-identical content and unchanged modification times, and no file was created at a
+  previously absent overlay path. A non-colliding `--status-file` in the same directory starts
+  normally.
+- AC39 (R7): A live UI whose status path holds, in turn: a record made unreadable (mode `000`, or
+  a directory at that path); non-JSON bytes; valid JSON `[1, 2]`; a JSON object missing
+  `digest`; and a JSON object whose digest equals the on-disk digest but whose pid is the string
+  `"123"`. For each, every page returns 200, shows "status record unusable" with a reason that
+  differs from the "no status record" text and contains none of the record's bytes, shows drift
+  "unknown" (never "in sync"), and shows no per-module running state; the UI process keeps
+  serving afterwards. With a fake launch argv whose child writes only such a record, Apply
+  reports unknown after a window shortened to 1 s, never accepted.
+- AC40 (R7): Starting from one valid record V (version `1`, the live test process's pid,
+  `started_at` and `published_at` timestamps, `sequence` `1`, `digest` equal to the on-disk
+  digest, `state` `ready`, `modules` `{"M": {"state": "ready"}}`), V itself is classified usable
+  (drift "in sync", M shown ready with V's `published_at`), and V with an extra top-level key and
+  an extra key inside M's entry is still usable with the same display. Each of the following
+  single mutations of V is classified unusable, with the behaviour of AC39 (status "status
+  record unusable", a value-free reason naming the failing field and expected type or set, drift
+  "unknown", no per-module running state, no field of the record displayed): each of the 8
+  required fields removed in turn; `version` `2`, `"1"` and `1.0`; `pid` `0`, `-4`, `true`,
+  `2147483648` and `"123"`; `started_at` `1759068187`, `"2026-09-28 14:03:07Z"`,
+  `"2026-09-28T14:03:07+02:00"`, `"2026-02-30T00:00:00Z"` and a fraction of 7 digits;
+  `published_at` `null`; `sequence` `0`, `1.5`, `9007199254740992` and `"1"`; `digest` in
+  uppercase hex, of 63 characters, prefixed `sha256:`, and `null`; `state` `"degraded"`,
+  `"READY"` and `1`; `modules` `[]`, `{"": {"state": "ready"}}`, `{"M": "ready"}`, `{"M": {}}`,
+  `{"M": {"state": "stopped"}}` and `{"M": {"state": null}}`; a JSON text with `pid` given twice;
+  a JSON text containing `NaN`; and a file of 1 MiB + 1 byte. For none of them is the pid coerced
+  or displayed, and none shows "in sync". A usable record identical to V but whose `pid` is that
+  of an exited process shows drift "unknown" and no per-module running state. With a fake
+  launch argv whose child writes V with its own pid but `state` `"starting"`, or V with a pid
+  other than its own, Apply reports unknown after a window shortened to 1 s, never accepted.
 
 ## Test failure allowlist
 
