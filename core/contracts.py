@@ -693,7 +693,9 @@ _CONSTRAINT_KEYWORDS = frozenset(
 # Annotations carry no constraint; they are accepted and ignored so manifests
 # can document their schemas. Every other keyword is an explicit error rather
 # than a silent no-op, so an unsupported constraint can never look enforced.
-_ANNOTATION_KEYWORDS = frozenset({"title", "description"})
+# ``default`` is the one annotation that is itself checked: it must satisfy the
+# node that declares it, so a documented default can never be an invalid value.
+_ANNOTATION_KEYWORDS = frozenset({"title", "description", "default"})
 
 _KNOWN_KEYWORDS = _CONSTRAINT_KEYWORDS | _ANNOTATION_KEYWORDS
 
@@ -706,7 +708,9 @@ def validate_schema(schema: Any, *, label: str) -> None:
     """Raise :class:`SchemaError` unless *schema* uses the supported subset.
 
     The subset is ``type``, ``enum``, ``minimum``, ``maximum``, ``required``,
-    ``properties``, ``items`` and ``additionalProperties``.
+    ``properties``, ``items`` and ``additionalProperties``. A ``default``
+    annotation must satisfy the node that declares it; a nested node's
+    ``default`` is checked through the same recursion.
     """
 
     if not isinstance(schema, Mapping):
@@ -774,6 +778,16 @@ def validate_schema(schema: Any, *, label: str) -> None:
         schema["additionalProperties"], bool
     ):
         raise SchemaError(f"{label}.additionalProperties", "must be a boolean")
+
+    if "default" in schema:
+        # Checked against the node's constraints only: ``_apply_schema`` never
+        # reads ``default``, so the check cannot recurse into the annotation.
+        try:
+            _apply_schema(schema["default"], schema, label=f"{label}.default")
+        except ContractError as exc:
+            field = f"{label}.default"
+            reason = exc.reason if exc.field == field else f"{exc.field}: {exc.reason}"
+            raise SchemaError(field, reason) from None
 
 
 def validate_against_schema(value: Any, schema: Any, *, label: str) -> None:
