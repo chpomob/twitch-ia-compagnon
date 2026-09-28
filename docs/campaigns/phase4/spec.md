@@ -685,3 +685,11 @@ core modules tests`; blind spot: calls through aliases or `getattr`.
 | tests/test_shutdown.py (2) | `run` | None |
 | core/contracts.py (6 internal) | `validate_schema` recursion | Carry the `default` check through nested nodes |
 | core/loader.py (1) | `validate_schema` on `settings_schema` | None; accepts the new annotation |
+
+## Recorded deviations (P19 gate)
+
+Recorded, not relaxing any requirement: the unplanned regression-fix step P3F1 touched two files that
+are not targets above — `tests/conftest.py` (`wait_until` gains an optional wall-time floor for work
+run in a worker thread; it never sleeps) and `tests/test_presence_pack.py` (the presence scenario's
+`drive` uses it) — to remove a load-dependent flake in a phase-2 scenario. No assertion was
+weakened. The full gate summary is in `plan.md` ("P19 review summary").

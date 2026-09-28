@@ -707,3 +707,97 @@ again in the step that implements it.
 | P2 — synchronous Check inside the aiohttp handler | D8; P9 bridge (`_to_ui_request`, `_dispatch` via a dedicated thread pool, locks); P12 bridge test drives a real `/check` through `_dispatch` from a running loop, plus a guard test proving Check refuses to run on a running loop |
 | P3 — shared-file and Save ordering | P14 dependencies `[P4, P13]`; P18 dependencies `[P16]`; "Shared-file ordering" in the ordering rationale |
 | P4 — child output backpressure | D9; P15 stdout inherited, stderr drained continuously by `_StderrDrain` with a bounded tail, and four backpressure tests (1 MiB before ready, output after acceptance, tail on refusal, drain unit test) |
+
+## P19 review summary (full-branch gate)
+
+Recorded by P19. No requirement is relaxed here; this section only records what the gate
+checked and the deviations it found.
+
+**Change set.** The step branch starts at `main`, so `git diff main...HEAD` is empty by
+construction. The phase-4 change set was reviewed as one diff from the campaign scaffolding
+commit to the P18 head: `git diff 835d9b4..HEAD` (33 files outside `docs/campaigns/`,
++11,610/−38).
+
+**Suite (AC11).** With no `*.local.yaml` anywhere in the repository,
+`.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` reports **2889 passed, 18 skipped,
+0 failed** in 93 s. The four phase-4 test files collect 429 tests
+(`test_config_ui.py`, `test_overlay.py`, `test_status_record.py`,
+`test_manifest_presentation.py`), so the floor is 2,460 + 429 = 2,889 passed: met exactly.
+The 18 skips are the pre-existing environment-gated ones (capture process groups, 6 phase-2
+and 6 phase-3 opt-in trials, the pip install test). The only modified pre-existing assertions
+are the two allowlisted tests (`test_users.py::test_manifest_is_v2_and_declares_users_read_without_granting_it`,
+`test_main.py::test_pyproject_declares_the_console_script_and_the_build_backend_for_tests`).
+
+**Cross-file checks.**
+- Digest (P2/P4/P14/P15): `core.main._load_documents` digests `deep_merge(read_base(path), read_overlay(...))`
+  before resolution; the UI's drift and Apply acceptance use `core.overlay.on_disk_digest`, which is
+  `canonical_digest(deep_merge(read_base(base), read_overlay(overlay)))` — the same functions on the same
+  unresolved document. `canonical_digest` has exactly these two callers. Tests:
+  `test_status_record.py::test_the_record_describes_the_loaded_configuration`,
+  `test_config_ui.py::test_ac32_drift_follows_the_overlay_and_the_record`,
+  `test_config_ui.py::test_ac32_after_a_successful_apply_every_page_shows_in_sync`.
+- Check/Save draft (P12/P13): both build the draft with `_apply_edits(overlay, …)`
+  (`core/config_ui/__init__.py` Check and Save paths); Save applies it only when no edit is refused, so it
+  writes the draft Check validates. Test: `test_apply_edits_sets_paths_on_a_copy`, `test_ac38_*`, `test_ac24_*`.
+- Socket-creation patch (P9 vs P12/P15): the module-scoped autouse fixture `no_socket_creation` asserts a
+  zero creation counter at teardown over the whole of `test_config_ui.py`, including the real subprocess
+  Apply tests and the socket-free Check loop; the suite shows no teardown error.
+- D8: `grep -n "ui\.handle(\|self\.handle(\|asyncio\.run(" core/config_ui/__init__.py` → no match; `serve()`'s
+  `catch_all` reaches `handle` only through `_dispatch` (`loop.run_in_executor(executor, ui.handle, request)`).
+- D9: the only `Popen` is `Supervisor.start` (`self.popen(...)`, `stderr=subprocess.PIPE`), which creates a
+  `_StderrDrain` under the lock and starts it before returning.
+- Redaction of restart reports (P10/P15): the refused tail goes through `_report_tail(…, secret_values)`, a
+  launch failure through `_value_free(_redact(…))`; the AC35 sweep collects every `ApplyReport`. Tests:
+  `test_d9_the_refused_tail_is_redacted_and_value_free`,
+  `test_ac35_no_secret_value_reaches_any_response_log_report_or_record`.
+- Manifests (P5–P8) vs module pages (P11): `test_ac16_every_schema_path_is_shown_with_title_help_and_default`
+  and `test_manifest_presentation.py::test_presented_covers_every_shipped_manifest` pass on all 17.
+
+**Gate checklist.**
+- AC1–AC43 each have a named test. AC11 is this suite run; AC12 →
+  `test_manifest_presentation.py::test_every_setting_node_has_a_title`; AC13 →
+  `test_every_documented_default_is_declared`; AC14 → `test_default_satisfying_the_node_is_accepted`,
+  `test_default_violating_the_node_is_refused_as_default`,
+  `test_default_does_not_constrain_validated_values`, `test_audio_output_voices_schema_keeps_allowed_and_default`;
+  every other AC has at least one `test_ac<N>_*` test in `test_config_ui.py`, `test_overlay.py` or
+  `test_status_record.py` (AC33/AC34/AC41/AC43 in `test_status_record.py`, AC7–AC10 in `test_overlay.py`,
+  AC36 also in `test_main.py`).
+- AC17: `test_config_ui.py::test_ac17_no_ui_source_file_names_a_shipped_module` passes.
+- Write paths: the UI writes only through `_write_overlay` (temp file in the overlay's directory, then
+  `os.replace` onto the managed overlay; it refuses any other target and the base); the runtime writes only
+  the status record through `_write_status_record` (temp file, then `os.replace`). No `FileHandler` or other
+  file write exists in `core/config_ui` or `core/overlay.py`.
+- External URLs: the added production lines contain only `http://` as the origin-parsing scheme and the
+  loopback access URL `http://{access_authority}/?token=…`; `test_ac36_the_url_audit_finds_every_external_target`
+  passes.
+- `[project].dependencies`: unchanged (`aiohttp>=3.9,<4`, `PyYAML>=6,<7`); `pyproject.toml` only gains the
+  second `[project.scripts]` entry.
+- Caller table (spec "Caller Enumeration"): no existing caller changed; every caller omits the overlay and the
+  new keyword is optional. A fresh AST count of calls to `core.main.load_config`/`check_config`/`run` gives
+  `test_main.py` 59, `test_profiles.py` 6, `test_examples.py` 5, `test_integration.py` 2,
+  `test_shutdown.py` 7, plus `test_lifecycle.py` 1 and `test_retention.py` 2, which the table's
+  `grep` pattern does not match (they call `application.run(...)` through an `import core.main as application`
+  alias — the blind spot the table names). New callers: `core/config_ui` (`check_config`), `test_overlay.py`, `test_status_record.py`,
+  `test_config_ui.py`. `validate_schema` callers are unchanged (6 in `core/contracts.py`, 1 in `core/loader.py`).
+- Targets vs files touched: equal except `tests/conftest.py` and `tests/test_presence_pack.py` (deviation 1).
+
+**Deviations.**
+1. **P3F1, an unplanned regression-fix step**, touched `tests/conftest.py` (`wait_until` gains an optional
+   wall-time floor, `seconds=`, for work handed to a worker thread; it never sleeps) and
+   `tests/test_presence_pack.py` (`Presence.drive` uses `seconds=30.0`). Neither file is a spec target. The
+   change removed a load-dependent flake in a phase-2 scenario exposed by P3's slower suite; no assertion was
+   weakened. Also recorded in the specification.
+2. **Commit scope.** The P1, P2 and P3 commits carry `feat(phase3):`; every later commit is `(phase4)`. History
+   is not rewritten.
+3. **D1–D9 held as planned.** D5 held (the publisher subscribes to `TRACE_MODULE_READY`/`TRACE_MODULE_DEGRADED`
+   on the bus; `core/runtime.py` is untouched), so the P4 fallback was not used.
+4. **D7** relies on the private CPython `BaseSelectorEventLoop` methods `_make_self_pipe`, `_close_self_pipe`
+   and `_write_to_self`; `test_d7_the_private_self_pipe_hooks_still_exist` fails loudly if an interpreter
+   changes them.
+5. **Install test not exercised here.** `test_profiles.py`'s distribution install test is skipped because the
+   project virtualenv has no `pip` (a pre-existing skip counted in the 18), so the packaging of
+   `core.config_ui` through a built distribution was not run in this environment; the `[project.scripts]` and
+   `packages.find` assertions in `test_main.py` do run.
+6. **Vendor-named variable in a test.** The AC35 sweep sets `OPENAI_API_KEY` because the shipped profiles
+   (`config.yaml.example`, `config.server.yaml.example`) already reference that variable name; phase 4 adds no
+   new model, provider or vendor name to code or configuration.
