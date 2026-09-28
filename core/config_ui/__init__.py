@@ -19,7 +19,7 @@ The module is split into delimited sections (D3): settings and startup
 checks, authorities, the configuration model, the status record reader
 (R7), the redaction guard (R8), the rendering helpers (R9), the request core
 and its pages, the draft edits and Check (R5), Save and remove-override (R6),
-the socket-free event loop (D7), the request bridge and the entry point. No
+the supervised restart of Apply (R7, D9), the socket-free event loop (D7), the request bridge and the entry point. No
 section names a module: every page lists or renders what discovery found
 (A2).
 """
@@ -41,9 +41,11 @@ import re
 import secrets
 import selectors
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import weakref
 from contextlib import suppress
 from contextvars import ContextVar
@@ -83,6 +85,7 @@ from core.main import (
     check_config,
 )
 from core.overlay import (
+    STATUS_FILE_VARIABLE,
     OverlayError,
     deep_merge,
     default_status_path,
@@ -95,17 +98,20 @@ from core.overlay import (
 )
 
 __all__ = [
+    "ApplyReport",
     "CheckResult",
     "ConfigUI",
     "ConfigView",
     "RunningState",
     "StatusReading",
     "StatusRecord",
+    "Supervisor",
     "UIRequest",
     "UIResponse",
     "UISettings",
     "WriteResult",
     "accepted_authorities",
+    "default_launch_argv",
     "main",
     "process_alive",
     "read_status",
@@ -1747,6 +1753,7 @@ class ConfigUI:
         environ: Mapping[str, str] | None = None,
         checker: Checker | None = None,
         probe: Probe | None = None,
+        supervisor: Supervisor | None = None,
     ) -> None:
         self.settings = settings
         #: The UI process's own environment: "set/unset" is judged here, the
@@ -1775,9 +1782,14 @@ class ConfigUI:
         #: The liveness probe of a status record's process; a seam for tests,
         #: production always uses :func:`process_alive` (R7).
         self.probe: Probe = process_alive if probe is None else probe
-        #: The main process this UI launched, if any: the only one it
-        #: supervises (A4); a record naming another pid is "not supervised".
-        self.child: ChildHandle | None = None
+        #: Stops and starts the main process this UI launched (R7, A4).
+        self.supervisor = (
+            Supervisor(default_launch_argv(settings), self.status_path)
+            if supervisor is None
+            else supervisor
+        )
+        #: The last Apply's report, shown on the pages (R7).
+        self.last_apply: ApplyReport | None = None
         _LOG_REDACTION.sources.add(self)
         self.routes: dict[str, tuple[frozenset[str], Handler]] = {
             "/": (frozenset({"GET"}), self._base_page),
@@ -1786,11 +1798,22 @@ class ConfigUI:
             "/save": (frozenset({"POST"}), self._save_endpoint),
             "/remove": (frozenset({"POST"}), self._remove_endpoint),
             "/check": (frozenset({"POST"}), self._check_endpoint),
-            "/apply": (frozenset({"POST"}), self._not_available),
+            "/apply": (frozenset({"POST"}), self._apply_endpoint),
         }
 
     def __repr__(self) -> str:
         return f"ConfigUI(authority={self.access_authority!r})"
+
+    @property
+    def child(self) -> ChildHandle | None:
+        """The main process this UI launched, if any: the only one it
+        supervises (A4); a record naming another pid is "not supervised"."""
+
+        return self.supervisor.child  # type: ignore[no-any-return]
+
+    @child.setter
+    def child(self, child: ChildHandle | None) -> None:
+        self.supervisor.child = child
 
     def view(self) -> ConfigView:
         """Load a fresh configuration snapshot and remember its secret set."""
@@ -2033,7 +2056,9 @@ class ConfigUI:
             '<section id="actions-bar">'
             '<p><a href="/core">Core settings</a></p>'
             f'<form method="post" action="/check">{_csrf_field(session)}{_page_field("/")}'
-            '<button type="submit">Check</button></form></section>'
+            '<button type="submit">Check</button></form>'
+            f'<form method="post" action="/apply">{_csrf_field(session)}{_page_field("/")}'
+            '<button type="submit">Apply (restart the main process)</button></form></section>'
         )
         return _page("Configuration", session, body)
 
@@ -2321,8 +2346,73 @@ class ConfigUI:
         content = "".join(policies) or "<p>No channel policy is configured: every channel uses the module default.</p>"
         return f'<section id="triggers"><h2>Trigger policies</h2>{content}{add}</section>'
 
-    def _not_available(self, request: UIRequest, session: _Session) -> UIResponse:
-        return _text(501, "501 Not Implemented")
+    # -- Apply (R7, A4) --------------------------------------------------------
+
+    def apply(self) -> ApplyReport:
+        """Check the on-disk configuration, then restart the supervised child (R7).
+
+        A failing Check refuses with its diagnostics before anything is
+        stopped or started. Only the child this UI launched is ever
+        signalled (A4). The report is remembered for the pages and logged
+        with the paths and the outcome only.
+        """
+
+        result = self.check()
+        if not result.passed:
+            report = ApplyReport(APPLY_REFUSED, diagnostics=result.diagnostics, check_refused=True)
+        else:
+            try:
+                digest = on_disk_digest(self.base_path, self.overlay_path)
+            except OverlayError as exc:
+                report = ApplyReport(
+                    APPLY_REFUSED,
+                    diagnostics=(_redact(str(exc), self.secret_values),),
+                    check_refused=True,
+                )
+            else:
+                report = self.supervisor.restart(digest, self.secret_values)
+        self.last_apply = report
+        logger.info(
+            "configuration apply %s: base %s, overlay %s, status file %s",
+            report.outcome,
+            os.fspath(self.base_path),
+            "(none)" if self.overlay_path is None else os.fspath(self.overlay_path),
+            os.fspath(self.status_path),
+            extra={"config_ui_operation": "apply", "config_ui_outcome": report.outcome},
+        )
+        return report
+
+    def _apply_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``POST /apply``: the supervised restart and its report (R7)."""
+
+        fields = _form_fields(request)
+        page = self._posted_page(fields, self.view())
+        report = self.apply()
+        titles = {
+            APPLY_ACCEPTED: "Apply accepted",
+            APPLY_REFUSED: "Apply refused",
+            APPLY_UNKNOWN: "Apply outcome unknown",
+        }
+        parts = [
+            f'<h1 id="apply-outcome" data-outcome="{report.outcome}">{titles[report.outcome]}</h1>',
+            f'<p><a href="{ident(page)}">Back</a></p>',
+            self._running_section(self.running_state()),
+        ]
+        if report.check_refused:
+            parts.append("<p>The on-disk Check failed: nothing was stopped or started.</p>")
+        if report.diagnostics:
+            items = "".join(f'<li class="diagnostic">{esc(line)}</li>' for line in report.diagnostics)
+            parts.append(f'<section class="diagnostics" id="apply-diagnostics"><ul>{items}</ul></section>')
+        if report.exit_status is not None:
+            parts.append(f'<p id="exit-status" data-status="{report.exit_status}">'
+                         f"The process exited with status {report.exit_status}.</p>")
+            parts.append(f'<pre id="stderr-tail">{esc(report.stderr_tail)}</pre>')
+        if report.outcome == APPLY_UNKNOWN:
+            parts.append(
+                f"<p>No status record of the new process reported ready with the on-disk "
+                f"configuration within {self.supervisor.apply_window:g} s.</p>"
+            )
+        return _page(titles[report.outcome], session, "".join(parts))
 
     # -- Check (R5) -----------------------------------------------------------
 
@@ -3499,6 +3589,290 @@ def _write_overlay(
 
 
 # ---------------------------------------------------------------------------
+# Supervised restart (R7 Apply, A4, D9)
+#
+# Apply runs an on-disk Check, stops the one child this UI launched
+# (terminate, a bounded wait, then kill and wait), starts the launch argv
+# without a shell with the status-file variable set, and polls the status
+# path within a bounded window for one of three outcomes. A status record
+# naming any other pid is never signalled. The child's stdout is inherited,
+# so it can never fill a pipe; its stderr is a pipe drained for the child's
+# whole life by a :class:`_StderrDrain` thread, which forwards it to the
+# UI's own stderr (the terminal, never a page or a log record) and keeps a
+# bounded tail for a refused Apply's report.
+# ---------------------------------------------------------------------------
+
+APPLY_ACCEPTED = "accepted"
+APPLY_REFUSED = "refused"
+APPLY_UNKNOWN = "unknown"
+
+#: The documented defaults (R7): the stop grace and the Apply window, in seconds.
+DEFAULT_STOP_GRACE = 10.0
+DEFAULT_APPLY_WINDOW = 60.0
+APPLY_POLL_SECONDS = 0.05
+#: How long a stop or a refused Apply waits for the drain to read EOF.
+DRAIN_JOIN_SECONDS = 2.0
+#: The drain keeps the last 8 KiB; a report shows at most the last 2 KiB.
+DRAIN_TAIL_BYTES = 8 * 1024
+REPORT_TAIL_BYTES = 2 * 1024
+_DRAIN_CHUNK = 4096
+
+
+class _StderrDrain(threading.Thread):
+    """Reads one child's stderr pipe until EOF (D9).
+
+    Each chunk is forwarded to the UI's own ``sys.stderr.buffer`` (a failed
+    write only skips forwarding; draining never stops early) and appended to
+    a tail trimmed to the last :data:`DRAIN_TAIL_BYTES` under a lock.
+    """
+
+    def __init__(self, fd: int, stream: Any = None) -> None:
+        super().__init__(name="stderr-drain", daemon=True)
+        self._fd = fd
+        #: The pipe's file object, closed by :meth:`close` once drained.
+        self._stream = stream
+        self._tail = bytearray()
+        self._lock = threading.Lock()
+        self._finished = False
+        self._close_when_finished = False
+
+    def run(self) -> None:
+        try:
+            while True:
+                try:
+                    chunk = os.read(self._fd, _DRAIN_CHUNK)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self._forward(chunk)
+                with self._lock:
+                    self._tail += chunk
+                    if len(self._tail) > DRAIN_TAIL_BYTES:
+                        del self._tail[:-DRAIN_TAIL_BYTES]
+        finally:
+            with self._lock:
+                self._finished = True
+                close = self._close_when_finished
+            if close:
+                self._close_stream()
+
+    @staticmethod
+    def _forward(chunk: bytes) -> None:
+        try:
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+        except Exception:  # noqa: BLE001 - forwarding only; the drain goes on
+            pass
+
+    def tail(self, limit: int) -> str:
+        """The last *limit* bytes drained, decoded with ``errors="replace"``."""
+
+        with self._lock:
+            data = bytes(self._tail[-limit:]) if limit > 0 else b""
+        return data.decode("utf-8", errors="replace")
+
+    def close(self, timeout: float = DRAIN_JOIN_SECONDS) -> None:
+        """Join (bounded), then close the pipe.
+
+        A drain still blocked after *timeout* (a grandchild holding the write
+        end) closes the pipe itself on EOF, so its descriptor is never closed
+        under a pending read.
+        """
+
+        self.join(timeout)
+        with self._lock:
+            if not self._finished:
+                self._close_when_finished = True
+                return
+        self._close_stream()
+
+    def _close_stream(self) -> None:
+        if self._stream is not None:
+            with suppress(OSError, ValueError):
+                self._stream.close()
+
+
+@dataclass(frozen=True)
+class ApplyReport:
+    """The outcome of one Apply (R7); every text is value-free and redacted."""
+
+    outcome: str
+    #: Why Apply refused before stopping anything: the on-disk Check's diagnostics.
+    diagnostics: tuple[str, ...] = ()
+    #: The exit status of a child that exited within the window.
+    exit_status: int | None = None
+    #: The last :data:`REPORT_TAIL_BYTES` of that child's stderr.
+    stderr_tail: str = ""
+    #: ``True`` when the on-disk Check refused and nothing was stopped or started.
+    check_refused: bool = False
+
+
+def default_launch_argv(settings: UISettings) -> tuple[str, ...]:
+    """The launch argv: the one given after ``--``, else the runtime on this base (R7)."""
+
+    if settings.launch_argv:
+        return settings.launch_argv
+    argv = [sys.executable, "-m", "core.main", "--config", os.fspath(settings.base_path)]
+    if settings.overlay is not None:
+        argv += ["--overlay", os.fspath(settings.overlay)]
+    return tuple(argv)
+
+
+def _real_wait(interval: float) -> None:
+    threading.Event().wait(interval)
+
+
+class SupervisorClosed(RuntimeError):
+    """The UI is shutting down: :meth:`Supervisor.start` launches nothing more."""
+
+
+class Supervisor:
+    """Stops and starts the one main process this UI launched (R7, A4, D9).
+
+    Every wait is bounded: ``clock`` and ``wait`` drive the Apply window (a
+    test injects both), ``stop_grace`` bounds the wait after terminate.
+    """
+
+    def __init__(
+        self,
+        argv: Sequence[str],
+        status_path: str | os.PathLike[str],
+        *,
+        stop_grace: float = DEFAULT_STOP_GRACE,
+        apply_window: float = DEFAULT_APPLY_WINDOW,
+        poll_interval: float = APPLY_POLL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        wait: Callable[[float], None] = _real_wait,
+        popen: Callable[..., Any] = subprocess.Popen,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        self.argv = tuple(argv)
+        self.status_path = os.fspath(status_path)
+        self.stop_grace = stop_grace
+        self.apply_window = apply_window
+        self.poll_interval = poll_interval
+        self.clock = clock
+        self.wait = wait
+        self.popen = popen
+        self._environ = environ
+        #: The child this UI launched, if any: the only process ever signalled.
+        self.child: Any = None
+        self._drain: _StderrDrain | None = None
+        #: Guards :attr:`child` against a launch racing :meth:`close`.
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        """Forbid every later launch, then stop the child (the UI's final cleanup).
+
+        A restart still waiting on the mutation lock after the HTTP server
+        stopped then starts nothing, so no runtime outlives the UI.
+        """
+
+        with self._lock:
+            self._closed = True
+        self.stop()
+
+    def stop(self) -> None:
+        """Stop the child this UI launched, if any: terminate, bounded wait, kill."""
+
+        with self._lock:
+            child, drain = self.child, self._drain
+            self.child, self._drain = None, None
+        if child is None:
+            return
+        child.terminate()
+        try:
+            child.wait(timeout=self.stop_grace)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+        if drain is not None:
+            drain.close()
+
+    def start(self) -> Any:
+        """Start the launch argv without a shell, and its stderr drain (D9).
+
+        Raises :class:`SupervisorClosed` after :meth:`close`, and ``OSError``
+        when the launch argv cannot be executed.
+        """
+
+        environ = os.environ if self._environ is None else self._environ
+        with self._lock:
+            if self._closed:
+                raise SupervisorClosed("the configuration UI is shutting down")
+            child = self.popen(
+                list(self.argv),
+                shell=False,
+                env={**environ, STATUS_FILE_VARIABLE: self.status_path},
+                stdout=None,
+                stderr=subprocess.PIPE,
+                start_new_session=False,
+            )
+            self.child = child
+            stream = child.stderr
+            drain = _StderrDrain(stream.fileno(), stream) if stream is not None else None
+            self._drain = drain
+        if drain is not None:
+            drain.start()
+        return child
+
+    def restart(self, digest: str, secret_values: Iterable[str] = ()) -> ApplyReport:
+        """Stop, start, then poll the status path within the window (R7).
+
+        Accepted: a usable record of this child, ``ready``, with *digest*.
+        Refused: the child exited; its status and stderr tail are reported.
+        Unknown: the window elapsed. An unusable record never counts.
+        A launch that fails (the argv cannot be executed, or the UI is
+        shutting down) is refused with a redacted diagnostic.
+        """
+
+        self.stop()
+        try:
+            child = self.start()
+        except SupervisorClosed as exc:
+            return ApplyReport(APPLY_REFUSED, diagnostics=(str(exc),))
+        except OSError as exc:
+            reason = _value_free(_redact(str(exc), secret_values))
+            return ApplyReport(
+                APPLY_REFUSED,
+                diagnostics=(f"the launch command could not be started: {reason}",),
+            )
+        drain = self._drain
+        deadline = self.clock() + self.apply_window
+        while True:
+            returncode = child.poll()
+            if returncode is not None:
+                tail = ""
+                if drain is not None:
+                    drain.join(DRAIN_JOIN_SECONDS)
+                    tail = _report_tail(drain.tail(DRAIN_TAIL_BYTES), secret_values)
+                return ApplyReport(APPLY_REFUSED, exit_status=returncode, stderr_tail=tail)
+            record = read_status(self.status_path).record
+            if record is not None and record.pid == child.pid and record.digest == digest:
+                # A usable record's state is always ``ready`` (the reader
+                # refuses every other value).
+                return ApplyReport(APPLY_ACCEPTED)
+            if self.clock() >= deadline:
+                return ApplyReport(APPLY_UNKNOWN)
+            self.wait(self.poll_interval)
+
+
+def _report_tail(text: str, secret_values: Iterable[str]) -> str:
+    """The last :data:`REPORT_TAIL_BYTES` of *text*, redacted and value-free (R8).
+
+    Redaction runs on the whole drained tail first, so a secret cut by the
+    2 KiB boundary was already replaced.
+    """
+
+    redacted = _redact(text, secret_values)
+    lines = "\n".join(_value_free(line) for line in redacted.split("\n"))
+    data = lines.encode("utf-8")[-REPORT_TAIL_BYTES:]
+    return data.decode("utf-8", errors="ignore")
+
+
+# ---------------------------------------------------------------------------
 # Socket-free event loop (D7)
 #
 # A standard selector loop creates a self-pipe socketpair; this one creates no
@@ -3666,5 +4040,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ui = ConfigUI(settings)
     print(f"Configuration UI: {ui.access_url}", flush=True)
     logger.info("configuration UI serving on %s", ui.access_authority)
-    serve(ui, settings)
+    try:
+        serve(ui, settings)
+    finally:
+        ui.supervisor.close()
     return 0

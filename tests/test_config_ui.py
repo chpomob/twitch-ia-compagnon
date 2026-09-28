@@ -2,7 +2,7 @@
 the configuration model, base page and core-settings page (P10); the module
 pages generated from each manifest (P11); Check (P12); Save and
 remove-override (P13); the status record reader, drift and running state
-(P14).
+(P14); Apply, the supervised restart (P15).
 
 The whole module runs with socket creation patched to raise (AC5): no test
 here binds, connects or even creates a socket. The request core is driven
@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -32,6 +33,7 @@ import threading
 import tokenize
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -3628,3 +3630,610 @@ def test_ac32_drift_follows_the_overlay_and_the_record(tmp_path: Path) -> None:
     pages = _status_pages(ui, cookie)
     assert {_drift(page) for page in pages.values()} == {DRIFT_UNKNOWN}
     assert {_record_status(page) for page in pages.values()} == {NO_STATUS_RECORD}
+
+
+# ---------------------------------------------------------------------------
+# P15: Apply — the supervised restart (R7, A4, D9)
+#
+# Real fake children: scripts written to tmp_path, run with sys.executable,
+# publishing through the core.overlay helpers. Every wait is a bounded
+# Event.wait (never a sleep) and every window is about 1 s.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+APPLY_WINDOW = 1.0
+#: The window of a test whose child must be accepted: long only if it fails.
+ACCEPT_WINDOW = 10.0
+STOP_GRACE = 0.5
+MIB = 1024 * 1024
+
+CHILD_PRELUDE = f"""\
+import json, os, signal, sys, threading
+sys.path.insert(0, {str(REPO_ROOT)!r})
+from core.overlay import STATUS_FILE_VARIABLE, on_disk_digest
+
+STATUS = os.environ[STATUS_FILE_VARIABLE]
+BASE, OVERLAY = sys.argv[1], sys.argv[2]
+
+
+def publish(data=None, **changes):
+    if data is None:
+        record = {{
+            "version": 1,
+            "pid": os.getpid(),
+            "started_at": "2026-09-28T14:03:07Z",
+            "published_at": "2026-09-28T14:03:08Z",
+            "sequence": 1,
+            "digest": on_disk_digest(BASE, OVERLAY),
+            "state": "ready",
+            "modules": {{"M": {{"state": "ready"}}, "N": {{"state": "ready"}}}},
+        }}
+        record.update(changes)
+        data = json.dumps(record).encode("utf-8")
+    temporary = STATUS + ".tmp"
+    with open(temporary, "wb") as handle:
+        handle.write(data)
+    os.replace(temporary, STATUS)
+
+
+def hold():
+    threading.Event().wait(60)
+
+"""
+
+READY_CHILD = "publish()\nhold()\n"
+
+
+def _passing_checker(*args: object) -> tuple[bool, list[str]]:
+    return True, []
+
+
+def _failing_checker(*args: object) -> tuple[bool, list[str]]:
+    return False, ["modules.M.a: must be an integer"]
+
+
+@pytest.fixture
+def launched() -> Iterator[list[config_ui.Supervisor]]:
+    """Every supervisor a test builds; each one's child is stopped afterwards."""
+
+    supervisors: list[config_ui.Supervisor] = []
+    yield supervisors
+    for supervisor in supervisors:
+        supervisor.stop_grace = STOP_GRACE
+        supervisor.stop()
+
+
+def _apply_ui(
+    tmp_path: Path,
+    launched: list[config_ui.Supervisor],
+    body: str,
+    *,
+    window: float = ACCEPT_WINDOW,
+    checker: object = _passing_checker,
+    **supervisor_options: object,
+) -> ConfigUI:
+    """The P14 status fixture whose launch argv (after ``--``) runs *body*."""
+
+    ui = _status_ui(tmp_path)
+    script = tmp_path / "child.py"
+    script.write_text(CHILD_PRELUDE + body, encoding="utf-8")
+    settings = UISettings.from_argv(
+        [
+            "--config",
+            str(ui.base_path),
+            "--",
+            sys.executable,
+            str(script),
+            str(ui.base_path),
+            str(ui.overlay_path),
+        ]
+    )
+    supervisor = config_ui.Supervisor(
+        config_ui.default_launch_argv(settings),
+        settings.status_path,
+        stop_grace=STOP_GRACE,
+        apply_window=window,
+        **supervisor_options,  # type: ignore[arg-type]
+    )
+    launched.append(supervisor)
+    return ConfigUI(settings, checker=checker, supervisor=supervisor)  # type: ignore[arg-type]
+
+
+def _bounded_until(condition: object, limit: float = 5.0) -> bool:
+    """Poll *condition* with a bounded ``Event.wait`` loop (never a sleep)."""
+
+    event = threading.Event()
+    for _ in range(int(limit / 0.05)):
+        if condition():  # type: ignore[operator]
+            return True
+        event.wait(0.05)
+    return bool(condition())  # type: ignore[operator]
+
+
+# -- the launch argv ------------------------------------------------------------
+
+
+def test_the_default_launch_argv_runs_the_runtime_on_the_same_files(tmp_path: Path) -> None:
+    base = tmp_path / "config.yaml"
+    plain = UISettings.from_argv(["--config", str(base)])
+    assert config_ui.default_launch_argv(plain) == (
+        sys.executable, "-m", "core.main", "--config", str(base)
+    )
+    overlay = tmp_path / "mine.yaml"
+    explicit = UISettings.from_argv(["--config", str(base), "--overlay", str(overlay)])
+    assert config_ui.default_launch_argv(explicit) == (
+        sys.executable, "-m", "core.main", "--config", str(base), "--overlay", str(overlay)
+    )
+    given = UISettings.from_argv(["--config", str(base), "--", "run-me", "--flag"])
+    assert config_ui.default_launch_argv(given) == ("run-me", "--flag")
+    ui = ConfigUI(explicit)
+    assert ui.supervisor.argv == config_ui.default_launch_argv(explicit)
+    assert ui.supervisor.status_path == str(explicit.status_path)
+    assert (ui.supervisor.stop_grace, ui.supervisor.apply_window) == (10.0, 60.0)
+
+
+# -- AC29: a failing on-disk Check stops and starts nothing ----------------------
+
+
+class _SpiedChild:
+    def __init__(self, pid: int = 4242) -> None:
+        self.pid = pid
+        self.calls: list[str] = []
+
+    def poll(self) -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        self.calls.append("terminate")
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.calls.append("wait")
+        return 0
+
+
+def test_ac29_a_failing_on_disk_check_refuses_and_touches_no_process(
+    tmp_path: Path, launched: list[config_ui.Supervisor], caplog: pytest.LogCaptureFixture
+) -> None:
+    started: list[object] = []
+    ui = _apply_ui(
+        tmp_path,
+        launched,
+        READY_CHILD,
+        checker=_failing_checker,
+        popen=lambda *args, **kwargs: started.append(args),
+    )
+    existing = _SpiedChild()
+    ui.child = existing
+    cookie, csrf = _login(ui)
+    caplog.set_level(logging.INFO, logger="core.config_ui")
+    response = _post(ui, "/apply", cookie, csrf)
+    page = response.body.decode("utf-8")
+    assert 'data-outcome="refused"' in page
+    assert "modules.M.a: must be an integer" in page
+    assert ui.last_apply is not None and ui.last_apply.check_refused
+    assert started == []
+    assert existing.calls == []
+    assert ui.child is existing
+    assert not ui.status_path.exists()
+    assert "configuration apply refused" in caplog.text
+
+
+# -- AC30: accepted, refused, unknown; no shell -----------------------------------
+
+
+def test_ac30_a_ready_record_of_the_child_with_the_on_disk_digest_is_accepted(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    ui = _apply_ui(tmp_path, launched, READY_CHILD)
+    report = ui.apply()
+    assert report.outcome == config_ui.APPLY_ACCEPTED
+    record = read_status(ui.status_path).record
+    assert record is not None and ui.child is not None
+    assert record.pid == ui.child.pid != os.getpid()
+    assert ui.child.poll() is None
+
+
+def test_ac30_a_child_exiting_2_is_refused_with_its_status_and_diagnostic(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    body = "sys.stderr.write('config error: modules.M.a is not valid\\n')\nsys.exit(2)\n"
+    ui = _apply_ui(tmp_path, launched, body)
+    cookie, csrf = _login(ui)
+    page = _post(ui, "/apply", cookie, csrf).body.decode("utf-8")
+    report = ui.last_apply
+    assert report is not None
+    assert report.outcome == config_ui.APPLY_REFUSED and not report.check_refused
+    assert report.exit_status == 2
+    assert "config error: modules.M.a is not valid" in report.stderr_tail
+    assert 'data-status="2"' in page
+    assert "config error: modules.M.a is not valid" in _html.unescape(page)
+
+
+def test_ac30_a_child_writing_nothing_within_the_window_is_unknown(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    ui = _apply_ui(tmp_path, launched, "hold()\n", window=APPLY_WINDOW)
+    report = ui.apply()
+    assert report.outcome == config_ui.APPLY_UNKNOWN
+    assert report.exit_status is None
+    assert ui.child is not None and ui.child.poll() is None
+
+
+def test_ac30_the_launch_argv_runs_without_a_shell(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    seen = tmp_path / "argv.json"
+    body = f"open({str(seen)!r}, 'w').write(json.dumps(sys.argv[1:]))\npublish()\nhold()\n"
+    ui = _apply_ui(tmp_path, launched, body)
+    ui.supervisor.argv = (*ui.supervisor.argv, ";echo x", "$HOME", "a b")
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    arguments = json.loads(seen.read_text(encoding="utf-8"))
+    assert arguments[2:] == [";echo x", "$HOME", "a b"]
+
+
+def test_the_child_inherits_the_environment_plus_the_status_variable(
+    tmp_path: Path, launched: list[config_ui.Supervisor], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[dict[str, object]] = []
+    real = subprocess.Popen
+
+    def spy(argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        captured.append(kwargs)
+        return real(argv, **kwargs)  # type: ignore[call-overload, no-any-return]
+
+    monkeypatch.setenv("P15_INHERITED", "yes")
+    ui = _apply_ui(tmp_path, launched, READY_CHILD, popen=spy)
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    (options,) = captured
+    env = options["env"]
+    assert isinstance(env, dict)
+    assert env[config_ui.STATUS_FILE_VARIABLE] == str(ui.status_path)
+    assert env["P15_INHERITED"] == "yes"
+    assert options["shell"] is False
+    assert options["stdout"] is None and options["stderr"] == subprocess.PIPE
+    assert options["start_new_session"] is False
+
+
+# -- AC31: terminate, bounded wait, kill; a foreign pid is never signalled --------
+
+
+def test_ac31_a_child_ignoring_terminate_is_killed_after_the_bounded_wait(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    calls: list[tuple[int, str]] = []
+    children: list[subprocess.Popen[bytes]] = []
+    real = subprocess.Popen
+
+    def spied(argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        child = real(argv, **kwargs)  # type: ignore[call-overload]
+        terminate, kill, wait = child.terminate, child.kill, child.wait
+
+        def record(name: str, method: object) -> object:
+            def call(*args: object, **options: object) -> object:
+                calls.append((child.pid, name))
+                return method(*args, **options)  # type: ignore[operator]
+
+            return call
+
+        child.terminate = record("terminate", terminate)  # type: ignore[method-assign]
+        child.kill = record("kill", kill)  # type: ignore[method-assign]
+        child.wait = record("wait", wait)  # type: ignore[method-assign]
+        children.append(child)
+        return child
+
+    body = "signal.signal(signal.SIGTERM, signal.SIG_IGN)\npublish()\nhold()\n"
+    ui = _apply_ui(tmp_path, launched, body, popen=spied)
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    first = children[0]
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    assert [name for pid, name in calls if pid == first.pid] == [
+        "terminate",
+        "wait",
+        "kill",
+        "wait",
+    ]
+    assert first.returncode == -signal.SIGKILL
+    assert ui.child is children[1] and children[1].poll() is None
+
+
+def test_stop_waits_for_the_grace_before_killing() -> None:
+    """The stop order without a real process: the bounded wait times out."""
+
+    class Stubborn(_SpiedChild):
+        def wait(self, timeout: float | None = None) -> int:
+            self.calls.append(f"wait({timeout})")
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("child", timeout)
+            return -9
+
+    supervisor = config_ui.Supervisor(("x",), "status.json", stop_grace=3.0)
+    child = Stubborn()
+    supervisor.child = child
+    supervisor.stop()
+    assert child.calls == ["terminate", "wait(3.0)", "kill", "wait(None)"]
+    assert supervisor.child is None
+    supervisor.stop()  # nothing launched: nothing signalled
+    assert len(child.calls) == 4
+
+
+def test_ac31_apply_never_signals_a_foreign_record_pid(
+    tmp_path: Path, launched: list[config_ui.Supervisor], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ui = _apply_ui(tmp_path, launched, READY_CHILD)
+    foreign = os.getpid()
+    _publish(ui, _valid(ui, pid=foreign))
+    cookie = _logged_in(ui)
+    assert _supervision(_get(ui, "/", cookie).body.decode("utf-8")) == NOT_SUPERVISED
+    sent: list[tuple[int, int]] = []
+    real_kill = os.kill
+
+    def spy(pid: int, signal_number: int) -> None:
+        sent.append((pid, signal_number))
+        if pid != foreign:
+            real_kill(pid, signal_number)
+
+    monkeypatch.setattr(os, "kill", spy)
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED  # stops the first child
+    assert all(pid != foreign for pid, _ in sent)
+    assert any(signal_number == signal.SIGTERM for _, signal_number in sent)
+
+
+# -- AC32: after a successful Apply every page is in sync again ---------------------
+
+
+def test_ac32_after_a_successful_apply_every_page_shows_in_sync(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    ui = _apply_ui(tmp_path, launched, READY_CHILD)
+    cookie, csrf = _login(ui)
+    _publish(ui, _valid(ui))
+    assert {_drift(page) for page in _status_pages(ui, cookie).values()} == {DRIFT_IN_SYNC}
+    assert _write(ui, cookie, "/save", "/module/M", [("modules.M.a", "3")]).status == 303
+    assert {_drift(page) for page in _status_pages(ui, cookie).values()} == {DRIFT_DIFFERS}
+
+    response = _post(ui, "/apply", cookie, csrf)
+    assert response.status == 200
+    assert 'data-outcome="accepted"' in response.body.decode("utf-8")
+    pages = _status_pages(ui, cookie)
+    assert {_drift(page) for page in pages.values()} == {DRIFT_IN_SYNC}
+    assert {_supervision(page) for page in pages.values()} == {SUPERVISED}
+
+
+def test_the_base_page_posts_apply_with_the_csrf_token(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie, csrf = _login(ui)
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    form = re.search(r'<form method="post" action="/apply">(.*?)</form>', page, re.S)
+    assert form is not None and csrf in form.group(1)
+
+
+# -- AC39/AC40: an unusable or foreign record never accepts ----------------------------
+
+
+@pytest.mark.parametrize(
+    "publication",
+    [
+        "publish(b'not json at all')",
+        "publish(pid='123')",
+        "publish(state='starting')",
+        "publish(pid=os.getppid())",
+        "publish(digest='0' * 64)",
+    ],
+)
+def test_ac39_ac40_a_child_writing_only_an_unaccepted_record_is_unknown(
+    publication: str, tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    ui = _apply_ui(tmp_path, launched, f"{publication}\nhold()\n", window=APPLY_WINDOW)
+    report = ui.apply()
+    assert report.outcome == config_ui.APPLY_UNKNOWN
+    assert ui.status_path.exists()
+
+
+# -- D9: pipe backpressure ------------------------------------------------------------
+
+
+def test_d9_a_chatty_child_is_accepted_within_the_window(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    body = (
+        f"sys.stderr.write('e' * {MIB})\nsys.stderr.flush()\n"
+        f"sys.stdout.write('o' * {MIB})\nsys.stdout.flush()\n"
+        "publish()\nhold()\n"
+    )
+    ui = _apply_ui(tmp_path, launched, body, window=APPLY_WINDOW)
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+
+
+def test_d9_draining_continues_after_acceptance(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    marker = tmp_path / "marker"
+    body = (
+        "publish()\n"
+        f"sys.stderr.write('e' * {MIB})\nsys.stderr.flush()\n"
+        f"open({str(marker)!r}, 'w').close()\nhold()\n"
+    )
+    ui = _apply_ui(tmp_path, launched, body)
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    assert _bounded_until(marker.exists)
+
+
+def test_d9_a_refused_report_carries_the_last_line_within_2_kib(
+    tmp_path: Path, launched: list[config_ui.Supervisor]
+) -> None:
+    body = (
+        f"sys.stderr.write('filler line\\n' * ({MIB} // 12))\n"
+        "sys.stderr.write('LAST-LINE\\n')\nsys.exit(2)\n"
+    )
+    ui = _apply_ui(tmp_path, launched, body)
+    report = ui.apply()
+    assert report.outcome == config_ui.APPLY_REFUSED
+    assert report.exit_status == 2
+    assert "LAST-LINE" in report.stderr_tail
+    assert len(report.stderr_tail.encode("utf-8")) <= config_ui.REPORT_TAIL_BYTES == 2048
+
+
+def test_d9_the_refused_tail_is_redacted_and_value_free(
+    tmp_path: Path, launched: list[config_ui.Supervisor], caplog: pytest.LogCaptureFixture
+) -> None:
+    canary = "CANARY-TAIL-7f3a"
+    body = (
+        f"sys.stderr.write('token {canary} rejected\\n')\n"
+        "sys.stderr.write('modules.M.a: must be an integer, got 91827\\n')\nsys.exit(1)\n"
+    )
+    ui = _apply_ui(tmp_path, launched, body)
+    ui.secret_values = frozenset({canary})
+    caplog.set_level(logging.DEBUG, logger="core.config_ui")
+    cookie, csrf = _login(ui)
+    page = _post(ui, "/apply", cookie, csrf).body.decode("utf-8")
+    report = ui.last_apply
+    assert report is not None and report.exit_status == 1
+    assert canary not in report.stderr_tail and config_ui.REDACTED in report.stderr_tail
+    assert "modules.M.a: must be an integer" in report.stderr_tail
+    assert "91827" not in report.stderr_tail
+    assert canary not in page and "91827" not in page
+    assert canary not in caplog.text and "91827" not in caplog.text
+    assert f"configuration apply refused: base {ui.base_path}" in caplog.text
+
+
+def test_d9_the_drain_keeps_a_bounded_tail_of_a_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    forwarded = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stderr", forwarded)
+    read_end, write_end = os.pipe()
+    drain = config_ui._StderrDrain(read_end)
+    drain.start()
+    data = bytes(index % 251 for index in range(100 * 1024))
+    with os.fdopen(write_end, "wb") as writer:
+        for offset in range(0, len(data), 1000):
+            writer.write(data[offset : offset + 1000])
+            writer.flush()
+            with drain._lock:
+                assert len(drain._tail) <= config_ui.DRAIN_TAIL_BYTES
+    drain.join(5)
+    assert not drain.is_alive()
+    os.close(read_end)
+    assert len(drain._tail) == config_ui.DRAIN_TAIL_BYTES
+    assert bytes(drain._tail) == data[-config_ui.DRAIN_TAIL_BYTES :]
+    assert drain.tail(16) == data[-16:].decode("utf-8", errors="replace")
+    assert forwarded.buffer.getvalue() == data  # type: ignore[attr-defined]
+
+
+def test_d9_a_failed_forward_never_stops_the_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "stderr", io.StringIO())  # no ``buffer``: every forward fails
+    read_end, write_end = os.pipe()
+    stream = os.fdopen(read_end, "rb")
+    drain = config_ui._StderrDrain(read_end, stream)
+    drain.start()
+    with os.fdopen(write_end, "wb") as writer:
+        writer.write(b"x" * 70000 + b"END")
+    drain.close()
+    assert not drain.is_alive() and stream.closed
+    assert drain.tail(3) == "END"
+
+
+# -- the Apply loop on an injected clock ------------------------------------------------
+
+
+class _FakeProcess:
+    pid = 987654
+    stderr = None
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15 if self.returncode is None else self.returncode
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
+
+
+def test_the_apply_window_runs_on_the_injected_clock(tmp_path: Path) -> None:
+    now = [100.0]
+    waits: list[float] = []
+
+    def wait(interval: float) -> None:
+        waits.append(interval)
+        now[0] += interval
+
+    process = _FakeProcess()
+    supervisor = config_ui.Supervisor(
+        ("x",),
+        tmp_path / "status.json",
+        apply_window=60.0,
+        poll_interval=5.0,
+        clock=lambda: now[0],
+        wait=wait,
+        popen=lambda *args, **kwargs: process,
+    )
+    assert supervisor.restart("0" * 64).outcome == config_ui.APPLY_UNKNOWN
+    assert waits == [5.0] * 12 and now[0] == 160.0
+
+    supervisor.stop()
+    assert process.returncode == -15
+    process.returncode = 3
+    report = supervisor.restart("0" * 64)
+    assert (report.outcome, report.exit_status, report.stderr_tail) == ("refused", 3, "")
+
+
+def test_main_stops_the_supervised_child_when_the_ui_stops(
+    config_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    children: list[_SpiedChild] = []
+
+    def serve(ui: ConfigUI, settings: UISettings) -> None:
+        children.append(_SpiedChild())
+        ui.child = children[0]
+
+    monkeypatch.setattr(config_ui, "serve", serve)
+    assert main(["--config", str(config_dir / "config.yaml")]) == 0
+    assert children[0].calls == ["terminate", "wait"]
+
+
+def test_a_launch_that_cannot_start_is_a_refused_report(tmp_path: Path) -> None:
+    """A missing launch executable is refused with a redacted diagnostic, not raised."""
+
+    first = _FakeProcess()
+    launches: list[Any] = [first]
+
+    def popen(*args: Any, **kwargs: Any) -> Any:
+        if launches:
+            return launches.pop()
+        raise FileNotFoundError(2, "No such file or directory: 'hunter2-runtime'")
+
+    supervisor = config_ui.Supervisor(("x",), tmp_path / "status.json", popen=popen)
+    supervisor.start()
+    report = supervisor.restart("0" * 64, ("hunter2",))
+    assert report.outcome == config_ui.APPLY_REFUSED and not report.check_refused
+    assert report.exit_status is None and first.returncode == -15
+    assert len(report.diagnostics) == 1
+    assert report.diagnostics[0].startswith("the launch command could not be started:")
+    assert "hunter2" not in report.diagnostics[0]
+    assert supervisor.child is None
+
+
+def test_close_forbids_every_later_launch(tmp_path: Path) -> None:
+    """A restart that runs after the UI's final cleanup starts nothing."""
+
+    launched: list[_FakeProcess] = []
+
+    def popen(*args: Any, **kwargs: Any) -> _FakeProcess:
+        launched.append(_FakeProcess())
+        return launched[-1]
+
+    supervisor = config_ui.Supervisor(("x",), tmp_path / "status.json", popen=popen)
+    supervisor.start()
+    supervisor.close()
+    assert launched[0].returncode == -15 and supervisor.child is None
+    report = supervisor.restart("0" * 64)
+    assert report.outcome == config_ui.APPLY_REFUSED and report.diagnostics
+    assert len(launched) == 1 and supervisor.child is None
+    with pytest.raises(config_ui.SupervisorClosed):
+        supervisor.start()
