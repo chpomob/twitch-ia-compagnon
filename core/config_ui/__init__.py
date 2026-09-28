@@ -16,11 +16,12 @@ request bridge (:func:`_to_ui_request`, :func:`_dispatch`) runs it on the
 dedicated ``config-ui`` thread pool (D8).
 
 The module is split into delimited sections (D3): settings and startup
-checks, authorities, the configuration model, the redaction guard (R8), the
-rendering helpers (R9), the request core and its pages, the draft edits and
-Check (R5), Save and remove-override (R6), the socket-free event loop (D7),
-the request bridge and the entry point. No section names a module: every page lists or renders what discovery
-found (A2).
+checks, authorities, the configuration model, the status record reader
+(R7), the redaction guard (R8), the rendering helpers (R9), the request core
+and its pages, the draft edits and Check (R5), Save and remove-override (R6),
+the socket-free event loop (D7), the request bridge and the entry point. No
+section names a module: every page lists or renders what discovery found
+(A2).
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import os
 import re
 import secrets
 import selectors
+import stat
 import sys
 import tempfile
 import threading
@@ -51,7 +53,7 @@ from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 from urllib.parse import parse_qsl
 
 import yaml
@@ -84,6 +86,7 @@ from core.overlay import (
     OverlayError,
     deep_merge,
     default_status_path,
+    on_disk_digest,
     read_base,
     read_overlay,
     resolve_overlay_path,
@@ -95,12 +98,17 @@ __all__ = [
     "CheckResult",
     "ConfigUI",
     "ConfigView",
+    "RunningState",
+    "StatusReading",
+    "StatusRecord",
     "UIRequest",
     "UIResponse",
     "UISettings",
     "WriteResult",
     "accepted_authorities",
     "main",
+    "process_alive",
+    "read_status",
     "serve",
     "startup_checks",
 ]
@@ -720,6 +728,311 @@ def _plain(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Status record reader, liveness and drift (R7 reader side, R4 readiness)
+#
+# The status record is untrusted input: the reader performs exactly the
+# reader-verifiable validity checks of R7 — no coercion, no partial trust —
+# and a failure is reported by check name, field name and expected type or
+# set, never by any byte of the record. The publisher obligations (sequence
+# order, container keys matching the enabled modules, ...) are never checked
+# here: a usable record is trusted for them (R7, AC42).
+# ---------------------------------------------------------------------------
+
+#: The largest status record accepted, in bytes (R7).
+STATUS_MAX_BYTES = 1024 * 1024
+STATUS_VERSION = 1
+STATUS_REQUIRED_FIELDS = (
+    "version",
+    "pid",
+    "started_at",
+    "published_at",
+    "sequence",
+    "digest",
+    "state",
+    "modules",
+)
+PID_MAX = 2147483647
+SEQUENCE_MAX = 2**53 - 1
+STATUS_STATES = ("ready",)
+MODULE_STATES = ("ready", "degraded")
+
+_TIMESTAMP = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,6}))?Z"
+)
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+READING_ABSENT = "absent"
+READING_UNUSABLE = "unusable"
+READING_USABLE = "usable"
+
+NO_STATUS_RECORD = "no status record"
+STATUS_RECORD_UNUSABLE = "status record unusable"
+DRIFT_IN_SYNC = "in sync"
+DRIFT_DIFFERS = "differs"
+DRIFT_UNKNOWN = "unknown"
+NOT_SUPERVISED = "not supervised"
+SUPERVISED = "supervised by this UI"
+NO_RUNNING_PROCESS = "no running process is known"
+PROCESS_NOT_RUNNING = "the recorded process is not running"
+NOT_REPORTED = "not reported by the running process"
+
+
+@dataclass(frozen=True)
+class StatusRecord:
+    """The fields of a usable status record the UI uses; extra keys are dropped."""
+
+    pid: int
+    started_at: str
+    published_at: str
+    sequence: int
+    digest: str
+    #: Module name → ``ready`` or ``degraded``, as the publisher reported.
+    modules: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class StatusReading:
+    """One of ``absent``, ``unusable(reason)`` or ``usable(record)`` (R7)."""
+
+    kind: str
+    reason: str | None = None
+    record: StatusRecord | None = None
+
+    @classmethod
+    def absent(cls) -> StatusReading:
+        return cls(READING_ABSENT)
+
+    @classmethod
+    def unusable(cls, reason: str) -> StatusReading:
+        return cls(READING_UNUSABLE, reason=reason)
+
+    @classmethod
+    def usable(cls, record: StatusRecord) -> StatusReading:
+        return cls(READING_USABLE, record=record)
+
+
+class _Unusable(Exception):
+    """A failed validity check; its message is value-free by construction."""
+
+    def __init__(self, check: str, field_name: str, expected: str) -> None:
+        super().__init__(f"{check}: {field_name}, expected {expected}")
+
+
+def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            # The key itself is record content: it is never named.
+            raise _Unusable("duplicate key", "an object", "each key at most once")
+        result[key] = value
+    return result
+
+
+def _no_constant(token: str) -> Any:
+    raise _Unusable("not JSON", "a number", "a finite JSON number (no NaN or Infinity)")
+
+
+def _is_integer(value: Any) -> bool:
+    # ``type(...) is int`` excludes ``bool`` and every float (``1.0``, ``1e0``).
+    return type(value) is int
+
+
+def _check_timestamp(record: Mapping[str, Any], name: str) -> str:
+    value = record[name]
+    expected = "a UTC timestamp YYYY-MM-DDTHH:MM:SS[.ffffff]Z"
+    if not isinstance(value, str):
+        raise _Unusable("wrong type", f"field {name}", expected)
+    match = _TIMESTAMP.fullmatch(value)
+    if match is None:
+        raise _Unusable("wrong format", f"field {name}", expected)
+    year, month, day, hour, minute, second, fraction = match.groups()
+    try:
+        datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            int((fraction or "0").ljust(6, "0")),
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        raise _Unusable("invalid date or time", f"field {name}", expected) from None
+    return value
+
+
+def _check_record(document: Any) -> StatusRecord:
+    if not isinstance(document, dict):
+        raise _Unusable("wrong type", "top level", "a JSON object")
+    for name in STATUS_REQUIRED_FIELDS:
+        if name not in document:
+            raise _Unusable("missing", f"field {name}", "present")
+    version = document["version"]
+    if not _is_integer(version) or version != STATUS_VERSION:
+        raise _Unusable("wrong value", "field version", f"the integer {STATUS_VERSION}")
+    pid = document["pid"]
+    if not _is_integer(pid) or not 1 <= pid <= PID_MAX:
+        raise _Unusable("wrong value", "field pid", f"an integer in 1..{PID_MAX}")
+    started_at = _check_timestamp(document, "started_at")
+    published_at = _check_timestamp(document, "published_at")
+    sequence = document["sequence"]
+    if not _is_integer(sequence) or not 1 <= sequence <= SEQUENCE_MAX:
+        raise _Unusable("wrong value", "field sequence", f"an integer in 1..{SEQUENCE_MAX}")
+    digest = document["digest"]
+    if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+        raise _Unusable("wrong value", "field digest", "64 lowercase hexadecimal characters")
+    state = document["state"]
+    if not isinstance(state, str) or state not in STATUS_STATES:
+        raise _Unusable("wrong value", "field state", "one of {" + ", ".join(STATUS_STATES) + "}")
+    container = document["modules"]
+    if not isinstance(container, dict):
+        raise _Unusable("wrong type", "field modules", "a JSON object")
+    modules: dict[str, str] = {}
+    for key, entry in container.items():
+        if not isinstance(key, str) or not key:
+            raise _Unusable("wrong key", "field modules", "non-empty string keys")
+        if not isinstance(entry, dict):
+            raise _Unusable("wrong type", "a modules entry", "a JSON object")
+        if "state" not in entry:
+            raise _Unusable("missing", "state of a modules entry", "present")
+        module_state = entry["state"]
+        if not isinstance(module_state, str) or module_state not in MODULE_STATES:
+            raise _Unusable(
+                "wrong value",
+                "state of a modules entry",
+                "one of {" + ", ".join(MODULE_STATES) + "}",
+            )
+        modules[key] = module_state
+    return StatusRecord(
+        pid=pid,
+        started_at=started_at,
+        published_at=published_at,
+        sequence=sequence,
+        digest=digest,
+        modules=modules,
+    )
+
+
+def read_status(path: str | os.PathLike[str]) -> StatusReading:
+    """Classify the status record at *path* (R7): absent, unusable or usable."""
+
+    unreadable = StatusReading.unusable("unreadable: the status path, expected a readable file")
+    too_large = StatusReading.unusable(
+        f"too large: the status file, expected at most {STATUS_MAX_BYTES} bytes"
+    )
+    try:
+        found = os.stat(path)
+    except FileNotFoundError:
+        return StatusReading.absent()
+    except (OSError, ValueError):
+        return unreadable
+    if not stat.S_ISREG(found.st_mode):
+        return StatusReading.unusable("not a regular file: the status path, expected a regular file")
+    if found.st_size > STATUS_MAX_BYTES:
+        return too_large
+    try:
+        with open(path, "rb") as handle:
+            # Capped: the file may have grown since the stat.
+            data = handle.read(STATUS_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return StatusReading.absent()
+    except OSError:
+        return unreadable
+    if len(data) > STATUS_MAX_BYTES:
+        return too_large
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return StatusReading.unusable("not UTF-8: the status file, expected UTF-8 text")
+    try:
+        document = json.loads(text, object_pairs_hook=_unique_pairs, parse_constant=_no_constant)
+        return StatusReading.usable(_check_record(document))
+    except _Unusable as exc:
+        return StatusReading.unusable(str(exc))
+    except (ValueError, RecursionError):
+        return StatusReading.unusable("not JSON: the status file, expected one JSON text")
+
+
+class ChildHandle(Protocol):
+    """What the UI knows of the process it launched: a ``subprocess.Popen``."""
+
+    pid: int
+
+    def poll(self) -> int | None: ...
+
+
+#: ``probe(pid, child)`` → whether the process *pid* is alive (R7).
+Probe = Callable[[int, "ChildHandle | None"], bool]
+
+
+def process_alive(pid: int, child: ChildHandle | None) -> bool:
+    """The default liveness probe (R7).
+
+    The UI's own child handle is authoritative for its child; any other pid
+    is probed with signal 0: "no such process" is dead, success or
+    "permission denied" is alive.
+    """
+
+    if child is not None and child.pid == pid:
+        return child.poll() is None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@dataclass(frozen=True)
+class RunningState:
+    """The status record as the pages show it (R4, R7)."""
+
+    reading: StatusReading
+    #: A usable record whose process is alive: only then is there running state.
+    alive: bool
+    drift: str
+    supervised: bool
+
+    @property
+    def live_record(self) -> StatusRecord | None:
+        return self.reading.record if self.alive else None
+
+    def record_text(self) -> str:
+        """The record status: "no status record", "status record unusable: …" or its time."""
+
+        if self.reading.kind == READING_ABSENT:
+            return NO_STATUS_RECORD
+        if self.reading.kind == READING_UNUSABLE:
+            return f"{STATUS_RECORD_UNUSABLE}: {self.reading.reason}"
+        record = self.reading.record
+        assert record is not None
+        return f"status record published at {record.published_at}"
+
+    def supervision_text(self) -> str:
+        record = self.reading.record
+        if record is None:
+            return NO_RUNNING_PROCESS
+        label = SUPERVISED if self.supervised else NOT_SUPERVISED
+        if not self.alive:
+            return f"{PROCESS_NOT_RUNNING} ({label})"
+        return label
+
+    def module_text(self, name: str) -> tuple[str | None, str]:
+        """Module *name*'s running state and its text; ``None`` when there is none."""
+
+        record = self.live_record
+        if record is None:
+            return None, NO_RUNNING_PROCESS
+        state = record.modules.get(name)
+        if state is None:
+            return None, NOT_REPORTED
+        label = SUPERVISED if self.supervised else NOT_SUPERVISED
+        return state, f"running: {state} at {record.published_at} ({label})"
 
 
 # ---------------------------------------------------------------------------
@@ -1433,6 +1746,7 @@ class ConfigUI:
         *,
         environ: Mapping[str, str] | None = None,
         checker: Checker | None = None,
+        probe: Probe | None = None,
     ) -> None:
         self.settings = settings
         #: The UI process's own environment: "set/unset" is judged here, the
@@ -1458,6 +1772,12 @@ class ConfigUI:
         self.checker: Checker = _default_checker if checker is None else checker
         #: The verdict of the last Check, shown as readiness (R4).
         self.last_check: CheckResult | None = None
+        #: The liveness probe of a status record's process; a seam for tests,
+        #: production always uses :func:`process_alive` (R7).
+        self.probe: Probe = process_alive if probe is None else probe
+        #: The main process this UI launched, if any: the only one it
+        #: supervises (A4); a record naming another pid is "not supervised".
+        self.child: ChildHandle | None = None
         _LOG_REDACTION.sources.add(self)
         self.routes: dict[str, tuple[frozenset[str], Handler]] = {
             "/": (frozenset({"GET"}), self._base_page),
@@ -1592,6 +1912,57 @@ class ConfigUI:
                 return handler(request, session)
         return handler(request, session)
 
+    # -- the status record (R7, R4) --------------------------------------------
+
+    def running_state(self) -> RunningState:
+        """Read the one watched status path and judge liveness and drift (R7).
+
+        Only :attr:`status_path` is ever read (A5). Drift is ``unknown`` for
+        an absent, unusable or dead record, else the record's digest compared
+        with the on-disk digest recomputed from the base and overlay files.
+        """
+
+        reading = read_status(self.status_path)
+        record = reading.record
+        if record is None:
+            return RunningState(reading, alive=False, drift=DRIFT_UNKNOWN, supervised=False)
+        child = self.child
+        supervised = child is not None and child.pid == record.pid
+        alive = self.probe(record.pid, child)
+        drift = DRIFT_UNKNOWN
+        if alive:
+            try:
+                on_disk = on_disk_digest(self.base_path, self.overlay_path)
+            except OverlayError:
+                on_disk = None
+            if on_disk is not None:
+                drift = DRIFT_IN_SYNC if record.digest == on_disk else DRIFT_DIFFERS
+        return RunningState(reading, alive=alive, drift=drift, supervised=supervised)
+
+    @staticmethod
+    def _running_section(running: RunningState) -> str:
+        """The record status, the drift state and the supervision label (R7)."""
+
+        return (
+            '<section id="running"><h2>Running process</h2><table>'
+            f'<tr><th>Status record</th><td id="record-status" data-record="{running.reading.kind}">'
+            f"{esc(running.record_text())}</td></tr>"
+            f'<tr><th>Disk and running process</th><td id="drift" data-drift="{running.drift}">'
+            f"{running.drift}</td></tr>"
+            f'<tr><th>Supervision</th><td id="supervision">{esc(running.supervision_text())}</td></tr>'
+            "</table></section>"
+        )
+
+    def _readiness_markup(self, name: str, running: RunningState) -> str:
+        """The last Check verdict plus module *name*'s running state (R4)."""
+
+        state, text = running.module_text(name)
+        attribute = "" if state is None else f' data-running="{state}"'
+        return (
+            f'<span class="check">{esc(self._readiness(name))}</span><br>'
+            f'<span class="running"{attribute}>{esc(text)}</span>'
+        )
+
     # -- route handlers (placeholders replaced by later steps) --------------
 
     def _readiness(self, name: str) -> str:
@@ -1612,6 +1983,7 @@ class ConfigUI:
         """Every discovered module and the configuration's origin (R4a)."""
 
         view = self.view()
+        running = self.running_state()
         enabled = view.enabled_modules()
         rows: list[str] = []
         for name in sorted(view.modules):
@@ -1626,7 +1998,7 @@ class ConfigUI:
                 f'value="{str(not is_enabled).lower()}">'
                 f'<button type="submit">{"Disable" if is_enabled else "Enable"}</button>'
                 "</form></td>"
-                f'<td class="readiness">{esc(self._readiness(name))}</td></tr>'
+                f'<td class="readiness">{self._readiness_markup(name, running)}</td></tr>'
             )
         missing = [name for name in enabled if name not in view.modules]
         missing_note = (
@@ -1646,6 +2018,7 @@ class ConfigUI:
         body = (
             "<h1>Configuration</h1>"
             f'<p class="local-only" id="local-only">{esc(LOCAL_ONLY_STATEMENT)}</p>'
+            f"{self._running_section(running)}"
             f"{_diagnostics(view)}"
             '<section id="origin"><h2>Configuration origin</h2><table>'
             f'<tr><th>Base file</th><td id="base-path"><code>{esc(str(view.base_path))}</code></td></tr>'
@@ -1673,6 +2046,7 @@ class ConfigUI:
         body = [
             "<h1>Core settings</h1>",
             '<p><a href="/">Back to the configuration</a></p>',
+            self._running_section(self.running_state()),
             _diagnostics(view),
             '<section id="modules-directory"><h2>Modules directory</h2>'
             f'<form method="post" action="/save">{_write_guard(session, view)}{_page_field(CORE_PAGE)}'
@@ -1813,9 +2187,13 @@ class ConfigUI:
         fields = self._module_fields(renderer, name, module)
         page = f"{MODULE_PAGE_PREFIX}{name}"
         form_id = "settings-form"
+        running = self.running_state()
         body = [
             f"<h1>Module {ident(name)}</h1>",
             '<p><a href="/">Back to the configuration</a></p>',
+            self._running_section(running),
+            '<section id="readiness"><h2>Readiness</h2>'
+            f"<p>{self._readiness_markup(name, running)}</p></section>",
             _diagnostics(view),
             f'<section id="settings"><h2>Settings</h2>'
             f'<form id="{form_id}" method="post" action="/save">{_write_guard(session, view)}'

@@ -1,4 +1,5 @@
-"""The runtime's status record publisher (R7, A5; AC33, AC34, AC41, AC43).
+"""The runtime's status record publisher (R7, A5; AC33, AC34, AC41, AC43),
+and the UI reader's classification of the records it publishes (P14).
 
 Fixture modules M, N and P are written to ``tmp_path``. Each one's activation
 hands its per-module context to a hook registry the test installs in
@@ -23,6 +24,7 @@ import pytest
 import yaml
 
 import core.main as application
+from core.config_ui import ConfigUI, StatusReading, UISettings, read_status
 from core.overlay import STATUS_FILE_VARIABLE, on_disk_digest
 
 
@@ -171,13 +173,17 @@ async def test_three_transitions_publish_three_records_in_order(
     status = tmp_path / "config.yaml.status.json"
     overlay = tmp_path / "config.local.yaml"
     records: list[dict[str, Any]] = []
+    readings: list[StatusReading] = []
 
     async with _Running(base, _environ(status)) as running:
         records.append(_read(status))
+        readings.append(read_status(status))
         await hooks.contexts[M].supervision.degraded(reason="fixture degraded")
         records.append(_read(status))
+        readings.append(read_status(status))
         await hooks.contexts[M].supervision.ready()
         records.append(_read(status))
+        readings.append(read_status(status))
 
     assert running.status == 0
     assert running.diagnostics == []
@@ -199,6 +205,18 @@ async def test_three_transitions_publish_three_records_in_order(
         assert record["digest"] == expected_digest
         assert record["state"] == "ready"
         assert set(record["modules"]) == {M, N}
+    # Reader side (P14): each of the 3 records is classified usable, and
+    # the reader's view of it is the record as published.
+    for record, reading in zip(records, readings):
+        assert reading.kind == "usable", reading.reason
+        assert reading.record is not None
+        assert reading.record.pid == record["pid"]
+        assert reading.record.sequence == record["sequence"]
+        assert reading.record.digest == record["digest"]
+        assert reading.record.published_at == record["published_at"]
+        assert dict(reading.record.modules) == {
+            name: entry["state"] for name, entry in record["modules"].items()
+        }
     # The record never carries a resolved value.
     assert CANARY not in status.read_text(encoding="utf-8")
     # Shutdown publishes no ``stopped`` module state.
@@ -469,6 +487,11 @@ async def test_the_record_describes_the_loaded_configuration(
         assert on_disk_digest(base, overlay) != loaded_digest
         await hooks.contexts[N].supervision.degraded(reason="fixture degraded")
         second = _read(status)
+        # The UI reading it, while this live process wrote it, sees drift.
+        ui = ConfigUI(
+            UISettings.from_argv(["--config", str(base), "--status-file", str(status)])
+        )
+        running_state = ui.running_state()
 
     assert running.status == 0
     assert set(hooks.contexts) == {M, N}
@@ -478,6 +501,8 @@ async def test_the_record_describes_the_loaded_configuration(
     assert second["started_at"] == first["started_at"]
     assert second["digest"] == first["digest"]
     assert second["sequence"] > first["sequence"]
+    assert running_state.reading.kind == "usable"
+    assert running_state.drift == "differs"
 
 
 async def test_a_run_enabling_no_module_publishes_an_empty_container(

@@ -1,7 +1,8 @@
 """The configuration UI: CLI, bind policy, guards and startup refusals (P9);
 the configuration model, base page and core-settings page (P10); the module
 pages generated from each manifest (P11); Check (P12); Save and
-remove-override (P13).
+remove-override (P13); the status record reader, drift and running state
+(P14).
 
 The whole module runs with socket creation patched to raise (AC5): no test
 here binds, connects or even creates a socket. The request core is driven
@@ -38,14 +39,24 @@ import yaml
 import core.config_ui as config_ui
 from core.config_ui import (
     BASE_ENTRY_NOTE,
+    DRIFT_DIFFERS,
+    DRIFT_IN_SYNC,
+    DRIFT_UNKNOWN,
     ENTRY_SEGMENT,
     HIDDEN_LITERAL,
     ITEMS_SEGMENT,
     LOCAL_ONLY_STATEMENT,
     MODULE_PAGE_PREFIX,
+    NO_RUNNING_PROCESS,
+    NO_STATUS_RECORD,
     NOT_EDITABLE,
+    NOT_REPORTED,
+    NOT_SUPERVISED,
     READ_ONLY_REASON,
     REDACT_MIN_LENGTH,
+    STATUS_MAX_BYTES,
+    STATUS_RECORD_UNUSABLE,
+    SUPERVISED,
     ConfigUI,
     ConfigView,
     UIRequest,
@@ -59,10 +70,12 @@ from core.config_ui import (
     _to_ui_request,
     accepted_authorities,
     main,
+    process_alive,
+    read_status,
     startup_checks,
 )
 from core.main import LIMIT_DECLARATION
-from core.overlay import read_base
+from core.overlay import on_disk_digest, read_base
 
 # ---------------------------------------------------------------------------
 # AC5: socket creation patched to raise for the whole module
@@ -2298,12 +2311,22 @@ def test_every_page_posts_its_draft_to_check(tmp_path: Path) -> None:
 
 
 def test_the_last_check_verdict_is_the_readiness(tmp_path: Path) -> None:
+    """The Check verdict part of the readiness cell.
+
+    Since P14 the cell also carries the running state (R4, AC21), so the
+    verdict is read from its ``check`` part.
+    """
+
     ui = _check_fixture(tmp_path, VALID_MODULES)
     cookie = _logged_in(ui)
 
     def readiness(name: str) -> str:
         page = _get(ui, "/", cookie).body.decode("utf-8")
-        match = re.search(rf'<tr data-module="{name}".*?<td class="readiness">(.*?)</td>', page, re.S)
+        match = re.search(
+            rf'<tr data-module="{name}".*?<td class="readiness"><span class="check">(.*?)</span>',
+            page,
+            re.S,
+        )
         assert match is not None
         return _html.unescape(match.group(1))
 
@@ -3097,3 +3120,511 @@ def test_ac28_the_write_targets_only_the_managed_overlay(tmp_path: Path) -> None
     assert yaml.safe_load(overlay.read_text(encoding="utf-8")) == {"k": "${NAME}", "${KEY}": {"é": 1}}
     assert "é" in overlay.read_text(encoding="utf-8")  # allow_unicode
     assert base.read_text(encoding="utf-8") == "a: 1\n"
+
+
+# ---------------------------------------------------------------------------
+# P14: the status record reader, liveness, drift and running state (R7, R4)
+# ---------------------------------------------------------------------------
+
+STATUS_PAGES = ("/", "/core", "/module/M", "/module/N")
+#: A container entry naming no discovered module: never displayed (AC42).
+UNDISCOVERED = "zeta_unlisted"
+STARTED_AT = "2026-09-28T14:03:07.412Z"
+PUBLISHED_AT = "2026-09-28T14:05:09.5Z"
+
+
+def _dead(pid: int, child: object) -> bool:
+    return False
+
+
+def _status_ui(tmp_path: Path, *extra: str, probe: object = None) -> ConfigUI:
+    """Discovered modules M and N, both enabled; the default status path."""
+
+    for name in ("M", "N"):
+        _write_manifest(tmp_path / "mods", name, AC21_MANIFEST)
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        "modules_directory: ./mods\nenabled_modules: [M, N]\nmodules:\n  M: {a: 1}\n  N: {a: 1}\n",
+        encoding="utf-8",
+    )
+    settings = UISettings.from_argv(["--config", str(base), *extra])
+    return ConfigUI(settings, probe=probe)  # type: ignore[arg-type]
+
+
+def _valid(ui: ConfigUI, **changes: object) -> dict[str, object]:
+    """V of AC40: the live test process's pid and the on-disk digest."""
+
+    record: dict[str, object] = {
+        "version": 1,
+        "pid": os.getpid(),
+        "started_at": STARTED_AT,
+        "published_at": PUBLISHED_AT,
+        "sequence": 1,
+        "digest": on_disk_digest(ui.base_path, ui.overlay_path),
+        "state": "ready",
+        "modules": {"M": {"state": "ready"}},
+    }
+    record.update(changes)
+    return record
+
+
+def _publish(ui: ConfigUI, record: object) -> bytes:
+    data = record if isinstance(record, bytes) else json.dumps(record).encode("utf-8")
+    ui.status_path.write_bytes(data)
+    return data
+
+
+def _status_pages(ui: ConfigUI, cookie: str) -> dict[str, str]:
+    pages: dict[str, str] = {}
+    for path in STATUS_PAGES:
+        response = _get(ui, path, cookie)
+        assert response.status == 200, path
+        pages[path] = response.body.decode("utf-8")
+    return pages
+
+
+def _drift(page: str) -> str:
+    found = re.findall(r'<td id="drift" data-drift="([^"]*)">', page)
+    assert len(found) == 1
+    return found[0]
+
+
+def _record_status(page: str) -> str:
+    match = re.search(r'<td id="record-status" data-record="[^"]*">(.*?)</td>', page, re.S)
+    assert match is not None
+    return _html.unescape(match.group(1))
+
+
+def _supervision(page: str) -> str:
+    match = re.search(r'<td id="supervision">(.*?)</td>', page, re.S)
+    assert match is not None
+    return _html.unescape(match.group(1))
+
+
+def _running_of(page: str, name: str) -> tuple[str | None, str]:
+    """Module *name*'s running part of its readiness cell (base page) or section."""
+
+    if f'<tr data-module="{name}"' in page:
+        pattern = rf'<tr data-module="{name}".*?<span class="running"( data-running="[^"]*")?>(.*?)</span>'
+    else:
+        pattern = r'<section id="readiness">.*?<span class="running"( data-running="[^"]*")?>(.*?)</span>'
+    match = re.search(pattern, page, re.S)
+    assert match is not None
+    state = None if match.group(1) is None else match.group(1).split('"')[1]
+    return state, _html.unescape(match.group(2))
+
+
+def _visible(page: str) -> str:
+    """The page without its random tokens and hidden form values."""
+
+    return re.sub(r'(content|value)="[^"]*"', "", page)
+
+
+def _record_values(record: object) -> list[str]:
+    """Every scalar of *record* as text, for the "no field displayed" checks."""
+
+    if isinstance(record, dict):
+        return [text for value in record.values() for text in _record_values(value)]
+    if isinstance(record, list):
+        return [text for value in record for text in _record_values(value)]
+    if record is None or isinstance(record, bool):
+        return []
+    return [str(record)]
+
+
+def _assert_unusable(ui: ConfigUI, cookie: str, data: bytes, values: Sequence[str]) -> str:
+    """The behaviour of AC39 on every page; return the reason shown."""
+
+    reasons = set()
+    for path, page in _status_pages(ui, cookie).items():
+        status = _record_status(page)
+        assert status.startswith(f"{STATUS_RECORD_UNUSABLE}: "), (path, status)
+        reason = status[len(STATUS_RECORD_UNUSABLE) + 2 :]
+        assert reason and NO_STATUS_RECORD not in reason
+        reasons.add(reason)
+        assert _drift(page) == DRIFT_UNKNOWN
+        assert DRIFT_IN_SYNC not in page
+        assert "data-running" not in page and "running: " not in page
+        assert _supervision(page) == NO_RUNNING_PROCESS
+        if data:
+            assert data.decode("utf-8", errors="replace") not in reason
+        visible = _visible(page)
+        for value in values:
+            if len(value) >= 3:
+                assert value not in reason, (path, value)
+                assert value not in visible, (path, value)
+    assert len(reasons) == 1
+    return reasons.pop()
+
+
+# -- read_status: classification ----------------------------------------------
+
+
+def _mutations(v: dict[str, object]) -> list[tuple[str, str | None, bytes]]:
+    """The single mutations of V listed by AC40: (label, field named, bytes)."""
+
+    def changed(field_name: str, value: object) -> bytes:
+        return json.dumps({**v, field_name: value}).encode("utf-8")
+
+    digest = str(v["digest"])
+    cases: list[tuple[str, str | None, bytes]] = []
+    for name in v:
+        removed = {key: value for key, value in v.items() if key != name}
+        cases.append((f"without {name}", name, json.dumps(removed).encode("utf-8")))
+    changes: list[tuple[str, object]] = [
+        ("version", 2), ("version", "1"), ("version", 1.0),
+        ("pid", 0), ("pid", -4), ("pid", True), ("pid", 2147483648), ("pid", "123"),
+        ("started_at", 1759068187),
+        ("started_at", "2026-09-28 14:03:07Z"),
+        ("started_at", "2026-09-28T14:03:07+02:00"),
+        ("started_at", "2026-02-30T00:00:00Z"),
+        ("started_at", "2026-09-28T14:03:07.1234567Z"),
+        ("published_at", None),
+        ("sequence", 0), ("sequence", 1.5), ("sequence", 9007199254740992), ("sequence", "1"),
+        ("digest", digest.upper()), ("digest", digest[:63]), ("digest", f"sha256:{digest}"),
+        ("digest", None),
+        ("state", "degraded"), ("state", "READY"), ("state", 1),
+        ("modules", []),
+        ("modules", {"": {"state": "ready"}}),
+        ("modules", {"M": "ready"}),
+        ("modules", {"M": {}}),
+        ("modules", {"M": {"state": "stopped"}}),
+        ("modules", {"M": {"state": None}}),
+    ]
+    for name, value in changes:
+        cases.append((f"{name}={json.dumps(value)}", name, changed(name, value)))
+    text = json.dumps(v)
+    duplicate = text[:-1] + f', "pid": {v["pid"]}' + "}"
+    cases.append(("pid twice", None, duplicate.encode("utf-8")))
+    cases.append(("NaN", None, (text[:-1] + ', "extra": NaN}').encode("utf-8")))
+    oversized = text.encode("utf-8")
+    cases.append(("1 MiB + 1 byte", None, oversized + b" " * (STATUS_MAX_BYTES + 1 - len(oversized))))
+    return cases
+
+
+def test_ac40_every_listed_mutation_of_v_is_unusable_with_a_value_free_reason(
+    tmp_path: Path,
+) -> None:
+    ui = _status_ui(tmp_path)
+    v = _valid(ui)
+    cases = _mutations(v)
+    assert len(cases) == 8 + 31 + 3
+    assert len(cases[-1][2]) == STATUS_MAX_BYTES + 1
+    values = [str(os.getpid()), str(v["digest"]), STARTED_AT, PUBLISHED_AT]
+    for label, field_name, data in cases:
+        _publish(ui, data)
+        reading = read_status(ui.status_path)
+        assert reading.kind == "unusable", label
+        assert reading.record is None
+        assert reading.reason is not None
+        if field_name is not None:
+            assert field_name in reading.reason, (label, reading.reason)
+        assert "expected" in reading.reason, label
+        for value in values:
+            assert value not in reading.reason, (label, value)
+
+
+def test_ac40_the_mutations_show_the_ac39_behaviour_on_every_page(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    v = _valid(ui)
+    values = [str(os.getpid()), str(v["digest"]), STARTED_AT, PUBLISHED_AT, "123"]
+    for _label, _field_name, data in _mutations(v):
+        _publish(ui, data)
+        _assert_unusable(ui, cookie, data, values)
+
+
+def test_ac40_v_is_usable_and_extra_keys_change_nothing(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    v = _valid(ui)
+    _publish(ui, v)
+    reading = read_status(ui.status_path)
+    assert reading.kind == "usable" and reading.reason is None
+    assert reading.record is not None
+    assert reading.record.pid == os.getpid()
+    assert dict(reading.record.modules) == {"M": "ready"}
+    shown = _status_pages(ui, cookie)
+    for path, page in shown.items():
+        assert _drift(page) == DRIFT_IN_SYNC, path
+        assert _record_status(page) == f"status record published at {PUBLISHED_AT}"
+        assert STATUS_RECORD_UNUSABLE not in page
+        assert _supervision(page) == NOT_SUPERVISED
+    for path in ("/", "/module/M"):
+        assert _running_of(shown[path], "M") == (
+            "ready",
+            f"running: ready at {PUBLISHED_AT} ({NOT_SUPERVISED})",
+        )
+    assert str(os.getpid()) not in _visible(shown["/"])
+
+    extra = _valid(ui, extra_top={"pid": 1}, modules={"M": {"state": "ready", "note": "x-extra"}})
+    _publish(ui, extra)
+    assert read_status(ui.status_path) == reading
+    assert _status_pages(ui, cookie) == shown
+
+
+def test_ac40_a_dead_pid_is_unknown_with_no_running_state(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path, probe=_dead)
+    cookie = _logged_in(ui)
+    _publish(ui, _valid(ui))
+    assert read_status(ui.status_path).kind == "usable"
+    for page in _status_pages(ui, cookie).values():
+        assert _drift(page) == DRIFT_UNKNOWN
+        assert DRIFT_IN_SYNC not in page
+        assert "data-running" not in page and "running: " not in page
+        assert _record_status(page) == f"status record published at {PUBLISHED_AT}"
+        assert _supervision(page).startswith("the recorded process is not running")
+
+
+def test_read_status_accepts_the_integer_forms_only(tmp_path: Path) -> None:
+    """``1.0``, ``1e0`` and ``true`` are not integers; ``1`` is (R7)."""
+
+    ui = _status_ui(tmp_path)
+    text = json.dumps(_valid(ui))
+    assert '"version": 1,' in text
+    for spelled, usable in (("1", True), ("1.0", False), ("1e0", False), ("true", False)):
+        ui.status_path.write_text(text.replace('"version": 1,', f'"version": {spelled},'), encoding="utf-8")
+        assert (read_status(ui.status_path).kind == "usable") is usable, spelled
+    for constant in ("Infinity", "-Infinity"):
+        ui.status_path.write_text(text[:-1] + f', "x": {constant}}}', encoding="utf-8")
+        assert read_status(ui.status_path).kind == "unusable", constant
+    ui.status_path.write_bytes(b'{"version": 1, "pid": \xff}')
+    assert "UTF-8" in str(read_status(ui.status_path).reason)
+    ui.status_path.write_text("[" * 100_000, encoding="utf-8")
+    assert read_status(ui.status_path).kind == "unusable"
+
+
+def test_read_status_caps_the_read_when_the_file_grew_after_the_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ui = _status_ui(tmp_path)
+    text = json.dumps(_valid(ui)).encode("utf-8")
+    _publish(ui, text + b" " * (STATUS_MAX_BYTES + 1 - len(text)))
+    real_stat = os.stat
+    target = os.fspath(ui.status_path)
+
+    def small(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        found = real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+        if os.fspath(path) != target:  # type: ignore[arg-type]
+            return found
+        fields = list(found)
+        fields[6] = 10  # st_size, as it was before the file grew
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "stat", small)
+    reading = read_status(ui.status_path)
+    monkeypatch.undo()
+    assert reading.kind == "unusable" and "at most" in str(reading.reason)
+
+
+def test_read_status_of_an_absent_path_is_absent(tmp_path: Path) -> None:
+    assert read_status(tmp_path / "missing.json").kind == "absent"
+
+
+# -- AC39 ---------------------------------------------------------------------
+
+
+def test_ac39_unreadable_or_malformed_records_are_unusable_on_every_page(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    digest = on_disk_digest(ui.base_path, ui.overlay_path)
+    without_digest = {key: value for key, value in _valid(ui).items() if key != "digest"}
+    records: list[tuple[bytes, list[str]]] = [
+        (b"\x00not json {CANARY-STATUS-BYTES", ["CANARY-STATUS-BYTES"]),
+        (b"[1, 2]", ["[1, 2]"]),
+        (json.dumps(without_digest).encode("utf-8"), [STARTED_AT, PUBLISHED_AT, str(os.getpid())]),
+        (json.dumps(_valid(ui, pid="123")).encode("utf-8"), [digest, STARTED_AT, PUBLISHED_AT, "123"]),
+    ]
+    reasons = []
+    for data, values in records:
+        _publish(ui, data)
+        reasons.append(_assert_unusable(ui, cookie, data, values))
+    assert "digest" in reasons[2] and "pid" in reasons[3]
+
+    ui.status_path.unlink()
+    ui.status_path.mkdir()
+    reasons.append(_assert_unusable(ui, cookie, b"", []))
+    ui.status_path.rmdir()
+
+    # The UI keeps serving: a usable record is shown right after.
+    _publish(ui, _valid(ui))
+    assert all(_drift(page) == DRIFT_IN_SYNC for page in _status_pages(ui, cookie).values())
+
+
+def test_ac39_a_record_with_mode_000_is_unusable(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("running as root: a mode-000 file stays readable, so it cannot be unreadable")
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    data = _publish(ui, _valid(ui))
+    ui.status_path.chmod(0)
+    try:
+        reason = _assert_unusable(ui, cookie, data, [str(os.getpid()), STARTED_AT])
+    finally:
+        ui.status_path.chmod(0o600)
+    assert "unreadable" in reason
+
+
+# -- AC42 ---------------------------------------------------------------------
+
+
+def test_ac42_publisher_obligations_are_never_verified_by_the_reader(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    records = [
+        _valid(ui, modules={}),
+        _valid(ui, modules={"M": {"state": "ready"}, UNDISCOVERED: {"state": "degraded"}}),
+        _valid(ui, sequence=7),
+        _valid(ui, started_at="2026-09-28T15:00:00Z", published_at="2026-09-28T14:00:00Z"),
+    ]
+    for record in records:
+        for digest, drift in (
+            (on_disk_digest(ui.base_path, ui.overlay_path), DRIFT_IN_SYNC),
+            ("0" * 64, DRIFT_DIFFERS),
+        ):
+            _publish(ui, {**record, "digest": digest})
+            assert read_status(ui.status_path).kind == "usable"
+            pages = _status_pages(ui, cookie)
+            for page in pages.values():
+                assert _drift(page) == drift
+                assert STATUS_RECORD_UNUSABLE not in page
+                assert UNDISCOVERED not in page
+            entries = record["modules"]
+            assert isinstance(entries, dict)
+            for path in ("/", "/module/M"):
+                if "M" in entries:
+                    assert _running_of(pages[path], "M")[0] == "ready"
+                else:
+                    assert _running_of(pages[path], "M") == (None, NOT_REPORTED)
+            for path in ("/", "/module/N"):
+                assert _running_of(pages[path], "N") == (None, NOT_REPORTED)
+
+
+# -- AC21 readiness -------------------------------------------------------------
+
+
+def test_ac21_readiness_combines_the_check_verdict_and_the_running_state(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+
+    def cell(name: str) -> str:
+        page = _get(ui, "/", cookie).body.decode("utf-8")
+        match = re.search(rf'<tr data-module="{name}".*?<td class="readiness">(.*?)</td>', page, re.S)
+        assert match is not None
+        return _html.unescape(re.sub(r"<[^>]*>", " ", match.group(1))).split()
+
+    assert " ".join(cell("M")) == f"not checked yet {NO_RUNNING_PROCESS}"
+    _publish(ui, _valid(ui, modules={"M": {"state": "degraded"}, "N": {"state": "ready"}}))
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    assert _running_of(page, "M") == ("degraded", f"running: degraded at {PUBLISHED_AT} ({NOT_SUPERVISED})")
+    assert _running_of(page, "N")[0] == "ready"
+    module_page = _get(ui, "/module/M", cookie).body.decode("utf-8")
+    assert _running_of(module_page, "M")[0] == "degraded"
+    assert "not checked yet" in _section(module_page, "readiness")
+
+
+# -- AC31 display ---------------------------------------------------------------
+
+
+def test_ac31_a_foreign_live_record_is_shown_not_supervised(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    assert ui.status_path == tmp_path / "config.yaml.status.json"
+    assert ui.child is None
+    _publish(ui, _valid(ui, modules={"M": {"state": "ready"}, "N": {"state": "degraded"}}))
+    for path, page in _status_pages(ui, cookie).items():
+        assert _supervision(page) == NOT_SUPERVISED, path
+        assert SUPERVISED not in page
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    assert _running_of(page, "N") == ("degraded", f"running: degraded at {PUBLISHED_AT} ({NOT_SUPERVISED})")
+
+
+def test_ac31_only_the_one_status_path_is_read(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    other = tmp_path / "other.status.json"
+    other.write_text(json.dumps(_valid(ui)), encoding="utf-8")
+    for page in _status_pages(ui, cookie).values():
+        assert _record_status(page) == NO_STATUS_RECORD
+        assert _drift(page) == DRIFT_UNKNOWN
+        assert _supervision(page) == NO_RUNNING_PROCESS
+
+    custom = tmp_path / "custom.json"
+    overridden = _status_ui(tmp_path / "second", "--status-file", str(custom))
+    assert overridden.status_path == custom
+    default = tmp_path / "second" / "config.yaml.status.json"
+    default.write_text(json.dumps(_valid(overridden)), encoding="utf-8")
+    cookie = _logged_in(overridden)
+    assert _record_status(_get(overridden, "/", cookie).body.decode("utf-8")) == NO_STATUS_RECORD
+    custom.write_text(json.dumps(_valid(overridden)), encoding="utf-8")
+    assert _drift(_get(overridden, "/", cookie).body.decode("utf-8")) == DRIFT_IN_SYNC
+
+
+class _FakeChild:
+    def __init__(self, pid: int, returncode: int | None) -> None:
+        self.pid = pid
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def test_the_launched_child_is_supervised_and_its_handle_is_authoritative(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    _publish(ui, _valid(ui))
+    ui.child = _FakeChild(os.getpid(), None)
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    assert _supervision(page) == SUPERVISED and _drift(page) == DRIFT_IN_SYNC
+    assert _running_of(page, "M") == ("ready", f"running: ready at {PUBLISHED_AT} ({SUPERVISED})")
+    # The child exited: dead, although a signal-0 probe of its pid succeeds.
+    ui.child = _FakeChild(os.getpid(), 0)
+    page = _get(ui, "/", cookie).body.decode("utf-8")
+    assert _drift(page) == DRIFT_UNKNOWN and "data-running" not in page
+
+
+def test_the_liveness_probe_uses_signal_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[tuple[int, int]] = []
+
+    def kill_with(error: type[OSError] | None) -> None:
+        def kill(pid: int, signal_number: int) -> None:
+            sent.append((pid, signal_number))
+            if error is not None:
+                raise error()
+
+        monkeypatch.setattr(os, "kill", kill)
+
+    kill_with(ProcessLookupError)
+    assert process_alive(4242, None) is False
+    kill_with(PermissionError)
+    assert process_alive(4242, None) is True
+    kill_with(None)
+    assert process_alive(4242, _FakeChild(99, 0)) is True
+    assert sent == [(4242, 0)] * 3
+    assert process_alive(99, _FakeChild(99, None)) is True
+    assert process_alive(99, _FakeChild(99, 1)) is False
+    assert len(sent) == 3  # the child's own handle, never a signal
+
+
+# -- AC32 display ---------------------------------------------------------------
+
+
+def test_ac32_drift_follows_the_overlay_and_the_record(tmp_path: Path) -> None:
+    ui = _status_ui(tmp_path)
+    cookie = _logged_in(ui)
+    _publish(ui, _valid(ui))
+    assert {_drift(page) for page in _status_pages(ui, cookie).values()} == {DRIFT_IN_SYNC}
+
+    response = _write(ui, cookie, "/save", "/module/M", [("modules.M.a", "3")])
+    assert response.status == 303
+    assert {_drift(page) for page in _status_pages(ui, cookie).values()} == {DRIFT_DIFFERS}
+
+    dead = ConfigUI(ui.settings, probe=_dead)
+    dead_cookie = _logged_in(dead)
+    _publish(dead, _valid(dead))
+    assert {_drift(page) for page in _status_pages(dead, dead_cookie).values()} == {DRIFT_UNKNOWN}
+
+    ui.status_path.unlink()
+    pages = _status_pages(ui, cookie)
+    assert {_drift(page) for page in pages.values()} == {DRIFT_UNKNOWN}
+    assert {_record_status(page) for page in pages.values()} == {NO_STATUS_RECORD}
