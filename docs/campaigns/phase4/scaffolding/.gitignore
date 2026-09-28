@@ -1,0 +1,10 @@
+# Volatile campaign output — durable scaffolding stays tracked, run artefacts do not.
+logs/
+loop-out/
+wip/
+campaign.log
+commit-msg-*.txt
+wip-*.patch
+
+# Gate reports ARE tracked on purpose (unlike phases 1-3): the closing review and its findings are
+# the durable evidence of the phase-4 gate, and the phase summary refers to them.
