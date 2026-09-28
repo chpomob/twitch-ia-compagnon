@@ -39,9 +39,11 @@ lifecycle:
 # reserved `limits` block the entry point hands every enabled module is
 # accepted and not read: this module owns its own bound.
 settings_schema:
+  title: Capture settings
   type: object
   properties:
     sources:
+      title: Sources
       type: object
       description: >-
         The named capture sources. A `file` source (`kind: file`, `path`) is
@@ -50,15 +52,19 @@ settings_schema:
         program and takes the PNG or JPEG it writes on stdout, killed once
         the timeout expires.
     default_source:
+      title: Default source
       type: string
       description: The source a call that names none captures from.
     max_bytes:
+      title: Max bytes
+      default: 5242880
       type: integer
       minimum: 1
       description: >-
         The most bytes one capture may weigh; a larger one is refused
         `attachment_refused` with nothing stored. Default 5242880.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every

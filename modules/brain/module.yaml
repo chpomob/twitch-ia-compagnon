@@ -35,43 +35,54 @@ lifecycle:
 # and reports one diagnostic per offending field naming module and field,
 # with no configured value echoed back.
 settings_schema:
+  title: Brain settings
   type: object
   properties:
     endpoint:
+      title: Endpoint
       type: string
       description: Chat-completions URL of the configured model backend.
     model:
+      title: Model
       type: string
       description: Name of the model requested from that backend.
     api_key:
+      title: API key
       type: string
       description: Bearer credential, resolved from an environment reference.
     # Admission limits the engine owns: one bounded FIFO per session, a global
     # pending cap, a live-session cap, a bounded worker count, a finite wait
     # deadline per queued item and a finite total deadline per run (R2).
     admission:
+      title: Admission
       type: object
       properties:
         session_queue_capacity:
+          title: Session queue capacity
           type: integer
           minimum: 1
           description: Maximum queued works per session.
         global_pending_capacity:
+          title: Global pending capacity
           type: integer
           minimum: 1
           description: Maximum queued works across every session.
         max_sessions:
+          title: Max sessions
           type: integer
           minimum: 1
           description: Maximum live sessions before a new one is refused.
         workers:
+          title: Workers
           type: integer
           minimum: 1
           description: Bounded number of run workers.
         wait_seconds:
+          title: Wait seconds
           type: number
           description: Finite deadline a queued work may wait before it starts.
         total_run_seconds:
+          title: Total run seconds
           type: number
           description: Finite deadline from admission to delivery, wait included.
       required:
@@ -88,39 +99,48 @@ settings_schema:
     # included), the repetitions of one identical proposal, and the time kept
     # back before the total deadline for the whole terminal step.
     budget:
+      title: Budget
       type: object
       properties:
         model_turns:
+          title: Model turns
           type: integer
           minimum: 1
           description: Maximum model calls per run.
         model_call_seconds:
+          title: Model call seconds
           type: number
           description: Finite deadline of one model call.
         action_seconds:
+          title: Action seconds
           type: number
           description: Finite deadline of one action call, delivery included.
         max_tokens:
+          title: Max tokens
           type: integer
           minimum: 1
           description: Cumulated input and output tokens per run.
         max_observation_bytes:
+          title: Max observation bytes
           type: integer
           minimum: 1
           description: Largest observation or medium admitted into a transcript.
         max_action_calls:
+          title: Max action calls
           type: integer
           minimum: 1
           description: >-
             Maximum action calls per run, every delivery entry and the
             fallback included.
         max_repeated_actions:
+          title: Max repeated actions
           type: integer
           minimum: 1
           description: >-
             Executions of one identical proposal (same action name and
             canonical arguments) within one run; the next one is not executed.
         delivery_reserve_seconds:
+          title: Delivery reserve seconds
           type: number
           description: >-
             Time kept back before the total run deadline for the whole
@@ -138,21 +158,26 @@ settings_schema:
     # Conversation memory the engine owns, bounded in sessions, exchanges,
     # bytes and age (R6).
     conversation_memory:
+      title: Conversation memory
       type: object
       properties:
         max_sessions:
+          title: Max sessions
           type: integer
           minimum: 1
           description: Maximum remembered sessions; the oldest is evicted first.
         max_exchanges:
+          title: Max exchanges
           type: integer
           minimum: 1
           description: Maximum retained exchanges per session.
         max_bytes:
+          title: Max bytes
           type: integer
           minimum: 1
           description: Maximum retained bytes of exchanges per session.
         max_age_seconds:
+          title: Max age seconds
           type: number
           description: Finite age after which a retained exchange is evicted.
       required:
@@ -164,12 +189,15 @@ settings_schema:
     # delivery list as a final response, when a run ends without one because
     # of budget exhaustion, deadline expiry or a stale drop.
     fallback:
+      title: Fallback
       type: object
       properties:
         enabled:
+          title: Enabled
           type: boolean
           description: Whether the fallback text is delivered at all.
         text:
+          title: Text
           type: string
           description: The text delivered in place of the missing answer.
       required:
@@ -182,9 +210,11 @@ settings_schema:
     # the settings hook holds the list to that vocabulary as a whole, naming
     # this field.
     capabilities:
+      title: Capabilities
       type: object
       properties:
         required:
+          title: Required
           type: array
           items:
             type: string
@@ -204,34 +234,42 @@ settings_schema:
     # model never selects a delivery; `overrides` selects another list per
     # `<platform>/<channel_id>` destination.
     delivery:
+      title: Delivery
       type: object
       properties:
         mode:
+          title: Mode
           type: string
           enum:
             - fixed
             - modules
           description: How the delivery list is built.
         actions:
+          title: Actions
           type: array
           items:
+            title: Delivery entry
             type: object
             properties:
               action:
+                title: Action
                 type: string
                 description: Name of a delivery-capable action of the catalog.
               text_argument:
+                title: Text argument
                 type: string
                 description: >-
                   Argument the answer text is put under, or `none` for an
                   effect-only entry; absent inherits the declaration.
               arguments:
+                title: Arguments
                 type: object
                 description: Constant arguments the entry always carries.
             required:
               - action
           description: The ordered list mode `fixed` delivers through.
         preference:
+          title: Preference
           type: array
           items:
             type: string
@@ -240,6 +278,7 @@ settings_schema:
         # Keyed by destination, so the values cannot be declared here: the
         # settings hook holds each one to the shape of the group above.
         overrides:
+          title: Overrides
           type: object
           description: >-
             Delivery lists of the same shape (`mode`, `actions`, `preference`)
@@ -253,27 +292,33 @@ settings_schema:
     # a command of at most 32 characters, unique route names — are enforced
     # by the settings hook, naming the field.
     persona:
+      title: Persona
       type: string
       description: >-
         Replaces the opening identity line of the system instructions, at
         most 2000 characters; the fixed lines about tools and plain-text
         output are always kept.
     routes:
+      title: Routes
       type: array
       description: >-
         At most 16 routes, evaluated in order once per run from the
         triggering event; the first match wins, and with none the
         destination's list and the plain instructions apply.
       items:
+        title: Route
         type: object
         properties:
           name:
+            title: Name
             type: string
             description: Unique name of the route, used in startup diagnostics.
           match:
+            title: Match
             type: object
             properties:
               kinds:
+                title: Kinds
                 type: array
                 items:
                   type: string
@@ -289,11 +334,13 @@ settings_schema:
                     - watch_tick
                 description: Non-empty list of event kinds the route matches.
               command:
+                title: Command
                 type: string
                 description: >-
                   One token of at most 32 characters the event text must
                   start with, compared case-insensitively as a whole token.
               audience:
+                title: Audience
                 type: string
                 enum:
                   - broadcaster
@@ -307,11 +354,13 @@ settings_schema:
             required:
               - kinds
           instructions:
+            title: Instructions
             type: string
             description: >-
               Appended to the system instructions of a matched run, at most
               2000 characters.
           delivery:
+            title: Delivery
             type: object
             description: >-
               A delivery list of the shape above (`mode`, `actions`,

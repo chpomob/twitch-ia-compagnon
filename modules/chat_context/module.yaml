@@ -33,9 +33,11 @@ lifecycle:
 # (plan decision 4). The declared hook requires that group and checks its
 # values are finite and positive, one diagnostic per field, value-free.
 settings_schema:
+  title: Chat context settings
   type: object
   properties:
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point. The

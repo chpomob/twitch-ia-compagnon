@@ -139,6 +139,10 @@ PRESENTED = (
     "audio_input",
     "audio_output",
     "audit",
+    "brain",
+    "capture",
+    "chat_context",
+    "clips",
 )
 
 _DEFAULT_LITERAL = re.compile(r"Default (`[^`]*`|\S+?)\.(\s|$)")
@@ -240,3 +244,18 @@ def test_audio_output_max_text_chars_default_is_400() -> None:
     node = _settings_schema("audio_output")["properties"]["max_text_chars"]
     assert node["default"] == 400
     assert node["description"].endswith("Default 400.")
+
+
+def test_clips_required_default_is_boolean_false() -> None:
+    node = _settings_schema("clips")["properties"]["required"]
+    assert node["default"] is False
+    assert node["description"].endswith("Default false.")
+
+
+def test_walker_reaches_brain_items_properties() -> None:
+    paths = {path for path, _ in _setting_nodes(_settings_schema("brain"))}
+    assert "settings_schema.properties.routes.items.properties.match" in paths
+    assert (
+        "settings_schema.properties.delivery.properties.actions.items"
+        ".properties.text_argument"
+    ) in paths
