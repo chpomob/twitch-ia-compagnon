@@ -31,20 +31,26 @@ lifecycle:
 # field, including the cross-check `max_ticks_per_hour <= 3600 //
 # interval_seconds`.
 settings_schema:
+  title: Watch settings
   type: object
   properties:
     channels:
+      title: Channels
       type: array
       items:
         type: string
       description: >-
         The watched channels, 1 to 4 entries of `<platform>/<channel_id>`.
     interval_seconds:
+      title: Interval seconds
+      default: 60
       type: integer
       minimum: 15
       maximum: 3600
       description: The time between two ticks of an active session. Default 60.
     max_ticks_per_hour:
+      title: Max ticks per hour
+      default: 30
       type: integer
       minimum: 1
       maximum: 240
@@ -53,11 +59,14 @@ settings_schema:
         3600 // `interval_seconds`; a tick over it is skipped and counted.
         Default 30.
     max_active_seconds:
+      title: Max active seconds
+      default: 3600
       type: integer
       minimum: 60
       maximum: 14400
       description: How long a session lasts before it stops itself. Default 3600.
     activation:
+      title: Activation
       type: string
       enum:
         - command
@@ -66,12 +75,17 @@ settings_schema:
         `command` (the default) starts a session only on `start_command`;
         `startup` also starts one per channel when inputs start.
     start_command:
+      title: Start command
+      default: "!watch"
       type: string
       description: The exact chat text that starts a session. Default `!watch`.
     stop_command:
+      title: Stop command
+      default: "!unwatch"
       type: string
       description: The exact chat text that stops a session. Default `!unwatch`.
     command_audience:
+      title: Command audience
       type: string
       enum:
         - broadcaster
@@ -80,6 +94,7 @@ settings_schema:
         Who may start and stop a session: the trusted broadcaster (the
         default), or also the trusted moderators.
     prompt_text:
+      title: Prompt text
       type: string
       description: The text a tick carries, at most 500 characters.
   required:

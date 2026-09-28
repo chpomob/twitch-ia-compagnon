@@ -36,26 +36,31 @@ lifecycle:
 # reserved `limits` block the entry point hands every enabled module is
 # accepted and not read: this module owns its own bounds.
 settings_schema:
+  title: Users settings
   type: object
   properties:
     max_channels:
+      title: Max channels
       type: integer
       minimum: 1
       description: >-
         How many `(platform, channel_id)` directories are retained; beyond
         it the least recently updated channel is dropped whole.
     max_users_per_channel:
+      title: Max users per channel
       type: integer
       minimum: 1
       description: >-
         How many authors one channel retains; beyond it the author with the
         oldest `last_seen` is evicted and counted in `coverage.evicted`.
     max_age_seconds:
+      title: Max age seconds
       type: number
       description: >-
         How long an author stays listed after its last message; an older
         author is dropped at read. Reported as `freshness.window_seconds`.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every

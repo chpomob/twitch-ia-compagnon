@@ -877,7 +877,11 @@ def test_manifest_is_v2_and_declares_users_read_without_granting_it() -> None:
     nothing, no credential, a settings schema requiring the three bounds
     (plus the reserved ``limits`` block), the declared hook, and exactly the
     ``users.read`` read action over ``*/*/chat`` — a `read` carries no
-    delivery capability and no grant lives in the file."""
+    delivery capability and no grant lives in the file.
+
+    Phase-4 R3 supersedes the former exact-dict assertion on
+    ``max_channels``: the node now carries a ``title``, so the check keeps
+    ``type``/``minimum``/``description`` and bounds the allowed keywords."""
 
     manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
     assert MANIFEST_PATH == MODULE_DIR / "module.yaml"
@@ -898,10 +902,16 @@ def test_manifest_is_v2_and_declares_users_read_without_granting_it() -> None:
         "max_channels", "max_users_per_channel", "max_age_seconds", "limits",
     }
     assert set(schema["required"]) == {"max_channels", "max_users_per_channel", "max_age_seconds"}
-    assert schema["properties"]["max_channels"] == {
-        "type": "integer", "minimum": 1,
-        "description": schema["properties"]["max_channels"]["description"],
-    }
+    # R3 (phase 4) supersedes the former exact-dict check: every setting node
+    # now carries a ``title`` (and may carry a ``default``). The type and
+    # minimum checks are kept; no other keyword may appear.
+    max_channels = schema["properties"]["max_channels"]
+    assert max_channels["type"] == "integer"
+    assert max_channels["minimum"] == 1
+    assert isinstance(max_channels["description"], str)
+    assert max_channels["description"].strip()
+    assert isinstance(max_channels["title"], str) and max_channels["title"].strip()
+    assert set(max_channels) <= {"type", "minimum", "description", "title", "default"}
     assert schema["properties"]["max_users_per_channel"]["type"] == "integer"
     assert schema["properties"]["max_age_seconds"]["type"] == "number"
     assert schema["properties"]["limits"]["type"] == "object"

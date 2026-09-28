@@ -132,8 +132,8 @@ def test_audio_output_voices_schema_keeps_allowed_and_default() -> None:
 
 # --- AC12 / AC13 (R3): titles and documented defaults on shipped manifests ---
 
-# The manifests whose settings schemas carry presentation metadata so far.
-# Grows step by step until it lists every shipped manifest.
+# The manifests whose settings schemas carry presentation metadata: every
+# shipped manifest (the completeness test below keeps it that way).
 PRESENTED = (
     "agent_link",
     "audio_input",
@@ -147,6 +147,11 @@ PRESENTED = (
     "moderation",
     "proxy",
     "stream_control",
+    "twitch",
+    "users",
+    "viewer_memory",
+    "watch",
+    "youtube",
 )
 
 _DEFAULT_LITERAL = re.compile(r"Default (`[^`]*`|\S+?)\.(\s|$)")
@@ -222,6 +227,21 @@ def test_walker_treats_a_property_named_default_as_a_node() -> None:
     paths = [path for path, _ in _setting_nodes(schema)]
     assert "settings_schema.properties.voices.properties.default" in paths
     assert "settings_schema.properties.voices.properties.allowed" in paths
+
+
+def _shipped_manifests() -> set[str]:
+    return {
+        path.parent.name for path in (_REPO / "modules").glob("*/module.yaml")
+    }
+
+
+def test_presented_covers_every_shipped_manifest() -> None:
+    """AC12: the title and default checks run over all 17 shipped manifests."""
+
+    shipped = _shipped_manifests()
+    assert len(shipped) == 17
+    assert len(PRESENTED) == len(set(PRESENTED))
+    assert set(PRESENTED) == shipped
 
 
 @pytest.mark.parametrize("module", PRESENTED)
@@ -300,3 +320,33 @@ def test_moderation_command_defaults_are_the_command_strings() -> None:
     propose = _settings_schema("moderation")["properties"]["propose"]["properties"]
     assert propose["approve_command"]["default"] == "!modok"
     assert propose["reject_command"]["default"] == "!modno"
+
+
+def test_watch_command_defaults_are_the_command_strings() -> None:
+    properties = _settings_schema("watch")["properties"]
+    assert properties["start_command"]["default"] == "!watch"
+    assert properties["stop_command"]["default"] == "!unwatch"
+
+
+def test_youtube_nested_quota_cost_defaults_are_declared() -> None:
+    quota = _settings_schema("youtube")["properties"]["quota"]["properties"]
+    assert quota["daily_units"]["default"] == 10000
+    assert quota["costs"]["properties"]["broadcast_lookup"]["default"] == 1
+
+
+def test_users_max_channels_node_is_titled() -> None:
+    node = _settings_schema("users")["properties"]["max_channels"]
+    assert node["title"] == "Max channels"
+
+
+def test_audio_output_probe_default_true_is_boolean_true() -> None:
+    """AC13's ``Default true.`` example lives in the audio_output group."""
+
+    (probe,) = [
+        node
+        for path, node in _setting_nodes(_settings_schema("audio_output"))
+        if path.endswith(".properties.probe")
+    ]
+    assert probe["type"] == "boolean"
+    assert probe["default"] is True
+    assert probe["description"].endswith("Default true.")

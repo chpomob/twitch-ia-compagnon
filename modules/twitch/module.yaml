@@ -30,29 +30,37 @@ lifecycle:
 # reports one diagnostic per offending field naming module and field, with
 # no configured value echoed back.
 settings_schema:
+  title: Twitch settings
   type: object
   properties:
     client_id:
+      title: Client ID
       type: string
       description: Application identifier presented on every platform request.
     client_secret:
+      title: Client secret
       type: string
       description: Application secret, resolved from an environment reference.
     access_token:
+      title: Access token
       type: string
       description: User token authorising the chat subscription and sends.
     broadcaster_id:
+      title: Broadcaster ID
       type: string
       description: Channel whose chat is read and written.
     bot_user_id:
+      title: Bot user ID
       type: string
       description: The companion's own account, used to send and for anti-echo.
     companion_name:
+      title: Name of the companion
       type: string
       description: >-
         The name viewers use to address the companion. Configuration owns this
         value; the default trigger policy below refers to it by token only.
     notices:
+      title: Notices
       type: object
       description: >-
         Community notices (R1). Absent or empty, only chat messages are
@@ -65,6 +73,7 @@ settings_schema:
         notice type is ignored and counted.
       properties:
         kinds:
+          title: Kinds
           type: array
           description: The notice kinds this module ingests (default none).
           items:

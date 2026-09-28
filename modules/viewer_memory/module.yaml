@@ -37,15 +37,19 @@ lifecycle:
 # `max_total_bytes >= max_file_bytes`. The reserved `limits` block the entry
 # point hands every enabled module is accepted and not read.
 settings_schema:
+  title: Viewer memory settings
   type: object
   properties:
     directory:
+      title: Directory
       type: string
       description: >-
         The directory the memory files live in. Created at prepare when
         absent. Only files named like memory files are ever read, counted or
         deleted there.
     retention_days:
+      title: Retention days
+      default: 30
       type: integer
       minimum: 1
       maximum: 365
@@ -53,11 +57,15 @@ settings_schema:
         A record whose `last_seen` is older than this is deleted at prepare
         and at every sweep, and is never returned. Default 30.
     max_files:
+      title: Max files
+      default: 1000
       type: integer
       minimum: 1
       maximum: 100000
       description: The most memory files the directory holds. Default 1000.
     max_file_bytes:
+      title: Max file bytes
+      default: 4096
       type: integer
       minimum: 512
       maximum: 65536
@@ -65,6 +73,8 @@ settings_schema:
         The largest a memory file may be; the oldest notes are dropped to fit.
         Default 4096.
     max_total_bytes:
+      title: Max total bytes
+      default: 16777216
       type: integer
       minimum: 512
       maximum: 1073741824
@@ -72,16 +82,22 @@ settings_schema:
         The most bytes all memory files hold together; at least
         `max_file_bytes`. Default 16777216.
     max_notes:
+      title: Max notes
+      default: 10
       type: integer
       minimum: 1
       maximum: 100
       description: The most notes one memory file keeps. Default 10.
     sweep_interval_seconds:
+      title: Sweep interval seconds
+      default: 3600
       type: integer
       minimum: 60
       maximum: 86400
       description: How often expired records are swept. Default 3600.
     max_recall_bytes:
+      title: Max recall bytes
+      default: 1024
       type: integer
       minimum: 512
       maximum: 8192
@@ -90,12 +106,14 @@ settings_schema:
         left out oldest first, then the display name is shortened, to fit.
         Default 1024.
     forget_command:
+      title: Forget command
       type: string
       description: >-
         The exact chat text by which a trusted author erases their own memory
         file for that platform and channel. Default `!forgetme`; empty
         disables it.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every

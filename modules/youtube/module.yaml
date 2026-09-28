@@ -32,32 +32,40 @@ lifecycle:
 # reports one diagnostic per offending field naming module and field, with
 # no configured value echoed back.
 settings_schema:
+  title: YouTube settings
   type: object
   properties:
     client_id:
+      title: Client ID
       type: string
       description: The application's client identifier (not a secret).
     client_secret:
+      title: Client secret
       type: string
       description: Application secret, resolved from an environment reference.
     refresh_token:
+      title: Refresh token
       type: string
       description: >-
         The long-lived refresh token of the companion's account, exchanged at
         the token endpoint for access tokens before they expire.
     channels:
+      title: Channels
       type: array
       description: >-
         The channel identifiers whose active broadcast's live chat is polled.
       items:
         type: string
     companion_name:
+      title: Companion name
       type: string
       description: >-
         The name viewers use to address the companion, also its display name
         on the platform (anti-echo). Configuration owns this value; the
         default trigger policy below refers to it by token only.
     min_poll_interval_seconds:
+      title: Min poll interval seconds
+      default: 5
       type: integer
       minimum: 1
       maximum: 60
@@ -65,6 +73,7 @@ settings_schema:
         The shortest spacing between two list requests of one chat; the
         server-given interval is honoured when it is longer. Default 5.
     quota:
+      title: Quota
       type: object
       description: >-
         The local daily quota ledger. Every API request is charged its cost;
@@ -72,40 +81,56 @@ settings_schema:
         while it leaves `write_reserve_units` for sends.
       properties:
         daily_units:
+          title: Daily units
+          default: 10000
           type: integer
           minimum: 1
           description: Units available per quota day. Default 10000.
         write_reserve_units:
+          title: Write reserve units
+          default: 1000
           type: integer
           minimum: 0
           description: Units reads may never consume, kept for sends. Default 1000.
         costs:
+          title: Costs
           type: object
           description: The units each request kind is charged.
           properties:
             list:
+              title: List
+              default: 5
               type: integer
               minimum: 0
               description: One live-chat list request. Default 5.
             insert:
+              title: Insert
+              default: 50
               type: integer
               minimum: 0
               description: One chat message send. Default 50.
             delete:
+              title: Delete
+              default: 50
               type: integer
               minimum: 0
               description: One chat message deletion. Default 50.
             ban:
+              title: Ban
+              default: 50
               type: integer
               minimum: 0
               description: One chat ban (a timeout). Default 50.
             broadcast_lookup:
+              title: Broadcast lookup
+              default: 1
               type: integer
               minimum: 0
               description: One active-broadcast lookup. Default 1.
           additionalProperties: false
       additionalProperties: false
     notices:
+      title: Notices
       type: object
       description: >-
         Community notices (R1). Absent or empty, only chat messages are
@@ -114,6 +139,7 @@ settings_schema:
         ignored and counted.
       properties:
         kinds:
+          title: Kinds
           type: array
           description: The notice kinds this module ingests (default none).
           items:
