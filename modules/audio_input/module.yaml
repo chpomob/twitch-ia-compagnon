@@ -39,9 +39,11 @@ lifecycle:
 # at the call deadline itself. The reserved `limits` block the entry point
 # hands every enabled module is accepted and not read.
 settings_schema:
+  title: Audio input settings
   type: object
   properties:
     sources:
+      title: Sources
       type: object
       description: >-
         The named audio sources. A `command` source (`kind: command`, `argv`)
@@ -50,19 +52,26 @@ settings_schema:
         source (`kind: file`, `path`) is a WAV re-read at each call. Either
         must deliver PCM 16-bit, 16 000 Hz, mono.
     default_source:
+      title: Default source
       type: string
       description: The source a call that names none records from.
     max_seconds:
+      title: Max seconds
+      default: 30
       type: integer
       minimum: 1
       description: The longest segment one call may request. Default 30.
     max_bytes:
+      title: Max bytes
+      default: 1048576
       type: integer
       minimum: 1
       description: >-
         The most bytes one stored segment may weigh; a larger one is refused
         `attachment_refused` with nothing stored. Default 1048576.
     grace_seconds:
+      title: Grace seconds
+      default: 2
       type: number
       minimum: 0
       description: >-
@@ -70,41 +79,55 @@ settings_schema:
         before its deadline minus this reserve is refused `capture_too_long`
         before any process is spawned. Default 2.
     transcription:
+      title: Transcription
       type: object
       description: >-
         The optional transcription of each stored segment by an HTTP
         endpoint. No endpoint is assumed: while it is empty nothing is sent.
       properties:
         enabled:
+          title: Enabled
+          default: false
           type: boolean
           description: Whether a stored segment is transcribed. Default false.
         endpoint:
+          title: Endpoint
           type: string
           description: The transcription URL; empty until the operator configures one.
         model:
+          title: Model
           type: string
           description: The transcription model name sent with each request.
         api_key:
+          title: API key
           type: string
           description: >-
             Optional bearer credential; sent as an Authorization header when
             non-empty, redacted from every trace and diagnostic.
         language:
+          title: Language
           type: string
           description: Optional language hint sent with each request.
         timeout_seconds:
+          title: Timeout seconds
+          default: 10
           type: number
           description: How long one transcription request may take. Default 10.
         max_chars:
+          title: Max characters
+          default: 2000
           type: integer
           minimum: 1
           description: The most characters of transcription text kept. Default 2000.
     required:
+      title: Required
+      default: false
       type: boolean
       description: >-
         Whether an unusable source at `prepare` fails startup (true) or is
         reported and left aside (false). Default false.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every

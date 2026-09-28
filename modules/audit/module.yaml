@@ -32,9 +32,11 @@ lifecycle:
 # diagnostic per offending field naming module and field, with no configured
 # value echoed back.
 settings_schema:
+  title: Audit settings
   type: object
   properties:
     output:
+      title: Output
       type: string
       description: >-
         Where records are written: the literal `stdout` or `stderr`, or a
@@ -43,13 +45,16 @@ settings_schema:
     # blocks the publication chain: when either bound is reached the newly
     # offered record is dropped and the loss counter is incremented.
     queue:
+      title: Queue
       type: object
       properties:
         max_records:
+          title: Max records
           type: integer
           minimum: 1
           description: Maximum records admitted and not yet written.
         max_bytes:
+          title: Max bytes
           type: integer
           minimum: 1
           description: Maximum serialized bytes admitted and not yet written.

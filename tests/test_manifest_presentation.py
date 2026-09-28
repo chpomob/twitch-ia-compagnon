@@ -4,10 +4,15 @@ AC14 (R3): a schema node may carry a ``default`` annotation. The validator
 accepts it only when it satisfies the node that declares it, reports a bad
 one as ``<label>.default``, and the annotation has no effect on the values
 validated against the schema.
+
+AC12 / AC13 (R3): every setting node of each manifest in ``PRESENTED``
+carries a non-empty ``title``, and every node whose description documents
+``Default <literal>.`` declares that literal as its ``default``.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -123,3 +128,115 @@ def test_audio_output_voices_schema_keeps_allowed_and_default() -> None:
     assert "default" not in voices  # the node itself carries no annotation
     validate_schema(voices, label="settings_schema.properties.voices")
     validate_schema(settings_schema, label="settings_schema")
+
+
+# --- AC12 / AC13 (R3): titles and documented defaults on shipped manifests ---
+
+# The manifests whose settings schemas carry presentation metadata so far.
+# Grows step by step until it lists every shipped manifest.
+PRESENTED = (
+    "agent_link",
+    "audio_input",
+    "audio_output",
+    "audit",
+)
+
+_DEFAULT_LITERAL = re.compile(r"Default (`[^`]*`|\S+?)\.(\s|$)")
+_EMPTY_BY_TYPE = {"array": [], "object": {}, "string": ""}
+
+
+def _settings_schema(module: str) -> dict:
+    path = _REPO / "modules" / module / "module.yaml"
+    manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return manifest["settings_schema"]
+
+
+def _setting_nodes(node: dict, path: str = "settings_schema"):
+    """Yield ``(path, node)`` for every setting node, per R3.
+
+    The root, every ``properties`` entry recursively, and every ``items``
+    sub-schema having ``properties``. Property names are keys of
+    ``properties`` only, so a property literally named ``default`` is a node,
+    never the annotation.
+    """
+
+    yield path, node
+    for name, child in (node.get("properties") or {}).items():
+        yield from _setting_nodes(child, f"{path}.properties.{name}")
+    items = node.get("items")
+    if isinstance(items, dict) and "properties" in items:
+        yield from _setting_nodes(items, f"{path}.items")
+
+
+_NO_DEFAULT = object()
+
+
+def _documented_default(node: dict) -> object:
+    """The default a node's description documents, or ``_NO_DEFAULT``."""
+
+    match = _DEFAULT_LITERAL.search(node.get("description", ""))
+    if match is None:
+        return _NO_DEFAULT
+    literal = match.group(1)
+    if literal.startswith("`"):
+        literal = literal[1:-1]
+    if literal == "empty":
+        return _EMPTY_BY_TYPE[node["type"]]
+    return yaml.safe_load(literal)
+
+
+def test_extractor_reads_literals_and_ignores_prose() -> None:
+    assert _documented_default({"description": "Bound. Default 400."}) == 400
+    assert _documented_default({"description": "Default true. Then more."}) is True
+    assert _documented_default({"description": "Default `alert`."}) == "alert"
+    assert _documented_default({"description": "Default `[delete_message]`."}) == [
+        "delete_message"
+    ]
+    assert _documented_default({"type": "array", "description": "Default empty."}) == []
+    assert _documented_default({"description": 'Default "ready".'}) == "ready"
+    assert _documented_default({"description": "Default 1.5 seconds."}) is _NO_DEFAULT
+    assert _documented_default({"description": "Default behaviour applies."}) is (
+        _NO_DEFAULT
+    )
+
+
+def test_walker_treats_a_property_named_default_as_a_node() -> None:
+    schema = _settings_schema("audio_output")
+    paths = [path for path, _ in _setting_nodes(schema)]
+    assert "settings_schema.properties.voices.properties.default" in paths
+    assert "settings_schema.properties.voices.properties.allowed" in paths
+
+
+@pytest.mark.parametrize("module", PRESENTED)
+def test_every_setting_node_has_a_title(module: str) -> None:
+    nodes = list(_setting_nodes(_settings_schema(module)))
+    assert len(nodes) > 0
+    for path, node in nodes:
+        title = node.get("title")
+        assert isinstance(title, str) and title.strip(), path
+
+
+@pytest.mark.parametrize("module", PRESENTED)
+def test_every_documented_default_is_declared(module: str) -> None:
+    for path, node in _setting_nodes(_settings_schema(module)):
+        expected = _documented_default(node)
+        if expected is _NO_DEFAULT:
+            continue
+        assert "default" in node, path
+        assert node["default"] == expected, path
+        assert type(node["default"]) is type(expected), path
+
+
+@pytest.mark.parametrize("module", PRESENTED)
+def test_every_declared_default_validates_against_its_node(module: str) -> None:
+    schema = _settings_schema(module)
+    validate_schema(schema, label="settings_schema")
+    for path, node in _setting_nodes(schema):
+        if "default" in node:
+            validate_schema(node, label=path)
+
+
+def test_audio_output_max_text_chars_default_is_400() -> None:
+    node = _settings_schema("audio_output")["properties"]["max_text_chars"]
+    assert node["default"] == 400
+    assert node["description"].endswith("Default 400.")

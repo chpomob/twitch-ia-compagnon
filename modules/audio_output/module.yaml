@@ -34,9 +34,11 @@ lifecycle:
 # after that stop (R10). The reserved `limits` block the entry point hands
 # every enabled module is accepted and not read.
 settings_schema:
+  title: Audio output settings
   type: object
   properties:
     synthesis:
+      title: Synthesis
       type: object
       description: >-
         The speech synthesis HTTP endpoint: one JSON request per call
@@ -45,88 +47,116 @@ settings_schema:
         the module sends no request.
       properties:
         endpoint:
+          title: Endpoint
           type: string
           description: The synthesis URL; empty until the operator configures one.
         model:
+          title: Model
           type: string
           description: The synthesis model name sent in each request.
         api_key:
+          title: API key
           type: string
           description: >-
             Optional bearer credential; sent as an Authorization header when
             non-empty, redacted from every trace and diagnostic.
         timeout_seconds:
+          title: Timeout seconds
+          default: 10
           type: number
           description: >-
             How long one synthesis request may take before the call ends
             `timeout` with cause `synthesis`. Default 10.
         probe:
+          title: Probe
+          default: true
           type: boolean
           description: >-
             Whether `prepare` verifies the endpoint with one bounded probe
             synthesis. Default true.
         probe_text:
+          title: Probe text
+          default: "ready"
           type: string
           description: The text the probe synthesis speaks. Default "ready".
       required:
         - endpoint
         - model
     voices:
+      title: Voices
       type: object
       description: The voices a call may name, and the one used when it names none.
       properties:
         allowed:
+          title: Allowed
           type: array
           items:
             type: string
           description: The allowlist of voice names.
         default:
+          title: Default voice
           type: string
           description: The voice a call that names none is spoken with; one of `allowed`.
       required:
         - allowed
         - default
     outputs:
+      title: Outputs
       type: object
       description: >-
         The named outputs, each `{player: {argv: [...]}}`: the command started
         per playback, fed the whole WAV on its standard input.
     default_output:
+      title: Default output
       type: string
       description: The output a call that names none plays on.
     clips:
+      title: Clips
       type: object
       description: >-
         The named clips `audio.play` may play, each `{path}`: a WAV file on
         this machine, re-read at each call.
     max_text_chars:
+      title: Max text characters
+      default: 400
       type: integer
       minimum: 1
       description: The most characters one `audio.speak` text may hold. Default 400.
     max_speech_seconds:
+      title: Max speech seconds
+      default: 20
       type: number
       description: The longest segment either action plays. Default 20.
     max_audio_bytes:
+      title: Max audio bytes
+      default: 5242880
       type: integer
       minimum: 1
       description: The heaviest WAV body either action accepts. Default 5242880.
     stop_grace_seconds:
+      title: Stop grace seconds
+      default: 1
       type: number
       description: >-
         After a stop, how long a terminated player may take to exit before it
         is killed. Default 1.
     max_waiters:
+      title: Max waiters
+      default: 1
       type: integer
       minimum: 0
       description: >-
         How many calls may wait behind a busy output before one more is
         refused `resource_busy`. Default 1.
     required:
+      title: Required
+      default: false
       type: boolean
       description: >-
         Whether an unavailable dependency at `prepare` fails startup (true)
         or leaves the affected action unbound (false). Default false.
     limits:
+      title: Limits
       type: object
       description: >-
         The accepted `limits` block, handed over by the entry point to every
