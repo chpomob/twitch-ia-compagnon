@@ -1,5 +1,6 @@
 """The configuration UI: CLI, bind policy, guards and startup refusals (P9);
-the configuration model, base page and core-settings page (P10).
+the configuration model, base page and core-settings page (P10); the module
+pages generated from each manifest (P11).
 
 The whole module runs with socket creation patched to raise (AC5): no test
 here binds, connects or even creates a socket. The request core is driven
@@ -11,10 +12,13 @@ would create its self-pipe socketpair under the patch.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import gc
 import hashlib
+import html as _html
 import io
+import json
 import logging
 import os
 import re
@@ -27,12 +31,17 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
+import yaml
 
 import core.config_ui as config_ui
 from core.config_ui import (
+    BASE_ENTRY_NOTE,
+    ENTRY_SEGMENT,
     HIDDEN_LITERAL,
+    ITEMS_SEGMENT,
     LOCAL_ONLY_STATEMENT,
     MODULE_PAGE_PREFIX,
+    NOT_EDITABLE,
     READ_ONLY_REASON,
     REDACT_MIN_LENGTH,
     ConfigUI,
@@ -41,6 +50,7 @@ from core.config_ui import (
     UIResponse,
     UISettings,
     _dispatch,
+    _SchemaRenderer,
     _redact,
     _run_socket_free,
     _SocketFreeEventLoop,
@@ -1303,3 +1313,506 @@ def test_pages_use_inline_assets_and_relative_targets_only(tmp_path: Path) -> No
         assert all(target.startswith("/") and not target.startswith("//") for target in targets)
         assert "http://" not in page and "https://" not in page
         assert "url(" not in page and "@import" not in page
+
+
+# ---------------------------------------------------------------------------
+# P11: generated module pages (R4b, A2, A7, R9)
+# ---------------------------------------------------------------------------
+
+def _path_notation(path: Sequence[str]) -> str:
+    """The setting-path notation of the plan: ``a.b``, ``a.b[]``, ``a.<entry>``."""
+
+    text = ""
+    for segment in path:
+        text += segment if segment == "[]" else ("." if text else "") + segment
+    return text
+
+
+def _schema_paths(schema: object, prefix: tuple[str, ...] = ()) -> dict[str, dict]:
+    """Every setting path a schema declares, walked independently of the UI."""
+
+    found: dict[str, dict] = {}
+    if not isinstance(schema, dict):
+        return found
+    for key, sub in (schema.get("properties") or {}).items():
+        path = (*prefix, key)
+        found[_path_notation(path)] = sub
+        found.update(_schema_paths(sub, path))
+    if isinstance(schema.get("additionalProperties"), dict):
+        path = (*prefix, "<entry>")
+        found[_path_notation(path)] = schema["additionalProperties"]
+        found.update(_schema_paths(schema["additionalProperties"], path))
+    if isinstance(schema.get("items"), dict):
+        path = (*prefix[:-1], prefix[-1] + "[]") if prefix else ("[]",)
+        found[_path_notation(path)] = schema["items"]
+        found.update(_schema_paths(schema["items"], path))
+    return found
+
+
+def _shown_paths(page: str, prefix: str) -> list[str]:
+    """The ``data-path`` values under *prefix*, prefix removed, in page order."""
+
+    paths = [_html.unescape(value) for value in re.findall(r'data-path="([^"]*)"', page)]
+    return [path[len(prefix) :] for path in paths if path.startswith(prefix)]
+
+
+def _node(page: str, path: str) -> str:
+    """The markup of the node whose ``data-path`` is *path*, up to the next node."""
+
+    marker = f'data-path="{_html.escape(path, quote=True)}"'
+    start = page.index(marker)
+    following = page.find('data-path="', start + len(marker))
+    return page[start : following if following >= 0 else len(page)]
+
+
+def _logged_in(ui: ConfigUI) -> str:
+    cookie, _ = _login(ui)
+    return cookie
+
+
+def _module_html(ui: ConfigUI, cookie: str, name: str) -> str:
+    response = _get(ui, f"{MODULE_PAGE_PREFIX}{name}", cookie)
+    assert response.status == 200, name
+    return response.body.decode("utf-8")
+
+
+def test_setting_path_notation_is_shared_with_the_renderer() -> None:
+    assert (ITEMS_SEGMENT, ENTRY_SEGMENT) == ("[]", "<entry>")
+    assert config_ui._path_text(("modules", "m", "a", ITEMS_SEGMENT, "b")) == "modules.m.a[].b"
+    assert config_ui._path_text(("modules", "m", "a", ENTRY_SEGMENT)) == "modules.m.a.<entry>"
+    assert config_ui._path_text(("triggers", "m", "channels", "k", "rules", 0)) == (
+        "triggers.m.channels.k.rules[0]"
+    )
+
+
+@pytest.mark.parametrize("name", SHIPPED_MODULES)
+def test_ac16_every_schema_path_is_shown_with_title_help_and_default(
+    name: str, tmp_path: Path
+) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    page = _module_html(ui, _logged_in(ui), name)
+    manifest = yaml.safe_load((REPO / "modules" / name / "module.yaml").read_text(encoding="utf-8"))
+    schema = manifest["settings_schema"]
+    declared = _schema_paths(schema)
+    shown = _shown_paths(page, f"modules.{name}.")
+    assert len(shown) == len(set(shown)), "a setting path is shown twice"
+    assert set(shown) - set(declared) == set()  # 0 extra
+    assert set(declared) - set(shown) == set()  # 0 silently dropped
+
+    for path, node in declared.items():
+        markup = _node(page, f"modules.{name}.{path}")
+        if "title" in node:
+            assert f'<span class="title">{_html.escape(node["title"])}</span>' in markup, path
+        if "description" in node:
+            assert f'<p class="help">{_html.escape(node["description"])}</p>' in markup, path
+        if "default" in node:
+            default = node["default"]
+            text = default if isinstance(default, str) else json.dumps(default, ensure_ascii=False)
+            assert f'<code class="default">{_html.escape(text)}</code>' in markup, path
+
+    if "limits" in schema.get("properties", {}):
+        limits = _node(page, f"modules.{name}.limits")
+        assert 'data-notice="true"' in limits and NOT_EDITABLE in limits
+    # Only reserved or unrenderable nodes are notices; every renderable one is a control.
+    for path in _shown_paths(page, f"modules.{name}."):
+        markup = _node(page, f"modules.{name}.{path}")
+        if 'data-notice="true"' in markup:
+            node = declared[path]
+            assert path == "limits" or (
+                node.get("type") == "object" and "properties" not in node
+            ) or (node.get("type") == "array" and "items" not in node) or node.get("type") == "null"
+
+
+def _write_manifest(root: Path, name: str, body: str) -> None:
+    directory = root / name
+    directory.mkdir(parents=True)
+    header = (
+        f"name: {name}\nmanifest_version: 2\nruntime_api: 2\n"
+        "produces: []\nconsumes: []\nmiddleware: false\n"
+    )
+    (directory / "module.yaml").write_text(header + body, encoding="utf-8")
+
+
+def _module_fixture(
+    tmp_path: Path, name: str, manifest: str, *, base: str = "", overlay: str | None = None
+) -> ConfigUI:
+    _write_manifest(tmp_path / "mods", name, manifest)
+    (tmp_path / "config.yaml").write_text(
+        f"modules_directory: ./mods\nenabled_modules: [{name}]\nmodules:\n  {name}: {base or '{}'}\n",
+        encoding="utf-8",
+    )
+    if overlay is not None:
+        (tmp_path / "config.local.yaml").write_text(overlay, encoding="utf-8")
+    return _ui(tmp_path / "config.yaml", "--status-file", str(tmp_path / "status.json"))
+
+
+def test_ac17_a_module_added_as_a_directory_gets_its_titled_page(tmp_path: Path) -> None:
+    ui = _module_fixture(
+        tmp_path,
+        "newcomer",
+        "settings_schema:\n  type: object\n  properties:\n"
+        "    greeting: {title: Greeting text, type: string, description: Said first., default: hello}\n"
+        "    rounds: {title: Round count, type: integer, minimum: 1, default: 3}\n",
+    )
+    page = _module_html(ui, _logged_in(ui), "newcomer")
+    assert _shown_paths(page, "modules.newcomer.") == ["greeting", "rounds"]
+    assert '<span class="title">Greeting text</span>' in page
+    assert '<span class="title">Round count</span>' in page
+    assert '<p class="help">Said first.</p>' in page
+    assert '<code class="default">hello</code>' in page
+    assert 'name="modules.newcomer.greeting"' in page
+    assert 'name="modules.newcomer.rounds" min="1" step="1"' in page
+
+
+def test_ac17_no_ui_source_file_names_a_shipped_module() -> None:
+    sources = sorted(Path(config_ui.__file__).parent.glob("*.py"))
+    assert sources
+    for source in sources:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        literals = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        assert literals & set(SHIPPED_MODULES) == set(), source.name
+
+
+FIXTURE_SCHEMA = """settings_schema:
+  type: object
+  properties:
+    blob: {title: Blob, type: object}
+    bag: {title: Bag, type: array}
+    nothing: {title: Nothing, type: "null"}
+    mode: {title: Mode, type: string, enum: [fast, slow, "a<b"]}
+    count: {title: Count, type: integer, minimum: 1, maximum: 10}
+    ratio: {title: Ratio, type: number, minimum: 0, maximum: 1}
+    flag: {title: Flag, type: boolean}
+    names: {title: Names, type: array, items: {type: string}}
+    nested:
+      title: Nested
+      type: object
+      additionalProperties: false
+      properties:
+        inner: {title: Inner, type: string}
+  required: [count]
+"""
+
+
+def test_ac18_unrenderable_nodes_get_notices_and_controls_keep_the_schema(tmp_path: Path) -> None:
+    ui = _module_fixture(
+        tmp_path, "fmod", FIXTURE_SCHEMA, base="{blob: {k: v}, flag: true, names: [x, y]}"
+    )
+    page = _module_html(ui, _logged_in(ui), "fmod")
+    notices = [
+        _html.unescape(path)
+        for path in re.findall(r'data-path="([^"]+)"[^>]*data-notice="true"', page)
+    ]
+    assert notices == ["modules.fmod.blob", "modules.fmod.bag", "modules.fmod.nothing"]
+    for path in notices:
+        markup = _node(page, path)
+        assert NOT_EDITABLE in markup and f"<code>{path}</code>" in markup
+    # The configured text is shown read-only.
+    assert '<pre class="value">{&quot;k&quot;: &quot;v&quot;}</pre>' in _node(page, "modules.fmod.blob")
+
+    mode = _node(page, "modules.fmod.mode")
+    options = [_html.unescape(value) for value in re.findall(r'<option value="([^"]*)"', mode)]
+    assert options == ["fast", "slow", "a<b"]
+    count = _node(page, "modules.fmod.count")
+    assert 'min="1" max="10" step="1"' in count
+    assert 'data-required="true"' in count and '<abbr class="required" title="required">*</abbr>' in count
+    assert "required" not in _node(page, "modules.fmod.mode")
+    assert 'min="0" max="1" step="any"' in _node(page, "modules.fmod.ratio")
+    assert 'type="checkbox" name="modules.fmod.flag" value="true" checked' in page
+    names = _node(page, "modules.fmod.names")
+    assert '<textarea name="modules.fmod.names" data-json="list"' in names
+    assert "[&quot;x&quot;, &quot;y&quot;]</textarea>" in names
+    assert _shown_paths(page, "modules.fmod.")[-4:] == ["names", "names[]", "nested", "nested.inner"]
+    # additionalProperties: false offers no extra-key control.
+    assert "new_entry_name" not in page
+
+
+def test_ac18_a_manifest_without_settings_schema_gets_a_notice(tmp_path: Path) -> None:
+    ui = _module_fixture(tmp_path, "bare", "", base="{anything: kept-as-text}")
+    page = _module_html(ui, _logged_in(ui), "bare")
+    markup = _node(page, "modules.bare")
+    assert 'data-notice="true"' in markup and NOT_EDITABLE in markup
+    assert "kept-as-text" in markup
+    assert 'id="triggers"' not in page
+
+
+def test_r4_a_schema_additional_properties_is_a_named_entries_editor(tmp_path: Path) -> None:
+    """The manifest validator accepts only boolean ``additionalProperties``
+    today, so the named-entries editor is exercised on the renderer itself."""
+
+    base = _fixture_config(tmp_path)
+    base.write_text(
+        base.read_text(encoding="utf-8").replace(
+            "modules: {}", "modules:\n  ymod: {routes: {first: {weight: 2}}}"
+        ),
+        encoding="utf-8",
+    )
+    view = ConfigView.load(UISettings.from_argv(["--config", str(base)]), {})
+    schema = {
+        "type": "object",
+        "properties": {
+            "routes": {
+                "title": "Routes",
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {"weight": {"title": "Weight", "type": "integer"}},
+                },
+            }
+        },
+    }
+    markup = _SchemaRenderer(view).children(schema, ("modules", "ymod"))
+    assert _shown_paths(markup, "modules.ymod.") == [
+        "routes",
+        "routes.<entry>",
+        "routes.<entry>.weight",
+    ]
+    assert set(_shown_paths(markup, "modules.ymod.")) == set(_schema_paths(schema))
+    assert '<div class="entry" data-entry="first">' in markup
+    assert 'name="modules.ymod.routes.first" data-json="entry"' in markup
+    assert "{&quot;weight&quot;: 2}</textarea>" in markup
+    assert 'name="new_entry_name:modules.ymod.routes"' in markup
+
+
+# -- AC19: trigger policies ------------------------------------------------------
+
+
+def test_ac19_the_twitch_page_shows_the_configured_channel_policy(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    page = _module_html(ui, _logged_in(ui), "twitch")
+    triggers = _section(page, "triggers")
+    channels = re.findall(r'<fieldset class="channel" data-channel="([^"]*)">', triggers)
+    assert channels == ["${TWITCH_BROADCASTER_ID}"]
+    assert "<legend>Channel <code>${TWITCH_BROADCASTER_ID}</code> (unset)</legend>" in triggers
+    assert re.search(r'<option value="all_of" selected>all_of</option>', triggers)
+    assert re.findall(r'data-rule-type="([^"]+)"', triggers) == ["keyword"]
+    path = "triggers.twitch.channels.${TWITCH_BROADCASTER_ID}.rules[0].parameters.keywords"
+    keywords = re.search(
+        rf'<textarea name="{re.escape(path)}" data-json="list" rows="3">([^<]*)</textarea>', triggers
+    )
+    assert keywords is not None and json.loads(_html.unescape(keywords.group(1))) == ["!ask"]
+
+    manifest = yaml.safe_load((REPO / "modules" / "twitch" / "module.yaml").read_text(encoding="utf-8"))
+    declared_types = [entry["name"] for entry in manifest["triggers"]["types"]]
+    add = triggers[triggers.index('id="add-channel-policy"') :]
+    offered = re.findall(r'<option value="([^"]+)">', add.split('name="rule_type"')[1].split("</select>")[0])
+    # Exactly the declared types: {probability, audience, keyword} plus any
+    # type the manifest declares since the specification was written.
+    assert offered == declared_types
+    assert {"probability", "audience", "keyword"} <= set(offered)
+    combinations = re.findall(
+        r'<option value="([^"]+)"', add.split('name="combination"')[1].split("</select>")[0]
+    )
+    assert combinations == manifest["triggers"]["combinations"]
+    # A7: the base channel offers no delete and says why.
+    assert BASE_ENTRY_NOTE in triggers
+    assert "Delete this channel policy" not in triggers
+
+
+def test_ac19_a_module_without_trigger_types_has_no_trigger_section(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    cookie = _logged_in(ui)
+    for name in SHIPPED_MODULES:
+        manifest = yaml.safe_load((REPO / "modules" / name / "module.yaml").read_text(encoding="utf-8"))
+        has_types = bool((manifest.get("triggers") or {}).get("types"))
+        assert ('<section id="triggers">' in _module_html(ui, cookie, name)) == has_types, name
+    assert not all(
+        (yaml.safe_load((REPO / "modules" / name / "module.yaml").read_text()).get("triggers"))
+        for name in SHIPPED_MODULES
+    )
+
+
+TRIGGER_MANIFEST = """settings_schema: {type: object, properties: {}}
+triggers:
+  types:
+    - name: odds
+      parameter_schema:
+        type: object
+        properties: {odds: {title: Odds, type: number, minimum: 0, maximum: 1}}
+        required: [odds]
+        additionalProperties: false
+  combinations: [all_of, any_of]
+  default_policy: {combination: all_of, rules: [{type: odds, parameters: {odds: 1}}]}
+"""
+
+
+def test_a7_an_overlay_channel_can_be_deleted_and_a_base_one_cannot(tmp_path: Path) -> None:
+    ui = _module_fixture(tmp_path, "tmod", TRIGGER_MANIFEST)
+    base = tmp_path / "config.yaml"
+    base.write_text(
+        base.read_text(encoding="utf-8")
+        + "triggers:\n  tmod:\n    channels:\n      from-base:\n        combination: any_of\n"
+        "        rules: [{type: odds, parameters: {odds: 0.5}}]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.local.yaml").write_text(
+        "triggers:\n  tmod:\n    channels:\n      from-overlay:\n"
+        "        rules: [{type: odds, parameters: {odds: 0.25}}, {type: unknown}]\n",
+        encoding="utf-8",
+    )
+    page = _module_html(ui, _logged_in(ui), "tmod")
+    fieldsets = dict(
+        re.findall(r'<fieldset class="channel" data-channel="([^"]+)">(.*?)</form></fieldset>', page, re.S)
+    )
+    assert list(fieldsets) == ["from-base", "from-overlay"]
+    assert BASE_ENTRY_NOTE in fieldsets["from-base"]
+    assert "Delete this channel policy" not in fieldsets["from-base"]
+    assert BASE_ENTRY_NOTE not in fieldsets["from-overlay"]
+    assert (
+        'formaction="/remove" name="path" value="triggers.tmod.channels.from-overlay">'
+        "Delete this channel policy" in fieldsets["from-overlay"]
+    )
+    assert 'selected>any_of</option>' in fieldsets["from-base"]
+    odds = _node(page, "triggers.tmod.channels.from-base.rules[0].parameters.odds")
+    assert 'min="0" max="1" step="any" value="0.5"' in odds
+    # An undeclared rule type is a notice, never dropped.
+    unknown = _node(page, "triggers.tmod.channels.from-overlay.rules[1]")
+    assert 'data-notice="true"' in unknown and "{&quot;type&quot;: &quot;unknown&quot;}" in unknown
+
+
+# -- AC21: values and origins -------------------------------------------------------
+
+AC21_MANIFEST = "settings_schema:\n  type: object\n  properties:\n" + "".join(
+    f"    {key}: {{title: Setting {key.upper()}, type: integer, default: 5}}\n" for key in "abcd"
+)
+
+
+@pytest.mark.parametrize("var_c", [None, "resolved-c-value-9"])
+def test_ac21_each_field_shows_its_value_and_origin(var_c: str | None, tmp_path: Path) -> None:
+    ui = _module_fixture(
+        tmp_path,
+        "M",
+        AC21_MANIFEST,
+        base="{a: 1, c: '${VAR_C}', d: 5}",
+        overlay="modules:\n  M: {a: 2}\n",
+    )
+    ui.environ = {} if var_c is None else {"VAR_C": var_c}
+    page = _module_html(ui, _logged_in(ui), "M")
+    a, b, c, d = (_node(page, f"modules.M.{key}") for key in "abcd")
+
+    assert 'data-origin="overlay"' in a and '<code class="value">2</code>' in a
+    assert '<span class="origin">overlay</span>' in a
+    assert 'formaction="/remove" name="path" value="modules.M.a">Remove override' in a
+
+    assert 'data-origin="base"' in c
+    assert '<span class="origin">environment reference (base)</span>' in c
+    state = "unset" if var_c is None else "set"
+    assert f'<code class="value">${{VAR_C}}</code> <span class="reference-state">({state})</span>' in c
+    assert "resolved-c-value-9" not in page
+
+    assert '<code class="value">5</code>' in d and '<span class="origin">base</span>' in d
+
+    assert 'data-origin="default-not-set"' in b
+    assert '<span class="origin">default-not-set</span>' in b
+    assert '<code class="default">5</code>' in b
+    assert '<span class="value">not set</span>' in b and 'value=""' in b
+
+    for markup in (b, c, d):
+        assert "Remove override" not in markup
+
+
+def test_credential_literals_are_hidden_on_the_module_page(tmp_path: Path) -> None:
+    base = _fixture_config(tmp_path)
+    base.write_text(
+        base.read_text(encoding="utf-8").replace(
+            "modules: {}", "modules:\n  xmod: {token: literal-token-1234}"
+        ),
+        encoding="utf-8",
+    )
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    page = _module_html(ui, _logged_in(ui), "xmod")
+    token = _node(page, "modules.xmod.token")
+    assert f'<code class="value">{HIDDEN_LITERAL}</code>' in token
+    assert f'value="" placeholder="{HIDDEN_LITERAL}"' in token
+    assert "literal-token-1234" not in page
+
+
+@pytest.mark.parametrize(
+    ("declared", "literal"),
+    [("{type: string, enum: [abc, xyz]}", "abc"), ("{enum: [q7, r8], type: string}", "r8")],
+)
+def test_a_credential_is_masked_whatever_its_control(
+    declared: str, literal: str, tmp_path: Path
+) -> None:
+    # Short literals escape the redaction guard, so the control itself must mask them.
+    ui = _module_fixture(
+        tmp_path,
+        "cmod",
+        f"settings_schema:\n  type: object\n  properties:\n    pin: {declared}\n"
+        "credentials: [pin]\n",
+        base=f"{{pin: {literal}}}",
+    )
+    page = _module_html(ui, _logged_in(ui), "cmod")
+    pin = _node(page, "modules.cmod.pin")
+    assert f'value="" placeholder="{HIDDEN_LITERAL}"' in pin
+    assert "<select" not in pin and "<option" not in pin
+    assert f'<code class="value">{HIDDEN_LITERAL}</code>' in pin
+    assert f'value="{literal}"' not in page and f">{literal}<" not in page
+
+
+@pytest.mark.parametrize(
+    ("schema", "reason"),
+    [("{type: object}", "an object without properties"), ("{type: string}", "not an object")],
+)
+def test_an_unrenderable_root_settings_schema_is_a_notice(
+    schema: str, reason: str, tmp_path: Path
+) -> None:
+    ui = _module_fixture(tmp_path, "rmod", f"settings_schema: {schema}\n", base="{k: 1}")
+    page = _module_html(ui, _logged_in(ui), "rmod")
+    root = _node(page, "modules.rmod")
+    assert 'data-notice="true"' in root and NOT_EDITABLE in root and reason in root
+    assert '<pre class="value">' in root
+
+
+# -- AC36: configured values are escaped text, never a URL -----------------------------
+
+HOSTILE = 'https://cdn.example.invalid/x.js"><script>'
+
+
+def test_ac36_a_configured_url_is_escaped_text_only(tmp_path: Path) -> None:
+    ui = _module_fixture(
+        tmp_path,
+        "umod",
+        "settings_schema:\n  type: object\n  properties:\n"
+        "    endpoint: {title: Endpoint, type: string}\n"
+        "    blob: {title: Blob, type: object}\n",
+        base="{endpoint: " + json.dumps(HOSTILE) + ", blob: {u: " + json.dumps(HOSTILE) + "}}",
+    )
+    page = _module_html(ui, _logged_in(ui), "umod")
+    assert "&lt;script&gt;" in page
+    assert page.count("<script>") == 1  # the page's own inline script only
+    assert page.count("<script") == 1
+    targets = re.findall(r'\b(?:src|href|action|formaction)="([^"]*)"', page)
+    assert targets and all(target.startswith("/") and not target.startswith("//") for target in targets)
+    for target in targets:
+        assert "cdn.example.invalid" not in target
+
+
+def test_r9_module_pages_use_inline_assets_and_relative_targets_only(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    cookie = _logged_in(ui)
+    for name in SHIPPED_MODULES:
+        page = _module_html(ui, cookie, name)
+        assert "<link" not in page and "<script src" not in page
+        targets = re.findall(r'\b(?:src|href|action|formaction)="([^"]*)"', page)
+        assert targets and all(
+            target.startswith("/") and not target.startswith("//") for target in targets
+        ), name
+        assert "url(" not in page and "@import" not in page
+
+
+# -- AC3: an unauthenticated module page ------------------------------------------------
+
+
+def test_ac3_every_module_page_needs_a_session_and_names_nothing(tmp_path: Path) -> None:
+    ui = _profile_ui(tmp_path, "config.yaml.example", {})
+    for name in SHIPPED_MODULES:
+        response = ui.handle(_request("GET", f"{MODULE_PAGE_PREFIX}{name}"))
+        assert response.status == 401
+        body = response.body.decode("utf-8")
+        for word in SHIPPED_MODULES + SETTING_PATHS:
+            assert word not in body

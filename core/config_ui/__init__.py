@@ -51,12 +51,20 @@ import yaml
 
 from core.actions import ANY_ACTION
 from core.bus import EventBus
-from core.loader import DiscoveredModule, ModuleLoader, ModuleLoadError, _validate_manifest
+from core.loader import (
+    MANIFEST_SETTINGS_SCHEMA_KEY,
+    MANIFEST_TRIGGERS_KEY,
+    DiscoveredModule,
+    ModuleLoader,
+    ModuleLoadError,
+    _validate_manifest,
+)
 from core.main import (
     _ENV_REFERENCE,
     ACTIONS_KEY,
     LIMIT_DECLARATION,
     LIMIT_KIND_COUNT,
+    LIMITS_KEY,
     MODULES_DIRECTORY_BUILTIN,
     SECRETS_KEY,
     _builtin_modules_directory,
@@ -812,6 +820,12 @@ section { margin: 1.5rem 0; }
 .diagnostics { color: #b00; }
 form.inline { display: inline; margin: 0; }
 code { font-family: ui-monospace, monospace; }
+fieldset { margin: 0.5rem 0; }
+.field, .notice { margin: 0.5rem 0; }
+.help, .meta { margin: 0.2rem 0; color: #777; font-size: 0.9em; }
+.not-editable { border-left: 4px solid #c90; padding-left: 0.75rem; }
+.required { color: #b00; text-decoration: none; }
+textarea { width: 100%; font-family: ui-monospace, monospace; }
 """
 
 _SCRIPT = """
@@ -860,6 +874,376 @@ def _listing(value: Any) -> str:
     if isinstance(value, list):
         return ", ".join(esc(item) for item in value)
     return esc(value)
+
+
+# ---------------------------------------------------------------------------
+# Generated module pages (R4b, A2, A7, R9)
+#
+# A module page is generated from its manifest alone: the settings form from
+# ``settings_schema`` and the trigger policies from each declared trigger
+# type's ``parameter_schema``, both through :class:`_SchemaRenderer` over the
+# subset ``type``, ``properties``, ``required``, ``additionalProperties``,
+# ``enum``, ``items``, ``minimum`` and ``maximum``. Every rendered node
+# carries its setting path in ``data-path`` (see :func:`_path_text`); a node
+# the page cannot edit is shown with a "not editable here" notice naming its
+# path, never silently omitted.
+# ---------------------------------------------------------------------------
+
+NOT_EDITABLE = "not editable here"
+BASE_ENTRY_NOTE = "the overlay cannot delete a base entry"
+LIMITS_NOTICE = "the reserved limits setting is handed to every module from the core limits"
+
+#: Setting-path segments standing for "each item" of an array and "each
+#: named entry" of an ``additionalProperties`` mapping: ``a.b[]`` and
+#: ``a.<entry>`` (the notation the tests' schema walker uses too).
+ITEMS_SEGMENT = "[]"
+ENTRY_SEGMENT = "<entry>"
+
+_SCALAR_KINDS = ("string", "integer", "number", "boolean")
+
+
+def _path_text(path: Sequence[Any]) -> str:
+    """A setting path as text: dotted names, ``[i]`` indexes, ``[]`` items."""
+
+    text = ""
+    for segment in path:
+        if isinstance(segment, int) and not isinstance(segment, bool):
+            text += f"[{segment}]"
+        elif segment == ITEMS_SEGMENT:
+            text += ITEMS_SEGMENT
+        else:
+            text += ("." if text else "") + _plain(segment)
+    return text
+
+
+def _schema_kind(schema: Mapping[str, Any]) -> str | None:
+    """The node's type; an untyped node with ``properties`` or ``items`` is inferred."""
+
+    kind = schema.get("type")
+    if isinstance(kind, str):
+        return kind
+    if kind is None:
+        if isinstance(schema.get("properties"), Mapping) or isinstance(
+            schema.get("additionalProperties"), Mapping
+        ):
+            return "object"
+        if "items" in schema:
+            return "array"
+    return None
+
+
+def _trigger_types(manifest: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """The declared trigger types, name → ``parameter_schema``, in order."""
+
+    declared = manifest.get(MANIFEST_TRIGGERS_KEY)
+    if not isinstance(declared, Mapping):
+        return {}
+    types: dict[str, Mapping[str, Any]] = {}
+    listed = declared.get("types")
+    for entry in listed if isinstance(listed, list) else []:
+        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
+            schema = entry.get("parameter_schema")
+            types[entry["name"]] = schema if isinstance(schema, Mapping) else {}
+    return types
+
+
+def _key_label(key: Any, view: ConfigView) -> str:
+    """A configured mapping key as text; a ``${NAME}`` key stays a reference."""
+
+    name = reference_name(key)
+    if name is not None:
+        return f"<code>${{{ident(name)}}}</code> ({_state(view.references.get(name, False))})"
+    return f"<code>{esc(_plain(key))}</code>"
+
+
+class _SchemaRenderer:
+    """Renders a JSON-schema subset as form controls over one configuration view.
+
+    A *live* node edits the configured value at its path and shows its
+    current value and origin; a node under an array's ``items`` or a
+    mapping's named entries is *descriptive*: it documents the shape the
+    enclosing JSON editor accepts, with no control of its own.
+    """
+
+    def __init__(self, view: ConfigView) -> None:
+        self.view = view
+
+    # -- values -------------------------------------------------------------
+
+    def origin(self, path: Sequence[Any]) -> str:
+        return ConfigUI._origin(self.view, path)
+
+    def _masked(self, path: Sequence[Any], value: Any) -> Any:
+        """*value* with every nested credential literal replaced (R8)."""
+
+        if reference_name(value) is not None:
+            return value
+        if self.view.is_credential(path):
+            return HIDDEN_LITERAL
+        if isinstance(value, Mapping):
+            return {key: self._masked((*path, key), item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._masked((*path, index), item) for index, item in enumerate(value)]
+        return value
+
+    def configured_text(self, path: Sequence[Any]) -> str | None:
+        """The unresolved configured text at *path*, credentials hidden."""
+
+        value = self.view.value(path)
+        if value is _MISSING:
+            return None
+        return _plain(self._masked(path, value))
+
+    def _json_text(self, path: Sequence[Any]) -> str:
+        value = self.view.value(path)
+        if value is _MISSING:
+            return ""
+        return json.dumps(self._masked(path, value), ensure_ascii=False, default=str)
+
+    # -- nodes --------------------------------------------------------------
+
+    def children(self, schema: Mapping[str, Any], path: Sequence[Any], live: bool = True) -> str:
+        """The properties (and named entries) of an object node at *path*."""
+
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, Mapping) else {}
+        listed = schema.get("required")
+        required = set(listed) if isinstance(listed, list) else set()
+        parts = [
+            self.node(sub, (*path, key), required=key in required, live=live)
+            for key, sub in properties.items()
+        ]
+        entries = schema.get("additionalProperties")
+        if isinstance(entries, Mapping):
+            parts.append(self._entries(entries, path, set(properties), live))
+        return "".join(parts)
+
+    def node(
+        self, schema: Any, path: Sequence[Any], *, required: bool = False, live: bool = True
+    ) -> str:
+        if not isinstance(schema, Mapping):
+            return self.notice(path, "its schema is not a mapping", live=live)
+        if live and len(path) == 3 and path[0] == "modules" and path[2] == LIMITS_KEY:
+            return self.notice(path, LIMITS_NOTICE, schema, required)
+        kind = _schema_kind(schema)
+        enum = schema.get("enum")
+        if isinstance(enum, list) and kind in (None, *_SCALAR_KINDS):
+            return self._field(schema, path, required, live, "enum")
+        if kind in _SCALAR_KINDS:
+            return self._field(schema, path, required, live, kind)
+        if kind == "object":
+            has_properties = isinstance(schema.get("properties"), Mapping)
+            if has_properties or isinstance(schema.get("additionalProperties"), Mapping):
+                return (
+                    f'<fieldset class="object" {self._attributes(path, required, live)}>'
+                    f"<legend>{self._label(schema, path, required)}</legend>"
+                    f"{self._help(schema, path, live)}{self.children(schema, path, live)}</fieldset>"
+                )
+            return self.notice(path, "an object without properties", schema, required, live)
+        if kind == "array":
+            items = schema.get("items")
+            if isinstance(items, Mapping):
+                return self._list(schema, items, path, required, live)
+            return self.notice(path, "an array without items", schema, required, live)
+        if kind == "null":
+            return self.notice(path, "a null-typed setting", schema, required, live)
+        return self.notice(path, "a type outside the rendered subset", schema, required, live)
+
+    def notice(
+        self,
+        path: Sequence[Any],
+        reason: str,
+        schema: Mapping[str, Any] | None = None,
+        required: bool = False,
+        live: bool = True,
+    ) -> str:
+        """A "not editable here" notice naming *path*, its configured text read-only.
+
+        Under a JSON editor (*live* false) the node is edited through that
+        editor, so it is only described.
+        """
+
+        if not live:
+            described = schema or {}
+            return (
+                f'<div class="field described" {self._attributes(path, required, live)}>'
+                f"{self._label(described, path, required)}{self._help(described, path, live)}</div>"
+            )
+        label = self._label(schema, path, required) if schema is not None else ""
+        configured = ""
+        if live:
+            text = self.configured_text(path)
+            configured = (
+                '<span class="value">not configured</span>'
+                if text is None
+                else f'<pre class="value">{esc(text)}</pre>'
+            )
+        return (
+            f'<div class="notice not-editable" {self._attributes(path, required, live)} data-notice="true">'
+            f"{label} <strong>{NOT_EDITABLE}</strong>: <code>{ident(_path_text(path))}</code> "
+            f'<span class="reason">({esc(reason)})</span>'
+            f"{self._help(schema or {}, path, False)}{configured}</div>"
+        )
+
+    # -- pieces -------------------------------------------------------------
+
+    def _attributes(self, path: Sequence[Any], required: bool, live: bool) -> str:
+        attributes = f'data-path="{ident(_path_text(path))}"'
+        if live:
+            attributes += f' data-origin="{ident(self.view.origin(path))}"'
+        if required:
+            attributes += ' data-required="true"'
+        return attributes
+
+    @staticmethod
+    def _label(schema: Mapping[str, Any], path: Sequence[Any], required: bool) -> str:
+        title = schema.get("title")
+        last = path[-1] if path else ""
+        if isinstance(title, str) and title:
+            text = title
+        elif last == ITEMS_SEGMENT:
+            text = "each item"
+        elif last == ENTRY_SEGMENT:
+            text = "each entry"
+        else:
+            text = _plain(last)
+        marker = ' <abbr class="required" title="required">*</abbr>' if required else ""
+        return f'<span class="title">{ident(text)}</span>{marker}'
+
+    def _help(self, schema: Mapping[str, Any], path: Sequence[Any], live: bool) -> str:
+        parts: list[str] = []
+        description = schema.get("description")
+        if isinstance(description, str) and description:
+            parts.append(f'<p class="help">{ident(description)}</p>')
+        meta: list[str] = []
+        if "default" in schema:
+            meta.append(f'default: <code class="default">{esc(_plain(schema["default"]))}</code>')
+        if live:
+            meta.append(f"current: {self._current(path)}")
+            meta.append(f'origin: <span class="origin">{esc(self.origin(path))}</span>')
+            if self.view.origin(path) == ORIGIN_OVERLAY:
+                meta.append(
+                    '<button type="submit" formaction="/remove" name="path" '
+                    f'value="{ident(_path_text(path))}">Remove override</button>'
+                )
+        if meta:
+            parts.append(f'<p class="meta">{" · ".join(meta)}</p>')
+        return "".join(parts)
+
+    def _current(self, path: Sequence[Any]) -> str:
+        value = self.view.value(path)
+        if value is _MISSING:
+            return '<span class="value">not set</span>'
+        name = reference_name(value)
+        if name is not None:
+            is_set = self.view.references.get(name, False)
+            return (
+                f'<code class="value">${{{ident(name)}}}</code> '
+                f'<span class="reference-state">({_state(is_set)})</span>'
+            )
+        return f'<code class="value">{esc(_plain(self._masked(path, value)))}</code>'
+
+    def _field(
+        self, schema: Mapping[str, Any], path: Sequence[Any], required: bool, live: bool, kind: str
+    ) -> str:
+        control = self._control(schema, path, kind) if live else ""
+        return (
+            f'<div class="field" {self._attributes(path, required, live)}>'
+            f"<label>{self._label(schema, path, required)} {control}</label>"
+            f"{self._help(schema, path, live)}</div>"
+        )
+
+    def _control(self, schema: Mapping[str, Any], path: Sequence[Any], kind: str) -> str:
+        name = ident(_path_text(path))
+        value = self.view.value(path)
+        if reference_name(value) is not None:
+            # A reference is edited as its text, whatever the declared type.
+            return f'<input type="text" name="{name}" value="{esc(value)}">'
+        if self.view.is_credential(path):
+            # A literal credential is never placed in the page (R8),
+            # whatever control its declared type would get (enum, number, ...).
+            return f'<input type="text" name="{name}" value="" placeholder="{esc(HIDDEN_LITERAL)}">'
+        if kind == "enum":
+            options = "".join(
+                f'<option value="{esc(_plain(member))}"'
+                f'{" selected" if value is not _MISSING and value == member else ""}>'
+                f"{esc(_plain(member))}</option>"
+                for member in schema["enum"]
+            )
+            return f'<select name="{name}">{options}</select>'
+        if kind == "boolean":
+            checked = " checked" if value is True else ""
+            return (
+                f'<input type="hidden" name="{name}" value="false">'
+                f'<input type="checkbox" name="{name}" value="true"{checked}>'
+            )
+        if kind in ("integer", "number") and (
+            value is _MISSING or (isinstance(value, (int, float)) and not isinstance(value, bool))
+        ):
+            bounds = ""
+            for keyword, attribute in (("minimum", "min"), ("maximum", "max")):
+                bound = schema.get(keyword)
+                if isinstance(bound, (int, float)) and not isinstance(bound, bool):
+                    bounds += f' {attribute}="{esc(_plain(bound))}"'
+            step = "1" if kind == "integer" else "any"
+            shown = "" if value is _MISSING else _plain(value)
+            return f'<input type="number" name="{name}"{bounds} step="{step}" value="{esc(shown)}">'
+        shown = "" if value is _MISSING else _plain(value)
+        return f'<input type="text" name="{name}" value="{esc(shown)}">'
+
+    def _list(
+        self,
+        schema: Mapping[str, Any],
+        items: Mapping[str, Any],
+        path: Sequence[Any],
+        required: bool,
+        live: bool,
+    ) -> str:
+        """A list editor: one JSON text area, validated server-side."""
+
+        editor = (
+            f'<textarea name="{ident(_path_text(path))}" data-json="list" rows="3">'
+            f"{esc(self._json_text(path))}</textarea>"
+            if live
+            else ""
+        )
+        return (
+            f'<div class="field list" {self._attributes(path, required, live)}>'
+            f"<label>{self._label(schema, path, required)} {editor}</label>"
+            f"{self._help(schema, path, live)}"
+            '<div class="items">Each item (JSON list):'
+            f"{self.node(items, (*path, ITEMS_SEGMENT), live=False)}</div></div>"
+        )
+
+    def _entries(
+        self, schema: Mapping[str, Any], path: Sequence[Any], known: set[Any], live: bool
+    ) -> str:
+        """A named-entries editor: one JSON text area per entry, and an add row."""
+
+        rows: list[str] = []
+        if live:
+            configured = self.view.value(path)
+            entries = configured if isinstance(configured, Mapping) else {}
+            for key in entries:
+                if key in known:
+                    continue
+                entry_path = (*path, key)
+                rows.append(
+                    f'<div class="entry" data-entry="{esc(_plain(key))}">'
+                    f"<label>Entry {_key_label(key, self.view)} "
+                    f'<textarea name="{ident(_path_text(entry_path))}" data-json="entry" rows="2">'
+                    f"{esc(self._json_text(entry_path))}</textarea></label> "
+                    f'<span class="origin">origin: {esc(self.origin(entry_path))}</span></div>'
+                )
+            prefix = ident(_path_text(path))
+            rows.append(
+                f'<div class="entry new">New entry name <input type="text" name="new_entry_name:{prefix}"> '
+                f'value (JSON) <textarea name="new_entry_value:{prefix}" rows="2"></textarea></div>'
+            )
+        return (
+            '<div class="entries">Named entries:'
+            f"{self.node(schema, (*path, ENTRY_SEGMENT), live=False)}{''.join(rows)}</div>"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1296,14 +1680,136 @@ class ConfigUI:
         )
 
     def _module_page(self, request: UIRequest, session: _Session) -> UIResponse:
-        """A discovered module's page; the settings controls are generated later."""
+        """A discovered module's page, generated from its manifest (R4b, A2, A7).
+
+        The settings form renders ``settings_schema`` through
+        :class:`_SchemaRenderer`; the trigger section, present only when the
+        manifest declares trigger types, renders each configured channel
+        policy with the same renderer over each type's ``parameter_schema``.
+        """
 
         name = request.path[len(MODULE_PAGE_PREFIX) :]
         view = self.view()
-        if name not in view.modules:
+        module = view.modules.get(name)
+        if module is None:
             return _text(404, "404 Not Found")
-        body = f'<h1>Module {ident(name)}</h1><p><a href="/">Back to the configuration</a></p>'
-        return _page(f"Module {name}", session, body)
+        renderer = _SchemaRenderer(view)
+        root = ("modules", name)
+        schema = module.manifest.get(MANIFEST_SETTINGS_SCHEMA_KEY)
+        if isinstance(schema, Mapping) and _schema_kind(schema) == "object" and (
+            isinstance(schema.get("properties"), Mapping)
+            or isinstance(schema.get("additionalProperties"), Mapping)
+        ):
+            fields = renderer.children(schema, root)
+        elif isinstance(schema, Mapping):
+            # A root the renderer cannot expand still names the settings
+            # "not editable here", with their configured text read-only.
+            reason = (
+                "an object without properties"
+                if _schema_kind(schema) == "object"
+                else "a settings_schema that is not an object"
+            )
+            fields = renderer.notice(root, reason, schema)
+        else:
+            fields = renderer.notice(root, "the manifest declares no settings_schema")
+        form_id = "settings-form"
+        body = [
+            f"<h1>Module {ident(name)}</h1>",
+            '<p><a href="/">Back to the configuration</a></p>',
+            _diagnostics(view),
+            f'<section id="settings"><h2>Settings</h2>'
+            f'<form id="{form_id}" method="post" action="/save">{_csrf_field(session)}'
+            f"{fields}"
+            '<button type="submit">Save</button></form></section>',
+        ]
+        declared = _trigger_types(module.manifest)
+        if declared:
+            body.append(self._trigger_section(view, renderer, session, name, module.manifest))
+        return _page(f"Module {name}", session, "".join(body))
+
+    def _trigger_section(
+        self,
+        view: ConfigView,
+        renderer: _SchemaRenderer,
+        session: _Session,
+        name: str,
+        manifest: Mapping[str, Any],
+    ) -> str:
+        """Each configured channel policy of ``triggers.<name>`` and an add form."""
+
+        types = _trigger_types(manifest)
+        declared = manifest.get(MANIFEST_TRIGGERS_KEY)
+        combinations = [
+            item
+            for item in (declared.get("combinations", []) if isinstance(declared, Mapping) else [])
+            if isinstance(item, str)
+        ]
+        channels_path = ("triggers", name, "channels")
+        configured = view.value(channels_path)
+        channels = configured if isinstance(configured, Mapping) else {}
+        policies: list[str] = []
+        for key, policy in channels.items():
+            path = (*channels_path, key)
+            label = _key_label(key, view)
+            parts = [
+                f'<fieldset class="channel" data-channel="{esc(_plain(key))}">'
+                f"<legend>Channel {label}</legend>",
+                f'<form method="post" action="/save">{_csrf_field(session)}',
+            ]
+            if not isinstance(policy, Mapping):
+                parts.append(renderer.notice(path, "the channel policy is not a mapping"))
+            else:
+                combination = policy.get("combination", "all_of")
+                options = "".join(
+                    f'<option value="{ident(item)}"'
+                    f'{" selected" if item == combination else ""}>{ident(item)}</option>'
+                    for item in combinations
+                )
+                parts.append(
+                    f'<p><label>Combination <select name="{ident(_path_text((*path, "combination")))}" '
+                    f'data-combination="{esc(_plain(combination))}">{options}</select></label> '
+                    f'<span class="origin">{esc(renderer.origin((*path, "combination")))}</span></p>'
+                )
+                rules = policy.get("rules")
+                for index, rule in enumerate(rules if isinstance(rules, list) else []):
+                    rule_path = (*path, "rules", index)
+                    rule_type = rule.get("type") if isinstance(rule, Mapping) else None
+                    schema = types.get(rule_type) if isinstance(rule_type, str) else None
+                    if schema is None:
+                        parts.append(renderer.notice(rule_path, "the rule type is not declared"))
+                        continue
+                    parts.append(
+                        f'<fieldset class="rule" data-rule-type="{ident(rule_type)}">'
+                        f"<legend>Rule {index + 1}: {ident(rule_type)}</legend>"
+                        f"{renderer.children(schema, (*rule_path, 'parameters'))}</fieldset>"
+                    )
+            parts.append('<button type="submit">Save</button>')
+            if _lookup(view.base, path) is not _MISSING:
+                parts.append(f'<p class="note">{esc(BASE_ENTRY_NOTE)}</p>')
+            else:
+                parts.append(
+                    f'<button type="submit" formaction="/remove" name="path" '
+                    f'value="{ident(_path_text(path))}">Delete this channel policy</button>'
+                )
+            parts.append("</form></fieldset>")
+            policies.append("".join(parts))
+        type_options = "".join(
+            f'<option value="{ident(item)}">{ident(item)}</option>' for item in types
+        )
+        combination_options = "".join(
+            f'<option value="{ident(item)}">{ident(item)}</option>' for item in combinations
+        )
+        add = (
+            '<form id="add-channel-policy" method="post" action="/save">'
+            f"{_csrf_field(session)}<h3>Add channel policy</h3>"
+            f'<input type="hidden" name="add_channel_policy" value="{ident(_path_text(channels_path))}">'
+            '<label>Channel <input type="text" name="channel"></label> '
+            f'<label>Combination <select name="combination">{combination_options}</select></label> '
+            f'<label>Rule type <select name="rule_type">{type_options}</select></label> '
+            '<button type="submit">Add</button></form>'
+        )
+        content = "".join(policies) or "<p>No channel policy is configured: every channel uses the module default.</p>"
+        return f'<section id="triggers"><h2>Trigger policies</h2>{content}{add}</section>'
 
     def _not_available(self, request: UIRequest, session: _Session) -> UIResponse:
         return _text(501, "501 Not Implemented")
