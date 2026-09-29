@@ -12,3 +12,8 @@ __pycache__/
 
 # Journaux volatils des pipelines de campagne (phase 4)
 /docs/campaigns/phase4/scaffolding/*.log
+
+# Fichiers générés par opérateur (phase 4) : l'overlay géré par l'interface de
+# configuration et l'enregistrement de statut du runtime — pas des sources.
+*.local.yaml
+*.status.json

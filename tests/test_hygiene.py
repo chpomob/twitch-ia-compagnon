@@ -48,6 +48,9 @@ Three checks over the files themselves, none over the runtime:
   as planned but untouched; the spec must state that permitted scope in so
   many words; and every target must exist, so the list names no file the
   branch never produced.
+* Ignore rules (phase 4 gate-8 N8): the managed overlay (``*.local.yaml``)
+  and the status record (``*.status.json``) are per-operator generated
+  files, so ``git check-ignore`` must report them ignored.
 """
 
 from __future__ import annotations
@@ -55,8 +58,12 @@ from __future__ import annotations
 import ast
 import io
 import re
+import shutil
+import subprocess
 import tokenize
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = ROOT / "tests"
@@ -740,3 +747,28 @@ def test_the_target_list_parsers_read_the_documents_shape(tmp_path: Path) -> Non
     assert _plan_files(plan) == {"P1": ["a/b.py", "c.md"], "P2": ["d.py"]}
     body = "## Top\n\n### Other\nx\n\n### Scope here\nline one\n\n#### Deeper\nstill inside\n\n### Next\nout\n"
     assert _subsection(body, "Scope here") == "### Scope here\nline one\n\n#### Deeper\nstill inside\n"
+
+
+GENERATED_OPERATOR_FILES = (
+    "config.local.yaml",
+    "config.yaml.status.json",
+    "presence.local.yaml",
+    "presence.yaml.status.json",
+    "modules/brain/operator.local.yaml",
+    "modules/brain/operator.yaml.status.json",
+)
+
+
+def test_n8_the_generated_overlay_and_status_files_are_ignored() -> None:
+    git = shutil.which("git")
+    if git is None or not (ROOT / ".git").exists():
+        pytest.skip("no git checkout to ask")
+    result = subprocess.run(
+        [git, "check-ignore", "--no-index", "--", *GENERATED_OPERATOR_FILES],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == list(GENERATED_OPERATOR_FILES)
