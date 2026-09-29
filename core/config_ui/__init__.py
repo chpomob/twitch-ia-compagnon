@@ -1288,15 +1288,26 @@ def _tagged(value: Any) -> Any:
 # lossy, and the old scheme of reconstructing the real value from the masked
 # text posted back mistook entries for one another (gate-6 N3, N5, N6). Such a
 # value is edited entry by entry instead. Every entry gets an identity
-# allocated at render time — a keyed digest of the page, the setting, the
-# entry's real path below it and its real value — revealed only as an opaque
-# token in the control's name, and mapped back to that exact place by
-# rendering the page again over the same configuration. A submission carries,
-# per control, its identity and either its untouched text (no change) or the
-# new value; the server applies those changes to the real value it loaded,
-# so an entry left alone keeps its real value without ever being sent, and
-# Check and Save validate the same real result. A part the page withheld is
-# never editable in place: it is kept, moved, removed or replaced whole.
+# allocated at render time — a keyed digest of the render, the page, the
+# setting's real path, the entry's real path below it and its real value —
+# revealed only as an opaque token in the control's name, and mapped back to
+# that exact place by rendering the page again over the same configuration.
+# A submission carries, per control, its identity and either its untouched
+# text (no change) or the new value; the server applies those changes to the
+# real value it loaded, so an entry left alone keeps its real value without
+# ever being sent, and Check and Save validate the same real result. A part
+# the page withheld is never editable in place: it is kept, moved, removed or
+# replaced whole.
+#
+# P19F10: every identity starts with its render's tag — a random tag drawn
+# for each rendering of a page and remembered by the session showing it — so
+# no identity of an earlier render, or of another session, can ever equal a
+# current one (gate-7 N3/N6): such a submission is refused as stale, before
+# anything is parsed. A control whose shown text is not its value (an empty
+# replacement for a withheld value, an unset setting) posts an explicit
+# operation beside it — ``unchanged``, ``set`` or ``clear`` — so "unchanged"
+# is never inferred from the text, and any value, the empty string included,
+# can be set (gate-7 N7).
 # ---------------------------------------------------------------------------
 
 #: The prefix of every patch control's name: ``@patch-<operation>-<token>``.
@@ -1313,6 +1324,22 @@ PATCH_ITEM = "item"
 #: A new mapping entry's key and its value (JSON), on the mapping's token.
 PATCH_KEY = "key"
 PATCH_ENTRY = "entry"
+#: The explicit operation of a withheld entry's replacement control (P19F10).
+PATCH_OPERATION = "op"
+#: The prefix of the explicit operation posted beside an ordinary control
+#: whose shown text is not its value: ``@op:<field name>`` (P19F10).
+OPERATION_FIELD_PREFIX = "@op:"
+#: The operations: keep the configured value (whatever the text holds —
+#: text typed with it is refused), set the text as the whole new value (the
+#: empty string included), or clear the setting from the overlay.
+OPERATION_UNCHANGED = "unchanged"
+OPERATION_SET = "set"
+OPERATION_CLEAR = "clear"
+#: Hex characters of the render tag every patch identity starts with.
+RENDER_TAG_LENGTH = 16
+#: How many render tags the UI remembers to tell a stale identity from an
+#: unknown one; a forgotten tag is still refused, as unknown.
+MAX_RENDER_TAGS = 4096
 #: The placeholder of a control whose configured text is withheld.
 WITHHELD_PLACEHOLDER = "withheld: type a replacement, or leave empty to keep it"
 
@@ -1328,6 +1355,30 @@ class _PatchControl:
     relative: tuple[Any, ...]
     operation: str
     rendered: str
+
+
+def _render_tag(name: str) -> str | None:
+    """The render tag a posted patch control's identity starts with, or
+    ``None`` for a field that is no patch control (P19F10)."""
+
+    if not name.startswith(PATCH_FIELD_PREFIX):
+        return None
+    _operation, sep, token = name[len(PATCH_FIELD_PREFIX) :].partition("-")
+    return token[:RENDER_TAG_LENGTH] if sep else None
+
+
+class _Cleared:
+    """The value of an edit that clears its setting from the overlay: the
+    ``clear`` operation (P19F10). One object, kept by every copy."""
+
+    def __deepcopy__(self, memo: Any) -> _Cleared:
+        return self
+
+    def __repr__(self) -> str:
+        return "<cleared>"
+
+
+_CLEARED = _Cleared()
 
 
 class _Refusal(str):
@@ -1894,6 +1945,21 @@ def _withheld_attributes() -> str:
     return f' placeholder="{ident(WITHHELD_PLACEHOLDER)}" data-withheld="true"'
 
 
+def _operation_select(name: str, clearable: bool) -> str:
+    """The explicit operation posted beside a control named *name* whose
+    shown text is not its value (P19F10, gate-7 N7): ``unchanged`` is
+    selected, so a control left alone sends no edit, whatever its text."""
+
+    labels = [(OPERATION_UNCHANGED, "keep the current value"), (OPERATION_SET, "set to the text typed")]
+    if clearable:
+        labels.append((OPERATION_CLEAR, "clear this setting"))
+    options = "".join(
+        f'<option value="{value}"{" selected" if value == OPERATION_UNCHANGED else ""}>{label}</option>'
+        for value, label in labels
+    )
+    return f'<select name="{name}" data-operation="true">{options}</select>'
+
+
 def _editable(text: str) -> str:
     """The text a scalar control holds: *text*, or ``""`` when the page cannot
     show it exactly — the control is then an empty replacement (P19F9)."""
@@ -1927,10 +1993,16 @@ class _SchemaRenderer:
     form is read back through the very controls the page rendered.
     """
 
-    def __init__(self, view: ConfigView, page: str = "") -> None:
+    def __init__(self, view: ConfigView, page: str = "", render: str = "") -> None:
         self.view = view
         #: The page being rendered: a patch identity belongs to one page.
         self.page = page
+        #: The tag of this rendering: a patch identity belongs to one render
+        #: (P19F10); see :meth:`ConfigUI._new_render`.
+        self.render = render
+        #: Field name → whether its explicit operation offers ``clear``, for
+        #: every control rendered with one (P19F10).
+        self.operations: dict[str, bool] = {}
         self.controls: dict[str, _Control] = {}
         #: ``new_entry_*`` field suffix → the mapping path a new entry joins.
         self.entry_mappings: dict[str, tuple[Any, ...]] = {}
@@ -2044,19 +2116,23 @@ class _SchemaRenderer:
     def _patch_token(self, top: tuple[Any, ...], relative: tuple[Any, ...], value: Any) -> str:
         """The opaque identity of the entry at *relative* below *top*.
 
-        A keyed digest of the page, the setting, the entry's real path and
-        its real value: unique per place, meaningless without this UI's
-        field key, and unknown once the entry's value or place changed — a
-        stale identity is refused, never retargeted.
+        The render's tag, then a keyed digest of the render, the page, the
+        setting's real path (its configured keys themselves, never their
+        positions: gate-7 N6), the entry's real path and its real value.
+        Unique per render and place, meaningless without this UI's field
+        key, and unknown once the entry's value or place changed. The tag is
+        random per rendering, so an identity drawn by an earlier render or
+        in another session never equals a current one (gate-7 N3): it is
+        refused, never retargeted. No configured key or value appears in it.
         """
 
         source = _RENDERING_FOR.get()
         key = _PROCESS_FIELD_KEY if source is None else source.field_key
         material = json.dumps(
-            [self.page, _field_name(top, self.view), _tagged(relative), _tagged(value)],
+            [self.render, self.page, _tagged(top), _tagged(relative), _tagged(value)],
             ensure_ascii=False,
         )
-        return hmac.new(key, material.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+        return self.render + hmac.new(key, material.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
 
     def _patch_control(
         self, operation: str, token: str, top: tuple[Any, ...], relative: tuple[Any, ...], rendered: str
@@ -2124,9 +2200,13 @@ class _SchemaRenderer:
             )
             return f'<ol class="patch-list" start="0">{"".join(rows)}</ol>'
         name = self._patch_control(PATCH_VALUE, token, top, relative, "")
+        # The empty replacement says nothing by its text: its operation does
+        # (gate-7 N7). Removal is the entry's own removal flag.
+        operation = self._patch_control(PATCH_OPERATION, token, top, relative, OPERATION_UNCHANGED)
         return (
             f'<code class="value withheld">{esc(self._masked(path, value))}</code> '
-            f'<input type="text" name="{name}" data-patch="replace" value=""{_withheld_attributes()}>'
+            f'<input type="text" name="{name}" data-patch="replace" value=""{_withheld_attributes()}> '
+            f"{_operation_select(operation, False)}"
         )
 
     # -- nodes --------------------------------------------------------------
@@ -2346,11 +2426,35 @@ class _SchemaRenderer:
         is shown masked beside it (``current:``).
         """
 
+        configured = self.view.value(path)
         if _guarded(text) != text:
             self.register(path, kind, "", schema)
-            return f'<input type="text" name="{name}" value=""{_withheld_attributes()}>'
+            return (
+                f'<input type="text" name="{name}" value=""{_withheld_attributes()}> '
+                f"{self._operation(path, name, configured)}"
+            )
         self.register(path, kind, text, schema)
-        return f'<input type="{control}" name="{name}"{attributes} value="{esc(text)}">'
+        markup = f'<input type="{control}" name="{name}"{attributes} value="{esc(text)}">'
+        if configured is _MISSING:
+            # Empty says "not set" here, so setting the empty string needs
+            # the explicit operation too (gate-7 N7).
+            markup += f" {self._operation(path, name, configured)}"
+        return markup
+
+    def _operation(self, path: Sequence[Any], name: str, configured: Any) -> str:
+        """The explicit operation of the control *name* at *path* (P19F10):
+        ``clear`` is offered when the overlay holds the setting, and never
+        for one inside a list (a trigger rule's parameter, say): the overlay
+        list replaces the base list wholesale, so deleting a field from it
+        could not bring the base value back (P19F10 review A1)."""
+
+        clearable = (
+            configured is not _MISSING
+            and self.view.origin(path) == ORIGIN_OVERLAY
+            and not any(isinstance(segment, int) and not isinstance(segment, bool) for segment in path)
+        )
+        self.operations[_field_name(path, self.view)] = clearable
+        return _operation_select(f"{OPERATION_FIELD_PREFIX}{name}", clearable)
 
     def _boolean(self, schema: Mapping[str, Any], path: Sequence[Any], name: str, value: Any) -> str:
         """A three-state boolean: not set (inherit), ``true`` or ``false`` (gate F3).
@@ -2482,6 +2586,9 @@ class UIResponse:
 @dataclass
 class _Session:
     csrf_token: str
+    #: Page → the tag of the rendering of it this session currently shows
+    #: (P19F10): only that render's patch identities are accepted from it.
+    renders: dict[str, str] = field(default_factory=dict)
 
 
 Handler = Callable[[UIRequest, _Session], UIResponse]
@@ -2567,6 +2674,9 @@ class ConfigUI:
         self.status_path = settings.status_path
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._sessions_lock = threading.Lock()
+        #: Render tag → the page it was drawn for, newest last, bounded
+        #: (P19F10): tells an identity of an earlier render from an unknown one.
+        self._render_tags: OrderedDict[str, str] = OrderedDict()
         self._mutation_lock = threading.Lock()
         #: Runs the settings phase of Check; the seam exists for unit tests,
         #: production always uses :func:`_default_checker` (R5).
@@ -2647,6 +2757,51 @@ class ConfigUI:
             for session_id, session in self._sessions.items():
                 if _equal(session_id, presented):
                     return session
+        return None
+
+    def _new_render(self, session: _Session, page: str) -> str:
+        """A fresh tag for one rendering of *page*, now the one *session*
+        shows (P19F10): every identity it draws starts with it, and the
+        identities of the render it replaces are refused from now on."""
+
+        tag = secrets.token_hex(RENDER_TAG_LENGTH // 2)
+        with self._sessions_lock:
+            session.renders[page] = tag
+            self._render_tags[tag] = page
+            while len(self._render_tags) > MAX_RENDER_TAGS:
+                self._render_tags.popitem(last=False)
+        return tag
+
+    def _live_render(self, page: str, fields: Sequence[tuple[str, str]]) -> str:
+        """The render tag the patch identities of *fields* carry, when it is
+        one some session currently shows for *page*; else ``""`` (no
+        identity is then known). For :meth:`parse_edits` called without a
+        session; the routes pass theirs."""
+
+        tags = {_render_tag(name) for name, _text in fields} - {None}
+        if len(tags) != 1:
+            return ""
+        tag = tags.pop()
+        with self._sessions_lock:
+            live = any(session.renders.get(page) == tag for session in self._sessions.values())
+        return tag if live else ""
+
+    def _stale_identities(
+        self, fields: Sequence[tuple[str, str]], session: _Session, page: str
+    ) -> WriteResult | None:
+        """A stale result when a posted patch identity was drawn for *page*
+        by a render *session* is not showing — an earlier render, or another
+        session's (gate-7 N3/N6). Refused before anything is parsed, exactly
+        as a stale layout is, on Check and Save alike; nothing is applied
+        elsewhere. An identity no render drew is left to :meth:`parse_edits`,
+        which refuses it as unknown."""
+
+        with self._sessions_lock:
+            current = session.renders.get(page)
+            for name, _text in fields:
+                tag = _render_tag(name)
+                if tag is not None and tag != current and self._render_tags.get(tag) == page:
+                    return WriteResult(OUTCOME_STALE, (_STALE_IDENTITY_REASON,))
         return None
 
     def _csrf(self, request: UIRequest) -> str | None:
@@ -3011,7 +3166,7 @@ class ConfigUI:
         if module is None:
             return _text(404, "404 Not Found")
         page = f"{MODULE_PAGE_PREFIX}{name}"
-        renderer = _SchemaRenderer(view, page)
+        renderer = _SchemaRenderer(view, page, self._new_render(session, page))
         fields = self._module_fields(renderer, name, module)
         form_id = "settings-form"
         running = self.running_state()
@@ -3219,14 +3374,15 @@ class ConfigUI:
 
     # -- Check (R5) -----------------------------------------------------------
 
-    def _controls(self, view: ConfigView) -> _SchemaRenderer:
+    def _controls(self, view: ConfigView, render: str = "") -> _SchemaRenderer:
         """Every control the pages render over *view*, by field name.
 
         The module pages are rendered (their HTML discarded) through the same
-        renderer, so a posted field is read back exactly as its page drew it.
+        renderer, so a posted field is read back exactly as its page drew it
+        — by the render tagged *render* (P19F10).
         """
 
-        renderer = _SchemaRenderer(view)
+        renderer = _SchemaRenderer(view, render=render)
         placeholder = _Session(csrf_token="")
         for name, module in view.modules.items():
             renderer.page = f"{MODULE_PAGE_PREFIX}{name}"
@@ -3247,27 +3403,49 @@ class ConfigUI:
         return renderer
 
     def parse_edits(
-        self, view: ConfigView, fields: Sequence[tuple[str, str]]
+        self,
+        view: ConfigView,
+        fields: Sequence[tuple[str, str]],
+        session: _Session | None = None,
     ) -> tuple[list[Edit], list[str]]:
         """The draft edits a posted form makes, and the fields it cannot read.
 
-        A field left as its page rendered it is no edit. A trigger-policy
+        Patch identities are read back through the render *session* shows
+        for the posted page (without a session: a render some session
+        shows, P19F10). A control posted with an explicit operation
+        (``@op:<name>``) is read by that operation, never by its text
+        (gate-7 N7); any other field left as its page rendered it is no
+        edit. A trigger-policy
         field is lifted to its whole channel policy (the unit a policy is
         written in, R6); a base-page toggle ``enabled_modules.<name>`` edits
         the whole ``enabled_modules`` list; the add-channel-policy form makes
         a new one-rule channel policy.
         """
 
-        renderer = self._controls(view)
+        page = self._posted_page(fields, view)
+        if session is not None:
+            render = session.renders.get(page, "")
+        else:
+            render = self._live_render(page, fields)
+        renderer = self._controls(view, render)
         posted: dict[str, str] = {}
         patches: list[tuple[str, str]] = []
+        operations: dict[str, str] = {}
         for name, value in fields:
             if name.startswith(PATCH_FIELD_PREFIX):
                 patches.append((name, value))  # every one counted: a duplicate is refused
                 continue
+            if name.startswith(OPERATION_FIELD_PREFIX):
+                operations[name[len(OPERATION_FIELD_PREFIX) :]] = value
+                continue
             posted[name] = value  # the last value wins (a checkbox after its hidden twin)
         edits: dict[tuple[Any, ...], Any] = {}
         problems: list[str] = []
+        for name in operations:
+            if name not in renderer.operations or renderer.controls.get(name) is None:
+                problems.append(f"{OPERATION_FIELD_PREFIX}{name}: is not a setting this UI edits")
+            elif name not in posted:
+                posted[name] = ""  # an operation without its text: the text is empty
         enabled: list[str] | None = None
         policies: dict[tuple[Any, ...], Any] = {}
         if _ADD_CHANNEL_POLICY in posted:
@@ -3306,6 +3484,11 @@ class ConfigUI:
                     problems.append(_Refusal(f"{name}: {_WITHHELD_WHOLE_REASON}"))
                 else:
                     problems.append(f"{name}: is not a setting this UI edits")
+                continue
+            if name in operations and name in renderer.operations:
+                value = _operated(name, control, text, operations[name], renderer.operations[name], problems)
+                if value is not _MISSING:
+                    _draft_edit(edits, policies, view, control.path, value)
                 continue
             if text == control.rendered:
                 continue
@@ -3350,6 +3533,9 @@ class ConfigUI:
         refusals: list[str] = []
         seen: set[str] = set()
         changes: dict[tuple[Any, ...], dict[tuple[tuple[Any, ...], str], str]] = {}
+        # A withheld entry's explicit operation, and its replacement's text.
+        operations: dict[tuple[tuple[Any, ...], tuple[Any, ...]], str] = {}
+        replacements: dict[tuple[tuple[Any, ...], tuple[Any, ...]], str] = {}
         for name, text in patches:
             control = renderer.patches.get(name)
             if control is None or control.page != page:
@@ -3360,8 +3546,28 @@ class ConfigUI:
                 refusals.append(_Refusal(f"{label}: {_DUPLICATE_ENTRY_REASON}"))
                 continue
             seen.add(name)
+            place = (control.top, control.relative)
+            if control.operation == PATCH_OPERATION:
+                operations[place] = text
+                continue
+            if control.operation == PATCH_VALUE:
+                replacements[place] = text
             if text != control.rendered:
                 changes.setdefault(control.top, {})[(control.relative, control.operation)] = text
+        for (top, relative), operation in operations.items():
+            # The operation decides, never the text (gate-7 N7).
+            text = replacements.get((top, relative), "")
+            changed = changes.setdefault(top, {})
+            if operation == OPERATION_SET:
+                changed[(relative, PATCH_VALUE)] = text
+            elif operation == OPERATION_UNCHANGED:
+                changed.pop((relative, PATCH_VALUE), None)
+                if text:
+                    refusals.append(_Refusal(f"{_field_name(top, view)}: {_TYPED_BUT_UNCHANGED_REASON}"))
+            else:
+                refusals.append(_Refusal(f"{_field_name(top, view)}: {_OPERATION_REASON}"))
+            if not changed:
+                del changes[top]
         settings: dict[tuple[Any, ...], Any] = {}
         for top, changed in changes.items():
             found: list[str] = []
@@ -3488,13 +3694,13 @@ class ConfigUI:
         fields = _form_fields(request)
         view = self.view()
         page = self._posted_page(fields, view)
-        stale = _stale_layout(fields, view)
+        stale = _stale_layout(fields, view) or self._stale_identities(fields, session, page)
         if stale is not None:
             return self._write_response(stale, page, session)
         module: str | None = None
         if page.startswith(MODULE_PAGE_PREFIX):
             module = page[len(MODULE_PAGE_PREFIX) :]
-        edits, problems = self.parse_edits(view, fields)
+        edits, problems = self.parse_edits(view, fields, session)
         result = self.check(edits, problems=problems, view=view)
         shown = result.diagnostics if module is None else result.for_module(module)
         others = len(result.diagnostics) - len(shown)
@@ -3692,10 +3898,10 @@ class ConfigUI:
         fields = _form_fields(request)
         view = self.view()
         page = self._posted_page(fields, view)
-        stale = _stale_layout(fields, view)
+        stale = _stale_layout(fields, view) or self._stale_identities(fields, session, page)
         if stale is not None:
             return self._write_response(stale, page, session)
-        edits, problems = self.parse_edits(view, fields)
+        edits, problems = self.parse_edits(view, fields, session)
         result = self.save(
             edits, fingerprint=_posted(fields, FINGERPRINT_FIELD), page=page, problems=problems, view=view
         )
@@ -3845,6 +4051,9 @@ def _set_path(document: dict[Any, Any], path: Sequence[Any], value: Any) -> None
 
     if not path:
         raise ValueError("an edit needs a setting path")
+    if value is _CLEARED:
+        _clear_path(document, path, prune=False)
+        return
     node: Any = document
     for index, segment in enumerate(path[:-1]):
         following = path[index + 1]
@@ -3863,6 +4072,55 @@ def _set_path(document: dict[Any, Any], path: Sequence[Any], value: Any) -> None
         node[last] = _detached(value)
     else:
         raise ValueError(f"{_path_text(path)}: no such item")
+
+
+def _clear_path(document: dict[Any, Any], path: Sequence[Any], *, prune: bool) -> None:
+    """Delete *path* from *document* when it is there; with *prune*, drop
+    the mappings it leaves empty, as a removed override does (P19F10)."""
+
+    chain: list[tuple[Any, Any]] = []
+    node: Any = document
+    for segment in path[:-1]:
+        child = _child(node, segment)
+        if not isinstance(child, (dict, list)):
+            return
+        chain.append((node, segment))
+        node = child
+    if not isinstance(node, dict) or path[-1] not in node:
+        return
+    del node[path[-1]]
+    if prune:
+        for parent, segment in reversed(chain):
+            if parent[segment] != {}:
+                break
+            del parent[segment]
+
+
+def _operated(
+    name: str, control: _Control, text: str, operation: str, clearable: bool, problems: list[str]
+) -> Any:
+    """The value a control posted with an explicit operation sets, or
+    ``_MISSING`` for none (P19F10, gate-7 N7).
+
+    The operation decides, never the text: ``unchanged`` sends nothing (text
+    typed with it is refused, not guessed at), ``set`` sets the text as the
+    whole new value — the empty string included — and ``clear``, where the
+    page offers it, clears the setting from the overlay.
+    """
+
+    if operation == OPERATION_UNCHANGED:
+        if text != control.rendered:
+            problems.append(_Refusal(f"{name}: {_TYPED_BUT_UNCHANGED_REASON}"))
+        return _MISSING
+    if operation == OPERATION_SET:
+        return _coerce(control.kind, control.schema, text)
+    if operation == OPERATION_CLEAR and clearable:
+        if text != control.rendered:
+            problems.append(_Refusal(f"{name}: {_CLEARED_AND_TYPED_REASON}"))
+            return _MISSING
+        return _CLEARED
+    problems.append(_Refusal(f"{name}: {_OPERATION_REASON}"))
+    return _MISSING
 
 
 def _draft_edit(
@@ -3913,7 +4171,11 @@ def _apply_edits(overlay: Mapping[str, Any], edits: Iterable[Edit]) -> dict[str,
 
     draft: dict[str, Any] = _detached(overlay)
     for path, value in edits:
-        _set_path(draft, path, value)
+        if value is _CLEARED:
+            # Cleared from the overlay: emptied mappings go too (P19F10).
+            _clear_path(draft, path, prune=True)
+        else:
+            _set_path(draft, path, value)
     return draft
 
 
@@ -4114,6 +4376,17 @@ _EXISTING_KEY_REASON = "a new entry names a key the setting already has; edit th
 _NEW_KEY_REASON = "a new entry needs a key"
 _ORDER_REASON = "an entry position must be a whole number"
 _REMOVE_FLAG_REASON = "a removal flag must be 'true'"
+#: Why a patch identity of another rendering is refused (P19F10, gate-7 N3/N6).
+_STALE_IDENTITY_REASON = (
+    "a posted entry was drawn by an earlier rendering of this page or in another session, "
+    "not by the page this session shows now; reload the page"
+)
+#: Why an explicit operation is refused (P19F10, gate-7 N7).
+_OPERATION_REASON = "an operation must be 'unchanged', 'set' or 'clear' where the page offers it"
+_TYPED_BUT_UNCHANGED_REASON = (
+    "a value was typed but its operation is 'unchanged'; choose 'set' to apply it, or empty it"
+)
+_CLEARED_AND_TYPED_REASON = "a value was typed but its operation is 'clear'; clear it or set it, not both"
 _OUTSIDE_SCOPE = "is outside the settings this UI writes"
 
 
@@ -4294,7 +4567,7 @@ def _draft_value(view: ConfigView, path: tuple[Any, ...], value: Any) -> Any:
     """
 
     current = view.value(path)
-    if current is _MISSING:
+    if current is _MISSING or value is _CLEARED:
         return value
     for relative, kind in _protected_descendants(view, path):
         if kind != "credential":
@@ -4314,6 +4587,12 @@ def _protect_save(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[
     refusals = _direct_protection(view, path)
     if refusals:
         return value, refusals
+    if value is _CLEARED:
+        # Clearing keeps no protected descendant (P19F10).
+        return value, [
+            f"{_path_text((*path, *relative))}: {_PROTECTED_REASON}"
+            for relative, _kind in _protected_descendants(view, path)
+        ]
     current = view.value(path)
     value = _draft_value(view, path, value)
     for relative, kind in _protected_descendants(view, path):
@@ -4347,6 +4626,9 @@ def _validate_edit(view: ConfigView, path: tuple[Any, ...], value: Any) -> list[
 
     label = _path_text(path)
     head = path[0]
+    if value is _CLEARED:
+        # The effective value is the base's again, as after Remove.
+        return []
     if head == "enabled_modules":
         if not isinstance(value, list):
             return [f"{label}: must be a list of module names"]

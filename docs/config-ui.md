@@ -245,13 +245,19 @@ A setting whose value holds such a field, or a secret inside a longer text, is
 never offered as one editable text. A list or mapping is edited entry by entry:
 each entry keeps its own position, can be removed, moved or (when fully shown)
 edited, and a row adds a new entry; a withheld entry is shown masked with an
-empty box: left empty it is kept exactly, and anything typed replaces it whole.
-A single text setting holding a secret works the same way. Only what changed is
-applied to the real configuration the UI loaded, so Check and Save validate
-the same values. A submission the UI cannot apply exactly (an entry it does
-not know, a stale page, an entry posted twice, an entry both removed and
-edited, a new key that already exists) is refused by name and nothing is
-written. The UI never edits
+empty box and an operation choice: "keep the current value" (the default: it
+is kept exactly, and text typed with it is refused) or "set to the text typed"
+(the text replaces it whole, and an empty box sets the empty string). A single
+text setting holding a secret works the same way, and so does an unset text
+setting; one the overlay holds can also be cleared, which removes it from the
+overlay so the base value applies again. Only what changed is applied to the
+real configuration the UI loaded, so Check and Save validate the same values.
+Every entry's identity is drawn for one rendering of the page, in one browser
+session: a form from an earlier rendering, or from another session, is refused
+as a stale page ("reload the page") on Check and Save alike. A submission the
+UI cannot apply exactly (an entry it does not know, a stale page, an entry
+posted twice, an entry both removed and edited, a new key that already
+exists) is refused by name and nothing is written. The UI never edits
 environment variables: set them in the shell that starts the UI. The access token
 appears only in the single startup line on standard output.
 

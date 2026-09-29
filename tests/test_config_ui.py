@@ -2309,8 +2309,8 @@ def test_a_new_trigger_parameter_entry_is_lifted_to_its_channel_policy(
     parameters = (*channel, "rules", 0, "parameters")
     controls = ui._controls
 
-    def with_entries(view: ConfigView) -> _SchemaRenderer:
-        renderer = controls(view)
+    def with_entries(view: ConfigView, render: str = "") -> _SchemaRenderer:
+        renderer = controls(view, render)
         renderer.entry_mappings[config_ui._field_name(parameters, view)] = parameters
         return renderer
 
@@ -2447,6 +2447,17 @@ def _form_fingerprint(ui: ConfigUI, cookie: str, page: str) -> str:
     return found.pop()
 
 
+def _guard_values(ui: ConfigUI) -> tuple[str, str]:
+    """The overlay fingerprint and key layout every form rendered now carries."""
+
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        view = ui.view()
+        return config_ui._view_fingerprint(view), config_ui._view_layout(view)
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+
+
 def _form_layout(ui: ConfigUI, cookie: str, page: str) -> str:
     """The key-layout digest the forms of *page* carry (all of them agree)."""
 
@@ -2466,14 +2477,19 @@ def _write(
     fingerprint: str | None = None,
     layout: str | None = None,
 ) -> UIResponse:
-    """POST a Save or Remove form as *page* renders it (its guard fields included)."""
+    """POST a Save or Remove form as *page* renders it (its guard fields included).
+
+    The guard fields are the values the page's forms carry, computed without
+    rendering it again: as a browser does, the post comes from the render
+    already loaded, whose patch identities a new render would retire (P19F10).
+    """
 
     from urllib.parse import urlencode
 
-    if fingerprint is None:
-        fingerprint = _form_fingerprint(ui, cookie, page)
-    if layout is None:
-        layout = _form_layout(ui, cookie, page)
+    if fingerprint is None or layout is None:
+        current_fingerprint, current_layout = _guard_values(ui)
+        fingerprint = current_fingerprint if fingerprint is None else fingerprint
+        layout = current_layout if layout is None else layout
     body = urlencode(
         [
             ("csrf_token", _csrf_of(ui, cookie)),
@@ -6009,6 +6025,8 @@ class _PatchEditors(HTMLParser):
         self.fields: dict[str, dict[str, Any]] = {}
         self._stack: list[tuple[str, dict[str, Any] | None]] = []
         self._capture: tuple[str, dict[str, Any], str] | None = None
+        #: The open ``<select>`` patch control: it posts its selected option.
+        self._select: tuple[dict[str, Any], str, bool] | None = None
 
     @staticmethod
     def _new() -> dict[str, Any]:
@@ -6039,10 +6057,19 @@ class _PatchEditors(HTMLParser):
             if tag == "textarea":
                 current["values"][operation] = ""
                 self._capture = ("textarea", current, operation)
+            elif tag == "select":
+                current["values"][operation] = ""
+                self._select = (current, operation, False)
             elif attributes.get("type") != "checkbox":
                 current["values"][operation] = attributes.get("value", "")
             if attributes.get("data-patch") == "replace":
                 current["replace"] = True
+        if tag == "option" and self._select is not None:
+            owner, operation, chosen = self._select
+            if not chosen or "selected" in attributes:
+                # The first option, until one is selected.
+                owner["values"][operation] = attributes.get("value", "")
+                self._select = (owner, operation, "selected" in attributes)
         if current is not None and tag == "span" and "patch-key" in classes:
             current["key"] = ""
             self._capture = ("span", current, "key")
@@ -6053,6 +6080,8 @@ class _PatchEditors(HTMLParser):
             self._stack.append((tag, node))
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "select":
+            self._select = None
         if self._capture is not None and self._capture[0] == tag:
             self._capture = None
         while self._stack:
@@ -6102,6 +6131,16 @@ def _submitted(node: dict[str, Any], changes: Mapping[str, str]) -> list[tuple[s
     fields = [(name, changes.get(name, text)) for name, text in _browser(node)]
     posted = {name for name, _text in fields}
     return fields + [(name, text) for name, text in changes.items() if name not in posted]
+
+
+def _replaced(entry: dict[str, Any], text: str) -> dict[str, str]:
+    """What a browser posts to replace a withheld entry with *text*: the
+    text typed and its operation set to ``set`` (P19F10)."""
+
+    return {
+        entry["controls"][config_ui.PATCH_VALUE]: text,
+        entry["controls"][config_ui.PATCH_OPERATION]: config_ui.OPERATION_SET,
+    }
 
 
 def _exact_values(node: dict[str, Any]) -> Iterator[Any]:
@@ -6677,7 +6716,10 @@ def test_p19f7_every_published_secret_length_is_still_never_rendered(
                 document = json.loads(_html.unescape(body))
                 assert all(secret not in str(scalar) for scalar in _scalars(document)), name
         found = re.findall(rf'name="{re.escape(config_ui.PATCH_FIELD_PREFIX)}[a-z]+-([^"]*)"', page)
-        assert found and all(re.fullmatch(r"[0-9a-f]{32}", token) for token in found), name
+        # P19F10: the render's random tag, then the keyed digest.
+        assert found and all(
+            re.fullmatch(rf"[0-9a-f]{{{config_ui.RENDER_TAG_LENGTH + 32}}}", token) for token in found
+        ), name
         names.update(found)
     other = _f2_value_ui(tmp_path, secret)
     other_cookie = _logged_in(other)
@@ -7062,7 +7104,9 @@ def test_p19f9_a_stale_identity_is_refused_never_retargeted(tmp_path: Path) -> N
     ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
     cookie = _logged_in(ui)
     editor = _allowed_editor(ui, cookie)
-    layout = _form_layout(ui, cookie, f"{MODULE_PAGE_PREFIX}audio_output")
+    # The layout the loaded page carries: rendering the page again would
+    # retire its identities as stale before their value is looked at (P19F10).
+    layout = _guard_values(ui)[1]
     base = tmp_path / "config.yaml"
     base.write_text(base.read_text(encoding="utf-8").replace('"kept"', '"changed"'), encoding="utf-8")
     fields = _submitted(editor, {editor["entries"][0]["controls"][config_ui.PATCH_VALUE]: '"edited"'})
@@ -7121,7 +7165,7 @@ def test_p19f9_a_legitimate_edit_with_punctuation_or_marker_text_applies(tmp_pat
     editor = _allowed_editor(ui, cookie)
     changes = {
         editor["entries"][0]["controls"][config_ui.PATCH_VALUE]: json.dumps(text),
-        editor["entries"][2]["controls"][config_ui.PATCH_VALUE]: json.dumps(f"{text}!"),
+        **_replaced(editor["entries"][2], json.dumps(f"{text}!")),
         **_allowed_changes(editor, append=f"{text}?"),
     }
     checked, saved = _check_then_save(ui, cookie, "audio_output", _submitted(editor, changes))
@@ -7177,10 +7221,398 @@ def test_p19f9_a_withheld_scalar_replacement_is_the_whole_new_value(tmp_path: Pa
     assert [entry["withheld"] for entry in editor["entries"][1:]] == ["prefix-[hidden]", HIDDEN_LITERAL]
     response = _write(
         ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
-        _submitted(editor, {editor["entries"][1]["controls"][config_ui.PATCH_VALUE]: '"replaced"'}),
+        _submitted(editor, _replaced(editor["entries"][1], '"replaced"')),
     )
     assert response.status == 303, _written(response)
     assert _saved_allowed(tmp_path) == ["kept", "replaced", "q7Z"]
     page = _module_html(ui, cookie, "audio_output")
     probe = _probe_select(page)
     assert _rendered_options(probe)[1:] == [("true", "true"), ("false", "false")]
+
+
+# ---------------------------------------------------------------------------
+# P19F10 (gate-7 N3/N6 residual, N7): identities are unique per render and
+# bound to the session showing it; "unchanged" is an explicit operation
+# ---------------------------------------------------------------------------
+
+
+GATE7_POLICY = {"combination": "all_of", "rules": [{"type": "keyword", "parameters": {"keywords": ["q7Z", "kept"]}}]}
+
+
+def _gate7_ui(tmp_path: Path) -> ConfigUI:
+    """Gate 7's fixture: an overlay-only Twitch channel ``first`` whose
+    keyword list holds the collected secret ``q7Z`` beside ``kept``."""
+
+    (tmp_path / "config.local.yaml").write_text(
+        yaml.safe_dump({"triggers": {"twitch": {"channels": {"first": GATE7_POLICY}}}}), encoding="utf-8"
+    )
+    return _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        "modules:\n  twitch:\n    companion_name: helper\n",
+        {"GATE_SECRET": "q7Z"},
+    )
+
+
+def _keywords_editor(ui: ConfigUI, cookie: str) -> dict[str, Any]:
+    return _patch_editor(_module_html(ui, cookie, "twitch"), ".keywords")
+
+
+def _both_routes(ui: ConfigUI, cookie: str, module: str, fields: list[tuple[str, str]]) -> tuple[UIResponse, UIResponse]:
+    page = f"{MODULE_PAGE_PREFIX}{module}"
+    return _write(ui, cookie, "/check", page, fields), _write(ui, cookie, "/save", page, fields)
+
+
+def _assert_stale_identity(check: UIResponse, save: UIResponse) -> None:
+    """The layout guard's "reload the page" outcome, identical on both routes."""
+
+    for response in (check, save):
+        assert response.status == 409, _written(response)
+        assert "Refused: stale page" in response.body.decode("utf-8")
+        assert _written(response) == [config_ui._STALE_IDENTITY_REASON]
+    assert _written(check) == _written(save)
+
+
+def _identity_tokens(page: str) -> list[str]:
+    return re.findall(rf'name="{re.escape(config_ui.PATCH_FIELD_PREFIX)}[a-z]+-([^"]*)"', page)
+
+
+def test_p19f10_gate7_an_old_identity_after_remove_and_save_is_refused_never_retargeted(tmp_path: Path) -> None:
+    """Gate 7's closing residual through the real handlers: the channel
+    ``first`` is removed and ``second`` saved with exactly the same policy;
+    the old identity of ``kept`` equalled the new one and edited ``second``.
+    Identities are now per render: the old one never equals the new one and
+    is refused as stale on Check and Save alike, before the checker, with
+    nothing committed — and even replayed against the render it came from,
+    its real path (``first``) no longer exists, so it is unknown."""
+
+    ui = _gate7_ui(tmp_path)
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    page = f"{MODULE_PAGE_PREFIX}twitch"
+    old = _keywords_editor(ui, cookie)
+    old_name = old["entries"][1]["controls"][config_ui.PATCH_VALUE]
+    assert old["entries"][1]["values"][config_ui.PATCH_VALUE] == '"kept"'
+    removed = _write(ui, cookie, "/remove", page, [("path", "triggers.twitch.channels.@0")])
+    assert removed.status == 303, _written(removed)
+    # The identities of the loaded page, replayed after the Remove: the
+    # path they name is gone, so nothing is found to apply them to.
+    check, save = _both_routes(ui, cookie, "twitch", [(old_name, '"edited"')])
+    assert not _verdict(check.body.decode("utf-8"))
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(check))
+    assert save.status == 403
+    added = _write(
+        ui, cookie, "/save", page,
+        [("add_channel_policy", "triggers.twitch.channels"), ("channel", "second"), ("combination", "all_of"),
+         ("rule_type", "keyword"), ("parameters", json.dumps({"keywords": ["q7Z", "kept"]}))],
+    )
+    assert added.status == 303, _written(added)
+    assert _overlay_doc(tmp_path / "config.local.yaml") == {"triggers": {"twitch": {"channels": {"second": GATE7_POLICY}}}}
+    # Still on the old render: the old identity names ``first``, not ``second``.
+    before = _snapshot(tmp_path)
+    check, save = _both_routes(ui, cookie, "twitch", [(old_name, '"edited"')])
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(check))
+    assert save.status == 403
+    # The gate's exact order: a fresh page, then the old identity.
+    fresh = _module_html(ui, cookie, "twitch")
+    new = _patch_editor(fresh, ".keywords")
+    new_name = new["entries"][1]["controls"][config_ui.PATCH_VALUE]
+    assert new_name != old_name
+    assert not set(_identity_tokens(fresh)) & {old_name.rsplit("-", 1)[1]}
+    check, save = _both_routes(ui, cookie, "twitch", [(old_name, '"edited"')])
+    _assert_stale_identity(check, save)
+    # Mixed with the current render's own untouched controls: still stale.
+    check, save = _both_routes(ui, cookie, "twitch", [*_browser(new), (old_name, '"edited"')])
+    _assert_stale_identity(check, save)
+    assert seen == []
+    assert _snapshot(tmp_path) == before
+    # Opaque: no configured key and no secret in any identity.
+    for token in _identity_tokens(fresh):
+        assert not any(text in token for text in ("first", "second", "q7Z", "kept", "keywords"))
+    # The current identity edits exactly its own entry.
+    response = _write(ui, cookie, "/save", page, _submitted(new, {new_name: '"edited"'}))
+    assert response.status == 303, _written(response)
+    saved = _overlay_doc(tmp_path / "config.local.yaml")["triggers"]["twitch"]["channels"]["second"]
+    assert saved["rules"][0]["parameters"]["keywords"] == ["q7Z", "edited"]
+
+
+def test_p19f10_an_identity_of_an_older_render_of_the_same_page_is_refused(tmp_path: Path) -> None:
+    """Rendering a page again retires the identities of the render before:
+    a form from the earlier render is refused as stale on both routes, with
+    nothing checked or written, even though the configuration is unchanged;
+    the page shown now edits as ever."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    older = _allowed_editor(ui, cookie)
+    current = _allowed_editor(ui, cookie)
+    older_tokens = {name for name in older["entries"][0]["controls"].values()}
+    assert not older_tokens & set(current["entries"][0]["controls"].values())
+    fields = _submitted(older, {older["entries"][0]["controls"][config_ui.PATCH_VALUE]: '"edited"'})
+    check, save = _both_routes(ui, cookie, "audio_output", fields)
+    _assert_stale_identity(check, save)
+    assert seen == []
+    assert not (tmp_path / "config.local.yaml").exists()
+    fields = _submitted(current, {current["entries"][0]["controls"][config_ui.PATCH_VALUE]: '"edited"'})
+    response = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output", fields)
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["edited", "q7Z"]
+
+
+@pytest.mark.parametrize("other_rendered", [True, False], ids=["other-shows-the-page", "other-never-did"])
+def test_p19f10_an_identity_from_another_session_is_refused(tmp_path: Path, other_rendered: bool) -> None:
+    """An identity belongs to the session whose render drew it: posted in
+    another authenticated session over the same page and configuration it
+    is refused as stale on both routes, whether or not that session shows
+    the page itself; the drawing session still edits with it."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    seen = _observed(ui)
+    first = _logged_in(ui)
+    second = _logged_in(ui)
+    editor = _allowed_editor(ui, first)
+    if other_rendered:
+        _allowed_editor(ui, second)
+    fields = _submitted(editor, _allowed_changes(editor, append="added"))
+    check, save = _both_routes(ui, second, "audio_output", fields)
+    _assert_stale_identity(check, save)
+    assert seen == []
+    assert not (tmp_path / "config.local.yaml").exists()
+    response = _write(ui, first, "/save", f"{MODULE_PAGE_PREFIX}audio_output", fields)
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["kept", "q7Z", "added"]
+
+
+N7_SETTINGS_TEXT = (
+    "modules_directory: builtin\nenabled_modules: [audio_output]\n"
+    "secrets: ['${GATE_SECRET}']\n"
+    "modules:\n  audio_output:\n"
+    "    synthesis: {endpoint: '', model: MODEL}\n"
+    "    voices: {allowed: ['q7Z'], default: '${GATE_SECRET}'}\n"
+    "    outputs: {o: {player: {argv: [cat]}}}\n"
+    "    default_output: o\n"
+)
+MODEL_FIELD = "modules.audio_output.synthesis.model"
+
+
+def _n7_ui(tmp_path: Path, model: str = "q7Z") -> ConfigUI:
+    """Gate 7's N7 fixture: an enabled audio output whose ordinary model
+    setting equals the collected secret, so its control is withheld."""
+
+    ui = _twitch_ui(tmp_path, N7_SETTINGS_TEXT.replace("MODEL", repr(model)), {"GATE_SECRET": "q7Z"})
+    assert ui.check().passed
+    return ui
+
+
+def _checked_drafts(ui: ConfigUI) -> list[Any]:
+    """Every draft the real checker is handed from now on."""
+
+    seen: list[Any] = []
+    real = ui.checker
+
+    def checker(base: Path, environ: Mapping[str, str], overlay: Path | None, draft: Mapping[str, Any]) -> tuple[bool, list[str]]:
+        seen.append(json.loads(json.dumps(draft)))
+        return real(base, environ, overlay, draft)
+
+    ui.checker = checker
+    return seen
+
+
+def _operation_options(page: str, field_name: str) -> list[str]:
+    match = re.search(
+        rf'<select name="{re.escape(config_ui.OPERATION_FIELD_PREFIX + field_name)}"[^>]*>(.*?)</select>', page, re.S
+    )
+    assert match is not None, field_name
+    return re.findall(r'<option value="([^"]*)"', match.group(1))
+
+
+def test_p19f10_gate7_n7_a_withheld_ordinary_scalar_can_be_set_to_the_empty_string(tmp_path: Path) -> None:
+    """Gate-7 N7 through the actual form and the real enabled-module checker:
+    the withheld model posted as the empty string with the ``set`` operation
+    reaches Check's draft as ``''``, Save commits it, and the stored model
+    is exactly the empty string — not "Nothing to save", not ``'""'``."""
+
+    ui = _n7_ui(tmp_path)
+    drafts = _checked_drafts(ui)
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "audio_output")
+    tag = re.search(rf'<input[^>]*name="{re.escape(MODEL_FIELD)}"[^>]*>', page)
+    assert tag is not None and 'value=""' in tag.group(0) and 'data-withheld="true"' in tag.group(0)
+    # Base-configured: kept or set, never cleared from the overlay.
+    assert _operation_options(page, MODEL_FIELD) == [config_ui.OPERATION_UNCHANGED, config_ui.OPERATION_SET]
+    assert "q7Z" not in page
+    fields = [(MODEL_FIELD, ""), (config_ui.OPERATION_FIELD_PREFIX + MODEL_FIELD, config_ui.OPERATION_SET)]
+    checked, saved = _check_then_save(ui, cookie, "audio_output", fields)
+    assert _verdict(checked), _listed(checked)
+    assert drafts == [{"modules": {"audio_output": {"synthesis": {"model": ""}}}}]
+    assert saved.status == 303, _written(saved)
+    stored = _overlay_doc(tmp_path / "config.local.yaml")
+    assert stored == drafts[0]
+    assert stored["modules"]["audio_output"]["synthesis"]["model"] == ""
+
+
+def test_p19f10_a_genuinely_unchanged_withheld_field_sends_nothing(tmp_path: Path) -> None:
+    """Left alone — empty text, ``unchanged`` selected — the withheld field
+    makes no edit: Check's draft holds none and Save has nothing to save.
+    Text typed while ``unchanged`` stays selected is refused by name on both
+    routes, never applied nor dropped silently."""
+
+    ui = _n7_ui(tmp_path)
+    drafts = _checked_drafts(ui)
+    cookie = _logged_in(ui)
+    _module_html(ui, cookie, "audio_output")
+    operation = config_ui.OPERATION_FIELD_PREFIX + MODEL_FIELD
+    checked, saved = _check_then_save(ui, cookie, "audio_output", [(MODEL_FIELD, ""), (operation, "unchanged")])
+    assert _verdict(checked) and drafts == [{}]
+    assert saved.status == 200 and "Nothing to save" in saved.body.decode("utf-8")
+    before = _snapshot(tmp_path)
+    checked, saved = _check_then_save(ui, cookie, "audio_output", [(MODEL_FIELD, "typed"), (operation, "unchanged")])
+    assert not _verdict(checked)
+    assert any(config_ui._TYPED_BUT_UNCHANGED_REASON in line for line in _listed(checked))
+    assert saved.status == 403
+    assert any(config_ui._TYPED_BUT_UNCHANGED_REASON in line for line in _written(saved))
+    for bad in ("remove", "clear", ""):
+        checked, saved = _check_then_save(ui, cookie, "audio_output", [(MODEL_FIELD, ""), (operation, bad)])
+        assert any(config_ui._OPERATION_REASON in line for line in _listed(checked)), bad
+        assert saved.status == 403, bad
+    assert drafts == [{}]
+    assert _snapshot(tmp_path) == before
+
+
+def test_p19f10_an_unset_scalar_can_be_set_to_the_empty_string(tmp_path: Path) -> None:
+    """An unset text setting renders empty, so it carries the operation too:
+    ``set`` with no text is the empty string, and ``unchanged`` is nothing."""
+
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: []\nmodules:\n  twitch: {}\n",
+        {},
+    )
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "twitch")
+    name = "modules.twitch.companion_name"
+    assert _operation_options(page, name) == [config_ui.OPERATION_UNCHANGED, config_ui.OPERATION_SET]
+    operation = config_ui.OPERATION_FIELD_PREFIX + name
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        assert ui.parse_edits(ui.view(), [(name, ""), (operation, "unchanged")]) == ([], [])
+        assert ui.parse_edits(ui.view(), [(name, ""), (operation, "set")]) == (
+            [(("modules", "twitch", "companion_name"), "")], [],
+        )
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+    response = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}twitch", [(name, ""), (operation, "set")])
+    assert response.status == 303, _written(response)
+    assert _overlay_doc(tmp_path / "config.local.yaml") == {"modules": {"twitch": {"companion_name": ""}}}
+
+
+def test_p19f10_clearing_an_optional_overlay_entry_restores_the_base(tmp_path: Path) -> None:
+    """A withheld setting the overlay holds offers ``clear``: Check validates
+    the draft without it and Save removes it (emptied mappings pruned), so
+    the base value is effective again; clear with typed text is refused."""
+
+    ui = _n7_ui(tmp_path, model="base-model")
+    (tmp_path / "config.local.yaml").write_text(
+        yaml.safe_dump({"modules": {"audio_output": {"synthesis": {"model": "q7Z"}}}}), encoding="utf-8"
+    )
+    drafts = _checked_drafts(ui)
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "audio_output")
+    assert "q7Z" not in page
+    assert _operation_options(page, MODEL_FIELD) == [
+        config_ui.OPERATION_UNCHANGED, config_ui.OPERATION_SET, config_ui.OPERATION_CLEAR,
+    ]
+    operation = config_ui.OPERATION_FIELD_PREFIX + MODEL_FIELD
+    before = _snapshot(tmp_path)
+    checked, saved = _check_then_save(ui, cookie, "audio_output", [(MODEL_FIELD, "x"), (operation, "clear")])
+    assert any(config_ui._CLEARED_AND_TYPED_REASON in line for line in _listed(checked))
+    assert saved.status == 403 and _snapshot(tmp_path) == before and drafts == []
+    checked, saved = _check_then_save(ui, cookie, "audio_output", [(MODEL_FIELD, ""), (operation, "clear")])
+    assert _verdict(checked), _listed(checked)
+    assert drafts == [{}]
+    assert saved.status == 303, _written(saved)
+    assert _overlay_doc(tmp_path / "config.local.yaml") in (None, {})
+    assert ui.view().value(("modules", "audio_output", "synthesis", "model")) == "base-model"
+
+
+def test_p19f10_a_withheld_entry_can_be_replaced_by_the_empty_string(tmp_path: Path) -> None:
+    """A withheld list entry's replacement carries its operation: ``set``
+    with empty text is the empty string, applied at that entry only; left
+    ``unchanged`` it keeps the real value."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z", "xq7Zy"])
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    editor = _allowed_editor(ui, cookie)
+    assert editor["entries"][1]["values"][config_ui.PATCH_OPERATION] == config_ui.OPERATION_UNCHANGED
+    checked, saved = _check_then_save(ui, cookie, "audio_output", _submitted(editor, _replaced(editor["entries"][1], "")))
+    assert _verdict(checked), _listed(checked)
+    assert saved.status == 303, _written(saved)
+    assert _saved_allowed(tmp_path) == ["kept", "", "xq7Zy"]
+    assert seen == [_overlay_doc(tmp_path / "config.local.yaml")]
+
+
+def test_p19f10_removal_controls_drop_exactly_their_entry(tmp_path: Path) -> None:
+    """The remove control of a list entry and of an optional mapping entry
+    each drop exactly that entry beside withheld ones; Check sees the draft
+    Save writes."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z", "other"])
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    editor = _allowed_editor(ui, cookie)
+    checked, saved = _check_then_save(ui, cookie, "audio_output", _submitted(editor, _allowed_changes(editor, remove=[2])))
+    assert _verdict(checked) and saved.status == 303, _written(saved)
+    assert _saved_allowed(tmp_path) == ["kept", "q7Z"]
+    assert seen == [_overlay_doc(tmp_path / "config.local.yaml")]
+
+    other = tmp_path / "mapping"
+    other.mkdir()
+    ui = _arguments_ui(other, {"xq7Z": "one", "optional": "two"}, {"GATE_SECRET": "q7Z"})
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    actions = _actions_editor(ui, cookie)
+    arguments = actions["entries"][0]["entries"][1]
+    optional = next(entry for entry in arguments["entries"] if entry["key"] == "optional")
+    checked, saved = _check_then_save(
+        ui, cookie, "brain", _submitted(actions, {optional["controls"][config_ui.PATCH_REMOVE]: "true"})
+    )
+    assert _verdict(checked) and saved.status == 303, _written(saved)
+    assert _saved_arguments(other) == {"xq7Z": "one"}
+    assert seen == [_overlay_doc(other / "config.local.yaml")]
+
+
+def test_p19f10_a_withheld_rule_parameter_offers_no_clear(tmp_path: Path) -> None:
+    """P19F10 review A1: a trigger rule's parameter lives in a rule list the
+    overlay replaces wholesale, so clearing it from the overlay could not
+    restore the base value. The withheld overlay probability is kept or set,
+    never offered ``clear``, and a posted ``clear`` is refused by name."""
+
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        "triggers:\n  twitch:\n    channels:\n      chan:\n"
+        "        combination: all_of\n        rules:\n"
+        "          - type: probability\n            parameters: {probability: 0.25}\n",
+        {"GATE_SECRET": "0.75"},
+    )
+    (tmp_path / "config.local.yaml").write_text(
+        yaml.safe_dump({"triggers": {"twitch": {"channels": {"chan": {
+            "combination": "all_of",
+            "rules": [{"type": "probability", "parameters": {"probability": 0.75}}],
+        }}}}}),
+        encoding="utf-8",
+    )
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "twitch")
+    name = "triggers.twitch.channels.@0.rules[0].parameters.probability"
+    tag = re.search(rf'<input[^>]*name="{re.escape(name)}"[^>]*>', page)
+    assert tag is not None and 'data-withheld="true"' in tag.group(0)
+    assert _operation_options(page, name) == [config_ui.OPERATION_UNCHANGED, config_ui.OPERATION_SET]
+    before = _snapshot(tmp_path)
+    operation = config_ui.OPERATION_FIELD_PREFIX + name
+    checked, saved = _check_then_save(ui, cookie, "twitch", [(name, ""), (operation, config_ui.OPERATION_CLEAR)])
+    assert any(config_ui._OPERATION_REASON in line for line in _listed(checked))
+    assert saved.status == 403
+    assert _snapshot(tmp_path) == before
