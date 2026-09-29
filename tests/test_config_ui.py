@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 import tokenize
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -5503,6 +5503,190 @@ def test_f3_a_configured_boolean_spelling_string_can_be_corrected(tmp_path: Path
         assert ui.parse_edits(ui.view(), [(PROBE_FIELD, keep)]) == ([], [])
         assert ui.parse_edits(ui.view(), [(PROBE_FIELD, "true")]) == ([(probe, True)], [])
         assert ui.parse_edits(ui.view(), [(PROBE_FIELD, "false")]) == ([(probe, False)], [])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+
+
+# -- Gate-2 N1: redaction never rewrites the UI's own tokens ------------------------
+
+
+@pytest.fixture
+def forget_ui() -> Iterator[Callable[[ConfigUI], ConfigUI]]:
+    """Drop each UI from the process-wide log redaction filter afterwards:
+    a one-character secret set left alive would redact later tests' logs."""
+
+    made: list[ConfigUI] = []
+
+    def forget(ui: ConfigUI) -> ConfigUI:
+        made.append(ui)
+        return ui
+
+    yield forget
+    for ui in made:
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+def _secret_audio_ui(tmp_path: Path, secret: str, settings: str = AUDIO_SETTINGS_TEXT) -> ConfigUI:
+    text = settings.replace("enabled_modules: []\n", "enabled_modules: []\nsecrets: ['${GATE_SECRET}']\n")
+    return _twitch_ui(tmp_path, text, {"GATE_SECRET": secret})
+
+
+def _rendered_options(control: str) -> list[tuple[str, str]]:
+    return [
+        (_html.unescape(value), _html.unescape(label))
+        for value, label in re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', control)
+    ]
+
+
+# Short secrets occurring inside ``true`` (r, u), inside ``false`` (a, l, s),
+# inside both (e) and inside the kept-value token (k, -).
+@pytest.mark.parametrize("secret", ["r", "u", "t", "e", "a", "l", "s", "f", "k", "-", "ue", "als"])
+def test_n1_a_short_secret_inside_true_or_false_never_rewrites_the_boolean_options(
+    tmp_path: Path, secret: str, forget_ui: Callable[[ConfigUI], ConfigUI]
+) -> None:
+    """Gate-2 N1 (``test_gate2_boolean_redaction``) as a running test: with
+    ``${GATE_SECRET}`` set to ``r`` the true option rendered as
+    ``<option value="t[hidden]ue">`` and submitting it sent the string
+    ``'t[hidden]ue'`` to Check, while Save refused it with 422. The options are
+    the UI's own tokens: each rendered option, submitted exactly as rendered,
+    now reaches Check, Save, the overlay and the runtime settings parser as a
+    real boolean, and the unset option stays "no edit" (gate-1 F3)."""
+
+    from modules.audio_output import _Settings
+
+    seen: list[Mapping[str, Any]] = []
+
+    def checker(path: Path, environ: Mapping[str, str], overlay: Path | None, draft: Mapping[str, Any]):
+        seen.append(draft)
+        return True, []
+
+    ui = forget_ui(_secret_audio_ui(tmp_path, secret))
+    ui.checker = checker  # type: ignore[assignment]
+    cookie, _ = _login(ui)
+    page = f"{MODULE_PAGE_PREFIX}audio_output"
+    probe = ("modules", "audio_output", "synthesis", "probe")
+    overlay_file = tmp_path / "config.local.yaml"
+
+    def runtime() -> bool:
+        overlay = yaml.safe_load(overlay_file.read_text(encoding="utf-8")) if overlay_file.exists() else {}
+        merged = config_ui.deep_merge(yaml.safe_load(AUDIO_SETTINGS_TEXT), overlay or {})
+        return _Settings.from_mapping(merged["modules"]["audio_output"]).probe
+
+    control = _probe_select(_module_html(ui, cookie, "audio_output"))
+    assert secret in ui.secret_values
+    assert "[hidden]" not in control
+    assert 'data-effective="true"' in control
+    options = _rendered_options(control)
+    assert options == [("", "not set (default: true)"), ("true", "true"), ("false", "false")]
+    unset, true, false = (value for value, _ in options)
+
+    # Unset: the inherit option is no edit, and the draft carries no probe.
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, unset)]) == ([], [])
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, true)]) == ([(probe, True)], [])
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, false)]) == ([(probe, False)], [])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+    assert _verdict(_post_check(ui, page, [(PROBE_FIELD, unset)], cookie=cookie)) is True
+    assert "probe" not in seen[-1].get("modules", {}).get("audio_output", {}).get("synthesis", {})
+
+    # Explicit false over ``default: true``: a real boolean end to end.
+    assert _verdict(_post_check(ui, page, [(PROBE_FIELD, false)], cookie=cookie)) is True
+    assert seen[-1]["modules"]["audio_output"]["synthesis"]["probe"] is False
+    saved = _write(ui, cookie, "/save", page, [(PROBE_FIELD, false)])
+    assert saved.status == 303, saved.body
+    assert yaml.safe_load(overlay_file.read_text(encoding="utf-8")) == {
+        "modules": {"audio_output": {"synthesis": {"probe": False}}}
+    }
+    assert runtime() is False
+
+    # Redrawn over the saved false, the true option is still the real token.
+    control = _probe_select(_module_html(ui, cookie, "audio_output"))
+    assert 'data-effective="false"' in control
+    assert _rendered_options(control) == [("true", "true"), ("false", "false")]
+    assert '<option value="false" selected>' in control
+    true = _rendered_options(control)[0][0]
+    assert _verdict(_post_check(ui, page, [(PROBE_FIELD, true)], cookie=cookie)) is True
+    assert seen[-1]["modules"]["audio_output"]["synthesis"]["probe"] is True
+    saved = _write(ui, cookie, "/save", page, [(PROBE_FIELD, true)])
+    assert saved.status == 303, saved.body
+    assert yaml.safe_load(overlay_file.read_text(encoding="utf-8")) == {
+        "modules": {"audio_output": {"synthesis": {"probe": True}}}
+    }
+    assert runtime() is True
+
+    # The false option posted untouched over a saved false is no edit.
+    control = _probe_select(_module_html(ui, cookie, "audio_output"))
+    selected = re.search(r'<option value="([^"]*)" selected>', control)
+    assert selected is not None and selected.group(1) == "true"
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, "true")]) == ([], [])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+
+
+@pytest.mark.parametrize("secret", ["q7Z", "maybe"])
+def test_n1_a_configured_secret_is_still_never_rendered_beside_the_boolean_tokens(
+    tmp_path: Path, secret: str, forget_ui: Callable[[ConfigUI], ConfigUI]
+) -> None:
+    """Gate-2 N1 must not reopen gate-1 F2: only the UI's tokens are exempt.
+    A configured non-boolean ``probe`` and a configured endpoint equal to a
+    secret are data, and both still render ``[hidden]``; the kept option
+    still posts untouched."""
+
+    settings = AUDIO_SETTINGS_TEXT.replace(
+        "synthesis: {endpoint: '', model: ''}", f"synthesis: {{endpoint: '{secret}', model: '', probe: '{secret}'}}"
+    )
+    ui = forget_ui(_secret_audio_ui(tmp_path, secret, settings))
+    cookie, _ = _login(ui)
+    html_page = _module_html(ui, cookie, "audio_output")
+    assert secret not in html_page
+    control = _probe_select(html_page)
+    keep = config_ui._KEEP_NON_BOOLEAN
+    assert 'data-effective="[hidden]"' in control
+    assert _rendered_options(control) == [(keep, "[hidden] (not a boolean)"), ("true", "true"), ("false", "false")]
+    assert 'name="modules.audio_output.synthesis.endpoint" value="[hidden]"' in html_page
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, keep)]) == ([], [])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+
+
+@pytest.mark.parametrize("secret", ["l", "_", "o"])
+def test_n1_a_short_secret_never_rewrites_declared_enum_options(
+    tmp_path: Path, secret: str, forget_ui: Callable[[ConfigUI], ConfigUI]
+) -> None:
+    """The same class as gate-2 N1 for declared enum members: with a secret
+    ``l`` the combination select registered ``a[hidden][hidden]_of`` as its
+    untouched value, so the unchanged ``all_of`` option posted as an edit.
+    The members are the schema's tokens; posted as rendered, they are no edit,
+    and the other member is a real edit."""
+
+    ui = forget_ui(_twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        "triggers:\n  twitch:\n    channels:\n      chan:\n"
+        "        combination: all_of\n        rules:\n"
+        "          - type: probability\n            parameters: {probability: 0.5}\n",
+        {"GATE_SECRET": secret},
+    ))
+    cookie, _ = _login(ui)
+    page = _module_html(ui, cookie, "twitch")
+    select = re.search(r'<select name="([^"]*\.combination)" data-combination[^>]*>(.*?)</select>', page, re.S)
+    assert select is not None
+    options = re.findall(r'<option value="([^"]*)"( selected)?>([^<]*)</option>', select.group(2))
+    assert ("all_of", " selected", "all_of") in options
+    assert ("any_of", "", "any_of") in options
+    path = ("triggers", "twitch", "channels", "chan", "combination")
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        assert ui.parse_edits(ui.view(), [(select.group(1), "all_of")]) == ([], [])
+        edits, problems = ui.parse_edits(ui.view(), [(select.group(1), "any_of")])
+        assert problems == []
+        assert [(edit_path, value["combination"]) for edit_path, value in edits] == [(path[:-1], "any_of")]
     finally:
         config_ui._RENDERING_FOR.reset(token)
 

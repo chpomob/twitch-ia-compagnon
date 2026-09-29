@@ -1602,11 +1602,21 @@ class _SchemaRenderer:
         self.entry_mappings: dict[str, tuple[Any, ...]] = {}
 
     def register(
-        self, path: Sequence[Any], kind: str, rendered: str, schema: Mapping[str, Any] | None = None
+        self,
+        path: Sequence[Any],
+        kind: str,
+        rendered: str,
+        schema: Mapping[str, Any] | None = None,
+        *,
+        structural: bool = False,
     ) -> None:
         # Keyed by the name the control renders and holding the text it posts
         # untouched: both are what the page shows, secret-set values redacted.
-        self.controls[_field_name(path, self.view)] = _Control(tuple(path), kind, _guarded(rendered), schema or {})
+        # A *structural* token (an option value the UI or the schema declares,
+        # never configured data) is posted exactly as generated, so it is
+        # held unredacted too (gate-2 N1).
+        held = rendered if structural else _guarded(rendered)
+        self.controls[_field_name(path, self.view)] = _Control(tuple(path), kind, held, schema or {})
 
     # -- values -------------------------------------------------------------
 
@@ -1811,11 +1821,13 @@ class _SchemaRenderer:
             selected = [member for member in members if value is not _MISSING and value == member]
             # An unselected <select> posts its first option.
             chosen = selected[0] if selected else (members[0] if members else "")
-            self.register(path, kind, _plain(chosen), schema)
+            # The members are the schema's declared tokens, not configured
+            # data: redacting one would post a value outside the enum (gate-2 N1).
+            self.register(path, kind, _plain(chosen), schema, structural=True)
             options = "".join(
-                f'<option value="{esc(_plain(member))}"'
+                f'<option value="{ident(_plain(member))}"'
                 f'{" selected" if value is not _MISSING and value == member else ""}>'
-                f"{esc(_plain(member))}</option>"
+                f"{ident(_plain(member))}</option>"
                 for member in schema["enum"]
             )
             return f'<select name="{name}">{options}</select>'
@@ -1853,30 +1865,40 @@ class _SchemaRenderer:
         That option posts ``_KEEP_NON_BOOLEAN``, never the value's own text:
         a configured string ``'true'`` must leave the real ``true`` choice
         selectable, so it can be corrected to the boolean.
+
+        Gate-2 N1: the option values (``""``, ``true``, ``false``,
+        ``_KEEP_NON_BOOLEAN``) and the labels built from a boolean are the
+        UI's own tokens, so they are never redacted: a short secret occurring
+        in ``true`` once made the option post ``t[hidden]ue``, a string. Only
+        a configured non-boolean value is data, and it alone goes through
+        :func:`esc`.
         """
 
         default = schema.get("default")
         if value is _MISSING:
             effective = _plain(default) if isinstance(default, bool) else ""
             inherit = f"not set (default: {effective})" if effective else "not set"
-            current: tuple[str, str] | None = ("", inherit)
+            current: tuple[str, str] | None = ("", ident(inherit))
+            shown_effective = ident(effective)
         elif isinstance(value, bool):
             effective, current = _plain(value), None
+            shown_effective = ident(effective)
         else:
             effective = _plain(value)
-            current = (_KEEP_NON_BOOLEAN, f"{effective} (not a boolean)")
+            current = (_KEEP_NON_BOOLEAN, f"{esc(effective)} (not a boolean)")
+            shown_effective = esc(effective)
         rendered = current[0] if current is not None else effective
-        self.register(path, "boolean", rendered, schema)
+        self.register(path, "boolean", rendered, schema, structural=True)
         choices = ([current] if current is not None else []) + [
             (option, option) for option in ("true", "false")
         ]
         options = "".join(
-            f'<option value="{esc(option)}"{" selected" if option == rendered else ""}>'
-            f"{esc(label)}</option>"
+            f'<option value="{ident(option)}"{" selected" if option == rendered else ""}>'
+            f"{label}</option>"
             for option, label in choices
         )
         return (
-            f'<select name="{name}" data-kind="boolean" data-effective="{esc(effective)}">'
+            f'<select name="{name}" data-kind="boolean" data-effective="{shown_effective}">'
             f"{options}</select>"
         )
 
@@ -2579,6 +2601,7 @@ class ConfigUI:
                     "enum",
                     _plain(combination if combination in combinations else (combinations or [""])[0]),
                     {"enum": combinations},
+                    structural=True,
                 )
                 options = "".join(
                     f'<option value="{ident(item)}"'
