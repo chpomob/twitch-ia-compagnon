@@ -1135,61 +1135,90 @@ def _is_secret_scalar(value: Any, secret_values: frozenset[str] | set[str]) -> b
     return reference_name(value) is None and str(value) in secret_values
 
 
-def _hidden_keys(mapping: Mapping[Any, Any], secret_values: frozenset[str] | set[str]) -> dict[Any, Any]:
-    """Every key of *mapping* as :func:`_shown` withholds it.
+class StandInCollision(RuntimeError):
+    """A withheld mapping key could not be given a stand-in distinct from
+    every other key of its mapping: the page refuses to render rather than
+    show one entry in place of another (gate-5 N5). Value-free."""
 
-    A key equal to a secret-set value is shown as :data:`HIDDEN_LITERAL`, the
-    second and later ones numbered by their order among the hidden keys, so
-    the stand-ins stay distinct and the same for the same configuration (the
-    Save restoration maps them back, :func:`_unmask_secrets`).
+
+def _hidden_keys(mapping: Mapping[Any, Any], secret_values: frozenset[str] | set[str]) -> dict[Any, Any]:
+    """Every key of *mapping* as :func:`_shown` shows it, each one distinct.
+
+    A key the redaction leaves unchanged is shown as itself and keeps that
+    text. Every other key — equal to a secret-set value, or merely holding
+    one — gets a stand-in: :data:`HIDDEN_LITERAL` for the former, its
+    redacted text for the latter, the second and later of a form numbered
+    ``(2)``, ``(3)``… Uniqueness is decided on the final, redacted form
+    against every form already taken (the unchanged keys first), so two
+    withheld keys, or a withheld key and legitimate text that looks like a
+    stand-in, are never shown alike and never merge (gate-5 N5). The
+    allocation is the same for the same configuration, which is how the
+    draft restoration maps each stand-in back (:func:`_unmask_secrets`).
+    When a secret-set value rewrites the numbering itself so that no
+    distinct form can be found, :class:`StandInCollision` is raised:
+    the render fails rather than lose an entry.
     """
 
     shown: dict[Any, Any] = {}
-    taken = {key for key in mapping if not _is_secret_scalar(key, secret_values)}
-    count = 0
+    taken: set[Any] = set()
+    withheld: list[Any] = []
     for key in mapping:
-        if not _is_secret_scalar(key, secret_values):
-            shown[key] = key
+        if _is_secret_scalar(key, secret_values) or _shown_key(key, secret_values) != key:
+            withheld.append(key)
             continue
-        while True:
-            count += 1
-            stand_in = HIDDEN_LITERAL if count == 1 else f"{HIDDEN_LITERAL} ({count})"
-            if stand_in not in taken:
+        shown[key] = key
+        taken.add(key)
+    for key in withheld:
+        base = HIDDEN_LITERAL if _is_secret_scalar(key, secret_values) else _plain(key)
+        for count in range(1, 2 * len(mapping) + 8):
+            candidate = _shown_key(base if count == 1 else f"{base} ({count})", secret_values)
+            if candidate not in taken:
                 break
-        taken.add(stand_in)
-        shown[key] = stand_in
-    return shown
+        else:
+            raise StandInCollision("a withheld mapping key has no distinct stand-in")
+        taken.add(candidate)
+        shown[key] = candidate
+    return {key: shown[key] for key in mapping}
 
 
-#: A :func:`_hidden_keys` stand-in, the first or a numbered one.
-_HIDDEN_STAND_IN = re.compile(re.escape(HIDDEN_LITERAL) + r"(?: \(\d+\))?")
+#: The texts only a masking pass writes, compared case- and space-folded
+#: (:func:`_is_mask_marker`): an edited stand-in still holds one.
+_MARKER_TEXTS = tuple(
+    " ".join(text.split()).casefold()
+    for text in (REDACTED, "literal value configured", "configured (hidden)")
+)
+
+#: Why a place of a posted value could not be put back (the named refusal).
+_UNMATCHED = "unmatched"
+_CONFLICTING = "conflicting"
 
 #: One place of *proposed* :func:`_unmask_secrets` could not put back: the
-#: relative path of a value, or of a mapping whose key it is (``True``).
-_Unresolved = tuple[tuple[Any, ...], bool]
+#: relative path of a value, or of a mapping whose key it is (``True``), and
+#: why (:data:`_UNMATCHED` or :data:`_CONFLICTING`).
+_Unresolved = tuple[tuple[Any, ...], bool, str]
 
 
 def _shown(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
     """*value* as a page shows it, as data: masked, then every scalar and key redacted.
 
     The one masking every rendering serializes (gate-4 N4): a scalar or key
-    equal to a secret-set value is withheld (:func:`_hidden_keys`), then the
+    equal to a secret-set value is withheld, then the
     text of every string, number and key has each secret-set value replaced
     by ``[hidden]`` — the stand-ins included, so a secret that is a
     substring of :data:`HIDDEN_LITERAL` rewrites the placeholder itself. The
     result is serialized afterwards, so JSON's own delimiters and escapes are
     never taken for secret text. A number whose text holds a secret is shown
     as its redacted text; a boolean or null is a token, never data text
-    (gate-2 N1). The draft restoration compares with this form (P19F5 review
-    A2), never with the bare placeholder.
+    (gate-2 N1). Every mapping key is shown distinct from its siblings
+    (:func:`_hidden_keys`), so no entry is lost (gate-5 N5). The draft
+    restoration compares with this form (P19F5 review A2), never with the
+    bare placeholder.
     """
 
     if isinstance(value, Mapping):
         keys = _hidden_keys(value, secret_values)
-        return {
-            _shown_key(keys[key], secret_values): _shown(item, secret_values)
-            for key, item in value.items()
-        }
+        # Distinct by construction: no entry is ever shown in place of another.
+        return {keys[key]: _shown(item, secret_values) for key, item in value.items()}
     if isinstance(value, list):
         return [_shown(item, secret_values) for item in value]
     if _is_secret_scalar(value, secret_values):
@@ -1229,11 +1258,20 @@ def _shown_text(value: Any, secret_values: frozenset[str] | set[str], *, as_json
 
 
 def _is_mask_marker(value: Any) -> bool:
-    """Whether *value* is text a masking pass produced (a stand-in or ``[hidden]``)."""
+    """Whether *value* is text shaped like masking output.
 
-    return isinstance(value, str) and (
-        REDACTED in value or _HIDDEN_STAND_IN.fullmatch(value) is not None
-    )
+    ``[hidden]`` or a piece of :data:`HIDDEN_LITERAL` anywhere, whatever the
+    case or spacing around it: a stand-in with anything added, removed or
+    re-spaced is still one, so it is refused as unmatched rather than
+    written as literal text (gate-5 N3). Text the page showed for a
+    configured value is matched to it before this is asked, so legitimate
+    configured text of this shape round-trips.
+    """
+
+    if not isinstance(value, str):
+        return False
+    folded = " ".join(value.split()).casefold()
+    return any(text in folded for text in _MARKER_TEXTS)
 
 
 def _has_mask_marker(value: Any) -> bool:
@@ -1286,7 +1324,7 @@ def _restore(
         return _restore_mapping(proposed, configured, secret_values, at)
     if isinstance(proposed, list):
         return _restore_list(proposed, configured, secret_values, at)
-    return proposed, [(at, False)] if _is_mask_marker(proposed) else []
+    return proposed, [(at, False, _UNMATCHED)] if _is_mask_marker(proposed) else []
 
 
 def _restore_mapping(
@@ -1298,7 +1336,7 @@ def _restore_mapping(
     known = configured if isinstance(configured, Mapping) else {}
     originals: dict[Any, list[Any]] = {}
     for key, stand_in in _hidden_keys(known, secret_values).items():
-        originals.setdefault(_shown_key(stand_in, secret_values), []).append(key)
+        originals.setdefault(stand_in, []).append(key)
     restored: dict[Any, Any] = {}
     unresolved: list[_Unresolved] = []
     for key, item in proposed.items():
@@ -1306,10 +1344,15 @@ def _restore_mapping(
         if len(matches) == 1:
             original, counterpart = matches[0], known[matches[0]]
         else:
-            # Unknown, or shown alike for different configured keys.
+            # Unknown (the stand-ins are distinct by construction).
             original, counterpart = key, _MISSING
             if matches or _is_mask_marker(key):
-                unresolved.append(((*at, key), True))
+                unresolved.append(((*at, key), True, _UNMATCHED))
+        if original in restored:
+            # Two posted keys — a stand-in and the real key it stands for —
+            # name one key: neither value is chosen (gate-5 N3).
+            unresolved.append(((*at, key), True, _CONFLICTING))
+            continue
         value, missed = _restore(item, counterpart, secret_values, (*at, original))
         restored[original] = value
         unresolved.extend(missed)
@@ -1354,7 +1397,7 @@ def _restore_list(
         else:
             # Some of several different entries shown alike were removed or
             # added: which ones cannot be told.
-            unresolved.extend(((*at, position), False) for position in positions)
+            unresolved.extend(((*at, position), False, _UNMATCHED) for position in positions)
             continue
         for position, index in zip(positions, chosen):
             restored[position] = copy.deepcopy(known[index])
@@ -1384,6 +1427,7 @@ def _restore_edited(
     if not missed:
         return alone, []
     results = []
+    conflicts: list[_Unresolved] = []
     for candidate in candidates:
         if isinstance(candidate, Mapping) != isinstance(item, Mapping) or isinstance(
             candidate, list
@@ -1392,9 +1436,14 @@ def _restore_edited(
         result, left = _restore(item, candidate, secret_values, at)
         if not left:
             results.append(result)
+        elif all(why == _CONFLICTING for _path, _is_key, why in left):
+            # Matched but for keys posted twice: that is the refusal to name.
+            conflicts.extend(left)
     if results and all(_identical(result, results[0]) for result in results):
         return results[0], []
-    return item, [(at, False)]
+    if conflicts and not results:
+        return item, conflicts
+    return item, [(at, False, _UNMATCHED)]
 
 
 def _secret_set(view: ConfigView | None = None) -> frozenset[str]:
@@ -3192,6 +3241,16 @@ class ConfigUI:
         # (gate-4 N3).
         edits, unmatched = _draft_edits(view, edits)
         problems = (*problems, *unmatched)
+        if unmatched:
+            # Refused before validation, as Save refuses it: the checker
+            # never sees a placeholder or a value chosen between aliases.
+            result = CheckResult(
+                False,
+                tuple(_redact(line, secret_values) for line in problems),
+                settings_phase_reached=False,
+            )
+            self.last_check = result
+            return result
         try:
             base = read_base(self.base_path)
             overlay = read_overlay(self.overlay_path)
@@ -3851,6 +3910,10 @@ _READ_ONLY_BLOCK = "is read-only in v1"
 _UNMATCHED_REASON = (
     "a hidden value cannot be matched to exactly one configured entry; edit it in the configuration file"
 )
+_CONFLICTING_REASON = (
+    "a hidden key and its configured key were both posted, or two posted keys name one "
+    "configured key; keep only one of them"
+)
 _OUTSIDE_SCOPE = "is outside the settings this UI writes"
 
 
@@ -4037,7 +4100,9 @@ def _draft_value(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[A
     :data:`HIDDEN_LITERAL` becomes its configured literal again. A masking
     marker that cannot be matched to exactly one configured value (edited,
     duplicated or ambiguous) is refused, naming why: a value is never
-    guessed and a placeholder never written (P19F5 review A1/A2).
+    guessed and a placeholder never written (P19F5 review A1/A2). So are
+    two posted keys that name one configured key — a stand-in beside the
+    real key it stands for: neither value is chosen (gate-5 N3).
     """
 
     current = view.value(path)
@@ -4051,10 +4116,17 @@ def _draft_value(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[A
         if configured is not _MISSING and _lookup(value, relative) in hidden:
             value = copy.deepcopy(value)
             _set_path(value, relative, configured)
-    if any(is_key or _has_mask_marker(_lookup(value, relative)) for relative, is_key in unresolved):
-        # The field path only: a relative path may hold a restored key.
-        return value, [f"{_path_text(path)}: {_UNMATCHED_REASON}"]
-    return value, []
+    reasons = {
+        why
+        for relative, is_key, why in unresolved
+        if is_key or _has_mask_marker(_lookup(value, relative))
+    }
+    # The field path only: a relative path may hold a restored key.
+    return value, [
+        f"{_path_text(path)}: {reason}"
+        for why, reason in ((_UNMATCHED, _UNMATCHED_REASON), (_CONFLICTING, _CONFLICTING_REASON))
+        if why in reasons
+    ]
 
 
 def _protect_save(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[Any, list[str]]:
