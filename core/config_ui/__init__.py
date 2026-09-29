@@ -177,7 +177,10 @@ class UISettings:
     # Every path below is in its one canonical form (``core.overlay.
     # canonical_path``): the startup refusal, the Save destination, the
     # status-path rules and the launched runtime all use these values, so no
-    # spelling of the base file can pass for the overlay (R6, R7). Each
+    # spelling of the base file can pass for the overlay (R6, R7). Whether
+    # two of them are one file is always decided by ``core.overlay.
+    # same_file``, on file identity, so no hard link or other alias can
+    # either (gate-2 F1). Each
     # raises ``OverlayError`` for a path that cannot be canonicalised;
     # :func:`startup_checks` turns that into a refusal before anything else.
 
@@ -256,7 +259,9 @@ def startup_checks(settings: UISettings) -> list[str]:
             f"no overlay path can be derived from configuration file {base}: "
             "--overlay PATH is required"
         )
-    elif overlay == base:
+    elif same_file(overlay, base):
+        # File identity, not path text: a hard link or any other alias of
+        # the base is the base (gate-2 F1).
         given = settings.config if settings.overlay is None else settings.overlay
         problems.append(
             f"overlay_path_collision: overlay path {given} resolves to the "
@@ -1072,17 +1077,21 @@ class RunningState:
 # included (gate-1 F2): the replacement only ever touches configured text.
 # Declared identifiers (module directory names, manifest field and limit
 # names, ``${NAME}`` variable names) go through :func:`ident`, which never
-# redacts. A setting path is not a declared identifier when it holds a
-# configured key (a trigger channel, a named entry): it is shown through
-# :func:`esc` and named, in controls and ``data-`` hooks, by
-# :func:`_field_name`, which replaces a path that would carry a secret-set
-# value by an opaque name the server maps back.
+# redacts. A configured key (a trigger channel, a named entry, a rule id) is
+# never an identifier: it is shown as text through :func:`esc`, and every
+# generated identifier naming it (a control ``name``, a ``data-`` hook, a
+# Remove target) stands for it by its position alone (:func:`_field_name`,
+# :func:`_key_token`), which the parser maps back (gate-2 F2).
 # ---------------------------------------------------------------------------
 
 REDACTED = "[hidden]"
-#: The prefix of the opaque name :func:`_field_name` gives a path that would
-#: otherwise carry a secret-set value.
+#: The prefix of the opaque name :func:`_field_name` gives a path whose
+#: configured key has no position in the configuration it is named from.
 OPAQUE_FIELD_PREFIX = "@field-"
+#: The prefix of :func:`_key_token`, the positional stand-in for a key.
+KEY_TOKEN_PREFIX = "@"
+#: Keys :data:`OPAQUE_FIELD_PREFIX` names rendered without a UI.
+_PROCESS_FIELD_KEY = secrets.token_bytes(32)
 
 #: The UI answering the current request; :func:`esc` redacts its secret set
 #: as it stands when the value is rendered (the handler refreshes it first).
@@ -1157,35 +1166,160 @@ def _guarded(text: str) -> str:
     return text if source is None else _redact(text, source.secret_values)
 
 
-def _field_name(path: Sequence[Any]) -> str:
-    """The form-field name and ``data-path`` of a setting *path* (R8).
+def _key_token(position: int) -> str:
+    """The positional stand-in for the configured key at *position* (gate-2 F2).
 
-    The path's text when no configured segment of it carries a secret-set
-    value; otherwise an opaque name, a keyed digest of the text under this
-    UI's per-process key, so a configured key (a trigger channel, a named
-    entry) equal to or containing a secret never reaches a page (gate-1 F2).
-    A declared segment (see :func:`_declared_names`) is public text, never a
-    disclosure. The same UI renders the same name again when it reads the
-    posted form back.
+    The index of the key among its mapping's keys, in configuration order:
+    it names the key in generated identifiers without embedding its text.
     """
 
-    text = _path_text(path)
-    source = _RENDERING_FOR.get()
-    if source is None or not any(
-        isinstance(segment, str)
-        and segment not in source.declared_names
-        and _redact(segment, source.secret_values) != segment
-        for segment in path
-    ):
-        return text
-    digest = hmac.new(source.field_key, text.encode("utf-8"), hashlib.sha256).hexdigest()
-    return OPAQUE_FIELD_PREFIX + digest[:32]
+    return f"{KEY_TOKEN_PREFIX}{position}"
 
 
-def _names_path(posted: str, path: Sequence[Any]) -> bool:
-    """Whether *posted* names *path*: by its text or by its :func:`_field_name`."""
+def _schema_configured(
+    schema: Any, path: Sequence[Any], start: int, configured: set[int]
+) -> None:
+    """Add to *configured* each segment of ``path[start:]`` *schema* does not declare.
 
-    return posted in (_path_text(path), _field_name(path))
+    A segment is declared text only where it is a ``properties`` key of the
+    schema node it is looked up in (or the ``[]``/``<entry>`` notation of a
+    described node); any other key, a named entry included, is configured.
+    Below a key the schema does not describe, every key is configured.
+    """
+
+    node = schema
+    for index in range(start, len(path)):
+        segment = path[index]
+        mapping = node if isinstance(node, Mapping) else {}
+        if isinstance(segment, int) and not isinstance(segment, bool):
+            # A list position; :func:`_configured_segments` checks it
+            # against the document.
+            node = mapping.get("items")
+            continue
+        if segment == ITEMS_SEGMENT:
+            node = mapping.get("items")
+            continue
+        elif segment == ENTRY_SEGMENT:
+            node = mapping.get("additionalProperties")
+            continue
+        properties = mapping.get("properties")
+        if isinstance(segment, str) and isinstance(properties, Mapping) and segment in properties:
+            node = properties[segment]
+            continue
+        configured.add(index)
+        node = mapping.get("additionalProperties")
+
+
+def _configured_segments(view: ConfigView, path: Sequence[Any]) -> set[int]:
+    """The indexes of *path*'s segments that are configured keys (gate-2 F2).
+
+    Decided by the segment's position in the document's structure, never by
+    its text: a channel key spelled like a declared name (``combination``,
+    ``rules``, a module name) is still a configured key. An index into a
+    configured list is positional already and is never one; an integer key
+    of a mapping (a numeric channel id) is.
+    """
+
+    configured: set[int] = set()
+
+    def keys_from(start: int) -> None:
+        configured.update(range(start, len(path)))
+
+    head = path[0] if path else None
+    module = view.modules.get(path[1]) if len(path) > 1 else None
+    if head == "modules":
+        if module is None:
+            keys_from(1)
+        else:
+            _schema_configured(module.manifest.get(MANIFEST_SETTINGS_SCHEMA_KEY), path, 2, configured)
+    elif head == "triggers":
+        if module is None or (len(path) > 2 and path[2] != "channels"):
+            keys_from(1)
+        elif len(path) > 3:
+            configured.add(3)  # the channel
+            tail = tuple(path[4:])
+            if len(tail) > 2 and tail[0] == "rules" and tail[2] == "parameters":
+                rule = _lookup(view.merged, path[:6])
+                rule_type = rule.get("type") if isinstance(rule, Mapping) else None
+                types = _trigger_types(module.manifest)
+                schema = types.get(rule_type) if isinstance(rule_type, str) else None
+                _schema_configured(schema, path, 7, configured)
+            elif len(tail) > 2 and tail[0] == "rules" and tail[2] == "type":
+                keys_from(7)
+            elif tail and tail[0] == "rules":
+                keys_from(6)
+            elif tail and tail[0] == "combination":
+                keys_from(5)
+            else:
+                keys_from(4)
+    elif head == "limits":
+        fields = LIMIT_DECLARATION.get(path[1]) if len(path) > 1 else None
+        if fields is None:
+            keys_from(1)
+        elif len(path) > 2 and path[2] not in fields:
+            keys_from(2)
+        else:
+            keys_from(3)
+    elif head in _TOP_LEVEL_SEGMENTS:
+        keys_from(1)
+    else:
+        keys_from(0)
+    # The document decides what an integer is: a list position, or a key.
+    for index, segment in enumerate(path):
+        parent = _lookup(view.merged, path[:index])
+        if isinstance(parent, list):
+            configured.discard(index)
+        elif isinstance(parent, Mapping) and isinstance(segment, int):
+            configured.add(index)
+        elif segment in (ITEMS_SEGMENT, ENTRY_SEGMENT) and parent is _MISSING:
+            # The notation of a described node, not a key of the document.
+            configured.discard(index)
+    return configured
+
+
+def _field_name(path: Sequence[Any], view: ConfigView | None) -> str:
+    """The form-field name, ``data-path`` and Remove target of setting *path*.
+
+    Declared segments (see :func:`_configured_segments`) keep their text; a
+    configured key (a trigger channel, a named entry) is replaced by
+    :func:`_key_token`, its position among its mapping's keys, so no
+    configured key ever reaches a generated identifier, whatever its
+    spelling or length (gate-2 F2). The parser reads a posted form back
+    through this same function over the same configuration. A key with no
+    position in *view* (never rendered) gives the whole path an opaque
+    keyed-digest name. Without a *view* (no configuration to take positions
+    from) the path's text is returned.
+    """
+
+    if view is None:
+        return _path_text(path)
+    configured = _configured_segments(view, path)
+    if not configured:
+        return _path_text(path)
+    text = ""
+    for index, segment in enumerate(path):
+        if index in configured:
+            parent = _lookup(view.merged, path[:index])
+            keys = list(parent) if isinstance(parent, Mapping) else []
+            if segment not in keys:
+                source = _RENDERING_FOR.get()
+                key = _PROCESS_FIELD_KEY if source is None else source.field_key
+                digest = hmac.new(key, _path_text(path).encode("utf-8"), hashlib.sha256).hexdigest()
+                return OPAQUE_FIELD_PREFIX + digest[:32]
+            text += ("." if text else "") + _key_token(keys.index(segment))
+        elif isinstance(segment, int) and not isinstance(segment, bool):
+            text += f"[{segment}]"
+        elif segment == ITEMS_SEGMENT:
+            text += ITEMS_SEGMENT
+        else:
+            text += ("." if text else "") + _plain(segment)
+    return text
+
+
+def _names_path(posted: str, path: Sequence[Any], view: ConfigView | None) -> bool:
+    """Whether *posted* names *path*: by its :func:`_field_name`, nothing else."""
+
+    return posted == _field_name(path, view)
 
 
 def ident(name: str) -> str:
@@ -1251,12 +1385,45 @@ def _view_fingerprint(view: ConfigView) -> str:
     return view.overlay_digest or ""
 
 
+#: The field carrying the key layout a form's positional names were rendered
+#: from (see :func:`_view_layout`).
+LAYOUT_FIELD = "layout"
+
+
+def _key_skeleton(node: Any) -> Any:
+    """The keys of every mapping under *node*, in order, and list lengths."""
+
+    if isinstance(node, Mapping):
+        return [[f"{type(key).__name__}:{key}", _key_skeleton(value)] for key, value in node.items()]
+    if isinstance(node, list):
+        return [_key_skeleton(item) for item in node]
+    return None
+
+
+def _view_layout(view: ConfigView) -> str:
+    """A keyed digest of the merged configuration's key order.
+
+    :func:`_field_name` names a configured key by its position, so a form is
+    only meaningful against the key order it was rendered from. The overlay
+    fingerprint does not cover the base file: reordering the base's keys
+    would retarget a posted positional name at another key. A form carries
+    this digest and a write whose current layout differs is stale. It is
+    keyed by the UI's field key, so no key text can be guessed from it.
+    """
+
+    source = _RENDERING_FOR.get()
+    key = _PROCESS_FIELD_KEY if source is None else source.field_key
+    skeleton = json.dumps(_key_skeleton(view.merged), ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(key, skeleton.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def _write_guard(session: _Session, view: ConfigView) -> str:
     """The hidden fields every form that saves or removes carries."""
 
     return (
         f"{_csrf_field(session)}"
         f'<input type="hidden" name="{FINGERPRINT_FIELD}" value="{ident(_view_fingerprint(view))}">'
+        f'<input type="hidden" name="{LAYOUT_FIELD}" value="{ident(_view_layout(view))}">'
     )
 
 
@@ -1334,49 +1501,10 @@ LIMITS_NOTICE = "the reserved limits setting is handed to every module from the 
 ITEMS_SEGMENT = "[]"
 ENTRY_SEGMENT = "<entry>"
 
-#: The fixed segments of the setting paths the pages render (R4).
-_FIXED_SEGMENTS = frozenset(
-    {
-        "modules", "modules_directory", "enabled_modules", "limits", "secrets", "actions",
-        "triggers", "channels", "combination", "rules", "type", "parameters",
-        ITEMS_SEGMENT, ENTRY_SEGMENT,
-    }
+#: The top-level keys of the configuration document the pages name.
+_TOP_LEVEL_SEGMENTS = frozenset(
+    {"modules", "modules_directory", "enabled_modules", "limits", "secrets", "actions", "triggers"}
 )
-
-
-def _mapping_keys(value: Any) -> set[str]:
-    """Every string mapping key inside *value*, recursively."""
-
-    found: set[str] = set()
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if isinstance(key, str):
-                found.add(key)
-            found |= _mapping_keys(item)
-    elif isinstance(value, list):
-        for item in value:
-            found |= _mapping_keys(item)
-    return found
-
-
-def _declared_names(view: ConfigView) -> frozenset[str]:
-    """The path segments that are declared, public text: never configured.
-
-    Module names (discovered directories), every key of every manifest
-    (setting, trigger and parameter names), the declared trigger types, the
-    limit groups and fields, and the fixed segments. A configured key such
-    as a trigger channel or a named entry is none of these.
-    """
-
-    names: set[str] = set(_FIXED_SEGMENTS)
-    for name, module in view.modules.items():
-        names.add(name)
-        names |= _mapping_keys(module.manifest)
-        names |= set(_trigger_types(module.manifest))
-    for group, fields in LIMIT_DECLARATION.items():
-        names.add(group)
-        names |= set(fields)
-    return frozenset(names)
 
 
 _SCALAR_KINDS = ("string", "integer", "number", "boolean")
@@ -1478,7 +1606,7 @@ class _SchemaRenderer:
     ) -> None:
         # Keyed by the name the control renders and holding the text it posts
         # untouched: both are what the page shows, secret-set values redacted.
-        self.controls[_field_name(path)] = _Control(tuple(path), kind, _guarded(rendered), schema or {})
+        self.controls[_field_name(path, self.view)] = _Control(tuple(path), kind, _guarded(rendered), schema or {})
 
     # -- values -------------------------------------------------------------
 
@@ -1600,7 +1728,7 @@ class _SchemaRenderer:
     # -- pieces -------------------------------------------------------------
 
     def _attributes(self, path: Sequence[Any], required: bool, live: bool) -> str:
-        attributes = f'data-path="{ident(_field_name(path))}"'
+        attributes = f'data-path="{ident(_field_name(path, self.view))}"'
         if live:
             attributes += f' data-origin="{ident(self.view.origin(path))}"'
         if required:
@@ -1636,7 +1764,7 @@ class _SchemaRenderer:
             if self.view.origin(path) == ORIGIN_OVERLAY:
                 meta.append(
                     '<button type="submit" formaction="/remove" name="path" '
-                    f'value="{ident(_field_name(path))}">Remove override</button>'
+                    f'value="{ident(_field_name(path, self.view))}">Remove override</button>'
                 )
         if meta:
             parts.append(f'<p class="meta">{" · ".join(meta)}</p>')
@@ -1666,7 +1794,7 @@ class _SchemaRenderer:
         )
 
     def _control(self, schema: Mapping[str, Any], path: Sequence[Any], kind: str) -> str:
-        name = ident(_field_name(path))
+        name = ident(_field_name(path, self.view))
         value = self.view.value(path)
         if reference_name(value) is not None:
             # A reference is edited as its text, whatever the declared type.
@@ -1765,7 +1893,7 @@ class _SchemaRenderer:
         if live:
             self.register(path, "json", self._json_text(path), schema)
         editor = (
-            f'<textarea name="{ident(_field_name(path))}" data-json="list" rows="3">'
+            f'<textarea name="{ident(_field_name(path, self.view))}" data-json="list" rows="3">'
             f"{esc(self._json_text(path))}</textarea>"
             if live
             else ""
@@ -1787,20 +1915,20 @@ class _SchemaRenderer:
         if live:
             configured = self.view.value(path)
             entries = configured if isinstance(configured, Mapping) else {}
-            for key in entries:
+            for position, key in enumerate(entries):
                 if key in known:
                     continue
                 entry_path = (*path, key)
                 self.register(entry_path, "json", self._json_text(entry_path), schema)
                 rows.append(
-                    f'<div class="entry" data-entry="{esc(_plain(key))}">'
+                    f'<div class="entry" data-entry="{_key_token(position)}">'
                     f"<label>Entry {_key_label(key, self.view)} "
-                    f'<textarea name="{ident(_field_name(entry_path))}" data-json="entry" rows="2">'
+                    f'<textarea name="{ident(_field_name(entry_path, self.view))}" data-json="entry" rows="2">'
                     f"{esc(self._json_text(entry_path))}</textarea></label> "
                     f'<span class="origin">origin: {esc(self.origin(entry_path))}</span></div>'
                 )
-            self.entry_mappings[_field_name(path)] = tuple(path)
-            prefix = ident(_field_name(path))
+            self.entry_mappings[_field_name(path, self.view)] = tuple(path)
+            prefix = ident(_field_name(path, self.view))
             rows.append(
                 f'<div class="entry new">New entry name <input type="text" name="new_entry_name:{prefix}"> '
                 f'value (JSON) <textarea name="new_entry_value:{prefix}" rows="2"></textarea></div>'
@@ -1911,8 +2039,6 @@ class ConfigUI:
         self.environ: Mapping[str, str] = os.environ if environ is None else environ
         #: The secret set of the last configuration snapshot (R8).
         self.secret_values: frozenset[str] = frozenset()
-        #: The declared path segments of every snapshot (:func:`_field_name`).
-        self.declared_names: frozenset[str] = _FIXED_SEGMENTS
         self._secrets_lock = threading.Lock()
         self.token = secrets.token_urlsafe(32)
         #: Keys the opaque field names of :func:`_field_name` (R8).
@@ -1975,10 +2101,8 @@ class ConfigUI:
         view = ConfigView.load(self.settings, self.environ)
         # A union, so a snapshot loaded concurrently never drops a value an
         # earlier one still rendered around (R8).
-        declared = _declared_names(view)
         with self._secrets_lock:
             self.secret_values = self.secret_values | view.secret_values
-            self.declared_names = self.declared_names | declared
         return view
 
     @property
@@ -2269,7 +2393,7 @@ class ConfigUI:
                     f'<tr data-limit="{ident(group)}.{ident(field_name)}">'
                     f"<td><label>{ident(field_name)}</label></td>"
                     f'<td class="kind">{ident(kind)}</td>'
-                    f'<td><input {control} name="{ident(_field_name(path))}" '
+                    f'<td><input {control} name="{ident(_field_name(path, view))}" '
                     f'value="{esc(shown or "")}"></td>'
                     f'<td class="origin">{esc(self._origin(view, path))}</td></tr>'
                 )
@@ -2311,15 +2435,20 @@ class ConfigUI:
         rules = view.rules()
         origin = view.origin((ACTIONS_KEY,))
         rows: list[str] = []
-        for rule in rules:
+        for position, rule in enumerate(rules):
+            # The row is named by its position: a rule id is configured text,
+            # shown in its cell, never an identifier (gate-2 F2).
             if not isinstance(rule, Mapping):
-                rows.append(f'<tr data-rule="" data-origin="{esc(origin)}"><td colspan="7">invalid rule</td></tr>')
+                rows.append(
+                    f'<tr data-rule="{position}" data-origin="{esc(origin)}">'
+                    '<td colspan="7">invalid rule</td></tr>'
+                )
                 continue
             rule_id = rule.get("rule_id", "")
             action = rule.get("action_name", ANY_ACTION)
             action_text = "any" if action in (ANY_ACTION, None) else _plain(action)
             rows.append(
-                f'<tr data-rule="{esc(_plain(rule_id))}" data-origin="{esc(origin)}">'
+                f'<tr data-rule="{position}" data-origin="{esc(origin)}">'
                 f"<td><code>{esc(_plain(rule_id))}</code></td>"
                 f"<td>{esc(action_text)}</td>"
                 f"<td>{_listing(rule.get('destination'))}</td>"
@@ -2432,11 +2561,11 @@ class ConfigUI:
         configured = view.value(channels_path)
         channels = configured if isinstance(configured, Mapping) else {}
         policies: list[str] = []
-        for key, policy in channels.items():
+        for position, (key, policy) in enumerate(channels.items()):
             path = (*channels_path, key)
             label = _key_label(key, view)
             parts = [
-                f'<fieldset class="channel" data-channel="{esc(_plain(key))}">'
+                f'<fieldset class="channel" data-channel="{_key_token(position)}">'
                 f"<legend>Channel {label}</legend>",
                 f'<form method="post" action="/save">{_write_guard(session, view)}'
                 f"{_page_field(MODULE_PAGE_PREFIX + name)}",
@@ -2457,7 +2586,7 @@ class ConfigUI:
                     for item in combinations
                 )
                 parts.append(
-                    f'<p><label>Combination <select name="{ident(_field_name((*path, "combination")))}" '
+                    f'<p><label>Combination <select name="{ident(_field_name((*path, "combination"), view))}" '
                     f'data-combination="{esc(_plain(combination))}">{options}</select></label> '
                     f'<span class="origin">{esc(renderer.origin((*path, "combination")))}</span></p>'
                 )
@@ -2480,7 +2609,7 @@ class ConfigUI:
             else:
                 parts.append(
                     f'<button type="submit" formaction="/remove" name="path" '
-                    f'value="{ident(_field_name(path))}">Delete this channel policy</button>'
+                    f'value="{ident(_field_name(path, view))}">Delete this channel policy</button>'
                 )
             parts.append("</form></fieldset>")
             policies.append("".join(parts))
@@ -2493,7 +2622,7 @@ class ConfigUI:
         add = (
             '<form id="add-channel-policy" method="post" action="/save">'
             f"{_write_guard(session, view)}{_page_field(MODULE_PAGE_PREFIX + name)}<h3>Add channel policy</h3>"
-            f'<input type="hidden" name="add_channel_policy" value="{ident(_field_name(channels_path))}">'
+            f'<input type="hidden" name="add_channel_policy" value="{ident(_field_name(channels_path, view))}">'
             '<label>Channel <input type="text" name="channel"></label> '
             f'<label>Combination <select name="combination">{combination_options}</select></label> '
             f'<label>Rule type <select name="rule_type">{type_options}</select></label> '
@@ -2675,7 +2804,7 @@ class ConfigUI:
             name
             for name, module in view.modules.items()
             if _trigger_types(module.manifest)
-            and _names_path(target, ("triggers", name, "channels"))
+            and _names_path(target, ("triggers", name, "channels"), view)
         ]
         if len(inputs) != 1:
             problems.append(f"{_ADD_CHANNEL_POLICY}: is not a trigger input this UI edits")
@@ -2862,7 +2991,7 @@ class ConfigUI:
             return prepared
         base, overlay = prepared
         view = self.view() if view is None else view
-        candidates = [path for path in _overlay_key_paths(overlay) if _names_path(path_text, path)]
+        candidates = [path for path in _overlay_key_paths(overlay) if _names_path(path_text, path, view)]
         if len(candidates) != 1:
             reason = "is not overridden in the overlay" if not candidates else "is ambiguous"
             return self._refused(WriteResult(OUTCOME_REFUSED, (f"{path_text}: {reason}",)))
@@ -2965,6 +3094,9 @@ class ConfigUI:
         fields = _form_fields(request)
         view = self.view()
         page = self._posted_page(fields, view)
+        stale = _stale_layout(fields, view)
+        if stale is not None:
+            return self._write_response(stale, page, session)
         edits, problems = self.parse_edits(view, fields)
         result = self.save(
             edits, fingerprint=_posted(fields, FINGERPRINT_FIELD), page=page, problems=problems, view=view
@@ -2977,6 +3109,9 @@ class ConfigUI:
         fields = _form_fields(request)
         view = self.view()
         page = self._posted_page(fields, view)
+        stale = _stale_layout(fields, view)
+        if stale is not None:
+            return self._write_response(stale, page, session)
         result = self.remove(
             _posted(fields, "path"),
             fingerprint=_posted(fields, FINGERPRINT_FIELD),
@@ -3041,6 +3176,7 @@ _NOT_SETTING_FIELDS = frozenset(
         CSRF_FIELD,
         PAGE_FIELD,
         FINGERPRINT_FIELD,
+        LAYOUT_FIELD,
         "path",
         _ADD_CHANNEL_POLICY,
         "channel",
@@ -3390,6 +3526,22 @@ def _posted(fields: Sequence[tuple[str, str]], name: str) -> str:
         if key == name:
             value = item
     return value
+
+
+def _stale_layout(fields: Sequence[tuple[str, str]], view: ConfigView) -> WriteResult | None:
+    """A stale result when the posted form's key layout is not *view*'s.
+
+    Positional field names read back against another key order would name
+    other keys; the form is refused before any of its names is parsed.
+    """
+
+    posted = _posted(fields, LAYOUT_FIELD)
+    if posted and _equal(posted, _view_layout(view)):
+        return None
+    return WriteResult(
+        OUTCOME_STALE,
+        ("the configuration changed on disk since this page was rendered; reload it",),
+    )
 
 
 def _file_fingerprint(path: Path) -> str | None:

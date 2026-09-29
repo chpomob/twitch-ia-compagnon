@@ -1047,7 +1047,12 @@ def test_ac20_secrets_and_actions_are_read_only_with_every_rule(tmp_path: Path) 
     count = re.search(r'data-rule-count="(\d+)"', actions_block)
     assert count is not None and int(count.group(1)) == len(base["actions"]) == 9
     rows = re.findall(r'<tr data-rule="([^"]*)" data-origin="([^"]+)">', actions_block)
-    assert [rule_id for rule_id, _ in rows] == [rule["rule_id"] for rule in base["actions"]]
+    # Gate-2 F2: a rule id is configured text, so the row hook is its
+    # position; the id itself is shown in the row's first cell.
+    assert [position for position, _ in rows] == [str(index) for index in range(len(base["actions"]))]
+    assert re.findall(r'data-origin="[^"]+"><td><code>([^<]*)</code>', actions_block) == [
+        rule["rule_id"] for rule in base["actions"]
+    ]
     assert {origin for _, origin in rows} == {"base"}
     # References stay unresolved; every field of a rule is shown.
     first = base["actions"][0]
@@ -1096,9 +1101,12 @@ def test_a9_hand_written_overlay_actions_and_secrets_show_origin_overlay(tmp_pat
     cookie, _ = _login(ui)
     page = _get(ui, "/core", cookie).body.decode("utf-8")
     actions_block = _section(page, "actions")
+    # Gate-2 F2: the row hook is the rule's position, never its id.
     assert re.findall(r'<tr data-rule="([^"]*)" data-origin="([^"]+)">', actions_block) == [
-        ("hand-written", "overlay")
+        ("0", "overlay")
     ]
+    assert "<td><code>hand-written</code></td>" in actions_block
+    assert 'data-rule="hand-written"' not in actions_block
     assert "(origin: overlay)" in actions_block
     secrets_block = _section(page, "secrets")
     assert "origin: overlay" in secrets_block
@@ -1603,6 +1611,9 @@ def test_r4_a_schema_additional_properties_is_a_named_entries_editor(tmp_path: P
             }
         },
     }
+    # The page renders a module's own settings_schema: the view's manifest
+    # carries the schema under test, as it would in production.
+    view.modules["ymod"].manifest["settings_schema"] = schema
     markup = _SchemaRenderer(view).children(schema, ("modules", "ymod"))
     assert _shown_paths(markup, "modules.ymod.") == [
         "routes",
@@ -1610,8 +1621,12 @@ def test_r4_a_schema_additional_properties_is_a_named_entries_editor(tmp_path: P
         "routes.<entry>.weight",
     ]
     assert set(_shown_paths(markup, "modules.ymod.")) == set(_schema_paths(schema))
-    assert '<div class="entry" data-entry="first">' in markup
-    assert 'name="modules.ymod.routes.first" data-json="entry"' in markup
+    # Gate-2 F2: the configured entry key is shown as text, and named in
+    # every generated identifier by its position alone.
+    assert '<div class="entry" data-entry="@0">' in markup
+    assert 'name="modules.ymod.routes.@0" data-json="entry"' in markup
+    assert "Entry <code>first</code>" in markup
+    assert all("first" not in value for value in re.findall(r'[a-z-]+="([^"]*)"', markup))
     assert "{&quot;weight&quot;: 2}</textarea>" in markup
     assert 'name="new_entry_name:modules.ymod.routes"' in markup
 
@@ -1624,11 +1639,12 @@ def test_ac19_the_twitch_page_shows_the_configured_channel_policy(tmp_path: Path
     page = _module_html(ui, _logged_in(ui), "twitch")
     triggers = _section(page, "triggers")
     channels = re.findall(r'<fieldset class="channel" data-channel="([^"]*)">', triggers)
-    assert channels == ["${TWITCH_BROADCASTER_ID}"]
+    # Gate-2 F2: the configured channel key is named by its position.
+    assert channels == ["@0"]
     assert "<legend>Channel <code>${TWITCH_BROADCASTER_ID}</code> (unset)</legend>" in triggers
     assert re.search(r'<option value="all_of" selected>all_of</option>', triggers)
     assert re.findall(r'data-rule-type="([^"]+)"', triggers) == ["keyword"]
-    path = "triggers.twitch.channels.${TWITCH_BROADCASTER_ID}.rules[0].parameters.keywords"
+    path = "triggers.twitch.channels.@0.rules[0].parameters.keywords"
     keywords = re.search(
         rf'<textarea name="{re.escape(path)}" data-json="list" rows="3">([^<]*)</textarea>', triggers
     )
@@ -1696,19 +1712,23 @@ def test_a7_an_overlay_channel_can_be_deleted_and_a_base_one_cannot(tmp_path: Pa
     fieldsets = dict(
         re.findall(r'<fieldset class="channel" data-channel="([^"]+)">(.*?)</form></fieldset>', page, re.S)
     )
-    assert list(fieldsets) == ["from-base", "from-overlay"]
-    assert BASE_ENTRY_NOTE in fieldsets["from-base"]
-    assert "Delete this channel policy" not in fieldsets["from-base"]
-    assert BASE_ENTRY_NOTE not in fieldsets["from-overlay"]
+    # Gate-2 F2: each channel is named by its position (the base's first),
+    # its key shown only as the legend's text.
+    assert list(fieldsets) == ["@0", "@1"]
+    assert "<legend>Channel <code>from-base</code></legend>" in fieldsets["@0"]
+    assert "<legend>Channel <code>from-overlay</code></legend>" in fieldsets["@1"]
+    assert BASE_ENTRY_NOTE in fieldsets["@0"]
+    assert "Delete this channel policy" not in fieldsets["@0"]
+    assert BASE_ENTRY_NOTE not in fieldsets["@1"]
     assert (
-        'formaction="/remove" name="path" value="triggers.tmod.channels.from-overlay">'
-        "Delete this channel policy" in fieldsets["from-overlay"]
+        'formaction="/remove" name="path" value="triggers.tmod.channels.@1">'
+        "Delete this channel policy" in fieldsets["@1"]
     )
-    assert 'selected>any_of</option>' in fieldsets["from-base"]
-    odds = _node(page, "triggers.tmod.channels.from-base.rules[0].parameters.odds")
+    assert 'selected>any_of</option>' in fieldsets["@0"]
+    odds = _node(page, "triggers.tmod.channels.@0.rules[0].parameters.odds")
     assert 'min="0" max="1" step="any" value="0.5"' in odds
     # An undeclared rule type is a notice, never dropped.
-    unknown = _node(page, "triggers.tmod.channels.from-overlay.rules[1]")
+    unknown = _node(page, "triggers.tmod.channels.@1.rules[1]")
     assert 'data-notice="true"' in unknown and "{&quot;type&quot;: &quot;unknown&quot;}" in unknown
 
 
@@ -2281,16 +2301,17 @@ def test_a_new_trigger_parameter_entry_is_lifted_to_its_channel_policy(
 
     def with_entries(view: ConfigView) -> _SchemaRenderer:
         renderer = controls(view)
-        renderer.entry_mappings[config_ui._path_text(parameters)] = parameters
+        renderer.entry_mappings[config_ui._field_name(parameters, view)] = parameters
         return renderer
 
     monkeypatch.setattr(ui, "_controls", with_entries)
+    # Gate-2 F2: the channel is named by its position in every field name.
     edits, problems = ui.parse_edits(
         view,
         [
-            ("new_entry_name:triggers.tmod.channels.from-base.rules[0].parameters", "extra"),
-            ("new_entry_value:triggers.tmod.channels.from-base.rules[0].parameters", "7"),
-            ("triggers.tmod.channels.from-base.rules[0].parameters.odds", "0.25"),
+            ("new_entry_name:triggers.tmod.channels.@0.rules[0].parameters", "extra"),
+            ("new_entry_value:triggers.tmod.channels.@0.rules[0].parameters", "7"),
+            ("triggers.tmod.channels.@0.rules[0].parameters.odds", "0.25"),
         ],
     )
     assert problems == []
@@ -2416,6 +2437,15 @@ def _form_fingerprint(ui: ConfigUI, cookie: str, page: str) -> str:
     return found.pop()
 
 
+def _form_layout(ui: ConfigUI, cookie: str, page: str) -> str:
+    """The key-layout digest the forms of *page* carry (all of them agree)."""
+
+    html_text = _get(ui, page, cookie).body.decode("utf-8")
+    found = set(re.findall(r'name="layout" value="([^"]*)"', html_text))
+    assert len(found) == 1, found
+    return found.pop()
+
+
 def _write(
     ui: ConfigUI,
     cookie: str,
@@ -2424,15 +2454,24 @@ def _write(
     fields: Sequence[tuple[str, str]],
     *,
     fingerprint: str | None = None,
+    layout: str | None = None,
 ) -> UIResponse:
-    """POST a Save or Remove form as *page* renders it (its fingerprint included)."""
+    """POST a Save or Remove form as *page* renders it (its guard fields included)."""
 
     from urllib.parse import urlencode
 
     if fingerprint is None:
         fingerprint = _form_fingerprint(ui, cookie, page)
+    if layout is None:
+        layout = _form_layout(ui, cookie, page)
     body = urlencode(
-        [("csrf_token", _csrf_of(ui, cookie)), ("page", page), ("fingerprint", fingerprint), *fields]
+        [
+            ("csrf_token", _csrf_of(ui, cookie)),
+            ("page", page),
+            ("fingerprint", fingerprint),
+            ("layout", layout),
+            *fields,
+        ]
     ).encode("utf-8")
     return ui.handle(
         _request(
@@ -2663,17 +2702,61 @@ def test_ac25_a_base_channel_policy_offers_no_delete_and_cannot_be_removed(tmp_p
     triggers = _section(_module_html(ui, cookie, "tmod"), "triggers")
     assert BASE_ENTRY_NOTE in triggers and "Delete this channel policy" not in triggers
     # An override of the base policy is removable; the base entry stays (A7).
-    field = "triggers.tmod.channels.from-base.rules[0].parameters.odds"
+    # Gate-2 F2: the channel is named by its position, never its key.
+    field = "triggers.tmod.channels.@0.rules[0].parameters.odds"
     assert _write(ui, cookie, "/save", "/module/tmod", [(field, "0.25")]).status == 303
     overlay = tmp_path / "config.local.yaml"
     assert _overlay_doc(overlay)["triggers"]["tmod"]["channels"]["from-base"]["rules"][0]["parameters"] == {"odds": 0.25}  # type: ignore[index]
-    path = "triggers.tmod.channels.from-base"
+    path = "triggers.tmod.channels.@0"
     assert _write(ui, cookie, "/remove", "/module/tmod", [("path", path)]).status == 303
     assert _overlay_doc(overlay) == {}
     assert ui.view().value(("triggers", "tmod", "channels", "from-base"))["rules"][0]["parameters"] == {"odds": 0.5}
     before = _snapshot(tmp_path)
     response = _write(ui, cookie, "/remove", "/module/tmod", [("path", path)])
     assert response.status == 403 and _snapshot(tmp_path) == before
+
+
+def test_ac24_a_base_key_reorder_makes_a_rendered_form_stale(tmp_path: Path) -> None:
+    """Positional names are bound to the key order they were rendered from.
+
+    Gate-3 A1: the overlay fingerprint alone does not cover the base file, so
+    reordering the base's channels would retarget ``@0`` at another channel.
+    """
+
+    _write_manifest(tmp_path / "mods", "tmod", TRIGGER_MANIFEST)
+    base = tmp_path / "config.yaml"
+    rules = "        combination: any_of\n        rules: [{type: odds, parameters: {odds: 0.5}}]\n"
+
+    def write_base(first: str, second: str) -> None:
+        base.write_text(
+            "modules_directory: ./mods\nenabled_modules: [tmod]\nmodules:\n  tmod: {}\n"
+            f"triggers:\n  tmod:\n    channels:\n      {first}:\n{rules}      {second}:\n{rules}",
+            encoding="utf-8",
+        )
+
+    write_base("chan-a", "chan-b")
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie = _logged_in(ui)
+    page = "/module/tmod"
+    fingerprint = _form_fingerprint(ui, cookie, page)
+    layout = _form_layout(ui, cookie, page)
+    write_base("chan-b", "chan-a")  # the overlay is untouched
+    before = _snapshot(tmp_path)
+    field = "triggers.tmod.channels.@0.combination"
+    response = _write(ui, cookie, "/save", page, [(field, "all_of")], fingerprint=fingerprint, layout=layout)
+    assert response.status == 409
+    assert "changed on disk" in _written(response)[0]
+    remove = _write(
+        ui, cookie, "/remove", page, [("path", "triggers.tmod.channels.@0")], fingerprint=fingerprint, layout=layout
+    )
+    assert "changed on disk" in _written(remove)[0]
+    assert _snapshot(tmp_path) == before
+    # A form rendered from the current order saves to the channel it shows
+    # (the base is put back: the UI never writes it, the fixture checks).
+    assert _write(ui, cookie, "/save", page, [(field, "all_of")]).status == 303
+    channels = _overlay_doc(tmp_path / "config.local.yaml")["triggers"]["tmod"]["channels"]  # type: ignore[index]
+    assert list(channels) == ["chan-b"] and channels["chan-b"]["combination"] == "all_of"
+    write_base("chan-a", "chan-b")
 
 
 # -- AC26 ---------------------------------------------------------------------
@@ -3053,7 +3136,8 @@ def test_ac27_a_referenced_channel_key_is_saved_as_its_reference_text(tmp_path: 
     ui, base = _profile_copy(tmp_path, environ)
     overlay = tmp_path / "config.local.yaml"
     cookie = _logged_in(ui)
-    field = "triggers.twitch.channels.${TWITCH_BROADCASTER_ID}.rules[0].parameters.keywords"
+    # Gate-2 F2: the channel key is named by its position in the field name.
+    field = "triggers.twitch.channels.@0.rules[0].parameters.keywords"
     response = _write(ui, cookie, "/save", "/module/twitch", [(field, '["!ask", "!q"]')])
     assert response.status == 303, _written(response)
     text = overlay.read_text(encoding="utf-8")
@@ -5026,6 +5110,55 @@ def test_f1_save_never_replaces_the_base_whatever_the_overlay_spelling(
     assert _snapshot(home) == before
 
 
+def test_f1_a_hard_link_of_the_base_refuses_to_start_and_is_never_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Gate-2 F1: a hard link of the base shares its file but not its path
+    text; as the overlay or the status file it used to pass
+    ``startup_checks``, and ``status_path_collision`` returned ``None``."""
+
+    base = _fixture_config(tmp_path, rules=[("preserve-me", "x.do")], enabled=())
+    alias = tmp_path / "alias.yaml"
+    os.link(base, alias)
+    status = tmp_path / "status.json"
+    monkeypatch.setattr(config_ui, "serve", _fail)
+    monkeypatch.setattr(subprocess, "Popen", _fail)
+    before = _snapshot(tmp_path)
+
+    overlay_settings = UISettings.from_argv(
+        ["--config", str(base), "--overlay", str(alias), "--status-file", str(status)]
+    )
+    assert overlay_settings.overlay_path != overlay_settings.base_path
+    assert startup_checks(overlay_settings) == [
+        f"overlay_path_collision: overlay path {alias} resolves to the configuration file {base} itself"
+    ]
+    status_settings = UISettings.from_argv(["--config", str(base), "--status-file", str(alias)])
+    assert startup_checks(status_settings) == [
+        f"status_path_collision: status file {alias} collides with the base file {base}"
+    ]
+    for argv in (
+        ["--config", str(base), "--overlay", str(alias), "--status-file", str(status)],
+        ["--config", str(base), "--status-file", str(alias)],
+    ):
+        assert main(argv) != 0, argv
+        assert "path_collision" in capsys.readouterr().err
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+    # A UI built past the refusal still never writes through the link.
+    ui = ConfigUI(overlay_settings)
+    replace = []
+    monkeypatch.setattr(config_ui.os, "replace", lambda *args: replace.append(args))
+    cookie, _ = _login(ui)
+    response = _write(ui, cookie, "/save", "/", [("enabled_modules.xmod", "true")])
+    assert response.status == 403
+    assert "the overlay path is the configuration file itself" in response.body.decode("utf-8")
+    with pytest.raises(RuntimeError, match="managed overlay"):
+        config_ui._write_overlay(alias, alias, base, {"enabled_modules": []})
+    assert replace == []
+    assert _snapshot(tmp_path) == before
+    assert "preserve-me" in base.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Gate-1 F2: R8 covers every secret value, at any length, in any position
 # ---------------------------------------------------------------------------
@@ -5103,20 +5236,21 @@ def test_f2_a_credential_used_as_a_trigger_channel_key_is_never_rendered(
     page = response.body.decode("utf-8")
     assert secret in ui.secret_values
     assert secret not in page
-    names = re.findall(r'name="(@field-[0-9a-f]{32})"', page)
-    assert names, "the channel's controls carry an opaque name"
+    # Gate-2 F2: the channel's controls are named by its position.
+    names = re.findall(r'name="(triggers\.twitch\.channels\.@0[^"]*)"', page)
+    assert names, "the channel's controls carry a positional name"
     assert all(secret not in name for name in re.findall(r'(?:name|value|data-[a-z-]+)="([^"]*)"', page))
 
-    # The opaque names are read back: the channel policy is edited...
-    select = re.search(r'<select name="(@field-[0-9a-f]{32})" data-combination', page)
+    # The positional names are read back: the channel policy is edited...
+    select = re.search(r'<select name="(triggers\.twitch\.channels\.@0\.combination)" data-combination', page)
     assert select is not None
     saved = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}twitch", [(select.group(1), "any_of")])
     assert saved.status == 303, re.findall(r"<li[^>]*>[^<]*", saved.body.decode())
     overlay = yaml.safe_load((tmp_path / "config.local.yaml").read_text(encoding="utf-8"))
     assert overlay["triggers"]["twitch"]["channels"][secret]["combination"] == "any_of"
-    # ...and removed, through the same opaque name, never echoing the key.
+    # ...and removed, through the same positional name, never echoing the key.
     page = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
-    remove = re.search(r'name="path" value="(@field-[0-9a-f]{32})">Delete this channel policy', page)
+    remove = re.search(r'name="path" value="(triggers\.twitch\.channels\.@0)">Delete this channel policy', page)
     assert remove is not None
     removed = _write(ui, cookie, "/remove", f"{MODULE_PAGE_PREFIX}twitch", [("path", remove.group(1))])
     assert removed.status == 303, removed.body
@@ -5137,6 +5271,110 @@ def test_f2_declared_identifiers_are_public_text_and_stay_intact(tmp_path: Path)
     cookie, _ = _login(ui)
     page = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
     assert 'name="modules.twitch.companion_name"' in page
+
+
+def _attribute_values(page: str) -> list[str]:
+    return re.findall(r'\s[a-z-]+="([^"]*)"', page)
+
+
+def _gate2_channel_ui(tmp_path: Path, key: str, environ: dict[str, str]) -> ConfigUI:
+    return _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        f"modules:\n  twitch:\n    companion_name: {json.dumps(key)}\n"
+        f"    client_secret: {json.dumps(key)}\n"
+        f"triggers:\n  twitch:\n    channels:\n      {json.dumps(key)}:\n"
+        "        combination: all_of\n        rules:\n"
+        "          - type: probability\n            parameters: {probability: 0.5}\n",
+        environ,
+    )
+
+
+@pytest.mark.parametrize(
+    "key", ["rules", "twitch", "combination", "channels", "Ω", "q7Z", "gate-secret-channel-97bf"]
+)
+def test_f2_a_configured_channel_key_never_reaches_a_generated_identifier(
+    tmp_path: Path, key: str
+) -> None:
+    """Gate-2 F2 as a running test: a credential reused as a channel key and
+    spelled like a declared segment (``rules``, ``twitch``, ``combination``)
+    was exempted as "structural" and surfaced in
+    ``name="triggers.twitch.channels.<key>.combination"``."""
+
+    ui = _gate2_channel_ui(tmp_path, key, {"GATE_SECRET": key})
+    cookie, _ = _login(ui)
+    response = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie)
+    assert response.status == 200
+    page = response.body.decode("utf-8")
+    assert key in ui.secret_values
+    assert f'name="triggers.twitch.channels.{key}.combination"' not in page
+    assert f'value="{key}"' not in page
+    select = re.search(r'<select name="([^"]*)" data-combination', page)
+    assert select is not None and select.group(1) == "triggers.twitch.channels.@0.combination"
+    assert re.findall(r'<fieldset class="channel" data-channel="([^"]*)">', page) == ["@0"]
+    # Every generated identifier naming a channel names it by position.
+    channel_ids = [value for value in _attribute_values(page) if value.startswith("triggers.twitch.channels.")]
+    assert channel_ids and all(value.split(".")[3].startswith("@0") for value in channel_ids)
+
+    # The positional name is read back to the configured key.
+    saved = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}twitch", [(select.group(1), "any_of")])
+    assert saved.status == 303, re.findall(r"<li[^>]*>[^<]*", saved.body.decode())
+    overlay = yaml.safe_load((tmp_path / "config.local.yaml").read_text(encoding="utf-8"))
+    assert overlay["triggers"]["twitch"]["channels"][key]["combination"] == "any_of"
+
+
+def test_f2_a_non_secret_channel_key_is_shown_as_text_and_named_by_position(tmp_path: Path) -> None:
+    """Gate-2 F2: a configured key occurrence is never an identifier, secret
+    or not; the operator still sees the key, as the legend's text. Two
+    channels are named ``@0``, ``@1``, ... and each maps back to its own key,
+    a numeric channel id included (never rendered as ``[12345]``)."""
+
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\n"
+        "triggers:\n  twitch:\n    channels:\n"
+        "      first-chan: {combination: all_of, rules: [{type: probability, parameters: {probability: 0.5}}]}\n"
+        "      second-chan: {combination: all_of, rules: [{type: probability, parameters: {probability: 0.5}}]}\n"
+        "      12345: {combination: all_of, rules: [{type: probability, parameters: {probability: 0.5}}]}\n",
+        {},
+    )
+    cookie, _ = _login(ui)
+    page = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
+    assert "<legend>Channel <code>first-chan</code></legend>" in page
+    assert "<legend>Channel <code>12345</code></legend>" in page
+    assert re.findall(r'<fieldset class="channel" data-channel="([^"]*)">', page) == ["@0", "@1", "@2"]
+    for value in _attribute_values(page):
+        assert all(key not in value for key in ("first-chan", "second-chan", "12345")), value
+    assert 'name="triggers.twitch.channels.@2.combination"' in page
+    fields = [("triggers.twitch.channels.@1.combination", "any_of")]
+    saved = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}twitch", fields)
+    assert saved.status == 303, re.findall(r"<li[^>]*>[^<]*", saved.body.decode())
+    overlay = yaml.safe_load((tmp_path / "config.local.yaml").read_text(encoding="utf-8"))
+    assert overlay["triggers"]["twitch"]["channels"] == {
+        "second-chan": {
+            "combination": "any_of",
+            "rules": [{"type": "probability", "parameters": {"probability": 0.5}}],
+        }
+    }
+    # The text of a key is not a name the parser accepts.
+    view = ui.view()
+    edits, problems = ui.parse_edits(view, [("triggers.twitch.channels.first-chan.combination", "any_of")])
+    assert edits == [] and problems == [
+        "triggers.twitch.channels.first-chan.combination: is not a setting this UI edits"
+    ]
+
+
+def test_f2_a_rule_id_is_shown_and_never_an_identifier(tmp_path: Path) -> None:
+    """Gate-2 F2: a rule id (the operator's alias for a rule) used to be
+    copied into ``data-rule``; it is shown in its cell only."""
+
+    base = _fixture_config(tmp_path, rules=[("rules", "x.do"), ("alias-7f3", "y.do")])
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    cookie, _ = _login(ui)
+    actions = _section(_get(ui, "/core", cookie).body.decode("utf-8"), "actions")
+    assert re.findall(r'<tr data-rule="([^"]*)"', actions) == ["0", "1"]
+    assert "<td><code>alias-7f3</code></td>" in actions
+    assert all("alias-7f3" not in value for value in _attribute_values(actions))
 
 
 # -- Gate-1 F3: a boolean draft has three honest states ------------------------------

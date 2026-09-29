@@ -214,15 +214,82 @@ def canonical_path(path: str | os.PathLike[str]) -> Path:
         raise OverlayError(f"{label}: cannot be canonicalised") from None
 
 
-def same_file(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
-    """Whether both paths name the same file once canonicalised.
+def _existing_anchor(path: Path) -> tuple[Path, tuple[str, ...]]:
+    """The deepest existing ancestor of canonical *path* and the names below it.
 
-    Both sides go through :func:`canonical_path`, so ``~``, environment
-    references, relative spellings, ``..`` and links all compare equal to the
-    file they name.
+    *path* itself when it exists; ``(path, ())`` then. The walk stops at the
+    filesystem root, which always exists.
     """
 
-    return canonical_path(a) == canonical_path(b)
+    missing: list[str] = []
+    current = path
+    while not os.path.lexists(current) and current.parent != current:
+        missing.append(current.name)
+        current = current.parent
+    return current, tuple(reversed(missing))
+
+
+def _case_insensitive(directory: Path) -> bool:
+    """Whether names in *directory* are looked up ignoring case.
+
+    Probed on the directory's own entry: the case-swapped spelling of its name
+    is the same directory only on a case-insensitive filesystem. A name with
+    no cased letter cannot be probed and is taken as case-sensitive.
+    """
+
+    swapped = directory.name.swapcase()
+    if swapped == directory.name:
+        return False
+    try:
+        return os.path.samefile(directory, directory.parent / swapped)
+    except OSError:
+        return False
+
+
+def same_file(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
+    """Whether both paths name the same file: file identity, not path text.
+
+    Both sides go through :func:`canonical_path` first, so ``~``, environment
+    references, relative spellings, ``..`` and symbolic links name the file
+    they resolve to. When both files exist the decision is their identity
+    (device and inode, ``os.path.samefile``): a hard link, a bind-mount alias
+    or a differing case on a case-insensitive filesystem is the same file
+    whatever its path text (gate-2 F1).
+
+    Where no identity can be compared because a path does not exist yet, the
+    comparison falls back to canonicalised paths: each side is split into its
+    deepest existing ancestor and the names below it, the ancestors are
+    compared by identity and the remaining names as text (ignoring case where
+    that ancestor's filesystem does). A file not created yet is thus the same
+    file as the one another spelling will create, and never the same as an
+    existing file, which it cannot be.
+    """
+
+    first, second = canonical_path(a), canonical_path(b)
+    if first == second:
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        # At least one side does not exist yet (or cannot be examined): fall
+        # back to the canonicalised-path comparison described above.
+        pass
+    first_anchor, first_names = _existing_anchor(first)
+    second_anchor, second_names = _existing_anchor(second)
+    if not first_names or not second_names or len(first_names) != len(second_names):
+        return False
+    try:
+        if not os.path.samefile(first_anchor, second_anchor):
+            return False
+    except OSError:
+        return False
+    if first_names == second_names:
+        return True
+    if _case_insensitive(first_anchor):
+        return tuple(name.casefold() for name in first_names) == tuple(
+            name.casefold() for name in second_names
+        )
+    return False
 
 
 def status_path_collision(

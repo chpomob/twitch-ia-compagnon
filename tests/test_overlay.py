@@ -297,6 +297,44 @@ def test_a_different_name_does_not_collide(tmp_path):
     assert not same_file(tmp_path / "other.json", base)
 
 
+def test_a_hard_link_is_the_same_file_whatever_its_name(tmp_path):
+    """Gate-2 F1: two hard links to one file compared unequal as path text,
+    so a hard-linked status file or overlay passed every collision check."""
+
+    base, overlay_path = _layout(tmp_path)
+    base_link = tmp_path / "status.json"
+    os.link(base, base_link)
+    overlay_link = tmp_path / "elsewhere.json"
+    os.link(overlay_path, overlay_link)
+    assert os.path.samefile(base, base_link)
+    assert same_file(base_link, base) and same_file(base, base_link)
+    assert status_path_collision(base_link, base, overlay_path) == "base"
+    assert status_path_collision(overlay_link, base, overlay_path) == "overlay"
+    assert status_path_collision(base_link, base, None) == "base"
+    # A distinct file with identical content is not the same file.
+    copy_path = tmp_path / "copy.yaml"
+    copy_path.write_bytes(base.read_bytes())
+    assert not same_file(copy_path, base)
+    assert status_path_collision(copy_path, base, overlay_path) is None
+
+
+def test_a_missing_file_falls_back_to_the_canonical_path(tmp_path, monkeypatch):
+    """Gate-2 F1: with no identity to compare (a file not created yet), the
+    canonical paths decide: the same name in the same directory is the same
+    file, an existing file never is, and case only matters where the
+    directory's filesystem says so."""
+
+    base, _ = _layout(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / "later.json"
+    assert same_file("./later.json", missing)
+    assert not same_file(missing, base) and not same_file(base, missing)
+    assert not same_file(missing, tmp_path / "Later.json")
+    monkeypatch.setattr(overlay, "_case_insensitive", lambda directory: True)
+    assert same_file(missing, tmp_path / "Later.json")
+    assert not same_file(missing, tmp_path / "other.json")
+
+
 # --- Runtime merge and the --overlay CLI (R2; AC9, AC10) -----------------------
 
 RECORDING_SOURCE = """

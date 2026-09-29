@@ -427,6 +427,26 @@ def test_the_collision_is_refused_through_main(
     assert not overlay.exists()
 
 
+def test_a_hard_linked_status_file_is_refused_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Gate-2 F1: a status path that is a hard link of the base file is the
+    base file; the runtime's check compares file identity, not path text."""
+
+    base = _setup(tmp_path, [], names=())
+    status = tmp_path / "status.json"
+    os.link(base, status)
+    before = base.read_bytes()
+    monkeypatch.setenv(STATUS_FILE_VARIABLE, os.fspath(status))
+
+    result = application.main(["--config", os.fspath(base)])
+
+    assert result != 0
+    err = capsys.readouterr().err
+    assert "status_path_collision" in err and "collides with the base file" in err
+    assert base.read_bytes() == before and os.path.samefile(base, status)
+
+
 async def test_a_tilde_overlay_is_compared_as_the_file_that_is_read(
     tmp_path: Path, hooks: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
