@@ -5832,3 +5832,318 @@ def test_f5_close_logs_an_unkillable_child(caplog: pytest.LogCaptureFixture) -> 
     assert "6262 did not end within 1 s after kill" in caplog.text
     with pytest.raises(config_ui.SupervisorClosed):
         supervisor.start()
+
+
+# ---------------------------------------------------------------------------
+# Gate-3 F2 residual: the masking is value-driven, not path-driven
+# ---------------------------------------------------------------------------
+
+_F2_JSON_SECRETS = ['a"b', "a\\b", "a\nb", "q7Z", "Ω"]
+
+
+def _f2_value_ui(tmp_path: Path, secret: str) -> ConfigUI:
+    """The gate-3 D/positions and D/JSON fixture: a collected ``${GATE_SECRET}``
+    reused as a mapping key and a value inside the brain's delivery action
+    list, and as a value of the audio voices' allowed list."""
+
+    arguments = json.dumps(
+        {secret: "v", "plain": secret, "nested": [{"deep": secret}], f"k{secret}": 2}
+    )
+    allowed = json.dumps([secret, "kept", f"x{secret}y"])
+    return _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        "modules:\n  brain:\n    delivery:\n      actions:\n"
+        f"        - action: reply\n          arguments: {arguments}\n"
+        f"  audio_output:\n    voices:\n      allowed: {allowed}\n",
+        {"GATE_SECRET": secret},
+    )
+
+
+def _decoded_textareas(page: str) -> list[object]:
+    """Every JSON textarea of *page*, HTML-unescaped and re-parsed."""
+
+    decoded: list[object] = []
+    for body in re.findall(r"<textarea[^>]*>(.*?)</textarea>", page, re.S):
+        text = _html.unescape(body)
+        try:
+            decoded.append(json.loads(text))
+        except ValueError:
+            decoded.append(text)
+    return decoded
+
+
+def _scalars(value: object) -> Iterator[object]:
+    """Every scalar of *value*, mapping keys included, at any depth."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            yield key
+            yield from _scalars(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _scalars(item)
+    else:
+        yield value
+
+
+@pytest.mark.parametrize("secret", _F2_JSON_SECRETS)
+def test_f2_a_secret_used_as_a_list_key_or_value_is_never_rendered(
+    tmp_path: Path, secret: str
+) -> None:
+    """Gate-3 F2 "list key" and "list value" defeats as running tests: the
+    collected secret ``a"b`` as a mapping key at
+    ``modules.brain.delivery.actions[0].arguments`` decoded exactly from the
+    JSON textarea, and ``modules.audio_output.voices.allowed: ['a"b']`` was
+    recovered by ``json.loads(html.unescape(textarea))[0]``. Every scalar
+    equal to the secret — key or value, at any depth — is now withheld before
+    serialization; a non-secret value stays visible."""
+
+    ui = _f2_value_ui(tmp_path, secret)
+    assert secret in ui.view().secret_values
+    cookie = _logged_in(ui)
+    for name in ("brain", "audio_output"):
+        page = _module_html(ui, cookie, name)
+        assert secret not in page, name
+        assert secret not in _html.unescape(page), name
+        assert json.dumps(secret)[1:-1] not in _html.unescape(page), name
+        decoded = _decoded_textareas(page)
+        assert decoded, name
+        for document in decoded:
+            assert all(secret not in str(scalar) for scalar in _scalars(document)), name
+
+    brain = _decoded_textareas(_module_html(ui, cookie, "brain"))
+    actions = next(item for item in brain if isinstance(item, list) and item and "arguments" in item[0])
+    assert actions[0]["arguments"] == {
+        HIDDEN_LITERAL: "v",
+        "plain": HIDDEN_LITERAL,
+        "nested": [{"deep": HIDDEN_LITERAL}],
+        f"k{config_ui.REDACTED}": 2,
+    }
+    assert actions[0]["action"] == "reply"
+    audio = _decoded_textareas(_module_html(ui, cookie, "audio_output"))
+    allowed = next(item for item in audio if isinstance(item, list) and "kept" in item)
+    assert allowed[0] == HIDDEN_LITERAL
+    assert allowed[1] == "kept"
+    assert secret not in allowed[2]
+    # The reference and its set state stay visible.
+    core = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert "${GATE_SECRET}" in core
+    assert 'data-secret="GATE_SECRET"' in core
+
+
+def test_f2_two_secret_keys_in_one_mapping_get_distinct_stand_ins(tmp_path: Path) -> None:
+    """Gate-3 F2: withheld keys stay distinct, so neither overwrites the other."""
+
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\n"
+        "secrets: ['${ONE}', '${TWO}']\n"
+        "modules:\n  brain:\n    delivery:\n      actions:\n"
+        "        - action: reply\n          arguments: {'k1\"': 1, 'k2\"': 2, other: 3}\n",
+        {"ONE": 'k1"', "TWO": 'k2"'},
+    )
+    cookie = _logged_in(ui)
+    brain = _decoded_textareas(_module_html(ui, cookie, "brain"))
+    actions = next(item for item in brain if isinstance(item, list) and item and "arguments" in item[0])
+    assert actions[0]["arguments"] == {HIDDEN_LITERAL: 1, f"{HIDDEN_LITERAL} (2)": 2, "other": 3}
+
+
+def test_f2_an_edited_json_field_puts_withheld_values_and_keys_back(tmp_path: Path) -> None:
+    """Gate-3 F2: a JSON field edited around its withheld entries saves the
+    configured secret, never the placeholder (value and key alike, a secret
+    inside a longer text included)."""
+
+    secret = 'a"b'
+    ui = _f2_value_ui(tmp_path, secret)
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "audio_output")
+    field = re.search(r'<textarea name="([^"]*voices\.allowed)"', page)
+    assert field is not None
+    allowed = json.loads(_html.unescape(re.search(
+        rf'<textarea name="{re.escape(field.group(1))}"[^>]*>(.*?)</textarea>', page, re.S
+    ).group(1)))
+    allowed.append("added")
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
+        [(field.group(1), json.dumps(allowed))],
+    )
+    assert response.status == 303, _written(response)
+    saved = _overlay_doc(tmp_path / "config.local.yaml")
+    written = saved["modules"]["audio_output"]["voices"]["allowed"]
+    assert written[0] == secret
+    assert written[1:3] == ["kept", f"x{secret}y"]
+    assert written[-1] == "added"
+    assert HIDDEN_LITERAL not in written
+
+    brain_page = _module_html(ui, cookie, "brain")
+    field = re.search(r'<textarea name="([^"]*delivery\.actions)"', brain_page)
+    assert field is not None
+    actions = json.loads(_html.unescape(re.search(
+        rf'<textarea name="{re.escape(field.group(1))}"[^>]*>(.*?)</textarea>', brain_page, re.S
+    ).group(1)))
+    actions[0]["arguments"]["added"] = 1
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain", [(field.group(1), json.dumps(actions))]
+    )
+    assert response.status == 303, _written(response)
+    saved = _overlay_doc(tmp_path / "config.local.yaml")
+    arguments = saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"]
+    assert arguments[secret] == "v"
+    assert arguments["plain"] == secret
+    assert arguments["nested"] == [{"deep": secret}]
+    assert arguments[f"k{secret}"] == 2
+    assert arguments["added"] == 1
+    assert HIDDEN_LITERAL not in arguments
+
+
+@pytest.mark.parametrize("secret", ['a"b', "a\\b", "a\nb", "é "])
+def test_f2_a_json_spelled_secret_is_redacted_from_errors_and_diagnostics(secret: str) -> None:
+    """Gate-3 F2: ``_redaction_forms`` held the raw and HTML spellings only, so
+    a secret serialized by ``json.dumps`` (``a\\"b``) passed through error and
+    diagnostic text. Every JSON spelling is now redacted too, and the text
+    no longer yields the secret once HTML-unescaped and re-parsed."""
+
+    for ascii_only in (False, True):
+        text = f"invalid value {json.dumps([secret, 'kept'], ensure_ascii=ascii_only)}"
+        for shown in (text, _html.escape(text, quote=True)):
+            redacted = config_ui._redact(shown, {secret})
+            decoded = json.loads(_html.unescape(redacted)[len("invalid value ") :])
+            assert decoded == [config_ui.REDACTED, "kept"]
+            assert secret not in _html.unescape(redacted)
+
+
+# ---------------------------------------------------------------------------
+# P19F5 review: the Save restoration matches entries by what the page showed
+# ---------------------------------------------------------------------------
+
+
+def _allowed_ui(tmp_path: Path, secret: str, allowed: list[str]) -> ConfigUI:
+    """A collected ``${GATE_SECRET}`` and an audio voices' allowed list."""
+
+    return _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        f"modules:\n  audio_output:\n    voices:\n      allowed: {json.dumps(allowed)}\n",
+        {"GATE_SECRET": secret},
+    )
+
+
+def _json_field(page: str, suffix: str) -> tuple[str, Any]:
+    """The name of the JSON textarea ending in *suffix*, and its decoded value."""
+
+    match = re.search(rf'<textarea name="([^"]*{re.escape(suffix)})"[^>]*>(.*?)</textarea>', page, re.S)
+    assert match is not None
+    return match.group(1), json.loads(_html.unescape(match.group(2)))
+
+
+def _save_allowed(ui: ConfigUI, cookie: str, edit: Callable[[list[Any]], list[Any]]) -> UIResponse:
+    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+    return _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output", [(name, json.dumps(edit(shown)))]
+    )
+
+
+def _saved_allowed(tmp_path: Path) -> object:
+    return _overlay_doc(tmp_path / "config.local.yaml")["modules"]["audio_output"]["voices"]["allowed"]
+
+
+@pytest.mark.parametrize(
+    ("edit", "expected"),
+    [
+        (lambda shown: shown[1:], ["q7Z"]),
+        (lambda shown: list(reversed(shown)), ["q7Z", "kept"]),
+        (lambda shown: ["new", *shown], ["new", "kept", "q7Z"]),
+    ],
+    ids=["remove-first", "reorder", "insert-first"],
+)
+def test_p19f5_a_shifted_hidden_entry_keeps_its_own_value(
+    tmp_path: Path, edit: Callable[[list[Any]], list[Any]], expected: list[str]
+) -> None:
+    """Review A1: restoration matched list entries by index, so removing
+    ``kept`` from ``['kept', 'q7Z']`` compared the placeholder with ``kept``
+    and saved it over ``q7Z``. Entries are now matched by what they showed."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    cookie = _logged_in(ui)
+    response = _save_allowed(ui, cookie, edit)
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == expected
+
+
+def test_p19f5_removing_one_of_two_different_hidden_entries_is_refused(tmp_path: Path) -> None:
+    """Review A1: two different secrets show the same placeholder; which one
+    a removal meant cannot be told, so the Save is refused, nothing written."""
+
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${ONE}', '${TWO}']\n"
+        "modules:\n  audio_output:\n    voices:\n      allowed: ['kept', 's1x', 's2x']\n",
+        {"ONE": "s1x", "TWO": "s2x"},
+    )
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    response = _save_allowed(ui, cookie, lambda shown: shown[:2])
+    assert response.status == 403
+    assert any(config_ui._UNMATCHED_REASON in line for line in _written(response))
+    body = response.body.decode("utf-8")
+    assert "s1x" not in body and "s2x" not in body
+    assert _snapshot(tmp_path) == before
+    # Kept in place (their configured order is the only one shown), both
+    # entries save as they were.
+    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["kept", "s1x", "s2x", "added"]
+
+
+def test_p19f5_an_unmatched_placeholder_is_refused(tmp_path: Path) -> None:
+    """Review A1/A2: a placeholder with no configured counterpart is never saved."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept"])
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    for posted in (HIDDEN_LITERAL, f"x{config_ui.REDACTED}"):
+        response = _save_allowed(ui, cookie, lambda shown: [*shown, posted])
+        assert response.status == 403
+        assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("secret", ["value", "e", "hidden", ")"])
+def test_p19f5_a_placeholder_rewritten_by_redaction_is_restored(tmp_path: Path, secret: str) -> None:
+    """Review A2: ``esc`` redacts the placeholder too, so a secret ``value``
+    showed as ``literal [hidden] configured (hidden)``, matched neither form
+    the restoration knew, and was saved over the configured value."""
+
+    ui = _allowed_ui(tmp_path, secret, ["kept", secret, f"x{secret}y"])
+    cookie = _logged_in(ui)
+    _name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+    assert shown[1] != HIDDEN_LITERAL
+    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["kept", secret, f"x{secret}y", "added"]
+    response = _save_allowed(ui, cookie, lambda shown: shown[1:])
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == [secret, f"x{secret}y", "added"]
+
+
+def test_p19f5_a_redacted_stand_in_key_is_restored(tmp_path: Path) -> None:
+    """Review A2: a withheld mapping key shows its stand-in redacted too."""
+
+    secret = "value"
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        "modules:\n  brain:\n    delivery:\n      actions:\n"
+        f"        - action: reply\n          arguments: {{{secret}: 1, other: {secret}}}\n",
+        {"GATE_SECRET": secret},
+    )
+    cookie = _logged_in(ui)
+    name, actions = _json_field(_module_html(ui, cookie, "brain"), "delivery.actions")
+    assert HIDDEN_LITERAL not in actions[0]["arguments"]
+    actions[0]["arguments"]["added"] = 2
+    response = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain", [(name, json.dumps(actions))])
+    assert response.status == 303, _written(response)
+    saved = _overlay_doc(tmp_path / "config.local.yaml")
+    assert saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"] == {
+        secret: 1, "other": secret, "added": 2
+    }

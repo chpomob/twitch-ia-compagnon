@@ -715,6 +715,8 @@ class ConfigView:
             return f"${{{name}}}"
         if self.is_credential(path):
             return HIDDEN_LITERAL
+        if isinstance(value, (Mapping, list)):
+            return _plain(_mask_secrets(value, _secret_set(self)))
         return _plain(value)
 
     def enabled_modules(self) -> list[str]:
@@ -1068,7 +1070,10 @@ class RunningState:
 #
 # Defence in depth: the renderers never place a secret-set value in a page
 # (credentials and references are shown as ``${NAME}`` or as
-# :data:`HIDDEN_LITERAL`); this guard replaces each secret-set value by
+# :data:`HIDDEN_LITERAL`, and structured data is masked value by value, keys
+# included, before it is serialized — :func:`_mask_secrets`, gate-3 F2);
+# this guard replaces each secret-set value, in its raw, HTML and JSON
+# spellings, by
 # ``[hidden]`` anyway, in every configured value as :func:`esc` renders it
 # and in every log record. It works on values before they are serialized,
 # never on the finished body or headers, so a secret that happens to equal a
@@ -1099,15 +1104,291 @@ _RENDERING_FOR: ContextVar[ConfigUI | None] = ContextVar("_RENDERING_FOR", defau
 
 
 def _redaction_forms(secret_values: Iterable[str]) -> list[str]:
-    """Every form a value can take in a response, longest first."""
+    """Every form a value can take in a response, longest first.
+
+    The raw text, its HTML form, and the body of its JSON string literal (both
+    ``ensure_ascii`` spellings) with that body's HTML form: a secret with a
+    quote, a backslash or a control character is spelled differently once
+    serialized, and a substring of serialized configured data must still be
+    caught (gate-3 F2).
+    """
 
     forms: set[str] = set()
     for value in secret_values:
         if not value:
             continue
-        forms.add(value)
-        forms.add(html.escape(value, quote=True))
+        spellings = {value}
+        for ascii_only in (False, True):
+            spellings.add(json.dumps(value, ensure_ascii=ascii_only)[1:-1])
+        for spelling in spellings:
+            forms.add(spelling)
+            forms.add(html.escape(spelling, quote=True))
     return sorted(forms, key=len, reverse=True)
+
+
+def _is_secret_scalar(value: Any, secret_values: frozenset[str] | set[str]) -> bool:
+    """Whether *value* is a configured scalar whose text is a secret-set value."""
+
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return False
+    return reference_name(value) is None and str(value) in secret_values
+
+
+def _hidden_keys(mapping: Mapping[Any, Any], secret_values: frozenset[str] | set[str]) -> dict[Any, Any]:
+    """Every key of *mapping* as :func:`_mask_secrets` shows it.
+
+    A key equal to a secret-set value is shown as :data:`HIDDEN_LITERAL`, the
+    second and later ones numbered by their order among the hidden keys, so
+    the stand-ins stay distinct and the same for the same configuration (the
+    Save restoration maps them back, :func:`_unmask_secrets`).
+    """
+
+    shown: dict[Any, Any] = {}
+    taken = {key for key in mapping if not _is_secret_scalar(key, secret_values)}
+    count = 0
+    for key in mapping:
+        if not _is_secret_scalar(key, secret_values):
+            shown[key] = key
+            continue
+        while True:
+            count += 1
+            stand_in = HIDDEN_LITERAL if count == 1 else f"{HIDDEN_LITERAL} ({count})"
+            if stand_in not in taken:
+                break
+        taken.add(stand_in)
+        shown[key] = stand_in
+    return shown
+
+
+def _mask_secrets(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
+    """*value* with every scalar equal to a secret-set value withheld (gate-3 F2).
+
+    Value-driven, whatever the path: a nested value or a mapping key, inside
+    a list or a mapping at any depth, is replaced by :data:`HIDDEN_LITERAL`
+    before the data is serialized. A ``${NAME}`` reference is kept as itself.
+    """
+
+    if not secret_values:
+        return value
+    if isinstance(value, Mapping):
+        keys = _hidden_keys(value, secret_values)
+        return {keys[key]: _mask_secrets(item, secret_values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_mask_secrets(item, secret_values) for item in value]
+    if _is_secret_scalar(value, secret_values):
+        return HIDDEN_LITERAL
+    return value
+
+
+#: A :func:`_hidden_keys` stand-in, the first or a numbered one.
+_HIDDEN_STAND_IN = re.compile(re.escape(HIDDEN_LITERAL) + r"(?: \(\d+\))?")
+
+#: One place of *proposed* :func:`_unmask_secrets` could not put back: the
+#: relative path of a value, or of a mapping whose key it is (``True``).
+_Unresolved = tuple[tuple[Any, ...], bool]
+
+
+def _shown(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
+    """*value* as a page shows it once decoded: masked, then every text redacted.
+
+    :func:`esc` redacts the serialized text, the stand-ins included, so a
+    secret that is a substring of :data:`HIDDEN_LITERAL` rewrites the
+    placeholder itself; the Save restoration compares with this form (P19F5
+    review A2), never with the bare placeholder.
+    """
+
+    if isinstance(value, Mapping):
+        keys = _hidden_keys(value, secret_values)
+        return {
+            _shown_key(keys[key], secret_values): _shown(item, secret_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_shown(item, secret_values) for item in value]
+    if _is_secret_scalar(value, secret_values):
+        value = HIDDEN_LITERAL
+    return _redact(value, secret_values) if isinstance(value, str) else value
+
+
+def _shown_key(key: Any, secret_values: frozenset[str] | set[str]) -> Any:
+    return _redact(key, secret_values) if isinstance(key, str) else key
+
+
+def _is_mask_marker(value: Any) -> bool:
+    """Whether *value* is text a masking pass produced (a stand-in or ``[hidden]``)."""
+
+    return isinstance(value, str) and (
+        REDACTED in value or _HIDDEN_STAND_IN.fullmatch(value) is not None
+    )
+
+
+def _has_mask_marker(value: Any) -> bool:
+    """Whether *value* holds a masking marker, as a key or a value, at any depth."""
+
+    if isinstance(value, Mapping):
+        return any(_is_mask_marker(key) or _has_mask_marker(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_has_mask_marker(item) for item in value)
+    return _is_mask_marker(value)
+
+
+def _identical(left: Any, right: Any) -> bool:
+    """Equal as configured data, ``1``, ``1.0`` and ``true`` told apart."""
+
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return left.keys() == right.keys() and all(_identical(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(map(_identical, left, right))
+    return type(left) is type(right) and left == right
+
+
+def _unmask_secrets(
+    proposed: Any, configured: Any, secret_values: frozenset[str] | set[str]
+) -> tuple[Any, list[_Unresolved]]:
+    """*proposed* with every :func:`_mask_secrets` stand-in put back, and
+    every masking marker it could not put back.
+
+    A posted value identical to a configured one as the page showed it
+    (:func:`_shown`: withheld, then redacted) becomes that configured value
+    again; a posted stand-in key becomes the configured key it stood for.
+    List entries are matched by what they showed, never by index alone, so
+    removing, inserting or reordering entries keeps each withheld value with
+    its own entry (P19F5 review A1). A marker that matches no configured
+    entry, or entries that differ behind the same shown form, is returned
+    unresolved: the Save is refused rather than a placeholder written.
+    """
+
+    if not secret_values:
+        return proposed, []
+    return _restore(proposed, configured, secret_values, ())
+
+
+def _restore(
+    proposed: Any, configured: Any, secret_values: frozenset[str] | set[str], at: tuple[Any, ...]
+) -> tuple[Any, list[_Unresolved]]:
+    if configured is not _MISSING and _identical(proposed, _shown(configured, secret_values)):
+        return copy.deepcopy(configured), []
+    if isinstance(proposed, Mapping):
+        return _restore_mapping(proposed, configured, secret_values, at)
+    if isinstance(proposed, list):
+        return _restore_list(proposed, configured, secret_values, at)
+    return proposed, [(at, False)] if _is_mask_marker(proposed) else []
+
+
+def _restore_mapping(
+    proposed: Mapping[Any, Any],
+    configured: Any,
+    secret_values: frozenset[str] | set[str],
+    at: tuple[Any, ...],
+) -> tuple[Any, list[_Unresolved]]:
+    known = configured if isinstance(configured, Mapping) else {}
+    originals: dict[Any, list[Any]] = {}
+    for key, stand_in in _hidden_keys(known, secret_values).items():
+        originals.setdefault(_shown_key(stand_in, secret_values), []).append(key)
+    restored: dict[Any, Any] = {}
+    unresolved: list[_Unresolved] = []
+    for key, item in proposed.items():
+        matches = originals.get(key, [])
+        if len(matches) == 1:
+            original, counterpart = matches[0], known[matches[0]]
+        else:
+            # Unknown, or shown alike for different configured keys.
+            original, counterpart = key, _MISSING
+            if matches or _is_mask_marker(key):
+                unresolved.append(((*at, key), True))
+        value, missed = _restore(item, counterpart, secret_values, (*at, original))
+        restored[original] = value
+        unresolved.extend(missed)
+    return restored, unresolved
+
+
+def _restore_list(
+    proposed: list[Any],
+    configured: Any,
+    secret_values: frozenset[str] | set[str],
+    at: tuple[Any, ...],
+) -> tuple[Any, list[_Unresolved]]:
+    known = configured if isinstance(configured, list) else []
+    # Configured entries grouped by what the page showed for them.
+    groups: list[tuple[Any, list[int]]] = []
+    for index, item in enumerate(known):
+        shown = _shown(item, secret_values)
+        for form, members in groups:
+            if _identical(form, shown):
+                members.append(index)
+                break
+        else:
+            groups.append((shown, [index]))
+    posted: dict[int, list[int]] = {}
+    for position, item in enumerate(proposed):
+        for number, (form, _members) in enumerate(groups):
+            if _identical(item, form):
+                posted.setdefault(number, []).append(position)
+                break
+    restored: list[Any] = list(proposed)
+    unresolved: list[_Unresolved] = []
+    matched: set[int] = set()
+    for number, positions in posted.items():
+        members = groups[number][1]
+        alike = all(_identical(known[index], known[members[0]]) for index in members)
+        if alike:
+            chosen = [members[min(count, len(members) - 1)] for count in range(len(positions))]
+        elif len(positions) == len(members):
+            # Entries shown alike are kept in their configured order: no
+            # reordering among them was visible, so none is expressed.
+            chosen = members
+        else:
+            # Some of several different entries shown alike were removed or
+            # added: which ones cannot be told.
+            unresolved.extend(((*at, position), False) for position in positions)
+            continue
+        for position, index in zip(positions, chosen):
+            restored[position] = copy.deepcopy(known[index])
+            matched.add(index)
+    for position, item in enumerate(proposed):
+        if any(position in positions for positions in posted.values()):
+            continue
+        restored[position], missed = _restore_edited(
+            item, [known[index] for index in range(len(known)) if index not in matched],
+            secret_values, (*at, position),
+        )
+        unresolved.extend(missed)
+    return restored, unresolved
+
+
+def _restore_edited(
+    item: Any, candidates: list[Any], secret_values: frozenset[str] | set[str], at: tuple[Any, ...]
+) -> tuple[Any, list[_Unresolved]]:
+    """An edited list entry restored against the configured entry it came from.
+
+    Every unmatched configured entry of the same kind is tried; the entry is
+    restored only when every candidate that resolves all its markers gives
+    the same result, otherwise it is unresolved.
+    """
+
+    alone, missed = _restore(item, _MISSING, secret_values, at)
+    if not missed:
+        return alone, []
+    results = []
+    for candidate in candidates:
+        if isinstance(candidate, Mapping) != isinstance(item, Mapping) or isinstance(
+            candidate, list
+        ) != isinstance(item, list):
+            continue
+        result, left = _restore(item, candidate, secret_values, at)
+        if not left:
+            results.append(result)
+    if results and all(_identical(result, results[0]) for result in results):
+        return results[0], []
+    return item, [(at, False)]
+
+
+def _secret_set(view: ConfigView | None = None) -> frozenset[str]:
+    """The secret-set values in force: *view*'s and the rendering UI's."""
+
+    source = _RENDERING_FOR.get()
+    values = frozenset() if view is None else view.secret_values
+    return values if source is None else values | source.secret_values
 
 
 def _redact(text: str, secret_values: Iterable[str]) -> str:
@@ -1152,8 +1433,12 @@ logger.addFilter(_LOG_REDACTION)
 def esc(value: Any) -> str:
     """HTML-escape *value* (quotes included), as text, secret-set values redacted."""
 
-    text = value if isinstance(value, str) else _plain(value)
     source = _RENDERING_FOR.get()
+    if isinstance(value, str):
+        text = value
+    else:
+        # Structured data is masked value by value before it is serialized.
+        text = _plain(value if source is None else _mask_secrets(value, source.secret_values))
     if source is not None:
         text = _redact(text, source.secret_values)
     return html.escape(text, quote=True)
@@ -1624,16 +1909,28 @@ class _SchemaRenderer:
         return ConfigUI._origin(self.view, path)
 
     def _masked(self, path: Sequence[Any], value: Any) -> Any:
-        """*value* with every nested credential literal replaced (R8)."""
+        """*value* with every nested credential literal and secret value replaced (R8).
 
+        Declared credential paths are withheld whatever they hold; then every
+        nested scalar or mapping key equal to a secret-set value is withheld
+        whatever its path (gate-3 F2). A top-level scalar is left to
+        :func:`esc`, which shows it as ``[hidden]``.
+        """
+
+        masked = self._credentials_masked(path, value)
+        if isinstance(masked, (Mapping, list)):
+            return _mask_secrets(masked, _secret_set(self.view))
+        return masked
+
+    def _credentials_masked(self, path: Sequence[Any], value: Any) -> Any:
         if reference_name(value) is not None:
             return value
         if self.view.is_credential(path):
             return HIDDEN_LITERAL
         if isinstance(value, Mapping):
-            return {key: self._masked((*path, key), item) for key, item in value.items()}
+            return {key: self._credentials_masked((*path, key), item) for key, item in value.items()}
         if isinstance(value, list):
-            return [self._masked((*path, index), item) for index, item in enumerate(value)]
+            return [self._credentials_masked((*path, index), item) for index, item in enumerate(value)]
         return value
 
     def configured_text(self, path: Sequence[Any]) -> str | None:
@@ -3524,6 +3821,9 @@ _OUTCOME_STATUS = {
 
 _PROTECTED_REASON = "a protected field must keep its configured text"
 _READ_ONLY_BLOCK = "is read-only in v1"
+_UNMATCHED_REASON = (
+    "a hidden value cannot be matched to exactly one configured entry; edit it in the configuration file"
+)
 _OUTSIDE_SCOPE = "is outside the settings this UI writes"
 
 
@@ -3688,23 +3988,32 @@ def _protect_save(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[
     """*value* with hidden credentials restored, and every protection refusal.
 
     A credential the page showed as :data:`HIDDEN_LITERAL` inside a JSON
-    editor is put back as its configured literal before the comparison.
+    editor is put back as its configured literal before the comparison, and
+    so is every secret-set value or key the page withheld (gate-3 F2). A
+    masking marker that cannot be matched to exactly one configured value
+    refuses the Save: a placeholder is never written (P19F5 review A1/A2).
     """
 
     refusals = _direct_protection(view, path)
     if refusals:
         return value, refusals
     current = view.value(path)
+    secret_values = _secret_set(view)
+    value, unresolved = _unmask_secrets(value, current, secret_values)
+    hidden = (HIDDEN_LITERAL, _redact(HIDDEN_LITERAL, secret_values))
     for relative, kind in _protected_descendants(view, path):
         configured = _lookup(current, relative) if current is not _MISSING else _MISSING
         proposed = _lookup(value, relative)
-        if kind == "credential" and proposed == HIDDEN_LITERAL and configured is not _MISSING:
+        if kind == "credential" and proposed in hidden and configured is not _MISSING:
             value = copy.deepcopy(value)
             _set_path(value, relative, configured)
             proposed = configured
         kept = proposed is not _MISSING if kind == "key" else _same(proposed, configured)
         if not kept:
             refusals.append(f"{_path_text((*path, *relative))}: {_PROTECTED_REASON}")
+    if any(is_key or _has_mask_marker(_lookup(value, relative)) for relative, is_key in unresolved):
+        # The field path only: a relative path may hold a restored key.
+        refusals.append(f"{_path_text(path)}: {_UNMATCHED_REASON}")
     return value, refusals
 
 
