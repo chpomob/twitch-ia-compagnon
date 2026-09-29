@@ -716,7 +716,7 @@ class ConfigView:
         if self.is_credential(path):
             return HIDDEN_LITERAL
         if isinstance(value, (Mapping, list)):
-            return _plain(_mask_secrets(value, _secret_set(self)))
+            return _shown_text(value, _secret_set(self))
         return _plain(value)
 
     def enabled_modules(self) -> list[str]:
@@ -1071,13 +1071,14 @@ class RunningState:
 # Defence in depth: the renderers never place a secret-set value in a page
 # (credentials and references are shown as ``${NAME}`` or as
 # :data:`HIDDEN_LITERAL`, and structured data is masked value by value, keys
-# included, before it is serialized — :func:`_mask_secrets`, gate-3 F2);
-# this guard replaces each secret-set value, in its raw, HTML and JSON
-# spellings, by
-# ``[hidden]`` anyway, in every configured value as :func:`esc` renders it
-# and in every log record. It works on values before they are serialized,
-# never on the finished body or headers, so a secret that happens to equal a
-# path, a field name or any other piece of markup cannot rewrite it. Every
+# included — :func:`_shown`, gate-3 F2); this guard replaces each secret-set
+# value, in its raw, HTML and JSON spellings, by ``[hidden]`` anyway, in
+# every configured scalar and key as :func:`esc` renders it and in every log
+# record. It works on data before it is serialized, never on serialized text,
+# the finished body or headers: a secret that happens to equal a path, a
+# field name, a JSON delimiter or escape or any other piece of markup cannot
+# rewrite it (gate-4 N4); the serialized form of masked data is a
+# :class:`_Shown` text, escaped as it is and never redacted again. Every
 # secret-set value is replaced whatever its length, a single character
 # included (gate-1 F2): the replacement only ever touches configured text.
 # Declared identifiers (module directory names, manifest field and limit
@@ -1135,7 +1136,7 @@ def _is_secret_scalar(value: Any, secret_values: frozenset[str] | set[str]) -> b
 
 
 def _hidden_keys(mapping: Mapping[Any, Any], secret_values: frozenset[str] | set[str]) -> dict[Any, Any]:
-    """Every key of *mapping* as :func:`_mask_secrets` shows it.
+    """Every key of *mapping* as :func:`_shown` withholds it.
 
     A key equal to a secret-set value is shown as :data:`HIDDEN_LITERAL`, the
     second and later ones numbered by their order among the hidden keys, so
@@ -1160,26 +1161,6 @@ def _hidden_keys(mapping: Mapping[Any, Any], secret_values: frozenset[str] | set
     return shown
 
 
-def _mask_secrets(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
-    """*value* with every scalar equal to a secret-set value withheld (gate-3 F2).
-
-    Value-driven, whatever the path: a nested value or a mapping key, inside
-    a list or a mapping at any depth, is replaced by :data:`HIDDEN_LITERAL`
-    before the data is serialized. A ``${NAME}`` reference is kept as itself.
-    """
-
-    if not secret_values:
-        return value
-    if isinstance(value, Mapping):
-        keys = _hidden_keys(value, secret_values)
-        return {keys[key]: _mask_secrets(item, secret_values) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_mask_secrets(item, secret_values) for item in value]
-    if _is_secret_scalar(value, secret_values):
-        return HIDDEN_LITERAL
-    return value
-
-
 #: A :func:`_hidden_keys` stand-in, the first or a numbered one.
 _HIDDEN_STAND_IN = re.compile(re.escape(HIDDEN_LITERAL) + r"(?: \(\d+\))?")
 
@@ -1189,12 +1170,18 @@ _Unresolved = tuple[tuple[Any, ...], bool]
 
 
 def _shown(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
-    """*value* as a page shows it once decoded: masked, then every text redacted.
+    """*value* as a page shows it, as data: masked, then every scalar and key redacted.
 
-    :func:`esc` redacts the serialized text, the stand-ins included, so a
-    secret that is a substring of :data:`HIDDEN_LITERAL` rewrites the
-    placeholder itself; the Save restoration compares with this form (P19F5
-    review A2), never with the bare placeholder.
+    The one masking every rendering serializes (gate-4 N4): a scalar or key
+    equal to a secret-set value is withheld (:func:`_hidden_keys`), then the
+    text of every string, number and key has each secret-set value replaced
+    by ``[hidden]`` — the stand-ins included, so a secret that is a
+    substring of :data:`HIDDEN_LITERAL` rewrites the placeholder itself. The
+    result is serialized afterwards, so JSON's own delimiters and escapes are
+    never taken for secret text. A number whose text holds a secret is shown
+    as its redacted text; a boolean or null is a token, never data text
+    (gate-2 N1). The draft restoration compares with this form (P19F5 review
+    A2), never with the bare placeholder.
     """
 
     if isinstance(value, Mapping):
@@ -1207,11 +1194,38 @@ def _shown(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
         return [_shown(item, secret_values) for item in value]
     if _is_secret_scalar(value, secret_values):
         value = HIDDEN_LITERAL
-    return _redact(value, secret_values) if isinstance(value, str) else value
+    return _shown_key(value, secret_values)
 
 
 def _shown_key(key: Any, secret_values: frozenset[str] | set[str]) -> Any:
-    return _redact(key, secret_values) if isinstance(key, str) else key
+    """A scalar or key as :func:`_shown` shows it: its text redacted."""
+
+    if isinstance(key, str):
+        return _redact(key, secret_values)
+    if isinstance(key, bool) or key is None:
+        return key
+    text = _plain(key)
+    redacted = _redact(text, secret_values)
+    # Any other scalar (a date YAML parsed) is serialized as its text anyway.
+    return key if redacted == text and isinstance(key, (int, float)) else redacted
+
+
+class _Shown(str):
+    """Text serialized from :func:`_shown` data: escaped as it is, never
+    redacted again (a second pass would rewrite JSON syntax, gate-4 N4)."""
+
+
+def _shown_text(value: Any, secret_values: frozenset[str] | set[str], *, as_json: bool = False) -> _Shown:
+    """*value* masked as data (:func:`_shown`), then serialized.
+
+    Strings are shown as themselves unless *as_json*, which serializes every
+    value as JSON (the text a JSON editor posts back).
+    """
+
+    shown = _shown(value, secret_values)
+    if as_json:
+        return _Shown(json.dumps(shown, ensure_ascii=False, default=str))
+    return _Shown(_plain(shown))
 
 
 def _is_mask_marker(value: Any) -> bool:
@@ -1245,7 +1259,7 @@ def _identical(left: Any, right: Any) -> bool:
 def _unmask_secrets(
     proposed: Any, configured: Any, secret_values: frozenset[str] | set[str]
 ) -> tuple[Any, list[_Unresolved]]:
-    """*proposed* with every :func:`_mask_secrets` stand-in put back, and
+    """*proposed* with every :func:`_shown` stand-in put back, and
     every masking marker it could not put back.
 
     A posted value identical to a configured one as the page showed it
@@ -1431,24 +1445,26 @@ logger.addFilter(_LOG_REDACTION)
 
 
 def esc(value: Any) -> str:
-    """HTML-escape *value* (quotes included), as text, secret-set values redacted."""
+    """HTML-escape *value* (quotes included), as text, secret-set values redacted.
 
+    A string is redacted as the text it is; structured data is masked value
+    by value and key by key before it is serialized (:func:`_shown_text`);
+    a :class:`_Shown` text is already masked and is only escaped (gate-4 N4).
+    """
+
+    return html.escape(_guarded(value), quote=True)
+
+
+def _guarded(value: Any) -> str:
+    """*value* as :func:`esc` shows it, before HTML escaping: redacted."""
+
+    if isinstance(value, _Shown):
+        return value
     source = _RENDERING_FOR.get()
+    secret_values = frozenset() if source is None else source.secret_values
     if isinstance(value, str):
-        text = value
-    else:
-        # Structured data is masked value by value before it is serialized.
-        text = _plain(value if source is None else _mask_secrets(value, source.secret_values))
-    if source is not None:
-        text = _redact(text, source.secret_values)
-    return html.escape(text, quote=True)
-
-
-def _guarded(text: str) -> str:
-    """*text* as :func:`esc` would show it, before HTML escaping: redacted."""
-
-    source = _RENDERING_FOR.get()
-    return text if source is None else _redact(text, source.secret_values)
+        return value if source is None else _redact(value, secret_values)
+    return _shown_text(value, secret_values)
 
 
 def _key_token(position: int) -> str:
@@ -1914,19 +1930,17 @@ class _SchemaRenderer:
     def origin(self, path: Sequence[Any]) -> str:
         return ConfigUI._origin(self.view, path)
 
-    def _masked(self, path: Sequence[Any], value: Any) -> Any:
-        """*value* with every nested credential literal and secret value replaced (R8).
+    def _masked(self, path: Sequence[Any], value: Any, *, as_json: bool = False) -> _Shown:
+        """*value* shown with every nested credential literal and secret value withheld (R8).
 
         Declared credential paths are withheld whatever they hold; then every
-        nested scalar or mapping key equal to a secret-set value is withheld
-        whatever its path (gate-3 F2). A top-level scalar is left to
-        :func:`esc`, which shows it as ``[hidden]``.
+        scalar or mapping key equal to a secret-set value is withheld, and
+        every secret-set value in any other scalar or key redacted, whatever
+        its path (gate-3 F2) — on the data, before it is serialized (gate-4 N4).
         """
 
         masked = self._credentials_masked(path, value)
-        if isinstance(masked, (Mapping, list)):
-            return _mask_secrets(masked, _secret_set(self.view))
-        return masked
+        return _shown_text(masked, _secret_set(self.view), as_json=as_json)
 
     def _credentials_masked(self, path: Sequence[Any], value: Any) -> Any:
         if reference_name(value) is not None:
@@ -1945,13 +1959,13 @@ class _SchemaRenderer:
         value = self.view.value(path)
         if value is _MISSING:
             return None
-        return _plain(self._masked(path, value))
+        return self._masked(path, value)
 
     def _json_text(self, path: Sequence[Any]) -> str:
         value = self.view.value(path)
         if value is _MISSING:
             return ""
-        return json.dumps(self._masked(path, value), ensure_ascii=False, default=str)
+        return self._masked(path, value, as_json=True)
 
     # -- nodes --------------------------------------------------------------
 
@@ -2094,7 +2108,7 @@ class _SchemaRenderer:
                 f'<code class="value">${{{ident(name)}}}</code> '
                 f'<span class="reference-state">({_state(is_set)})</span>'
             )
-        return f'<code class="value">{esc(_plain(self._masked(path, value)))}</code>'
+        return f'<code class="value">{esc(self._masked(path, value))}</code>'
 
     def _field(
         self, schema: Mapping[str, Any], path: Sequence[Any], required: bool, live: bool, kind: str
@@ -3173,6 +3187,11 @@ class ConfigUI:
 
         view = self.view() if view is None else view
         secret_values = set(self.secret_values)
+        # The values Save would write, not the placeholders the page showed:
+        # the same restoration, an unmatched placeholder the same refusal
+        # (gate-4 N3).
+        edits, unmatched = _draft_edits(view, edits)
+        problems = (*problems, *unmatched)
         try:
             base = read_base(self.base_path)
             overlay = read_overlay(self.overlay_path)
@@ -3992,37 +4011,73 @@ def _same(left: Any, right: Any) -> bool:
     return type(left) is type(right) and left == right
 
 
-def _protect_save(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[Any, list[str]]:
-    """*value* with hidden credentials restored, and every protection refusal.
+def _draft_edits(view: ConfigView, edits: Sequence[Edit]) -> tuple[list[Edit], list[str]]:
+    """*edits* as the draft holds them (:func:`_draft_value`), and every
+    placeholder that could not be restored — the draft Check validates."""
 
-    A credential the page showed as :data:`HIDDEN_LITERAL` inside a JSON
-    editor is put back as its configured literal before the comparison, and
-    so is every secret-set value or key the page withheld (gate-3 F2). A
-    masking marker that cannot be matched to exactly one configured value
-    refuses the Save: a placeholder is never written (P19F5 review A1/A2).
+    restored: list[Edit] = []
+    unmatched: list[str] = []
+    for path, value in edits:
+        path = tuple(path)
+        value, refusals = _draft_value(view, path, value)
+        restored.append((path, value))
+        unmatched.extend(refusals)
+    return restored, unmatched
+
+
+def _draft_value(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[Any, list[str]]:
+    """A posted *value* with every placeholder the page showed put back, and
+    the refusal of any it could not put back.
+
+    The one draft normalisation Check and Save share (gate-4 N3), so both
+    validate the real values the operator kept, never the placeholders: a
+    secret-set value or key the page withheld or redacted is restored by
+    :func:`_unmask_secrets` — nested keys, reordered and removed list entries
+    included — and a credential a JSON editor showed as
+    :data:`HIDDEN_LITERAL` becomes its configured literal again. A masking
+    marker that cannot be matched to exactly one configured value (edited,
+    duplicated or ambiguous) is refused, naming why: a value is never
+    guessed and a placeholder never written (P19F5 review A1/A2).
+    """
+
+    current = view.value(path)
+    secret_values = _secret_set(view)
+    value, unresolved = _unmask_secrets(value, current, secret_values)
+    hidden = (HIDDEN_LITERAL, _redact(HIDDEN_LITERAL, secret_values))
+    for relative, kind in _protected_descendants(view, path):
+        if kind != "credential" or current is _MISSING:
+            continue
+        configured = _lookup(current, relative)
+        if configured is not _MISSING and _lookup(value, relative) in hidden:
+            value = copy.deepcopy(value)
+            _set_path(value, relative, configured)
+    if any(is_key or _has_mask_marker(_lookup(value, relative)) for relative, is_key in unresolved):
+        # The field path only: a relative path may hold a restored key.
+        return value, [f"{_path_text(path)}: {_UNMATCHED_REASON}"]
+    return value, []
+
+
+def _protect_save(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[Any, list[str]]:
+    """*value* as the draft holds it (:func:`_draft_value`), and every
+    protection refusal.
+
+    Hidden credentials and every secret-set value or key the page withheld
+    are restored before the comparison (gate-3 F2); an unmatched masking
+    marker refuses the Save.
     """
 
     refusals = _direct_protection(view, path)
     if refusals:
         return value, refusals
     current = view.value(path)
-    secret_values = _secret_set(view)
-    value, unresolved = _unmask_secrets(value, current, secret_values)
-    hidden = (HIDDEN_LITERAL, _redact(HIDDEN_LITERAL, secret_values))
+    value, unmatched = _draft_value(view, path, value)
     for relative, kind in _protected_descendants(view, path):
         configured = _lookup(current, relative) if current is not _MISSING else _MISSING
         proposed = _lookup(value, relative)
-        if kind == "credential" and proposed in hidden and configured is not _MISSING:
-            value = copy.deepcopy(value)
-            _set_path(value, relative, configured)
-            proposed = configured
         kept = proposed is not _MISSING if kind == "key" else _same(proposed, configured)
         if not kept:
             refusals.append(f"{_path_text((*path, *relative))}: {_PROTECTED_REASON}")
-    if any(is_key or _has_mask_marker(_lookup(value, relative)) for relative, is_key in unresolved):
-        # The field path only: a relative path may hold a restored key.
-        refusals.append(f"{_path_text(path)}: {_UNMATCHED_REASON}")
-    return value, refusals
+    return value, refusals + unmatched
 
 
 def _protect_remove(

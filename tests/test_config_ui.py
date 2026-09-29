@@ -6227,3 +6227,222 @@ def test_p19f5_a_redacted_stand_in_key_is_restored(tmp_path: Path) -> None:
     assert saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"] == {
         secret: 1, "other": secret, "added": 2
     }
+
+
+# ---------------------------------------------------------------------------
+# P19F7 (gate-4 N3/N4): data is masked before it is serialized, and Check
+# validates the very draft Save restores
+# ---------------------------------------------------------------------------
+
+
+def _textarea_text(page: str, suffix: str) -> tuple[str, str]:
+    """The name of the textarea ending in *suffix*, and its unescaped text."""
+
+    match = re.search(rf'<textarea name="([^"]*{re.escape(suffix)})"[^>]*>(.*?)</textarea>', page, re.S)
+    assert match is not None
+    return match.group(1), _html.unescape(match.group(2))
+
+
+@pytest.mark.parametrize(
+    ("secret", "allowed"),
+    [
+        ('"', ["kept", "voice-two"]),
+        ("\\", ["kept", 'ordinary"quote']),
+        *((mark, ["kept", "voice-two"]) for mark in ["[", "]", "{", "}", ",", ":", " "]),
+    ],
+    ids=["quote", "backslash", "open-bracket", "close-bracket", "open-brace", "close-brace",
+         "comma", "colon", "space"],
+)
+def test_n4_a_punctuation_secret_never_breaks_a_legitimate_list(
+    tmp_path: Path, secret: str, allowed: list[str], forget_ui: Callable[[ConfigUI], ConfigUI]
+) -> None:
+    """Gate-4 D/N4 as a running test: with the one-character secret ``"``,
+    the legitimate ``['kept', 'voice-two']`` rendered as
+    ``[[hidden]kept[hidden], [hidden]voice-two[hidden]]`` (and with ``\\``,
+    ``'ordinary"quote'`` as ``"ordinary[hidden]"quote"``): the redaction ran
+    over serialized text. The list now decodes exactly, and an edit Saves."""
+
+    ui = forget_ui(_allowed_ui(tmp_path, secret, allowed))
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "audio_output")
+    name, text = _textarea_text(page, "voices.allowed")
+    assert json.loads(text) == allowed
+    check = _write(
+        ui, cookie, "/check", f"{MODULE_PAGE_PREFIX}audio_output",
+        [(name, json.dumps([*allowed, "added"]))],
+    )
+    assert check.status == 200
+    assert not any(config_ui._UNMATCHED_REASON in line for line in _written(check))
+    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == [*allowed, "added"]
+
+
+@pytest.mark.parametrize("secret", ['"', "\\", "[", "]", "{", "}", ",", ":"])
+def test_n4_punctuation_secrets_in_nested_data_mask_the_data_not_the_syntax(
+    tmp_path: Path, secret: str, forget_ui: Callable[[ConfigUI], ConfigUI]
+) -> None:
+    """A punctuation secret used as a key, a value and inside longer text, at
+    depth: every JSON editor decodes, no decoded scalar holds the secret, and
+    the untouched legitimate data around it is shown exactly."""
+
+    ui = forget_ui(_f2_value_ui(tmp_path, secret))
+    cookie = _logged_in(ui)
+    brain = _module_html(ui, cookie, "brain")
+    _name, text = _textarea_text(brain, "delivery.actions")
+    actions = json.loads(text)
+    assert actions[0]["action"] == "reply"
+    assert actions[0]["arguments"] == {
+        HIDDEN_LITERAL: "v",
+        "plain": HIDDEN_LITERAL,
+        "nested": [{"deep": HIDDEN_LITERAL}],
+        f"k{config_ui.REDACTED}": 2,
+    }
+    audio = _module_html(ui, cookie, "audio_output")
+    _name, text = _textarea_text(audio, "voices.allowed")
+    assert json.loads(text) == [HIDDEN_LITERAL, "kept", f"x{config_ui.REDACTED}y"]
+    for page in (brain, audio):
+        for document in _decoded_textareas(page):
+            # ``[`` and ``]`` are the marker's own brackets, never the data's.
+            assert all(
+                secret not in str(scalar).replace(config_ui.REDACTED, "") for scalar in _scalars(document)
+            )
+
+
+N3_SETTINGS_TEXT = (
+    "modules_directory: builtin\nenabled_modules: [audio_output]\n"
+    "secrets: ['${GATE_SECRET}']\n"
+    "modules:\n  audio_output:\n"
+    "    synthesis: {endpoint: '', model: ''}\n"
+    "    voices: {allowed: ALLOWED, default: '${GATE_SECRET}'}\n"
+    "    outputs: {o: {player: {argv: [cat]}}}\n"
+    "    default_output: o\n"
+)
+
+
+def _n3_ui(tmp_path: Path, secret: str, allowed: list[str]) -> ConfigUI:
+    return _twitch_ui(
+        tmp_path, N3_SETTINGS_TEXT.replace("ALLOWED", json.dumps(allowed)), {"GATE_SECRET": secret}
+    )
+
+
+def _check_and_save(ui: ConfigUI, cookie: str, name: str, posted: list[Any]) -> tuple[str, UIResponse]:
+    page = f"{MODULE_PAGE_PREFIX}audio_output"
+    check = _write(ui, cookie, "/check", page, [(name, json.dumps(posted))])
+    assert check.status == 200
+    return check.body.decode("utf-8"), _write(ui, cookie, "/save", page, [(name, json.dumps(posted))])
+
+
+def test_n3_check_gives_the_real_checker_verdict_on_the_draft_save_writes(tmp_path: Path) -> None:
+    """Gate-4 D/N3 as a running test, through the real checker: with
+    ``voices.allowed = ['kept', 'a"b']``, ``voices.default = '${GATE_SECRET}'``
+    and ``GATE_SECRET = 'a"b'``, appending a voice made Check fail
+    (``must be an allowed voice``: it validated the placeholder) while Save
+    wrote ``['kept', 'a"b', 'added']``, which the real checker passes."""
+
+    secret = 'a"b'
+    ui = _n3_ui(tmp_path, secret, ["kept", secret])
+    assert ui.check().passed
+    cookie = _logged_in(ui)
+    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+    assert shown == ["kept", HIDDEN_LITERAL]
+    checked, saved = _check_and_save(ui, cookie, name, [*shown, "added"])
+    assert _verdict(checked), _listed(checked)
+    assert saved.status == 303, _written(saved)
+    draft = _overlay_doc(tmp_path / "config.local.yaml")
+    assert draft["modules"]["audio_output"]["voices"]["allowed"] == ["kept", secret, "added"]
+    assert config_ui._default_checker(ui.base_path, ui.environ, ui.overlay_path, draft) == (True, [])
+    assert secret not in checked
+
+
+def test_n3_an_invalid_draft_fails_check_on_its_real_values(tmp_path: Path) -> None:
+    """Removing the withheld voice leaves ``voices.default`` outside the
+    allowed list: Check reports it from the real values, as the real
+    checker does on the same draft."""
+
+    secret = 'a"b'
+    ui = _n3_ui(tmp_path, secret, ["kept", secret])
+    cookie = _logged_in(ui)
+    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+    page = f"{MODULE_PAGE_PREFIX}audio_output"
+    checked = _write(ui, cookie, "/check", page, [(name, json.dumps(shown[:1]))]).body.decode("utf-8")
+    assert not _verdict(checked)
+    assert any("must be an allowed voice" in line for line in _listed(checked))
+    assert secret not in checked
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda shown: [*shown, "added"],
+        lambda shown: ["added", *reversed(shown)],
+        lambda shown: shown[1:],
+    ],
+    ids=["append", "reorder", "remove"],
+)
+def test_n3_check_and_save_validate_the_same_restored_draft(
+    tmp_path: Path, edit: Callable[[list[Any]], list[Any]]
+) -> None:
+    """The captured drafts are identical: Check received ``prefix-[hidden]-suffix``
+    where Save restored ``prefix-a"b-suffix``. Both now go through one
+    restoration, reordered and removed entries included."""
+
+    secret = 'a"b'
+    ui = _allowed_ui(tmp_path, secret, ["kept", secret, f"prefix-{secret}-suffix"])
+    seen: list[Any] = []
+    ui.checker = lambda base, environ, overlay, draft: (seen.append(json.loads(json.dumps(draft))) or True, [])
+    cookie = _logged_in(ui)
+    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+    assert shown == ["kept", HIDDEN_LITERAL, f"prefix-{config_ui.REDACTED}-suffix"]
+    checked, saved = _check_and_save(ui, cookie, name, edit(shown))
+    assert _verdict(checked), _listed(checked)
+    assert saved.status == 303, _written(saved)
+    written = _overlay_doc(tmp_path / "config.local.yaml")
+    assert seen == [written]
+    real = dict(zip(shown, ["kept", secret, f"prefix-{secret}-suffix"]))
+    assert _saved_allowed(tmp_path) == [real.get(item, item) for item in edit(shown)]
+
+
+def test_n3_an_unmatched_placeholder_fails_check_as_save_refuses_it(tmp_path: Path) -> None:
+    """A placeholder that cannot be put back is an explicit outcome on both
+    routes, naming why; Check never validates a guessed value."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    seen: list[Any] = []
+    ui.checker = lambda base, environ, overlay, draft: (seen.append(draft) or True, [])
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+    checked, saved = _check_and_save(ui, cookie, name, [*shown, f"x{config_ui.REDACTED}"])
+    assert not _verdict(checked)
+    assert any(config_ui._UNMATCHED_REASON in line for line in _listed(checked))
+    assert saved.status == 403
+    assert any(config_ui._UNMATCHED_REASON in line for line in _written(saved))
+    assert _snapshot(tmp_path) == before
+    assert "q7Z" not in checked
+
+
+@pytest.mark.parametrize("secret", ["Ω", "q7Z", "gate-secret-channel-97bf"])
+def test_p19f7_every_published_secret_length_is_still_never_rendered(
+    tmp_path: Path, secret: str
+) -> None:
+    """The earlier guarantees under the data-level masking: the gate's
+    one-character, three-character and long secrets, as a key, a value and
+    inside longer text at any depth, never reach a page nor a decoded JSON
+    editor, and an untouched round trip Saves the configured values."""
+
+    ui = _f2_value_ui(tmp_path, secret)
+    cookie = _logged_in(ui)
+    for name in ("brain", "audio_output"):
+        page = _module_html(ui, cookie, name)
+        assert secret not in page and secret not in _html.unescape(page), name
+        for spelling in (json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=True)[1:-1]):
+            assert spelling not in _html.unescape(page), name
+        for body in re.findall(r"<textarea[^>]*>(.*?)</textarea>", page, re.S):
+            if body:
+                document = json.loads(_html.unescape(body))
+                assert all(secret not in str(scalar) for scalar in _scalars(document)), name
+    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == [secret, "kept", f"x{secret}y", "added"]
+    assert secret not in response.body.decode("utf-8")
