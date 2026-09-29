@@ -239,7 +239,19 @@ setting, trigger and limit names) are public text and are shown as they are.
 Such fields are displayed only as their reference (`${NAME}`), or as
 "literal value configured (hidden)", with their set/unset state. The set/unset
 state is evaluated against the UI process's own environment, which is the
-environment a main process launched by the UI inherits. The UI never edits
+environment a main process launched by the UI inherits.
+
+A setting whose value holds such a field, or a secret inside a longer text, is
+never offered as one editable text. A list or mapping is edited entry by entry:
+each entry keeps its own position, can be removed, moved or (when fully shown)
+edited, and a row adds a new entry; a withheld entry is shown masked with an
+empty box: left empty it is kept exactly, and anything typed replaces it whole.
+A single text setting holding a secret works the same way. Only what changed is
+applied to the real configuration the UI loaded, so Check and Save validate
+the same values. A submission the UI cannot apply exactly (an entry it does
+not know, a stale page, an entry posted twice, an entry both removed and
+edited, a new key that already exists) is refused by name and nothing is
+written. The UI never edits
 environment variables: set them in the shell that starts the UI. The access token
 appears only in the single startup line on standard output.
 

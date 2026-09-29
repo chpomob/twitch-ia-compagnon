@@ -1152,10 +1152,9 @@ def _hidden_keys(mapping: Mapping[Any, Any], secret_values: frozenset[str] | set
     against every form already taken (the unchanged keys first), so two
     withheld keys, or a withheld key and legitimate text that looks like a
     stand-in, are never shown alike and never merge (gate-5 N5). The
-    allocation is the same for the same configuration, which is how the
-    draft restoration maps each stand-in back (:func:`_unmask_secrets`).
-    When a secret-set value rewrites the numbering itself so that no
-    distinct form can be found, :class:`StandInCollision` is raised:
+    stand-ins are display text only: no posted text is ever mapped back
+    through them (P19F9, see :func:`_patched`). When a secret-set value
+    rewrites the numbering itself so that no distinct form can be found, :class:`StandInCollision` is raised:
     the render fails rather than lose an entry.
     """
 
@@ -1181,23 +1180,6 @@ def _hidden_keys(mapping: Mapping[Any, Any], secret_values: frozenset[str] | set
     return {key: shown[key] for key in mapping}
 
 
-#: The texts only a masking pass writes, compared case- and space-folded
-#: (:func:`_is_mask_marker`): an edited stand-in still holds one.
-_MARKER_TEXTS = tuple(
-    " ".join(text.split()).casefold()
-    for text in (REDACTED, "literal value configured", "configured (hidden)")
-)
-
-#: Why a place of a posted value could not be put back (the named refusal).
-_UNMATCHED = "unmatched"
-_CONFLICTING = "conflicting"
-
-#: One place of *proposed* :func:`_unmask_secrets` could not put back: the
-#: relative path of a value, or of a mapping whose key it is (``True``), and
-#: why (:data:`_UNMATCHED` or :data:`_CONFLICTING`).
-_Unresolved = tuple[tuple[Any, ...], bool, str]
-
-
 def _shown(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
     """*value* as a page shows it, as data: masked, then every scalar and key redacted.
 
@@ -1210,9 +1192,9 @@ def _shown(value: Any, secret_values: frozenset[str] | set[str]) -> Any:
     never taken for secret text. A number whose text holds a secret is shown
     as its redacted text; a boolean or null is a token, never data text
     (gate-2 N1). Every mapping key is shown distinct from its siblings
-    (:func:`_hidden_keys`), so no entry is lost (gate-5 N5). The draft
-    restoration compares with this form (P19F5 review A2), never with the
-    bare placeholder.
+    (:func:`_hidden_keys`), so no entry is lost (gate-5 N5). It is read-only
+    display: a value this changes is never placed in a control whose text
+    is posted back (P19F9).
     """
 
     if isinstance(value, Mapping):
@@ -1257,33 +1239,6 @@ def _shown_text(value: Any, secret_values: frozenset[str] | set[str], *, as_json
     return _Shown(_plain(shown))
 
 
-def _is_mask_marker(value: Any) -> bool:
-    """Whether *value* is text shaped like masking output.
-
-    ``[hidden]`` or a piece of :data:`HIDDEN_LITERAL` anywhere, whatever the
-    case or spacing around it: a stand-in with anything added, removed or
-    re-spaced is still one, so it is refused as unmatched rather than
-    written as literal text (gate-5 N3). Text the page showed for a
-    configured value is matched to it before this is asked, so legitimate
-    configured text of this shape round-trips.
-    """
-
-    if not isinstance(value, str):
-        return False
-    folded = " ".join(value.split()).casefold()
-    return any(text in folded for text in _MARKER_TEXTS)
-
-
-def _has_mask_marker(value: Any) -> bool:
-    """Whether *value* holds a masking marker, as a key or a value, at any depth."""
-
-    if isinstance(value, Mapping):
-        return any(_is_mask_marker(key) or _has_mask_marker(item) for key, item in value.items())
-    if isinstance(value, list):
-        return any(_has_mask_marker(item) for item in value)
-    return _is_mask_marker(value)
-
-
 def _identical(left: Any, right: Any) -> bool:
     """Equal as configured data, ``1``, ``1.0`` and ``true`` told apart."""
 
@@ -1294,156 +1249,164 @@ def _identical(left: Any, right: Any) -> bool:
     return type(left) is type(right) and left == right
 
 
-def _unmask_secrets(
-    proposed: Any, configured: Any, secret_values: frozenset[str] | set[str]
-) -> tuple[Any, list[_Unresolved]]:
-    """*proposed* with every :func:`_shown` stand-in put back, and
-    every masking marker it could not put back.
+def _exact_scalar(value: Any, secret_values: frozenset[str] | set[str]) -> bool:
+    """Whether a page shows the scalar *value* exactly as it is configured.
 
-    A posted value identical to a configured one as the page showed it
-    (:func:`_shown`: withheld, then redacted) becomes that configured value
-    again; a posted stand-in key becomes the configured key it stood for.
-    List entries are matched by what they showed, never by index alone, so
-    removing, inserting or reordering entries keeps each withheld value with
-    its own entry (P19F5 review A1). A marker that matches no configured
-    entry, or entries that differ behind the same shown form, is returned
-    unresolved: the Save is refused rather than a placeholder written.
+    Not a secret-set value, no secret-set value inside its text, and a JSON
+    round trip gives it back with its type (a YAML date would come back as
+    text, a NaN as another NaN). Only such a value is ever placed in an
+    editable control whose untouched text means "unchanged" (P19F9).
     """
 
-    if not secret_values:
-        return proposed, []
-    return _restore(proposed, configured, secret_values, ())
+    if _is_secret_scalar(value, secret_values):
+        return False
+    if not _identical(_shown_key(value, secret_values), value):
+        return False
+    try:
+        return _identical(json.loads(json.dumps(value, ensure_ascii=False)), value)
+    except (TypeError, ValueError):
+        return False
 
 
-def _restore(
-    proposed: Any, configured: Any, secret_values: frozenset[str] | set[str], at: tuple[Any, ...]
-) -> tuple[Any, list[_Unresolved]]:
-    if configured is not _MISSING and _identical(proposed, _shown(configured, secret_values)):
-        return copy.deepcopy(configured), []
-    if isinstance(proposed, Mapping):
-        return _restore_mapping(proposed, configured, secret_values, at)
-    if isinstance(proposed, list):
-        return _restore_list(proposed, configured, secret_values, at)
-    return proposed, [(at, False, _UNMATCHED)] if _is_mask_marker(proposed) else []
+def _tagged(value: Any) -> Any:
+    """*value* as JSON-safe data with every scalar's type kept: the material
+    of a patch identity (:meth:`_SchemaRenderer._patch_token`)."""
+
+    if isinstance(value, Mapping):
+        return ["map", [[_tagged(key), _tagged(item)] for key, item in value.items()]]
+    if isinstance(value, (list, tuple)):
+        return ["list", [_tagged(item) for item in value]]
+    return [type(value).__name__, repr(value)]
 
 
-def _restore_mapping(
-    proposed: Mapping[Any, Any],
-    configured: Any,
-    secret_values: frozenset[str] | set[str],
-    at: tuple[Any, ...],
-) -> tuple[Any, list[_Unresolved]]:
-    known = configured if isinstance(configured, Mapping) else {}
-    originals: dict[Any, list[Any]] = {}
-    for key, stand_in in _hidden_keys(known, secret_values).items():
-        originals.setdefault(stand_in, []).append(key)
-    restored: dict[Any, Any] = {}
-    unresolved: list[_Unresolved] = []
-    for key, item in proposed.items():
-        matches = originals.get(key, [])
-        if len(matches) == 1:
-            original, counterpart = matches[0], known[matches[0]]
-        else:
-            # Unknown (the stand-ins are distinct by construction).
-            original, counterpart = key, _MISSING
-            if matches or _is_mask_marker(key):
-                unresolved.append(((*at, key), True, _UNMATCHED))
-        if original in restored:
-            # Two posted keys — a stand-in and the real key it stands for —
-            # name one key: neither value is chosen (gate-5 N3).
-            unresolved.append(((*at, key), True, _CONFLICTING))
-            continue
-        value, missed = _restore(item, counterpart, secret_values, (*at, original))
-        restored[original] = value
-        unresolved.extend(missed)
-    return restored, unresolved
+# ---------------------------------------------------------------------------
+# Patch controls (P19F9)
+#
+# A setting whose value a page cannot show exactly — a secret-set value or a
+# declared credential somewhere inside it, or a secret inside a longer text —
+# is never rendered as one text the browser posts back whole: masking is
+# lossy, and the old scheme of reconstructing the real value from the masked
+# text posted back mistook entries for one another (gate-6 N3, N5, N6). Such a
+# value is edited entry by entry instead. Every entry gets an identity
+# allocated at render time — a keyed digest of the page, the setting, the
+# entry's real path below it and its real value — revealed only as an opaque
+# token in the control's name, and mapped back to that exact place by
+# rendering the page again over the same configuration. A submission carries,
+# per control, its identity and either its untouched text (no change) or the
+# new value; the server applies those changes to the real value it loaded,
+# so an entry left alone keeps its real value without ever being sent, and
+# Check and Save validate the same real result. A part the page withheld is
+# never editable in place: it is kept, moved, removed or replaced whole.
+# ---------------------------------------------------------------------------
+
+#: The prefix of every patch control's name: ``@patch-<operation>-<token>``.
+PATCH_FIELD_PREFIX = "@patch-"
+#: The new value of an entry (its JSON text), or the whole replacement of a
+#: withheld entry (empty: kept).
+PATCH_VALUE = "value"
+#: ``true``: drop this list item or mapping entry.
+PATCH_REMOVE = "remove"
+#: The position of a list item (its index when untouched).
+PATCH_ORDER = "order"
+#: A new item appended to a list (JSON), on the list's token.
+PATCH_ITEM = "item"
+#: A new mapping entry's key and its value (JSON), on the mapping's token.
+PATCH_KEY = "key"
+PATCH_ENTRY = "entry"
+#: The placeholder of a control whose configured text is withheld.
+WITHHELD_PLACEHOLDER = "withheld: type a replacement, or leave empty to keep it"
 
 
-def _restore_list(
-    proposed: list[Any],
-    configured: Any,
-    secret_values: frozenset[str] | set[str],
-    at: tuple[Any, ...],
-) -> tuple[Any, list[_Unresolved]]:
-    known = configured if isinstance(configured, list) else []
-    # Configured entries grouped by what the page showed for them.
-    groups: list[tuple[Any, list[int]]] = []
-    for index, item in enumerate(known):
-        shown = _shown(item, secret_values)
-        for form, members in groups:
-            if _identical(form, shown):
-                members.append(index)
-                break
-        else:
-            groups.append((shown, [index]))
-    posted: dict[int, list[int]] = {}
-    for position, item in enumerate(proposed):
-        for number, (form, _members) in enumerate(groups):
-            if _identical(item, form):
-                posted.setdefault(number, []).append(position)
-                break
-    restored: list[Any] = list(proposed)
-    unresolved: list[_Unresolved] = []
-    matched: set[int] = set()
-    for number, positions in posted.items():
-        members = groups[number][1]
-        alike = all(_identical(known[index], known[members[0]]) for index in members)
-        if alike:
-            chosen = [members[min(count, len(members) - 1)] for count in range(len(positions))]
-        elif len(positions) == len(members):
-            # Entries shown alike are kept in their configured order: no
-            # reordering among them was visible, so none is expressed.
-            chosen = members
-        else:
-            # Some of several different entries shown alike were removed or
-            # added: which ones cannot be told.
-            unresolved.extend(((*at, position), False, _UNMATCHED) for position in positions)
-            continue
-        for position, index in zip(positions, chosen):
-            restored[position] = copy.deepcopy(known[index])
-            matched.add(index)
-    for position, item in enumerate(proposed):
-        if any(position in positions for positions in posted.values()):
-            continue
-        restored[position], missed = _restore_edited(
-            item, [known[index] for index in range(len(known)) if index not in matched],
-            secret_values, (*at, position),
-        )
-        unresolved.extend(missed)
-    return restored, unresolved
+@dataclass(frozen=True)
+class _PatchControl:
+    """One patch control: the place it edits and the text it posts untouched."""
+
+    page: str
+    #: The setting path the whole value is written at.
+    top: tuple[Any, ...]
+    #: The real keys and indexes of the entry below *top*.
+    relative: tuple[Any, ...]
+    operation: str
+    rendered: str
 
 
-def _restore_edited(
-    item: Any, candidates: list[Any], secret_values: frozenset[str] | set[str], at: tuple[Any, ...]
-) -> tuple[Any, list[_Unresolved]]:
-    """An edited list entry restored against the configured entry it came from.
+class _Refusal(str):
+    """A problem that refuses the whole submission before validation: the
+    posted changes cannot be applied unambiguously (P19F9). Check reports it
+    without running the checker, Save refuses on it; nothing is guessed."""
 
-    Every unmatched configured entry of the same kind is tried; the entry is
-    restored only when every candidate that resolves all its markers gives
-    the same result, otherwise it is unresolved.
+
+def _patched(
+    real: Any, relative: tuple[Any, ...], changes: Mapping[tuple[tuple[Any, ...], str], str], found: list[str]
+) -> Any:
+    """*real* with every posted change applied, and *found* extended with
+    every reason a change cannot be applied (P19F9).
+
+    *changes* maps ``(relative path, operation)`` to the posted text of each
+    control that was not left untouched. An entry with no change is copied
+    from *real* as it is: its value never travelled.
     """
 
-    alone, missed = _restore(item, _MISSING, secret_values, at)
-    if not missed:
-        return alone, []
-    results = []
-    conflicts: list[_Unresolved] = []
-    for candidate in candidates:
-        if isinstance(candidate, Mapping) != isinstance(item, Mapping) or isinstance(
-            candidate, list
-        ) != isinstance(item, list):
-            continue
-        result, left = _restore(item, candidate, secret_values, at)
-        if not left:
-            results.append(result)
-        elif all(why == _CONFLICTING for _path, _is_key, why in left):
-            # Matched but for keys posted twice: that is the refusal to name.
-            conflicts.extend(left)
-    if results and all(_identical(result, results[0]) for result in results):
-        return results[0], []
-    if conflicts and not results:
-        return item, conflicts
-    return item, [(at, False, _UNMATCHED)]
+    replaced = changes.get((relative, PATCH_VALUE))
+    if replaced is not None:
+        return _coerce("json", {}, replaced)
+    if isinstance(real, Mapping):
+        mapping: dict[Any, Any] = {}
+        for key, item in real.items():
+            child = (*relative, key)
+            if not _removed(child, changes, found):
+                mapping[key] = _patched(item, child, changes, found)
+        key_text = changes.get((relative, PATCH_KEY), "")
+        entry_text = changes.get((relative, PATCH_ENTRY), "")
+        if key_text or entry_text:
+            if not key_text:
+                found.append(_NEW_KEY_REASON)
+            elif any(_plain(key) == key_text for key in real):
+                # Kept or removed: the new entry is never merged into one.
+                found.append(_EXISTING_KEY_REASON)
+            else:
+                mapping[key_text] = _coerce("json", {}, entry_text)
+        return mapping
+    if isinstance(real, list):
+        kept: list[tuple[int, int, Any]] = []
+        for index, item in enumerate(real):
+            child = (*relative, index)
+            if _removed(child, changes, found):
+                continue
+            position = index
+            order = changes.get((child, PATCH_ORDER))
+            if order is not None:
+                if _INTEGER_TEXT.match(order.strip()):
+                    position = int(order.strip())
+                else:
+                    found.append(_ORDER_REASON)
+            kept.append((position, index, _patched(item, child, changes, found)))
+        # Equal positions keep their configured order.
+        items = [item for _position, _index, item in sorted(kept, key=lambda entry: entry[:2])]
+        added = changes.get((relative, PATCH_ITEM))
+        if added is not None and added.strip():
+            items.append(_coerce("json", {}, added))
+        return items
+    return _detached(real)
+
+
+def _removed(
+    child: tuple[Any, ...], changes: Mapping[tuple[tuple[Any, ...], str], str], found: list[str]
+) -> bool:
+    """Whether the entry at *child* is removed; an entry both removed and
+    edited is refused, never resolved one way or the other."""
+
+    flag = changes.get((child, PATCH_REMOVE))
+    if flag is None:
+        return False
+    if flag != "true":
+        found.append(_REMOVE_FLAG_REASON)
+        return False
+    for relative, operation in changes:
+        if relative[: len(child)] == child and (relative, operation) != (child, PATCH_REMOVE):
+            found.append(_REMOVED_AND_EDITED_REASON)
+            break
+    return True
 
 
 def _secret_set(view: ConfigView | None = None) -> frozenset[str]:
@@ -1925,6 +1888,19 @@ def _key_label(key: Any, view: ConfigView) -> str:
     return f"<code>{esc(_plain(key))}</code>"
 
 
+def _withheld_attributes() -> str:
+    """The attributes of an empty control standing for a withheld value."""
+
+    return f' placeholder="{ident(WITHHELD_PLACEHOLDER)}" data-withheld="true"'
+
+
+def _editable(text: str) -> str:
+    """The text a scalar control holds: *text*, or ``""`` when the page cannot
+    show it exactly — the control is then an empty replacement (P19F9)."""
+
+    return text if _guarded(text) == text else ""
+
+
 @dataclass(frozen=True)
 class _Control:
     """One rendered form control: what its posted text means (R5, R6).
@@ -1951,11 +1927,18 @@ class _SchemaRenderer:
     form is read back through the very controls the page rendered.
     """
 
-    def __init__(self, view: ConfigView) -> None:
+    def __init__(self, view: ConfigView, page: str = "") -> None:
         self.view = view
+        #: The page being rendered: a patch identity belongs to one page.
+        self.page = page
         self.controls: dict[str, _Control] = {}
         #: ``new_entry_*`` field suffix → the mapping path a new entry joins.
         self.entry_mappings: dict[str, tuple[Any, ...]] = {}
+        #: Patch control name → the place it edits (P19F9).
+        self.patches: dict[str, _PatchControl] = {}
+        #: Field name → path of a value edited entry by entry, whose whole
+        #: text is never posted (P19F9).
+        self.withheld: dict[str, tuple[Any, ...]] = {}
 
     def register(
         self,
@@ -2015,6 +1998,136 @@ class _SchemaRenderer:
         if value is _MISSING:
             return ""
         return self._masked(path, value, as_json=True)
+
+    # -- patch editors (P19F9) ------------------------------------------------
+
+    def _exact(self, path: Sequence[Any], value: Any) -> bool:
+        """Whether the page shows *value* at *path* exactly: no declared
+        credential literal, no secret-set value, no secret inside any text,
+        key or value, and a JSON round trip gives it back unchanged."""
+
+        secret_values = _secret_set(self.view)
+        if reference_name(value) is None and self.view.is_credential(path):
+            return False
+        if isinstance(value, Mapping):
+            return all(
+                isinstance(key, str)
+                and _exact_scalar(key, secret_values)
+                and self._exact((*path, key), item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return all(self._exact((*path, index), item) for index, item in enumerate(value))
+        return _exact_scalar(value, secret_values)
+
+    def _json_editor(self, path: Sequence[Any], schema: Mapping[str, Any], role: str, rows: int) -> str:
+        """The editor of the structured value at *path*.
+
+        A value the page shows exactly is one JSON text area, as ever: its
+        untouched text means "unchanged", and an edit is the new value. Any
+        other value is edited entry by entry (:meth:`_patch_node`); its
+        field name is then refused if posted (:data:`_WITHHELD_WHOLE_REASON`).
+        """
+
+        name = _field_name(path, self.view)
+        value = self.view.value(path)
+        if value is _MISSING or self._exact(path, value):
+            text = self._json_text(path)
+            self.register(path, "json", text, schema)
+            return f'<textarea name="{ident(name)}" data-json="{role}" rows="{rows}">{esc(text)}</textarea>'
+        self.withheld[name] = tuple(path)
+        return (
+            f'<div class="patch" data-json="{role}" data-patch-field="{ident(name)}">'
+            f"{self._patch_node(tuple(path), (), value)}</div>"
+        )
+
+    def _patch_token(self, top: tuple[Any, ...], relative: tuple[Any, ...], value: Any) -> str:
+        """The opaque identity of the entry at *relative* below *top*.
+
+        A keyed digest of the page, the setting, the entry's real path and
+        its real value: unique per place, meaningless without this UI's
+        field key, and unknown once the entry's value or place changed — a
+        stale identity is refused, never retargeted.
+        """
+
+        source = _RENDERING_FOR.get()
+        key = _PROCESS_FIELD_KEY if source is None else source.field_key
+        material = json.dumps(
+            [self.page, _field_name(top, self.view), _tagged(relative), _tagged(value)],
+            ensure_ascii=False,
+        )
+        return hmac.new(key, material.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+    def _patch_control(
+        self, operation: str, token: str, top: tuple[Any, ...], relative: tuple[Any, ...], rendered: str
+    ) -> str:
+        name = f"{PATCH_FIELD_PREFIX}{operation}-{token}"
+        self.patches[name] = _PatchControl(self.page, top, relative, operation, rendered)
+        return ident(name)
+
+    def _patch_node(self, top: tuple[Any, ...], relative: tuple[Any, ...], value: Any) -> str:
+        """The controls of the entry at *relative* below *top*.
+
+        Shown exactly: one control holding its JSON text. A list or mapping
+        that is not: an entry per item or key, each with its own identity,
+        a position (list) and a removal flag, and a row adding one entry. A
+        withheld scalar or credential: its masked text, read-only, and an
+        empty replacement control.
+        """
+
+        path = (*top, *relative)
+        token = self._patch_token(top, relative, value)
+        if self._exact(path, value):
+            # Exact data: no secret in it, so only syntax is serialized (gate-4 N4).
+            text = _Shown(json.dumps(value, ensure_ascii=False))
+            name = self._patch_control(PATCH_VALUE, token, top, relative, text)
+            if isinstance(value, (Mapping, list)):
+                return f'<textarea name="{name}" data-patch="value" rows="2">{esc(text)}</textarea>'
+            return f'<input type="text" name="{name}" data-patch="value" value="{esc(text)}">'
+        withheld = reference_name(value) is None and self.view.is_credential(path)
+        if isinstance(value, Mapping) and not withheld:
+            rows: list[str] = []
+            for position, (key, item) in enumerate(value.items()):
+                child = (*relative, key)
+                remove = self._patch_control(
+                    PATCH_REMOVE, self._patch_token(top, child, item), top, child, ""
+                )
+                rows.append(
+                    f'<li class="patch-entry" data-entry="{_key_token(position)}">'
+                    f'<span class="patch-key">{_key_label(key, self.view)}</span> '
+                    f"{self._patch_node(top, child, item)} "
+                    f'<label><input type="checkbox" name="{remove}" value="true"> remove</label></li>'
+                )
+            key_name = self._patch_control(PATCH_KEY, token, top, relative, "")
+            entry_name = self._patch_control(PATCH_ENTRY, token, top, relative, "")
+            rows.append(
+                f'<li class="patch-new">New entry <input type="text" name="{key_name}"> '
+                f'value (JSON) <textarea name="{entry_name}" rows="1"></textarea></li>'
+            )
+            return f'<ul class="patch-mapping">{"".join(rows)}</ul>'
+        if isinstance(value, list) and not withheld:
+            rows = []
+            for index, item in enumerate(value):
+                child = (*relative, index)
+                child_token = self._patch_token(top, child, item)
+                order = self._patch_control(PATCH_ORDER, child_token, top, child, str(index))
+                remove = self._patch_control(PATCH_REMOVE, child_token, top, child, "")
+                rows.append(
+                    '<li class="patch-entry">'
+                    f'<label>position <input type="number" step="1" name="{order}" value="{index}"></label> '
+                    f"{self._patch_node(top, child, item)} "
+                    f'<label><input type="checkbox" name="{remove}" value="true"> remove</label></li>'
+                )
+            item_name = self._patch_control(PATCH_ITEM, token, top, relative, "")
+            rows.append(
+                f'<li class="patch-new">New item (JSON) <textarea name="{item_name}" rows="1"></textarea></li>'
+            )
+            return f'<ol class="patch-list" start="0">{"".join(rows)}</ol>'
+        name = self._patch_control(PATCH_VALUE, token, top, relative, "")
+        return (
+            f'<code class="value withheld">{esc(self._masked(path, value))}</code> '
+            f'<input type="text" name="{name}" data-patch="replace" value=""{_withheld_attributes()}>'
+        )
 
     # -- nodes --------------------------------------------------------------
 
@@ -2174,8 +2287,7 @@ class _SchemaRenderer:
         value = self.view.value(path)
         if reference_name(value) is not None:
             # A reference is edited as its text, whatever the declared type.
-            self.register(path, kind, value, schema)
-            return f'<input type="text" name="{name}" value="{esc(value)}">'
+            return self._text_input(path, kind, schema, name, value)
         if self.view.is_credential(path):
             # A literal credential is never placed in the page (R8),
             # whatever control its declared type would get (enum, number, ...).
@@ -2209,14 +2321,36 @@ class _SchemaRenderer:
                     bounds += f' {attribute}="{esc(_plain(bound))}"'
             step = "1" if kind == "integer" else "any"
             shown = "" if value is _MISSING else _plain(value)
-            self.register(path, kind, shown, schema)
-            if _guarded(shown) != shown:
-                # A number input would post its redacted text as "".
-                return f'<input type="text" name="{name}" value="{esc(shown)}">'
-            return f'<input type="number" name="{name}"{bounds} step="{step}" value="{esc(shown)}">'
+            return self._text_input(path, kind, schema, name, shown, "number", f'{bounds} step="{step}"')
         shown = "" if value is _MISSING else _plain(value)
-        self.register(path, kind, shown, schema)
-        return f'<input type="text" name="{name}" value="{esc(shown)}">'
+        return self._text_input(path, kind, schema, name, shown)
+
+    def _text_input(
+        self,
+        path: Sequence[Any],
+        kind: str,
+        schema: Mapping[str, Any],
+        name: str,
+        text: str,
+        control: str = "text",
+        attributes: str = "",
+    ) -> str:
+        """An input holding *text*, or an empty replacement input when the
+        page cannot show *text* exactly (P19F9).
+
+        A text the redaction would change is never placed in the control:
+        posted back edited, it could not be told from literal text, and
+        reading it back would mean reconstructing the withheld part (gate-6
+        N3). The control starts empty — left empty it keeps the configured
+        value, and any text typed is the whole new value. The current value
+        is shown masked beside it (``current:``).
+        """
+
+        if _guarded(text) != text:
+            self.register(path, kind, "", schema)
+            return f'<input type="text" name="{name}" value=""{_withheld_attributes()}>'
+        self.register(path, kind, text, schema)
+        return f'<input type="{control}" name="{name}"{attributes} value="{esc(text)}">'
 
     def _boolean(self, schema: Mapping[str, Any], path: Sequence[Any], name: str, value: Any) -> str:
         """A three-state boolean: not set (inherit), ``true`` or ``false`` (gate F3).
@@ -2276,16 +2410,10 @@ class _SchemaRenderer:
         required: bool,
         live: bool,
     ) -> str:
-        """A list editor: one JSON text area, validated server-side."""
+        """A list editor: one JSON text area, validated server-side, or a
+        patch editor when the page cannot show the list exactly (P19F9)."""
 
-        if live:
-            self.register(path, "json", self._json_text(path), schema)
-        editor = (
-            f'<textarea name="{ident(_field_name(path, self.view))}" data-json="list" rows="3">'
-            f"{esc(self._json_text(path))}</textarea>"
-            if live
-            else ""
-        )
+        editor = self._json_editor(path, schema, "list", 3) if live else ""
         return (
             f'<div class="field list" {self._attributes(path, required, live)}>'
             f"<label>{self._label(schema, path, required)} {editor}</label>"
@@ -2307,12 +2435,10 @@ class _SchemaRenderer:
                 if key in known:
                     continue
                 entry_path = (*path, key)
-                self.register(entry_path, "json", self._json_text(entry_path), schema)
                 rows.append(
                     f'<div class="entry" data-entry="{_key_token(position)}">'
                     f"<label>Entry {_key_label(key, self.view)} "
-                    f'<textarea name="{ident(_field_name(entry_path, self.view))}" data-json="entry" rows="2">'
-                    f"{esc(self._json_text(entry_path))}</textarea></label> "
+                    f"{self._json_editor(entry_path, schema, 'entry', 2)}</label> "
                     f'<span class="origin">origin: {esc(self.origin(entry_path))}</span></div>'
                 )
             self.entry_mappings[_field_name(path, self.view)] = tuple(path)
@@ -2744,7 +2870,8 @@ class ConfigUI:
             '<section id="modules-directory"><h2>Modules directory</h2>'
             f'<form method="post" action="/save">{_write_guard(session, view)}{_page_field(CORE_PAGE)}'
             '<label>modules_directory '
-            f'<input type="text" name="modules_directory" value="{esc(directory)}"></label> '
+            f'<input type="text" name="modules_directory" value="{esc(_editable(directory))}"'
+            f'{"" if _editable(directory) == directory else _withheld_attributes()}></label> '
             f'<span class="origin">origin: {esc(self._origin(view, ("modules_directory",)))}</span> '
             f'<button type="submit">Save</button> {_CHECK_BUTTON}</form></section>',
             self._limits_section(view, session),
@@ -2782,7 +2909,8 @@ class ConfigUI:
                     f"<td><label>{ident(field_name)}</label></td>"
                     f'<td class="kind">{ident(kind)}</td>'
                     f'<td><input {control} name="{ident(_field_name(path, view))}" '
-                    f'value="{esc(shown or "")}"></td>'
+                    f'value="{esc(_editable(shown or ""))}"'
+                    f'{"" if _editable(shown or "") == (shown or "") else _withheld_attributes()}></td>'
                     f'<td class="origin">{esc(self._origin(view, path))}</td></tr>'
                 )
             groups.append(
@@ -2882,9 +3010,9 @@ class ConfigUI:
         module = view.modules.get(name)
         if module is None:
             return _text(404, "404 Not Found")
-        renderer = _SchemaRenderer(view)
-        fields = self._module_fields(renderer, name, module)
         page = f"{MODULE_PAGE_PREFIX}{name}"
+        renderer = _SchemaRenderer(view, page)
+        fields = self._module_fields(renderer, name, module)
         form_id = "settings-form"
         running = self.running_state()
         body = [
@@ -3101,18 +3229,20 @@ class ConfigUI:
         renderer = _SchemaRenderer(view)
         placeholder = _Session(csrf_token="")
         for name, module in view.modules.items():
+            renderer.page = f"{MODULE_PAGE_PREFIX}{name}"
             self._module_fields(renderer, name, module)
             if _trigger_types(module.manifest):
                 self._trigger_section(view, renderer, placeholder, name, module.manifest)
+        renderer.page = CORE_PAGE
         directory = ("modules_directory",)
-        renderer.register(directory, "string", view.display(directory) or "")
+        renderer.register(directory, "string", _editable(view.display(directory) or ""))
         for group, fields in LIMIT_DECLARATION.items():
             for field_name, kind in fields.items():
                 path = ("limits", group, field_name)
                 renderer.register(
                     path,
                     "integer" if kind == LIMIT_KIND_COUNT else "number",
-                    view.display(path) or "",
+                    _editable(view.display(path) or ""),
                 )
         return renderer
 
@@ -3130,7 +3260,11 @@ class ConfigUI:
 
         renderer = self._controls(view)
         posted: dict[str, str] = {}
+        patches: list[tuple[str, str]] = []
         for name, value in fields:
+            if name.startswith(PATCH_FIELD_PREFIX):
+                patches.append((name, value))  # every one counted: a duplicate is refused
+                continue
             posted[name] = value  # the last value wins (a checkbox after its hidden twin)
         edits: dict[tuple[Any, ...], Any] = {}
         problems: list[str] = []
@@ -3166,18 +3300,78 @@ class ConfigUI:
                 continue
             control = renderer.controls.get(name)
             if control is None:
-                problems.append(f"{name}: is not a setting this UI edits")
+                if name in renderer.withheld:
+                    # Never read back: its text could only be applied by
+                    # reconstructing what the page withheld (P19F9).
+                    problems.append(_Refusal(f"{name}: {_WITHHELD_WHOLE_REASON}"))
+                else:
+                    problems.append(f"{name}: is not a setting this UI edits")
                 continue
             if text == control.rendered:
                 continue
             value = _coerce(control.kind, control.schema, text)
             _draft_edit(edits, policies, view, control.path, value)
+        if patches:
+            patched, refusals = self._patched_settings(view, renderer, fields, patches)
+            problems.extend(refusals)
+            for path, value in patched.items():
+                _draft_edit(edits, policies, view, path, value)
         ordered: list[Edit] = []
         if enabled is not None:
             ordered.append((("enabled_modules",), enabled))
         ordered.extend(edits.items())
         ordered.extend(policies.items())
         return ordered, problems
+
+    def _patched_settings(
+        self,
+        view: ConfigView,
+        renderer: _SchemaRenderer,
+        fields: Sequence[tuple[str, str]],
+        patches: Sequence[tuple[str, str]],
+    ) -> tuple[dict[tuple[Any, ...], Any], list[str]]:
+        """The settings the posted patch controls change, each the real
+        configured value with the changes applied (:func:`_patched`), and the
+        refusals (P19F9).
+
+        Each control is mapped back through the identity this page rendered
+        over the current configuration. An unknown identity (never
+        rendered, truncated, stale, from another page) or one posted twice
+        refuses the submission by name; so does a change that cannot be
+        applied unambiguously. A refused setting is left out whole: nothing
+        is written from a submission that was not applied as posted.
+        """
+
+        page = self._posted_page(fields, view)
+        # An unknown identity names no setting: it is reported on its page.
+        where = page
+        if page.startswith(MODULE_PAGE_PREFIX):
+            where = f"{MODULES_KEY}.{page[len(MODULE_PAGE_PREFIX) :]}"
+        refusals: list[str] = []
+        seen: set[str] = set()
+        changes: dict[tuple[Any, ...], dict[tuple[tuple[Any, ...], str], str]] = {}
+        for name, text in patches:
+            control = renderer.patches.get(name)
+            if control is None or control.page != page:
+                refusals.append(_Refusal(f"{where}: {_UNKNOWN_ENTRY_REASON}"))
+                continue
+            label = _field_name(control.top, view)
+            if name in seen:
+                refusals.append(_Refusal(f"{label}: {_DUPLICATE_ENTRY_REASON}"))
+                continue
+            seen.add(name)
+            if text != control.rendered:
+                changes.setdefault(control.top, {})[(control.relative, control.operation)] = text
+        settings: dict[tuple[Any, ...], Any] = {}
+        for top, changed in changes.items():
+            found: list[str] = []
+            value = _patched(view.value(top), (), changed, found)
+            if found:
+                label = _field_name(top, view)
+                refusals.extend(_Refusal(f"{label}: {reason}") for reason in dict.fromkeys(found))
+            else:
+                settings[top] = value
+        return settings, list(dict.fromkeys(refusals))
 
     @staticmethod
     def _added_policy(
@@ -3236,14 +3430,12 @@ class ConfigUI:
 
         view = self.view() if view is None else view
         secret_values = set(self.secret_values)
-        # The values Save would write, not the placeholders the page showed:
-        # the same restoration, an unmatched placeholder the same refusal
-        # (gate-4 N3).
-        edits, unmatched = _draft_edits(view, edits)
-        problems = (*problems, *unmatched)
-        if unmatched:
-            # Refused before validation, as Save refuses it: the checker
-            # never sees a placeholder or a value chosen between aliases.
+        # The draft Save would write: the same normalisation (gate-4 N3).
+        edits = _draft_edits(view, edits)
+        if any(isinstance(line, _Refusal) for line in problems):
+            # A submission that cannot be applied as posted is refused before
+            # validation, as Save refuses it: the checker never sees a value
+            # chosen by guessing (P19F9).
             result = CheckResult(
                 False,
                 tuple(_redact(line, secret_values) for line in problems),
@@ -3907,13 +4099,21 @@ _OUTCOME_STATUS = {
 
 _PROTECTED_REASON = "a protected field must keep its configured text"
 _READ_ONLY_BLOCK = "is read-only in v1"
-_UNMATCHED_REASON = (
-    "a hidden value cannot be matched to exactly one configured entry; edit it in the configuration file"
+#: Why a patch submission is refused before validation (P19F9, value-free).
+_UNKNOWN_ENTRY_REASON = (
+    "a posted entry is not one this page rendered from the current configuration "
+    "(unknown, stale or from another page); reload the page"
 )
-_CONFLICTING_REASON = (
-    "a hidden key and its configured key were both posted, or two posted keys name one "
-    "configured key; keep only one of them"
+_DUPLICATE_ENTRY_REASON = "an entry was posted more than once; post each entry once"
+_WITHHELD_WHOLE_REASON = (
+    "holds a withheld value and is edited entry by entry, never as one text; "
+    "edit its entries, or edit it in the configuration file"
 )
+_REMOVED_AND_EDITED_REASON = "an entry marked for removal was also edited; remove it or edit it, not both"
+_EXISTING_KEY_REASON = "a new entry names a key the setting already has; edit that entry instead"
+_NEW_KEY_REASON = "a new entry needs a key"
+_ORDER_REASON = "an entry position must be a whole number"
+_REMOVE_FLAG_REASON = "a removal flag must be 'true'"
 _OUTSIDE_SCOPE = "is outside the settings this UI writes"
 
 
@@ -4074,82 +4274,55 @@ def _same(left: Any, right: Any) -> bool:
     return type(left) is type(right) and left == right
 
 
-def _draft_edits(view: ConfigView, edits: Sequence[Edit]) -> tuple[list[Edit], list[str]]:
-    """*edits* as the draft holds them (:func:`_draft_value`), and every
-    placeholder that could not be restored — the draft Check validates."""
+def _draft_edits(view: ConfigView, edits: Sequence[Edit]) -> list[Edit]:
+    """*edits* as the draft holds them (:func:`_draft_value`): the draft
+    Check validates and Save writes."""
 
-    restored: list[Edit] = []
-    unmatched: list[str] = []
-    for path, value in edits:
-        path = tuple(path)
-        value, refusals = _draft_value(view, path, value)
-        restored.append((path, value))
-        unmatched.extend(refusals)
-    return restored, unmatched
+    return [(tuple(path), _draft_value(view, tuple(path), value)) for path, value in edits]
 
 
-def _draft_value(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[Any, list[str]]:
-    """A posted *value* with every placeholder the page showed put back, and
-    the refusal of any it could not put back.
+def _draft_value(view: ConfigView, path: tuple[Any, ...], value: Any) -> Any:
+    """*value* as the draft holds it: the one normalisation Check and Save
+    share (gate-4 N3).
 
-    The one draft normalisation Check and Save share (gate-4 N3), so both
-    validate the real values the operator kept, never the placeholders: a
-    secret-set value or key the page withheld or redacted is restored by
-    :func:`_unmask_secrets` — nested keys, reordered and removed list entries
-    included — and a credential a JSON editor showed as
-    :data:`HIDDEN_LITERAL` becomes its configured literal again. A masking
-    marker that cannot be matched to exactly one configured value (edited,
-    duplicated or ambiguous) is refused, naming why: a value is never
-    guessed and a placeholder never written (P19F5 review A1/A2). So are
-    two posted keys that name one configured key — a stand-in beside the
-    real key it stands for: neither value is chosen (gate-5 N3).
+    A declared credential below *path* given as exactly
+    :data:`HIDDEN_LITERAL` keeps its configured literal (a credential is
+    protected: it can only keep its text). Nothing else is ever restored:
+    the routes post real values — a patch applied to the configured value
+    (:func:`_patched`) or the exact text of a control that showed its value
+    exactly — so no value is ever inferred from masked text (P19F9).
     """
 
     current = view.value(path)
-    secret_values = _secret_set(view)
-    value, unresolved = _unmask_secrets(value, current, secret_values)
-    hidden = (HIDDEN_LITERAL, _redact(HIDDEN_LITERAL, secret_values))
+    if current is _MISSING:
+        return value
     for relative, kind in _protected_descendants(view, path):
-        if kind != "credential" or current is _MISSING:
+        if kind != "credential":
             continue
         configured = _lookup(current, relative)
-        if configured is not _MISSING and _lookup(value, relative) in hidden:
+        proposed = _lookup(value, relative)
+        if configured is not _MISSING and isinstance(proposed, str) and proposed == HIDDEN_LITERAL:
             value = copy.deepcopy(value)
             _set_path(value, relative, configured)
-    reasons = {
-        why
-        for relative, is_key, why in unresolved
-        if is_key or _has_mask_marker(_lookup(value, relative))
-    }
-    # The field path only: a relative path may hold a restored key.
-    return value, [
-        f"{_path_text(path)}: {reason}"
-        for why, reason in ((_UNMATCHED, _UNMATCHED_REASON), (_CONFLICTING, _CONFLICTING_REASON))
-        if why in reasons
-    ]
+    return value
 
 
 def _protect_save(view: ConfigView, path: tuple[Any, ...], value: Any) -> tuple[Any, list[str]]:
     """*value* as the draft holds it (:func:`_draft_value`), and every
-    protection refusal.
-
-    Hidden credentials and every secret-set value or key the page withheld
-    are restored before the comparison (gate-3 F2); an unmatched masking
-    marker refuses the Save.
-    """
+    protection refusal."""
 
     refusals = _direct_protection(view, path)
     if refusals:
         return value, refusals
     current = view.value(path)
-    value, unmatched = _draft_value(view, path, value)
+    value = _draft_value(view, path, value)
     for relative, kind in _protected_descendants(view, path):
         configured = _lookup(current, relative) if current is not _MISSING else _MISSING
         proposed = _lookup(value, relative)
         kept = proposed is not _MISSING if kind == "key" else _same(proposed, configured)
         if not kept:
             refusals.append(f"{_path_text((*path, *relative))}: {_PROTECTED_REASON}")
-    return value, refusals + unmatched
+    return value, refusals
 
 
 def _protect_remove(

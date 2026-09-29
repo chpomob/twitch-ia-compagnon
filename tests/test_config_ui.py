@@ -5259,7 +5259,13 @@ def test_f2_a_short_secret_in_an_ordinary_setting_is_never_rendered(
 ) -> None:
     """Gate-1 C/F2a as a running test: a 3-character ``${GATE_SECRET}`` equal
     to ``modules.twitch.companion_name`` used to be shown as ``value="q7Z"``;
-    a 1-character one is covered too. The reference stays visible."""
+    a 1-character one is covered too. The reference stays visible.
+
+    P19F9: a value the page cannot show exactly is no longer placed in its
+    input as masked text (posted back edited, ``[hidden]x`` could not be told
+    from literal text, gate-6 N3): the input starts empty — left empty it
+    keeps the configured value — and any text typed is the whole new value,
+    never merged with the withheld text."""
 
     ui = _twitch_ui(
         tmp_path,
@@ -5277,17 +5283,23 @@ def test_f2_a_short_secret_in_an_ordinary_setting_is_never_rendered(
     core = _get(ui, "/core", cookie).body.decode("utf-8")
     assert "${GATE_SECRET}" in core
     module = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
-    assert 'name="modules.twitch.companion_name" value="[hidden]"' in module
-    # The field posted back as the page drew it is no edit: "[hidden]" is
-    # never written over the configured value.
+    placeholder = _html.escape(config_ui.WITHHELD_PLACEHOLDER, quote=True)
+    assert (
+        f'name="modules.twitch.companion_name" value="" placeholder="{placeholder}" data-withheld="true"'
+        in module
+    )
+    # The field posted back as the page drew it is no edit: nothing is
+    # written over the configured value.
     token = config_ui._RENDERING_FOR.set(ui)
     try:
-        edits, problems = ui.parse_edits(
-            ui.view(), [("modules.twitch.companion_name", "[hidden]")]
-        )
+        edits, problems = ui.parse_edits(ui.view(), [("modules.twitch.companion_name", "")])
+        assert (edits, problems) == ([], [])
+        # Typed text is the whole new value, taken as posted: never read
+        # back as the withheld text it resembles.
+        edits, problems = ui.parse_edits(ui.view(), [("modules.twitch.companion_name", "[hidden]")])
     finally:
         config_ui._RENDERING_FOR.reset(token)
-    assert (edits, problems) == ([], [])
+    assert (edits, problems) == ([(("modules", "twitch", "companion_name"), "[hidden]")], [])
 
 
 def test_f2_a_credential_used_as_a_trigger_channel_key_is_never_rendered(
@@ -5727,7 +5739,8 @@ def test_n1_a_configured_secret_is_still_never_rendered_beside_the_boolean_token
     keep = config_ui._KEEP_NON_BOOLEAN
     assert 'data-effective="[hidden]"' in control
     assert _rendered_options(control) == [(keep, "[hidden] (not a boolean)"), ("true", "true"), ("false", "false")]
-    assert 'name="modules.audio_output.synthesis.endpoint" value="[hidden]"' in html_page
+    # P19F9: the endpoint equal to a secret is an empty replacement input.
+    assert 'name="modules.audio_output.synthesis.endpoint" value="" placeholder=' in html_page
     token = config_ui._RENDERING_FOR.set(ui)
     try:
         assert ui.parse_edits(ui.view(), [(PROBE_FIELD, keep)]) == ([], [])
@@ -5967,6 +5980,156 @@ def _scalars(value: object) -> Iterator[object]:
         yield value
 
 
+# ---------------------------------------------------------------------------
+# P19F9 (gate-6 N3, N5, N6): a value the page cannot show exactly is edited
+# entry by entry, each entry named by an opaque identity; the server applies
+# the posted changes to the real configuration and never reconstructs a value
+# from masked text. The tests below drive the patch controls as a browser
+# posts them: every text control with its text, a checkbox only when ticked.
+# ---------------------------------------------------------------------------
+
+
+_VOID_TAGS = frozenset({"input", "br", "meta", "link", "img", "hr", "col", "area", "base", "wbr"})
+
+
+class _PatchEditors(HTMLParser):
+    """Every patch editor of a page as nested entries.
+
+    A node is the editor's root or one ``li.patch-entry``: ``controls`` maps
+    an operation (``value``, ``order``, ``remove``, ``item``, ``key``,
+    ``entry``) to its control's name and ``values`` to the text it posts
+    untouched; ``entries`` are its children in page order; ``key`` is the
+    shown key label of a mapping entry, ``withheld`` the shown text of a
+    withheld value and ``replace`` whether its value control is an empty
+    replacement.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fields: dict[str, dict[str, Any]] = {}
+        self._stack: list[tuple[str, dict[str, Any] | None]] = []
+        self._capture: tuple[str, dict[str, Any], str] | None = None
+
+    @staticmethod
+    def _new() -> dict[str, Any]:
+        return {"entries": [], "controls": {}, "values": {}, "key": None, "withheld": None, "replace": False}
+
+    def _current(self) -> dict[str, Any] | None:
+        return next((node for _tag, node in reversed(self._stack) if node is not None), None)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {name: value or "" for name, value in attrs}
+        classes = attributes.get("class", "").split()
+        node = None
+        if tag == "div" and "patch" in classes:
+            node = self._new()
+            node["field"] = attributes["data-patch-field"]
+            self.fields[attributes["data-patch-field"]] = node
+        elif tag == "li" and "patch-entry" in classes:
+            node = self._new()
+            parent = self._current()
+            assert parent is not None
+            parent["entries"].append(node)
+        current = node or self._current()
+        name = attributes.get("name", "")
+        if current is not None and name.startswith(config_ui.PATCH_FIELD_PREFIX):
+            operation = name[len(config_ui.PATCH_FIELD_PREFIX) :].split("-", 1)[0]
+            assert operation not in current["controls"], name
+            current["controls"][operation] = name
+            if tag == "textarea":
+                current["values"][operation] = ""
+                self._capture = ("textarea", current, operation)
+            elif attributes.get("type") != "checkbox":
+                current["values"][operation] = attributes.get("value", "")
+            if attributes.get("data-patch") == "replace":
+                current["replace"] = True
+        if current is not None and tag == "span" and "patch-key" in classes:
+            current["key"] = ""
+            self._capture = ("span", current, "key")
+        if current is not None and tag == "code" and "withheld" in classes:
+            current["withheld"] = ""
+            self._capture = ("code", current, "withheld")
+        if tag not in _VOID_TAGS:
+            self._stack.append((tag, node))
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._capture is not None and self._capture[0] == tag:
+            self._capture = None
+        while self._stack:
+            popped, _node = self._stack.pop()
+            if popped == tag:
+                break
+
+    def handle_data(self, data: str) -> None:
+        if self._capture is None:
+            return
+        _tag, node, slot = self._capture
+        if slot in ("key", "withheld"):
+            node[slot] += data
+        else:
+            node["values"][slot] += data
+
+
+def _patch_editors(page: str) -> dict[str, dict[str, Any]]:
+    parser = _PatchEditors()
+    parser.feed(page)
+    parser.close()
+    return parser.fields
+
+
+def _patch_editor(page: str, suffix: str) -> dict[str, Any]:
+    """The one patch editor of *page* whose field name ends in *suffix*."""
+
+    found = [node for field, node in _patch_editors(page).items() if field.endswith(suffix)]
+    assert len(found) == 1, list(_patch_editors(page))
+    return found[0]
+
+
+def _browser(node: dict[str, Any]) -> list[tuple[str, str]]:
+    """What a browser posts for *node* left untouched: every text control's
+    text, no checkbox."""
+
+    fields = [(name, node["values"].get(operation, "")) for operation, name in node["controls"].items()
+              if operation != config_ui.PATCH_REMOVE]
+    for child in node["entries"]:
+        fields.extend(_browser(child))
+    return fields
+
+
+def _submitted(node: dict[str, Any], changes: Mapping[str, str]) -> list[tuple[str, str]]:
+    """The browser's post of *node* with *changes* typed or ticked."""
+
+    fields = [(name, changes.get(name, text)) for name, text in _browser(node)]
+    posted = {name for name, _text in fields}
+    return fields + [(name, text) for name, text in changes.items() if name not in posted]
+
+
+def _exact_values(node: dict[str, Any]) -> Iterator[Any]:
+    """The decoded text of every exact value control under *node*."""
+
+    if config_ui.PATCH_VALUE in node["controls"] and not node["replace"]:
+        yield json.loads(node["values"][config_ui.PATCH_VALUE])
+    for child in node["entries"]:
+        yield from _exact_values(child)
+
+
+def _observed(ui: ConfigUI) -> list[Any]:
+    """Every draft the checker is handed from now on (it passes them all)."""
+
+    seen: list[Any] = []
+    ui.checker = lambda base, environ, overlay, draft: (seen.append(json.loads(json.dumps(draft))) or True, [])
+    return seen
+
+
+def _check_then_save(ui: ConfigUI, cookie: str, module: str, fields: list[tuple[str, str]]) -> tuple[str, UIResponse]:
+    """POST *fields* to Check, then the same fields to Save, from *module*'s page."""
+
+    page = f"{MODULE_PAGE_PREFIX}{module}"
+    check = _write(ui, cookie, "/check", page, fields)
+    assert check.status == 200
+    return check.body.decode("utf-8"), _write(ui, cookie, "/save", page, fields)
+
+
 @pytest.mark.parametrize("secret", _F2_JSON_SECRETS)
 def test_f2_a_secret_used_as_a_list_key_or_value_is_never_rendered(
     tmp_path: Path, secret: str
@@ -5975,9 +6138,12 @@ def test_f2_a_secret_used_as_a_list_key_or_value_is_never_rendered(
     collected secret ``a"b`` as a mapping key at
     ``modules.brain.delivery.actions[0].arguments`` decoded exactly from the
     JSON textarea, and ``modules.audio_output.voices.allowed: ['a"b']`` was
-    recovered by ``json.loads(html.unescape(textarea))[0]``. Every scalar
-    equal to the secret — key or value, at any depth — is now withheld before
-    serialization; a non-secret value stays visible."""
+    recovered by ``json.loads(html.unescape(textarea))[0]``.
+
+    P19F9: a value holding a secret is no longer one JSON text; it is an
+    editor per entry. Every exact control still decodes and no decoded
+    scalar holds the secret; withheld entries show masked text only, and
+    each key is a label, never a generated attribute."""
 
     ui = _f2_value_ui(tmp_path, secret)
     assert secret in ui.view().secret_values
@@ -5987,25 +6153,27 @@ def test_f2_a_secret_used_as_a_list_key_or_value_is_never_rendered(
         assert secret not in page, name
         assert secret not in _html.unescape(page), name
         assert json.dumps(secret)[1:-1] not in _html.unescape(page), name
-        decoded = _decoded_textareas(page)
-        assert decoded, name
-        for document in decoded:
-            assert all(secret not in str(scalar) for scalar in _scalars(document)), name
+        editors = _patch_editors(page)
+        assert editors, name
+        for node in editors.values():
+            assert all(secret not in str(scalar) for value in _exact_values(node) for scalar in _scalars(value))
 
-    brain = _decoded_textareas(_module_html(ui, cookie, "brain"))
-    actions = next(item for item in brain if isinstance(item, list) and item and "arguments" in item[0])
-    assert actions[0]["arguments"] == {
-        HIDDEN_LITERAL: "v",
-        "plain": HIDDEN_LITERAL,
-        "nested": [{"deep": HIDDEN_LITERAL}],
-        f"k{config_ui.REDACTED}": 2,
-    }
-    assert actions[0]["action"] == "reply"
-    audio = _decoded_textareas(_module_html(ui, cookie, "audio_output"))
-    allowed = next(item for item in audio if isinstance(item, list) and "kept" in item)
-    assert allowed[0] == HIDDEN_LITERAL
-    assert allowed[1] == "kept"
-    assert secret not in allowed[2]
+    actions = _patch_editor(_module_html(ui, cookie, "brain"), "delivery.actions")
+    (action,) = actions["entries"]
+    by_key = {entry["key"]: entry for entry in action["entries"]}
+    assert list(by_key) == ["action", "arguments"]
+    assert list(_exact_values(by_key["action"])) == ["reply"]
+    arguments = by_key["arguments"]["entries"]
+    assert [entry["key"] for entry in arguments] == [config_ui.REDACTED, "plain", "nested", f"k{config_ui.REDACTED}"]
+    assert list(_exact_values(arguments[0])) == ["v"]
+    assert arguments[1]["replace"] and arguments[1]["withheld"] == HIDDEN_LITERAL
+    (deep,) = arguments[2]["entries"][0]["entries"]
+    assert deep["key"] == "deep" and deep["withheld"] == HIDDEN_LITERAL
+    assert list(_exact_values(arguments[3])) == [2]
+    allowed = _patch_editor(_module_html(ui, cookie, "audio_output"), "voices.allowed")["entries"]
+    assert allowed[0]["withheld"] == HIDDEN_LITERAL
+    assert list(_exact_values(allowed[1])) == ["kept"]
+    assert secret not in allowed[2]["withheld"]
     # The reference and its set state stay visible.
     core = _get(ui, "/core", cookie).body.decode("utf-8")
     assert "${GATE_SECRET}" in core
@@ -6013,7 +6181,10 @@ def test_f2_a_secret_used_as_a_list_key_or_value_is_never_rendered(
 
 
 def test_f2_two_secret_keys_in_one_mapping_get_distinct_stand_ins(tmp_path: Path) -> None:
-    """Gate-3 F2: withheld keys stay distinct, so neither overwrites the other."""
+    """Gate-3 F2: withheld keys stay distinct, so neither overwrites the other.
+
+    P19F9: each key is its own entry with its own identity, whatever its
+    shown label; editing one entry's value changes that entry only."""
 
     ui = _twitch_ui(
         tmp_path,
@@ -6024,60 +6195,57 @@ def test_f2_two_secret_keys_in_one_mapping_get_distinct_stand_ins(tmp_path: Path
         {"ONE": 'k1"', "TWO": 'k2"'},
     )
     cookie = _logged_in(ui)
-    brain = _decoded_textareas(_module_html(ui, cookie, "brain"))
-    actions = next(item for item in brain if isinstance(item, list) and item and "arguments" in item[0])
-    assert actions[0]["arguments"] == {HIDDEN_LITERAL: 1, f"{HIDDEN_LITERAL} (2)": 2, "other": 3}
+    actions = _patch_editor(_module_html(ui, cookie, "brain"), "delivery.actions")
+    arguments = actions["entries"][0]["entries"][1]["entries"]
+    assert [entry["key"] for entry in arguments] == [config_ui.REDACTED, config_ui.REDACTED, "other"]
+    names = {entry["controls"][config_ui.PATCH_VALUE] for entry in arguments}
+    assert len(names) == 3
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain",
+        _submitted(actions, {arguments[1]["controls"][config_ui.PATCH_VALUE]: "5"}),
+    )
+    assert response.status == 303, _written(response)
+    saved = _overlay_doc(tmp_path / "config.local.yaml")
+    assert saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"] == {'k1"': 1, 'k2"': 5, "other": 3}
 
 
 def test_f2_an_edited_json_field_puts_withheld_values_and_keys_back(tmp_path: Path) -> None:
-    """Gate-3 F2: a JSON field edited around its withheld entries saves the
+    """Gate-3 F2: a field edited around its withheld entries saves the
     configured secret, never the placeholder (value and key alike, a secret
-    inside a longer text included)."""
+    inside a longer text included).
+
+    P19F9: the withheld entries are never posted at all; the appended item
+    and the added key are the only changes applied to the real values."""
 
     secret = 'a"b'
     ui = _f2_value_ui(tmp_path, secret)
     cookie = _logged_in(ui)
-    page = _module_html(ui, cookie, "audio_output")
-    field = re.search(r'<textarea name="([^"]*voices\.allowed)"', page)
-    assert field is not None
-    allowed = json.loads(_html.unescape(re.search(
-        rf'<textarea name="{re.escape(field.group(1))}"[^>]*>(.*?)</textarea>', page, re.S
-    ).group(1)))
-    allowed.append("added")
+    allowed = _patch_editor(_module_html(ui, cookie, "audio_output"), "voices.allowed")
     response = _write(
         ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
-        [(field.group(1), json.dumps(allowed))],
+        _submitted(allowed, {allowed["controls"][config_ui.PATCH_ITEM]: '"added"'}),
     )
     assert response.status == 303, _written(response)
     saved = _overlay_doc(tmp_path / "config.local.yaml")
-    written = saved["modules"]["audio_output"]["voices"]["allowed"]
-    assert written[0] == secret
-    assert written[1:3] == ["kept", f"x{secret}y"]
-    assert written[-1] == "added"
-    assert HIDDEN_LITERAL not in written
+    assert saved["modules"]["audio_output"]["voices"]["allowed"] == [secret, "kept", f"x{secret}y", "added"]
 
-    brain_page = _module_html(ui, cookie, "brain")
-    field = re.search(r'<textarea name="([^"]*delivery\.actions)"', brain_page)
-    assert field is not None
-    actions = json.loads(_html.unescape(re.search(
-        rf'<textarea name="{re.escape(field.group(1))}"[^>]*>(.*?)</textarea>', brain_page, re.S
-    ).group(1)))
-    actions[0]["arguments"]["added"] = 1
+    actions = _patch_editor(_module_html(ui, cookie, "brain"), "delivery.actions")
+    arguments = actions["entries"][0]["entries"][1]
     response = _write(
-        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain", [(field.group(1), json.dumps(actions))]
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain",
+        _submitted(actions, {
+            arguments["controls"][config_ui.PATCH_KEY]: "added",
+            arguments["controls"][config_ui.PATCH_ENTRY]: "1",
+        }),
     )
     assert response.status == 303, _written(response)
     saved = _overlay_doc(tmp_path / "config.local.yaml")
-    arguments = saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"]
-    assert arguments[secret] == "v"
-    assert arguments["plain"] == secret
-    assert arguments["nested"] == [{"deep": secret}]
-    assert arguments[f"k{secret}"] == 2
-    assert arguments["added"] == 1
-    assert HIDDEN_LITERAL not in arguments
+    assert saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"] == {
+        secret: "v", "plain": secret, "nested": [{"deep": secret}], f"k{secret}": 2, "added": 1,
+    }
 
 
-@pytest.mark.parametrize("secret", ['a"b', "a\\b", "a\nb", "é "])
+@pytest.mark.parametrize("secret", ['a"b', "a\\b", "a\nb", "é "])
 def test_f2_a_json_spelled_secret_is_redacted_from_errors_and_diagnostics(secret: str) -> None:
     """Gate-3 F2: ``_redaction_forms`` held the raw and HTML spellings only, so
     a secret serialized by ``json.dumps`` (``a\\"b``) passed through error and
@@ -6094,7 +6262,8 @@ def test_f2_a_json_spelled_secret_is_redacted_from_errors_and_diagnostics(secret
 
 
 # ---------------------------------------------------------------------------
-# P19F5 review: the Save restoration matches entries by what the page showed
+# P19F5 review, under P19F9: list entries keep their identity through
+# removal, reordering and appending
 # ---------------------------------------------------------------------------
 
 
@@ -6117,10 +6286,30 @@ def _json_field(page: str, suffix: str) -> tuple[str, Any]:
     return match.group(1), json.loads(_html.unescape(match.group(2)))
 
 
-def _save_allowed(ui: ConfigUI, cookie: str, edit: Callable[[list[Any]], list[Any]]) -> UIResponse:
-    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+def _allowed_editor(ui: ConfigUI, cookie: str) -> dict[str, Any]:
+    return _patch_editor(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+
+
+def _allowed_changes(editor: dict[str, Any], *, order: Sequence[int] | None = None,
+                     remove: Sequence[int] = (), append: Any = None) -> dict[str, str]:
+    """The changes a browser posts to reorder, remove and append entries."""
+
+    changes: dict[str, str] = {}
+    for index, entry in enumerate(editor["entries"]):
+        if order is not None:
+            changes[entry["controls"][config_ui.PATCH_ORDER]] = str(order[index])
+        if index in remove:
+            changes[entry["controls"][config_ui.PATCH_REMOVE]] = "true"
+    if append is not None:
+        changes[editor["controls"][config_ui.PATCH_ITEM]] = json.dumps(append)
+    return changes
+
+
+def _save_allowed(ui: ConfigUI, cookie: str, **edit: Any) -> UIResponse:
+    editor = _allowed_editor(ui, cookie)
     return _write(
-        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output", [(name, json.dumps(edit(shown)))]
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
+        _submitted(editor, _allowed_changes(editor, **edit)),
     )
 
 
@@ -6131,29 +6320,32 @@ def _saved_allowed(tmp_path: Path) -> object:
 @pytest.mark.parametrize(
     ("edit", "expected"),
     [
-        (lambda shown: shown[1:], ["q7Z"]),
-        (lambda shown: list(reversed(shown)), ["q7Z", "kept"]),
-        (lambda shown: ["new", *shown], ["new", "kept", "q7Z"]),
+        ({"remove": [0]}, ["q7Z"]),
+        ({"order": [1, 0]}, ["q7Z", "kept"]),
+        ({"append": "new"}, ["kept", "q7Z", "new"]),
     ],
-    ids=["remove-first", "reorder", "insert-first"],
+    ids=["remove-first", "reorder", "append"],
 )
 def test_p19f5_a_shifted_hidden_entry_keeps_its_own_value(
-    tmp_path: Path, edit: Callable[[list[Any]], list[Any]], expected: list[str]
+    tmp_path: Path, edit: dict[str, Any], expected: list[str]
 ) -> None:
     """Review A1: restoration matched list entries by index, so removing
     ``kept`` from ``['kept', 'q7Z']`` compared the placeholder with ``kept``
-    and saved it over ``q7Z``. Entries are now matched by what they showed."""
+    and saved it over ``q7Z``. P19F9: each entry is removed, moved or kept by
+    its own identity; the withheld one never travels."""
 
     ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
     cookie = _logged_in(ui)
-    response = _save_allowed(ui, cookie, edit)
+    response = _save_allowed(ui, cookie, **edit)
     assert response.status == 303, _written(response)
     assert _saved_allowed(tmp_path) == expected
 
 
-def test_p19f5_removing_one_of_two_different_hidden_entries_is_refused(tmp_path: Path) -> None:
-    """Review A1: two different secrets show the same placeholder; which one
-    a removal meant cannot be told, so the Save is refused, nothing written."""
+def test_p19f5_removing_one_of_two_different_hidden_entries_removes_exactly_that_one(tmp_path: Path) -> None:
+    """Review A1: two different secrets showed the same placeholder, so which
+    one a removal meant could not be told and the Save was refused. P19F9
+    replaces that refusal: the removal names the entry by its identity, so
+    exactly that entry goes, whichever it is, and the other is kept."""
 
     ui = _twitch_ui(
         tmp_path,
@@ -6162,52 +6354,74 @@ def test_p19f5_removing_one_of_two_different_hidden_entries_is_refused(tmp_path:
         {"ONE": "s1x", "TWO": "s2x"},
     )
     cookie = _logged_in(ui)
-    before = _snapshot(tmp_path)
-    response = _save_allowed(ui, cookie, lambda shown: shown[:2])
-    assert response.status == 403
-    assert any(config_ui._UNMATCHED_REASON in line for line in _written(response))
+    editor = _allowed_editor(ui, cookie)
+    assert editor["entries"][1]["withheld"] == editor["entries"][2]["withheld"] == HIDDEN_LITERAL
+    response = _save_allowed(ui, cookie, remove=[2])
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["kept", "s1x"]
     body = response.body.decode("utf-8")
     assert "s1x" not in body and "s2x" not in body
-    assert _snapshot(tmp_path) == before
-    # Kept in place (their configured order is the only one shown), both
-    # entries save as they were.
-    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${ONE}', '${TWO}']\n"
+        "modules:\n  audio_output:\n    voices:\n      allowed: ['kept', 's1x', 's2x']\n",
+        {"ONE": "s1x", "TWO": "s2x"},
+    )
+    (tmp_path / "config.local.yaml").unlink()
+    cookie = _logged_in(ui)
+    response = _save_allowed(ui, cookie, remove=[1], append="added")
     assert response.status == 303, _written(response)
-    assert _saved_allowed(tmp_path) == ["kept", "s1x", "s2x", "added"]
+    assert _saved_allowed(tmp_path) == ["kept", "s2x", "added"]
 
 
 def test_p19f5_an_unmatched_placeholder_is_refused(tmp_path: Path) -> None:
-    """Review A1/A2: a placeholder with no configured counterpart is never saved."""
+    """Review A1/A2: a placeholder with no configured counterpart is never
+    saved. P19F9: the whole-list text is no longer a control of this page —
+    posting it is refused by name, nothing written — while a new item that
+    merely looks like a placeholder is the operator's literal text."""
 
-    ui = _allowed_ui(tmp_path, "q7Z", ["kept"])
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
     cookie = _logged_in(ui)
+    field = _allowed_editor(ui, cookie)["field"]
     before = _snapshot(tmp_path)
     for posted in (HIDDEN_LITERAL, f"x{config_ui.REDACTED}"):
-        response = _save_allowed(ui, cookie, lambda shown: [*shown, posted])
+        response = _write(
+            ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
+            [(field, json.dumps(["kept", HIDDEN_LITERAL, posted]))],
+        )
         assert response.status == 403
+        assert any(config_ui._WITHHELD_WHOLE_REASON in line for line in _written(response))
         assert _snapshot(tmp_path) == before
+    response = _save_allowed(ui, cookie, append=f"x{config_ui.REDACTED}")
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["kept", "q7Z", f"x{config_ui.REDACTED}"]
 
 
 @pytest.mark.parametrize("secret", ["value", "e", "hidden", ")"])
-def test_p19f5_a_placeholder_rewritten_by_redaction_is_restored(tmp_path: Path, secret: str) -> None:
-    """Review A2: ``esc`` redacts the placeholder too, so a secret ``value``
-    showed as ``literal [hidden] configured (hidden)``, matched neither form
-    the restoration knew, and was saved over the configured value."""
+def test_p19f5_a_placeholder_rewritten_by_redaction_is_restored(
+    tmp_path: Path, secret: str, forget_ui: Callable[[ConfigUI], ConfigUI]
+) -> None:
+    """Review A2: ``esc`` redacted the placeholder too, so a secret ``value``
+    showed as ``literal [hidden] configured (hidden)`` and matched neither
+    form the restoration knew. P19F9: no placeholder is ever read back, so a
+    secret that rewrites it cannot matter: append and removal keep every
+    other entry exactly."""
 
-    ui = _allowed_ui(tmp_path, secret, ["kept", secret, f"x{secret}y"])
+    ui = forget_ui(_allowed_ui(tmp_path, secret, ["kept", secret, f"x{secret}y"]))
     cookie = _logged_in(ui)
-    _name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
-    assert shown[1] != HIDDEN_LITERAL
-    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    editor = _allowed_editor(ui, cookie)
+    assert editor["entries"][1]["withheld"] != HIDDEN_LITERAL or secret == ")"
+    response = _save_allowed(ui, cookie, append="added")
     assert response.status == 303, _written(response)
     assert _saved_allowed(tmp_path) == ["kept", secret, f"x{secret}y", "added"]
-    response = _save_allowed(ui, cookie, lambda shown: shown[1:])
+    response = _save_allowed(ui, cookie, remove=[0])
     assert response.status == 303, _written(response)
     assert _saved_allowed(tmp_path) == [secret, f"x{secret}y", "added"]
 
 
 def test_p19f5_a_redacted_stand_in_key_is_restored(tmp_path: Path) -> None:
-    """Review A2: a withheld mapping key shows its stand-in redacted too."""
+    """Review A2: a withheld mapping key showed its stand-in redacted too.
+    P19F9: the key is never posted; adding an entry beside it keeps it."""
 
     secret = "value"
     ui = _twitch_ui(
@@ -6218,10 +6432,15 @@ def test_p19f5_a_redacted_stand_in_key_is_restored(tmp_path: Path) -> None:
         {"GATE_SECRET": secret},
     )
     cookie = _logged_in(ui)
-    name, actions = _json_field(_module_html(ui, cookie, "brain"), "delivery.actions")
-    assert HIDDEN_LITERAL not in actions[0]["arguments"]
-    actions[0]["arguments"]["added"] = 2
-    response = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain", [(name, json.dumps(actions))])
+    actions = _patch_editor(_module_html(ui, cookie, "brain"), "delivery.actions")
+    arguments = actions["entries"][0]["entries"][1]
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain",
+        _submitted(actions, {
+            arguments["controls"][config_ui.PATCH_KEY]: "added",
+            arguments["controls"][config_ui.PATCH_ENTRY]: "2",
+        }),
+    )
     assert response.status == 303, _written(response)
     saved = _overlay_doc(tmp_path / "config.local.yaml")
     assert saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"] == {
@@ -6231,7 +6450,7 @@ def test_p19f5_a_redacted_stand_in_key_is_restored(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # P19F7 (gate-4 N3/N4): data is masked before it is serialized, and Check
-# validates the very draft Save restores
+# validates the very draft Save writes
 # ---------------------------------------------------------------------------
 
 
@@ -6272,8 +6491,16 @@ def test_n4_a_punctuation_secret_never_breaks_a_legitimate_list(
         [(name, json.dumps([*allowed, "added"]))],
     )
     assert check.status == 200
-    assert not any(config_ui._UNMATCHED_REASON in line for line in _written(check))
-    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    # P19F9: an exact list stays one JSON text, never refused as withheld.
+    assert not any(
+        reason in line
+        for reason in (config_ui._UNKNOWN_ENTRY_REASON, config_ui._WITHHELD_WHOLE_REASON)
+        for line in _written(check)
+    )
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
+        [(name, json.dumps([*allowed, "added"]))],
+    )
     assert response.status == 303, _written(response)
     assert _saved_allowed(tmp_path) == [*allowed, "added"]
 
@@ -6283,29 +6510,33 @@ def test_n4_punctuation_secrets_in_nested_data_mask_the_data_not_the_syntax(
     tmp_path: Path, secret: str, forget_ui: Callable[[ConfigUI], ConfigUI]
 ) -> None:
     """A punctuation secret used as a key, a value and inside longer text, at
-    depth: every JSON editor decodes, no decoded scalar holds the secret, and
-    the untouched legitimate data around it is shown exactly."""
+    depth: every exact control decodes, no decoded scalar holds the secret,
+    and the untouched legitimate data around it is shown exactly (P19F9: in
+    per-entry controls rather than one JSON text)."""
 
     ui = forget_ui(_f2_value_ui(tmp_path, secret))
     cookie = _logged_in(ui)
     brain = _module_html(ui, cookie, "brain")
-    _name, text = _textarea_text(brain, "delivery.actions")
-    actions = json.loads(text)
-    assert actions[0]["action"] == "reply"
-    assert actions[0]["arguments"] == {
-        HIDDEN_LITERAL: "v",
-        "plain": HIDDEN_LITERAL,
-        "nested": [{"deep": HIDDEN_LITERAL}],
-        f"k{config_ui.REDACTED}": 2,
-    }
+    actions = _patch_editor(brain, "delivery.actions")
+    action = {entry["key"]: entry for entry in actions["entries"][0]["entries"]}
+    assert list(_exact_values(action["action"])) == ["reply"]
+    arguments = action["arguments"]["entries"]
+    assert [entry["key"] for entry in arguments] == [config_ui.REDACTED, "plain", "nested", f"k{config_ui.REDACTED}"]
+    assert list(_exact_values(arguments[0])) == ["v"]
+    assert arguments[1]["withheld"] == HIDDEN_LITERAL
+    assert list(_exact_values(arguments[3])) == [2]
     audio = _module_html(ui, cookie, "audio_output")
-    _name, text = _textarea_text(audio, "voices.allowed")
-    assert json.loads(text) == [HIDDEN_LITERAL, "kept", f"x{config_ui.REDACTED}y"]
+    allowed = _patch_editor(audio, "voices.allowed")["entries"]
+    assert allowed[0]["withheld"] == HIDDEN_LITERAL
+    assert list(_exact_values(allowed[1])) == ["kept"]
+    assert allowed[2]["withheld"] == f"x{config_ui.REDACTED}y"
     for page in (brain, audio):
-        for document in _decoded_textareas(page):
+        for node in _patch_editors(page).values():
             # ``[`` and ``]`` are the marker's own brackets, never the data's.
             assert all(
-                secret not in str(scalar).replace(config_ui.REDACTED, "") for scalar in _scalars(document)
+                secret not in str(scalar).replace(config_ui.REDACTED, "")
+                for value in _exact_values(node)
+                for scalar in _scalars(value)
             )
 
 
@@ -6326,27 +6557,22 @@ def _n3_ui(tmp_path: Path, secret: str, allowed: list[str]) -> ConfigUI:
     )
 
 
-def _check_and_save(ui: ConfigUI, cookie: str, name: str, posted: list[Any]) -> tuple[str, UIResponse]:
-    page = f"{MODULE_PAGE_PREFIX}audio_output"
-    check = _write(ui, cookie, "/check", page, [(name, json.dumps(posted))])
-    assert check.status == 200
-    return check.body.decode("utf-8"), _write(ui, cookie, "/save", page, [(name, json.dumps(posted))])
-
-
 def test_n3_check_gives_the_real_checker_verdict_on_the_draft_save_writes(tmp_path: Path) -> None:
     """Gate-4 D/N3 as a running test, through the real checker: with
     ``voices.allowed = ['kept', 'a"b']``, ``voices.default = '${GATE_SECRET}'``
     and ``GATE_SECRET = 'a"b'``, appending a voice made Check fail
     (``must be an allowed voice``: it validated the placeholder) while Save
-    wrote ``['kept', 'a"b', 'added']``, which the real checker passes."""
+    wrote ``['kept', 'a"b', 'added']``, which the real checker passes.
+    P19F9: both routes apply the same patch to the same real list."""
 
     secret = 'a"b'
     ui = _n3_ui(tmp_path, secret, ["kept", secret])
     assert ui.check().passed
     cookie = _logged_in(ui)
-    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
-    assert shown == ["kept", HIDDEN_LITERAL]
-    checked, saved = _check_and_save(ui, cookie, name, [*shown, "added"])
+    editor = _allowed_editor(ui, cookie)
+    checked, saved = _check_then_save(
+        ui, cookie, "audio_output", _submitted(editor, _allowed_changes(editor, append="added"))
+    )
     assert _verdict(checked), _listed(checked)
     assert saved.status == 303, _written(saved)
     draft = _overlay_doc(tmp_path / "config.local.yaml")
@@ -6363,61 +6589,66 @@ def test_n3_an_invalid_draft_fails_check_on_its_real_values(tmp_path: Path) -> N
     secret = 'a"b'
     ui = _n3_ui(tmp_path, secret, ["kept", secret])
     cookie = _logged_in(ui)
-    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
+    editor = _allowed_editor(ui, cookie)
     page = f"{MODULE_PAGE_PREFIX}audio_output"
-    checked = _write(ui, cookie, "/check", page, [(name, json.dumps(shown[:1]))]).body.decode("utf-8")
+    fields = _submitted(editor, _allowed_changes(editor, remove=[1]))
+    checked = _write(ui, cookie, "/check", page, fields).body.decode("utf-8")
     assert not _verdict(checked)
     assert any("must be an allowed voice" in line for line in _listed(checked))
     assert secret not in checked
 
 
 @pytest.mark.parametrize(
-    "edit",
+    ("edit", "expected"),
     [
-        lambda shown: [*shown, "added"],
-        lambda shown: ["added", *reversed(shown)],
-        lambda shown: shown[1:],
+        ({"append": "added"}, ["kept", 1, 2, "added"]),
+        ({"order": [2, 1, 0], "append": "added"}, [2, 1, "kept", "added"]),
+        ({"remove": [0]}, [1, 2]),
     ],
     ids=["append", "reorder", "remove"],
 )
 def test_n3_check_and_save_validate_the_same_restored_draft(
-    tmp_path: Path, edit: Callable[[list[Any]], list[Any]]
+    tmp_path: Path, edit: dict[str, Any], expected: list[Any]
 ) -> None:
-    """The captured drafts are identical: Check received ``prefix-[hidden]-suffix``
-    where Save restored ``prefix-a"b-suffix``. Both now go through one
-    restoration, reordered and removed entries included."""
+    """The captured drafts were different: Check received
+    ``prefix-[hidden]-suffix`` where Save restored ``prefix-a"b-suffix``.
+    P19F9: both routes apply the same patch to the same real list, so the
+    checker is handed exactly what Save writes (indexes below stand for the
+    configured entries)."""
 
     secret = 'a"b'
-    ui = _allowed_ui(tmp_path, secret, ["kept", secret, f"prefix-{secret}-suffix"])
-    seen: list[Any] = []
-    ui.checker = lambda base, environ, overlay, draft: (seen.append(json.loads(json.dumps(draft))) or True, [])
+    configured = ["kept", secret, f"prefix-{secret}-suffix"]
+    ui = _allowed_ui(tmp_path, secret, configured)
+    seen = _observed(ui)
     cookie = _logged_in(ui)
-    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
-    assert shown == ["kept", HIDDEN_LITERAL, f"prefix-{config_ui.REDACTED}-suffix"]
-    checked, saved = _check_and_save(ui, cookie, name, edit(shown))
+    editor = _allowed_editor(ui, cookie)
+    checked, saved = _check_then_save(ui, cookie, "audio_output", _submitted(editor, _allowed_changes(editor, **edit)))
     assert _verdict(checked), _listed(checked)
     assert saved.status == 303, _written(saved)
     written = _overlay_doc(tmp_path / "config.local.yaml")
     assert seen == [written]
-    real = dict(zip(shown, ["kept", secret, f"prefix-{secret}-suffix"]))
-    assert _saved_allowed(tmp_path) == [real.get(item, item) for item in edit(shown)]
+    assert _saved_allowed(tmp_path) == [configured[item] if isinstance(item, int) else item for item in expected]
 
 
 def test_n3_an_unmatched_placeholder_fails_check_as_save_refuses_it(tmp_path: Path) -> None:
-    """A placeholder that cannot be put back is an explicit outcome on both
-    routes, naming why; Check never validates a guessed value."""
+    """An identity that maps to no rendered entry is an explicit outcome on
+    both routes, naming why; Check never validates a guessed target (P19F9:
+    a truncated identity replaces the unmatched placeholder)."""
 
     ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
-    seen: list[Any] = []
-    ui.checker = lambda base, environ, overlay, draft: (seen.append(draft) or True, [])
+    seen = _observed(ui)
     cookie = _logged_in(ui)
     before = _snapshot(tmp_path)
-    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
-    checked, saved = _check_and_save(ui, cookie, name, [*shown, f"x{config_ui.REDACTED}"])
+    editor = _allowed_editor(ui, cookie)
+    name = editor["entries"][0]["controls"][config_ui.PATCH_VALUE]
+    fields = [(key, text) for key, text in _browser(editor) if key != name] + [(name[:-1], '"edited"')]
+    checked, saved = _check_then_save(ui, cookie, "audio_output", fields)
     assert not _verdict(checked)
-    assert any(config_ui._UNMATCHED_REASON in line for line in _listed(checked))
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _listed(checked))
+    assert ui.last_check is not None and not ui.last_check.settings_phase_reached
+    assert seen == []
     assert saved.status == 403
-    assert any(config_ui._UNMATCHED_REASON in line for line in _written(saved))
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(saved))
     assert _snapshot(tmp_path) == before
     assert "q7Z" not in checked
 
@@ -6428,11 +6659,14 @@ def test_p19f7_every_published_secret_length_is_still_never_rendered(
 ) -> None:
     """The earlier guarantees under the data-level masking: the gate's
     one-character, three-character and long secrets, as a key, a value and
-    inside longer text at any depth, never reach a page nor a decoded JSON
-    editor, and an untouched round trip Saves the configured values."""
+    inside longer text at any depth, never reach a page nor a decoded exact
+    control, no identity is derived from them in a recoverable way (a keyed
+    digest, different for another UI over the same file), and an untouched
+    round trip plus an append Saves the configured values (P19F9)."""
 
     ui = _f2_value_ui(tmp_path, secret)
     cookie = _logged_in(ui)
+    names: set[str] = set()
     for name in ("brain", "audio_output"):
         page = _module_html(ui, cookie, name)
         assert secret not in page and secret not in _html.unescape(page), name
@@ -6442,15 +6676,23 @@ def test_p19f7_every_published_secret_length_is_still_never_rendered(
             if body:
                 document = json.loads(_html.unescape(body))
                 assert all(secret not in str(scalar) for scalar in _scalars(document)), name
-    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+        found = re.findall(rf'name="{re.escape(config_ui.PATCH_FIELD_PREFIX)}[a-z]+-([^"]*)"', page)
+        assert found and all(re.fullmatch(r"[0-9a-f]{32}", token) for token in found), name
+        names.update(found)
+    other = _f2_value_ui(tmp_path, secret)
+    other_cookie = _logged_in(other)
+    for name in ("brain", "audio_output"):
+        page = _module_html(other, other_cookie, name)
+        assert not names & set(re.findall(rf'name="{re.escape(config_ui.PATCH_FIELD_PREFIX)}[a-z]+-([^"]*)"', page))
+    response = _save_allowed(ui, cookie, append="added")
     assert response.status == 303, _written(response)
     assert _saved_allowed(tmp_path) == [secret, "kept", f"x{secret}y", "added"]
     assert secret not in response.body.decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
-# P19F8 (gate-5 N5 and the N3 residual): every withheld key is shown
-# distinct, and an edited or ambiguous placeholder is refused by name
+# P19F8 (gate-5 N5 and the N3 residual), under P19F9: every configured key
+# is its own entry, and a submission that cannot be applied is refused
 # ---------------------------------------------------------------------------
 
 
@@ -6468,52 +6710,61 @@ def _arguments_ui(tmp_path: Path, arguments: dict[str, Any], environ: dict[str, 
     )
 
 
-def _post_actions(ui: ConfigUI, cookie: str, name: str, actions: Any) -> tuple[str, UIResponse]:
-    page = f"{MODULE_PAGE_PREFIX}brain"
-    check = _write(ui, cookie, "/check", page, [(name, json.dumps(actions))])
-    assert check.status == 200
-    return check.body.decode("utf-8"), _write(ui, cookie, "/save", page, [(name, json.dumps(actions))])
-
-
 def _saved_arguments(tmp_path: Path) -> object:
     saved = _overlay_doc(tmp_path / "config.local.yaml")
     return saved["modules"]["brain"]["delivery"]["actions"][0]["arguments"]
 
 
+def _actions_editor(ui: ConfigUI, cookie: str) -> dict[str, Any]:
+    return _patch_editor(_module_html(ui, cookie, "brain"), "delivery.actions")
+
+
+def _add_argument(actions: dict[str, Any], key: str, value: Any, action: int = 0) -> dict[str, str]:
+    arguments = actions["entries"][action]["entries"][1]
+    return {
+        arguments["controls"][config_ui.PATCH_KEY]: key,
+        arguments["controls"][config_ui.PATCH_ENTRY]: json.dumps(value),
+    }
+
+
 @pytest.mark.parametrize(
-    ("arguments", "environ", "shown"),
+    ("arguments", "environ", "labels"),
     [
         (
             {"xq7Z": "one", "xsecond-secret": "two"},
             {"GATE_SECRET": "q7Z", "SECOND": "second-secret"},
-            {"x[hidden]": "one", "x[hidden] (2)": "two"},
+            ["x[hidden]", "x[hidden]"],
         ),
         (
             {"xq7Z": "one", "x[hidden]": "two"},
             {"GATE_SECRET": "q7Z"},
-            {"x[hidden] (2)": "one", "x[hidden]": "two"},
+            ["x[hidden]", "x[hidden]"],
         ),
     ],
     ids=["two-secrets", "marker-looking-key"],
 )
 def test_n5_keys_that_only_contain_a_secret_stay_distinct_entries(
-    tmp_path: Path, arguments: dict[str, Any], environ: dict[str, str], shown: dict[str, Any]
+    tmp_path: Path, arguments: dict[str, Any], environ: dict[str, str], labels: list[str]
 ) -> None:
-    """Gate-5 E/N5 as a running test: ``{'xq7Z': 'one', 'xsecond-secret':
-    'two'}`` decoded as ``{'x[hidden]': 'two'}`` — the whole first entry,
-    non-secret value included, was lost — and a configured ``x[hidden]`` key
-    displaced ``xq7Z`` the same way. Every entry is now shown under its own
-    key, and an unrelated edit Checks and Saves every configured entry."""
+    """Gate-5 E/N5 and gate-6 N5 as running tests: ``{'xq7Z': 'one',
+    'xsecond-secret': 'two'}`` decoded as ``{'x[hidden]': 'two'}`` — the
+    whole first entry lost — and a configured ``x[hidden]`` key displaced
+    ``xq7Z`` the same way. P19F9: every entry is its own control, shown
+    alike or not; an unrelated edit Checks and Saves every configured entry,
+    both routes handed the same real draft, both keys surviving."""
 
     ui = _arguments_ui(tmp_path, arguments, environ)
+    seen = _observed(ui)
     cookie = _logged_in(ui)
-    name, actions = _json_field(_module_html(ui, cookie, "brain"), "delivery.actions")
-    assert actions == [{"action": "x.do", "arguments": shown}]
-    actions[0]["arguments"]["added"] = "ok"
-    checked, saved = _post_actions(ui, cookie, name, actions)
-    assert not any(config_ui._UNMATCHED_REASON in line for line in _listed(checked))
+    actions = _actions_editor(ui, cookie)
+    entries = actions["entries"][0]["entries"][1]["entries"]
+    assert [entry["key"] for entry in entries] == labels
+    assert [list(_exact_values(entry)) for entry in entries] == [["one"], ["two"]]
+    checked, saved = _check_then_save(ui, cookie, "brain", _submitted(actions, _add_argument(actions, "added", "ok")))
+    assert _verdict(checked), _listed(checked)
     assert saved.status == 303, _written(saved)
     assert _saved_arguments(tmp_path) == {**arguments, "added": "ok"}
+    assert seen == [_overlay_doc(tmp_path / "config.local.yaml")]
     for secret in environ.values():
         assert secret not in checked and secret not in saved.body.decode("utf-8")
 
@@ -6521,55 +6772,51 @@ def test_n5_keys_that_only_contain_a_secret_stay_distinct_entries(
 def test_n5_legitimate_stand_in_shaped_text_never_collides(tmp_path: Path) -> None:
     """Configured text that looks like a stand-in — a key equal to
     :data:`HIDDEN_LITERAL` or its numbered form, a value with the stand-in in
-    it — is shown as itself; the withheld key takes the next free form, and
-    a round trip keeps every entry."""
+    it — is exact data, shown and posted as itself; a round trip keeps every
+    entry (P19F9: no marker heuristic exists to mistake it)."""
 
     arguments = {HIDDEN_LITERAL: "a", "q7Z": "b", f"{HIDDEN_LITERAL} (2)": "c", "v": f"{HIDDEN_LITERAL} x"}
     ui = _arguments_ui(tmp_path, arguments, {"GATE_SECRET": "q7Z"})
     cookie = _logged_in(ui)
-    name, actions = _json_field(_module_html(ui, cookie, "brain"), "delivery.actions")
-    assert actions[0]["arguments"] == {
-        HIDDEN_LITERAL: "a",
-        f"{HIDDEN_LITERAL} (3)": "b",
-        f"{HIDDEN_LITERAL} (2)": "c",
-        "v": f"{HIDDEN_LITERAL} x",
-    }
-    actions[0]["arguments"]["added"] = 1
-    _checked, saved = _post_actions(ui, cookie, name, actions)
+    actions = _actions_editor(ui, cookie)
+    entries = actions["entries"][0]["entries"][1]["entries"]
+    assert [entry["key"] for entry in entries] == [HIDDEN_LITERAL, config_ui.REDACTED, f"{HIDDEN_LITERAL} (2)", "v"]
+    assert [list(_exact_values(entry)) for entry in entries] == [["a"], ["b"], ["c"], [f"{HIDDEN_LITERAL} x"]]
+    _checked, saved = _check_then_save(ui, cookie, "brain", _submitted(actions, _add_argument(actions, "added", 1)))
     assert saved.status == 303, _written(saved)
     assert _saved_arguments(tmp_path) == {**arguments, "added": 1}
 
     allowed = ["kept", "q7Z", f"{HIDDEN_LITERAL} edited"]
     ui = _allowed_ui(tmp_path, "q7Z", allowed)
     cookie = _logged_in(ui)
-    _name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
-    assert shown == ["kept", HIDDEN_LITERAL, f"{HIDDEN_LITERAL} edited"]
-    response = _save_allowed(ui, cookie, lambda shown: [*shown, "added"])
+    editor = _allowed_editor(ui, cookie)
+    assert list(_exact_values(editor["entries"][2])) == [f"{HIDDEN_LITERAL} edited"]
+    response = _save_allowed(ui, cookie, append="added")
     assert response.status == 303, _written(response)
     assert _saved_allowed(tmp_path) == [*allowed, "added"]
 
 
 @pytest.mark.parametrize("secret", ["(", ")", " ", "-", "2", "[", "]", "."])
-def test_n5_a_single_punctuation_secret_keeps_every_key_distinct(tmp_path: Path, secret: str) -> None:
+def test_n5_a_single_punctuation_secret_keeps_every_key_distinct(
+    tmp_path: Path, secret: str, forget_ui: Callable[[ConfigUI], ConfigUI]
+) -> None:
     """A one-character secret that rewrites the stand-ins and their
-    numbering: every entry is still shown, under distinct keys, no scalar
+    numbering: every entry is still shown, as its own control, no label
     holds the secret, and a round trip Saves exactly the configured keys."""
 
     arguments = {
         secret: "a", f"x{secret}": "b", f"y{secret}": "c", f"{secret}{secret}": "d",
         "x[hidden]": "f", HIDDEN_LITERAL: "g", f"{HIDDEN_LITERAL} (2)": "h", "plain": "i",
     }
-    ui = _arguments_ui(tmp_path, arguments, {"GATE_SECRET": secret})
+    ui = forget_ui(_arguments_ui(tmp_path, arguments, {"GATE_SECRET": secret}))
     cookie = _logged_in(ui)
-    page = _module_html(ui, cookie, "brain")
-    name, actions = _json_field(page, "delivery.actions")
-    shown = actions[0]["arguments"]
-    assert sorted(shown.values()) == sorted(arguments.values())
-    assert shown["plain"] == "i"
-    for key in shown:
-        assert secret not in key.replace(config_ui.REDACTED, ""), key
-    actions[0]["arguments"]["added"] = 9
-    _checked, saved = _post_actions(ui, cookie, name, actions)
+    actions = _actions_editor(ui, cookie)
+    entries = actions["entries"][0]["entries"][1]["entries"]
+    assert len(entries) == len(arguments)
+    assert len({entry["controls"][config_ui.PATCH_REMOVE] for entry in entries}) == len(arguments)
+    for entry in entries:
+        assert secret not in entry["key"].replace(config_ui.REDACTED, ""), entry["key"]
+    _checked, saved = _check_then_save(ui, cookie, "brain", _submitted(actions, _add_argument(actions, "added", 9)))
     assert saved.status == 303, _written(saved)
     assert _saved_arguments(tmp_path) == {**arguments, "added": 9}
 
@@ -6585,78 +6832,355 @@ def test_n5_an_unallocatable_stand_in_fails_the_render_loudly() -> None:
 
 
 @pytest.mark.parametrize(
-    "edit",
+    "alter",
     [
-        lambda text: f"{text} edited",
-        lambda text: f" {text}",
-        lambda text: f"{text} ",
-        lambda text: text.upper(),
-        lambda text: text.replace(" ", "  ", 1),
-        lambda text: f"{text} (2)",
+        lambda token: token[:-1],
+        lambda token: token[:-12],
+        lambda token: token[:10] + ("0" if token[10] != "0" else "1") + token[11:],
+        lambda token: f"{token}0",
+        lambda token: token.upper(),
+        lambda token: "",
     ],
-    ids=["suffixed", "leading-space", "trailing-space", "upper-case", "respaced", "numbered"],
+    ids=["truncated", "truncated-12", "one-character", "suffixed", "upper-case", "empty"],
 )
 def test_n3_an_edited_stand_in_is_refused_never_written(
-    tmp_path: Path, edit: Callable[[str], str]
+    tmp_path: Path, alter: Callable[[str], str]
 ) -> None:
-    """Gate-5 E/N3 A as a running test, through the real checker:
-    ``literal value configured (hidden) edited`` passed Check and was Saved
-    as a literal voice name. Any edit of a stand-in is now refused by name
-    on both routes, before validation, and nothing is written."""
+    """Gate-5/gate-6 E/N3 as running tests, through the real checker: an
+    edited, truncated or internally altered stand-in passed Check and was
+    Saved as a literal voice name. P19F9: nothing editable holds a stand-in
+    any more; what a submission names is an identity, and any altered one —
+    truncated, one character changed, suffixed, re-cased — maps to no
+    rendered entry and is refused by name on both routes, before
+    validation, with nothing written."""
 
     ui = _n3_ui(tmp_path, "q7Z", ["kept", "q7Z", "q7Z"])
     assert ui.check().passed
     cookie = _logged_in(ui)
     before = _snapshot(tmp_path)
-    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
-    assert shown == ["kept", HIDDEN_LITERAL, HIDDEN_LITERAL]
-    checked, saved = _check_and_save(ui, cookie, name, [shown[0], shown[1], edit(shown[2])])
+    editor = _allowed_editor(ui, cookie)
+    assert [entry["replace"] for entry in editor["entries"]] == [False, True, True]
+    name = editor["entries"][2]["controls"][config_ui.PATCH_VALUE]
+    prefix = f"{config_ui.PATCH_FIELD_PREFIX}{config_ui.PATCH_VALUE}-"
+    altered = prefix + alter(name[len(prefix) :])
+    fields = [(key, text) for key, text in _browser(editor) if key != name] + [(altered, '"edited"')]
+    checked, saved = _check_then_save(ui, cookie, "audio_output", fields)
     assert not _verdict(checked)
-    assert any(config_ui._UNMATCHED_REASON in line for line in _listed(checked))
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _listed(checked))
     assert ui.last_check is not None and not ui.last_check.settings_phase_reached
     assert saved.status == 403
-    assert any(config_ui._UNMATCHED_REASON in line for line in _written(saved))
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(saved))
     assert _snapshot(tmp_path) == before
 
 
 def test_n3_an_unmatched_placeholder_never_reaches_the_checker(tmp_path: Path) -> None:
     """The refusal comes before validation: the checker is never given a
-    draft holding a placeholder."""
+    draft built from the whole masked text (P19F9: that text is refused as
+    a withheld field, whatever it holds)."""
 
     ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
-    seen: list[Any] = []
-    ui.checker = lambda base, environ, overlay, draft: (seen.append(draft) or True, [])
+    seen = _observed(ui)
     cookie = _logged_in(ui)
-    name, shown = _json_field(_module_html(ui, cookie, "audio_output"), "voices.allowed")
-    checked, saved = _check_and_save(ui, cookie, name, [*shown, f"{HIDDEN_LITERAL} edited"])
+    field = _allowed_editor(ui, cookie)["field"]
+    checked, saved = _check_then_save(
+        ui, cookie, "audio_output", [(field, json.dumps(["kept", HIDDEN_LITERAL, f"{HIDDEN_LITERAL} edited"]))]
+    )
     assert not _verdict(checked)
+    assert any(config_ui._WITHHELD_WHOLE_REASON in line for line in _listed(checked))
     assert seen == []
     assert saved.status == 403
 
 
-@pytest.mark.parametrize("reverse", [False, True], ids=["stand-in-first", "real-key-first"])
+@pytest.mark.parametrize("remove", [False, True], ids=["kept", "removed"])
 def test_n3_a_stand_in_beside_its_real_key_is_refused_never_resolved(
-    tmp_path: Path, reverse: bool
+    tmp_path: Path, remove: bool
 ) -> None:
     """Gate-5 E/N3 B as a running test: posting the displayed key and the
     real key ``q7Z`` with different values passed both routes and one value
-    silently disappeared, the winner set by key order. Both orders are now
-    refused by name, before validation, and nothing is written."""
+    silently disappeared, the winner set by key order. P19F9: the withheld
+    key is never posted; a new entry naming the key it holds — beside it or
+    in place of a removed one — is refused by name, before validation,
+    and nothing is written."""
 
     ui = _arguments_ui(tmp_path, {"q7Z": "original"}, {"GATE_SECRET": "q7Z"})
-    seen: list[Any] = []
-    ui.checker = lambda base, environ, overlay, draft: (seen.append(draft) or True, [])
+    seen = _observed(ui)
     cookie = _logged_in(ui)
     before = _snapshot(tmp_path)
-    name, actions = _json_field(_module_html(ui, cookie, "brain"), "delivery.actions")
-    assert actions[0]["arguments"] == {HIDDEN_LITERAL: "original"}
-    pairs = [(HIDDEN_LITERAL, "original"), ("q7Z", "second")]
-    actions[0]["arguments"] = dict(reversed(pairs) if reverse else pairs)
-    checked, saved = _post_actions(ui, cookie, name, actions)
+    actions = _actions_editor(ui, cookie)
+    (entry,) = actions["entries"][0]["entries"][1]["entries"]
+    changes = _add_argument(actions, "q7Z", "second")
+    if remove:
+        changes[entry["controls"][config_ui.PATCH_REMOVE]] = "true"
+    checked, saved = _check_then_save(ui, cookie, "brain", _submitted(actions, changes))
     assert not _verdict(checked)
-    assert any(config_ui._CONFLICTING_REASON in line for line in _listed(checked)), _listed(checked)
+    assert any(config_ui._EXISTING_KEY_REASON in line for line in _listed(checked)), _listed(checked)
     assert seen == []
     assert saved.status == 403
-    assert any(config_ui._CONFLICTING_REASON in line for line in _written(saved))
+    assert any(config_ui._EXISTING_KEY_REASON in line for line in _written(saved))
     assert _snapshot(tmp_path) == before
     assert "q7Z" not in checked and "q7Z" not in saved.body.decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# P19F9 (gate-6 N3, N5, N6): the gate's executed counterexamples and the
+# identity refusals
+# ---------------------------------------------------------------------------
+
+
+N6_ACTIONS = [
+    {"action": "x.do", "arguments": {"xq7Z": "one"}},
+    {"action": "x.do", "arguments": {"xsecond-secret": "two"}},
+]
+
+
+def _n6_ui(tmp_path: Path) -> ConfigUI:
+    return _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}', '${SECOND}']\n"
+        f"modules:\n  brain:\n    delivery:\n      actions: {json.dumps(N6_ACTIONS)}\n",
+        {"GATE_SECRET": "q7Z", "SECOND": "second-secret"},
+    )
+
+
+def test_p19f9_gate6_n6_a_visible_value_edit_never_changes_another_entrys_key(tmp_path: Path) -> None:
+    """Gate-6 D/N6 as a running test: both actions showed ``x[hidden]`` with
+    visible values ``one`` and ``two``; changing only the first value to
+    ``two`` passed Check and Save with both entries rewritten to
+    ``{'xsecond-secret': 'two'}`` — the first key silently substituted.
+    The edit now names its entry by identity: Check and Save are handed the
+    same real draft, the first entry keeps ``xq7Z`` with its new value and
+    the second entry is untouched, key and value."""
+
+    ui = _n6_ui(tmp_path)
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    actions = _actions_editor(ui, cookie)
+    first, second = (action["entries"][1]["entries"][0] for action in actions["entries"])
+    assert first["key"] == second["key"] == "x[hidden]"
+    assert list(_exact_values(first)) == ["one"] and list(_exact_values(second)) == ["two"]
+    checked, saved = _check_then_save(
+        ui, cookie, "brain", _submitted(actions, {first["controls"][config_ui.PATCH_VALUE]: '"two"'})
+    )
+    assert _verdict(checked), _listed(checked)
+    assert saved.status == 303, _written(saved)
+    expected = [
+        {"action": "x.do", "arguments": {"xq7Z": "two"}},
+        {"action": "x.do", "arguments": {"xsecond-secret": "two"}},
+    ]
+    written = _overlay_doc(tmp_path / "config.local.yaml")
+    assert written["modules"]["brain"]["delivery"]["actions"] == expected
+    assert seen == [written]
+    for secret in ("q7Z", "second-secret"):
+        assert secret not in checked and secret not in saved.body.decode("utf-8")
+
+
+def test_p19f9_gate6_n6_reversing_and_appending_keeps_each_key_with_its_entry(tmp_path: Path) -> None:
+    """Gate-6 D/N6's other variant — reverse both actions and add a field to
+    each — was refused as unmatched. By identity it is unambiguous: each
+    action moves with its own hidden key and gains its own field."""
+
+    ui = _n6_ui(tmp_path)
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    actions = _actions_editor(ui, cookie)
+    changes = {
+        actions["entries"][0]["controls"][config_ui.PATCH_ORDER]: "1",
+        actions["entries"][1]["controls"][config_ui.PATCH_ORDER]: "0",
+        **_add_argument(actions, "added", "ok", 0),
+        **_add_argument(actions, "added", "ok", 1),
+    }
+    checked, saved = _check_then_save(ui, cookie, "brain", _submitted(actions, changes))
+    assert _verdict(checked), _listed(checked)
+    assert saved.status == 303, _written(saved)
+    written = _overlay_doc(tmp_path / "config.local.yaml")
+    assert written["modules"]["brain"]["delivery"]["actions"] == [
+        {"action": "x.do", "arguments": {"xsecond-secret": "two", "added": "ok"}},
+        {"action": "x.do", "arguments": {"xq7Z": "one", "added": "ok"}},
+    ]
+    assert seen == [written]
+
+
+@pytest.mark.parametrize(
+    "alter",
+    [
+        lambda text: text[:-12],
+        lambda text: text.replace("configured", "configurex"),
+        lambda text: text.replace(HIDDEN_LITERAL, "[hidde]"),
+        lambda text: f"{text} edited",
+    ],
+    ids=["truncated-12", "one-character", "partial-bracket", "suffixed"],
+)
+def test_p19f9_gate6_n3_an_altered_stand_in_is_never_written(
+    tmp_path: Path, alter: Callable[[str], str]
+) -> None:
+    """Gate-6 E/N3 as a running test, through the real checker: the whole
+    list posted with a stand-in truncated by twelve characters
+    (``literal value configu``), altered internally (``configurex``) or cut
+    to ``[hidde]`` passed Check and Save wrote it as a literal voice. The
+    whole text of a withheld list is no longer read back at all: both routes
+    refuse it by name, before validation, and nothing is written."""
+
+    ui = _n3_ui(tmp_path, "q7Z", ["kept", "q7Z", "q7Z"])
+    assert ui.check().passed
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    field = _allowed_editor(ui, cookie)["field"]
+    posted = [(field, json.dumps(["kept", HIDDEN_LITERAL, alter(HIDDEN_LITERAL)]))]
+    checked, saved = _check_then_save(ui, cookie, "audio_output", posted)
+    assert not _verdict(checked)
+    assert any(config_ui._WITHHELD_WHOLE_REASON in line for line in _listed(checked))
+    assert ui.last_check is not None and not ui.last_check.settings_phase_reached
+    assert saved.status == 403
+    assert any(config_ui._WITHHELD_WHOLE_REASON in line for line in _written(saved))
+    assert _snapshot(tmp_path) == before
+
+
+def test_p19f9_a_duplicated_identity_is_refused(tmp_path: Path) -> None:
+    """Two posted values claiming one identity are refused by name on both
+    routes — even when one of them is the untouched text — and nothing is
+    written; neither value is chosen."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    before = _snapshot(tmp_path)
+    editor = _allowed_editor(ui, cookie)
+    name = editor["entries"][0]["controls"][config_ui.PATCH_VALUE]
+    checked, saved = _check_then_save(ui, cookie, "audio_output", [*_browser(editor), (name, '"other"')])
+    assert not _verdict(checked)
+    assert any(config_ui._DUPLICATE_ENTRY_REASON in line for line in _listed(checked))
+    assert seen == []
+    assert saved.status == 403
+    assert _snapshot(tmp_path) == before
+
+
+def test_p19f9_a_stale_identity_is_refused_never_retargeted(tmp_path: Path) -> None:
+    """A page rendered before an entry changed on disk names the old entry:
+    its identity no longer maps anywhere, even though the key layout is the
+    same, so the edit is refused rather than applied to the new value."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    cookie = _logged_in(ui)
+    editor = _allowed_editor(ui, cookie)
+    layout = _form_layout(ui, cookie, f"{MODULE_PAGE_PREFIX}audio_output")
+    base = tmp_path / "config.yaml"
+    base.write_text(base.read_text(encoding="utf-8").replace('"kept"', '"changed"'), encoding="utf-8")
+    fields = _submitted(editor, {editor["entries"][0]["controls"][config_ui.PATCH_VALUE]: '"edited"'})
+    for route in ("/check", "/save"):
+        response = _write(ui, cookie, route, f"{MODULE_PAGE_PREFIX}audio_output", fields, layout=layout)
+        assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(response)), route
+    assert not (tmp_path / "config.local.yaml").exists()
+
+
+def test_p19f9_an_identity_from_another_page_is_refused(tmp_path: Path) -> None:
+    """An identity rendered on one module's page and posted from another
+    page is refused: identities belong to the page that drew them."""
+
+    ui = _f2_value_ui(tmp_path, "q7Z")
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    editor = _allowed_editor(ui, cookie)
+    fields = _submitted(editor, _allowed_changes(editor, append="added"))
+    for route in ("/check", "/save"):
+        response = _write(ui, cookie, route, f"{MODULE_PAGE_PREFIX}brain", fields)
+        assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(response)), route
+    assert seen == []
+    assert not (tmp_path / "config.local.yaml").exists()
+
+
+def test_p19f9_an_entry_both_removed_and_edited_is_refused(tmp_path: Path) -> None:
+    """An entry marked for removal whose value was also changed is refused
+    by name on both routes: neither intent is chosen, nothing is written."""
+
+    ui = _arguments_ui(tmp_path, {"xq7Z": "one", "plain": "two"}, {"GATE_SECRET": "q7Z"})
+    cookie = _logged_in(ui)
+    actions = _actions_editor(ui, cookie)
+    entry = actions["entries"][0]["entries"][1]["entries"][0]
+    changes = {entry["controls"][config_ui.PATCH_REMOVE]: "true", entry["controls"][config_ui.PATCH_VALUE]: '"x"'}
+    checked, saved = _check_then_save(ui, cookie, "brain", _submitted(actions, changes))
+    assert not _verdict(checked)
+    assert any(config_ui._REMOVED_AND_EDITED_REASON in line for line in _listed(checked))
+    assert saved.status == 403
+    assert not (tmp_path / "config.local.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['a"b, {x}: [y] \\ z', "literal value configured (hidden)", "x[hidden]", "configured (hidden) [hidden]"],
+    ids=["punctuation", "stand-in", "marker", "both-markers"],
+)
+def test_p19f9_a_legitimate_edit_with_punctuation_or_marker_text_applies(tmp_path: Path, text: str) -> None:
+    """An ordinary edit is taken as typed, whatever punctuation or
+    marker-looking text it holds: an exact entry, a withheld entry's
+    replacement and an appended item all Save literally, beside the
+    withheld entries they never disturb, and Check sees the same draft."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z", "xq7Zy"])
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    editor = _allowed_editor(ui, cookie)
+    changes = {
+        editor["entries"][0]["controls"][config_ui.PATCH_VALUE]: json.dumps(text),
+        editor["entries"][2]["controls"][config_ui.PATCH_VALUE]: json.dumps(f"{text}!"),
+        **_allowed_changes(editor, append=f"{text}?"),
+    }
+    checked, saved = _check_then_save(ui, cookie, "audio_output", _submitted(editor, changes))
+    assert _verdict(checked), _listed(checked)
+    assert saved.status == 303, _written(saved)
+    assert _saved_allowed(tmp_path) == [text, "q7Z", f"{text}!", f"{text}?"]
+    assert seen == [_overlay_doc(tmp_path / "config.local.yaml")]
+
+
+def test_p19f9_an_untouched_patch_editor_posts_no_edit(tmp_path: Path) -> None:
+    """A page posted back untouched changes nothing: no value travels, no
+    edit is made, and every patch control's identity is unique."""
+
+    ui = _n6_ui(tmp_path)
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "brain")
+    names = re.findall(rf'name="({re.escape(config_ui.PATCH_FIELD_PREFIX)}[^"]*)"', page)
+    assert len(names) == len(set(names))
+    actions = _patch_editor(page, "delivery.actions")
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        fields = [("page", f"{MODULE_PAGE_PREFIX}brain"), *_browser(actions)]
+        assert ui.parse_edits(ui.view(), fields) == ([], [])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+    response = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}brain", _browser(actions))
+    assert response.status == 200 and "Nothing to save" in response.body.decode("utf-8")
+
+
+def test_p19f9_no_configured_key_reaches_a_generated_attribute(tmp_path: Path) -> None:
+    """The per-entry editor shows each configured key as text only: no
+    attribute of the page — patch identities included — holds a key, and
+    the withheld ones appear nowhere."""
+
+    arguments = {"visible-key-7c1": "one", "xq7Z": "two", "q7Z": "three"}
+    ui = _arguments_ui(tmp_path, arguments, {"GATE_SECRET": "q7Z"})
+    cookie = _logged_in(ui)
+    page = _module_html(ui, cookie, "brain")
+    assert "q7Z" not in page
+    assert "visible-key-7c1" in page
+    assert not any("visible-key-7c1" in value for value in _attribute_values(page))
+
+
+def test_p19f9_a_withheld_scalar_replacement_is_the_whole_new_value(tmp_path: Path) -> None:
+    """A withheld list item is replaced whole by what is typed in its empty
+    control — never merged with the text it had — and left empty keeps its
+    configured value; a declared boolean on the same page keeps its honest
+    three states."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "prefix-q7Z", "q7Z"])
+    cookie = _logged_in(ui)
+    editor = _allowed_editor(ui, cookie)
+    assert [entry["withheld"] for entry in editor["entries"][1:]] == ["prefix-[hidden]", HIDDEN_LITERAL]
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
+        _submitted(editor, {editor["entries"][1]["controls"][config_ui.PATCH_VALUE]: '"replaced"'}),
+    )
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["kept", "replaced", "q7Z"]
+    page = _module_html(ui, cookie, "audio_output")
+    probe = _probe_select(page)
+    assert _rendered_options(probe)[1:] == [("true", "true"), ("false", "false")]
