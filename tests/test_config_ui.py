@@ -1933,11 +1933,21 @@ VALID_MODULES = (
 
 
 def _check_request(
-    cookie: str, csrf: str, page: str, fields: Sequence[tuple[str, str]] = ()
+    ui: ConfigUI,
+    cookie: str,
+    csrf: str,
+    page: str,
+    fields: Sequence[tuple[str, str]] = (),
+    *,
+    layout: str | None = None,
 ) -> UIRequest:
+    """A Check form as *page* renders it, its key-layout guard included."""
+
     from urllib.parse import urlencode
 
-    body = urlencode([("csrf_token", csrf), ("page", page), *fields]).encode("utf-8")
+    if layout is None:
+        layout = _form_layout(ui, cookie, page)
+    body = urlencode([("csrf_token", csrf), ("layout", layout), ("page", page), *fields]).encode("utf-8")
     return _request(
         "POST",
         "/check",
@@ -1955,7 +1965,7 @@ def _post_check(
         session = ui._session(_request("GET", "/", headers={"cookie": cookie}))
         assert session is not None
         csrf = session.csrf_token
-    response = ui.handle(_check_request(cookie, csrf, page, fields))
+    response = ui.handle(_check_request(ui, cookie, csrf, page, fields))
     assert response.status == 200
     return response.body.decode("utf-8")
 
@@ -2187,7 +2197,7 @@ def test_bridge_check_runs_the_real_checker_from_a_running_loop(
 ) -> None:
     ui = _check_fixture(tmp_path, VALID_MODULES, overlay="modules:\n  amod: {level: 2}\n")
     cookie, csrf = _login(ui)
-    request = _check_request(cookie, csrf, "/module/amod", [("modules.amod.level", level)])
+    request = _check_request(ui, cookie, csrf, "/module/amod", [("modules.amod.level", level)])
     executor = config_ui.ThreadPoolExecutor(
         max_workers=config_ui.EXECUTOR_WORKERS,
         thread_name_prefix=config_ui.EXECUTOR_THREAD_PREFIX,
@@ -2757,6 +2767,76 @@ def test_ac24_a_base_key_reorder_makes_a_rendered_form_stale(tmp_path: Path) -> 
     channels = _overlay_doc(tmp_path / "config.local.yaml")["triggers"]["tmod"]["channels"]  # type: ignore[index]
     assert list(channels) == ["chan-b"] and channels["chan-b"]["combination"] == "all_of"
     write_base("chan-a", "chan-b")
+
+
+@pytest.mark.parametrize("reordered", ["base", "overlay"])
+def test_ac24_a_key_reorder_makes_a_rendered_check_stale_like_save(tmp_path: Path, reordered: str) -> None:
+    """Check applies Save's layout guard before parsing a positional name.
+
+    Gate-3 N2: after a key reorder, Check parsed the old form against the new
+    order and reported a verdict for the channel the operator did not edit
+    (``@0`` read as ``chan-b``), while Save refused the same form as stale.
+    Both now refuse it identically and the checker never sees a draft.
+    """
+
+    _write_manifest(tmp_path / "mods", "tmod", TRIGGER_MANIFEST)
+    base = tmp_path / "config.yaml"
+    overlay = tmp_path / "config.local.yaml"
+    policy = "        combination: all_of\n        rules: [{type: odds, parameters: {odds: 0.5}}]\n"
+    head = "modules_directory: ./mods\nenabled_modules: [tmod]\nmodules:\n  tmod: {}\n"
+
+    def channels(first: str, second: str) -> str:
+        return f"triggers:\n  tmod:\n    channels:\n      {first}:\n{policy}      {second}:\n{policy}"
+
+    def write(first: str, second: str) -> None:
+        if reordered == "base":
+            base.write_text(head + channels(first, second), encoding="utf-8")
+        else:
+            overlay.write_text(channels(first, second), encoding="utf-8")
+
+    if reordered == "overlay":
+        base.write_text(head, encoding="utf-8")
+    write("chan-a", "chan-b")
+    ui = _ui(base, "--status-file", str(tmp_path / "status.json"))
+    seen: list[Mapping[str, Any]] = []
+
+    def checker(path: Path, environ: Mapping[str, str], managed: Path | None, draft: Mapping[str, Any]):
+        seen.append(draft)
+        return True, []
+
+    ui.checker = checker  # type: ignore[assignment]
+    cookie = _logged_in(ui)
+    csrf = _csrf_of(ui, cookie)
+    page = "/module/tmod"
+    field = "triggers.tmod.channels.@0.combination"
+    assert f'name="{field}"' in _module_html(ui, cookie, "tmod")
+    fingerprint = _form_fingerprint(ui, cookie, page)
+    layout = _form_layout(ui, cookie, page)
+    write("chan-b", "chan-a")  # no content edit, only the key order
+    before = _snapshot(tmp_path)
+
+    checked = ui.handle(_check_request(ui, cookie, csrf, page, [(field, "any_of")], layout=layout))
+    saved = _write(ui, cookie, "/save", page, [(field, "any_of")], fingerprint=fingerprint, layout=layout)
+    assert checked.status == saved.status == 409
+    assert 'data-outcome="stale"' in checked.body.decode("utf-8")
+    assert checked.body == saved.body
+    assert "changed on disk" in _written(checked)[0] and "reload it" in _written(checked)[0]
+    assert "verdict" not in checked.body.decode("utf-8")
+    assert seen == []  # never parsed, never checked
+    assert _snapshot(tmp_path) == before
+    # A form missing the layout is not trusted either.
+    missing = ui.handle(_check_request(ui, cookie, csrf, page, [(field, "any_of")], layout=""))
+    assert missing.status == 409 and seen == []
+
+    # The page as rendered now names the channel it shows, and Check sees it.
+    checked = ui.handle(_check_request(ui, cookie, csrf, page, [(field, "any_of")]))
+    assert checked.status == 200 and _verdict(checked.body.decode("utf-8"))
+    assert len(seen) == 1
+    drafted = seen[0]["triggers"]["tmod"]["channels"]
+    assert drafted["chan-b"]["combination"] == "any_of"
+    assert "combination" not in drafted.get("chan-a", {}) or drafted["chan-a"]["combination"] == "all_of"
+    assert _snapshot(tmp_path) == before
+    write("chan-a", "chan-b")  # the UI never writes the base, the fixture checks
 
 
 # -- AC26 ---------------------------------------------------------------------
@@ -4776,7 +4856,7 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     cookie, csrf = _login(ui)
     tokens += [ui.token, cookie.split("=", 1)[1], csrf]
 
-    check = sweep.record("POST /check", ui.handle(_check_request(cookie, csrf, "/")))
+    check = sweep.record("POST /check", ui.handle(_check_request(ui, cookie, csrf, "/")))
     assert check.status == 200 and _listed(check.body.decode("utf-8"))
 
     saved = sweep.record(

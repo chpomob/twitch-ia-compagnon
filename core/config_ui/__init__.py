@@ -1702,13 +1702,19 @@ def _view_layout(view: ConfigView) -> str:
     return hmac.new(key, skeleton.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _layout_field(view: ConfigView) -> str:
+    """The hidden field carrying *view*'s key layout (see :func:`_stale_layout`)."""
+
+    return f'<input type="hidden" name="{LAYOUT_FIELD}" value="{ident(_view_layout(view))}">'
+
+
 def _write_guard(session: _Session, view: ConfigView) -> str:
-    """The hidden fields every form that saves or removes carries."""
+    """The hidden fields every form that saves, removes or checks carries."""
 
     return (
         f"{_csrf_field(session)}"
         f'<input type="hidden" name="{FINGERPRINT_FIELD}" value="{ident(_view_fingerprint(view))}">'
-        f'<input type="hidden" name="{LAYOUT_FIELD}" value="{ident(_view_layout(view))}">'
+        f"{_layout_field(view)}"
     )
 
 
@@ -2654,7 +2660,7 @@ class ConfigUI:
             f"{''.join(rows)}</table>{missing_note}</section>"
             '<section id="actions-bar">'
             '<p><a href="/core">Core settings</a></p>'
-            f'<form method="post" action="/check">{_csrf_field(session)}{_page_field("/")}'
+            f'<form method="post" action="/check">{_csrf_field(session)}{_layout_field(view)}{_page_field("/")}'
             '<button type="submit">Check</button></form>'
             f'<form method="post" action="/apply">{_csrf_field(session)}{_page_field("/")}'
             '<button type="submit">Apply (restart the main process)</button></form></section>'
@@ -3202,20 +3208,22 @@ class ConfigUI:
         """``POST /check``: Check the posting page's draft and report (R5).
 
         A module page lists the diagnostics naming that module; the base and
-        core-settings pages list all of them.
+        core-settings pages list all of them. A form rendered from another
+        key layout is refused as stale, exactly as Save refuses it, before
+        any of its positional names is parsed: read against the current key
+        order they would name other keys, and the verdict would be about a
+        draft the operator never edited (gate-3 N2).
         """
 
         fields = _form_fields(request)
         view = self.view()
-        page = "/"
-        for name, value in fields:
-            if name == PAGE_FIELD:
-                page = value
+        page = self._posted_page(fields, view)
+        stale = _stale_layout(fields, view)
+        if stale is not None:
+            return self._write_response(stale, page, session)
         module: str | None = None
-        if page.startswith(MODULE_PAGE_PREFIX) and page[len(MODULE_PAGE_PREFIX) :] in view.modules:
+        if page.startswith(MODULE_PAGE_PREFIX):
             module = page[len(MODULE_PAGE_PREFIX) :]
-        elif page != CORE_PAGE:
-            page = "/"
         edits, problems = self.parse_edits(view, fields)
         result = self.check(edits, problems=problems, view=view)
         shown = result.diagnostics if module is None else result.for_module(module)
