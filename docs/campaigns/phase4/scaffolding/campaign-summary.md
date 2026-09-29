@@ -1,8 +1,8 @@
 # Phase 4 campaign summary
 
-- steps approved: 2 — P19F3, P19F4
+- steps approved: 2 — P19F5, P19F6
 - halted: no
-- full-branch gate: REQUEST_CHANGES
-- main HEAD: f8b2c5c fix(phase4): P19F4 — redaction never rewrites structural tokens; the boolean tri-state submits real booleans
-- final test run: green — 2948 passed, 18 skipped in 120.88s (0:02:00)
+- full-branch gate: unparsed
+- main HEAD: 10ef6c2 fix(phase4): P19F6 — Check honours the layout digest instead of retargeting positional fields
+- final test run: green — 2971 passed, 18 skipped in 129.10s (0:02:09)
 - log: /media/chpo/HDD-papa/twitch-ia-compagnon/docs/campaigns/phase4/scaffolding/campaign.log
