@@ -430,24 +430,31 @@ def test_the_collision_is_refused_through_main(
 async def test_a_tilde_overlay_is_compared_as_the_file_that_is_read(
     tmp_path: Path, hooks: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC41: an explicit ``~/…`` overlay is read literally, so it is compared
-    literally: a status path naming the ``./~/…`` file it reads is refused."""
+    """AC41: an explicit ``~/…`` overlay is expanded like every other path, so
+    the status path naming the ``$HOME/…`` file it reads is refused.
+
+    Inverted by gate-1 F1: the overlay used to be read literally (``./~/…``),
+    a spelling the configuration UI's collision check did not share; every
+    path now goes through the one ``core.overlay.canonical_path`` form.
+    """
 
     base = _setup(tmp_path, [M], names=(M,))
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", os.fspath(home))
     monkeypatch.chdir(tmp_path)
+    expanded = home / "chosen.local.yaml"
+    expanded.write_text("enabled_modules: [mmod]\n", encoding="utf-8")
     literal = tmp_path / "~" / "chosen.local.yaml"
     literal.parent.mkdir()
     literal.write_text("enabled_modules: [mmod]\n", encoding="utf-8")
-    before = _snapshot(literal)
+    before = _snapshot(expanded, literal)
     diagnostics: list[str] = []
 
     result = await application.run(
         base,
         asyncio.Event(),
-        environ=_environ(literal),
+        environ=_environ(expanded),
         ready_reporter=lambda message: pytest.fail(message),
         diagnostic_reporter=diagnostics.append,
         overlay="~/chosen.local.yaml",
@@ -456,8 +463,9 @@ async def test_a_tilde_overlay_is_compared_as_the_file_that_is_read(
     assert result != 0
     assert len(diagnostics) == 1
     assert "collides with the overlay file" in diagnostics[0]
+    assert os.fspath(expanded) in diagnostics[0]
     assert hooks.contexts == {}
-    assert _snapshot(literal) == before
+    assert _snapshot(expanded, literal) == before
 
 
 # --------------------------------------------------------------------------- #

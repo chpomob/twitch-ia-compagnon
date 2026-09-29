@@ -59,7 +59,6 @@ from core.config_ui import (
     NOT_REPORTED,
     NOT_SUPERVISED,
     READ_ONLY_REASON,
-    REDACT_MIN_LENGTH,
     STATUS_MAX_BYTES,
     STATUS_RECORD_UNUSABLE,
     SUPERVISED,
@@ -1321,10 +1320,18 @@ def test_redaction_never_rewrites_structural_identifiers(tmp_path: Path) -> None
             assert f'name="limits.{group}.{field_name}"' in core
 
 
-def test_redaction_skips_values_shorter_than_the_minimum() -> None:
-    assert REDACT_MIN_LENGTH == 4
-    assert _redact("a 1 abc abcd", {"1", "abc", "abcd"}) == "a 1 abc [hidden]"
+def test_redaction_covers_values_of_every_length() -> None:
+    """Gate-1 F2: R8 covers every secret value of length >= 1, with no minimum.
+
+    Inverted from ``test_redaction_skips_values_shorter_than_the_minimum``,
+    which pinned the defect (values under four characters were skipped).
+    """
+
+    assert not hasattr(config_ui, "REDACT_MIN_LENGTH")
+    assert _redact("a 1 abc abcd", {"1", "abc", "abcd"}) == "a [hidden] [hidden] [hidden]"
+    assert _redact("say q7Z", {"q7Z"}) == "say [hidden]"
     assert _redact("x <tag> &lt;tag&gt;", {"<tag>"}) == "x [hidden] [hidden]"
+    assert _redact("unchanged", {""}) == "unchanged"
 
 
 # -- R9: inline assets, relative forms, no external URL -------------------------
@@ -3761,7 +3768,8 @@ def test_the_default_launch_argv_runs_the_runtime_on_the_same_files(tmp_path: Pa
     base = tmp_path / "config.yaml"
     plain = UISettings.from_argv(["--config", str(base)])
     assert config_ui.default_launch_argv(plain) == (
-        sys.executable, "-m", "core.main", "--config", str(base)
+        sys.executable, "-m", "core.main", "--config", str(base),
+        "--overlay", str(tmp_path / "config.local.yaml"),
     )
     overlay = tmp_path / "mine.yaml"
     explicit = UISettings.from_argv(["--config", str(base), "--overlay", str(overlay)])
@@ -4866,3 +4874,261 @@ def test_ac37_doc_restart_drift_and_status_file() -> None:
     assert "`config.yaml` → `config.yaml.status.json`" in doc
     assert "`status_path_collision`" in doc
 
+
+
+# ---------------------------------------------------------------------------
+# Gate-1 F1: one canonical form of every path; Save never targets the base
+# ---------------------------------------------------------------------------
+
+
+def _f1_spellings(home: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Overlay spellings of ``home/config.yaml`` that are not its text."""
+
+    (home / "sub").mkdir()
+    (home / "link.yaml").symlink_to(home / "config.yaml")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("F1_GATE_DIR", str(home))
+    monkeypatch.chdir(home)
+    return [
+        "~/config.yaml",
+        "$F1_GATE_DIR/config.yaml",
+        "${F1_GATE_DIR}/sub/../config.yaml",
+        "config.yaml",
+        "./sub/../config.yaml",
+        "link.yaml",
+    ]
+
+
+def test_f1_an_overlay_naming_the_base_by_any_spelling_refuses_to_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Gate-1 F1: ``--overlay ~/config.yaml`` (and every other spelling of the
+    base) used to pass ``startup_checks``; it is refused before any bind."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(BASE_TEXT, encoding="utf-8")
+    spellings = _f1_spellings(home, monkeypatch)
+    monkeypatch.setattr(config_ui, "serve", _fail)
+    monkeypatch.setattr(config_ui, "ConfigUI", _fail)
+    monkeypatch.setattr(subprocess, "Popen", _fail)
+    before = _snapshot(home)
+    for spelling in spellings:
+        status = main(["--config", str(home / "config.yaml"), "--overlay", spelling])
+        err = capsys.readouterr().err
+        assert status != 0, spelling
+        assert "overlay_path_collision" in err, spelling
+        assert f"configuration file {home / 'config.yaml'} itself" in err, spelling
+        assert _snapshot(home) == before
+        settings = UISettings.from_argv(["--config", "~/config.yaml", "--overlay", spelling])
+        assert settings.overlay_path == settings.base_path == home / "config.yaml"
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+@pytest.mark.parametrize(
+    "spelling", ["$F1_GATE_UNSET_VARIABLE/config.local.yaml", "~f1-no-such-user-7c1e/x.yaml"]
+)
+def test_f1_an_overlay_that_cannot_be_canonicalised_refuses_to_start(
+    spelling: str,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Gate-1 F1: a path whose file cannot be known is refused, never guessed."""
+
+    monkeypatch.delenv("F1_GATE_UNSET_VARIABLE", raising=False)
+    monkeypatch.setattr(config_ui, "serve", _fail)
+    monkeypatch.setattr(config_ui, "ConfigUI", _fail)
+    before = _snapshot(config_dir)
+    status = main(["--config", str(config_dir / "config.yaml"), "--overlay", spelling])
+    err = capsys.readouterr().err
+    assert status != 0
+    assert "path_not_canonical" in err and "cannot be canonicalised" in err
+    assert _snapshot(config_dir) == before
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+def test_f1_every_path_is_canonical_and_the_runtime_gets_the_same_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    settings = UISettings.from_argv(
+        ["--config", "~/config.yaml", "--overlay", "~/mine.yaml", "--status-file", "~/s.json"]
+    )
+    assert settings.base_path == home / "config.yaml"
+    assert settings.overlay_path == home / "mine.yaml"
+    assert settings.status_path == home / "s.json"
+    assert startup_checks(settings) == []
+    assert config_ui.default_launch_argv(settings)[-4:] == (
+        "--config", str(home / "config.yaml"), "--overlay", str(home / "mine.yaml")
+    )
+    implicit = UISettings.from_argv(["--config", "~/config.yaml"])
+    assert implicit.overlay_path == home / "config.local.yaml"
+    assert implicit.status_path == home / "config.yaml.status.json"
+
+
+def test_the_runtime_is_launched_on_the_managed_overlay_of_a_linked_base(
+    tmp_path: Path,
+) -> None:
+    """Gate-1 P19F1 A1: the base is launched by its canonical path, so the
+    implicit overlay the UI manages is passed explicitly; otherwise the
+    runtime would derive one from the link target's name."""
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "base.yaml").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "a" / "config.yaml").symlink_to(tmp_path / "b" / "base.yaml")
+    settings = UISettings.from_argv(["--config", str(tmp_path / "a" / "config.yaml")])
+    assert settings.overlay_path == tmp_path / "a" / "config.local.yaml"
+    assert config_ui.default_launch_argv(settings)[-4:] == (
+        "--config", str(tmp_path / "b" / "base.yaml"),
+        "--overlay", str(tmp_path / "a" / "config.local.yaml"),
+    )
+
+
+def test_f1_save_never_replaces_the_base_whatever_the_overlay_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate-1 C/F1 as a running test: a UI built past the startup refusal
+    over ``--overlay ~/config.yaml`` used to answer an authenticated Save
+    with 303 and replace the base file with the overlay document."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    base = _fixture_config(home, rules=[("preserve-me", "x.do")], enabled=())
+    before = _snapshot(home)
+    ui = ConfigUI(
+        UISettings.from_argv(
+            ["--config", str(base), "--overlay", "~/config.yaml",
+             "--status-file", str(tmp_path / "status.json")]
+        )
+    )
+    assert startup_checks(ui.settings) != []
+    cookie, _ = _login(ui)
+    response = _write(ui, cookie, "/save", "/", [("enabled_modules.xmod", "true")])
+    assert response.status == 403
+    assert "the overlay path is the configuration file itself" in response.body.decode("utf-8")
+    assert _snapshot(home) == before
+    assert "preserve-me" in base.read_text(encoding="utf-8")
+    with pytest.raises(RuntimeError, match="managed overlay"):
+        config_ui._write_overlay(base, base, base, {"enabled_modules": []})
+    with pytest.raises(RuntimeError, match="managed overlay"):
+        spelled = Path("~/config.local.yaml")
+        config_ui._write_overlay(spelled, spelled, base, {"enabled_modules": []})
+    assert _snapshot(home) == before
+
+
+# ---------------------------------------------------------------------------
+# Gate-1 F2: R8 covers every secret value, at any length, in any position
+# ---------------------------------------------------------------------------
+
+
+def _twitch_ui(tmp_path: Path, text: str, environ: dict[str, str]) -> ConfigUI:
+    base = tmp_path / "config.yaml"
+    base.write_text(text, encoding="utf-8")
+    return ConfigUI(
+        UISettings.from_argv(["--config", str(base), "--status-file", str(tmp_path / "status.json")]),
+        environ=environ,
+    )
+
+
+@pytest.mark.parametrize("secret", ["q7Z", "Ω"])
+def test_f2_a_short_secret_in_an_ordinary_setting_is_never_rendered(
+    tmp_path: Path, secret: str
+) -> None:
+    """Gate-1 C/F2a as a running test: a 3-character ``${GATE_SECRET}`` equal
+    to ``modules.twitch.companion_name`` used to be shown as ``value="q7Z"``;
+    a 1-character one is covered too. The reference stays visible."""
+
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${GATE_SECRET}']\n"
+        f"modules:\n  twitch:\n    companion_name: '{secret}'\n",
+        {"GATE_SECRET": secret},
+    )
+    cookie, _ = _login(ui)
+    for path in ("/", "/core", f"{MODULE_PAGE_PREFIX}twitch"):
+        response = _get(ui, path, cookie)
+        assert response.status == 200, path
+        page = response.body.decode("utf-8")
+        assert secret not in page, path
+        assert _html.escape(secret) not in page, path
+    core = _get(ui, "/core", cookie).body.decode("utf-8")
+    assert "${GATE_SECRET}" in core
+    module = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
+    assert 'name="modules.twitch.companion_name" value="[hidden]"' in module
+    # The field posted back as the page drew it is no edit: "[hidden]" is
+    # never written over the configured value.
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        edits, problems = ui.parse_edits(
+            ui.view(), [("modules.twitch.companion_name", "[hidden]")]
+        )
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+    assert (edits, problems) == ([], [])
+
+
+def test_f2_a_credential_used_as_a_trigger_channel_key_is_never_rendered(
+    tmp_path: Path,
+) -> None:
+    """Gate-1 C/F2b as a running test: a literal ``client_secret`` reused as a
+    trigger channel key used to surface in
+    ``name="triggers.twitch.channels.<secret>.combination"``."""
+
+    secret = "gate-secret-channel-97bf"
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\n"
+        f"modules:\n  twitch:\n    client_secret: {secret}\n",
+        {},
+    )
+    (tmp_path / "config.local.yaml").write_text(
+        f"triggers:\n  twitch:\n    channels:\n      {secret}:\n"
+        "        combination: all_of\n        rules:\n"
+        "          - type: probability\n            parameters: {probability: 0.5}\n",
+        encoding="utf-8",
+    )
+    cookie, _ = _login(ui)
+    response = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie)
+    assert response.status == 200
+    page = response.body.decode("utf-8")
+    assert secret in ui.secret_values
+    assert secret not in page
+    names = re.findall(r'name="(@field-[0-9a-f]{32})"', page)
+    assert names, "the channel's controls carry an opaque name"
+    assert all(secret not in name for name in re.findall(r'(?:name|value|data-[a-z-]+)="([^"]*)"', page))
+
+    # The opaque names are read back: the channel policy is edited...
+    select = re.search(r'<select name="(@field-[0-9a-f]{32})" data-combination', page)
+    assert select is not None
+    saved = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}twitch", [(select.group(1), "any_of")])
+    assert saved.status == 303, re.findall(r"<li[^>]*>[^<]*", saved.body.decode())
+    overlay = yaml.safe_load((tmp_path / "config.local.yaml").read_text(encoding="utf-8"))
+    assert overlay["triggers"]["twitch"]["channels"][secret]["combination"] == "any_of"
+    # ...and removed, through the same opaque name, never echoing the key.
+    page = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
+    remove = re.search(r'name="path" value="(@field-[0-9a-f]{32})">Delete this channel policy', page)
+    assert remove is not None
+    removed = _write(ui, cookie, "/remove", f"{MODULE_PAGE_PREFIX}twitch", [("path", remove.group(1))])
+    assert removed.status == 303, removed.body
+    assert secret not in removed.body.decode("utf-8")
+    overlay = yaml.safe_load((tmp_path / "config.local.yaml").read_text(encoding="utf-8")) or {}
+    assert secret not in overlay.get("triggers", {}).get("twitch", {}).get("channels", {})
+
+
+def test_f2_declared_identifiers_are_public_text_and_stay_intact(tmp_path: Path) -> None:
+    """A secret equal to a declared name (a module, a manifest field) is not
+    disclosed by the name, so the markup it builds is not rewritten."""
+
+    ui = _twitch_ui(
+        tmp_path,
+        "modules_directory: builtin\nenabled_modules: []\nsecrets: ['${A}']\n",
+        {"A": "companion_name"},
+    )
+    cookie, _ = _login(ui)
+    page = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
+    assert 'name="modules.twitch.companion_name"' in page

@@ -18,6 +18,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,20 @@ def resolve_overlay_path(
     if explicit is not None:
         return Path(explicit)
     return implicit_overlay_path(base)
+
+
+def canonical_overlay_path(
+    base: str | os.PathLike[str],
+    explicit: str | os.PathLike[str] | None,
+) -> Path | None:
+    """The managed overlay path (A1) in its :func:`canonical_path` form.
+
+    The implicit path is derived from the base file's name as given, then
+    canonicalised like an explicit one; ``None`` when no path can be derived.
+    """
+
+    overlay = resolve_overlay_path(base, explicit)
+    return None if overlay is None else canonical_path(overlay)
 
 
 def read_overlay(path: str | os.PathLike[str] | None) -> Mapping[str, Any]:
@@ -159,14 +174,55 @@ def on_disk_digest(
     return canonical_digest(deep_merge(read_base(base), read_overlay(overlay_path)))
 
 
-def _resolved(path: str | os.PathLike[str]) -> str:
-    return os.path.realpath(os.path.abspath(os.fspath(path)))
+#: An environment reference ``os.path.expandvars`` left in place: its
+#: variable is unset, so the path it names is unknown.
+_UNEXPANDED_VARIABLE = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)")
+
+
+def canonical_path(path: str | os.PathLike[str]) -> Path:
+    """The one canonical form of a configuration, overlay or status path.
+
+    ``~`` and environment references are expanded, the result is made
+    absolute against the working directory, and symbolic links and ``..``
+    are resolved whether or not the file exists yet. Every path the runtime
+    and the UI compare, read or replace goes through this function, so two
+    spellings of one file can never be told apart (A5, R6, R7).
+
+    A path that cannot be canonicalised raises :class:`OverlayError` rather
+    than being guessed at: a ``~user`` that names no user, a reference to an
+    unset variable, a link loop or an invalid path. The message names the
+    path as given and no file content.
+    """
+
+    raw = os.fspath(path)
+    label = f"path {raw}"
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(raw))
+    except (TypeError, ValueError, KeyError, RuntimeError):
+        raise OverlayError(f"{label}: cannot be canonicalised") from None
+    if expanded.startswith("~"):
+        raise OverlayError(f"{label}: cannot be canonicalised (unknown home directory)")
+    if _UNEXPANDED_VARIABLE.search(expanded):
+        raise OverlayError(f"{label}: cannot be canonicalised (unset environment variable)")
+    try:
+        # ``Path.resolve`` (not ``os.path.realpath``) so a link loop raises;
+        # it makes the path absolute and follows each link before applying the
+        # ``..`` after it, as the filesystem does (``os.path.abspath`` would
+        # collapse ``link/..`` lexically and name another file).
+        return Path(expanded).resolve(strict=False)
+    except (OSError, ValueError, RuntimeError):
+        raise OverlayError(f"{label}: cannot be canonicalised") from None
 
 
 def same_file(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
-    """Whether both paths name the same file once resolved (links followed)."""
+    """Whether both paths name the same file once canonicalised.
 
-    return _resolved(a) == _resolved(b)
+    Both sides go through :func:`canonical_path`, so ``~``, environment
+    references, relative spellings, ``..`` and links all compare equal to the
+    file they name.
+    """
+
+    return canonical_path(a) == canonical_path(b)
 
 
 def status_path_collision(

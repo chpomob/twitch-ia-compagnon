@@ -87,12 +87,13 @@ from core.main import (
 from core.overlay import (
     STATUS_FILE_VARIABLE,
     OverlayError,
+    canonical_overlay_path,
+    canonical_path,
     deep_merge,
     default_status_path,
     on_disk_digest,
     read_base,
     read_overlay,
-    resolve_overlay_path,
     same_file,
     status_path_collision,
 )
@@ -173,25 +174,32 @@ class UISettings:
             launch_argv=tuple(launch),
         )
 
+    # Every path below is in its one canonical form (``core.overlay.
+    # canonical_path``): the startup refusal, the Save destination, the
+    # status-path rules and the launched runtime all use these values, so no
+    # spelling of the base file can pass for the overlay (R6, R7). Each
+    # raises ``OverlayError`` for a path that cannot be canonicalised;
+    # :func:`startup_checks` turns that into a refusal before anything else.
+
     @property
     def base_path(self) -> Path:
-        """The base configuration file, as the runtime opens it."""
+        """The base configuration file, canonical, as the runtime opens it."""
 
-        return self.config.expanduser()
+        return canonical_path(self.config)
 
     @property
     def overlay_path(self) -> Path | None:
-        """The managed overlay path: ``--overlay`` or the implicit A1 path."""
+        """The managed overlay path, canonical: ``--overlay`` or the A1 path."""
 
-        return resolve_overlay_path(self.base_path, self.overlay)
+        return canonical_overlay_path(self.config, self.overlay)
 
     @property
     def status_path(self) -> Path:
-        """The one status path watched: ``--status-file`` or the A5 default."""
+        """The one status path watched, canonical: ``--status-file`` or A5."""
 
         if self.status_file is not None:
-            return self.status_file
-        return default_status_path(self.base_path)
+            return canonical_path(self.status_file)
+        return canonical_path(default_status_path(self.config))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -235,16 +243,25 @@ def startup_checks(settings: UISettings) -> list[str]:
             f"refusing to bind non-loopback host {settings.host}: "
             "the configuration UI is local-only; pass --allow-non-loopback to override"
         )
-    base = settings.base_path
-    overlay = settings.overlay_path
+    try:
+        base = settings.base_path
+        overlay = settings.overlay_path
+        status = settings.status_path
+    except OverlayError as exc:
+        # Refuse rather than guess which file a path names (R6, R7).
+        problems.append(f"path_not_canonical: {exc}")
+        return problems
     if overlay is None:
         problems.append(
             f"no overlay path can be derived from configuration file {base}: "
             "--overlay PATH is required"
         )
-    elif same_file(overlay, base):
-        problems.append(f"overlay path {overlay} is the configuration file itself")
-    status = settings.status_path
+    elif overlay == base:
+        given = settings.config if settings.overlay is None else settings.overlay
+        problems.append(
+            f"overlay_path_collision: overlay path {given} resolves to the "
+            f"configuration file {base} itself"
+        )
     collision = status_path_collision(status, base, overlay)
     if collision is not None:
         named = base if collision == "base" else overlay
@@ -1050,17 +1067,22 @@ class RunningState:
 # ``[hidden]`` anyway, in every configured value as :func:`esc` renders it
 # and in every log record. It works on values before they are serialized,
 # never on the finished body or headers, so a secret that happens to equal a
-# path, a field name or any other piece of markup cannot rewrite it; the
-# structural identifiers that build paths and control names (module, limit
-# and variable names) go through :func:`ident`, which never redacts.
-# Only values of at least ``REDACT_MIN_LENGTH`` characters are replaced:
-# redacting a one-character secret such as ``"1"`` would mangle every page,
-# and a shorter secret is still never rendered because the renderers show
-# references only.
+# path, a field name or any other piece of markup cannot rewrite it. Every
+# secret-set value is replaced whatever its length, a single character
+# included (gate-1 F2): the replacement only ever touches configured text.
+# Declared identifiers (module directory names, manifest field and limit
+# names, ``${NAME}`` variable names) go through :func:`ident`, which never
+# redacts. A setting path is not a declared identifier when it holds a
+# configured key (a trigger channel, a named entry): it is shown through
+# :func:`esc` and named, in controls and ``data-`` hooks, by
+# :func:`_field_name`, which replaces a path that would carry a secret-set
+# value by an opaque name the server maps back.
 # ---------------------------------------------------------------------------
 
-REDACT_MIN_LENGTH = 4
 REDACTED = "[hidden]"
+#: The prefix of the opaque name :func:`_field_name` gives a path that would
+#: otherwise carry a secret-set value.
+OPAQUE_FIELD_PREFIX = "@field-"
 
 #: The UI answering the current request; :func:`esc` redacts its secret set
 #: as it stands when the value is rendered (the handler refreshes it first).
@@ -1072,7 +1094,7 @@ def _redaction_forms(secret_values: Iterable[str]) -> list[str]:
 
     forms: set[str] = set()
     for value in secret_values:
-        if len(value) < REDACT_MIN_LENGTH:
+        if not value:
             continue
         forms.add(value)
         forms.add(html.escape(value, quote=True))
@@ -1126,6 +1148,44 @@ def esc(value: Any) -> str:
     if source is not None:
         text = _redact(text, source.secret_values)
     return html.escape(text, quote=True)
+
+
+def _guarded(text: str) -> str:
+    """*text* as :func:`esc` would show it, before HTML escaping: redacted."""
+
+    source = _RENDERING_FOR.get()
+    return text if source is None else _redact(text, source.secret_values)
+
+
+def _field_name(path: Sequence[Any]) -> str:
+    """The form-field name and ``data-path`` of a setting *path* (R8).
+
+    The path's text when no configured segment of it carries a secret-set
+    value; otherwise an opaque name, a keyed digest of the text under this
+    UI's per-process key, so a configured key (a trigger channel, a named
+    entry) equal to or containing a secret never reaches a page (gate-1 F2).
+    A declared segment (see :func:`_declared_names`) is public text, never a
+    disclosure. The same UI renders the same name again when it reads the
+    posted form back.
+    """
+
+    text = _path_text(path)
+    source = _RENDERING_FOR.get()
+    if source is None or not any(
+        isinstance(segment, str)
+        and segment not in source.declared_names
+        and _redact(segment, source.secret_values) != segment
+        for segment in path
+    ):
+        return text
+    digest = hmac.new(source.field_key, text.encode("utf-8"), hashlib.sha256).hexdigest()
+    return OPAQUE_FIELD_PREFIX + digest[:32]
+
+
+def _names_path(posted: str, path: Sequence[Any]) -> bool:
+    """Whether *posted* names *path*: by its text or by its :func:`_field_name`."""
+
+    return posted in (_path_text(path), _field_name(path))
 
 
 def ident(name: str) -> str:
@@ -1274,6 +1334,51 @@ LIMITS_NOTICE = "the reserved limits setting is handed to every module from the 
 ITEMS_SEGMENT = "[]"
 ENTRY_SEGMENT = "<entry>"
 
+#: The fixed segments of the setting paths the pages render (R4).
+_FIXED_SEGMENTS = frozenset(
+    {
+        "modules", "modules_directory", "enabled_modules", "limits", "secrets", "actions",
+        "triggers", "channels", "combination", "rules", "type", "parameters",
+        ITEMS_SEGMENT, ENTRY_SEGMENT,
+    }
+)
+
+
+def _mapping_keys(value: Any) -> set[str]:
+    """Every string mapping key inside *value*, recursively."""
+
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str):
+                found.add(key)
+            found |= _mapping_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            found |= _mapping_keys(item)
+    return found
+
+
+def _declared_names(view: ConfigView) -> frozenset[str]:
+    """The path segments that are declared, public text: never configured.
+
+    Module names (discovered directories), every key of every manifest
+    (setting, trigger and parameter names), the declared trigger types, the
+    limit groups and fields, and the fixed segments. A configured key such
+    as a trigger channel or a named entry is none of these.
+    """
+
+    names: set[str] = set(_FIXED_SEGMENTS)
+    for name, module in view.modules.items():
+        names.add(name)
+        names |= _mapping_keys(module.manifest)
+        names |= set(_trigger_types(module.manifest))
+    for group, fields in LIMIT_DECLARATION.items():
+        names.add(group)
+        names |= set(fields)
+    return frozenset(names)
+
+
 _SCALAR_KINDS = ("string", "integer", "number", "boolean")
 
 
@@ -1366,7 +1471,9 @@ class _SchemaRenderer:
     def register(
         self, path: Sequence[Any], kind: str, rendered: str, schema: Mapping[str, Any] | None = None
     ) -> None:
-        self.controls[_path_text(path)] = _Control(tuple(path), kind, rendered, schema or {})
+        # Keyed by the name the control renders and holding the text it posts
+        # untouched: both are what the page shows, secret-set values redacted.
+        self.controls[_field_name(path)] = _Control(tuple(path), kind, _guarded(rendered), schema or {})
 
     # -- values -------------------------------------------------------------
 
@@ -1480,7 +1587,7 @@ class _SchemaRenderer:
             )
         return (
             f'<div class="notice not-editable" {self._attributes(path, required, live)} data-notice="true">'
-            f"{label} <strong>{NOT_EDITABLE}</strong>: <code>{ident(_path_text(path))}</code> "
+            f"{label} <strong>{NOT_EDITABLE}</strong>: <code>{esc(_path_text(path))}</code> "
             f'<span class="reason">({esc(reason)})</span>'
             f"{self._help(schema or {}, path, False)}{configured}</div>"
         )
@@ -1488,7 +1595,7 @@ class _SchemaRenderer:
     # -- pieces -------------------------------------------------------------
 
     def _attributes(self, path: Sequence[Any], required: bool, live: bool) -> str:
-        attributes = f'data-path="{ident(_path_text(path))}"'
+        attributes = f'data-path="{ident(_field_name(path))}"'
         if live:
             attributes += f' data-origin="{ident(self.view.origin(path))}"'
         if required:
@@ -1524,7 +1631,7 @@ class _SchemaRenderer:
             if self.view.origin(path) == ORIGIN_OVERLAY:
                 meta.append(
                     '<button type="submit" formaction="/remove" name="path" '
-                    f'value="{ident(_path_text(path))}">Remove override</button>'
+                    f'value="{ident(_field_name(path))}">Remove override</button>'
                 )
         if meta:
             parts.append(f'<p class="meta">{" · ".join(meta)}</p>')
@@ -1554,7 +1661,7 @@ class _SchemaRenderer:
         )
 
     def _control(self, schema: Mapping[str, Any], path: Sequence[Any], kind: str) -> str:
-        name = ident(_path_text(path))
+        name = ident(_field_name(path))
         value = self.view.value(path)
         if reference_name(value) is not None:
             # A reference is edited as its text, whatever the declared type.
@@ -1597,6 +1704,9 @@ class _SchemaRenderer:
             step = "1" if kind == "integer" else "any"
             shown = "" if value is _MISSING else _plain(value)
             self.register(path, kind, shown, schema)
+            if _guarded(shown) != shown:
+                # A number input would post its redacted text as "".
+                return f'<input type="text" name="{name}" value="{esc(shown)}">'
             return f'<input type="number" name="{name}"{bounds} step="{step}" value="{esc(shown)}">'
         shown = "" if value is _MISSING else _plain(value)
         self.register(path, kind, shown, schema)
@@ -1615,7 +1725,7 @@ class _SchemaRenderer:
         if live:
             self.register(path, "json", self._json_text(path), schema)
         editor = (
-            f'<textarea name="{ident(_path_text(path))}" data-json="list" rows="3">'
+            f'<textarea name="{ident(_field_name(path))}" data-json="list" rows="3">'
             f"{esc(self._json_text(path))}</textarea>"
             if live
             else ""
@@ -1645,12 +1755,12 @@ class _SchemaRenderer:
                 rows.append(
                     f'<div class="entry" data-entry="{esc(_plain(key))}">'
                     f"<label>Entry {_key_label(key, self.view)} "
-                    f'<textarea name="{ident(_path_text(entry_path))}" data-json="entry" rows="2">'
+                    f'<textarea name="{ident(_field_name(entry_path))}" data-json="entry" rows="2">'
                     f"{esc(self._json_text(entry_path))}</textarea></label> "
                     f'<span class="origin">origin: {esc(self.origin(entry_path))}</span></div>'
                 )
-            self.entry_mappings[_path_text(path)] = tuple(path)
-            prefix = ident(_path_text(path))
+            self.entry_mappings[_field_name(path)] = tuple(path)
+            prefix = ident(_field_name(path))
             rows.append(
                 f'<div class="entry new">New entry name <input type="text" name="new_entry_name:{prefix}"> '
                 f'value (JSON) <textarea name="new_entry_value:{prefix}" rows="2"></textarea></div>'
@@ -1761,8 +1871,12 @@ class ConfigUI:
         self.environ: Mapping[str, str] = os.environ if environ is None else environ
         #: The secret set of the last configuration snapshot (R8).
         self.secret_values: frozenset[str] = frozenset()
+        #: The declared path segments of every snapshot (:func:`_field_name`).
+        self.declared_names: frozenset[str] = _FIXED_SEGMENTS
         self._secrets_lock = threading.Lock()
         self.token = secrets.token_urlsafe(32)
+        #: Keys the opaque field names of :func:`_field_name` (R8).
+        self.field_key = secrets.token_bytes(32)
         self.authorities = accepted_authorities(
             settings.host, settings.port, settings.allowed_hosts
         )
@@ -1821,8 +1935,10 @@ class ConfigUI:
         view = ConfigView.load(self.settings, self.environ)
         # A union, so a snapshot loaded concurrently never drops a value an
         # earlier one still rendered around (R8).
+        declared = _declared_names(view)
         with self._secrets_lock:
             self.secret_values = self.secret_values | view.secret_values
+            self.declared_names = self.declared_names | declared
         return view
 
     @property
@@ -2102,7 +2218,8 @@ class ConfigUI:
                 path = ("limits", group, field_name)
                 shown = view.display(path)
                 reference = reference_name(view.value(path)) is not None
-                if reference:
+                if reference or _guarded(shown or "") != (shown or ""):
+                    # A number input would post a redacted value as "".
                     control = 'type="text"'
                 elif kind == LIMIT_KIND_COUNT:
                     control = 'type="number" min="1" step="1"'
@@ -2112,7 +2229,7 @@ class ConfigUI:
                     f'<tr data-limit="{ident(group)}.{ident(field_name)}">'
                     f"<td><label>{ident(field_name)}</label></td>"
                     f'<td class="kind">{ident(kind)}</td>'
-                    f'<td><input {control} name="limits.{ident(group)}.{ident(field_name)}" '
+                    f'<td><input {control} name="{ident(_field_name(path))}" '
                     f'value="{esc(shown or "")}"></td>'
                     f'<td class="origin">{esc(self._origin(view, path))}</td></tr>'
                 )
@@ -2300,7 +2417,7 @@ class ConfigUI:
                     for item in combinations
                 )
                 parts.append(
-                    f'<p><label>Combination <select name="{ident(_path_text((*path, "combination")))}" '
+                    f'<p><label>Combination <select name="{ident(_field_name((*path, "combination")))}" '
                     f'data-combination="{esc(_plain(combination))}">{options}</select></label> '
                     f'<span class="origin">{esc(renderer.origin((*path, "combination")))}</span></p>'
                 )
@@ -2323,7 +2440,7 @@ class ConfigUI:
             else:
                 parts.append(
                     f'<button type="submit" formaction="/remove" name="path" '
-                    f'value="{ident(_path_text(path))}">Delete this channel policy</button>'
+                    f'value="{ident(_field_name(path))}">Delete this channel policy</button>'
                 )
             parts.append("</form></fieldset>")
             policies.append("".join(parts))
@@ -2336,7 +2453,7 @@ class ConfigUI:
         add = (
             '<form id="add-channel-policy" method="post" action="/save">'
             f"{_write_guard(session, view)}{_page_field(MODULE_PAGE_PREFIX + name)}<h3>Add channel policy</h3>"
-            f'<input type="hidden" name="add_channel_policy" value="{ident(_path_text(channels_path))}">'
+            f'<input type="hidden" name="add_channel_policy" value="{ident(_field_name(channels_path))}">'
             '<label>Channel <input type="text" name="channel"></label> '
             f'<label>Combination <select name="combination">{combination_options}</select></label> '
             f'<label>Rule type <select name="rule_type">{type_options}</select></label> '
@@ -2518,7 +2635,7 @@ class ConfigUI:
             name
             for name, module in view.modules.items()
             if _trigger_types(module.manifest)
-            and _path_text(("triggers", name, "channels")) == target
+            and _names_path(target, ("triggers", name, "channels"))
         ]
         if len(inputs) != 1:
             problems.append(f"{_ADD_CHANNEL_POLICY}: is not a trigger input this UI edits")
@@ -2705,7 +2822,7 @@ class ConfigUI:
             return prepared
         base, overlay = prepared
         view = self.view() if view is None else view
-        candidates = [path for path in _overlay_key_paths(overlay) if _path_text(path) == path_text]
+        candidates = [path for path in _overlay_key_paths(overlay) if _names_path(path_text, path)]
         if len(candidates) != 1:
             reason = "is not overridden in the overlay" if not candidates else "is ambiguous"
             return self._refused(WriteResult(OUTCOME_REFUSED, (f"{path_text}: {reason}",)))
@@ -2726,6 +2843,12 @@ class ConfigUI:
 
         if self.overlay_path is None:
             return WriteResult(OUTCOME_REFUSED, ("no managed overlay path is configured",))
+        if self.overlay_path != self._managed_overlay or same_file(self.overlay_path, self.base_path):
+            # The destination is never the base file, whatever its spelling
+            # (gate-1 F1); startup refuses this, a UI built past it does too.
+            return WriteResult(
+                OUTCOME_REFUSED, ("the overlay path is the configuration file itself",)
+            )
         current = _file_fingerprint(self.overlay_path)
         if current is None:
             return WriteResult(OUTCOME_FAILED, ("the overlay file is not readable",))
@@ -3569,10 +3692,16 @@ def _write_overlay(
     is removed and the previous overlay stays as it was.
     """
 
-    if target is None or managed is None or target != managed or same_file(target, base):
+    if (
+        target is None
+        or managed is None
+        or target != managed
+        or target != canonical_path(target)
+        or same_file(target, base)
+    ):
         raise RuntimeError("refusing to write a file other than the managed overlay")
     text = yaml.safe_dump(dict(document), sort_keys=False, allow_unicode=True)
-    directory = target.expanduser().parent
+    directory = target.parent
     handle, temporary = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=directory
     )
@@ -3581,7 +3710,7 @@ def _write_overlay(
             stream.write(text.encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, target.expanduser())
+        os.replace(temporary, target)
     except BaseException:
         with suppress(OSError):
             os.unlink(temporary)
@@ -3714,8 +3843,12 @@ def default_launch_argv(settings: UISettings) -> tuple[str, ...]:
     if settings.launch_argv:
         return settings.launch_argv
     argv = [sys.executable, "-m", "core.main", "--config", os.fspath(settings.base_path)]
-    if settings.overlay is not None:
-        argv += ["--overlay", os.fspath(settings.overlay)]
+    # The managed overlay is always passed, even when derived implicitly: the
+    # runtime would derive its own from the canonical base's name, which is a
+    # different file when the given base path is a link (R7).
+    overlay = settings.overlay_path
+    if overlay is not None:
+        argv += ["--overlay", os.fspath(overlay)]
     return tuple(argv)
 
 

@@ -115,10 +115,11 @@ from .overlay import (
     STATUS_FILE_VARIABLE,
     OverlayError,
     canonical_digest,
+    canonical_overlay_path,
+    canonical_path,
     deep_merge,
     read_base,
     read_overlay,
-    resolve_overlay_path,
     status_path_collision,
 )
 from .runtime import (
@@ -346,8 +347,8 @@ def _load_documents(
     """
 
     try:
-        path = Path(config_path).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError, TypeError):
+        path = canonical_path(config_path)
+    except (OverlayError, TypeError):
         raise ConfigurationError("configuration file: path is not valid") from None
     try:
         base = read_base(path)
@@ -511,10 +512,12 @@ async def run(
     status_variable = (os.environ if environ is None else environ).get(
         STATUS_FILE_VARIABLE
     )
-    # One path object for the check and the writes, so both name one file.
-    status_path = Path(status_variable) if status_variable else None
-    if status_path:
+    # One canonical path object for the check and the writes, so both name
+    # one file whatever spelling the variable used.
+    status_path: Path | None = None
+    if status_variable:
         try:
+            status_path = canonical_path(status_variable)
             collision = _status_collision(status_path, config_path, overlay)
         except Exception:
             report_diagnostic("status_path_collision: status file could not be checked")
@@ -683,15 +686,15 @@ def _overlay_read_path(
     config_path: str | os.PathLike[str],
     overlay: str | os.PathLike[str] | None,
 ) -> Path | None:
-    """The overlay path :func:`_load_documents` opens.
+    """The overlay path :func:`_load_documents` opens, canonical.
 
-    The implicit overlay is derived from the ``~``-expanded base path; an
-    explicit ``--overlay`` path is opened exactly as given. The status
-    collision check uses this same path, so it can never compare a file
-    other than the one that is read (R7).
+    The explicit ``--overlay`` or implicit A1 path in the one canonical form
+    the configuration UI also uses (``core.overlay.canonical_path``). The
+    status collision check uses this same path, so it can never compare a
+    file other than the one that is read (R7).
     """
 
-    return resolve_overlay_path(Path(config_path).expanduser(), overlay)
+    return canonical_overlay_path(config_path, overlay)
 
 
 def _status_collision(
@@ -708,7 +711,7 @@ def _status_collision(
     yet (A5, R7).
     """
 
-    base = Path(config_path).expanduser()
+    base = canonical_path(config_path)
     overlay_path = _overlay_read_path(config_path, overlay)
     collision = status_path_collision(status_path, base, overlay_path)
     if collision is None:

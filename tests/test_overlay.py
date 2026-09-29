@@ -9,6 +9,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from types import MappingProxyType
@@ -22,6 +23,8 @@ from core.overlay import (
     STATUS_FILE_VARIABLE,
     OverlayError,
     canonical_digest,
+    canonical_overlay_path,
+    canonical_path,
     deep_merge,
     default_status_path,
     implicit_overlay_path,
@@ -298,6 +301,7 @@ def test_a_different_name_does_not_collide(tmp_path):
 
 RECORDING_SOURCE = """
 import json
+import os
 from pathlib import Path
 
 
@@ -559,3 +563,63 @@ def test_limit_declaration_is_a_read_only_view_of_the_limit_table():
         declaration["dedup"] = {}  # type: ignore[index]
     with pytest.raises(TypeError):
         declaration["dedup"]["max_entries"] = "seconds"  # type: ignore[index]
+
+
+# -- gate-1 F1: one canonical form of every path ---------------------------------
+
+
+def test_every_spelling_of_one_file_has_one_canonical_form(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    (home / "sub").mkdir(parents=True)
+    (home / "link.yaml").symlink_to(home / "config.yaml")
+    monkeypatch.setenv("HOME", os.fspath(home))
+    monkeypatch.setenv("F1_GATE_DIR", os.fspath(home))
+    monkeypatch.chdir(home)
+    target = home / "config.yaml"
+    for spelling in (
+        "~/config.yaml",
+        "$F1_GATE_DIR/config.yaml",
+        "${F1_GATE_DIR}/sub/../config.yaml",
+        "config.yaml",
+        "./sub/../config.yaml",
+        "link.yaml",
+        target,
+    ):
+        assert canonical_path(spelling) == target, spelling
+        assert same_file(spelling, target), spelling
+    assert canonical_overlay_path("~/config.yaml", None) == home / "config.local.yaml"
+    assert canonical_overlay_path("~/config.yaml", "~/x.yaml") == home / "x.yaml"
+    assert canonical_overlay_path("~/config.txt", None) is None
+    assert status_path_collision("~/config.yaml", target, None) == "base"
+
+
+@pytest.mark.parametrize(
+    "spelling", ["$F1_GATE_UNSET_VARIABLE/x.yaml", "${F1_GATE_UNSET_VARIABLE}", "~f1-no-such-user-7c1e/x"]
+)
+def test_a_path_that_cannot_be_canonicalised_is_refused_not_guessed(
+    spelling: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("F1_GATE_UNSET_VARIABLE", raising=False)
+    with pytest.raises(OverlayError, match="cannot be canonicalised"):
+        canonical_path(spelling)
+
+
+def test_a_link_loop_cannot_be_canonicalised(tmp_path: Path) -> None:
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    with pytest.raises(OverlayError, match="cannot be canonicalised"):
+        canonical_path(tmp_path / "a")
+
+
+def test_a_link_is_followed_before_the_parent_component_after_it(tmp_path: Path) -> None:
+    """Gate-1 P19F1 A2: ``link/..`` names the link target's parent, as the
+    filesystem opens it, not the link's own directory."""
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b" / "sub").mkdir(parents=True)
+    (tmp_path / "a" / "link").symlink_to(tmp_path / "b" / "sub")
+    spelling = tmp_path / "a" / "link" / ".." / "config.yaml"
+    assert canonical_path(spelling) == tmp_path / "b" / "config.yaml"
+    assert canonical_path(os.fspath(spelling)) == tmp_path / "b" / "config.yaml"

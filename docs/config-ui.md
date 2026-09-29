@@ -107,7 +107,17 @@ directory:
 (`python -m core.main --config config.yaml --overlay PATH`) alike. A base whose
 name ends in neither `.yaml` nor `.yml` has no implicit overlay: the runtime then
 reads the base alone, and the UI refuses to start unless `--overlay PATH` is
-given. The UI also refuses to start when the overlay path is the base file.
+given. The UI also refuses to start when the overlay path is the base file, with
+the diagnostic `overlay_path_collision`, whatever its spelling.
+
+Every path — `--config`, `--overlay`, `--status-file` and the status-file
+variable — is used in one canonical form, on the UI and on the runtime alike: `~`
+and `$VAR`/`${VAR}` are expanded, the path is made absolute against the working
+directory, and symbolic links and `..` are resolved. `~/config.yaml`,
+`./sub/../config.yaml` and a link to the base therefore all name the base. A path
+that cannot be canonicalised (an unset variable, an unknown `~user`, a link loop)
+is refused at startup with the diagnostic `path_not_canonical`; it is never
+guessed.
 
 An absent overlay file changes nothing; an empty overlay file means no override.
 An overlay that is unreadable, not valid YAML or not a mapping is a configuration
@@ -205,6 +215,13 @@ diagnostic. Secret values are:
   base or the overlay (as a value or as a mapping key);
 - the values of the variables listed in the `secrets` block;
 - any literal value at a declared credential path.
+
+Every such value is covered whatever its length, a single character included,
+and wherever the same text is configured: in another setting's value, as a
+trigger channel or other named-entry key, in a diagnostic. A configured key that
+carries a secret value is named in the page's form controls by an opaque
+`@field-…` name the UI maps back, never by its text. Declared names (module,
+setting, trigger and limit names) are public text and are shown as they are.
 
 Such fields are displayed only as their reference (`${NAME}`), or as
 "literal value configured (hidden)", with their set/unset state. The set/unset
