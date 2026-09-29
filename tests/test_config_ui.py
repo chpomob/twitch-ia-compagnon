@@ -6681,15 +6681,14 @@ def test_n3_an_unmatched_placeholder_fails_check_as_save_refuses_it(tmp_path: Pa
     editor = _allowed_editor(ui, cookie)
     name = editor["entries"][0]["controls"][config_ui.PATCH_VALUE]
     fields = [(key, text) for key, text in _browser(editor) if key != name] + [(name[:-1], '"edited"')]
-    checked, saved = _check_then_save(ui, cookie, "audio_output", fields)
-    assert not _verdict(checked)
-    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _listed(checked))
-    assert ui.last_check is not None and not ui.last_check.settings_phase_reached
+    checked, saved = _both_routes(ui, cookie, "audio_output", fields)
+    # P19F11: one refusal on both routes, the stale page, before any Check.
+    _assert_stale_identity(checked, saved)
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(checked))
+    assert ui.last_check is None
     assert seen == []
-    assert saved.status == 403
-    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(saved))
     assert _snapshot(tmp_path) == before
-    assert "q7Z" not in checked
+    assert "q7Z" not in checked.body.decode("utf-8")
 
 
 @pytest.mark.parametrize("secret", ["Ω", "q7Z", "gate-secret-channel-97bf"])
@@ -6906,12 +6905,12 @@ def test_n3_an_edited_stand_in_is_refused_never_written(
     prefix = f"{config_ui.PATCH_FIELD_PREFIX}{config_ui.PATCH_VALUE}-"
     altered = prefix + alter(name[len(prefix) :])
     fields = [(key, text) for key, text in _browser(editor) if key != name] + [(altered, '"edited"')]
-    checked, saved = _check_then_save(ui, cookie, "audio_output", fields)
-    assert not _verdict(checked)
-    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _listed(checked))
-    assert ui.last_check is not None and not ui.last_check.settings_phase_reached
-    assert saved.status == 403
-    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(saved))
+    last = ui.last_check
+    checked, saved = _both_routes(ui, cookie, "audio_output", fields)
+    # P19F11: one refusal on both routes, the stale page, before any Check.
+    _assert_stale_identity(checked, saved)
+    assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(checked))
+    assert ui.last_check is last
     assert _snapshot(tmp_path) == before
 
 
@@ -7298,9 +7297,8 @@ def test_p19f10_gate7_an_old_identity_after_remove_and_save_is_refused_never_ret
     # The identities of the loaded page, replayed after the Remove: the
     # path they name is gone, so nothing is found to apply them to.
     check, save = _both_routes(ui, cookie, "twitch", [(old_name, '"edited"')])
-    assert not _verdict(check.body.decode("utf-8"))
+    _assert_stale_identity(check, save)
     assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(check))
-    assert save.status == 403
     added = _write(
         ui, cookie, "/save", page,
         [("add_channel_policy", "triggers.twitch.channels"), ("channel", "second"), ("combination", "all_of"),
@@ -7311,8 +7309,8 @@ def test_p19f10_gate7_an_old_identity_after_remove_and_save_is_refused_never_ret
     # Still on the old render: the old identity names ``first``, not ``second``.
     before = _snapshot(tmp_path)
     check, save = _both_routes(ui, cookie, "twitch", [(old_name, '"edited"')])
+    _assert_stale_identity(check, save)
     assert any(config_ui._UNKNOWN_ENTRY_REASON in line for line in _written(check))
-    assert save.status == 403
     # The gate's exact order: a fresh page, then the old identity.
     fresh = _module_html(ui, cookie, "twitch")
     new = _patch_editor(fresh, ".keywords")
@@ -7616,3 +7614,229 @@ def test_p19f10_a_withheld_rule_parameter_offers_no_clear(tmp_path: Path) -> Non
     assert any(config_ui._OPERATION_REASON in line for line in _listed(checked))
     assert saved.status == 403
     assert _snapshot(tmp_path) == before
+
+
+# ---------------------------------------------------------------------------
+# P19F11 (gate-8 N3/N6 residual): no identity value is ever reissued, and
+# every identity the current render did not draw meets one guard with one
+# outcome on every route that consumes it
+# ---------------------------------------------------------------------------
+
+
+#: The bounded render-tag history P19F10 kept (4,096 renders): exercising
+#: the allocator past it once made an evicted identity unrecognised.
+P19F10_RENDER_HISTORY = 4096
+
+
+def _counted_parses(ui: ConfigUI) -> list[None]:
+    """One entry per :meth:`ConfigUI.parse_edits` call from now on."""
+
+    calls: list[None] = []
+    original = ui.parse_edits
+
+    def parse_edits(*args: Any, **kwargs: Any) -> Any:
+        calls.append(None)
+        return original(*args, **kwargs)
+
+    ui.parse_edits = parse_edits  # type: ignore[method-assign]
+    return calls
+
+
+def _session_of(ui: ConfigUI, cookie: str) -> Any:
+    session = ui._session(_request("GET", "/", headers={"cookie": cookie}))
+    assert session is not None
+    return session
+
+
+def _allowed_overlay_ui(tmp_path: Path) -> ConfigUI:
+    """``_allowed_ui`` with the list overridden in the overlay, so Remove has
+    an override to delete."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    (tmp_path / "config.local.yaml").write_text(
+        yaml.safe_dump({"modules": {"audio_output": {"voices": {"allowed": ["kept", "q7Z", "over"]}}}}),
+        encoding="utf-8",
+    )
+    return ui
+
+
+def _all_routes(ui: ConfigUI, cookie: str, fields: list[tuple[str, str]]) -> dict[str, UIResponse]:
+    """*fields* posted from the audio output page to every route that
+    consumes a form's identities; Remove names a real override."""
+
+    page = f"{MODULE_PAGE_PREFIX}audio_output"
+    removal = [*fields, ("path", "modules.audio_output.voices.allowed")]
+    return {
+        "/check": _write(ui, cookie, "/check", page, fields),
+        "/save": _write(ui, cookie, "/save", page, fields),
+        "/remove": _write(ui, cookie, "/remove", page, removal),
+    }
+
+
+def test_p19f11_no_render_tag_or_identity_is_ever_reissued(tmp_path: Path) -> None:
+    """Many renders through the production allocator, across sessions and
+    two UI instances: every render tag and every identity is distinct, the
+    tag is the UI's startup nonce then a strictly growing counter, and no
+    history of issued tags is kept that could be evicted and reissued."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    other = ConfigUI(ui.settings, environ=ui.environ)
+    assert not hasattr(ui, "_render_tags")
+    tags: list[str] = []
+    for target in (ui, other):
+        sessions = [_session_of(target, _logged_in(target)) for _ in range(3)]
+        for index in range(2 * P19F10_RENDER_HISTORY):
+            tags.append(target._new_render(sessions[index % 3], f"{MODULE_PAGE_PREFIX}audio_output"))
+    assert len(set(tags)) == len(tags)
+    assert all(re.fullmatch(rf"[0-9a-f]{{{config_ui.RENDER_TAG_LENGTH}}}", tag) for tag in tags)
+    half = len(tags) // 2
+    first = {tag[: config_ui.RENDER_NONCE_LENGTH] for tag in tags[:half]}
+    last = {tag[: config_ui.RENDER_NONCE_LENGTH] for tag in tags[half:]}
+    assert len(first) == len(last) == 1 and first != last  # one nonce per UI, never shared
+    counts = [int(tag[config_ui.RENDER_NONCE_LENGTH :], 16) for tag in tags[:half]]
+    assert counts == sorted(set(counts))
+    # Rendered identities: distinct over many real page renders and both UIs.
+    # (the controls of one entry share its identity: counted once per page)
+    identities: list[str] = []
+    for target in (ui, other):
+        cookie = _logged_in(target)
+        for _ in range(50):
+            identities.extend(set(_identity_tokens(_module_html(target, cookie, "audio_output"))))
+    assert identities and len(set(identities)) == len(identities)
+    assert not any("q7Z" in token or "kept" in token for token in identities)
+
+
+def test_p19f11_gate8_a_foreign_process_identity_with_current_guards_is_refused(tmp_path: Path) -> None:
+    """Gate 8's first residual through the real handlers: an authentic
+    identity minted by another UI process over the same configuration,
+    posted with the receiver's current layout, fingerprint, CSRF token and
+    current controls, answered Check 200/failed and Save 403. It is now the
+    stale page on both routes, identically, with nothing parsed, checked or
+    committed; the receiver's own render still saves."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    seen = _observed(ui)
+    foreign = ConfigUI(ui.settings, environ=ui.environ)
+    other = _allowed_editor(foreign, _logged_in(foreign))
+    cookie = _logged_in(ui)
+    current = _allowed_editor(ui, cookie)
+    before = _snapshot(tmp_path)
+    parsed = _counted_parses(ui)
+    for changes in (_replaced(other["entries"][1], '"x"'), _allowed_changes(other, append="added")):
+        fields = [*_browser(current), *_submitted(other, changes)]
+        check, save = _both_routes(ui, cookie, "audio_output", fields)
+        _assert_stale_identity(check, save)
+        assert check.body == save.body
+    assert parsed == []
+    assert seen == []
+    assert _snapshot(tmp_path) == before
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
+        _submitted(current, _allowed_changes(current, append="added")),
+    )
+    assert response.status == 303, _written(response)
+    assert _saved_allowed(tmp_path) == ["kept", "q7Z", "added"]
+
+
+def test_p19f11_gate8_an_identity_past_the_old_history_bound_stays_refused(tmp_path: Path) -> None:
+    """Gate 8's second residual: a genuine identity retained from a render,
+    then the production allocator exercised past the 4,096-render history
+    P19F10 bounded, then the page rendered again. The old identity is no
+    longer "forgotten" into another class: it is the stale page on both
+    routes, identically, with nothing checked or committed."""
+
+    ui = _allowed_ui(tmp_path, "q7Z", ["kept", "q7Z"])
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    old = _allowed_editor(ui, cookie)
+    session = _session_of(ui, cookie)
+    for _ in range(P19F10_RENDER_HISTORY + 1):
+        ui._new_render(session, f"{MODULE_PAGE_PREFIX}audio_output")
+    current = _allowed_editor(ui, cookie)
+    before = _snapshot(tmp_path)
+    for fields in (
+        _browser(old),
+        _submitted(old, _allowed_changes(old, append="added")),
+        [*_browser(current), *_submitted(old, _replaced(old["entries"][1], '"x"'))],
+    ):
+        check, save = _both_routes(ui, cookie, "audio_output", fields)
+        _assert_stale_identity(check, save)
+    assert seen == []
+    assert _snapshot(tmp_path) == before
+    response = _write(
+        ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output",
+        _submitted(current, _allowed_changes(current, append="added")),
+    )
+    assert response.status == 303, _written(response)
+
+
+def test_p19f11_every_route_refuses_a_non_current_identity_identically(tmp_path: Path) -> None:
+    """One refusal class, one outcome: an identity from an earlier render,
+    another session, another UI process, past the old history bound, from
+    another page, altered, or naming an entry changed on disk since, posted
+    to Check, Save or Remove with the receiver's current guards, always
+    answers the same 409 stale page — status, content type and body
+    identical on every route and for every source — and nothing is parsed,
+    checked, removed or written. The current render's own form still works
+    on each route."""
+
+    ui = _allowed_overlay_ui(tmp_path)
+    seen = _observed(ui)
+    cookie = _logged_in(ui)
+    session = _session_of(ui, cookie)
+    earlier = _allowed_editor(ui, cookie)
+    second = _logged_in(ui)
+    elsewhere = _allowed_editor(ui, second)
+    foreign = ConfigUI(ui.settings, environ=ui.environ)
+    remote = _allowed_editor(foreign, _logged_in(foreign))
+    evicted = _allowed_editor(ui, cookie)
+    for _ in range(P19F10_RENDER_HISTORY + 1):
+        ui._new_render(session, f"{MODULE_PAGE_PREFIX}audio_output")
+    current = _allowed_editor(ui, cookie)
+    brain_page = _module_html(ui, cookie, "brain")
+    brain_identities = [
+        (f"{config_ui.PATCH_FIELD_PREFIX}{config_ui.PATCH_VALUE}-{token}", '"x"')
+        for token in _identity_tokens(brain_page)
+    ]
+    name = current["entries"][0]["controls"][config_ui.PATCH_VALUE]
+    prefix = f"{config_ui.PATCH_FIELD_PREFIX}{config_ui.PATCH_VALUE}-"
+    altered = prefix + name[len(prefix) :][:-1] + ("0" if name[-1] != "0" else "1")
+    sources: dict[str, list[tuple[str, str]]] = {
+        "earlier-render": _submitted(earlier, _allowed_changes(earlier, append="a")),
+        "other-session": _submitted(elsewhere, _allowed_changes(elsewhere, append="a")),
+        "other-process": [*_browser(current), *_submitted(remote, _replaced(remote["entries"][1], '"x"'))],
+        "past-history": _browser(evicted),
+        "other-page": [*_browser(current), *brain_identities[:1]],
+        "altered": [*[(key, text) for key, text in _browser(current) if key != name], (altered, '"x"')],
+    }
+    if not brain_identities:
+        del sources["other-page"]
+    before = _snapshot(tmp_path)
+    outcomes: set[tuple[int, str, bytes]] = set()
+    parsed = _counted_parses(ui)
+    for source, fields in sources.items():
+        for route, response in _all_routes(ui, cookie, fields).items():
+            assert response.status == 409, (source, route, _written(response))
+            assert _written(response) == [config_ui._STALE_IDENTITY_REASON], (source, route)
+            outcomes.add((response.status, response.content_type, response.body))
+    assert len(outcomes) == 1
+    assert "Refused: stale page" in next(iter(outcomes))[2].decode("utf-8")
+    assert parsed == []
+    assert seen == []
+    assert _snapshot(tmp_path) == before
+    # An entry changed on disk under the current render: the same outcome.
+    overlay = tmp_path / "config.local.yaml"
+    overlay.write_text(overlay.read_text(encoding="utf-8").replace("over", "moved"), encoding="utf-8")
+    changed = _snapshot(tmp_path)
+    fields = _submitted(current, {current["entries"][2]["controls"][config_ui.PATCH_VALUE]: '"x"'})
+    for route, response in _all_routes(ui, cookie, fields).items():
+        assert (response.status, response.content_type, response.body) in outcomes, route
+    assert seen == []
+    assert _snapshot(tmp_path) == changed
+    # The current render's own form: Check, then Remove, work as ever.
+    current = _allowed_editor(ui, cookie)
+    check = _write(ui, cookie, "/check", f"{MODULE_PAGE_PREFIX}audio_output", _browser(current))
+    assert check.status == 200 and _verdict(check.body.decode("utf-8"))
+    removed = _all_routes(ui, cookie, _browser(current))["/remove"]
+    assert removed.status == 303, _written(removed)
+    assert not overlay.exists() or "allowed" not in overlay.read_text(encoding="utf-8")

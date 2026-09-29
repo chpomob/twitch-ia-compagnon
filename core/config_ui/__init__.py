@@ -1335,11 +1335,13 @@ OPERATION_FIELD_PREFIX = "@op:"
 OPERATION_UNCHANGED = "unchanged"
 OPERATION_SET = "set"
 OPERATION_CLEAR = "clear"
-#: Hex characters of the render tag every patch identity starts with.
-RENDER_TAG_LENGTH = 16
-#: How many render tags the UI remembers to tell a stale identity from an
-#: unknown one; a forgotten tag is still refused, as unknown.
-MAX_RENDER_TAGS = 4096
+#: Hex characters of the render tag every patch identity starts with: the
+#: UI's startup nonce, then its render counter (P19F11).
+RENDER_TAG_LENGTH = 32
+#: Hex characters of the nonce each UI mints at startup: the first half of
+#: every render tag it issues, so no tag of another UI process equals one of
+#: its own (P19F11).
+RENDER_NONCE_LENGTH = 16
 #: The placeholder of a control whose configured text is withheld.
 WITHHELD_PLACEHOLDER = "withheld: type a replacement, or leave empty to keep it"
 
@@ -2121,8 +2123,9 @@ class _SchemaRenderer:
         positions: gate-7 N6), the entry's real path and its real value.
         Unique per render and place, meaningless without this UI's field
         key, and unknown once the entry's value or place changed. The tag is
-        random per rendering, so an identity drawn by an earlier render or
-        in another session never equals a current one (gate-7 N3): it is
+        this UI's startup nonce and its render counter, never issued twice
+        (P19F11), so an identity drawn by an earlier render, in another
+        session or by another UI process never equals a current one: it is
         refused, never retargeted. No configured key or value appears in it.
         """
 
@@ -2674,9 +2677,12 @@ class ConfigUI:
         self.status_path = settings.status_path
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._sessions_lock = threading.Lock()
-        #: Render tag → the page it was drawn for, newest last, bounded
-        #: (P19F10): tells an identity of an earlier render from an unknown one.
-        self._render_tags: OrderedDict[str, str] = OrderedDict()
+        #: Every render tag this UI issues is this nonce then the next count
+        #: (P19F11): the counter only grows and the nonce is minted here, so
+        #: no tag is ever issued twice, by this UI or by another, and no
+        #: history of issued tags is kept (none can be evicted and reissued).
+        self._render_nonce = secrets.token_hex(RENDER_NONCE_LENGTH // 2)
+        self._render_count = 0
         self._mutation_lock = threading.Lock()
         #: Runs the settings phase of Check; the seam exists for unit tests,
         #: production always uses :func:`_default_checker` (R5).
@@ -2764,12 +2770,11 @@ class ConfigUI:
         shows (P19F10): every identity it draws starts with it, and the
         identities of the render it replaces are refused from now on."""
 
-        tag = secrets.token_hex(RENDER_TAG_LENGTH // 2)
         with self._sessions_lock:
+            self._render_count += 1
+            width = RENDER_TAG_LENGTH - RENDER_NONCE_LENGTH
+            tag = f"{self._render_nonce}{self._render_count:0{width}x}"
             session.renders[page] = tag
-            self._render_tags[tag] = page
-            while len(self._render_tags) > MAX_RENDER_TAGS:
-                self._render_tags.popitem(last=False)
         return tag
 
     def _live_render(self, page: str, fields: Sequence[tuple[str, str]]) -> str:
@@ -2786,23 +2791,33 @@ class ConfigUI:
             live = any(session.renders.get(page) == tag for session in self._sessions.values())
         return tag if live else ""
 
-    def _stale_identities(
-        self, fields: Sequence[tuple[str, str]], session: _Session, page: str
+    def _stale_submission(
+        self, fields: Sequence[tuple[str, str]], view: ConfigView, session: _Session, page: str
     ) -> WriteResult | None:
-        """A stale result when a posted patch identity was drawn for *page*
-        by a render *session* is not showing — an earlier render, or another
-        session's (gate-7 N3/N6). Refused before anything is parsed, exactly
-        as a stale layout is, on Check and Save alike; nothing is applied
-        elsewhere. An identity no render drew is left to :meth:`parse_edits`,
-        which refuses it as unknown."""
+        """The one guard Check, Save and Remove run on a posted form before
+        anything of it is parsed, checked or written (P19F11, gate-8 N3/N6):
+        a stale result when its key layout is not the current one, or when
+        any patch identity it posts is not one the render *session* shows
+        for *page* drew over the current configuration. An earlier render,
+        another session, another UI process, another page, an altered
+        identity or an entry changed on disk since: one class, one outcome
+        (409, "reload the page"), identical on every route. The decision is
+        membership in the current render's identities, never recognition of
+        a past one, so no forgotten history can let an identity through."""
 
+        stale = _stale_layout(fields, view)
+        if stale is not None:
+            return stale
+        names = [name for name, _text in fields if name.startswith(PATCH_FIELD_PREFIX)]
+        if not names:
+            return None
         with self._sessions_lock:
             current = session.renders.get(page)
-            for name, _text in fields:
-                tag = _render_tag(name)
-                if tag is not None and tag != current and self._render_tags.get(tag) == page:
-                    return WriteResult(OUTCOME_STALE, (_STALE_IDENTITY_REASON,))
-        return None
+        if current is not None and all(_render_tag(name) == current for name in names):
+            drawn = self._controls(view, current).patches
+            if all(name in drawn and drawn[name].page == page for name in names):
+                return None
+        return WriteResult(OUTCOME_STALE, (_STALE_IDENTITY_REASON,))
 
     def _csrf(self, request: UIRequest) -> str | None:
         header = request.headers.get(CSRF_HEADER)
@@ -3694,7 +3709,7 @@ class ConfigUI:
         fields = _form_fields(request)
         view = self.view()
         page = self._posted_page(fields, view)
-        stale = _stale_layout(fields, view) or self._stale_identities(fields, session, page)
+        stale = self._stale_submission(fields, view, session, page)
         if stale is not None:
             return self._write_response(stale, page, session)
         module: str | None = None
@@ -3898,7 +3913,7 @@ class ConfigUI:
         fields = _form_fields(request)
         view = self.view()
         page = self._posted_page(fields, view)
-        stale = _stale_layout(fields, view) or self._stale_identities(fields, session, page)
+        stale = self._stale_submission(fields, view, session, page)
         if stale is not None:
             return self._write_response(stale, page, session)
         edits, problems = self.parse_edits(view, fields, session)
@@ -3913,7 +3928,7 @@ class ConfigUI:
         fields = _form_fields(request)
         view = self.view()
         page = self._posted_page(fields, view)
-        stale = _stale_layout(fields, view)
+        stale = self._stale_submission(fields, view, session, page)
         if stale is not None:
             return self._write_response(stale, page, session)
         result = self.remove(
@@ -4362,10 +4377,14 @@ _OUTCOME_STATUS = {
 _PROTECTED_REASON = "a protected field must keep its configured text"
 _READ_ONLY_BLOCK = "is read-only in v1"
 #: Why a patch submission is refused before validation (P19F9, value-free).
-_UNKNOWN_ENTRY_REASON = (
-    "a posted entry is not one this page rendered from the current configuration "
-    "(unknown, stale or from another page); reload the page"
+#: Why a posted patch identity is refused (P19F11, gate-8 N3/N6): one
+#: reason for every identity the current render did not draw.
+_STALE_IDENTITY_REASON = (
+    "a posted entry is not one the page this session shows now drew from the current "
+    "configuration (an earlier rendering, another session or UI process, another page, "
+    "or an altered or changed entry); reload the page"
 )
+_UNKNOWN_ENTRY_REASON = _STALE_IDENTITY_REASON
 _DUPLICATE_ENTRY_REASON = "an entry was posted more than once; post each entry once"
 _WITHHELD_WHOLE_REASON = (
     "holds a withheld value and is edited entry by entry, never as one text; "
@@ -4376,11 +4395,6 @@ _EXISTING_KEY_REASON = "a new entry names a key the setting already has; edit th
 _NEW_KEY_REASON = "a new entry needs a key"
 _ORDER_REASON = "an entry position must be a whole number"
 _REMOVE_FLAG_REASON = "a removal flag must be 'true'"
-#: Why a patch identity of another rendering is refused (P19F10, gate-7 N3/N6).
-_STALE_IDENTITY_REASON = (
-    "a posted entry was drawn by an earlier rendering of this page or in another session, "
-    "not by the page this session shows now; reload the page"
-)
 #: Why an explicit operation is refused (P19F10, gate-7 N7).
 _OPERATION_REASON = "an operation must be 'unchanged', 'set' or 'clear' where the page offers it"
 _TYPED_BUT_UNCHANGED_REASON = (

@@ -253,10 +253,12 @@ setting; one the overlay holds can also be cleared, which removes it from the
 overlay so the base value applies again. Only what changed is applied to the
 real configuration the UI loaded, so Check and Save validate the same values.
 Every entry's identity is drawn for one rendering of the page, in one browser
-session: a form from an earlier rendering, or from another session, is refused
-as a stale page ("reload the page") on Check and Save alike. A submission the
-UI cannot apply exactly (an entry it does not know, a stale page, an entry
-posted twice, an entry both removed and edited, a new key that already
+session, and is never issued twice: any entry the page this session shows now
+did not draw from the current configuration (an earlier rendering, another
+session or UI process, another page, an altered identity, or an entry changed
+on disk since) is refused as a stale page ("reload the page"), with the same
+answer on Check, Save and Remove, before anything is checked or written. A
+submission the UI cannot apply exactly (an entry posted twice, an entry both removed and edited, a new key that already
 exists) is refused by name and nothing is written. The UI never edits
 environment variables: set them in the shell that starts the UI. The access token
 appears only in the single startup line on standard output.
