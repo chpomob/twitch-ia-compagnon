@@ -84,6 +84,11 @@ the UI on that machine.
   with the page's CSRF token, and an `Origin` header, when present, must be
   exactly `http://<accepted authority>`. GET never changes anything.
 
+At most 16 requests are admitted at once (4 running, the rest waiting for a
+worker), each body at most 1 MiB. A request beyond that is answered
+`503 Service Unavailable` with `Retry-After: 1` before its body is read: nothing
+was done, submit it again.
+
 ## 3. The overlay file
 
 The UI never writes the base file. Every change goes to a **managed overlay file**
@@ -181,6 +186,14 @@ The UI writes exactly these **5 writable blocks**, into the overlay only:
 - `limits` — `limits.<group>.<field>`, on the core-settings page;
 - `modules_directory` — on the core-settings page.
 
+A boolean module setting is a three-way choice: "not set (default: …)" keeps it
+out of the overlay and inherits the declared default, while `true` and `false`
+write that value explicitly — so `false` over a `default: true` is saved as
+`false`. An explicit value goes back to "not set" through "Remove override". A
+configured value that is not a boolean (the string `'true'`, say) is shown as its
+own "(not a boolean)" choice and left untouched unless you pick `true` or `false`,
+which replaces it with the boolean.
+
 These **2 read-only blocks** are displayed but never written:
 
 - `secrets`
@@ -237,7 +250,10 @@ There is no hot reload: applying a change is a **supervised restart**.
 1. Apply first runs a Check of the on-disk configuration (base + overlay). If it
    fails, Apply is refused and nothing is stopped or started.
 2. The UI stops the main process **it launched itself**: terminate, then wait at
-   most the stop grace (10 s), then kill.
+   most the stop grace (10 s), then kill, then wait at most the kill wait (5 s).
+   A process still not ended after that is kept supervised (a later Apply or the
+   UI's shutdown signals it again), and Apply is refused with a diagnostic naming
+   its pid: nothing new is started beside it.
 3. It starts the launch argv (§1) without a shell, with the status-file variable
    (§8) set to its status path.
 4. It watches the status path for a bounded window (**60 s** by default) and

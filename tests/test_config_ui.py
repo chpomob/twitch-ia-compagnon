@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 import tokenize
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -802,7 +802,7 @@ def test_bridge_dispatch_runs_handle_on_a_config_ui_worker(config_dir: Path) -> 
 
     async def scenario() -> UIResponse:
         loop_thread.append(threading.current_thread().name)
-        return await _dispatch(ui, request, executor)
+        return await _dispatch(ui, request, executor, config_ui._Admission())
 
     try:
         bridged = _run_socket_free(scenario())
@@ -1558,7 +1558,9 @@ def test_ac18_unrenderable_nodes_get_notices_and_controls_keep_the_schema(tmp_pa
     assert 'data-required="true"' in count and '<abbr class="required" title="required">*</abbr>' in count
     assert "required" not in _node(page, "modules.fmod.mode")
     assert 'min="0" max="1" step="any"' in _node(page, "modules.fmod.ratio")
-    assert 'type="checkbox" name="modules.fmod.flag" value="true" checked' in page
+    flag = _node(page, "modules.fmod.flag")
+    assert '<select name="modules.fmod.flag" data-kind="boolean" data-effective="true">' in flag
+    assert '<option value="true" selected>true</option><option value="false">false</option>' in flag
     names = _node(page, "modules.fmod.names")
     assert '<textarea name="modules.fmod.names" data-json="list"' in names
     assert "[&quot;x&quot;, &quot;y&quot;]</textarea>" in names
@@ -2174,7 +2176,7 @@ def test_bridge_check_runs_the_real_checker_from_a_running_loop(
 
     async def scenario() -> UIResponse:
         assert isinstance(asyncio.get_running_loop(), _SocketFreeEventLoop)
-        return await _dispatch(ui, request, executor)
+        return await _dispatch(ui, request, executor, config_ui._Admission())
 
     try:
         response = _run_socket_free(scenario())
@@ -3952,20 +3954,23 @@ def test_ac31_a_child_ignoring_terminate_is_killed_after_the_bounded_wait(
 
 
 def test_stop_waits_for_the_grace_before_killing() -> None:
-    """The stop order without a real process: the bounded wait times out."""
+    """The stop order without a real process: the bounded wait times out.
+
+    Inverted for gate-1 F5: the wait after kill used to be ``wait(None)``
+    (unbounded); it is now bounded by ``kill_wait``."""
 
     class Stubborn(_SpiedChild):
         def wait(self, timeout: float | None = None) -> int:
             self.calls.append(f"wait({timeout})")
-            if timeout is not None:
+            if timeout == 3.0:
                 raise subprocess.TimeoutExpired("child", timeout)
             return -9
 
-    supervisor = config_ui.Supervisor(("x",), "status.json", stop_grace=3.0)
+    supervisor = config_ui.Supervisor(("x",), "status.json", stop_grace=3.0, kill_wait=2.0)
     child = Stubborn()
     supervisor.child = child
-    supervisor.stop()
-    assert child.calls == ["terminate", "wait(3.0)", "kill", "wait(None)"]
+    assert supervisor.stop() is True
+    assert child.calls == ["terminate", "wait(3.0)", "kill", "wait(2.0)"]
     assert supervisor.child is None
     supervisor.stop()  # nothing launched: nothing signalled
     assert len(child.calls) == 4
@@ -5132,3 +5137,276 @@ def test_f2_declared_identifiers_are_public_text_and_stay_intact(tmp_path: Path)
     cookie, _ = _login(ui)
     page = _get(ui, f"{MODULE_PAGE_PREFIX}twitch", cookie).body.decode("utf-8")
     assert 'name="modules.twitch.companion_name"' in page
+
+
+# -- Gate-1 F3: a boolean draft has three honest states ------------------------------
+
+AUDIO_SETTINGS_TEXT = (
+    "modules_directory: builtin\nenabled_modules: []\n"
+    "modules:\n  audio_output:\n"
+    "    synthesis: {endpoint: '', model: ''}\n"
+    "    voices: {allowed: [v], default: v}\n"
+    "    outputs: {o: {player: {argv: [cat]}}}\n"
+    "    default_output: o\n"
+)
+PROBE_FIELD = "modules.audio_output.synthesis.probe"
+
+
+def _probe_select(page: str) -> str:
+    match = re.search(rf'<select name="{re.escape(PROBE_FIELD)}"[^>]*>.*?</select>', page, re.S)
+    assert match is not None
+    return match.group(0)
+
+
+def test_f3_an_unset_true_default_boolean_renders_its_effective_value(tmp_path: Path) -> None:
+    """Gate-1 C/F3 as a running test, through the shipped ``audio_output``
+    manifest: an unset ``synthesis.probe`` is ``true`` at runtime, and used
+    to render as an unchecked checkbox."""
+
+    from modules.audio_output import _Settings
+
+    ui = _twitch_ui(tmp_path, AUDIO_SETTINGS_TEXT, {})
+    cookie, _ = _login(ui)
+    control = _probe_select(_module_html(ui, cookie, "audio_output"))
+    assert 'data-effective="true"' in control
+    assert re.findall(r'<option value="([^"]*)"( selected)?>([^<]*)', control) == [
+        ("", " selected", "not set (default: true)"),
+        ("true", "", "true"),
+        ("false", "", "false"),
+    ]
+    module = yaml.safe_load(AUDIO_SETTINGS_TEXT)["modules"]["audio_output"]
+    assert _Settings.from_mapping(module).probe is True
+
+
+@pytest.mark.parametrize(("posted", "written"), [("", None), ("false", False), ("true", True)])
+def test_f3_a_boolean_draft_expresses_unset_false_and_true(
+    tmp_path: Path, posted: str, written: bool | None
+) -> None:
+    """Gate-1 C/F3: posting ``false`` over an unset ``default: true`` used to
+    parse to no edit (``edits=[]``), so Check saw an empty overlay and Save
+    wrote nothing. Each state now reaches the parser, Check, Save and the
+    runtime settings parser distinctly."""
+
+    from modules.audio_output import _Settings
+
+    seen: list[Mapping[str, Any]] = []
+
+    def checker(path: Path, environ: Mapping[str, str], overlay: Path | None, draft: Mapping[str, Any]):
+        seen.append(draft)
+        return True, []
+
+    ui = _twitch_ui(tmp_path, AUDIO_SETTINGS_TEXT, {})
+    ui.checker = checker  # type: ignore[assignment]
+    cookie, _ = _login(ui)
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        edits, problems = ui.parse_edits(ui.view(), [(PROBE_FIELD, posted)])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+    expected = [] if written is None else [(("modules", "audio_output", "synthesis", "probe"), written)]
+    assert (edits, problems) == (expected, [])
+
+    page = _post_check(ui, f"{MODULE_PAGE_PREFIX}audio_output", [(PROBE_FIELD, posted)], cookie=cookie)
+    assert _verdict(page) is True
+    draft_probe = seen[-1].get("modules", {}).get("audio_output", {}).get("synthesis", {}).get("probe")
+    assert draft_probe is written
+
+    saved = _write(ui, cookie, "/save", f"{MODULE_PAGE_PREFIX}audio_output", [(PROBE_FIELD, posted)])
+    if written is None:
+        assert 'data-outcome="unchanged"' in saved.body.decode("utf-8")
+    else:
+        assert saved.status == 303, saved.body
+    overlay_file = tmp_path / "config.local.yaml"
+    overlay = yaml.safe_load(overlay_file.read_text(encoding="utf-8")) if overlay_file.exists() else None
+    if written is None:
+        assert not overlay
+    else:
+        assert overlay == {"modules": {"audio_output": {"synthesis": {"probe": written}}}}
+    merged = config_ui.deep_merge(yaml.safe_load(AUDIO_SETTINGS_TEXT), overlay or {})
+    runtime = _Settings.from_mapping(merged["modules"]["audio_output"]).probe
+    assert runtime is (True if written is None else written)
+
+    # The page redrawn over the saved overlay selects the explicit value.
+    control = _probe_select(_module_html(ui, cookie, "audio_output"))
+    effective = "true" if written is None else json.dumps(written)
+    assert f'data-effective="{effective}"' in control
+    assert ('<option value=""' in control) is (written is None)
+
+
+def test_f3_a_non_boolean_configured_value_posts_untouched(tmp_path: Path) -> None:
+    ui = _twitch_ui(tmp_path, AUDIO_SETTINGS_TEXT.replace("model: ''}", "model: '', probe: maybe}"), {})
+    cookie, _ = _login(ui)
+    control = _probe_select(_module_html(ui, cookie, "audio_output"))
+    keep = config_ui._KEEP_NON_BOOLEAN
+    assert f'<option value="{keep}" selected>maybe (not a boolean)</option>' in control
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, keep)]) == ([], [])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+
+
+@pytest.mark.parametrize("text", ["true", "false"])
+def test_f3_a_configured_boolean_spelling_string_can_be_corrected(tmp_path: Path, text: str) -> None:
+    """A configured *string* ``'true'`` keeps its own option, and the real
+    ``true`` and ``false`` choices stay selectable: posting either writes the
+    boolean, while the kept option still posts untouched."""
+
+    ui = _twitch_ui(tmp_path, AUDIO_SETTINGS_TEXT.replace("model: ''}", f"model: '', probe: '{text}'}}"), {})
+    cookie, _ = _login(ui)
+    control = _probe_select(_module_html(ui, cookie, "audio_output"))
+    keep = config_ui._KEEP_NON_BOOLEAN
+    assert f'<option value="{keep}" selected>{text} (not a boolean)</option>' in control
+    assert '<option value="true">true</option>' in control
+    assert '<option value="false">false</option>' in control
+    probe = ("modules", "audio_output", "synthesis", "probe")
+    token = config_ui._RENDERING_FOR.set(ui)
+    try:
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, keep)]) == ([], [])
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, "true")]) == ([(probe, True)], [])
+        assert ui.parse_edits(ui.view(), [(PROBE_FIELD, "false")]) == ([(probe, False)], [])
+    finally:
+        config_ui._RENDERING_FOR.reset(token)
+
+
+# -- Gate-1 F4: the dispatch bridge admits a bounded number of requests ---------------
+
+
+def test_f4_a_saturated_bridge_refuses_honestly_and_queues_nothing_more() -> None:
+    """Gate-1 C/F4 as a running test: 128 requests on the production worker
+    count used to leave 124 in the executor's unbounded queue. Admission is
+    now bounded; the overflow is refused with 503 before its body is read."""
+
+    release = threading.Event()
+    handled: list[str] = []
+    reads: list[int] = []
+
+    class Blocked:
+        def handle(self, request: UIRequest) -> UIResponse:
+            release.wait(5)  # released by the test; the bound only guards a failure
+            handled.append(request.path)
+            return UIResponse(401)
+
+    total = 128
+    admission = config_ui._Admission()
+    assert admission.capacity == config_ui.MAX_ADMITTED_REQUESTS == 4 * config_ui.EXECUTOR_WORKERS
+
+    def reader(index: int):
+        async def read() -> UIRequest:
+            reads.append(index)
+            return UIRequest("GET", f"/{index}", {}, {})
+
+        return read
+
+    async def saturation() -> list[UIResponse]:
+        with config_ui.ThreadPoolExecutor(max_workers=config_ui.EXECUTOR_WORKERS) as executor:
+            tasks = [
+                asyncio.create_task(_dispatch(Blocked(), reader(index), executor, admission))  # type: ignore[arg-type]
+                for index in range(total)
+            ]
+            try:
+                for _ in range(3):
+                    await asyncio.sleep(0)
+                queued = executor._work_queue.qsize()  # type: ignore[attr-defined]
+                assert queued <= config_ui.MAX_ADMITTED_REQUESTS - config_ui.EXECUTOR_WORKERS
+                assert admission.admitted == config_ui.MAX_ADMITTED_REQUESTS
+                assert len(reads) == config_ui.MAX_ADMITTED_REQUESTS
+            finally:
+                release.set()
+                results = await asyncio.gather(*tasks)
+        return results
+
+    responses = _run_socket_free(saturation())
+    busy = [response for response in responses if response.status == config_ui.BUSY_STATUS]
+    served = [response for response in responses if response.status == 401]
+    assert len(served) == len(handled) == config_ui.MAX_ADMITTED_REQUESTS
+    assert len(busy) == total - config_ui.MAX_ADMITTED_REQUESTS == admission.refused
+    assert all(("Retry-After", "1") in response.headers for response in busy)
+    assert all(b"nothing was done" in response.body for response in busy)
+    # Every admitted request left, so the bridge admits again.
+    assert admission.admitted == 0
+    assert admission.try_enter() is True
+
+
+def test_f4_a_failed_body_read_releases_its_admission() -> None:
+    admission = config_ui._Admission(capacity=1)
+
+    async def failing() -> UIRequest:
+        raise ValueError("body too large")
+
+    async def scenario() -> None:
+        with config_ui.ThreadPoolExecutor(max_workers=1) as executor:
+            with pytest.raises(ValueError):
+                await _dispatch(object(), failing, executor, admission)  # type: ignore[arg-type]
+
+    _run_socket_free(scenario())
+    assert admission.admitted == 0
+
+
+# -- Gate-1 F5: every wait of the stop sequence is bounded ----------------------------
+
+
+class _Unkillable(_SpiedChild):
+    """A child whose every wait times out: it cannot be confirmed ended."""
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.calls.append(f"wait({timeout})")
+        raise subprocess.TimeoutExpired("child", timeout if timeout is not None else 0.0)
+
+
+def test_f5_an_unkillable_child_is_reported_and_kept_not_waited_on_forever() -> None:
+    """Gate-1 C/F5 as a running test: the real supervisor used to make the
+    sequence ``terminate, wait(10.0), kill, wait(None)``."""
+
+    supervisor = config_ui.Supervisor(("x",), "status.json")
+    child = _Unkillable()
+    supervisor.child = child
+    assert supervisor.stop() is False
+    assert child.calls == [
+        "terminate",
+        f"wait({config_ui.DEFAULT_STOP_GRACE})",
+        "kill",
+        f"wait({config_ui.DEFAULT_KILL_WAIT})",
+    ]
+    assert "wait(None)" not in child.calls
+    # Ownership is kept: the child is still the one supervised, never lost.
+    assert supervisor.child is child
+
+
+def test_f5_apply_with_an_unkillable_child_is_refused_and_starts_nothing() -> None:
+    now = [0.0]
+    launched: list[object] = []
+
+    def popen(*args: object, **kwargs: object) -> object:
+        launched.append(args)
+        raise AssertionError("nothing may be started beside an unreaped child")
+
+    supervisor = config_ui.Supervisor(
+        ("x",),
+        "status.json",
+        stop_grace=10.0,
+        kill_wait=5.0,
+        clock=lambda: now[0],
+        wait=lambda interval: None,
+        popen=popen,
+    )
+    child = _Unkillable(pid=5151)
+    supervisor.child = child
+    report = supervisor.restart("digest")
+    assert report.outcome == config_ui.APPLY_REFUSED
+    assert not report.check_refused
+    assert report.diagnostics == (
+        "the running process (pid 5151) did not end within 5 s after kill; nothing new was started",
+    )
+    assert launched == [] and supervisor.child is child
+    assert child.calls == ["terminate", "wait(10.0)", "kill", "wait(5.0)"]
+
+
+def test_f5_close_logs_an_unkillable_child(caplog: pytest.LogCaptureFixture) -> None:
+    supervisor = config_ui.Supervisor(("x",), "status.json", kill_wait=1.0)
+    supervisor.child = _Unkillable(pid=6262)
+    with caplog.at_level(logging.WARNING, logger=config_ui.logger.name):
+        supervisor.close()
+    assert "6262 did not end within 1 s after kill" in caplog.text
+    with pytest.raises(config_ui.SupervisorClosed):
+        supervisor.start()

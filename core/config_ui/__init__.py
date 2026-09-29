@@ -51,7 +51,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from collections import OrderedDict
 from datetime import datetime, timezone
-from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1381,6 +1381,11 @@ def _declared_names(view: ConfigView) -> frozenset[str]:
 
 _SCALAR_KINDS = ("string", "integer", "number", "boolean")
 
+#: The form value of a boolean select's option that keeps a configured
+#: non-boolean value: distinct from ``true``, ``false`` and ``""`` (inherit),
+#: so it only ever posts "left untouched".
+_KEEP_NON_BOOLEAN = "keep-configured"
+
 
 def _path_text(path: Sequence[Any]) -> str:
     """A setting path as text: dotted names, ``[i]`` indexes, ``[]`` items."""
@@ -1687,12 +1692,7 @@ class _SchemaRenderer:
             )
             return f'<select name="{name}">{options}</select>'
         if kind == "boolean":
-            checked = " checked" if value is True else ""
-            self.register(path, kind, "true" if value is True else "false", schema)
-            return (
-                f'<input type="hidden" name="{name}" value="false">'
-                f'<input type="checkbox" name="{name}" value="true"{checked}>'
-            )
+            return self._boolean(schema, path, name, value)
         if kind in ("integer", "number") and (
             value is _MISSING or (isinstance(value, (int, float)) and not isinstance(value, bool))
         ):
@@ -1711,6 +1711,46 @@ class _SchemaRenderer:
         shown = "" if value is _MISSING else _plain(value)
         self.register(path, kind, shown, schema)
         return f'<input type="text" name="{name}" value="{esc(shown)}">'
+
+    def _boolean(self, schema: Mapping[str, Any], path: Sequence[Any], name: str, value: Any) -> str:
+        """A three-state boolean: not set (inherit), ``true`` or ``false`` (gate F3).
+
+        A checkbox has two states, so an unset setting whose default is
+        ``true`` drew unchecked and an explicit ``false`` posted as "left
+        untouched". The ``<select>`` always shows the effective value
+        (``data-effective``): when not set, its first option inherits and
+        names the declared default, and ``false`` or ``true`` is an explicit
+        edit. A configured value is removed with "Remove override"; one that
+        is not a boolean is kept as its own option, so it posts untouched.
+        That option posts ``_KEEP_NON_BOOLEAN``, never the value's own text:
+        a configured string ``'true'`` must leave the real ``true`` choice
+        selectable, so it can be corrected to the boolean.
+        """
+
+        default = schema.get("default")
+        if value is _MISSING:
+            effective = _plain(default) if isinstance(default, bool) else ""
+            inherit = f"not set (default: {effective})" if effective else "not set"
+            current: tuple[str, str] | None = ("", inherit)
+        elif isinstance(value, bool):
+            effective, current = _plain(value), None
+        else:
+            effective = _plain(value)
+            current = (_KEEP_NON_BOOLEAN, f"{effective} (not a boolean)")
+        rendered = current[0] if current is not None else effective
+        self.register(path, "boolean", rendered, schema)
+        choices = ([current] if current is not None else []) + [
+            (option, option) for option in ("true", "false")
+        ]
+        options = "".join(
+            f'<option value="{esc(option)}"{" selected" if option == rendered else ""}>'
+            f"{esc(label)}</option>"
+            for option, label in choices
+        )
+        return (
+            f'<select name="{name}" data-kind="boolean" data-effective="{esc(effective)}">'
+            f"{options}</select>"
+        )
 
     def _list(
         self,
@@ -3721,7 +3761,7 @@ def _write_overlay(
 # Supervised restart (R7 Apply, A4, D9)
 #
 # Apply runs an on-disk Check, stops the one child this UI launched
-# (terminate, a bounded wait, then kill and wait), starts the launch argv
+# (terminate, a bounded wait, then kill and a bounded wait), starts the launch argv
 # without a shell with the status-file variable set, and polls the status
 # path within a bounded window for one of three outcomes. A status record
 # naming any other pid is never signalled. The child's stdout is inherited,
@@ -3738,6 +3778,10 @@ APPLY_UNKNOWN = "unknown"
 #: The documented defaults (R7): the stop grace and the Apply window, in seconds.
 DEFAULT_STOP_GRACE = 10.0
 DEFAULT_APPLY_WINDOW = 60.0
+#: How long a stop waits for the child to be reaped after kill (gate F5).
+#: A stop is bounded by grace + kill wait + drain join, before the Apply
+#: window (which counts from the new child's start) begins.
+DEFAULT_KILL_WAIT = 5.0
 APPLY_POLL_SECONDS = 0.05
 #: How long a stop or a refused Apply waits for the drain to read EOF.
 DRAIN_JOIN_SECONDS = 2.0
@@ -3864,7 +3908,10 @@ class Supervisor:
     """Stops and starts the one main process this UI launched (R7, A4, D9).
 
     Every wait is bounded: ``clock`` and ``wait`` drive the Apply window (a
-    test injects both), ``stop_grace`` bounds the wait after terminate.
+    test injects both), ``stop_grace`` bounds the wait after terminate and
+    ``kill_wait`` the wait after kill. An Apply thus takes at most
+    ``stop_grace + kill_wait + DRAIN_JOIN_SECONDS`` to stop the old child,
+    then the Apply window from the new child's start.
     """
 
     def __init__(
@@ -3873,6 +3920,7 @@ class Supervisor:
         status_path: str | os.PathLike[str],
         *,
         stop_grace: float = DEFAULT_STOP_GRACE,
+        kill_wait: float = DEFAULT_KILL_WAIT,
         apply_window: float = DEFAULT_APPLY_WINDOW,
         poll_interval: float = APPLY_POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -3883,6 +3931,7 @@ class Supervisor:
         self.argv = tuple(argv)
         self.status_path = os.fspath(status_path)
         self.stop_grace = stop_grace
+        self.kill_wait = kill_wait
         self.apply_window = apply_window
         self.poll_interval = poll_interval
         self.clock = clock
@@ -3905,24 +3954,43 @@ class Supervisor:
 
         with self._lock:
             self._closed = True
-        self.stop()
+        if not self.stop():
+            logger.warning(
+                "the supervised process %s did not end within %g s after kill",
+                self.child.pid,
+                self.kill_wait,
+                extra={"config_ui_operation": "close", "config_ui_outcome": "unconfirmed"},
+            )
 
-    def stop(self) -> None:
-        """Stop the child this UI launched, if any: terminate, bounded wait, kill."""
+    def stop(self) -> bool:
+        """Stop the child this UI launched, if any; whether it is known to be gone.
+
+        Terminate, a bounded wait, kill, a bounded wait (gate F5). A child
+        still not reaped after the kill wait stays :attr:`child` (with its
+        drain), so it is neither forgotten nor replaced: ``False`` is
+        returned, and a later stop signals and waits on it again.
+        """
 
         with self._lock:
             child, drain = self.child, self._drain
             self.child, self._drain = None, None
         if child is None:
-            return
+            return True
         child.terminate()
         try:
             child.wait(timeout=self.stop_grace)
         except subprocess.TimeoutExpired:
             child.kill()
-            child.wait()
+            try:
+                child.wait(timeout=self.kill_wait)
+            except subprocess.TimeoutExpired:
+                with self._lock:
+                    if self.child is None:
+                        self.child, self._drain = child, drain
+                return False
         if drain is not None:
             drain.close()
+        return True
 
     def start(self) -> Any:
         """Start the launch argv without a shell, and its stderr drain (D9).
@@ -3958,10 +4026,19 @@ class Supervisor:
         Refused: the child exited; its status and stderr tail are reported.
         Unknown: the window elapsed. An unusable record never counts.
         A launch that fails (the argv cannot be executed, or the UI is
-        shutting down) is refused with a redacted diagnostic.
+        shutting down) is refused with a redacted diagnostic, and so is a
+        restart whose old child is not reaped within the kill wait: nothing
+        new is started beside it (gate F5).
         """
 
-        self.stop()
+        if not self.stop():
+            return ApplyReport(
+                APPLY_REFUSED,
+                diagnostics=(
+                    f"the running process (pid {self.child.pid}) did not end within "
+                    f"{self.kill_wait:g} s after kill; nothing new was started",
+                ),
+            )
         try:
             child = self.start()
         except SupervisorClosed as exc:
@@ -4082,6 +4159,51 @@ def _run_socket_free(coro: Coroutine[Any, Any, _T]) -> _T:
 EXECUTOR_THREAD_PREFIX = "config-ui"
 EXECUTOR_WORKERS = 4
 MAX_REQUEST_BYTES = 1024 * 1024
+#: Requests admitted at once, running or queued for a worker (gate F4). The
+#: admission is taken before the body is read, and each admitted body is at
+#: most MAX_REQUEST_BYTES, so the bridge retains at most 16 MiB of requests.
+MAX_ADMITTED_REQUESTS = 4 * EXECUTOR_WORKERS
+#: A refused request's ``Retry-After``, in seconds.
+BUSY_RETRY_SECONDS = 1
+BUSY_STATUS = 503
+
+
+class _Admission:
+    """A bounded count of requests admitted to the worker pool (gate F4).
+
+    Entered on the event loop before the body is read; left when the
+    worker's future completes (whatever thread completes it), so a
+    request whose client went away still counts while it runs.
+    """
+
+    def __init__(self, capacity: int = MAX_ADMITTED_REQUESTS) -> None:
+        self.capacity = capacity
+        self.admitted = 0
+        #: Requests refused because the bridge was full.
+        self.refused = 0
+        self._lock = threading.Lock()
+
+    def try_enter(self) -> bool:
+        with self._lock:
+            if self.admitted >= self.capacity:
+                self.refused += 1
+                return False
+            self.admitted += 1
+            return True
+
+    def leave(self, _future: Any = None) -> None:
+        with self._lock:
+            self.admitted -= 1
+
+
+def _busy_response() -> UIResponse:
+    """The refusal of a request the full bridge cannot admit: nothing ran."""
+
+    return UIResponse(
+        BUSY_STATUS,
+        b"The configuration UI is busy: nothing was done, retry shortly.\n",
+        headers=(("Retry-After", str(BUSY_RETRY_SECONDS)),),
+    )
 
 
 def _to_ui_request(
@@ -4116,11 +4238,33 @@ def _to_ui_request(
     )
 
 
-async def _dispatch(ui: ConfigUI, request: UIRequest, executor: Executor) -> UIResponse:
-    """Run ``ui.handle`` on *executor*, never on the calling loop (D8)."""
+async def _dispatch(
+    ui: ConfigUI,
+    request: UIRequest | Callable[[], Awaitable[UIRequest]],
+    executor: Executor,
+    admission: _Admission,
+) -> UIResponse:
+    """Run ``ui.handle`` on *executor*, never on the calling loop (D8).
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, ui.handle, request)
+    The request is first admitted (gate F4): when *admission* is full it is
+    refused with :data:`BUSY_STATUS` and nothing is read or queued. *request*
+    is a :class:`UIRequest`, or an async callable reading it (the HTTP body),
+    awaited only once admitted.
+    """
+
+    if not admission.try_enter():
+        return _busy_response()
+    submitted = False
+    try:
+        if not isinstance(request, UIRequest):
+            request = await request()
+        future = executor.submit(ui.handle, request)
+        future.add_done_callback(admission.leave)
+        submitted = True
+    finally:
+        if not submitted:
+            admission.leave()
+    return await asyncio.wrap_future(future)
 
 
 def serve(ui: ConfigUI, settings: UISettings) -> None:
@@ -4131,13 +4275,16 @@ def serve(ui: ConfigUI, settings: UISettings) -> None:
     executor = ThreadPoolExecutor(
         max_workers=EXECUTOR_WORKERS, thread_name_prefix=EXECUTOR_THREAD_PREFIX
     )
+    admission = _Admission()
 
     async def catch_all(request: web.Request) -> web.StreamResponse:
-        body = await request.read()
-        ui_request = _to_ui_request(
-            request.method, request.path, request.query, request.headers.items(), body
-        )
-        response = await _dispatch(ui, ui_request, executor)
+        async def read() -> UIRequest:
+            body = await request.read()
+            return _to_ui_request(
+                request.method, request.path, request.query, request.headers.items(), body
+            )
+
+        response = await _dispatch(ui, read, executor, admission)
         reply = web.Response(status=response.status, body=response.body)
         reply.headers["Content-Type"] = response.content_type
         for name, value in response.headers:
