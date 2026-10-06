@@ -18,7 +18,8 @@ Twitch is one channel among several; the core is platform-neutral by constructio
 
 ## What is proven, and what is not
 
-**Proven by the test suite** (3,051 passing tests, 18 environment-dependent skips):
+**Proven by the test suite** (~3,100 passing tests, with 13–18 environment-dependent skips). A GitHub
+Actions matrix runs that suite on **Python 3.10, 3.11, 3.12 and 3.13** — see the badge above:
 
 - The kernel: bounded admission, explicit terminal outcomes for every action call, a single global
   startup/shutdown deadline, bounded retention, and secret redaction in traces and diagnostics.
@@ -115,7 +116,7 @@ python -m pytest tests/ -q
 | `core/` | The kernel: bus, admission, triggers, brain loop, actions, loader, runtime, audit |
 | `core/config_ui/` | The local web configuration UI (separate process) |
 | `modules/` | 17 modules, each with a `module.yaml` manifest declaring its actions, schema and capabilities |
-| `tests/` | 3,051 tests, plus opt-in real-integration trials |
+| `tests/` | ~3,100 tests over Python 3.10–3.13, plus opt-in real-integration trials |
 | `docs/design-v2.md` | The design blueprint the phases implement |
 | `docs/config-ui.md` | Operator documentation for the configuration UI |
 | `docs/proxy-protocol.md` | The remote-deployment proxy protocol |
