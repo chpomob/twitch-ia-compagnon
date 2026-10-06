@@ -1,19 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Pipeline working directories (adversarial campaigns)
 .adversarial-loop/
 .adversarial-plan/
 .adversarial-spec/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-*.orig
-*.rej
 /docs/campaigns/phase2/scaffolding/spec-out/
 /docs/campaigns/phase3/scaffolding/spec-out/
 /docs/campaigns/phase4/scaffolding/artifacts/
 
-# Journaux volatils des pipelines de campagne (phase 4)
+# Volatile campaign logs and per-run manifests
 /docs/campaigns/phase4/scaffolding/*.log
+/docs/runs/
 
-# Fichiers générés par opérateur (phase 4) : l'overlay géré par l'interface de
-# configuration et l'enregistrement de statut du runtime — pas des sources.
+# Operator-generated files (phase 4): the overlay managed by the configuration UI and the runtime's
+# status record — generated per operator, not sources.
 *.local.yaml
 *.status.json
+
+# Patch leftovers
+*.orig
+*.rej
