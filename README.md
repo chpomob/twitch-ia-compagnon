@@ -7,6 +7,8 @@
 > fakes — which is not the same thing as being proven in the field. Read [What is proven, and what is
 > not](#what-is-proven-and-what-is-not) before you invest any time in it.
 
+[![CI](https://github.com/chpomob/twitch-ia-compagnon/actions/workflows/ci.yml/badge.svg)](https://github.com/chpomob/twitch-ia-compagnon/actions/workflows/ci.yml)
+
 A **multi-platform AI companion for streamers**: a multi-turn agentic brain whose input and output
 **modules are its tools**. A module proposes an action, an executor runs it, and the observation returns
 into the loop — the companion can read the chat, remember viewers, speak through your stream audio,

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests — Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Do not stop the other versions when one fails: knowing exactly which
+      # Python versions work is the point of the matrix.
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor (requires-python >=3.10).
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the project with its test extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Test suite
+        # The suite runs against fakes: it opens no network socket and needs no
+        # credentials. The provider trials are opt-in and remain skipped here.
+        run: python -m pytest tests/ -q -p no:cacheprovider
+
+      - name: Packaging and entry points
+        # The README tells a visitor these two entry points exist; prove they do,
+        # and that the project still builds a wheel.
+        run: |
+          python -c "import core.main, core.config_ui; print('imports ok')"
+          twitch-ia-compagnon --help > /dev/null
+          twitch-ia-compagnon-config-ui --help > /dev/null
+          python -m pip wheel . --no-deps --wheel-dir /tmp/wheel
+          ls -1 /tmp/wheel
