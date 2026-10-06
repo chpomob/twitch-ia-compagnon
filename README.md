@@ -139,7 +139,9 @@ reproduced. `docs/campaigns/phase4/scaffolding/gate-report-1..9.md` are those re
 
 ## License
 
-TBD — no license is granted yet. Until one is added, all rights are reserved.
+**WTFPL v2** — *Do What The Fuck You Want To Public License* (see [`LICENSE`](LICENSE)). In practice: use
+it, fork it, ship it, commercially or not, with no conditions. It comes with **no warranty of any kind**
+and **no support** — which is the honest position for a preview that has never run a real stream.
 
 ## What would make this real
 

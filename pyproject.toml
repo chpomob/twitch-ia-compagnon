@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "twitch-ia-compagnon"
 version = "0.1.0"
-description = "Modular AI companion for Twitch"
+description = "Local-first, multi-platform AI companion for streamers — an architectural preview"
+license = {text = "WTFPL"}
 requires-python = ">=3.10"
 dependencies = [
     "aiohttp>=3.9,<4",
