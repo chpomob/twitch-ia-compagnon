@@ -65,6 +65,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar, Token
@@ -105,6 +106,7 @@ __all__ = [
     "close_modules",
     "install_shutdown_watchdog",
     "module_roles",
+    "request_cancellation",
 ]
 
 Clock = Callable[[], float]
@@ -472,7 +474,7 @@ class SupervisedTasks:
             # One request is enough: a second ``CancelledError`` thrown into a
             # task that is already unwinding — cleaning up slowly in a
             # ``finally`` — would interrupt the very cleanup it was given.
-            task.cancel()
+            request_cancellation(task)
         task.add_done_callback(_consume_result)
         self._abandoned.append(task)
         failure = (
@@ -547,7 +549,7 @@ class SupervisedTasks:
         for task, (task_name, task_owner) in list(self._tasks.items()):
             if task.done():
                 continue
-            task.cancel()
+            request_cancellation(task)
             cancelled.append(
                 f"module {task_owner!r}: task {task_name!r} was cancelled "
                 "at the drain deadline"
@@ -799,7 +801,7 @@ async def close_modules(
         try:
             finished = await _wait_bounded({task}, remaining, wait)
             if task not in finished:
-                task.cancel()
+                request_cancellation(task)
                 # The grace is capped by the same deadline as the close (R4).
                 await _wait_bounded(
                     {task}, _remaining(grace, clock, deadline_at), wait
@@ -811,7 +813,7 @@ async def close_modules(
                 raise RuntimeError("close was cancelled")
             task.result()
         except asyncio.CancelledError:
-            task.cancel()
+            request_cancellation(task)
             task.add_done_callback(_consume_result)
             raise
         except Exception:
@@ -1396,7 +1398,7 @@ class PhaseCoordinator:
         try:
             finished = await _wait_bounded({task}, allowance, self._sleep)
             if task not in finished:
-                task.cancel()
+                request_cancellation(task)
                 # The grace to observe the cancellation is capped by the same
                 # global deadline as the hook itself (R4): a hook cut at
                 # that deadline gets one scheduling turn, never a fresh
@@ -1412,7 +1414,7 @@ class PhaseCoordinator:
                 return f"module {name!r}: phase {phase!r} was cancelled"
             task.result()
         except asyncio.CancelledError:
-            task.cancel()
+            request_cancellation(task)
             self._abandon(task)
             raise
         except Exception:
@@ -1461,7 +1463,7 @@ class PhaseCoordinator:
         try:
             finished = await _wait_bounded({task}, max(allowance, 0.0), self._sleep)
             if task not in finished:
-                task.cancel()
+                request_cancellation(task)
                 self._abandon(task)
                 self._note(f"module {name!r}: phase {phase!r}: health report timed out")
                 return
@@ -1470,7 +1472,7 @@ class PhaseCoordinator:
                 return
             task.result()
         except asyncio.CancelledError:
-            task.cancel()
+            request_cancellation(task)
             self._abandon(task)
             raise
         except Exception:
@@ -1577,16 +1579,36 @@ async def _wait_bounded(
     return {task for task in tasks if task.done()}
 
 
+#: The tasks :func:`request_cancellation` asked to stop, on a Python whose
+#: tasks keep no count of their own (``Task.cancelling`` is 3.11+).
+_CANCELLATION_REQUESTS: "weakref.WeakSet[asyncio.Future[Any]]" = weakref.WeakSet()
+
+
+def request_cancellation(task: "asyncio.Future[Any]") -> None:
+    """Cancel *task*, and remember the request where the task cannot.
+
+    Every cancellation that :func:`_cancellation_requested` must later see goes
+    through here, so that a task which resists the one request it is given is
+    not asked — and killed — a second time on Python 3.10, where tasks have no
+    ``cancelling()`` count.
+    """
+
+    if task.cancel() and not callable(getattr(task, "cancelling", None)):
+        _CANCELLATION_REQUESTS.add(task)
+
+
 def _cancellation_requested(task: "asyncio.Future[Any]") -> bool:
     """Whether *task* already has a cancellation request pending.
 
-    A task records its requests (``Task.cancelling``, 3.11+); a bare future
-    does not, and is asked again — cancelling a future twice is harmless.
+    A task records its requests (``Task.cancelling``, 3.11+). Elsewhere the
+    requests made through :func:`request_cancellation` are remembered here; a
+    future cancelled any other way is asked again — cancelling a bare future
+    twice is harmless.
     """
 
     cancelling = getattr(task, "cancelling", None)
     if not callable(cancelling):
-        return False
+        return task in _CANCELLATION_REQUESTS
     return cancelling() > 0
 
 

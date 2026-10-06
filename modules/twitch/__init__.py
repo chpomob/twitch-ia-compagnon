@@ -111,7 +111,6 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, fields
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +129,8 @@ from core.contracts import (
     Destination,
     SessionKey,
 )
+from core.lifecycle import request_cancellation
+from core.timestamps import parse_instant
 from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
 
 try:  # Keep the module importable for transport-injected contract tests.
@@ -645,7 +646,7 @@ def _parse_poll(entry: Any) -> dict[str, Any] | None:
     choices = entry.get("choices")
     state = entry.get("status")
     duration = entry.get("duration")
-    started_at = _epoch_seconds(entry.get("started_at"))
+    started_at = parse_instant(entry.get("started_at"))
     if (
         not isinstance(poll_id, str)
         or not poll_id.strip()
@@ -672,18 +673,6 @@ def _parse_poll(entry: Any) -> dict[str, Any] | None:
         "ends_at": started_at + duration,
         "state": state.lower(),
     }
-
-
-def _epoch_seconds(stamp: Any) -> float | None:
-    if not isinstance(stamp, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.timestamp()
 
 
 # --------------------------------------------------------------------------- #
@@ -1294,7 +1283,7 @@ class TwitchModule:
             pending = [task for task in sent_traces if not task.done()]
             if pending:
                 for task in pending:
-                    task.cancel()
+                    request_cancellation(task)
                 # Count outside the saturated path, before the cancellations
                 # are awaited: a held subscriber cannot delay the accounting.
                 self._drop_sent_traces(len(pending), "close budget exhausted")

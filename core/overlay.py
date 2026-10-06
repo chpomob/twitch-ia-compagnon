@@ -32,6 +32,8 @@ _EXAMPLE_SUFFIX = ".example"
 _YAML_SUFFIXES = (".yaml", ".yml")
 _OVERLAY_SUFFIX = ".local.yaml"
 _STATUS_SUFFIX = ".status.json"
+#: Marks, on the walk's stack, the end of one link's target: the link is resolved.
+_LINK_DONE = object()
 
 
 class OverlayError(RuntimeError):
@@ -205,13 +207,70 @@ def canonical_path(path: str | os.PathLike[str]) -> Path:
     if _UNEXPANDED_VARIABLE.search(expanded):
         raise OverlayError(f"{label}: cannot be canonicalised (unset environment variable)")
     try:
-        # ``Path.resolve`` (not ``os.path.realpath``) so a link loop raises;
-        # it makes the path absolute and follows each link before applying the
-        # ``..`` after it, as the filesystem does (``os.path.abspath`` would
-        # collapse ``link/..`` lexically and name another file).
-        return Path(expanded).resolve(strict=False)
+        resolved = _resolve_links(expanded)
     except (OSError, ValueError, RuntimeError):
         raise OverlayError(f"{label}: cannot be canonicalised") from None
+    if resolved is None:
+        raise OverlayError(f"{label}: cannot be canonicalised (link loop)")
+    return resolved
+
+
+def _resolve_links(expanded: str) -> Path | None:
+    """*expanded* made absolute with every link followed, or ``None`` on a loop.
+
+    The walk is done here rather than by ``Path.resolve`` or
+    ``os.path.realpath``, whose handling of a link loop differs between the
+    supported Python versions (3.13 stopped raising). Each component is
+    looked up in turn: a link is replaced by its target, and a ``..`` is
+    applied to the path resolved so far, as the filesystem does
+    (``os.path.abspath`` would collapse ``link/..`` lexically and name
+    another file). A component that does not exist, or is not a link, is kept
+    as written.
+
+    A loop is an actual cycle, not a long chain: each link is remembered while
+    its target is being walked and, once walked, with what it resolved to. A
+    link met again while still being walked never settles and the result is
+    ``None``; one met again after it settled is reused. A finite chain of any
+    length therefore resolves (P20F1 review A1).
+    """
+
+    absolute = Path(expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded))
+    resolved = absolute.anchor
+    pending: list[object] = list(reversed(absolute.parts[1:]))
+    # link path -> what it resolved to, or None while its target is walked.
+    seen: dict[str, str | None] = {}
+    while pending:
+        name = pending.pop()
+        if name is _LINK_DONE:
+            seen[str(pending.pop())] = resolved
+            continue
+        assert isinstance(name, str)
+        if name in ("", "."):
+            continue
+        if name == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, name)
+        if candidate in seen:
+            settled = seen[candidate]
+            if settled is None:
+                return None
+            resolved = settled
+            continue
+        try:
+            target = Path(os.readlink(candidate))
+        except OSError:
+            resolved = candidate
+            continue
+        seen[candidate] = None
+        pending.append(candidate)
+        pending.append(_LINK_DONE)
+        if target.anchor:
+            resolved = target.anchor
+            pending.extend(reversed(target.parts[1:]))
+        else:
+            pending.extend(reversed(target.parts))
+    return Path(resolved)
 
 
 def _existing_anchor(path: Path) -> tuple[Path, tuple[str, ...]]:

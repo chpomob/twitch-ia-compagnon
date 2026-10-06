@@ -651,6 +651,62 @@ def test_a_link_loop_cannot_be_canonicalised(tmp_path: Path) -> None:
         canonical_path(tmp_path / "a")
 
 
+@pytest.mark.parametrize(
+    "below",
+    [(), ("config.yaml",), ("missing", "config.yaml"), ("..", "config.yaml")],
+)
+def test_a_link_loop_is_refused_on_every_python(tmp_path: Path, below: tuple[str, ...]) -> None:
+    """P20F1: Python 3.13's ``Path.resolve`` no longer raises on a loop, so the
+    refusal is the module's own — wherever the loop sits in the path."""
+
+    (tmp_path / "self").symlink_to("self")
+    (tmp_path / "x").symlink_to("y")
+    (tmp_path / "y").symlink_to("./x")
+    for start in ("self", "x"):
+        with pytest.raises(OverlayError, match="cannot be canonicalised"):
+            canonical_path(tmp_path.joinpath(start, *below))
+        with pytest.raises(OverlayError, match="cannot be canonicalised"):
+            same_file(tmp_path.joinpath(start, *below), tmp_path / "other.yaml")
+
+
+def test_a_long_link_chain_without_a_loop_still_resolves(tmp_path: Path) -> None:
+    """P20F1 review A1: a loop is a cycle, not a hop count — a finite chain
+    longer than Linux's 40-link limit still resolves, as ``Path.resolve`` did."""
+
+    target = tmp_path / "real"
+    target.mkdir()
+    previous = "real"
+    for index in range(100):
+        (tmp_path / f"hop{index}").symlink_to(previous)
+        previous = f"hop{index}"
+    assert canonical_path(tmp_path / previous / "config.yaml") == target / "config.yaml"
+
+
+def test_a_link_into_itself_is_a_loop_and_a_shared_link_is_not(tmp_path: Path) -> None:
+    """A link whose target runs through the link again never settles, though
+    no walk state repeats; a link met twice after it settled is no loop."""
+
+    (tmp_path / "grow").symlink_to("grow/x")
+    with pytest.raises(OverlayError, match="link loop"):
+        canonical_path(tmp_path / "grow" / "config.yaml")
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "sub").mkdir()
+    (tmp_path / "shared").symlink_to("real")
+    (tmp_path / "again").symlink_to("shared/sub/../../shared")
+    assert canonical_path(tmp_path / "again" / "config.yaml") == tmp_path / "real" / "config.yaml"
+
+
+def test_a_relative_spelling_resolves_links_in_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "real").mkdir()
+    (tmp_path / "work").mkdir()
+    (tmp_path / "work" / "link").symlink_to("../real")
+    monkeypatch.chdir(tmp_path / "work")
+    assert canonical_path("link/./config.yaml") == tmp_path / "real" / "config.yaml"
+    assert canonical_path("missing/../link/config.yaml") == tmp_path / "real" / "config.yaml"
+
+
 def test_a_link_is_followed_before_the_parent_component_after_it(tmp_path: Path) -> None:
     """Gate-1 P19F1 A2: ``link/..`` names the link target's parent, as the
     filesystem opens it, not the link's own directory."""

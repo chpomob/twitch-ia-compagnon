@@ -2382,3 +2382,36 @@ async def test_fourth_module_starts_and_stops_through_every_phase_unnamed(
     source = _entry_point_source().lower()
     for literal in (FOURTH_MODULE_NAME, "twitch", "brain", "audit"):
         assert source.count(literal) == 0, literal
+
+
+@pytest.mark.asyncio
+async def test_a_task_asked_once_is_not_asked_again_on_any_python() -> None:
+    """P20F1: ``Task.cancelling`` is 3.11+, so on 3.10 the cancel-once guard
+    used to see no request and cancel again, killing a task that resists the
+    one request it is given. The request is now recorded where the task
+    cannot record it, so the guard holds on every supported Python."""
+
+    from core.lifecycle import _cancellation_requested, request_cancellation
+
+    release = asyncio.Event()
+    resisted = asyncio.Event()
+
+    async def resisting() -> None:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            resisted.set()
+            await release.wait()
+
+    task = asyncio.ensure_future(resisting())
+    await asyncio.sleep(0)
+    assert not _cancellation_requested(task)
+    request_cancellation(task)
+    assert _cancellation_requested(task)
+    await asyncio.wait_for(resisted.wait(), timeout=1)
+    if not _cancellation_requested(task):
+        task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    await asyncio.wait_for(task, timeout=1)

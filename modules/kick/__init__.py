@@ -98,7 +98,6 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +114,7 @@ from core.contracts import (
     Destination,
     SessionKey,
 )
+from core.timestamps import parse_instant
 from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
 
 try:  # Keep the module importable for transport-injected contract tests.
@@ -441,15 +441,7 @@ def signed_content(message_id: str, timestamp: str, body: bytes) -> bytes:
 def parse_timestamp(value: str) -> float | None:
     """An RFC 3339 timestamp with an offset as epoch seconds, else ``None``."""
 
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip())
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.timestamp()
+    return parse_instant(value)
 
 
 # --------------------------------------------------------------------------- #

@@ -105,6 +105,7 @@ from .lifecycle import (
     _consume_result,
     _discard,
     _wait_bounded,
+    request_cancellation,
 )
 from .runtime import SUPPORTED_RUNTIME_APIS, ServiceConflictError
 from .triggers import COMPANION_NAME_SETTING
@@ -699,7 +700,7 @@ class ModuleLoader:
         try:
             finished = await _wait_bounded({task}, remaining, self._sleep)
             if task not in finished:
-                task.cancel()
+                request_cancellation(task)
                 await _wait_bounded({task}, self._cancel_grace_seconds, self._sleep)
                 self._salvage(task, preserve)
                 self._abandon(task, release)
@@ -708,7 +709,7 @@ class ModuleLoader:
                 return "cancelled", None
             return "ok", task.result()
         except asyncio.CancelledError:
-            task.cancel()
+            request_cancellation(task)
             try:
                 # The hook is given the bounded grace to observe its
                 # cancellation before what it returned is looked at: without
@@ -824,7 +825,7 @@ class ModuleLoader:
         try:
             finished = await _wait_bounded({task}, allowance, self._sleep)
             if task not in finished:
-                task.cancel()
+                request_cancellation(task)
                 grace, _ = self._cleanup_allowance(
                     self._cancel_grace_seconds, self.cleanup_deadline_at
                 )
@@ -846,7 +847,7 @@ class ModuleLoader:
             # when the deadline and this cancellation coincide — is not asked
             # again, so one that resists the request is not killed by it.
             if not _cancellation_requested(task):
-                task.cancel()
+                request_cancellation(task)
             if late.expired_at is None:
                 # The loop tearing this task down, not the deadline: nothing
                 # is reported, as with any other abandoned owner.
@@ -929,7 +930,7 @@ class ModuleLoader:
                 unfinished = [late for late in pending if late.task not in finished]
                 for late in unfinished:
                     late.expired_at = deadline_at
-                    late.task.cancel()
+                    request_cancellation(late.task)
                 # Each expiry settles within scheduling turns, never time:
                 # the grace left past the deadline is one turn.
                 if unfinished:
