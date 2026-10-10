@@ -16,6 +16,25 @@ change your scene, clip a moment, or moderate, depending on what you enable and 
 
 Twitch is one channel among several; the core is platform-neutral by construction.
 
+## See it run, without a credential
+
+![the offline demo: a viewer's message becomes a written and spoken answer](docs/demo.gif)
+
+One command replays a scripted end-to-end run and narrates it — a viewer addresses the companion, the
+keyword trigger accepts the message, the brain is admitted to that viewer's session, it proposes
+`audio.capture`, the observation comes back with the transcription, and the configured delivery writes
+the answer to the chat and speaks it:
+
+```bash
+python -m demo          # no account, no key, no socket
+```
+
+Everything behind that narration is shipped code: the loader, the bounded admission queue, the trigger
+engine, the default-deny authorization policy, the executor, the attachment store and the brain's loop.
+Only four edges are scripted — the model's answers, the platform's replies, the microphone and the
+speech synthesis — and every run prints which, at the end. `--platform fake` drives the same scenario
+on a second platform, to show that nothing in `core/` is twitch-shaped.
+
 ## What is proven, and what is not
 
 **Proven by the test suite** (~3,100 passing tests, with 13–18 environment-dependent skips). A GitHub
@@ -81,12 +100,16 @@ Requires Python 3.10+.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[test]"
 
+# 0. See it run first: one scripted scenario, narrated end to end, no credential.
+python -m demo   # --platform fake drives the same run on a second platform
+
 # 1. Look at a shipped profile before writing your own.
 ls *.example          # config.yaml.example (PC profile, chat + audio + scenes)
                       # presence.yaml.example (the full phase-3 profile: persona, routes, memory…)
                       # config.server.yaml.example + agent.yaml.example (the remote profile)
 
 # 2. Validate a profile without opening a single socket (exit 0 = accepted, 2 = refused).
+#    The shipped examples reference ${...} variables, so expect a refusal until you export them.
 python -m core.main --config presence.yaml.example --check-config
 
 # 3. Run the companion.
@@ -115,6 +138,7 @@ python -m pytest tests/ -q
 |---|---|
 | `core/` | The kernel: bus, admission, triggers, brain loop, actions, loader, runtime, audit |
 | `core/config_ui/` | The local web configuration UI (separate process) |
+| `demo/` | The offline demo (`python -m demo`): the scripted scenario, narrated |
 | `modules/` | 17 modules, each with a `module.yaml` manifest declaring its actions, schema and capabilities |
 | `tests/` | ~3,100 tests over Python 3.10–3.13, plus opt-in real-integration trials |
 | `docs/design-v2.md` | The design blueprint the phases implement |

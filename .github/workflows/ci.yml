@@ -47,10 +47,13 @@ jobs:
 
       - name: Packaging and entry points
         # The README tells a visitor these two entry points exist; prove they do,
-        # and that the project still builds a wheel.
+        # and that the project still builds a wheel. The offline demo the README
+        # opens with is exercised here too: it drives the shipped scenario, so this
+        # step fails if that promise and the checkout ever drift apart.
         run: |
           python -c "import core.main, core.config_ui; print('imports ok')"
           twitch-ia-compagnon --help > /dev/null
           twitch-ia-compagnon-config-ui --help > /dev/null
+          python -m demo --no-colour > /dev/null
           python -m pip wheel . --no-deps --wheel-dir /tmp/wheel
           ls -1 /tmp/wheel
