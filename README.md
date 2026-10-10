@@ -35,10 +35,10 @@ Only four edges are scripted — the model's answers, the platform's replies, th
 speech synthesis — and every run prints which, at the end. `--platform fake` drives the same scenario
 on a second platform, to show that nothing in `core/` is twitch-shaped.
 
-Want it running on your own channel? **[Installer et mettre en route le compagnon](docs/installation.md)**
-(French) walks a non-technical reader from nothing to a companion answering in chat: the shopping list,
-a ready-to-copy chat-only profile, the eight values to collect, what each command prints, what the
-errors mean, and what is still unproven.
+Want it running on your own channel? **[Installing and running the companion](docs/installation.md)**
+(also [in French](docs/installation.fr.md)) walks a non-technical reader from nothing to a companion
+answering in chat: the shopping list, a ready-to-copy chat-only profile, the eight values to collect,
+what each command prints, what the errors mean, and what is still unproven.
 
 ## What is proven, and what is not
 
