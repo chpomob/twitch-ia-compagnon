@@ -1,5 +1,7 @@
 # Configuration UI — operator guide
 
+**English** · [Français](config-ui.fr.md)
+
 The configuration UI is a small web page to read and edit the configuration of
 `twitch-ia-compagnon`, check it, and restart the main process on it. It runs in
 **its own process**, separate from the main process (`core.main`), and adds no

@@ -1,83 +1,81 @@
-# Installer et mettre en route le compagnon
+# Installing and running the companion
 
-> **À lire avant de commencer.** Ce projet est une **exploration d'architecture**, publiée en
-> cours de route. Il n'a **jamais tourné sur un vrai stream** : les connexions à Twitch, Kick et
-> YouTube n'ont jamais parlé aux vrais serveurs, et il n'existe aucun retour d'expérience. Ce
-> guide ne vous fait donc pas installer un produit fini : il vous fait installer un projet qui
-> fonctionne, dont vous serez le premier utilisateur réel. Il n'y a pas de mise à jour
-> automatique, pas d'installeur, pas de service qui redémarre tout seul, et personne qui
-> corrigera un bogue à votre place. Si ce que vous cherchez, c'est un outil fiable aujourd'hui,
-> ce n'est pas encore celui-ci — lisez la section [Ce qui n'est pas prouvé](#ce-qui-nest-pas-prouvé)
-> à la fin.
+**English** · [Français](installation.fr.md)
 
-Ce guide vous emmène de « je n'ai rien installé » à « mon assistant répond dans mon chat ».
-Comptez **30 minutes**, dont la moitié passée à créer des comptes sur le web.
+> **Read this first.** This project is an **architectural exploration**, published as it is built. It
+> has **never run on a real stream**: its connections to Twitch, Kick and YouTube have never talked to
+> the live services, and there is no field experience of any kind. So this guide does not install a
+> finished product — it installs a project that works, of which you will be the first real user. There
+> is no automatic update, no installer, no service that restarts it for you, and nobody who will fix a
+> bug on your behalf. If what you want is a dependable tool today, this is not it yet: read
+> [What is not proven](#13-what-is-not-proven) at the end.
 
-## 1. À qui ce guide s'adresse
+This guide takes you from "I have installed nothing" to "my assistant answers in my chat". Budget
+**30 minutes**, half of it spent creating accounts on the web.
 
-Vous **n'avez pas besoin de savoir programmer**. Vous devez accepter trois choses :
+## 1. Who this guide is for
 
-- ouvrir une fenêtre noire appelée « terminal » et y **copier-coller** des commandes ;
-- créer deux comptes sur le web (Twitch développeur, et un fournisseur de modèle de langage) ;
-- recopier des valeurs d'un site vers un fichier, sans erreur de frappe.
+You **do not need to know how to program**. You do need to accept three things:
 
-Tout le reste est du copier-coller. Chaque commande est donnée **telle quelle**, avec, juste
-après, ce que vous devez voir s'afficher. Si ce n'est pas ce que vous voyez, allez à la section
-[12. Quand ça ne marche pas](#12-quand-ça-ne-marche-pas).
+- opening a black window called a "terminal" and **copying and pasting** commands into it;
+- creating two accounts on the web (Twitch developer, and a language-model provider);
+- copying values from a web page into a file without mistyping them.
 
-Un mot de vocabulaire, utilisé partout ensuite :
+Everything else is copying and pasting. Every command is given **exactly as you should type it**,
+followed by what you must see next. If what you see is something else, jump to
+[12. When something goes wrong](#12-when-something-goes-wrong).
 
-- **terminal** : la fenêtre où l'on tape les commandes (PowerShell ou Invite de commandes sous
-  Windows, Terminal sous macOS, n'importe quel terminal sous Linux) ;
-- **compagnon** : votre assistant, celui qui répond dans le chat ;
-- **profil** : le fichier de configuration (`mon-compagnon.yaml` dans ce guide) ;
-- **modèle** : l'IA qui rédige les réponses (ChatGPT, Claude, Mistral, un modèle local…).
+A few words, used throughout:
 
-## 2. La liste de courses
+- **terminal**: the window where commands are typed (PowerShell or Command Prompt on Windows,
+  Terminal on macOS, any terminal on Linux);
+- **companion**: your assistant, the one answering in the chat;
+- **profile**: the configuration file (`mon-compagnon.yaml` in this guide);
+- **model**: the AI that writes the answers (ChatGPT, Claude, Mistral, a local model…).
 
-Préparez ces cinq choses **dans cet ordre**. La colonne « où » est un lien direct.
+## 2. The shopping list
 
-| # | Ce qu'il faut | Pourquoi | Où / Coût |
+Prepare these five things **in this order**. The "where" column is a direct link.
+
+| # | What you need | Why | Where / Cost |
 |---|---|---|---|
-| 1 | **Python 3.10 ou plus récent** | le programme est écrit en Python | [python.org/downloads](https://www.python.org/downloads/) — gratuit. Sous Windows, **cochez « Add python.exe to PATH »** à l'installation, sinon rien ne marchera |
-| 2 | **Un compte Twitch + une application développeur** | pour que le compagnon lise et écrive dans votre chat | [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps) → « Register Your Application ». Vous en sortez un **client id** et un **client secret**. Gratuit |
-| 3 | **Un jeton d'accès Twitch + deux identifiants numériques** | le jeton est le mot de passe du bot ; les deux identifiants disent *quelle chaîne* et *quel compte bot* | [twitchtokengenerator.com](https://twitchtokengenerator.com) (site tiers, non affilié) ou l'outil officiel `twitch` CLI. Décochez tout sauf `chat:read` et `chat:edit`. Gratuit. **Le jeton expire : il faudra le refaire de temps en temps** |
-| 4 | **Une clé de modèle de langage** | c'est le « cerveau » qui rédige les réponses | [OpenAI](https://platform.openai.com/) (payant à l'usage), [Groq](https://console.groq.com/), [DeepInfra](https://deepinfra.com/), [Mistral](https://console.mistral.ai/)… ou un modèle **local** avec [Ollama](https://ollama.com/) (gratuit, sur votre PC). **Il faut un modèle qui sait « appeler des outils » (function calling)** : sans ça, il démarrera mais ne pourra rien faire |
-| 5 | **Le dossier du projet** | le logiciel lui-même | page GitHub du projet → bouton vert **Code** → **Download ZIP**, puis décompressez-le (ou `git clone` si vous connaissez) |
+| 1 | **Python 3.10 or newer** | the program is written in Python | [python.org/downloads](https://www.python.org/downloads/) — free. On Windows, **tick "Add python.exe to PATH"** during installation, or nothing will work |
+| 2 | **A Twitch account + a developer application** | so the companion can read and write in your chat | [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps) → "Register Your Application". You get a **client id** and a **client secret** out of it. Free |
+| 3 | **A Twitch access token + two numeric identifiers** | the token is the bot's password; the two identifiers say *which channel* and *which bot account* | [twitchtokengenerator.com](https://twitchtokengenerator.com) (third-party site, not affiliated) or the official `twitch` CLI. Untick everything except `chat:read` and `chat:edit`. Free. **The token expires: you will have to make a new one from time to time** |
+| 4 | **A language-model key** | it is the "brain" that writes the answers | [OpenAI](https://platform.openai.com/) (paid by usage), [Groq](https://console.groq.com/), [DeepInfra](https://deepinfra.com/), [Mistral](https://console.mistral.ai/)… or a **local** model with [Ollama](https://ollama.com/) (free, on your own PC). **The model must support "tool calling" (function calling)**: without it, the companion will start and then be unable to do anything |
+| 5 | **The project folder** | the software itself | the project's GitHub page → green **Code** button → **Download ZIP**, then unzip it (or `git clone` if you know git) |
 
-Ce que ça coûte : **0 €** pour Twitch et Python ; **de quelques centimes à quelques euros par
-soirée** pour le modèle, facturé à l'usage. Un modèle local ne coûte rien mais consomme votre PC.
+What it costs: **€0** for Twitch and Python; **a few cents to a few euros per evening** for the model,
+billed by usage. A local model costs nothing but uses your PC.
 
-## 3. D'abord : voir à quoi ça ressemble (2 minutes, aucun compte)
+## 3. First: see what it looks like (2 minutes, no account)
 
-Avant d'installer quoi que ce soit, sachez à quoi vous travaillez. Dans le dossier du projet,
-dans un terminal :
+Before installing anything, know what you are working on. In the project folder, in a terminal:
 
 ```sh
 python -m demo
 ```
 
-Ce que vous devez voir : une petite histoire qui se déroule toute seule — un spectateur écrit, le
-compagnon l'entend, réfléchit, capture l'audio, répond dans le chat et le dit à voix haute. C'est
-une démonstration **hors ligne** : elle n'ouvre aucune connexion, n'utilise aucun compte et ne
-coûte rien. Elle sert à vérifier que votre installation est vivante — le GIF du dépôt montre
-exactement cette sortie.
+What you must see: a small story that plays itself — a viewer writes, the companion hears it, thinks,
+captures audio, answers in the chat and speaks the answer out loud. It is an **offline** demonstration:
+it opens no connection, uses no account and costs nothing. It is how you check that your installation
+is alive — the GIF in the repository shows exactly this output.
 
-## 4. Installer le projet
+## 4. Installing the project
 
-### 4.1 Ouvrir un terminal **dans le dossier du projet**
+### 4.1 Open a terminal **inside the project folder**
 
-C'est le point qui rate le plus souvent. Le terminal doit être *à l'intérieur* du dossier
-décompressé, sinon les commandes ne trouvent rien.
+This is where people trip most often. The terminal must be *inside* the unzipped folder, otherwise the
+commands find nothing.
 
-- **Windows** : ouvrez le dossier du projet dans l'Explorateur, cliquez sur la barre d'adresse,
-  tapez `powershell`, appuyez sur Entrée.
-- **macOS** : clic droit sur le dossier → Services → « Nouveau terminal au dossier ».
-- **Linux** : clic droit dans le dossier → « Ouvrir dans un terminal ».
+- **Windows**: open the project folder in File Explorer, click the address bar, type `powershell`,
+  press Enter.
+- **macOS**: right-click the folder → Services → "New Terminal at Folder".
+- **Linux**: right-click inside the folder → "Open in Terminal".
 
-### 4.2 Installer
+### 4.2 Install
 
-**Windows** (une ligne à la fois) :
+**Windows** (one line at a time):
 
 ```powershell
 py -3 -m venv .venv
@@ -85,7 +83,7 @@ py -3 -m venv .venv
 python -m pip install -e .
 ```
 
-**macOS et Linux** (une ligne à la fois) :
+**macOS and Linux** (one line at a time):
 
 ```sh
 python3 -m venv .venv
@@ -93,37 +91,35 @@ python3 -m venv .venv
 python -m pip install -e .
 ```
 
-Ce que vous devez voir : la dernière commande se termine par `Successfully installed …`, et votre
-invite de commandes commence maintenant par `(.venv)`. C'est le signe que l'environnement est
-actif.
+What you must see: the last command ends with `Successfully installed …`, and your prompt now starts
+with `(.venv)`. That is the sign the environment is active.
 
-> **À retenir :** `(.venv)` doit apparaître dans toutes les commandes suivantes. Le terminal
-> oublie l'environnement quand vous le fermez : réactivez-le (la 2ᵉ ligne ci-dessus) à chaque
-> nouvelle session.
+> **Remember:** `(.venv)` must be visible for every command below. The terminal forgets the environment
+> when you close it: reactivate it (the 2nd line above) in every new session.
 
-## 5. Réunir les huit valeurs
+## 5. Gathering the eight values
 
-Reprenez la liste de courses et remplissez ce tableau **dans un brouillon**. C'est la partie
-fastidieuse, et une faute de frappe ici est la première cause d'échec.
+Go back to the shopping list and fill in this table **in a scratch file**. This is the tedious part, and
+a typo here is the first cause of failure.
 
-| Valeur | Ce que c'est | Où la prendre |
+| Value | What it is | Where to get it |
 |---|---|---|
-| `TWITCH_CLIENT_ID` | identifiant public de votre application Twitch | site développeur Twitch, page de votre application |
-| `TWITCH_CLIENT_SECRET` | mot de passe de votre application Twitch | même page, bouton « New Secret » |
-| `TWITCH_ACCESS_TOKEN` | le mot de passe du bot | le générateur de jetons (droits `chat:read` + `chat:edit`) |
-| `TWITCH_BROADCASTER_ID` | l'identifiant **numérique** de votre chaîne (pas votre pseudo) | le générateur de jetons l'affiche ; sinon un outil « Twitch user id lookup » |
-| `TWITCH_BOT_USER_ID` | l'identifiant numérique du compte qui parle (le bot) | même méthode, avec le compte bot |
-| `MODEL_ENDPOINT` | l'adresse du service de modèle | OpenAI : `https://api.openai.com/v1` · Ollama local : `http://localhost:11434/v1` · sinon l'adresse donnée par votre fournisseur |
-| `MODEL_NAME` | le nom exact du modèle | chez votre fournisseur (ex. `gpt-4o-mini`, `llama-3.3-70b-versatile`) |
-| `MODEL_API_KEY` | votre clé de modèle | la page « API keys » de votre fournisseur (Ollama local : n'importe quoi, `ollama` par exemple) |
+| `TWITCH_CLIENT_ID` | your Twitch application's public identifier | the Twitch developer site, your application's page |
+| `TWITCH_CLIENT_SECRET` | your Twitch application's password | same page, "New Secret" button |
+| `TWITCH_ACCESS_TOKEN` | the bot's password | the token generator (`chat:read` + `chat:edit` scopes) |
+| `TWITCH_BROADCASTER_ID` | the **numeric** identifier of your channel (not your username) | the token generator shows it; otherwise a "Twitch user id lookup" tool |
+| `TWITCH_BOT_USER_ID` | the numeric identifier of the account that speaks (the bot) | same method, with the bot account |
+| `MODEL_ENDPOINT` | the model service's address | OpenAI: `https://api.openai.com/v1` · local Ollama: `http://localhost:11434/v1` · otherwise the address your provider gives you |
+| `MODEL_NAME` | the model's exact name | from your provider (e.g. `gpt-4o-mini`, `llama-3.3-70b-versatile`) |
+| `MODEL_API_KEY` | your model key | your provider's "API keys" page (local Ollama: anything, `ollama` for instance) |
 
-> Le compte **bot** peut être votre propre compte, mais un second compte Twitch est plus propre :
-> les messages du compagnon n'apparaîtront alors pas comme les vôtres.
+> The **bot** account can be your own account, but a second Twitch account is cleaner: the companion's
+> messages then do not appear as yours.
 
-## 6. Créer le fichier de configuration
+## 6. Creating the configuration file
 
-À la racine du projet (le même dossier que `README.md`), créez un fichier nommé
-**`mon-compagnon.yaml`** et collez-y exactement ceci :
+At the root of the project (the folder that also holds `README.md`), create a file named
+**`mon-compagnon.yaml`** and paste exactly this into it:
 
 ```yaml
 modules_directory: ./modules
@@ -141,11 +137,11 @@ modules:
     access_token: ${TWITCH_ACCESS_TOKEN}
     broadcaster_id: ${TWITCH_BROADCASTER_ID}
     bot_user_id: ${TWITCH_BOT_USER_ID}
-    # Le nom que les spectateurs utilisent pour appeler le compagnon.
-    # CHANGEZ-LE (et gardez-le court) : c'est le mot qui déclenche une réponse.
+    # The name viewers use to call the companion.
+    # CHANGE IT (and keep it short): this is the word that triggers an answer.
     companion_name: Assistant
 
-  # Le compagnon garde en mémoire les derniers messages du chat.
+  # The companion keeps the last chat messages in memory.
   chat_context: {}
 
   brain:
@@ -175,7 +171,7 @@ modules:
       max_age_seconds: 3600
     fallback:
       enabled: true
-      text: "Je n'ai pas pu répondre à temps."
+      text: "I could not answer in time."
     capabilities:
       required:
         - structured_output
@@ -253,189 +249,180 @@ limits:
     total_run_seconds: 60
 ```
 
-Vous n'avez **rien à modifier** dans ce fichier, sauf `companion_name` (le nom du compagnon).
-Les `${...}` sont des renvois aux variables du point suivant : le programme y mettra vos valeurs
-tout seul, sans jamais les écrire dans le fichier.
+You have **nothing to change** in this file, except `companion_name` (the companion's name). The
+`${...}` are references to the previous section's variables: the program substitutes your values by
+itself, and never writes them into the file.
 
-En trois phrases, ce que dit ce profil :
+In three sentences, what this profile says:
 
-- `enabled_modules` : les quatre briques activées — la connexion Twitch, la mémoire du chat, le
-  cerveau, le journal ;
-- `actions` : **ce que le compagnon a le droit de faire**, et rien d'autre. Ici, deux
-  autorisations : lire le chat, y écrire. Hors de cette liste, tout est refusé — c'est le réglage
-  le plus important du fichier, et le plus facile à étendre plus tard ;
-- `limits` et les blocs `admission`/`budget` : les garde-fous (longueur de mémoire, nombre de
-  réponses en attente, durée maximale d'une réponse). Les valeurs fournies sont saines : laissez-
-  les tranquilles pour commencer.
+- `enabled_modules`: the four parts that are switched on — the Twitch connection, the chat memory, the
+  brain, the log;
+- `actions`: **what the companion is allowed to do**, and nothing else. Two permissions here: read the
+  chat, write to it. Outside this list, everything is refused — it is the most important setting in the
+  file, and the easiest one to extend later;
+- `limits` and the `admission`/`budget` blocks: the guard rails (how much memory, how many pending
+  answers, how long an answer may take). The values given are sane: leave them alone to start with.
 
-## 7. Rendre les huit valeurs visibles par le programme
+## 7. Making the eight values visible to the program
 
-Le programme lit vos valeurs dans le **terminal**, pas dans un fichier. Tapez les huit lignes
-ci-dessous dans le même terminal que celui où `(.venv)` apparaît — en remplaçant chaque valeur par
-la vôtre, **sans guillemets** :
+The program reads your values from the **terminal**, not from a file. Type the eight lines below in the
+same terminal where `(.venv)` is visible — replacing each value with your own, **without quotes**:
 
-**Windows — PowerShell :**
+**Windows — PowerShell:**
 
 ```powershell
-$env:TWITCH_CLIENT_ID="collez_ici"
-$env:TWITCH_CLIENT_SECRET="collez_ici"
-$env:TWITCH_ACCESS_TOKEN="collez_ici"
-$env:TWITCH_BROADCASTER_ID="collez_ici"
-$env:TWITCH_BOT_USER_ID="collez_ici"
-$env:MODEL_ENDPOINT="collez_ici"
-$env:MODEL_NAME="collez_ici"
-$env:MODEL_API_KEY="collez_ici"
+$env:TWITCH_CLIENT_ID="paste_here"
+$env:TWITCH_CLIENT_SECRET="paste_here"
+$env:TWITCH_ACCESS_TOKEN="paste_here"
+$env:TWITCH_BROADCASTER_ID="paste_here"
+$env:TWITCH_BOT_USER_ID="paste_here"
+$env:MODEL_ENDPOINT="paste_here"
+$env:MODEL_NAME="paste_here"
+$env:MODEL_API_KEY="paste_here"
 ```
 
-**Windows — Invite de commandes** (`cmd`) : même liste avec la forme `set TWITCH_CLIENT_ID=collez_ici`,
-sans guillemets et sans espaces autour du `=`.
+**Windows — Command Prompt** (`cmd`): the same list in the form `set TWITCH_CLIENT_ID=paste_here`,
+with no quotes and no spaces around the `=`.
 
-**macOS et Linux :**
+**macOS and Linux:**
 
 ```sh
-export TWITCH_CLIENT_ID=collez_ici
-export TWITCH_CLIENT_SECRET=collez_ici
-export TWITCH_ACCESS_TOKEN=collez_ici
-export TWITCH_BROADCASTER_ID=collez_ici
-export TWITCH_BOT_USER_ID=collez_ici
-export MODEL_ENDPOINT=collez_ici
-export MODEL_NAME=collez_ici
-export MODEL_API_KEY=collez_ici
+export TWITCH_CLIENT_ID=paste_here
+export TWITCH_CLIENT_SECRET=paste_here
+export TWITCH_ACCESS_TOKEN=paste_here
+export TWITCH_BROADCASTER_ID=paste_here
+export TWITCH_BOT_USER_ID=paste_here
+export MODEL_ENDPOINT=paste_here
+export MODEL_NAME=paste_here
+export MODEL_API_KEY=paste_here
 ```
 
-Ces valeurs ne survivent pas à la fermeture du terminal. C'est normal, et c'est même souhaitable :
-le jour où vous en aurez assez de les retaper, c'est le moment de lire
-[`docs/config-ui.md`](config-ui.md) et de garder ce guide à portée de main.
+These values do not survive closing the terminal. That is normal, and even desirable: the day retyping
+them annoys you enough, it is the moment to read [`docs/config-ui.md`](config-ui.md) and keep this guide
+within reach.
 
-## 8. Vérifier sans rien allumer
+## 8. Checking without switching anything on
 
-Avant de lancer quoi que ce soit en direct, demandez au programme de contrôler votre profil. Il
-ne se connecte à rien, il ne lit aucun message :
+Before running anything live, ask the program to check your profile. It connects to nothing and reads no
+message:
 
 ```sh
 python -m core.main --config mon-compagnon.yaml --check-config
 ```
 
-Ce que vous devez voir : **rien du tout**, et un retour immédiat au prompt. C'est la bonne
-nouvelle : `rien` = « tout est cohérent ». S'il y a un message d'erreur, il vous dit précisément
-quel champ ne va pas — reportez-vous à la section [12](#12-quand-ça-ne-marche-pas).
+What you must see: **nothing at all**, and an immediate return to the prompt. That is the good news:
+`nothing` means "everything is consistent". If there is an error message, it names the field that is
+wrong — see section [12](#12-when-something-goes-wrong).
 
-## 9. Lancer le compagnon
+## 9. Running the companion
 
 ```sh
 python -m core.main --config mon-compagnon.yaml
 ```
 
-Ce que vous devez voir : quatre lignes `ready` (les quatre briques qui démarrent), puis le
-programme reste silencieux — il écoute. Il n'y a **rien à taper** : allez dans votre chat Twitch
-et adressez-vous au compagnon par son nom :
+What you must see: four `ready` lines (the four parts starting up), then the program stays silent — it
+is listening. There is **nothing to type**: go to your Twitch chat and address the companion by name:
 
 ```
-Assistant, tu es là ?
+Assistant, are you there?
 ```
 
-Ce que vous devez voir ensuite : dans le chat, une réponse écrite par le compte bot ; dans le
-terminal, une série de lignes (`chat`, `trigger`, `call`, `run`) qui racontent ce qu'il vient de
-faire. Les lignes `audit` sont votre journal : elles disent exactement ce qui a été décidé.
+What you must see next: in the chat, an answer written by the bot account; in the terminal, a series of
+lines (`chat`, `trigger`, `call`, `run`) telling the story of what it just did. The `audit` lines are
+your log: they say exactly what was decided.
 
-Pour l'arrêter : `Ctrl` + `C` dans le terminal.
+To stop it: `Ctrl` + `C` in the terminal.
 
-> Testez d'abord en **chat privé avec vous-même**, ou sur une chaîne de test, pas devant votre
-> audience.
+> Test in a **private chat with yourself** first, or on a test channel — not in front of your audience.
 
-## 10. L'interface web de configuration
+## 10. The web configuration interface
 
-Retenir huit variables et éditer un YAML n'est pas tenable au quotidien. Le projet fournit une
-petite interface web locale pour lire et modifier votre configuration :
+Remembering eight variables and editing YAML is not sustainable day to day. The project ships a small
+local web interface to read and change your configuration:
 
 ```sh
 python -m core.config_ui --config mon-compagnon.yaml
 ```
 
-Ce que vous devez voir : une adresse à usage unique du type
-`Configuration UI: http://127.0.0.1:8765/?token=…` — copiez-la dans votre navigateur. Elle ne
-fonctionne que sur votre machine (elle n'est pas exposée sur internet) et le jeton change à
-chaque lancement.
+What you must see: a one-time address along the lines of
+`Configuration UI: http://127.0.0.1:8765/?token=…` — copy it into your browser. It only works on your
+own machine (it is not exposed on the internet) and the token changes on every launch.
 
-Trois choses à savoir sur cette interface :
+Three things to know about this interface:
 
-- elle écrit vos modifications dans un **fichier séparé** (`config.local.yaml`) posé par-dessus
-  votre profil : votre `mon-compagnon.yaml` reste intact, et supprimer une ligne de l'interface
-  restaure la valeur d'origine ;
-- les **secrets** et les **règles d'autorisation** (le bloc `actions`) y sont en lecture seule,
-  volontairement : un clic de travers ne doit pas pouvoir élargir ce que le compagnon a le droit
-  de faire ;
-- appliquer un changement demande un **redémarrage à la main** : arrêtez (`Ctrl` + `C`) et
-  relancez la commande du point 9.
+- it writes your changes into a **separate file** (`config.local.yaml`) laid over your profile: your
+  `mon-compagnon.yaml` stays intact, and removing a line in the interface restores the original value;
+- **secrets** and the **authorization rules** (the `actions` block) are read-only there, on purpose: a
+  stray click must not be able to widen what the companion is allowed to do;
+- applying a change needs a **manual restart**: stop it (`Ctrl` + `C`) and run the command from section
+  9 again.
 
-> Le détail de cette interface est dans le guide opérateur
-> [`docs/config-ui.md`](config-ui.md). Deux honnêtetés : ce guide-là est en anglais, et la partie
-> navigateur de cette interface n'a jamais été essayée dans un vrai navigateur (son contrat HTTP
-> est testé, pas son rendu). Si un bouton vous semble inerte, c'est probablement là.
+> The details of that interface are in the operator guide [`docs/config-ui.md`](config-ui.md), also
+> available [in French](config-ui.fr.md). One honesty: the interface's browser layer has never been
+> tried in a real browser (its HTTP contract is tested, its rendering is not). If a button seems
+> dead, that is probably where.
 
-## 11. Ajouter la voix, OBS, les captures d'écran
+## 11. Adding voice, OBS, screen captures
 
-Le profil du point 6 fait volontairement le minimum : il lit le chat et y répond. Tout le reste
-est **modulaire** — chaque capacité est une brique que vous activez, avec ses propres réglages.
-Vous n'avez rien à recomposer : les profils complets livrés avec le projet sont vos modèles.
+The profile from section 6 deliberately does the minimum: it reads the chat and answers in it.
+Everything else is **modular** — each capability is a part you switch on, with its own settings. You do
+not have to compose them from scratch: the complete profiles shipped with the project are your models.
 
-| Ce que vous voulez | Brique à activer | Ce qu'il faut en plus, en dehors du projet |
+| What you want | Part to enable | What you also need, outside the project |
 |---|---|---|
-| entendre le compagnon dans le stream | `audio_output` | un service de synthèse vocale (endpoint + clé), un lecteur audio installé |
-| que le compagnon vous entende | `audio_input` | un micro, un enregistreur en ligne de commande, un service de transcription |
-| changer vos scènes, vos alertes | `stream_control` | OBS avec `obs-websocket` activé |
-| parler d'une capture d'écran | `capture` | un outil de capture d'écran en ligne de commande |
-| reconnaître les habitués | `users`, `viewer_memory` | rien |
-| modérer, faire un clip, un sondage | `moderation`, `clips`, `twitch` | des droits supplémentaires sur votre jeton Twitch |
-| séparer le cerveau du PC de streaming | `proxy`, `agent_link` | un second ordinateur ou un serveur ([protocole](proxy-protocol.md)) |
+| hear the companion in the stream | `audio_output` | a speech-synthesis service (endpoint + key), an audio player installed |
+| have the companion hear you | `audio_input` | a microphone, a command-line recorder, a transcription service |
+| change your scenes, your alerts | `stream_control` | OBS with `obs-websocket` enabled |
+| talk about a screen capture | `capture` | a command-line screen-capture tool |
+| recognise regulars | `users`, `viewer_memory` | nothing |
+| moderate, clip a moment, run a poll | `moderation`, `clips`, `twitch` | extra permissions on your Twitch token |
+| split the brain from the streaming PC | `proxy`, `agent_link` | a second computer or a server ([protocol](proxy-protocol.md)) |
 
-Partez de `config.yaml.example` (le commentaire au-dessus de chaque ligne explique le réglage) et
-de `presence.yaml.example` (le profil complet : personnalité, mémoire, enchaînements). Copiez les
-blocs qui vous intéressent dans votre fichier. À chaque ajout, refaites la vérification du point 8
-avant de relancer : le message d'erreur vous dira quel réglage manque.
+Start from `config.yaml.example` (the comment above each line explains the setting) and
+`presence.yaml.example` (the full profile: persona, memory, routes). Copy the blocks you want into your
+file. After each addition, redo the check from section 8 before restarting: the error message will name
+the setting you are missing.
 
-## 12. Quand ça ne marche pas
+## 12. When something goes wrong
 
-Les messages ci-dessous sont ceux que le programme affiche réellement. Le premier `Aucun compte`
-veut dire : lisez d'abord la ligne juste en dessous.
+The messages below are the ones the program actually prints. The heading of each row is what you see on
+screen.
 
-| Ce que vous voyez | Ce que ça veut dire | Quoi faire |
+| What you see | What it means | What to do |
 |---|---|---|
-| `environment reference is unresolved` | une `${...}` de votre profil ne correspond à aucune variable de votre terminal | vérifiez au point 7 que les huit valeurs sont définies **dans ce terminal-ci** (le terminal oublie tout quand vous le fermez) |
-| `twitch authentication: rejected (status 401)` | Twitch a refusé votre jeton | votre `TWITCH_ACCESS_TOKEN` est faux, mal copié ou expiré : refaites-en un, et vérifiez que `TWITCH_CLIENT_ID` correspond bien à la même application |
-| `error: module 'brain': phase 'prepare' failed` | le cerveau n'a pas pu joindre le modèle ou n'a pas reçu de réponse utilisable | vérifiez `MODEL_ENDPOINT` (une barre oblique finale en trop suffit à casser l'adresse), `MODEL_NAME` (orthographe exacte) et `MODEL_API_KEY`, puis que le modèle **sait appeler des outils**. Soyez prévenu : aujourd'hui ce message **ne dit pas** laquelle de ces causes c'est — c'est une limite connue du projet |
-| `secrets[N]: is referenced by no setting` | vous avez listé dans `secrets:` une variable qui n'est utilisée nulle part | supprimez la ligne en question du bloc `secrets` |
-| `--check-config` sur un fichier `.example` livré : `environment reference is unresolved` | normal : ces exemples citent des variables d'exemple | contrôlez **votre** fichier, pas les `.example` |
-| Le compagnon démarre mais ne répond jamais | il n'est pas appelé, ou il n'a pas le droit de répondre | écrivez son nom exactement comme dans `companion_name` ; vérifiez que votre jeton porte les droits `chat:read` **et** `chat:edit` ; vérifiez que le compte bot a bien accès à votre chaîne |
-| Il répond « en retard » ou pas du tout au bout d'un moment | le jeton Twitch a expiré (environ 60 jours) | refaites le jeton, relancez |
-| La réponse est vide ou coupée | soit le modèle « réfléchit » et consomme tout son budget, soit la limite de longueur est trop basse | dans le profil, montez `brain.budget.max_tokens` |
-| Erreur de facturation chez votre fournisseur | votre clé de modèle est facturée à l'usage | rien à voir avec le projet : surveillez votre compte, ou passez à un modèle local |
+| `environment reference is unresolved` | one `${...}` in your profile matches no variable in your terminal | check section 7: the eight values must be defined **in this terminal** (the terminal forgets everything when you close it) |
+| `twitch authentication: rejected (status 401)` | Twitch refused your token | your `TWITCH_ACCESS_TOKEN` is wrong, mistyped or expired: make a new one, and check that `TWITCH_CLIENT_ID` belongs to the same application |
+| `error: module 'brain': phase 'prepare' failed` | the brain could not reach the model, or got no usable answer | check `MODEL_ENDPOINT` (a trailing slash is enough to break the address), `MODEL_NAME` (exact spelling) and `MODEL_API_KEY`, then that the model **supports tool calling**. Be warned: today this message **does not say** which of those it is — that is a known limitation of the project |
+| `secrets[N]: is referenced by no setting` | you listed in `secrets:` a variable that nothing uses | delete that line from the `secrets` block |
+| `environment reference is unresolved` on a shipped `.example` file | normal: those examples name example variables | check **your** file, not the `.example` ones |
+| The companion starts but never answers | it is not being called, or it is not allowed to answer | write its name exactly as in `companion_name`; check your token carries both `chat:read` and `chat:edit`; check the bot account has access to your channel |
+| It answers "late", or stops answering after a while | the Twitch token expired (about 60 days) | make a new token, restart |
+| The answer is empty or truncated | either the model "thinks" and spends its whole budget, or the length limit is too low | raise `brain.budget.max_tokens` in the profile |
+| A billing error from your provider | your model key is billed by usage | nothing to do with the project: watch your account, or switch to a local model |
 
-## 13. Ce qui n'est pas prouvé
+## 13. What is not proven
 
-À garder en tête avant de vous lancer en direct :
+Keep this in mind before going live:
 
-- **aucun stream réel n'a jamais tourné avec ce logiciel** ;
-- **les connexions à Twitch, Kick et YouTube n'ont jamais parlé aux vrais serveurs** : elles sont
-  testées contre des serveurs simulés. L'authentification, les limites de débit et les
-  particularités de ces services ne sont pas vérifiées ;
-- **l'interface web n'a jamais été essayée dans un vrai navigateur** ;
-- **pas de durcissement de production** : pas d'installation système, pas de mise à jour, pas de
-  supervision, pas d'essai de charge ;
-- le projet est publié sous **WTFPL** : utilisez-le, modifiez-le, redistribuez-le librement, et
-  **sans aucune garantie ni aucun support**.
+- **no real stream has ever run with this software**;
+- **the connections to Twitch, Kick and YouTube have never talked to the live services**: they are
+  tested against scripted servers. Authentication, rate limits and the particularities of those services
+  are unverified;
+- **the web interface has never been tried in a real browser**;
+- **no production hardening**: no system-wide install, no upgrades, no supervision, no load testing;
+- the project is released under **WTFPL**: use it, modify it, redistribute it freely, and with
+  **no warranty and no support of any kind**.
 
-Concrètement, pour une soirée en direct : commencez en chat privé ou sur une chaîne de test,
-gardez la main sur la modération, et soyez prêt à couper (`Ctrl` + `C`) si le compagnon part dans
-une direction que vous n'aimez pas.
+Concretely, for a live evening: start in a private chat or on a test channel, keep moderation in your
+hands, and be ready to cut it (`Ctrl` + `C`) if the companion goes somewhere you do not like.
 
-## 14. Pour aller plus loin
+## 14. Going further
 
-| Document | Contenu |
+| Document | Content |
 |---|---|
-| `README.md` | la vue d'ensemble, ce qui est prouvé et ce qui ne l'est pas, et la démo hors ligne |
-| [`docs/config-ui.md`](config-ui.md) | le guide de l'interface web (en anglais) |
-| [`docs/proxy-protocol.md`](proxy-protocol.md) | faire tourner le cerveau sur un autre ordinateur |
-| [`docs/design-v2.md`](design-v2.md) | la conception d'ensemble : pourquoi les briques sont modulaires |
-| `config.yaml.example`, `presence.yaml.example` | les profils complets, commentés ligne à ligne |
-| `python -m demo --platform fake` | la même démonstration sur une seconde plateforme, pour voir que le cœur ne dépend d'aucune en particulier |
+| `README.md` | the overview, what is proven and what is not, and the offline demo |
+| [`docs/config-ui.md`](config-ui.md) | the guide to the web interface (also [in French](config-ui.fr.md)) |
+| [`docs/proxy-protocol.md`](proxy-protocol.md) | running the brain on another computer (English only for now) |
+| [`docs/design-v2.md`](design-v2.md) | the overall design: why the parts are modular (French only for now) |
+| `config.yaml.example`, `presence.yaml.example` | the complete profiles, commented line by line |
+| `python -m demo --platform fake` | the same demonstration on a second platform, to see that the core depends on none in particular |
