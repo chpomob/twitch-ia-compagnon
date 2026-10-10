@@ -35,6 +35,11 @@ Only four edges are scripted — the model's answers, the platform's replies, th
 speech synthesis — and every run prints which, at the end. `--platform fake` drives the same scenario
 on a second platform, to show that nothing in `core/` is twitch-shaped.
 
+Want it running on your own channel? **[Installer et mettre en route le compagnon](docs/installation.md)**
+(French) walks a non-technical reader from nothing to a companion answering in chat: the shopping list,
+a ready-to-copy chat-only profile, the eight values to collect, what each command prints, what the
+errors mean, and what is still unproven.
+
 ## What is proven, and what is not
 
 **Proven by the test suite** (~3,100 passing tests, with 13–18 environment-dependent skips). A GitHub
@@ -142,6 +147,7 @@ python -m pytest tests/ -q
 | `modules/` | 17 modules, each with a `module.yaml` manifest declaring its actions, schema and capabilities |
 | `tests/` | ~3,100 tests over Python 3.10–3.13, plus opt-in real-integration trials |
 | `docs/design-v2.md` | The design blueprint the phases implement |
+| `docs/installation.md` | Installing and running it, for a non-technical reader (French) |
 | `docs/config-ui.md` | Operator documentation for the configuration UI |
 | `docs/proxy-protocol.md` | The remote-deployment proxy protocol |
 | `docs/campaigns/phase{1,2,3,4}/` | The specifications, plans, per-step specs, gate prompts and **gate reports** of each delivery phase |
