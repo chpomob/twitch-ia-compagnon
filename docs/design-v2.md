@@ -1,386 +1,760 @@
-# Design v2 — Compagnon agentique multi-plateforme
+# Design v2 — Multi-platform agentic companion
 
-Date : 9 septembre 2026. Statut : **blueprint cible, à implémenter**.
-Point de départ : `66d9a7e`, suite de référence de 189 tests.
+**English** · [Français](design-v2.fr.md)
 
-Ce document fixe la direction produit et les contrats d'architecture. Il ne livre aucune fonctionnalité. **Existant** désigne le code à ce SHA ; **cible** désigne les décisions à réaliser en phases 0–2 ; **plus tard** désigne les extensions conditionnelles de phase 3+. Les nouveaux noms de contrats, chemins et paramètres ci-dessous sont des propositions normatives pour l'implémentation, pas des API déjà disponibles.
+Date: 9 September 2026. Status: **target blueprint, to be implemented**.
+Starting point: `66d9a7e`, reference suite of 189 tests.
 
-Autorité : les décisions utilisateur de septembre 2026 priment sur les questions encore ouvertes de la review du 08-09-2026 (`/tmp/twitchia-arch-review.md`, sections A, B1–B8 et C.1–C.5). En particulier, multi-plateforme, boucle agentique, déploiement local/distant, capture déléguée aux modules et déclenchements configurables par input sont **actés**. La review reste une source de travail externe, non nécessaire pour comprendre ce fichier. Le [plan](../plan.md), la [spec MVP](../spec.md) et l'[index documentaire](README.md) conservent leur rôle historique ; leurs garanties ne deviennent pas automatiquement celles de v2.
+This document fixes the product direction and the architecture contracts. It delivers no feature.
+**Existing** designates the code at that SHA; **target** designates the decisions to realise in
+phases 0–2; **later** designates the conditional extensions of phase 3+. The new contract names,
+paths and parameters below are normative proposals for the implementation, not APIs already
+available.
 
-## 1. Vision et principes
+Authority: the September 2026 user decisions prevail over the still-open questions of the
+08-09-2026 review (`/tmp/twitchia-arch-review.md`, sections A, B1–B8 and C.1–C.5). In particular,
+multi-platform, the agentic loop, local/remote deployment, capture delegated to modules and
+per-input configurable triggering are **settled**. The review remains an external working source,
+not needed to understand this file. The [plan](../plan.md), the [MVP spec](../spec.md) and the
+[documentation index](README.md) keep their historical role; their guarantees do not automatically
+become those of v2.
 
-Le compagnon est ultra-adaptable : plateformes, canaux, sources de contexte, modèle, sorties, permissions, limites et topologie sont configurables. Twitch est un module de plateforme parmi d'autres. Le nom du dépôt ne limite pas le produit à Twitch ni au texte.
+## 1. Vision and principles
 
-Le **brain est un moteur de runs multi-turn** : le modèle peut demander une lecture du chat, observer une capture, puis décider de répondre. Les modules d'input/output sont des fournisseurs de **tools**, nommés **actions** dans le contrat runtime, y compris pour les lectures. Le modèle propose une action structurée ; un exécuteur contrôle et appelle son provider ; une observation texte et/ou image revient au modèle. Cette sémantique ne nécessite pas de dépendance à OpenAgents ni à un framework de skills.
+The companion is ultra-adaptable: platforms, channels, context sources, model, outputs,
+permissions, limits and topology are configurable. Twitch is one platform module among others. The
+repository's name does not limit the product to Twitch or to text.
 
-Les responsabilités sont stables :
+The **brain is a multi-turn run engine**: the model may request a chat read, observe a capture,
+then decide to answer. The input/output modules are **tool** providers, named **actions** in the
+runtime contract, reads included. The model proposes a structured action; an executor checks it and
+calls its provider; a text and/or image observation returns to the model. This semantics requires no
+dependency on OpenAgents or on a skills framework.
 
-- Le **socle** possède les contrats, le registre, les services partagés, le moteur d'évaluation des triggers par input et la coordination du lifecycle.
-- Le **brain** possède l'admission, l'ordonnancement par session, les tâches de run, les budgets et la conversation de travail du modèle.
-- Chaque **module** possède ses capacités, transports, ressources et handlers ; le brain ne connaît ni OBS, ni la capture OS/jeu, ni Helix.
-- Le **bus** transporte les faits, entrées normalisées et traces internes. Il conserve son contrat awaitable à chaîne ordonnée ; il n'est ni un RPC ni une preuve de livraison externe.
-- La **configuration** sélectionne les modules et les bindings de providers, locaux ou proxies distants, derrière le même contrat d'action.
+Responsibilities are stable:
 
-Le compagnon peut tourner sur le PC du streamer, sur un serveur, ou avec un brain serveur et des providers sur le PC. La cible comprend ces topologies ; la distribution du bus, une base de données et plusieurs instances concurrentes du brain ne sont pas des prérequis.
+- The **core** owns the contracts, the registry, the shared services, the per-input trigger
+  evaluation engine and the lifecycle coordination.
+- The **brain** owns admission, per-session scheduling, run tasks, budgets and the model's working
+  conversation.
+- Each **module** owns its capabilities, transports, resources and handlers; the brain knows
+  neither OBS, nor OS/game capture, nor Helix.
+- The **bus** carries facts, normalised inputs and internal traces. It keeps its awaitable
+  ordered-chain contract; it is neither an RPC nor a proof of external delivery.
+- **Configuration** selects the modules and the provider bindings, local or remote proxies, behind
+  the same action contract.
+
+The companion can run on the streamer's PC, on a server, or with a server brain and the providers on
+the PC. The target includes those topologies; distributing the bus, a database and several
+concurrent brain instances are not prerequisites.
 
 ```text
-Sources de plateformes → channel.chat.message → bus de faits
-                                                  │ handlers courts
-                                    contexte chat + trigger par input
+Platform sources → channel.chat.message → fact bus
+                                                  │ short handlers
+                                    chat context + per-input trigger
                                                   │
-                                          admission bornée
+                                          bounded admission
                                                   │
-                                    files de sessions → workers limités
+                                    session queues → bounded workers
                                                   │
-                              brain : modèle ⇄ exécuteur ⇄ observation
+                              brain: model ⇄ executor ⇄ observation
                                                   │
-                                       registre de providers prêts
+                                       registry of ready providers
                                            /               \
-                                  handler local      proxy → agent PC
+                                  local handler      proxy → PC agent
                                                   │
-                                  sortie acquittée → fin du run
+                                  acknowledged output → run ends
 
-Bus ← faits de santé, de trigger, d'admission, de run et d'action corrélés
+Bus ← correlated health, trigger, admission, run and action facts
 ```
 
-## 2. Vocabulaire neutre plateforme
+## 2. Platform-neutral vocabulary
 
-### 2.1. Événement de chat et destination
+### 2.1. Chat event and destination
 
-La cible conserve l'enveloppe de `core/bus.py` : `type`, `payload`, `metadata`, et le type existant `channel.chat.message`. `metadata.schema_version = 2` distingue le nouveau payload. Le bus reste générique ; les contrats de domaine valident les données à leurs frontières.
+The target keeps the envelope of `core/bus.py`: `type`, `payload`, `metadata`, and the existing type
+`channel.chat.message`. `metadata.schema_version = 2` distinguishes the new payload. The bus stays
+generic; domain contracts validate the data at their boundaries.
 
-| Champ cible | Sens et contrainte |
+| Target field | Meaning and constraint |
 | --- | --- |
-| `payload.platform` | Identifiant stable de plateforme, par exemple `twitch` ; jamais déduit du nom affiché d'un module. |
-| `payload.channel_id` | Identifiant opaque du canal dans cette plateforme. |
-| `payload.author` | `id`, `display_name`, éventuellement `roles` et leur provenance fiable. L'affichage n'est pas une clé d'identité. |
-| `payload.message_id`, `payload.text` | Identifiant source et texte borné du message. L'unicité du message est portée par `(platform, channel_id, message_id)`. |
-| `payload.thread_id`, `payload.parent_message_id` | Optionnels ; absence explicite si la source ne les fournit pas. Aucun thread inventé. |
-| `metadata` | `schema_version`, `event_id`, `source`, `provider_id`, `occurred_at`, `received_at`, puis corrélation disponible. Les timestamps sont UTC ; l'ordre local d'ingestion dispose d'une séquence par canal. |
+| `payload.platform` | Stable platform identifier, for instance `twitch`; never inferred from a module's display name. |
+| `payload.channel_id` | Opaque identifier of the channel on that platform. |
+| `payload.author` | `id`, `display_name`, possibly `roles` and their trusted provenance. The display name is not an identity key. |
+| `payload.message_id`, `payload.text` | Source identifier and bounded text of the message. Message uniqueness is carried by `(platform, channel_id, message_id)`. |
+| `payload.thread_id`, `payload.parent_message_id` | Optional; explicit absence when the source does not provide them. No invented thread. |
+| `metadata` | `schema_version`, `event_id`, `source`, `provider_id`, `occurred_at`, `received_at`, then whatever correlation is available. Timestamps are UTC; local ingestion order has a per-channel sequence. |
 
-`Destination` contient `platform`, `channel_id`, éventuellement `thread_id` et `parent_message_id`. L'identité d'envoi provient du binding configuré et des permissions du provider ; le modèle ne choisit pas librement un compte authentifié. Une destination hors périmètre est refusée.
+`Destination` contains `platform`, `channel_id`, possibly `thread_id` and `parent_message_id`. The
+sending identity comes from the configured binding and the provider's permissions; the model does
+not freely choose an authenticated account. A destination outside the perimeter is refused.
 
-La compatibilité d'entrée traduit les champs Twitch actuels `broadcaster_id`, `chatter_id`, `chatter_name`, `message_id`, `text` vers cette forme ; `metadata.source = twitch` reste conservé. La traduction se fait à la frontière, une seule fois, avec une plateforme explicitement connue. Les événements anciens ne sont pas réécrits dans les archives.
+Input compatibility translates the current Twitch fields `broadcaster_id`, `chatter_id`,
+`chatter_name`, `message_id`, `text` into this shape; `metadata.source = twitch` is still kept. The
+translation happens at the boundary, once, with an explicitly known platform. Old events are not
+rewritten in the archives.
 
-### 2.2. Identité, session et corrélation
+### 2.2. Identity, session and correlation
 
-**Décision actée — session hybride :** `SessionKey = (platform, channel_id, viewer_id)` pour les runs et la mémoire conversationnelle ; `viewer_id` provient de l'identité fiable de l'auteur (`author.id` pour le chat). Une éventuelle isolation par instance de compagnon entoure cette clé sans en changer la granularité. Le contexte global du chat utilise séparément `(platform, channel_id)`. Deux plateformes ou canaux ne partagent jamais de mémoire conversationnelle, même avec le même `viewer_id` ; les viewers d'un canal partagent uniquement son contexte de chat. Le thread reste une information de destination, pas une variante de session. La sérialisation doit être sans collision, sans concaténation ambiguë.
+**Settled decision — hybrid session:** `SessionKey = (platform, channel_id, viewer_id)` for runs and
+conversational memory; `viewer_id` comes from the author's trusted identity (`author.id` for chat).
+Any isolation by companion instance wraps that key without changing its granularity. The global chat
+context separately uses `(platform, channel_id)`. Two platforms or channels never share
+conversational memory, even with the same `viewer_id`; the viewers of one channel share only its
+chat context. The thread stays destination information, not a session variant. Serialisation must be
+collision-free, with no ambiguous concatenation.
 
-- `conversation_id` identifie cette session et sa mémoire ; sa clé reste stable pendant son existence.
-- `run_id` identifie un travail admis jusqu'à sa terminaison, y compris attente en file et livraison finale.
-- `call_id` identifie une invocation d'action. Il est généré par le runtime ; un identifiant de tool call du backend modèle est conservé séparément si nécessaire.
-- `source_event_id` et `source_message_id` relient le déclencheur ; `provider_id` identifie le binding exécutant. Les identités de session et les droits viennent du runtime, pas des arguments inventés par le modèle.
+- `conversation_id` identifies that session and its memory; its key stays stable for as long as it
+  exists.
+- `run_id` identifies one unit of admitted work until its termination, including queue wait and
+  final delivery.
+- `call_id` identifies one action invocation. It is generated by the runtime; a model backend's tool
+  call identifier is kept separately when needed.
+- `source_event_id` and `source_message_id` link back to the trigger; `provider_id` identifies the
+  executing binding. Session identities and rights come from the runtime, not from arguments the
+  model invented.
 
-Une identité absente ne doit jamais faire converger des viewers inconnus dans une même mémoire : rejeter l'admission si le module ne fournit pas d'identité viewer fiable. La destination et la session restent distinctes : une conversation n'autorise pas toutes les sorties du canal.
+An absent identity must never make unknown viewers converge into one memory: reject admission when
+the module provides no trusted viewer identity. Destination and session stay distinct: a
+conversation does not authorise every output of the channel.
 
-### 2.3. Faits de lifecycle et traces
+### 2.3. Lifecycle facts and traces
 
-Nouveaux types cibles, selon la convention pointée actuelle :
+New target types, following the current dotted convention:
 
-| Événements | Émetteur et contenu utile |
+| Events | Emitter and useful content |
 | --- | --- |
-| `module.ready`, `module.degraded`, `module.stopped` | Supervision : provider/module, capacités concernées, raison assainie, date. |
-| `input.trigger.accepted`, `input.trigger.rejected` | Ingestion : événement source, input/canal, version de politique, décision et motif borné ; aucun `run_id` à ce stade. |
-| `brain.admission.accepted`, `brain.admission.rejected` | Admission : message, session, `run_id` si accepté, motif et profondeur de file. |
-| `brain.run.started`, `brain.run.completed` | Brain : corrélation, délais, compteurs, état terminal et résultat de livraison séparé. |
-| `action.started`, `action.completed` | Exécuteur : action, provider, `call_id`, statut terminal, durée et sommaire borné. |
-| `channel.chat.sent` | Provider : fait d'envoi confirmé, destination et identifiant externe. Jamais déclenché par une simple acceptation du bus. |
+| `module.ready`, `module.degraded`, `module.stopped` | Supervision: provider/module, affected capabilities, sanitised reason, date. |
+| `input.trigger.accepted`, `input.trigger.rejected` | Ingestion: source event, input/channel, policy version, bounded decision and reason; no `run_id` at that stage. |
+| `brain.admission.accepted`, `brain.admission.rejected` | Admission: message, session, `run_id` when accepted, reason and queue depth. |
+| `brain.run.started`, `brain.run.completed` | Brain: correlation, delays, counters, terminal state and separate delivery outcome. |
+| `action.started`, `action.completed` | Executor: action, provider, `call_id`, terminal status, duration and bounded summary. |
+| `channel.chat.sent` | Provider: confirmed send fact, destination and external identifier. Never triggered by a mere bus acceptance. |
 
-Ces événements **décrivent** les transitions ; aucun subscriber ne doit répondre pour débloquer un appel. L'état terminal est enregistré chez son propriétaire avant la publication de sa trace. Une erreur d'audit ne peut ni annuler un effet externe ni déclencher sa répétition. Une séquence locale et les IDs permettent de reconstruire la causalité sans supposer un ordre global des publications.
+These events **describe** transitions; no subscriber may have to answer in order to unblock a call.
+Terminal state is recorded by its owner before its trace is published. An audit failure can neither
+cancel an external effect nor trigger its repetition. A local sequence plus the IDs make causality
+reconstructible without assuming a global publication order.
 
-L'audit conserve des métadonnées sélectionnées et expurgées, des statuts, temps d'attente, coûts/tokens si connus, rejets, abandons de messages périmés (`stale_drop`), timeouts et pertes de traces. Il n'archive ni images, ni prompts complets, ni raisonnement privé du modèle par défaut. Les arguments et résultats ne sont journalisés que sous une forme autorisée et bornée. Les événements internes et les propres sorties du compagnon ne sont pas des déclencheurs de run.
+The audit keeps selected and redacted metadata, statuses, wait times, costs/tokens when known,
+rejections, stale-message drops (`stale_drop`), timeouts and trace losses. By default it archives
+neither images, nor full prompts, nor the model's private reasoning. Arguments and results are
+logged only in an authorised and bounded form. Internal events and the companion's own outputs are
+not run triggers.
 
-### 2.4. Déclenchements configurables par input
+### 2.4. Per-input configurable triggering
 
-**Décision actée :** le streamer choisit une politique de déclenchement **par input/canal**, dans sa configuration ou ses profils. Les types disponibles dépendent du module d'input : ce n'est ni une politique globale ni une décision du brain. En l'absence de règle configurée par le streamer, chaque module déclare un **défaut propre à son type d'input**, configurable et remplaçable : par exemple, chat déclenché par un message contenant le nom du bot, vocal par un mot de réveil. Les règles explicites remplacent ce défaut ; toute combinaison doit être déclarée explicitement. Le socle évalue la politique effective à l'ingestion, avant l'admission, les budgets de run et tout appel modèle.
+**Settled decision:** the streamer chooses a trigger policy **per input/channel**, in their
+configuration or their profiles. The available types depend on the input module: this is neither a
+global policy nor a brain decision. In the absence of a rule configured by the streamer, each module
+declares a **default of its own input type**, configurable and replaceable: for instance, chat
+triggered by a message containing the bot's name, voice by a wake word. Explicit rules replace that
+default; any combination must be declared explicitly. The core evaluates the effective policy at
+ingestion, before admission, run budgets and any model call.
 
-| Contrat cible | Déclaration et responsabilité |
+| Target contract | Declaration and responsibility |
 | --- | --- |
-| `TriggerSpec` | Déclaration versionnée des types supportés et des schémas de paramètres par le module d'input, dans son manifest (section 4.1), par exemple `triggers: [probability, audience, keyword]`. Le module fournit les prédicats, les faits spécifiques à sa source et son défaut par type avec ses paramètres. |
-| Politique par input/canal | Règles sélectionnées et paramétrées par le streamer parmi ces capacités, sinon défaut déclaré par le module ; version de politique identifiée à l'ingestion. Types, paramètres et combinaisons non supportés sont refusés à la validation. |
-| Évaluation | Fonction bornée, déterministe à événement normalisé, contexte fiable, configuration et dépendances injectées identiques. RNG et horloge sont injectables, notamment pour le probabiliste ; le tirage et les éléments nécessaires à la reproduction sont conservés sous une forme bornée et expurgée avec la décision. |
+| `TriggerSpec` | Versioned declaration of the supported types and parameter schemas by the input module, in its manifest (section 4.1), for example `triggers: [probability, audience, keyword]`. The module provides the predicates, the facts specific to its source and its per-type default with its parameters. |
+| Policy per input/channel | Rules selected and parameterised by the streamer among those capabilities, otherwise the default declared by the module; policy version identified at ingestion. Unsupported types, parameters and combinations are refused at validation. |
+| Evaluation | Bounded function, deterministic on a normalised event, trusted context, injected configuration and dependencies, identical each time. RNG and clock are injectable, notably for the probabilistic rule; the draw and the elements needed to reproduce it are kept in a bounded, redacted form with the decision. |
 
-Le trigger transforme **événement ingéré → travail admissible pour un run brain**. Une acceptation ne crée pas encore de run et ne garantit pas son admission. Un rejet par trigger est une décision traitée et tracée, pas une erreur ; il ne lance aucun modèle. La déduplication conserve cette décision dans sa fenêtre bornée : une redélivrance du même événement n'effectue pas un nouveau tirage. La traçabilité suit les limites et garanties d'audit de la section 2.3.
+The trigger turns **ingested event → work admissible for a brain run**. An acceptance does not yet
+create a run and does not guarantee its admission. A trigger rejection is a decision that is handled
+and traced, not an error; it launches no model. Deduplication keeps that decision inside its bounded
+window: a redelivery of the same event does not draw again. Traceability follows the limits and
+audit guarantees of section 2.3.
 
-Ordre à l'ingestion : **normalisation → alimentation séparée du contexte de canal → trigger effectif (règles explicites ou défaut du type) → admission bornée → run**. L'authenticité, la validation et les exclusions anti-boucle (propres sorties et événements internes) sont des invariants système appliqués à la frontière avant le trigger ; les contrôles de sécurité restent également actifs à l'exécution. Le streamer ne peut pas désactiver ces invariants par une règle de trigger. L'admission de charge reste toujours active pour les événements acceptés : aucune politique, même « toujours », ne contourne la saturation. Le trigger précède les budgets de run, sans supprimer les bornes des transports, de l'ingestion ou de sa propre évaluation.
+Order at ingestion: **normalisation → separate feeding of the channel context → effective trigger
+(explicit rules or the type's default) → bounded admission → run**. Authenticity, validation and the
+anti-loop exclusions (own outputs and internal events) are system invariants applied at the boundary
+before the trigger; the security checks also stay active at execution. The streamer cannot disable
+those invariants with a trigger rule. Load admission always stays active for accepted events: no
+policy, not even "always", bypasses saturation. The trigger precedes the run budgets, without
+removing the bounds of the transports, of ingestion or of its own evaluation.
 
-| Input | Exemples de règles, syntaxe illustrative |
+| Input | Rule examples, illustrative syntax |
 | --- | --- |
-| Chat | `probability: 0.1` : 10 % de chance par événement unique ; `audience: subscribers` : seuls les messages d'abonnés ; `keyword: [bonjour, compagnon]` : mots-clés configurés. |
-| Vocal | Types propres au module vocal, par exemple `wake_word` ou `voice_command` : le module détecte un mot de réveil ou une commande vocale et fournit l'événement normalisé nécessaire à l'évaluation. Ces capacités ne sont pas imposées à tous les inputs. |
+| Chat | `probability: 0.1`: 10 % chance per unique event; `audience: subscribers`: only subscribers' messages; `keyword: [hello, companion]`: configured keywords. |
+| Voice | Types specific to the voice module, for example `wake_word` or `voice_command`: the module detects a wake word or a voice command and provides the normalised event the evaluation needs. Those capabilities are not imposed on every input. |
 
-Les combinaisons sont possibles selon les capacités déclarées du module, par exemple abonnés **ET** mot-clé **ET** probabilité de 10 %. Les opérateurs et leur ordre d'évaluation doivent être explicites et testables ; aucune composition implicite. Les prédicats de rôles/abonnement utilisent un contexte fiable fourni par la plateforme ou le provider, avec provenance ; le texte d'un message ou d'une transcription ne prouve jamais un rôle. Une information absente ne satisfait pas un prédicat exigeant ce rôle.
+Combinations are possible according to the module's declared capabilities, for example subscribers
+**AND** keyword **AND** 10 % probability. The operators and their evaluation order must be explicit
+and testable; no implicit composition. Role/subscription predicates use a trusted context provided
+by the platform or the provider, with provenance; the text of a message or of a transcription never
+proves a role. Missing information does not satisfy a predicate that requires that role.
 
-Une observation retournée à un run par `chat.read` ou `audio.capture` ne déclenche pas un autre run. Les triggers vocaux concernent les entrées spontanées émises par le module vocal lorsqu'il supporte cette capacité ; ils ne promettent pas une écoute continue dès la première capture audio. Le principe du défaut par type est acté ; la syntaxe exacte des déclarations, paramètres et compositions reste un contrat d'implémentation à préciser en phase 0 pour le chat, puis avec chaque nouvel input.
+An observation returned to a run by `chat.read` or `audio.capture` does not trigger another run.
+Voice triggers concern the spontaneous inputs emitted by the voice module when it supports that
+capability; they do not promise continuous listening from the first audio capture. The per-type
+default principle is settled; the exact syntax of declarations, parameters and compositions remains
+an implementation contract to be specified in phase 0 for chat, then with each new input.
 
-**Existant :** aucun moteur de triggers configurables n'est implémenté ; `BrainModule.handle_chat_message` appelle aujourd'hui le modèle pour tout message valide reçu, hors arrêt. Ce comportement n'est pas un défaut produit adopté pour v2 ; la phase 0 introduit la sélection par input.
+**Existing:** no configurable trigger engine is implemented; `BrainModule.handle_chat_message`
+today calls the model for every valid message received, outside shutdown. That behaviour is not a
+product default adopted for v2; phase 0 introduces per-input selection.
 
-## 3. Brain agentique : moteur de runs
+## 3. Agentic brain: run engine
 
-### 3.1. Boucle et propriété des tâches
+### 3.1. Loop and task ownership
 
-Un run peut terminer directement depuis `queued` en cas d'expiration (`timeout`, motif `stale_drop`) ou d'annulation ; sinon, il passe de `queued` à `running`, puis `finalizing` si une réponse doit être livrée, et enfin à un état terminal : `success`, `refused`, `error`, `timeout`, `cancelled` ou `external_unknown`. `success` exige la confirmation de toutes les sorties requises ; une fin sans sortie autorisée par le produit indique explicitement `delivery = not_requested`. Des appels intermédiaires peuvent échouer et être récupérés sans faire échouer tout le run. Tout effet restant incertain est signalé dans le bilan ; il interdit un bilan global de succès certain.
+A run may end directly from `queued` on expiry (`timeout`, reason `stale_drop`) or on cancellation;
+otherwise it goes from `queued` to `running`, then `finalizing` when an answer must be delivered,
+and finally to a terminal state: `success`, `refused`, `error`, `timeout`, `cancelled` or
+`external_unknown`. `success` requires the confirmation of every required output; an ending without
+an output authorised by the product says explicitly `delivery = not_requested`. Intermediate calls
+may fail and be recovered without failing the whole run. Any remaining uncertain effect is reported
+in the summary; it forbids an overall summary of certain success.
 
-À chaque étape, le brain :
+At every step, the brain:
 
-1. Construit un contexte borné et la liste des actions prêtes et autorisées pour cette session.
-2. Appelle l'adaptateur modèle, qui retourne soit une proposition `ActionProposal(name, arguments)`, soit `FinalResponse`.
-3. Pour une action, crée `ActionCall`, attend l'exécuteur, ajoute l'observation structurée au transcript, puis rappelle le modèle si les budgets le permettent.
-4. Pour une réponse finale, sélectionne la sortie configurée et appelle le même exécuteur avec le tool d'envoi correspondant. Cette livraison compte dans les budgets ; elle n'est pas un nouvel appel modèle obligatoire.
-5. Enregistre le bilan, met à jour la mémoire admissible et libère les ressources du run.
+1. Builds a bounded context and the list of ready, authorised actions for that session.
+2. Calls the model adapter, which returns either an `ActionProposal(name, arguments)` or a
+   `FinalResponse`.
+3. For an action, creates an `ActionCall`, waits for the executor, adds the structured observation
+   to the transcript, then calls the model again if the budgets allow it.
+4. For a final answer, selects the configured output and calls the same executor with the matching
+   send tool. That delivery counts in the budgets; it is not a mandatory new model call.
+5. Records the summary, updates admissible memory and releases the run's resources.
 
-**Adaptateur modèle acté :** un seul adaptateur « OpenAI-compatible », limité aux endpoints classiques au format Chat Completions de type OpenAI ; endpoint, modèle et clé restent configurables comme aujourd'hui. La compatibilité visée couvre les backends OpenAI, Ollama et les serveurs locaux exposant ce format, sous réserve des capacités vérifiées. Aucun adaptateur propriétaire multiple en v1. L'adaptateur détecte/vérifie la sortie structurée nécessaire aux propositions d'actions, la vision en phase 1, puis l'audio lorsque requis en phase 2. Un backend dépourvu d'une capacité requise est refusé explicitement, sans suppression silencieuse d'une image, d'un audio ou d'une structure attendue. Le format compatible seul ne prouve pas ces capacités.
+**Settled model adapter:** a single "OpenAI-compatible" adapter, limited to the classic endpoints in
+the OpenAI-style Chat Completions format; endpoint, model and key stay configurable as today. The
+targeted compatibility covers OpenAI backends, Ollama and local servers exposing that format,
+subject to verified capabilities. No multiple proprietary adapters in v1. The adapter detects and
+verifies the structured output the action proposals need, vision in phase 1, then audio when
+required in phase 2. A backend lacking a required capability is refused explicitly, with no silent
+removal of an image, an audio or an expected structure. Compatibility of the format alone does not
+prove those capabilities.
 
-Une seule action est exécutée à la fois dans un run en phase 1. Une réponse backend contenant plusieurs appels est refusée comme forme non supportée, sans effet partiel. Les actions explicites d'écriture ne sont permises que par la politique ; elles sont suivies dans le bilan pour éviter une seconde livraison automatique du même contenu. La verticale initiale n'autorise aucune écriture intermédiaire : seule la réponse finale peut être envoyée, avec une règle d'autorisation explicite applicable à l'envoi.
+One action at a time is executed within a run in phase 1. A backend response carrying several calls
+is refused as an unsupported shape, with no partial effect. Explicit write actions are permitted
+only by policy; they are tracked in the summary to avoid a second automatic delivery of the same
+content. The initial vertical authorises no intermediate write: only the final answer may be sent,
+with an explicit authorization rule applicable to that send.
 
-Le brain conserve toutes ses tâches, y compris celles détachées du handler d'entrée, jusqu'à leur terminaison ou transfert explicite au superviseur d'arrêt. L'exécuteur conserve de même les appels en vol. Un résultat tardif ne rouvre jamais un run terminé.
+The brain keeps all its tasks, including those detached from the input handler, until their
+termination or explicit transfer to the shutdown supervisor. The executor likewise keeps in-flight
+calls. A late result never reopens a finished run.
 
-### 3.2. Contrat d'action et d'appel
+### 3.2. Action and call contract
 
-Contrats partagés cibles dans `core/contracts.py`, registre/exécution dans `core/actions.py` ; aucun de ces fichiers n'existe à la référence de départ.
+Shared target contracts in `core/contracts.py`, registry/execution in `core/actions.py`; neither
+file exists at the starting reference.
 
-| Contrat | Champs et règles |
+| Contract | Fields and rules |
 | --- | --- |
-| `ActionSpec` | `name` pointé stable, `version`, `description`, `arguments_schema`, `result_schema`, nature `read` ou `write`, permissions requises, destinations/ressources supportées, politique de timeout et d'idempotence. Schémas JSON Schema avec dialecte déclaré et version de contrat vérifiée. |
-| `ActionCall` | Version, `name`, version d'action, arguments validés, `conversation_id`, `run_id`, `call_id`, événement/message déclencheur, destination, principal fiable, deadline, éventuelle clé d'idempotence. |
-| `ActionProvider` | Interface async `invoke(call) -> ActionObservation`, identique pour local et proxy ; le handler enregistré appartient à un seul module/provider. |
-| `ActionExecutor` | Valide forme et bornes, résout un provider unique pour l'action/destination, vérifie disponibilité et permissions avec refus par défaut, y compris pour les lectures, applique délais et conflits de ressources, valide le résultat. |
+| `ActionSpec` | Stable dotted `name`, `version`, `description`, `arguments_schema`, `result_schema`, nature `read` or `write`, required permissions, supported destinations/resources, timeout and idempotency policy. JSON Schema documents with a declared dialect and a verified contract version. |
+| `ActionCall` | Version, `name`, action version, validated arguments, `conversation_id`, `run_id`, `call_id`, triggering event/message, destination, trusted principal, deadline, possible idempotency key. |
+| `ActionProvider` | Async interface `invoke(call) -> ActionObservation`, identical for local and proxy; the registered handler belongs to a single module/provider. |
+| `ActionExecutor` | Validates shape and bounds, resolves a single provider for the action/destination, checks availability and permissions with default deny, reads included, applies deadlines and resource conflicts, validates the result. |
 
-Un binding doit désigner **un seul exécuteur** pour une action et son périmètre de destination. Deux bindings ambigus font échouer la préparation ; aucune diffusion à plusieurs sinks ni fallback automatique après un effet incertain. Plusieurs providers peuvent proposer le même tool pour des destinations disjointes ou avec une sélection explicite par configuration.
+A binding must designate **one executor** for an action and its destination perimeter. Two ambiguous
+bindings fail preparation; no broadcast to several sinks and no automatic fallback after an
+uncertain effect. Several providers may offer the same tool for disjoint destinations or with an
+explicit selection by configuration.
 
-Le modèle propose ; **l'exécuteur refuse par défaut : en l'absence de règle d'autorisation applicable, toute action est refusée, y compris une lecture.** Il n'existe aucune action auto-autorisée. Le contrôle est répété à chaque appel, même si l'action figurait dans le prompt.
+The model proposes; **the executor refuses by default: without an applicable authorization rule,
+every action is refused, a read included.** There is no self-authorised action. The check is
+repeated on every call, even when the action appeared in the prompt.
 
-**Les règles d'autorisation sont posées par le streamer (configuration/grants) et/ou déclarées par les modules d'input/output dans leur manifest/module, sous forme de règles déclaratives : chaque module connaît ses exigences.** Déclarer une action, sa nature `read`, ses permissions requises ou sa disponibilité ne constitue pas à soi seul une règle qui l'autorise. Le format des règles, leurs combinaisons et leur portée canal/session restent à définir plus tard (section 7) ; aucun ordre de priorité implicite n'est fixé ici. Une liste autorisée au début du run n'est pas une permission permanente. Le provider applique également ses contraintes externes et, à distance, sa propre autorisation. Les rôles absents ne sont pas présumés ; chat, OCR et observations sont des données externes, incapables d'élargir les droits.
+**Authorization rules are set by the streamer (configuration/grants) and/or declared by the
+input/output modules in their manifest/module, as declarative rules: each module knows its own
+requirements.** Declaring an action, its `read` nature, its required permissions or its availability
+does not by itself constitute a rule that authorises it. The format of the rules, their
+combinations and their channel/session scope remain to be defined later (section 7); no implicit
+priority order is fixed here. A list authorised at the start of the run is not a permanent
+permission. The provider also applies its external constraints and, remotely, its own authorization.
+Absent roles are not presumed; chat, OCR and observations are external data, unable to widen rights.
 
-### 3.3. Observation et résultats terminaux explicites
+### 3.3. Observation and explicit terminal outcomes
 
-`ActionObservation` contient la version, la corrélation, `status`, des `parts`, les données structurées validées par `result_schema`, la provenance (`provider_id`, source, date d'observation/capture), et éventuellement une erreur normalisée (`code`, message assaini, indication de réessai). Même une action d'output retourne une observation.
+`ActionObservation` contains the version, the correlation, `status`, some `parts`, the structured
+data validated by `result_schema`, the provenance (`provider_id`, source, observation/capture date),
+and possibly a normalised error (`code`, sanitised message, retry indication). Even an output action
+returns an observation.
 
-| `status` terminal | Signification |
+| Terminal `status` | Meaning |
 | --- | --- |
-| `success` | Lecture obtenue ou effet confirmé selon le contrat du provider ; référence externe conservée si disponible. |
-| `refused` | Absence de règle d'autorisation applicable, ou politique, destination, permission ou disponibilité qui interdit l'appel ; aucun effet engagé. |
-| `error` | Arguments invalides, réponse malformée ou échec certain ; code métier précis. Une réponse perdue après émission d'un effet n'entre pas ici. |
-| `timeout` | Délai dépassé sans ambiguïté d'effet externe, par exemple une lecture expirée. |
-| `cancelled` | Annulation confirmée sans effet incertain. |
-| `external_unknown` | L'effet a pu avoir lieu, mais sa confirmation manque ; inclut timeout/déconnexion/annulation après émission non réconciliée. |
+| `success` | Read obtained or effect confirmed according to the provider's contract; external reference kept when available. |
+| `refused` | No applicable authorization rule, or policy, destination, permission or availability forbidding the call; no effect engaged. |
+| `error` | Invalid arguments, malformed response or certain failure; precise business code. A response lost after an effect was emitted does not belong here. |
+| `timeout` | Deadline exceeded with no ambiguity about an external effect, for example an expired read. |
+| `cancelled` | Confirmed cancellation with no uncertain effect. |
+| `external_unknown` | The effect may have happened, but its confirmation is missing; includes timeout/disconnection/cancellation after an unreconciled emission. |
 
-Le champ `cause` peut distinguer timeout et annulation derrière `external_unknown`. L'absence de provider ou de résultat n'est jamais un succès. L'exécuteur normalise les exceptions attendues en observation ; les pannes d'infrastructure restent aussi visibles du superviseur. Une annulation du run conserve son contrôle asyncio : l'observation terminale est enregistrée pour le bilan, sans relancer le modèle annulé.
+The `cause` field may distinguish timeout from cancellation behind `external_unknown`. The absence of
+a provider or of a result is never a success. The executor normalises expected exceptions into an
+observation; infrastructure failures also stay visible to the supervisor. A run cancellation keeps
+its asyncio control: the terminal observation is recorded for the summary, without relaunching the
+cancelled model.
 
-Les parties sont typées : `text` avec texte limité ; `image_ref` avec `attachment_id`, MIME, taille, dimensions, provenance et date de capture. La phase audio étend ce contrat avec `audio_ref`, MIME, durée et éventuellement transcription texte. Le résultat peut combiner plusieurs parties ; ni objets Python arbitraires, ni chemins locaux utilisables à distance, ni images base64 dans les événements.
+Parts are typed: `text` with bounded text; `image_ref` with `attachment_id`, MIME, size, dimensions,
+provenance and capture date. The audio phase extends that contract with `audio_ref`, MIME, duration
+and possibly a text transcription. The result may combine several parts; no arbitrary Python
+objects, no local paths assumed usable remotely, no base64 images in the events.
 
-`AttachmentStore` (cible : `core/attachments.py`) possède les octets. Il impose taille par objet, nombre d'objets, volume global et par run, TTL et accès limité aux destinataires autorisés. Les références actives sont louées au run jusqu'à sa deadline ; si l'espace manque, l'ajout est refusé, sans croissance illimitée ni éviction silencieuse d'une observation en usage. Fin/annulation libèrent les références ; une expiration résiduelle assure le nettoyage. Une référence expirée retourne une erreur explicite.
+`AttachmentStore` (target: `core/attachments.py`) owns the bytes. It enforces a size per object, a
+number of objects, a global and per-run volume, a TTL, and access limited to authorised recipients.
+Active references are leased to the run until its deadline; when space runs out, the addition is
+refused, with no unbounded growth and no silent eviction of an observation in use. End/cancellation
+release the references; a residual expiry ensures cleanup. An expired reference returns an explicit
+error.
 
-L'adaptateur modèle résout les références et encode les médias au format du backend seulement pendant l'appel. Un proxy transfère les pièces jointes vers le store autorisé ou fournit une résolution authentifiée bornée ; un chemin sur le PC n'est pas une observation exploitable par le serveur. Le provider de capture applique la sélection de fenêtre/zone et les permissions avant acquisition et transmission ; sans règle applicable, aucune capture n'a lieu. Toute observation, même une lecture du cache local, passe par le même refus par défaut.
+The model adapter resolves the references and encodes the media in the backend's format only during
+the call. A proxy transfers attachments into the authorised store or provides a bounded
+authenticated resolution; a path on the PC is not an observation the server can use. The capture
+provider applies the window/area selection and the permissions before acquisition and transmission;
+without an applicable rule, no capture happens. Every observation, even a read of the local cache,
+goes through the same default deny.
 
-### 3.4. Admission, sessions et budgets
+### 3.4. Admission, sessions and budgets
 
-Le handler `BrainModule.handle_chat_message` cible valide et copie une entrée bornée, tandis que l'ingestion alimente séparément le contexte par plateforme/canal, puis fait évaluer le trigger effectif par input (section 2.4). Seul un événement accepté par ce trigger passe à l'admission immédiate ; le handler n'attend pas le modèle. La copie est indépendante des mutations ultérieures du bus. La lecture réseau ne crée pas une tâche illimitée par message : toute file intermédiaire de source est également bornée et possède une politique de saturation.
+The target `BrainModule.handle_chat_message` handler validates and copies a bounded entry, while
+ingestion separately feeds the per-platform/channel context, then has the effective per-input
+trigger evaluated (section 2.4). Only an event accepted by that trigger moves on to immediate
+admission; the handler does not wait for the model. The copy is independent of later bus mutations.
+Network reading does not create an unbounded task per message: every intermediate source queue is
+likewise bounded and has a saturation policy.
 
-Un ordonnanceur possède une file FIFO bornée par `SessionKey`, un plafond global de travaux en attente, un plafond de sessions et un nombre limité de workers. Chaque session `(platform, channel_id, viewer_id)` a au plus un run actif ; les sessions distinctes peuvent progresser en parallèle, avec répartition équitable. Les files/session locks inactifs sont évincés. Les actions partageant une ressource de canal, comme un sondage ou une scène, ajoutent un verrou ou une file **bornée** chez le provider : sérialiser les conversations ne suffit pas.
+A scheduler owns a queue FIFO bounded per `SessionKey`, a global cap on pending work, a cap on
+sessions and a limited number of workers. Each session `(platform, channel_id, viewer_id)` has at
+most one active run; distinct sessions may progress in parallel, with fair distribution. Idle
+queues/session locks are evicted. Actions sharing a channel resource, such as a poll or a scene, add
+a **bounded** lock or queue at the provider: serialising the conversations is not enough.
 
-**Décision actée :** tout nouveau message accepté pendant un run rejoint la FIFO bornée de sa session, sans fusion ni interruption du run actif. Chaque message en file possède une deadline d'attente finie, configurable par profil et au plus égale à la deadline totale du run calculée à l'admission. Si elle expire, le travail est abandonné avant tout appel modèle : état terminal `timeout`, motif `stale_drop`, trace `brain.run.completed` et compteur avec durée d'attente ; aucun démarrage ni réponse obsolète pour ce message. L'ordonnanceur contrôle cette échéance en file et avant démarrage. File pleine ou plafond global atteint : rejet du nouveau travail, tracé par `brain.admission.rejected` avec motif et compteur, sans appel modèle ni replay promis. Le contexte de chat conserve le message ingéré dans ses bornes propres, indépendamment de l'admission, d'un rejet trigger ou d'un abandon périmé. Le repli générique décidé ci-dessous s'applique aussi à l'expiration en file, sous réserve du budget de sortie et de la deadline totale ; il ne répond pas au contenu périmé.
+**Settled decision:** every new message accepted during a run joins its session's bounded FIFO,
+without merging or interrupting the active run. Each queued message has a finite wait deadline,
+configurable per profile and at most equal to the run's total deadline computed at admission. If it
+expires, the work is dropped before any model call: terminal state `timeout`, reason `stale_drop`,
+`brain.run.completed` trace and counter with the wait duration; no start and no obsolete answer for
+that message. The scheduler checks that bound while queued and before starting. Full queue or global
+cap reached: the new work is rejected, traced by `brain.admission.rejected` with reason and counter,
+with no model call and no replay promised. The chat context keeps the ingested message within its
+own bounds, independently of admission, of a trigger rejection or of a stale drop. The generic
+fallback decided below also applies to queue expiry, subject to the output budget and the total
+deadline; it does not answer the stale content.
 
-L'acceptation par l'admission signifie seulement que le runtime possède un travail en mémoire. La déduplication source et le contexte enregistrent une décision d'ingestion unique avant tout travail long ; un rejet explicite par trigger ou pour surcharge est une décision traitée, pas une exécution réussie. Une erreur technique avant cette décision peut être retentée. Les callbacks courts d'ingestion doivent être idempotents sur la clé du message, même si un subscriber ultérieur échoue. Une panne processus peut perdre un run accepté : aucune garantie durable avant phase 3+.
+Acceptance by admission means only that the runtime owns work in memory. Source deduplication and
+the context record a single ingestion decision before any long work; an explicit rejection by
+trigger or for overload is a decision that is handled, not a successful execution. A technical error
+before that decision may be retried. The short ingestion callbacks must be idempotent on the message
+key, even when a later subscriber fails. A process crash may lose an accepted run: no durable
+guarantee before phase 3+.
 
-Chaque profil configure des valeurs finies et validées pour : attente maximale, deadline totale **depuis admission jusqu'à livraison**, tours modèle, appels d'actions (livraison incluse), tokens entrée/sortie/cumul, volume d'observations et médias, délai par modèle/action, débit et budget par canal. Les défauts actés ci-dessous peuvent tous être remplacés par profil ; les autres limites doivent également être définies et validées, sans valeur numérique inventée ici. Aucun profil agentique n'est utilisable avec des limites omises ou infinies. Le runtime réserve de la marge pour la sortie et borne le prochain appel par le temps restant. Si le backend ne fournit pas les tokens réels, une estimation conservatrice est signalée comme telle et les tailles d'entrée/sortie restent plafonnées.
+Each profile configures finite, validated values for: maximum wait, total deadline **from admission
+to delivery**, model turns, action calls (delivery included), input/output/cumulative tokens,
+observation and media volume, per-model/action delay, rate and budget per channel. The defaults
+settled below can all be replaced per profile; the other limits must also be defined and validated,
+with no numeric value invented here. No agentic profile is usable with omitted or infinite limits.
+The runtime reserves margin for the output and bounds the next call by the remaining time. If the
+backend does not provide real tokens, a conservative estimate is reported as such and the
+input/output sizes stay capped.
 
-| Budget | Valeur par défaut actée |
+| Budget | Settled default value |
 | --- | --- |
-| Tours modèle par run | 5 maximum |
-| Délai par appel modèle | 30 s |
-| Délai par action, livraison incluse | 10 s |
-| Deadline totale admission → livraison, attente en file incluse | 60 s |
-| Tokens cumulés entrée + sortie par run | ≈ 8K |
-| Taille maximale d'une observation ou d'un média | ≈ 5 Mo |
+| Model turns per run | 5 maximum |
+| Delay per model call | 30 s |
+| Delay per action, delivery included | 10 s |
+| Total deadline admission → delivery, queue wait included | 60 s |
+| Cumulative input + output tokens per run | ≈ 8K |
+| Maximum size of one observation or media | ≈ 5 MB |
 
-Les valeurs approximatives deviennent des plafonds numériques explicites dans les profils d'implémentation. Les vérifications de capacités de l'adaptateur unique (section 3.1) précèdent l'utilisation du backend ; les appels modèle et les encodages médias restent soumis aux budgets. L'acceptation d'un trigger ou d'un run n'accorde aucun droit d'action : lectures, captures et livraison exigent chacune une règle applicable. Dépasser une borne arrête le travail concerné avec un bilan explicite, sans réponse métier obsolète ni renouvellement de deadline.
+The approximate values become explicit numeric caps in the implementation profiles. The capability
+checks of the single adapter (section 3.1) precede the use of the backend; the model calls and the
+media encodings stay subject to the budgets. Accepting a trigger or a run grants no action right:
+reads, captures and delivery each require an applicable rule. Exceeding a bound stops the work
+concerned with an explicit summary, with no obsolete business answer and no deadline renewal.
 
-**Décision actée — repli générique :** en cas de dépassement de budget ou d'expiration, envoyer au chat un message tel que « Je n'ai pas pu répondre dans le temps imparti ». Ce repli est activé par défaut et désactivable par configuration ; il ne nécessite pas de nouvel appel modèle. Il passe par l'exécuteur, exige une règle d'autorisation applicable et **consomme lui-même le budget de sortie**, dont l'appel d'action et les quotas de canal. La marge réservée à la sortie doit permettre cet envoi dans les bornes restantes. Si le repli est désactivé, non autorisé, ou si le budget de sortie ou la deadline totale ne permettent plus sa livraison, aucun message n'est envoyé et le motif est tracé. Aucun envoi après la deadline totale ; le repli ne transforme pas l'échec du travail initial en succès.
+**Settled decision — generic fallback:** on budget overrun or expiry, send to the chat a message
+such as "I could not answer in time". That fallback is enabled by default and disableable by
+configuration; it requires no new model call. It goes through the executor, requires an applicable
+authorization rule and **itself consumes the output budget**, including the action call and the
+channel quotas. The margin reserved for the output must allow that send within the remaining bounds.
+If the fallback is disabled, not authorised, or if the output budget or the total deadline no
+longer allow its delivery, no message is sent and the reason is traced. No send after the total
+deadline; the fallback does not turn the failure of the initial work into a success.
 
-La deadline locale utilise une horloge monotone. Un proxy transmet une échéance UTC et un temps restant ; le receveur applique une limite conservatrice et ne renouvelle jamais le budget à chaque saut. Le protocole doit tester les écarts d'horloge et la latence ; des timestamps muraux seuls ne suffisent pas.
+The local deadline uses a monotonic clock. A proxy transmits a UTC deadline and a remaining time;
+the receiver applies a conservative limit and never renews the budget at every hop. The protocol
+must test clock skew and latency; wall-clock timestamps alone are not enough.
 
-L'anti-boucle est un invariant système que les triggers configurables ne peuvent pas désactiver ; elle combine filtre anti-écho existant, exclusion des traces comme déclencheurs, quotas par canal, limite de tours et détection de répétitions action/arguments/observation sans progrès. Les lectures répétées peuvent être utiles si leur timestamp change, mais restent budgétées. Après un effet incertain, aucun retry aveugle : utiliser une idempotence effectivement supportée ou réconcilier l'état. `call_id` permet la corrélation, sans garantir à lui seul une exécution exactement une fois.
+The anti-loop is a system invariant that the configurable triggers cannot disable; it combines the
+existing anti-echo filter, the exclusion of traces as triggers, per-channel quotas, the turn limit
+and the detection of action/argument/observation repetitions without progress. Repeated reads may be
+useful when their timestamp changes, but they stay budgeted. After an uncertain effect, no blind
+retry: use an idempotency that is actually supported or reconcile the state. `call_id` allows
+correlation, without by itself guaranteeing exactly-once execution.
 
-### 3.5. Trois mémoires séparées, toutes bornées
+### 3.5. Three separate memories, all bounded
 
-| État | Propriétaire et politique cible |
+| State | Owner and target policy |
 | --- | --- |
-| Transcript de run | Brain ; appels, observations et sortie provisoire, bornés en tokens/octets et supprimés à la fin sauf résumé autorisé. Aucun stockage du raisonnement privé. |
-| Historique conversationnel | Brain ; évolution de `_histories`, indexée par `(platform, channel_id, viewer_id)`, bornée en sessions, échanges complets, tokens/octets et TTL. N'affirme livrées que les sorties acquittées ; les incertitudes restent explicitement marquées. |
-| Contexte du chat | Module de lecture ; alimenté rapidement à l'ingestion, indépendamment des triggers, admissions et runs, même sans réponse. Fenêtre par plateforme/canal, limites en messages/octets/âge, lectures datées et paginées. |
+| Run transcript | Brain; calls, observations and provisional output, bounded in tokens/bytes and deleted at the end unless a summary is authorised. No storage of private reasoning. |
+| Conversation history | Brain; evolution of `_histories`, indexed by `(platform, channel_id, viewer_id)`, bounded in sessions, complete exchanges, tokens/bytes and TTL. It asserts as delivered only the acknowledged outputs; uncertainties stay explicitly marked. |
+| Chat context | Read module; fed quickly at ingestion, independently of triggers, admissions and runs, even without an answer. Window per platform/channel, limits in messages/bytes/age, dated and paginated reads. |
 
-**Décision actée — mémoire extensible par modules :** persistance, mémoire longue et autres stratégies de mémoire se branchent comme les autres modules, avec déclaration, configuration, activation et lifecycle communs (section 4). Elles utilisent les contrats existants lorsque adaptés, ou une extension de contrat dédiée et versionnée. L'interface minimale prévoit des lectures et écritures bornées (nombre, volume et délai), un périmètre de session fourni par le runtime (`SessionKey`), ainsi qu'un TTL explicite avec expiration et effacement. Elle préserve la séparation des trois mémoires et l'isolation des sessions ; le contexte de canal garde son périmètre distinct. Les accès restent contrôlés, sans droit implicite ni choix de session par le modèle. Le détail de l'interface est à préciser à l'implémentation du module, sans imposer de moteur de stockage au socle.
+**Settled decision — memory extensible by modules:** persistence, long-term memory and other memory
+strategies plug in like the other modules, with the common declaration, configuration, activation
+and lifecycle (section 4). They use the existing contracts where suitable, or a dedicated, versioned
+contract extension. The minimal interface provides bounded reads and writes (count, volume and
+delay), a session perimeter provided by the runtime (`SessionKey`), and an explicit TTL with expiry
+and erasure. It preserves the separation of the three memories and the isolation of the sessions;
+the channel context keeps its distinct perimeter. Accesses stay controlled, with no implicit right
+and no session choice by the model. The interface details are to be specified when the module is
+implemented, without imposing a storage engine on the core.
 
-**Sans module de mémoire :** les états du socle sont volatils, avec TTL courts et bornes finies ; les médias sont nettoyés en fin de run selon la section 3.3. L'audit sur fichier est optionnel, avec rotation et exclusion des données sensibles conformément à la section 2.3 ; il ne sert pas de mémoire de reprise. Aucune persistance durable n'est implicite. Les durées et limites relèvent des profils ; tout module de mémoire durable doit déclarer ses politiques de conservation, d'accès et d'effacement. Sa livraison dépend d'un besoin observé en phase 3+.
+**Without a memory module:** the core's states are volatile, with short TTLs and finite bounds; the
+media are cleaned up at the end of the run per section 3.3. File audit is optional, with rotation
+and exclusion of sensitive data as per section 2.3; it does not serve as recovery memory. No durable
+persistence is implicit. Durations and limits belong to the profiles; any durable memory module must
+declare its retention, access and erasure policies. Its delivery depends on a need observed in
+phase 3+.
 
-`EventBus.list_events()` demeure un outil d'inspection borné, pas une mémoire conversationnelle : l'historique actuel est enregistré en ordre de fin et n'inclut pas nécessairement l'entrée en cours. Les snapshots du contexte sont ordonnés à l'ingestion ; le message déclencheur est disponible avant que son run démarre.
+`EventBus.list_events()` remains a bounded inspection tool, not conversational memory: the current
+history is recorded in completion order and does not necessarily include the entry in progress.
+Context snapshots are ordered at ingestion; the triggering message is available before its run
+starts.
 
-## 4. Modules : déclaration, exécution et topologie
+## 4. Modules: declaration, execution and topology
 
-### 4.1. Manifest versionné et activation
+### 4.1. Versioned manifest and activation
 
-La cible étend `modules/*/module.yaml` avec `manifest_version: 2`, `runtime_api: 2`, `settings_schema`, `actions`, `triggers` pour les modules d'input et des dépendances/capacités de lifecycle. Les déclarations `triggers` décrivent les types, versions, schémas de paramètres et combinaisons supportés ainsi que le défaut propre au type d'input (`TriggerSpec`, section 2.4) ; les règles explicites de la config/profil de chaque input/canal remplacent ce défaut et restent distinctes des actions exposées au modèle. Les modules d'input/output peuvent également déclarer leurs règles d'autorisation dans le manifest/module, séparément des triggers et des `ActionSpec` ; le format et la composition avec les grants du streamer sont à préciser à l'implémentation. Aucun grant implicite n'est déduit d'une déclaration de capacité. Chaque entrée `actions` porte les champs de `ActionSpec` ; un schéma peut être inline ou référencé dans le répertoire du module, avec validation des chemins. `produces`, `consumes`, `middleware`, `order` conservent leur sens événementiel. Déclarer `produces: [channel.chat.send]` n'autorise pas l'action `chat.write`.
+The target extends `modules/*/module.yaml` with `manifest_version: 2`, `runtime_api: 2`,
+`settings_schema`, `actions`, `triggers` for the input modules and lifecycle
+dependencies/capabilities. The `triggers` declarations describe the supported types, versions,
+parameter schemas and combinations, plus the default specific to the input type (`TriggerSpec`,
+section 2.4); the explicit rules of each input/channel config/profile replace that default and stay
+distinct from the actions exposed to the model. The input/output modules may also declare their
+authorization rules in the manifest/module, separately from the triggers and the `ActionSpec`; the
+format and the composition with the streamer's grants are to be specified at implementation. No
+implicit grant is inferred from a capability declaration. Each `actions` entry carries the
+`ActionSpec` fields; a schema may be inline or referenced in the module's directory, with path
+validation. `produces`, `consumes`, `middleware`, `order` keep their event meaning. Declaring
+`produces: [channel.chat.send]` does not authorise the `chat.write` action.
 
-Le loader distingue trois vues :
+The loader distinguishes three views:
 
-1. **Découvert** : manifest valide, même désactivé ; catalogue immuable pour introspection, jamais présenté comme liste d'outils utilisables.
-2. **Enregistré et prêt** : handler async enregistré pendant l'activation/préparation, schémas compatibles, ressources et authentification utilisables. Un enregistrement seul ne signifie pas prêt.
-3. **Autorisé** : sous-ensemble prêt filtré par principal, session, destination et règle d'autorisation applicable ; sans règle, l'action est exclue, même en lecture. Seule cette vue est exposée au modèle ; contrôle répété à l'exécution.
+1. **Discovered**: valid manifest, even disabled; immutable catalogue for introspection, never
+   presented as a list of usable tools.
+2. **Registered and ready**: async handler registered during activation/preparation, compatible
+   schemas, usable resources and authentication. Registration alone does not mean ready.
+3. **Authorised**: ready subset filtered by principal, session, destination and applicable
+   authorization rule; without a rule, the action is excluded, a read included. Only that view is
+   exposed to the model; the check is repeated at execution.
 
-Un `RuntimeContext` versionné (cible : `core/runtime.py`) injecte bus, registre/exécuteur, store, moteur de triggers, RNG et horloge injectables, supervision, diagnostics et factories de transports. La configuration YAML ne contient que des données ; les callables de tests quittent progressivement les settings. L'API v2 cible `validate_settings(settings)` puis `activate(context, settings, catalog)`, qui retourne un handle préparé et enregistre ses handlers async via `context.actions.register(spec, handler, provider_id)`. L'activation ne démarre pas les producteurs.
+A versioned `RuntimeContext` (target: `core/runtime.py`) injects the bus, registry/executor, store,
+trigger engine, injectable RNG and clock, supervision, diagnostics and transport factories. The YAML
+configuration contains only data; test callables progressively leave the settings. The v2 API
+targets `validate_settings(settings)` then `activate(context, settings, catalog)`, which returns a
+prepared handle and registers its async handlers through
+`context.actions.register(spec, handler, provider_id)`. Activation does not start the producers.
 
-Le core valide YAML, environnement, chemins et versions ; chaque module valide ses contraintes métier, pour **tous les activés avant leurs effets réseau**. Les imports doivent rester sans effets externes. Les manifests désactivés restent validés ; leurs secrets ne sont pas résolus ni leurs settings métier exigés. `${NAME}` reste une référence entière ; conversion et bornes des nombres appartiennent au schéma/hook du module. Un modèle local ne requiert une clé que si le backend OpenAI-compatible configuré l'exige.
+The core validates YAML, environment, paths and versions; each module validates its business
+constraints, for **every enabled module before its network effects**. Imports must stay free of
+external effects. Disabled manifests stay validated; their secrets are neither resolved nor their
+business settings required. `${NAME}` stays a whole reference; number conversion and bounds belong
+to the module's schema/hook. A local model requires a key only when the configured
+OpenAI-compatible backend requires one.
 
-### 4.2. Lifecycle par phases
+### 4.2. Lifecycle by phases
 
-Le handle v2 expose des hooks async idempotents et bornés ; un module sans rôle dans une phase fournit une opération vide. `core/main.py` coordonne ces phases sans tri par noms métier.
+The v2 handle exposes idempotent, bounded async hooks; a module with no role in a phase provides an
+empty operation. `core/main.py` coordinates those phases without sorting by business names.
 
-| Phase | Garantie |
+| Phase | Guarantee |
 | --- | --- |
-| Validation, puis préparation par `activate` | Tous les settings sont validés ; enregistrer consommateurs, handlers, ressources et tâches supervisées sans émettre d'entrées. Nettoyer localement si le handle n'a pas encore été rendu. |
-| Barrière de préparation puis `start_inputs()` | Tous les consommateurs et providers requis sont prêts avant la première entrée ; les politiques de triggers (défaut compris) et les règles d'autorisation déclarées sont validées, le refus par défaut est actif et l'évaluation des triggers ainsi que l'admission sont opérationnelles avant ouverture des producteurs. Readiness globale après démarrage réussi. |
-| `stop_inputs()` | À l'arrêt, couper les nouvelles sources et terminer les admissions courtes en vol ; fermer ensuite l'admission. Conserver les transports nécessaires aux outputs et lectures des runs. |
-| `drain(deadline)` | Terminer les travaux acceptés dans le budget d'arrêt ou les annuler explicitement ; garder les exécuteurs et sorties disponibles jusqu'aux bilans terminaux. |
-| `close()` des ressources ordinaires | Fermer transports et stores après les appels ; collecter les erreurs sans ignorer les autres modules. |
-| `flush(deadline)` puis fermeture des services d'observation | Finir les traces après les dernières fermetures, puis fermer l'audit. Ce rôle est déclaré, pas associé au nom `audit`. |
+| Validation, then preparation by `activate` | All settings are validated; consumers, handlers, resources and supervised tasks are registered without emitting any input. Clean up locally when the handle has not been returned yet. |
+| Preparation barrier then `start_inputs()` | All required consumers and providers are ready before the first input; the trigger policies (default included) and the declared authorization rules are validated, the default deny is active and the trigger evaluation as well as admission are operational before the producers open. Global readiness after a successful start. |
+| `stop_inputs()` | On shutdown, cut the new sources and finish the short in-flight admissions; then close admission. Keep the transports the outputs and reads of the running runs need. |
+| `drain(deadline)` | Finish the accepted work within the shutdown budget or cancel it explicitly; keep the executors and outputs available until the terminal summaries. |
+| `close()` of the ordinary resources | Close transports and stores after the calls; collect the errors without ignoring the other modules. |
+| `flush(deadline)` then closing of the observation services | Finish the traces after the last closures, then close the audit. That role is declared, not tied to the name `audit`. |
 
-Une deadline globale couvre startup et une autre shutdown ; les délais locaux ne s'additionnent pas sans plafond. Le superviseur observe les erreurs des tâches, dégrade les providers et retire leurs capacités prêtes. Une panne d'un provider obligatoire rend la santé globale dégradée ou arrête selon politique explicite.
+One global deadline covers startup and another shutdown; local delays do not add up without a cap.
+The supervisor observes task errors, degrades providers and withdraws their ready capabilities. A
+failure of a mandatory provider makes the global health degraded or stops it, according to an
+explicit policy.
 
-Annuler une coroutine ne prouve pas l'arrêt d'une capture native ou d'un writer en thread. Le module doit choisir une exécution bornée ou isolable et signaler les tâches résistantes ; le CLI conserve un ultime watchdog processus avec sortie non nulle et pertes possibles signalées. L'usage embarqué expose l'échec de fermeture au propriétaire du processus ; il ne peut garantir de tuer un thread arbitraire. Démarrage partiel et annulation suivent les mêmes responsabilités de nettoyage.
+Cancelling a coroutine does not prove that a native capture or a thread writer has stopped. The
+module must choose a bounded or isolatable execution and report tasks that resist; the CLI keeps a
+final process watchdog with a non-zero exit and reported possible losses. Embedded use exposes the
+close failure to the process owner; it cannot guarantee killing an arbitrary thread. Partial startup
+and cancellation follow the same cleanup responsibilities.
 
-### 4.3. Provider local ou proxy distant
+### 4.3. Local provider or remote proxy
 
-La configuration cible ajoute des bindings explicites : nom/version de tool, `provider_id`, destinations permises, `transport = local|remote`, référence du module local ou endpoint authentifié distant, contraintes et budgets. Ce vocabulaire est un **schéma cible**, pas des clés acceptées par `config.yaml.example` aujourd'hui. Brain appelle toujours `ActionExecutor`, jamais une URL ou une API de capture.
+The target configuration adds explicit bindings: tool name/version, `provider_id`, permitted
+destinations, `transport = local|remote`, reference of the local module or authenticated remote
+endpoint, constraints and budgets. That vocabulary is a **target schema**, not keys accepted by
+`config.yaml.example` today. The brain always calls `ActionExecutor`, never a URL or a capture API.
 
-| Topologie cible | Répartition |
+| Target topology | Distribution |
 | --- | --- |
-| Profil PC — phase 1 | Brain, plateformes/sinks et store sur le PC du streamer ; agent PC sur cette même machine pour exposer les capacités locales via proxy. Les bindings de providers locaux restent supportés ; les services de plateforme/modèle peuvent être externes. |
-| Profil serveur + agent PC — phase 1 | Brain, plateformes/sinks et store sur serveur distant ; petit agent sur le PC du streamer exposant capture et autres capacités locales via proxy. L'audio et le contrôle de scène arrivent en phase 2. |
-| Serveur autonome — sans capacités PC | Brain et modules réseau sur serveur ; une capture nécessite une source accessible depuis ce serveur. Ce cas ne remplace pas le profil serveur + agent PC retenu pour la phase 1. |
+| PC profile — phase 1 | Brain, platforms/sinks and store on the streamer's PC; a PC agent on that same machine to expose the local capabilities through the proxy. Local provider bindings stay supported; the platform/model services may be external. |
+| Server + PC agent profile — phase 1 | Brain, platforms/sinks and store on a remote server; a small agent on the streamer's PC exposing capture and other local capabilities through the proxy. Audio and scene control arrive in phase 2. |
+| Standalone server — no PC capability | Brain and network modules on a server; a capture needs a source reachable from that server. This case does not replace the server + PC agent profile retained for phase 1. |
 
-**Décision actée — phase 1 :** deux profils de configuration distincts placent le brain et les plateformes/sinks sur le PC du streamer ou sur un serveur distant. Un petit agent PC expose les capacités locales au brain via un proxy **WebSocket JSON avec token d'appairage**, limité à **un agent PC par brain en v1**, avec reconnexion avec backoff. Les pièces jointes sont transférées dans les bornes du store (section 3.3) ; les observations utilisent des références, jamais des chemins locaux supposés utilisables à distance.
+**Settled decision — phase 1:** two distinct configuration profiles place the brain and the
+platforms/sinks on the streamer's PC or on a remote server. A small PC agent exposes the local
+capabilities to the brain through a proxy **WebSocket JSON with a pairing token**, limited to **one
+PC agent per brain in v1**, with reconnection and backoff. Attachments are transferred within the
+store's bounds (section 3.3); observations use references, never local paths assumed usable
+remotely.
 
-Le protocole proxy versionné transporte `ActionCall`/`ActionObservation`, annulation, contrôle de santé et résolution des pièces jointes. Il impose authentification du pair, chiffrement réseau, contrôle local des destinations/ressources avec refus par défaut, même pour une lecture ; l'authentification du pair ne vaut pas grant d'action. Il impose aussi des limites de payload et de travaux, des deadlines et une déduplication bornée. Un même appel retransmis ne doit pas lancer une seconde exécution tant que son entrée d'idempotence est conservée ; après expiration ou crash, il peut rester incertain. Une reconnexion n'autorise pas le replay automatique des écritures.
+The versioned proxy protocol carries `ActionCall`/`ActionObservation`, cancellation, health control
+and attachment resolution. It imposes peer authentication, network encryption, local control of
+destinations/resources with default deny, a read included; peer authentication is not an action
+grant. It also imposes payload and work limits, deadlines and bounded deduplication. A retransmitted
+call must not launch a second execution while its idempotency entry is kept; after expiry or a crash
+it may remain uncertain. A reconnection does not authorise the automatic replay of writes.
 
-Les entrées spontanées distantes utilisent un adaptateur de source qui authentifie et normalise les événements avant publication dans le bus local. Cela ne distribue pas `EventBus` et n'utilise pas ses abonnements pour corréler les retours d'actions. Le transport retenu est à implémenter et à tester en phase 1 avec les exigences ci-dessus ; le format exact des messages, la syntaxe des profils et les paramètres de backoff sont à préciser à l'implémentation. L'interface commune et le support du mode distant sont des exigences immédiates, pas des capacités déjà livrées.
+Spontaneous remote inputs use a source adapter that authenticates and normalises the events before
+publishing them on the local bus. That does not distribute `EventBus` and does not use its
+subscriptions to correlate action returns. The chosen transport is to be implemented and tested in
+phase 1 with the requirements above; the exact message format, the profile syntax and the backoff
+parameters are to be specified at implementation. The common interface and the support of the remote
+mode are immediate requirements, not already delivered capabilities.
 
-### 4.4. Les sept modules starter
+### 4.4. The seven starter modules
 
-Les sept fonctions suivantes constituent le kit cible, livré progressivement en phases 1–2. Ce sont des unités configurables ; elles peuvent partager un provider de plateforme et ses connexions. Les noms de dossiers proposés n'imposent pas sept duplications de credentials ni sept connexions Twitch. **Aujourd'hui, seuls `twitch`, `brain`, `audit` existent.** `modules/twitch/` reste l'adaptateur Twitch partagé ; les nouveaux tools ci-dessous ne sont pas déjà enregistrés.
+The seven functions below constitute the target kit, delivered progressively in phases 1–2. They are
+configurable units; they may share a platform provider and its connections. The proposed directory
+names do not impose seven credential duplications or seven Twitch connections. **Today only
+`twitch`, `brain`, `audit` exist.** `modules/twitch/` stays the shared Twitch adapter; the new tools
+below are not already registered.
 
-| Module starter cible | Tools, sens et résultat | Dépendances externes et local/distant |
+| Target starter module | Tools, meaning and result | External dependencies and local/remote |
 | --- | --- | --- |
-| Lecture chat — `modules/chat_context/` | `chat.read` : input/observation, destination + fenêtre/limite → messages normalisés, curseur, date et couverture. | Cache alimenté par les sources ; Twitch via EventSub dans `modules/twitch/`. Pas de requête plateforme nécessaire pour lire le cache. Provider près de l'ingestion ou proxy ; résultat indique une fenêtre partielle/expirée. |
-| Lecture users — `modules/users/` | `users.read` : input/observation, destination + pagination/filtre borné → identités, rôles fiables disponibles, date et couverture. | Provider Twitch via opérations Helix adaptées et enrichissements EventSub disponibles. Autorisations et disponibilité vérifiées à l'implémentation ; ne promet pas une liste exhaustive des spectateurs. Local PC ou serveur/proxy derrière le même contrat. |
-| Écriture chat — `modules/chat_output/` | `chat.write` : output/action, `Destination`, texte, parent optionnel → confirmation, identifiant externe et destination. | Délègue à l'envoi Helix de `modules/twitch/` pour Twitch ; autres adaptateurs pour autres plateformes. PC, serveur ou proxy ; quotas et droits restent au provider. |
-| Screenshots stream/jeu — `modules/capture/` | `screen.capture` : input/observation, source/zone autorisée → `image_ref`, MIME, dimensions, provenance et timestamp. | OBS, capture OS, fenêtre ou API jeu selon provider. Acquisition sur la machine ayant accès à la source ; proxy si brain distant. Source, zone et cadence configurées dans le module ; observation ponctuelle demandée par le brain, sans capture de fond. |
-| Output audio — `modules/audio_output/` | `audio.speak` : output/action, texte + voix/sortie autorisées → état de lecture confirmé ; `audio.play` : référence audio → état de lecture. | TTS local ou service distant, périphérique audio/OBS. Le backend TTS peut être serveur ; la lecture finale est sur la machine de sortie, éventuellement via proxy. Le succès signifie lecture terminée selon contrat, pas seulement synthèse créée. |
-| Capture audio — `modules/audio_input/` | `audio.capture` : input/observation, source + durée bornée → `audio_ref` et transcription optionnelle datée. | Micro, mix système ou OBS ; transcription locale ou distante si configurée. Acquisition près du périphérique, transport borné des segments si brain serveur. Capture à la demande du brain ; sources/sorties et durée relèvent de la configuration des modules. Les entrées vocales spontanées de la section 2.4 sont une capacité distincte, sans capture de fond implicite. |
-| Interaction stream — `modules/stream_control/` | `stream.scene.set` : output/action, scène autorisée → état OBS confirmé ; `stream.poll.create` : output/action, question/options/durée bornées → identifiant et état du sondage. | Scènes via provider OBS sur PC ou proxy ; sondages Twitch via Helix, suivi d'état EventSub selon capacités disponibles. Permissions distinctes et exclusion mutuelle par ressource. La modération ultérieure exige ses propres tools/permissions, sans autorisation implicite. |
+| Chat read — `modules/chat_context/` | `chat.read`: input/observation, destination + window/limit → normalised messages, cursor, date and coverage. | Cache fed by the sources; Twitch through EventSub in `modules/twitch/`. No platform request needed to read the cache. Provider near ingestion or proxy; the result indicates a partial/expired window. |
+| Users read — `modules/users/` | `users.read`: input/observation, destination + bounded pagination/filter → identities, available trusted roles, date and coverage. | Twitch provider through suitable Helix operations and available EventSub enrichments. Authorizations and availability verified at implementation; it does not promise an exhaustive list of viewers. Local PC or server/proxy behind the same contract. |
+| Chat write — `modules/chat_output/` | `chat.write`: output/action, `Destination`, text, optional parent → confirmation, external identifier and destination. | Delegates to the Helix send of `modules/twitch/` for Twitch; other adapters for other platforms. PC, server or proxy; quotas and rights stay with the provider. |
+| Stream/game screenshots — `modules/capture/` | `screen.capture`: input/observation, authorised source/area → `image_ref`, MIME, dimensions, provenance and timestamp. | OBS, OS capture, window or game API depending on the provider. Acquisition on the machine with access to the source; proxy when the brain is remote. Source, area and cadence configured in the module; point observation requested by the brain, with no background capture. |
+| Audio output — `modules/audio_output/` | `audio.speak`: output/action, text + authorised voice/output → confirmed playback state; `audio.play`: audio reference → playback state. | Local TTS or remote service, audio device/OBS. The TTS backend may be a server; the final playback is on the output machine, possibly through the proxy. Success means playback finished per contract, not merely a synthesis created. |
+| Audio capture — `modules/audio_input/` | `audio.capture`: input/observation, source + bounded duration → `audio_ref` and optional dated transcription. | Microphone, system mix or OBS; local or remote transcription when configured. Acquisition near the device, bounded transport of the segments when the brain is a server. Capture on the brain's request; sources/outputs and duration belong to the modules' configuration. The spontaneous voice inputs of section 2.4 are a distinct capability, with no implicit background capture. |
+| Stream interaction — `modules/stream_control/` | `stream.scene.set`: output/action, authorised scene → confirmed OBS state; `stream.poll.create`: output/action, bounded question/options/duration → poll identifier and state. | Scenes through an OBS provider on the PC or through the proxy; Twitch polls through Helix, with EventSub state tracking according to the available capabilities. Distinct permissions and mutual exclusion per resource. Later moderation requires its own tools/permissions, with no implicit authorization. |
 
-Source de capture (OBS/OS/jeu), zone, cadence et sources/sorties audio relèvent de chaque module et de sa configuration : ni décision produit globale, ni gate de phase pour le core. La cadence naturelle est **action-driven** : le brain demande une observation quand il en a besoin, le module réalise la capture, sans capture de fond. Tous les tools du tableau, lectures comprises, exigent une règle d'autorisation applicable et respectent les budgets.
+Capture source (OBS/OS/game), area, cadence and audio sources/outputs belong to each module and its
+configuration: neither a global product decision nor a phase gate for the core. The natural cadence
+is **action-driven**: the brain requests an observation when it needs one, the module performs the
+capture, with no background capture. Every tool in the table, reads included, requires an applicable
+authorization rule and respects the budgets.
 
-Les détails d'endpoints, scopes, formats vision/audio et plateformes supportées doivent être vérifiés lors de chaque implémentation ; ce tableau fixe les responsabilités et résultats attendus. Un module sans sa dépendance externe reste découvert mais non prêt. Les fonctionnalités disponibles doivent être visibles dans l'état runtime, pas seulement dans le prompt.
+The details of endpoints, scopes, vision/audio formats and supported platforms must be verified at
+each implementation; this table fixes the responsibilities and the expected outcomes. A module
+without its external dependency stays discovered but not ready. The available features must be
+visible in the runtime state, not only in the prompt.
 
-## 5. Migration depuis l'existant
+## 5. Migration from the existing code
 
-### 5.1. Blocages de la review et réponse cible
+### 5.1. Review blockers and target answer
 
-| Blocage | Existant vérifié | Réponse cible et emplacement |
+| Blocker | Verified existing | Target answer and location |
 | --- | --- | --- |
-| B1 — Admission | `_consume` attend la publication ; `_publish_lock` de Twitch couvre le modèle et la sortie. | Admission et FIFO bornées par session avec deadline et `stale_drop`, workers brain ; `modules/twitch/__init__.py` et `modules/brain/__init__.py`, phase 0. |
-| B2 — Lifecycle | `_close_activations` trie Twitch d'abord, audit dernier ; Twitch possède les publications en cours. | Phases génériques et propriété des runs ; `core/main.py`, `core/loader.py`, handles des trois modules, dans le même lot que B1. |
-| B3 — Actions ≠ événements | Tags `[send:…]`, mutation `delivery_status`, pas d'exécuteur unique ni de retour au modèle. | `ActionExecutor`/registre et acquittement terminal dès phase 0 ; boucle et observations phase 1. `channel.chat.send` devient une route de compatibilité. |
-| B4 — Capacités | Catalogue de tous les manifests, désactivés inclus, utilisé dans le prompt. | Séparer découvert, prêt et autorisé ; manifests + registre/runtime ; exposition filtrée et refus par défaut à l'exécution, lectures comprises. |
-| B5 — Sessions | `_histories` indexé par viewer ; verrou de copie, pas de sérialisation d'un échange. | Sessions plateforme/canal/viewer, contexte global séparé par plateforme/canal alimenté à l'ingestion, files par session et workers globaux en phase 0 ; transcript distinct en phase 1. |
-| B6 — Rétention | Historique du bus, queue audit et dédup Twitch non bornés ; mémoire viewer bornée seulement en nombre. | Limites en nombre/volume/âge, politique de saturation, dédup à fenêtre explicite et store média borné. |
-| B7 — Validation | `_MODULE_REQUIRED_FIELDS` de `core/main.py` duplique `_Settings.from_mapping` ; références des désactivés résolues. | Hooks et schémas de modules avant effets réseau, contexte runtime séparé, secrets des seuls activés. |
-| B8 — Observabilité | Audit écrit `type`/`payload`, omet `metadata` et peut perdre silencieusement des records. | Traces corrélées, santé et compteurs de pertes bornés ; socle phase 0, instrumentation de boucle complète phase 1. |
+| B1 — Admission | `_consume` awaits the publication; Twitch's `_publish_lock` covers the model and the output. | Admission and FIFO bounded per session with a deadline and `stale_drop`, brain workers; `modules/twitch/__init__.py` and `modules/brain/__init__.py`, phase 0. |
+| B2 — Lifecycle | `_close_activations` sorts Twitch first, audit last; Twitch owns the publications in progress. | Generic phases and run ownership; `core/main.py`, `core/loader.py`, the three modules' handles, in the same batch as B1. |
+| B3 — Actions ≠ events | `[send:…]` tags, `delivery_status` mutation, no single executor and no return to the model. | `ActionExecutor`/registry and terminal acknowledgement from phase 0; loop and observations in phase 1. `channel.chat.send` becomes a compatibility route. |
+| B4 — Capabilities | Catalogue of every manifest, disabled ones included, used in the prompt. | Separate discovered, ready and authorised; manifests + registry/runtime; filtered exposure and default deny at execution, reads included. |
+| B5 — Sessions | `_histories` indexed by viewer; copy lock, no serialisation of one exchange. | Sessions platform/channel/viewer, global context separated per platform/channel fed at ingestion, per-session queues and global workers in phase 0; distinct transcript in phase 1. |
+| B6 — Retention | Bus history, audit queue and Twitch dedup unbounded; viewer memory bounded in number only. | Limits in count/volume/age, saturation policy, dedup with an explicit window and a bounded media store. |
+| B7 — Validation | `core/main.py`'s `_MODULE_REQUIRED_FIELDS` duplicates `_Settings.from_mapping`; references of disabled modules resolved. | Module hooks and schemas before network effects, separate runtime context, secrets of the enabled modules only. |
+| B8 — Observability | Audit writes `type`/`payload`, omits `metadata` and can silently lose records. | Correlated traces, bounded health and loss counters; core in phase 0, complete loop instrumentation in phase 1. |
 
-### 5.2. Ce qui est gardé, ce qui évolue explicitement
+### 5.2. What is kept, what explicitly evolves
 
-**Gardé :** `EventBus.subscribe/publish`, motifs `*`/`**`, ordre stable et erreurs de publication ; découverte de répertoires/manifests par `ModuleLoader` ; transports HTTP/WebSocket/writer injectables ; vrais modules derrière de faux transports en intégration ; filtre d'auto-écho Twitch, reconnexion et diagnostics expurgés. Les neuf fichiers `tests/test_{bus,loader,main,twitch,brain,audit,examples,integration,shutdown}.py` constituent la base de non-régression, pas une preuve de v2.
+**Kept:** `EventBus.subscribe/publish`, `*`/`**` patterns, stable order and publication errors;
+directory/manifest discovery by `ModuleLoader`; injectable HTTP/WebSocket/writer transports; real
+modules behind fake transports in integration; the Twitch anti-echo filter, reconnection and
+redacted diagnostics. The nine files `tests/test_{bus,loader,main,twitch,brain,audit,examples,integration,shutdown}.py`
+constitute the non-regression base, not a proof of v2.
 
-**Transition API :** absence de version de manifest signifie v1. Un chemin explicite conserve `activate(bus, settings, catalog)` et `close()` pour les modules v1. Il ne prétend pas extraire magiquement leurs phases : un producteur v1 incompatible avec la barrière doit être migré ou refusé dans le profil agentique. Les trois modules intégrés migrent ensemble ; aucun attribut de contexte caché n'est ajouté au bus.
+**API transition:** absence of a manifest version means v1. An explicit path keeps
+`activate(bus, settings, catalog)` and `close()` for v1 modules. It does not claim to extract their
+phases magically: a v1 producer incompatible with the barrier must be migrated or refused in the
+agentic profile. The three built-in modules migrate together; no hidden context attribute is added
+to the bus.
 
-**Transition sorties :** les tags restent confinés à l'adaptateur modèle historique. La route `channel.chat.send` et le tool `chat.write` convergent vers un service d'envoi commun, avec un seul chemin choisi par invocation. Le brain v2 utilise directement l'exécuteur et ne republie pas la commande en parallèle. Les clients historiques peuvent encore lire `delivery_status = sent|failed`, mais les nouvelles actions disposent du résultat complet, dont `external_unknown`. L'absence de statut n'est plus interprétée comme une livraison v2. Le parent de réponse est transmis explicitement à partir de `Destination`.
+**Output transition:** the tags stay confined to the historical model adapter. The
+`channel.chat.send` route and the `chat.write` tool converge on a common send service, with a single
+path chosen per invocation. The v2 brain uses the executor directly and does not republish the
+command in parallel. Historical clients can still read `delivery_status = sent|failed`, but the new
+actions have the complete result, `external_unknown` included. The absence of a status is no longer
+interpreted as a v2 delivery. The reply parent is transmitted explicitly from `Destination`.
 
-**Transition autorisations et modèle :** aucun droit implicite de l'existant n'est repris en v2. Les tests et profils de phase 1 devront configurer explicitement les grants nécessaires, y compris `chat.read`, `users.read`, `screen.capture` et `chat.write` lorsqu'ils sont utilisés ; la compatibilité des sorties ne contourne pas l'exécuteur. Endpoint, modèle et clé restent configurables derrière l'unique adaptateur OpenAI-compatible ; la sortie structurée et les capacités médias doivent être vérifiées, sans multiplication d'adaptateurs propriétaires.
+**Authorization and model transition:** no implicit right of the existing code is carried into v2.
+The phase 1 tests and profiles will have to configure explicitly the grants they need, including
+`chat.read`, `users.read`, `screen.capture` and `chat.write` when used; output compatibility does not
+bypass the executor. Endpoint, model and key stay configurable behind the single OpenAI-compatible
+adapter; structured output and media capabilities must be verified, without multiplying proprietary
+adapters.
 
-**Rétention cible décidée :** historique bus circulaire limité en événements/octets/TTL ; file audit limitée en records/octets, admission non bloquante et suppression du nouveau record en surcharge, avec compteur de pertes et diagnostic agrégé hors de la file saturée ; dédup source limitée par taille et TTL. La garantie de dédup v2 couvre **la fenêtre conservée**, pas toute l'activation. Une répétition après éviction peut être retraitée. Une garantie plus longue impose un stockage adapté et n'est pas promise par le socle mémoire.
+**Decided target retention:** bus history circular, limited in events/bytes/TTL; audit queue limited
+in records/bytes, non-blocking admission and dropping the new record on overload, with a loss
+counter and an aggregated diagnostic outside the saturated queue; source dedup limited by size and
+TTL. The v2 dedup guarantee covers **the retained window**, not the whole activation. A repetition
+after eviction may be processed again. A longer guarantee requires suitable storage and is not
+promised by the in-memory core.
 
-La politique sans module de mémoire est actée : tout volatil, TTL courts bornés, médias nettoyés en fin de run, audit fichier optionnel avec rotation et exclusion des données sensibles (section 3.5). Une mémoire durable nécessite un module de mémoire optionnel explicitement configuré ; ses politiques d'accès, de conservation et d'effacement sont déclarées par le module, sans persistance implicite dans le socle.
+The policy without a memory module is settled: everything volatile, short bounded TTLs, media
+cleaned at the end of the run, optional file audit with rotation and exclusion of sensitive data
+(section 3.5). Durable memory requires an explicitly configured optional memory module; its access,
+retention and erasure policies are declared by the module, with no implicit persistence in the core.
 
-Ces choix changent des garanties historiques : R1 pour l'inspection de l'historique, R4/AC10 pour la déduplication et R6/AC17 pour l'exhaustivité audit sous surcharge. R2/R3 évoluent avec les contrats d'activation/configuration ; R5/R7 avec le modèle et les modules. **La phase 0 devra versionner les exigences et adapter les tests concernés dans ses propres changements. Ce commit documentaire ne modifie ni spec, ni plan, ni tests.** La compatibilité signifie une transition explicite et testée, pas la conservation silencieuse de promesses incompatibles avec des bornes finies.
+These choices change historical guarantees: R1 for history inspection, R4/AC10 for deduplication and
+R6/AC17 for audit exhaustiveness under overload. R2/R3 evolve with the activation/configuration
+contracts; R5/R7 with the model and the modules. **Phase 0 will have to version the requirements and
+adapt the tests concerned in its own changes. This documentary commit modifies neither spec, nor
+plan, nor tests.** Compatibility means an explicit, tested transition, not the silent preservation
+of promises incompatible with finite bounds.
 
-Le packaging fait partie de la livraison : `pyproject.toml` n'inclut actuellement que `core*`. Une installation v2 devra fournir les modules starter, leurs manifests et des profils de configuration installables ; l'exécution depuis le checkout n'est pas une preuve de distribution fonctionnelle.
+Packaging is part of the delivery: `pyproject.toml` currently includes only `core*`. A v2
+installation will have to provide the starter modules, their manifests and installable
+configuration profiles; running from the checkout is not a proof of a working distribution.
 
-## 6. Roadmap phasée et critères de sortie
+## 6. Phased roadmap and exit criteria
 
-Les phases v2 ne renumérotent pas les étapes historiques P1–P9. Les critères ci-dessous sont à écrire et exécuter lors de l'implémentation ; les 189 tests actuels ne les couvrent pas tous. La section 7 récapitule les décisions produit actées ; aucune question produit bloquante n'y reste ouverte. Les détails techniques signalés sont à préciser à l'implémentation.
+The v2 phases do not renumber the historical steps P1–P9. The criteria below are to be written and
+executed during implementation; the 189 current tests do not cover them all. Section 7 summarises
+the settled product decisions; no blocking product question remains open there. The technical
+details flagged there are to be specified at implementation.
 
-### Phase 0 — Socle cohérent avant multi-turn
+### Phase 0 — Coherent core before multi-turn
 
-**Lot indissociable : moteur de triggers par input + admission bornée + lifecycle par phases + registre/exécuteur d'actions + identités et ordonnancement de session + rétention bornée.** Ajouter validation de modules, supervision et traces minimales. Livrer `TriggerSpec`, déclarations des capacités et de leurs défauts par type, configuration par input/canal et refus d'action par défaut, puis évaluation avant admission ; appliquer les premières politiques au chat pour remplacer l'appel modèle systématique actuel avant la verticale agentique. Les types vocaux arrivent avec les capacités du module audio en phase 2. Garder initialement un seul appel modèle par travail ; faire passer sa sortie par le résultat explicite du service d'envoi. Définir les références médias et tester le quota du store avant d'intégrer une capture.
+**Indissociable batch: per-input trigger engine + bounded admission + lifecycle by phases +
+action registry/executor + session identities and scheduling + bounded retention.** Add module
+validation, supervision and minimal traces. Deliver `TriggerSpec`, the capability declarations and
+their per-type defaults, per-input/channel configuration and default action denial, then evaluation
+before admission; apply the first policies to chat to replace the current systematic model call
+before the agentic vertical. The voice types arrive with the audio module's capabilities in phase 2.
+Initially keep one model call per unit of work; route its output through the explicit result of the
+send service. Define the media references and test the store's quota before integrating a capture.
 
-Critères de sortie :
+Exit criteria:
 
-- Deux inputs/canaux peuvent appliquer des politiques distinctes ; sans règle explicite, le défaut du type s'applique (chat : nom du bot), et une règle configurée le remplace ; types/combinaisons non déclarés refusés avant réseau. Probabilité, abonnement fiable et mot-clé sont vérifiés avec RNG/horloge injectés : même décision reproductible, aucun nouveau tirage sur doublon dans la fenêtre de dédup. Un rejet trigger est tracé sans admission ni appel modèle ; une acceptation reste soumise à la saturation et aux invariants anti-boucle/sécurité.
-- Un faux modèle maintenu en attente n'empêche pas la réception d'un deuxième message ni d'un keepalive ; les files et tâches restent sous leurs limites en surcharge, avec rejets comptés. Une deadline d'attente expirée provoque un `stale_drop` tracé sans appel modèle ni réponse obsolète, vérifié avec horloge injectée.
-- Deux messages d'une même session voient les historiques dans l'ordre ; une autre session progresse dans la limite des workers ; mêmes IDs de viewer sur deux plateformes/canaux ne partagent pas leur mémoire. Deux viewers d'un même canal ont des conversations distinctes et lisent, si autorisés, le même contexte global, alimenté même après rejet trigger/admission ou `stale_drop`.
-- Une activation de consommateur volontairement lente ne laisse passer aucune entrée avant la barrière. Un quatrième module producteur/sink fictif démarre et s'arrête sans ajout de nom dans `core/main.py`.
-- Après retour du handler d'admission, un arrêt conserve le transport de sortie jusqu'au bilan du run détaché ; délai épuisé : annulation et statut explicites. Couvrir chaque phase, startup partiel, `CancelledError`, tâche résistante et writer bloqué.
-- Un doublon de binding, un schéma incompatible, un module désactivé, un provider non prêt ou une absence de sink ne produisent aucun faux succès. Sans règle applicable, lecture comme écriture retournent `refused` sans invocation du provider ; les scénarios autorisés configurent leurs grants. Les validations métier échouent avant réseau, sans secret dans les diagnostics.
-- Dépassement des limites bus/audit/dédup/mémoires/store : bornes respectées et comportement d'éviction/rejet prouvé avec horloge injectée, y compris replay après expiration de dédup.
-- `tests/test_shutdown.py` et les assertions d'intégration sont adaptés à la nouvelle propriété des tâches : ne plus exiger « sortie avant entrée » comme invariant de run. Les anciens contrats préservés restent testés ; les changements R1–R7 sont documentés/versionnés.
+- Two inputs/channels can apply distinct policies; without an explicit rule, the type's default
+  applies (chat: the bot's name), and a configured rule replaces it; undeclared types/combinations
+  refused before the network. Probability, trusted subscription and keyword are verified with
+  injected RNG/clock: the same decision is reproducible, no new draw on a duplicate within the dedup
+  window. A trigger rejection is traced with no admission and no model call; an acceptance stays
+  subject to saturation and to the anti-loop/security invariants.
+- A fake model held waiting does not prevent the reception of a second message or of a keepalive;
+  the queues and tasks stay within their limits under overload, with counted rejections. An expired
+  wait deadline produces a traced `stale_drop` with no model call and no obsolete answer, verified
+  with an injected clock.
+- Two messages of one session see the histories in order; another session progresses within the
+  limit of the workers; the same viewer IDs on two platforms/channels do not share their memory. Two
+  viewers of one channel have distinct conversations and read, when authorised, the same global
+  context, fed even after a trigger/admission rejection or a `stale_drop`.
+- A deliberately slow consumer activation lets no input through before the barrier. A fourth
+  fictional producer/sink module starts and stops without adding a name in `core/main.py`.
+- After the admission handler returns, a shutdown keeps the output transport until the detached
+  run's summary; exhausted delay: explicit cancellation and status. Cover every phase, partial
+  startup, `CancelledError`, a resisting task and a blocked writer.
+- A duplicate binding, an incompatible schema, a disabled module, a not-ready provider or an absent
+  sink produce no false success. Without an applicable rule, read as well as write return `refused`
+  without invoking the provider; the authorised scenarios configure their grants. The business
+  validations fail before the network, with no secret in the diagnostics.
+- Exceeding the bus/audit/dedup/memory/store limits: bounds respected and eviction/rejection
+  behaviour proved with an injected clock, including a replay after the dedup window expires.
+- `tests/test_shutdown.py` and the integration assertions are adapted to the new task ownership: no
+  longer require "output before input" as a run invariant. The old contracts that are preserved stay
+  tested; the R1–R7 changes are documented/versioned.
 
-### Phase 1 — Verticale agentique texte + image, locale et distante
+### Phase 1 — Agentic text + image vertical, local and remote
 
-Livrer la boucle et l'unique adaptateur OpenAI-compatible avec sortie structurée, les budgets aux défauts actés en section 3.4, les observations multimodales et le store opérationnel. Fournir lecture chat, lecture users bornée, écriture chat et une capture simple. Livrer le petit agent PC et son proxy WebSocket JSON avec token d'appairage, un agent par brain en v1 et reconnexion avec backoff, sans distribuer le bus. Fournir deux profils distincts : brain et plateformes/sinks sur PC du streamer ou sur serveur distant, avec capacités locales exposées par l'agent PC et pièces jointes transférées par références dans les bornes du store (section 4.3). Fournir les modules/manifests installables correspondants.
+Deliver the loop and the single OpenAI-compatible adapter with structured output, the budgets at the
+defaults settled in section 3.4, the multimodal observations and the operational store. Provide chat
+read, bounded users read, chat write and a simple capture. Deliver the small PC agent and its
+WebSocket JSON proxy with a pairing token, one agent per brain in v1 and reconnection with backoff,
+without distributing the bus. Provide two distinct profiles: brain and platforms/sinks on the
+streamer's PC or on a remote server, with local capabilities exposed by the PC agent and attachments
+transferred by reference within the store's bounds (section 4.3). Provide the corresponding
+installable modules/manifests.
 
-Critères de sortie :
+Exit criteria:
 
-- Grants explicitement configurés dans les tests/profils pour chaque action du scénario, lectures et capture comprises. Faux modèle scripté : `chat.read` → observation texte → `screen.capture` → observation image → réponse finale → `chat.write` acquitté. Exactement un envoi, aucun envoi intermédiaire ; IDs continus et référence image nettoyée après run.
-- Même scénario via provider local puis proxy sur une frontière de transport simulée : même contrat, aucune branche de capture dans brain. Test réel sur deux processus via WebSocket JSON pour sérialisation, token d'appairage valide/invalide, limite d'un agent par brain, reconnexion avec backoff, annulation et transfert borné des pièces jointes par références sans chemins locaux distants ; essai PC/serveur consigné avant de déclarer cette topologie livrée.
-- Backend Chat Completions configuré vérifié pour sortie structurée/tools et vision via l'adaptateur unique ; backend sans capacité requise refusé avant le scénario, sans perte silencieuse des images. Le faux modèle prouve l'orchestration, pas la qualité du modèle réel.
-- Absence de règle applicable (même pour `chat.read`), actions interdites/désactivées, arguments invalides, changement de disponibilité pendant run, image trop grosse/expirée, timeout puis réponse tardive/double, annulation à chaque étape, rupture proxy après émission d'un effet : bilan correct, aucun retry aveugle ni fuite de tâches/pièces jointes.
-- Tours, actions répétées, tokens, attente, deadline de livraison et saturation arrêtent le travail concerné selon les bornes actées et la politique de repli décidée en section 3.4 : message générique activé par défaut, désactivable, soumis aux autorisations et consommant le budget de sortie ; vérifier le silence si désactivé ou si les bornes interdisent l'envoi ; un résultat externe incertain n'est jamais mémorisé comme envoi confirmé.
-- `users.read` indique pagination, fraîcheur et couverture ; aucune liste partielle présentée comme audience complète. Une seconde plateforme factice valide l'absence de dépendance à Twitch dans les contrats/brain.
-- Installation dans un environnement vierge puis découverte effective des modules/manifests ; smoke test des profils PC et serveur/proxy sans secrets embarqués.
+- Grants explicitly configured in the tests/profiles for every action of the scenario, reads and
+  capture included. Scripted fake model: `chat.read` → text observation → `screen.capture` → image
+  observation → final answer → acknowledged `chat.write`. Exactly one send, no intermediate send;
+  continuous IDs and the image reference cleaned after the run.
+- The same scenario through a local provider then through the proxy on a simulated transport
+  boundary: same contract, no capture branch in the brain. A real test on two processes over
+  WebSocket JSON for serialisation, valid/invalid pairing token, the one-agent-per-brain limit,
+  reconnection with backoff, cancellation and bounded transfer of attachments by reference with no
+  remote local paths; a PC/server trial recorded before declaring that topology delivered.
+- A configured Chat Completions backend verified for structured output/tools and vision through the
+  single adapter; a backend without a required capability refused before the scenario, with no
+  silent loss of images. The fake model proves the orchestration, not the quality of the real model.
+- Absence of an applicable rule (even for `chat.read`), forbidden/disabled actions, invalid
+  arguments, availability changing during a run, an image too large/expired, a timeout then a
+  late/double answer, cancellation at each step, a proxy break after an effect was emitted: correct
+  summary, no blind retry and no leak of tasks/attachments.
+- Turns, repeated actions, tokens, wait, delivery deadline and saturation stop the work concerned
+  according to the settled bounds and the fallback policy decided in section 3.4: generic message
+  enabled by default, disableable, subject to the authorizations and consuming the output budget;
+  verify the silence when disabled or when the bounds forbid the send; an uncertain external result
+  is never memorised as a confirmed send.
+- `users.read` states pagination, freshness and coverage; no partial list presented as the complete
+  audience. A second fictional platform validates the absence of a Twitch dependency in the
+  contracts/brain.
+- Installation in an empty environment then effective discovery of the modules/manifests; smoke test
+  of the PC and server/proxy profiles with no embedded secret.
 
-### Phase 2 — Audio et interaction stream
+### Phase 2 — Audio and stream interaction
 
-Compléter les sept starters : capture/sortie audio, scènes et sondages ; enrichir les adaptateurs plateforme sans introduire de commande métier dans le core. Vérifier les capacités audio requises de l'adaptateur modèle unique et configurer explicitement les règles/grants avant les effets ; le choix des sources/sorties audio reste dans les modules.
+Complete the seven starters: audio capture/output, scenes and polls; enrich the platform adapters
+without introducing a business command in the core. Verify the required audio capabilities of the
+single model adapter and configure the rules/grants explicitly before the effects; the choice of
+audio sources/outputs stays in the modules.
 
-Critères de sortie :
+Exit criteria:
 
-- Capture d'un segment borné → observation audio/transcription → réponse audio ; limites de durée/octets, fin de lecture, interruption et indisponibilité du périphérique vérifiées localement et via proxy.
-- Scène autorisée et sondage valide : un effet confirmé et tracé ; permission absente ou cible hors périmètre : zéro effet. Deux sessions concurrentes sur une ressource partagée respectent la sérialisation du provider.
-- Perte de confirmation après commande : réconciliation ou `external_unknown`, sans seconde création de sondage ni fausse confirmation. Arrêt pendant capture/lecture/contrôle de scène respecte le budget global.
-- Les sept unités sont activables/désactivables avec une vue honnête des capacités ; les dépendances audio/OBS optionnelles n'empêchent pas un profil chat seul. Packaging et essais d'intégration propres à chaque provider documentés.
+- Capture of a bounded segment → audio/transcription observation → audio answer; duration/byte
+  limits, playback end, interruption and device unavailability verified locally and through the
+  proxy.
+- Authorised scene and valid poll: one confirmed and traced effect; missing permission or target
+  outside the perimeter: zero effect. Two concurrent sessions on a shared resource respect the
+  provider's serialisation.
+- Loss of confirmation after a command: reconciliation or `external_unknown`, with no second poll
+  creation and no false confirmation. Shutdown during capture/playback/scene control respects the
+  global budget.
+- The seven units can be enabled/disabled with an honest view of the capabilities; the optional
+  audio/OBS dependencies do not prevent a chat-only profile. Packaging and integration trials
+  specific to each provider are documented.
 
-### Phase 3+ — Seulement selon l'usage observé
+### Phase 3+ — Only according to observed usage
 
-| Extension conditionnelle | Déclencheur et critère avant livraison |
+| Conditional extension | Trigger and criterion before delivery |
 | --- | --- |
-| Modules de mémoire optionnels via l'architecture modulaire (persistance, reprise, mémoire longue) | Besoin observé de conservation ou de survie au redémarrage ; contrats existants ou extension dédiée selon la section 3.5. Vérifier lectures/écritures bornées, isolation par session, TTL, accès et effacement ; si reprise, tester crash avant/après effet, idempotence et reprise sans faux envoi. Aucune persistance imposée au socle. |
-| Multi-instance du brain, instances multiples de providers, bus distribué éventuel | Charge ou disponibilité mesurée ; prouver ownership exclusif des sessions, fencing, traitement des partitions et absence de double effet. Le proxy PC de phase 1 n'attend pas cette phase. |
-| Hot reload | Besoin de reconfiguration sans arrêt ; désinscription par propriétaire, drainage, retrait atomique des tools et absence de références/tâches orphelines. |
-| Sandbox de modules | Exécution de code non fiable ; frontière de processus et capacités testées. Aujourd'hui comme en phase 1, un module Python dans le processus reste du code de confiance. |
-| Parallélisme d'outils, workflows, résumés/recherche | Gain démontré ; tests de conflits, budgets agrégés, causalité et qualité. Aucun framework, broker ou graphe dynamique imposé au socle. |
+| Optional memory modules through the modular architecture (persistence, recovery, long-term memory) | Observed need for retention or for surviving a restart; existing contracts or a dedicated extension per section 3.5. Verify bounded reads/writes, per-session isolation, TTL, access and erasure; when it is recovery, test a crash before/after an effect, idempotency and recovery without a false send. No persistence imposed on the core. |
+| Multi-instance brain, multiple provider instances, possible distributed bus | Measured load or availability; prove exclusive ownership of the sessions, fencing, partition handling and the absence of double effects. The phase 1 PC proxy does not wait for this phase. |
+| Hot reload | Need for reconfiguration without stopping; unsubscription by owner, draining, atomic removal of the tools and no orphaned references/tasks. |
+| Module sandbox | Execution of untrusted code; process boundary and tested capabilities. Today as in phase 1, a Python module inside the process remains trusted code. |
+| Tool parallelism, workflows, summaries/search | Demonstrated gain; conflict tests, aggregated budgets, causality and quality. No framework, broker or dynamic graph imposed on the core. |
 
-## 7. Décisions produit actées et détails d'implémentation
+## 7. Settled product decisions and implementation details
 
-**Décisions actées (batch 1) :** défaut de trigger déclaré par type d'input et remplaçable (2.4) ; sessions de runs/mémoire par plateforme + canal + viewer, contexte de chat séparé par plateforme + canal (2.2, 3.4–3.5) ; FIFO bornée par session avec deadline, `stale_drop` et rejet du nouveau travail si pleine (3.4) ; valeurs par défaut des budgets acceptées et configurables (3.4) ; aucune action auto-autorisée, refus par défaut et règles du streamer et/ou des modules (3.2, 4.1) ; adaptateur modèle unique OpenAI-compatible Chat Completions, capacités vérifiées et backend incompatible refusé (3.1). Ces décisions ne sont plus à arbitrer.
+**Settled decisions (batch 1):** trigger default declared per input type and replaceable (2.4);
+run/memory sessions per platform + channel + viewer, chat context separated per platform + channel
+(2.2, 3.4–3.5); FIFO bounded per session with a deadline, `stale_drop` and rejection of new work when
+full (3.4); default budget values accepted and configurable (3.4); no self-authorised action, default
+deny and rules from the streamer and/or the modules (3.2, 4.1); single OpenAI-compatible Chat
+Completions model adapter, verified capabilities and incompatible backend refused (3.1). Those
+decisions are no longer to be arbitrated.
 
-**Décisions actées (batch 2, final) :** les trois derniers arbitrages sont résolus ci-dessous. **Aucune question produit bloquante ne reste ouverte.** Les sous-détails techniques sont à préciser à l'implémentation, dans le cadre des décisions actées.
+**Settled decisions (batch 2, final):** the last three arbitrations are resolved below. **No blocking
+product question remains open.** The technical sub-details are to be specified at implementation,
+within the framework of the settled decisions.
 
-| Sujet | Statut et section de référence |
+| Topic | Status and reference section |
 | --- | --- |
-| Comportement si dépassement de budget/expiration (4b) | **Décidé — section 3.4 :** message de repli générique au chat, activé par défaut et désactivable par configuration. Il consomme le budget de sortie, exige une autorisation et ne prolonge pas la deadline ; aucun envoi si les bornes l'interdisent. |
-| Détail du système de permissions | **Principes décidés — sections 3.2 et 4.1 :** refus par défaut, lectures comprises, règles du streamer et/ou des modules sans grant implicite. Format exact, composition, portée canal/session et syntaxe de configuration : **à préciser à l'implémentation**. Grants explicites dans les tests/profils des phases 1–2 (section 6). La modération est hors périmètre des tools retenus ; ses futurs tools devront déclarer leurs propres permissions (section 4.4). |
-| Rétention après stream/redémarrage et accès aux données (8) | **Décidé — sections 3.5, 5.2 et phase 3+ :** domaine extensible par modules de mémoire optionnels, via contrats existants ou extension dédiée. Sans module : tout volatil, TTL courts bornés, médias nettoyés en fin de run et audit fichier optionnel rotatif excluant les données sensibles. Aucune persistance durable implicite. Durées et limites relèvent des profils ; conservation, accès et effacement durables relèvent du contrat et de la configuration du module choisi. |
-| Profils de déploiement et premier transport proxy (9) | **Décidé — sections 4.3 et 6, phase 1 :** brain et plateformes/sinks sur PC du streamer ou serveur distant, profils distincts, petit agent PC exposant les capacités locales via proxy WebSocket JSON avec token d'appairage. Un agent PC par brain en v1, reconnexion avec backoff, pièces jointes transférées dans les bornes du store et référencées sans chemins locaux distants. Formats exacts et paramètres : **à préciser à l'implémentation**. |
+| Behaviour on budget overrun/expiry (4b) | **Decided — section 3.4:** generic fallback message to the chat, enabled by default and disableable by configuration. It consumes the output budget, requires an authorization and does not extend the deadline; no send when the bounds forbid it. |
+| Detail of the permission system | **Principles decided — sections 3.2 and 4.1:** default deny, reads included, rules from the streamer and/or the modules with no implicit grant. Exact format, composition, channel/session scope and configuration syntax: **to be specified at implementation**. Explicit grants in the phase 1–2 tests/profiles (section 6). Moderation is outside the perimeter of the retained tools; its future tools will have to declare their own permissions (section 4.4). |
+| Retention after a stream/restart and data access (8) | **Decided — sections 3.5, 5.2 and phase 3+:** domain extensible by optional memory modules, through existing contracts or a dedicated extension. Without a module: everything volatile, short bounded TTLs, media cleaned at the end of the run and optional rotating file audit excluding sensitive data. No implicit durable persistence. Durations and limits belong to the profiles; durable retention, access and erasure belong to the contract and the configuration of the chosen module. |
+| Deployment profiles and first proxy transport (9) | **Decided — sections 4.3 and 6, phase 1:** brain and platforms/sinks on the streamer's PC or a remote server, distinct profiles, a small PC agent exposing the local capabilities through a WebSocket JSON proxy with a pairing token. One PC agent per brain in v1, reconnection with backoff, attachments transferred within the store's bounds and referenced with no remote local paths. Exact formats and parameters: **to be specified at implementation**. |
 
-**Configuration des modules, hors arbitrages du cœur :** source de capture (OBS/OS/jeu), zone, cadence et sources/sorties audio appartiennent à chaque module et à sa configuration, avec la mécanique dans le module, jamais dans brain. Ces choix ne sont ni une décision produit globale ni un gate de phase pour le core. La capture est naturellement action-driven, à la demande d'observation du brain, sans capture de fond ; toute capture reste soumise aux règles d'autorisation explicites et aux budgets. Les scénarios de phase utilisent une source configurée pour vérifier le contrat, sans imposer cette source au produit.
+**Module configuration, outside the core's arbitrations:** capture source (OBS/OS/game), area,
+cadence and audio sources/outputs belong to each module and its configuration, with the mechanics in
+the module, never in the brain. Those choices are neither a global product decision nor a phase gate
+for the core. Capture is naturally action-driven, on the brain's observation request, with no
+background capture; every capture stays subject to the explicit authorization rules and the budgets.
+The phase scenarios use a configured source to verify the contract, without imposing that source on
+the product.

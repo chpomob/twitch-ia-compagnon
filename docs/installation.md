@@ -422,7 +422,7 @@ hands, and be ready to cut it (`Ctrl` + `C`) if the companion goes somewhere you
 |---|---|
 | `README.md` | the overview, what is proven and what is not, and the offline demo |
 | [`docs/config-ui.md`](config-ui.md) | the guide to the web interface (also [in French](config-ui.fr.md)) |
-| [`docs/proxy-protocol.md`](proxy-protocol.md) | running the brain on another computer (English only for now) |
-| [`docs/design-v2.md`](design-v2.md) | the overall design: why the parts are modular (French only for now) |
+| [`docs/proxy-protocol.md`](proxy-protocol.md) | running the brain on another computer (normative; also [in French](proxy-protocol.fr.md), courtesy translation) |
+| [`docs/design-v2.md`](design-v2.md) | the overall design: why the parts are modular (also [in French](design-v2.fr.md)) |
 | `config.yaml.example`, `presence.yaml.example` | the complete profiles, commented line by line |
 | `python -m demo --platform fake` | the same demonstration on a second platform, to see that the core depends on none in particular |

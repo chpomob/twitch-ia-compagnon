@@ -437,7 +437,7 @@ une direction que vous n'aimez pas.
 |---|---|
 | `README.md` | la vue d'ensemble, ce qui est prouvé et ce qui ne l'est pas, et la démo hors ligne |
 | [`docs/config-ui.md`](config-ui.md) | le guide de l'interface web (également [en français](config-ui.fr.md)) |
-| [`docs/proxy-protocol.md`](proxy-protocol.md) | faire tourner le cerveau sur un autre ordinateur (anglais seulement pour l'instant) |
-| [`docs/design-v2.md`](design-v2.md) | la conception d'ensemble : pourquoi les briques sont modulaires (français seulement pour l'instant) |
+| [`docs/proxy-protocol.md`](proxy-protocol.md) | faire tourner le cerveau sur un autre ordinateur (normatif ; également [en français](proxy-protocol.fr.md), traduction de courtoisie) |
+| [`docs/design-v2.md`](design-v2.md) | la conception d'ensemble : pourquoi les briques sont modulaires (également [en français](design-v2.fr.md)) |
 | `config.yaml.example`, `presence.yaml.example` | les profils complets, commentés ligne à ligne |
 | `python -m demo --platform fake` | la même démonstration sur une seconde plateforme, pour voir que le cœur ne dépend d'aucune en particulier |

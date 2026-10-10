@@ -1,5 +1,7 @@
 # Proxy protocol v1 — brain ⇄ PC agent over WebSocket JSON
 
+**English** · [Français](proxy-protocol.fr.md)
+
 **Status: normative.** This document fixes protocol v1 between the brain-side
 `modules/proxy` (server, listens) and the agent-side `modules/agent_link`
 (client, dials), as decided by the phase 1 specification (`docs/campaigns/
