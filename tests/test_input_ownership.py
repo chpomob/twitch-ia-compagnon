@@ -2103,3 +2103,518 @@ async def test_ac14_the_real_users_and_bridge_split_the_viewer_read() -> None:
             assert len(fake.requests("GetActiveViewers")) == 1
         finally:
             await runs.stop()
+
+
+# --------------------------------------------------------------------------- #
+# P19: R1 no-change guarantees and the core vendor-name guard
+# (R1, R3, R10; AC1, AC2, AC5, AC11, AC44 shipped profiles)
+# --------------------------------------------------------------------------- #
+
+import ast  # noqa: E402
+import contextlib  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+from core.contracts import (  # noqa: E402
+    COUNTER_INPUT_OWNERSHIP_REJECTIONS as _REJECTIONS,
+    TRACE_MODULE_DEGRADED,
+)
+from test_automation_bridge import _Bridge  # noqa: E402
+from test_examples import _sample_environ  # noqa: E402
+from test_presence_pack import presence_environ  # noqa: E402
+from test_twitch import SETTINGS as _TWITCH_SETTINGS  # noqa: E402
+from test_twitch import FakeSession as _TwitchSession  # noqa: E402
+from test_twitch import no_delay as _no_delay  # noqa: E402
+from test_twitch import notification as _twitch_notification  # noqa: E402
+
+#: The commit the phase starts from (the plan's phase base).
+PHASE_BASE = "f900f27"
+
+#: The 4 shipped profiles R1 freezes (AC1, AC2).
+SHIPPED_PROFILES = (
+    "config.yaml.example",
+    "config.server.yaml.example",
+    "agent.yaml.example",
+    "presence.yaml.example",
+)
+
+#: AC1 baseline, captured once by running ``--check-config`` on each profile
+#: at the phase base ``f900f27`` (not on the edited tree), with the
+#: ``${NAME}`` values of ``tests/test_examples.py`` (``_sample_environ``):
+#: profile -> (exit status, diagnostic lines). The presence profile's
+#: ``watch.channels`` needs a ``<platform>/<channel_id>`` value the generic
+#: sample does not give, so it was refused there before this phase too —
+#: the guarantee is "the same output", which this pins.
+CHECK_CONFIG_BASELINE_SAMPLE_VALUES: dict[str, tuple[int, list[str]]] = {
+    "config.yaml.example": (0, []),
+    "config.server.yaml.example": (0, []),
+    "agent.yaml.example": (0, []),
+    "presence.yaml.example": (
+        2,
+        ["module 'watch': field 'channels': entries must be <platform>/<channel_id>"],
+    ),
+}
+
+#: AC1 baseline at ``f900f27`` with each profile's own test environment —
+#: ``tests/test_examples.py`` values for the three phase-2 profiles, the
+#: presence pack's ``presence_environ`` for the fourth — through the command
+#: line: exit status and the whole stderr/stdout text. Every profile exits 0
+#: with no output at all.
+CHECK_CONFIG_BASELINE_OWN_VALUES: dict[str, tuple[int, str]] = {
+    name: (0, "") for name in SHIPPED_PROFILES
+}
+
+_INPUTS_KEY_LINE = re.compile(r"^\s*inputs\s*:", re.MULTILINE)
+
+
+def _own_environ(name: str, directory: Path) -> dict[str, str]:
+    if name == "presence.yaml.example":
+        return presence_environ(directory)
+    return _sample_environ(ROOT / name)
+
+
+def _is_ownership_diagnostic(line: str) -> bool:
+    return line.startswith("inputs:") or "input ownership" in line.lower()
+
+
+# -- AC1: --check-config gives the pre-phase output --------------------------- #
+
+
+@pytest.mark.parametrize("name", SHIPPED_PROFILES)
+@pytest.mark.asyncio
+async def test_ac1_check_config_gives_the_pre_phase_diagnostics_with_the_sample_values(
+    name: str,
+) -> None:
+    """AC1 (R1): with the ``${NAME}`` values of ``tests/test_examples.py``,
+    each shipped profile's ``--check-config`` status and diagnostic list are
+    exactly the ones captured at the phase base, and none is about input
+    ownership."""
+
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        ROOT / name,
+        environ=_sample_environ(ROOT / name),
+        diagnostic_reporter=diagnostics.append,
+    )
+    assert (status, diagnostics) == CHECK_CONFIG_BASELINE_SAMPLE_VALUES[name]
+    assert not any(_is_ownership_diagnostic(line) for line in diagnostics)
+
+
+@pytest.mark.parametrize("name", SHIPPED_PROFILES)
+def test_ac1_main_check_config_exits_zero_with_the_pre_phase_output(
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC1 (R1), through the command line: ``--config <profile>
+    --check-config`` with the profile's test environment exported exits 0
+    and prints exactly what it printed at the phase base — nothing — so in
+    particular no ownership diagnostic; the bridge is not enabled."""
+
+    path = ROOT / name
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert _BRIDGE not in profile["enabled_modules"]
+    for variable, value in _own_environ(name, tmp_path).items():
+        monkeypatch.setenv(variable, value)
+
+    status = application.main(["--config", str(path), "--check-config"])
+    captured = capsys.readouterr()
+
+    output = captured.err + captured.out
+    assert (status, output) == CHECK_CONFIG_BASELINE_OWN_VALUES[name]
+    assert not any(_is_ownership_diagnostic(line) for line in output.splitlines())
+
+
+# -- AC2: the shipped profiles are untouched ---------------------------------- #
+
+
+@pytest.mark.parametrize("name", SHIPPED_PROFILES)
+def test_ac2_no_shipped_profile_names_the_bridge_or_an_inputs_key(name: str) -> None:
+    """AC2 (R1): no shipped profile contains the bridge's module name (any
+    spelling of the vendor's) or an ``inputs:`` key at any depth."""
+
+    text = (ROOT / name).read_text(encoding="utf-8")
+    assert _VENDOR_OR_BRIDGE.findall(text) == []
+    assert _BRIDGE not in text.lower()
+    assert _INPUTS_KEY_LINE.findall(text) == []
+    assert "inputs" not in yaml.safe_load(text)
+    # The key pattern does catch the key it guards against, nested or not.
+    assert _INPUTS_KEY_LINE.search("modules: {}\ninputs:\n  chat: {}\n")
+    assert _INPUTS_KEY_LINE.search("a:\n  inputs: {}\n")
+
+
+def _git(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(ROOT), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base() -> None:
+    """AC2 (R1): ``git diff --stat <phase base>`` over the 4 shipped profiles
+    — the working tree against ``f900f27`` — reports 0 changed lines."""
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not available: the phase-base diff cannot be taken")
+    if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
+        pytest.skip("not a git work tree: the phase-base diff cannot be taken")
+    if _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode != 0:
+        pytest.skip(f"the phase base {PHASE_BASE} is not in this clone (shallow?)")
+
+    diff = _git("diff", "--stat", PHASE_BASE, "--", *SHIPPED_PROFILES)
+    assert diff.returncode == 0, diff.stderr
+    assert diff.stdout.strip() == ""
+    numstat = _git("diff", "--numstat", PHASE_BASE, "--", *SHIPPED_PROFILES)
+    assert numstat.returncode == 0 and numstat.stdout.strip() == ""
+    # Each profile exists at the phase base, so an empty diff is no accident
+    # of a path the base never had.
+    for name in SHIPPED_PROFILES:
+        assert _git("cat-file", "-e", f"{PHASE_BASE}:{name}").returncode == 0, name
+
+
+# -- AC44, shipped half: no undeclared publisher meets a resolved owner ------- #
+
+#: The event type whose payload carries a (family, platform) pair (D1).
+_FAMILY_EVENT = "channel.chat.message"
+
+
+def _manifest_of(name: str) -> dict[str, Any]:
+    loaded = yaml.safe_load(
+        (ROOT / "modules" / name / "module.yaml").read_text(encoding="utf-8")
+    )
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+@pytest.mark.parametrize("name", SHIPPED_PROFILES)
+@pytest.mark.asyncio
+async def test_ac44_no_undeclared_shipped_publisher_meets_a_resolved_owner(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC44 (R3, R1), shipped half: the ownership ``--check-config`` resolves
+    for each shipped profile — through the real discovery and the real
+    resolver — gives an owner only to declaring modules, and every enabled
+    module with no ``input_families`` key that may publish a family-carrying
+    event finds no owner and no ``none`` on any row of the families it could
+    publish, so its guard admits every pair it publishes as before."""
+
+    resolved: list[tuple[list[str], Any]] = []
+    real = application.resolve_input_ownership
+
+    def spy(enabled: Any, declarations: Any, inputs: Any, **kwargs: Any) -> Any:
+        ownership = real(enabled, declarations, inputs, **kwargs)
+        resolved.append((list(enabled), ownership))
+        return ownership
+
+    monkeypatch.setattr(application, "resolve_input_ownership", spy)
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        ROOT / name,
+        environ=_own_environ(name, tmp_path),
+        diagnostic_reporter=diagnostics.append,
+    )
+    assert (status, diagnostics) == (0, [])
+    assert len(resolved) == 1
+    enabled, ownership = resolved[0]
+
+    declaring = {
+        module for module in enabled if "input_families" in _manifest_of(module)
+    }
+    undeclared = [module for module in enabled if module not in declaring]
+    # The bridge is not enabled; every profile enables an undeclared module.
+    assert _BRIDGE not in enabled
+    assert undeclared
+
+    rows = ownership.rows()
+    # Each family's wildcard row is always in the domain.
+    assert {("chat", WILDCARD), ("cues", WILDCARD), ("viewers", WILDCARD)} <= set(rows)
+    for family, platform in rows:
+        owner = ownership.owner(family, platform)
+        assert owner is None or owner in declaring, (family, platform, owner)
+        assert not ownership.is_set_none(family, platform)
+    assert not any(owner_origin == "explicit" for owner_origin in (
+        ownership.origin(family, platform) for family, platform in rows
+    ))
+
+    for module in undeclared:
+        produced = _manifest_of(module).get("produces") or []
+        families = ("chat", "cues") if _FAMILY_EVENT in produced else ()
+        for family in families:
+            for row_family, platform in rows:
+                if row_family == family:
+                    assert ownership.owner(family, platform) is None, (module, platform)
+        # An undeclared module publishes no family pair in the shipped set.
+        assert _FAMILY_EVENT not in produced, module
+
+
+_PROBE_PLUGIN = '''
+"""P19's counter probe: every input-ownership rejection, every guard built."""
+
+import json
+import os
+from pathlib import Path
+
+from core import contracts, runtime
+
+_seen = {"guards": 0, "admits": 0, "rejections": 0, "counted": 0}
+
+_init = runtime._InputGuard.__init__
+_admits = runtime._InputGuard.admits
+_reject = runtime._InputGuard.reject
+_increment = contracts.Counters.increment
+
+
+def _probe_init(self, *args, **kwargs):
+    _seen["guards"] += 1
+    _init(self, *args, **kwargs)
+
+
+def _probe_admits(self, family, platform):
+    _seen["admits"] += 1
+    return _admits(self, family, platform)
+
+
+async def _probe_reject(self, family, platform):
+    _seen["rejections"] += 1
+    await _reject(self, family, platform)
+
+
+def _probe_increment(self, name, *args, **kwargs):
+    if name == contracts.COUNTER_INPUT_OWNERSHIP_REJECTIONS:
+        _seen["counted"] += 1
+    return _increment(self, name, *args, **kwargs)
+
+
+runtime._InputGuard.__init__ = _probe_init
+runtime._InputGuard.admits = _probe_admits
+runtime._InputGuard.reject = _probe_reject
+contracts.Counters.increment = _probe_increment
+
+
+def pytest_sessionfinish(session, exitstatus):
+    Path(os.environ["P19_PROBE_OUTPUT"]).write_text(json.dumps(_seen), encoding="utf-8")
+'''
+
+
+def test_ac44_the_integration_scenarios_count_zero_ownership_rejections(
+    tmp_path: Path,
+) -> None:
+    """AC44 (R3, R1), shipped half: ``tests/test_integration.py`` and the
+    shipped-profile activations of ``tests/test_examples.py``, run whole
+    with a counter probe, pass and record ``input_ownership_rejections == 0``
+    while ownership guards were built and consulted — the shipped modules'
+    declarations leave every pair they publish admitted."""
+
+    (tmp_path / "p19_probe.py").write_text(_PROBE_PLUGIN, encoding="utf-8")
+    output = tmp_path / "probe.json"
+    environ = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            [str(tmp_path), str(ROOT), os.environ.get("PYTHONPATH", "")]
+        ),
+        "P19_PROBE_OUTPUT": str(output),
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/test_integration.py",
+            "tests/test_examples.py",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "p19_probe",
+        ],
+        cwd=ROOT,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert completed.returncode == 0, completed.stdout[-4000:] + completed.stderr[-4000:]
+    seen = json.loads(output.read_text(encoding="utf-8"))
+    assert seen["guards"] > 0 and seen["admits"] > 0, seen
+    assert seen["rejections"] == 0 and seen["counted"] == 0, seen
+
+
+# -- AC5 end to end: the bridge owns (chat, twitch), the instance is down ---- #
+
+
+def _keys_anywhere(value: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found.add(key)
+            found |= _keys_anywhere(item)
+    elif isinstance(value, list):
+        for item in value:
+            found |= _keys_anywhere(item)
+    return found
+
+
+def test_ac5_the_bridge_settings_schema_has_no_required_key() -> None:
+    """AC5 (R1): the bridge's settings schema has no ``required`` — the
+    switch another module uses to turn an unavailable dependency into a
+    failed startup — at any depth."""
+
+    schema = _manifest_of(_BRIDGE)["settings_schema"]
+    assert schema and "properties" in schema
+    assert "required" not in _keys_anywhere(schema)
+
+
+@pytest.mark.asyncio
+async def test_ac5_a_twitch_event_is_dropped_while_the_owning_bridge_is_down() -> None:
+    """AC5 (R1, R3), end to end through the real loader and coordinator:
+    the real bridge owns (``chat``, twitch) by an explicit ``inputs`` entry,
+    its fake instance has been stopped, and the real ``twitch`` module is
+    enabled beside it. Startup succeeds with the bridge degraded
+    (``unreachable``); a chat notification driven into the twitch handler
+    (P8's driver) reaches no subscriber and is counted once — the native
+    module is never a fallback."""
+
+    async with FakeInstance() as fake:
+        url = fake.url
+    # The instance is stopped: nothing listens at its URL any more.
+
+    bridge = _Bridge()
+    session = _TwitchSession([])
+    twitch_diagnostics: list[str] = []
+    await bridge.activate(
+        url=url,
+        inputs={"chat": {"twitch": _BRIDGE}},
+        companion_identities={"twitch": _TWITCH_SETTINGS["bot_user_id"]},
+        modules={
+            "twitch": {
+                **_TWITCH_SETTINGS,
+                "_session_factory": lambda: session,
+                "_retry_delay": _no_delay,
+                "diagnostic_reporter": twitch_diagnostics.append,
+            }
+        },
+    )
+    assert bridge.coordinator is not None
+    report = await asyncio.wait_for(bridge.coordinator.start(), FAKE_WAIT_SECONDS)
+    try:
+        assert report.status == 0, report.diagnostics
+        assert (TRACE_MODULE_DEGRADED, "unreachable") in bridge.health()
+        # The native module opened no ingestion source: it does not own the pair.
+        assert session.ws_calls == []
+        assert twitch_diagnostics == ["twitch: chat ingestion owned elsewhere"]
+
+        delivered: list[dict[str, Any]] = []
+        bridge.context.bus.subscribe(_FAMILY_EVENT, delivered.append, order=-100)
+        twitch = next(
+            activation.handle
+            for activation in bridge.coordinator._modules
+            if activation.name == "twitch"
+        )
+        before = bridge.context.supervision.snapshot()[_REJECTIONS]
+        await twitch._publish_notification(_twitch_notification("m-ac5", "hello Companion"))
+
+        assert delivered == []
+        assert not any(trace["type"] == _FAMILY_EVENT for trace in bridge.traces)
+        assert bridge.context.supervision.snapshot()[_REJECTIONS] == before + 1
+    finally:
+        with contextlib.suppress(Exception):
+            await bridge.stop()
+
+
+# -- AC11: core names neither the vendor nor the bridge; ownership code no platform #
+
+_PLATFORM_NAMES = ("twitch", "kick", "youtube")
+
+#: The ownership code of the two kernel files AC11 constrains, by name.
+_OWNERSHIP_CODE = {
+    "loader.py": (
+        "_manifest_input_families",
+        "_Row",
+        "InputOwnership",
+        "_owner_text",
+        "_inputs_line",
+        "resolve_input_ownership",
+        "_declares_owned_inputs",
+    ),
+    "runtime.py": (
+        "ModuleActions",
+        "OwnedInputs",
+        "_InputGuard",
+        "_OwnedBus",
+        "_OwnedTriggers",
+        "_OwnedChat",
+        "_ModuleInputs",
+        "for_module",
+    ),
+}
+
+
+def _core_files() -> list[Path]:
+    return sorted(
+        path
+        for path in (ROOT / "core").rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    )
+
+
+def test_ac11_no_file_under_core_names_the_vendor_or_the_bridge_module() -> None:
+    """AC11 (R2, R10): a case-insensitive grep of every file under ``core/``
+    (``__pycache__`` excluded) for the bridge module name and the vendor's
+    name returns 0 matches."""
+
+    files = _core_files()
+    assert any(path.name == "loader.py" for path in files)
+    assert not any("__pycache__" in path.parts for path in files)
+    matches = [
+        (str(path.relative_to(ROOT)), match)
+        for path in files
+        for match in _VENDOR_OR_BRIDGE.findall(path.read_text(encoding="utf-8", errors="replace"))
+    ]
+    assert matches == []
+    for spelling in (_BRIDGE, _BRIDGE.upper(), "Streamer.bot", "streamer bot", "Streamer_Bot"):
+        assert _VENDOR_OR_BRIDGE.search(spelling), spelling
+
+
+def _platform_literals(tree: ast.AST) -> list[str]:
+    return [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and any(platform in node.value.lower() for platform in _PLATFORM_NAMES)
+    ]
+
+
+@pytest.mark.parametrize("filename", sorted(_OWNERSHIP_CODE))
+def test_ac11_the_ownership_code_has_no_platform_name_literal(filename: str) -> None:
+    """AC11 (R2, R10): every ownership function and class of
+    ``core/loader.py`` and ``core/runtime.py`` — found by name in the AST, all
+    of them present — holds no string constant naming twitch, kick or
+    youtube, in any case and as any substring (docstrings included)."""
+
+    tree = ast.parse((ROOT / "core" / filename).read_text(encoding="utf-8"))
+    wanted = set(_OWNERSHIP_CODE[filename])
+    found: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in wanted:
+                found.setdefault(node.name, []).append(node)
+    assert set(found) == wanted, wanted - set(found)
+    offending = {
+        name: literals
+        for name, nodes in found.items()
+        for literals in [[value for node in nodes for value in _platform_literals(node)]]
+        if literals
+    }
+    assert offending == {}
+    # The scan does see a platform literal where one is.
+    planted = ast.parse('def f():\n    return {"family": "chat", "platform": "Twitch"}\n')
+    assert _platform_literals(planted) == ["Twitch"]
