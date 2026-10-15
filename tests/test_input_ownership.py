@@ -1909,3 +1909,111 @@ def test_the_authorized_view_honours_the_exclusion() -> None:
     assert _GATED not in registry.authorized(
         principal=_OPERATOR, destination=Destination("kick", "c", "chat")
     )
+
+
+# --------------------------------------------------------------------------- #
+# P6: engine anti-echo registration (R7; AC33 engine half — D6)
+# --------------------------------------------------------------------------- #
+
+from core.triggers import REASON_SELF_AUTHORED, TriggerEngine  # noqa: E402
+from test_triggers import _audience_policy, _engine, _message, _registry  # noqa: E402
+from test_triggers import CHAT_INPUT as _TRIGGER_INPUT  # noqa: E402
+
+#: The companion's own account on the relayed input, as configured; the
+#: events below carry it in other cases.
+_RELAYED_IDENTITY = "Relay-Companion"
+
+
+def _engine_without_identity() -> TriggerEngine:
+    """An engine whose policy accepts everyone and which knows no identity —
+    the shape ``core.main`` builds — so only the added identity can refuse."""
+
+    registry = _registry()
+    registry.configure(_TRIGGER_INPUT, _audience_policy("everyone"))
+    return _engine(registry, companion_identity=None)
+
+
+def test_ac33_an_added_identity_is_refused_by_the_anti_echo_invariant() -> None:
+    """AC33 (engine half): before the call the author's event is accepted;
+    after it, the same author in any case is refused through the existing
+    anti-echo reason, before any rule."""
+
+    engine = _engine_without_identity()
+    assert engine.evaluate(_message(message_id="m0", author_id=_RELAYED_IDENTITY)).accepted
+
+    engine.add_companion_identities([_RELAYED_IDENTITY])
+    evaluated = engine.rule_evaluations
+    for index, author in enumerate(
+        (_RELAYED_IDENTITY, _RELAYED_IDENTITY.upper(), _RELAYED_IDENTITY.lower())
+    ):
+        decision = engine.evaluate(_message(message_id=f"m{index + 1}", author_id=author))
+        assert decision.accepted is False
+        assert decision.reason == REASON_SELF_AUTHORED
+    assert engine.rule_evaluations == evaluated
+    # Another viewer is still accepted: the identity is the companion's only.
+    assert engine.evaluate(_message(message_id="m9", author_id="viewer-1")).accepted
+
+
+def test_adding_the_same_identity_twice_is_a_no_op() -> None:
+    engine = _engine_without_identity()
+    engine.add_companion_identities([_RELAYED_IDENTITY])
+    once = engine._companion_identities
+    engine.add_companion_identities([_RELAYED_IDENTITY, _RELAYED_IDENTITY.upper()])
+    engine.add_companion_identities(())
+    assert engine._companion_identities == once == frozenset({_RELAYED_IDENTITY.casefold()})
+
+
+def test_adding_identities_is_append_only() -> None:
+    """The constructor's identity survives an addition, and the set accepts
+    any iterable (a mapping's values included)."""
+
+    engine = _engine(_registry(), companion_identity="built-in")
+    engine.add_companion_identities({"p": "One", "q": "Two"}.values())
+    assert engine._companion_identities == frozenset({"built-in", "one", "two"})
+
+
+@pytest.mark.parametrize(
+    ("identities", "field"),
+    [
+        ("Relay-Companion", "companion_identities"),
+        (None, "companion_identities"),
+        (["ok", ""], "companion_identities[1]"),
+        (["ok", "  "], "companion_identities[1]"),
+        (["ok", 7], "companion_identities[1]"),
+    ],
+)
+def test_an_invalid_identity_is_refused_and_nothing_is_added(
+    identities: Any, field: str
+) -> None:
+    engine = _engine_without_identity()
+    with pytest.raises(ContractError) as caught:
+        engine.add_companion_identities(identities)
+    assert caught.value.field == field
+    assert engine._companion_identities == frozenset()
+
+
+def test_the_owned_triggers_facade_delegates_the_registration() -> None:
+    """A module handed the guarded facade (P4) registers on the shared engine."""
+
+    engine = _engine_without_identity()
+    runtime = RuntimeContext(
+        bus=EventBus(),
+        actions=ActionRegistry(authorization=AuthorizationPolicy()),
+        supervision=Supervision(EventBus()),
+        tasks=SupervisedTasks(),
+        triggers=engine,
+        chat=_FakeChat(),
+    )
+    context = _intruder(runtime)
+    assert context.triggers is not engine
+    context.triggers.add_companion_identities([_RELAYED_IDENTITY])
+    assert engine._companion_identities == frozenset({_RELAYED_IDENTITY.casefold()})
+
+
+def test_the_registration_names_no_vendor_and_no_platform() -> None:
+    text = (ROOT / "core" / "triggers.py").read_text(encoding="utf-8")
+    start = text.index("    def add_companion_identities(")
+    section = text[start : text.index("    def evaluate(", start)]
+    assert _VENDOR_OR_BRIDGE.findall(section) == []
+    for platform in ("twitch", "kick", "youtube"):
+        assert platform not in section.lower(), platform

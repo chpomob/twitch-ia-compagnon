@@ -66,7 +66,7 @@ import math
 import random
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -751,6 +751,29 @@ class TriggerEngine:
         """Decisions currently retained in the dedup window."""
 
         return len(self._window)
+
+    def add_companion_identities(self, identities: Iterable[str]) -> None:
+        """Add *identities* to those the anti-echo invariant refuses.
+
+        A module that learns the companion's own account after construction —
+        an input it relays rather than one the engine was built for — calls
+        this before any evaluation. Each identity is validated and case-folded
+        like the constructor's; the set only grows, so adding an identity
+        already present changes nothing. Every identity is validated before
+        any is added: a refused call leaves the set as it was. A bare string
+        is refused rather than read as a sequence of one-character identities.
+        """
+
+        if isinstance(identities, str) or not isinstance(identities, Iterable):
+            raise ContractError(
+                "companion_identities",
+                f"must be an iterable of strings, got {type(identities).__name__}",
+            )
+        added = frozenset(
+            _require_text(identity, f"companion_identities[{index}]").casefold()
+            for index, identity in enumerate(identities)
+        )
+        self._companion_identities = self._companion_identities | added
 
     def evaluate(
         self,
