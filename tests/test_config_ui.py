@@ -7840,3 +7840,190 @@ def test_p19f11_every_route_refuses_a_non_current_identity_identically(tmp_path:
     removed = _all_routes(ui, cookie, _browser(current))["/remove"]
     assert removed.status == 303, _written(removed)
     assert not overlay.exists() or "allowed" not in overlay.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 P7: the read-only input-ownership table and Check (R2, A8; AC10)
+# ---------------------------------------------------------------------------
+
+_OWNERSHIP_MANIFEST = (
+    "settings_schema:\n  type: object\n  properties: {{}}\n"
+    "input_families:\n"
+    "  - {{family: {family}, platforms: [{platforms}], default: {default}}}\n"
+)
+
+
+def _ownership_fixture(
+    tmp_path: Path,
+    declarations: Mapping[str, tuple[str, str, bool]],
+    *,
+    inputs: str = "",
+    overlay: str | None = None,
+) -> ConfigUI:
+    """Runnable tmp modules, each declaring one ``input_families`` entry, all enabled."""
+
+    for name, (family, platforms, default) in declarations.items():
+        body = _OWNERSHIP_MANIFEST.format(
+            family=family, platforms=platforms, default="true" if default else "false"
+        )
+        _write_manifest(tmp_path / "mods", name, body)
+        (tmp_path / "mods" / name / "__init__.py").write_text(CHECK_ENTRY_POINT, encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "modules_directory: ./mods\n"
+        f"enabled_modules: [{', '.join(declarations)}]\n"
+        f"modules: {{{', '.join(f'{name}: {{}}' for name in declarations)}}}\n" + inputs,
+        encoding="utf-8",
+    )
+    if overlay is not None:
+        (tmp_path / "config.local.yaml").write_text(overlay, encoding="utf-8")
+    return ConfigUI(
+        UISettings.from_argv(
+            ["--config", str(tmp_path / "config.yaml"), "--status-file", str(tmp_path / "status.json")]
+        ),
+        environ={},
+    )
+
+
+#: The AC9 profile: the bridge stand-in owns (chat, twitch) explicitly.
+_AC9_DECLARATIONS = {"twitch": ("chat", "twitch", True), "bridge": ("chat", "'*'", False)}
+_AC9_INPUTS = "inputs:\n  chat:\n    twitch: bridge\n"
+#: The AC7 configuration: two default declarers of (chat, x), no entry.
+_AC7_DECLARATIONS = {"amod": ("chat", "x", True), "bmod": ("chat", "x", True)}
+
+
+def _ownership_rows(page: str) -> dict[tuple[str, str], tuple[str, str, str]]:
+    section = _section(page, "input-ownership")
+    rows = re.findall(
+        r'<tr data-input-family="([^"]*)" data-input-platform="([^"]*)">'
+        r"<td>[^<]*</td><td>[^<]*</td>"
+        r'<td class="owner">([^<]*)</td><td class="origin">([^<]*)</td>'
+        r'<td class="candidates">([^<]*)</td></tr>',
+        section,
+    )
+    return {(family, platform): (owner, origin, candidates) for family, platform, owner, origin, candidates in rows}
+
+
+def test_p5_ac10_the_core_page_shows_the_resolved_ownership_read_only(tmp_path: Path) -> None:
+    ui = _ownership_fixture(tmp_path, _AC9_DECLARATIONS, inputs=_AC9_INPUTS)
+    before = _SOCKET_ATTEMPTS["count"]
+    page = _get(ui, "/core", _logged_in(ui)).body.decode("utf-8")
+    assert _SOCKET_ATTEMPTS["count"] == before == 0
+
+    rows = _ownership_rows(page)
+    assert rows[("chat", "twitch")] == ("bridge", "explicit", "bridge, twitch")
+    # The family's wildcard row: declared by the stand-in, no default, no entry.
+    assert rows[("chat", "*")] == ("unowned", "unowned", "bridge")
+    assert rows[("viewers", "*")] == ("unowned", "unowned", "")
+    section = _section(page, "input-ownership")
+    assert "<h2>Input ownership</h2>" in section
+    assert config_ui.OWNERSHIP_READ_ONLY_REASON in section
+    # Read-only: no form, no control of any kind.
+    for control in ("<form", "<input", "<select", "<textarea", "<button"):
+        assert control not in section
+
+
+def test_p5_ac10_default_origin_and_an_explicit_none_are_shown(tmp_path: Path) -> None:
+    ui = _ownership_fixture(
+        tmp_path, _AC9_DECLARATIONS, inputs="inputs:\n  cues:\n    '*': none\n"
+    )
+    rows = _ownership_rows(_get(ui, "/core", _logged_in(ui)).body.decode("utf-8"))
+    assert rows[("chat", "twitch")] == ("twitch", "default", "bridge, twitch")
+    assert rows[("cues", "*")] == ("none", "explicit", "")
+
+
+def test_p5_ac10_an_unresolvable_ownership_points_to_check(tmp_path: Path) -> None:
+    ui = _ownership_fixture(tmp_path, _AC7_DECLARATIONS)
+    page = _get(ui, "/core", _logged_in(ui)).body.decode("utf-8")
+    section = _section(page, "input-ownership")
+    assert '<p id="ownership-unresolved">ownership could not be resolved; see Check</p>' in section
+    assert "<table" not in section
+
+
+def test_p5_ac10_every_ownership_cell_is_escaped(tmp_path: Path) -> None:
+    hostile = "<b>p&amp</b>"
+    ui = _ownership_fixture(
+        tmp_path,
+        _AC9_DECLARATIONS,
+        inputs=f"inputs:\n  chat:\n    '{hostile}': bridge\n",
+    )
+    page = _get(ui, "/core", _logged_in(ui)).body.decode("utf-8")
+    section = _section(page, "input-ownership")
+    assert hostile not in section
+    assert _html.escape(hostile, quote=True) in section
+    assert _ownership_rows(page)[("chat", _html.escape(hostile, quote=True))][:2] == ("bridge", "explicit")
+
+
+def test_p5_ac10_an_enabled_module_reference_resolves_for_the_ownership_table(
+    tmp_path: Path,
+) -> None:
+    """``enabled_modules: ['${INPUT_MODULE}']`` names the module startup and
+    Check enable; the table shows its pair, the resolved name still hidden."""
+
+    _write_manifest(
+        tmp_path / "mods", "amod", _OWNERSHIP_MANIFEST.format(family="chat", platforms="x", default="true")
+    )
+    (tmp_path / "mods" / "amod" / "__init__.py").write_text(CHECK_ENTRY_POINT, encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "modules_directory: ./mods\n"
+        "enabled_modules: ['${INPUT_MODULE}']\n"
+        "modules: {amod: {}}\n",
+        encoding="utf-8",
+    )
+    environ = {"INPUT_MODULE": "amod"}
+    ui = ConfigUI(
+        UISettings.from_argv(
+            ["--config", str(tmp_path / "config.yaml"), "--status-file", str(tmp_path / "status.json")]
+        ),
+        environ=environ,
+    )
+    page = _get(ui, "/core", _logged_in(ui)).body.decode("utf-8")
+    rows = _ownership_rows(page)
+    assert rows[("chat", "x")] == (config_ui.REDACTED, "default", config_ui.REDACTED)
+    assert "amod" not in _section(page, "input-ownership")
+    assert _run_socket_free(config_ui.check_config(tmp_path / "config.yaml", environ=environ)) == 0
+
+
+def test_p5_ac10_check_shows_the_ac7_diagnostic_unmodified(tmp_path: Path) -> None:
+    ui = _ownership_fixture(tmp_path, _AC7_DECLARATIONS)
+    reported: list[str] = []
+    status = _run_socket_free(
+        config_ui.check_config(
+            tmp_path / "config.yaml", environ={}, diagnostic_reporter=reported.append
+        )
+    )
+    assert status != 0
+    (expected,) = [line for line in reported if line.startswith("inputs:")]
+    assert "'chat'" in expected and "'x'" in expected
+    assert "'amod'" in expected and "'bmod'" in expected
+
+    page = _post_check(ui, config_ui.CORE_PAGE)
+    assert not _verdict(page)
+    assert _listed(page) == [expected]
+    assert _SOCKET_ATTEMPTS["count"] == 0
+
+
+def test_p5_ac10_an_inputs_edit_is_refused_as_out_of_scope(tmp_path: Path) -> None:
+    ui = _ownership_fixture(tmp_path, _AC9_DECLARATIONS, overlay="modules: {}\n")
+    overlay = tmp_path / "config.local.yaml"
+    before = _snapshot(tmp_path)
+    result = ui.save([(("inputs", "chat", "twitch"), "bridge")], fingerprint=_fingerprint(overlay))
+    assert result.outcome == "refused"
+    assert result.diagnostics == ("inputs.chat.twitch: is outside the settings this UI writes",)
+    response = _write(ui, _logged_in(ui), "/save", config_ui.CORE_PAGE, [("inputs.chat.twitch", "bridge")])
+    assert response.status == 403
+    assert _snapshot(tmp_path) == before
+
+
+def test_p5_ac10_check_keeps_its_draft_semantics_for_an_inputs_edit(tmp_path: Path) -> None:
+    """Check applies the draft without Save's scope refusal
+    (check-shares-restoration-not-protection): an ``inputs`` entry in the
+    draft settles the AC7 ambiguity for Check, while Save refuses to write it."""
+
+    ui = _ownership_fixture(tmp_path, _AC7_DECLARATIONS, overlay="modules: {}\n")
+    edit = [(("inputs", "chat", "x"), "amod")]
+    before = _snapshot(tmp_path)
+    assert not ui.check().passed
+    checked = ui.check(edit)
+    assert checked.passed and checked.diagnostics == ()
+    assert ui.save(edit, fingerprint=_fingerprint(tmp_path / "config.local.yaml")).outcome == "refused"
+    assert _snapshot(tmp_path) == before

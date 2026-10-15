@@ -62,7 +62,12 @@ import yaml
 
 from core.actions import ANY_ACTION
 from core.bus import EventBus
-from core.contracts import ContractError, validate_against_schema, validate_schema
+from core.contracts import (
+    INPUT_OWNER_NONE,
+    ContractError,
+    validate_against_schema,
+    validate_schema,
+)
 from core.loader import (
     MANIFEST_SETTINGS_SCHEMA_KEY,
     MANIFEST_TRIGGERS_KEY,
@@ -71,10 +76,12 @@ from core.loader import (
     ModuleLoadError,
     _trigger_policy,
     _validate_manifest,
+    resolve_input_ownership,
 )
 from core.main import (
     _ENV_REFERENCE,
     ACTIONS_KEY,
+    INPUTS_KEY,
     LIMIT_DECLARATION,
     LIMIT_KIND_COUNT,
     LIMITS_KEY,
@@ -403,6 +410,11 @@ HIDDEN_LITERAL = "literal value configured (hidden)"
 READ_ONLY_REASON = (
     "read-only in v1: editing could widen the authorized actions / expose secrets"
 )
+OWNERSHIP_READ_ONLY_REASON = (
+    "read-only: input ownership is set in the configuration file; Check reports its diagnostics"
+)
+OWNERSHIP_UNRESOLVED = "ownership could not be resolved; see Check"
+OWNERSHIP_UNOWNED = "unowned"
 LOCAL_ONLY_STATEMENT = (
     "This configuration UI is local-only: it edits the configuration files of "
     "this machine and is never a remote administration channel."
@@ -3047,6 +3059,7 @@ class ConfigUI:
             self._limits_section(view, session),
             self._secrets_section(view),
             self._actions_section(view),
+            self._ownership_section(view),
         ]
         return _page("Core settings", session, "".join(body))
 
@@ -3164,6 +3177,74 @@ class ConfigUI:
             f"{''.join(rows)}</table>"
             "<h3>Actions not covered by any rule</h3>"
             f"{uncovered_list}</section>"
+        )
+
+    def _ownership_section(self, view: ConfigView) -> str:
+        """Every resolved (family, platform) pair, read-only (R2, A8).
+
+        Resolved from the discovered manifests and the merged ``inputs``
+        block by the resolver startup uses; no control is emitted and
+        ``inputs`` stays outside the writable scope. A refused resolution
+        shows a pointer to Check, which reports its diagnostics. An
+        ``enabled_modules`` entry that is a ``${NAME}`` reference resolves
+        against the UI's environment, as startup and Check resolve it; the
+        resolved name is a secret-set value, so the response still hides it.
+        """
+
+        enabled: list[str] = []
+        for name in view.enabled_modules():
+            variable = reference_name(name)
+            if variable is not None:
+                name = self.environ.get(variable)
+            if isinstance(name, str) and name in view.modules and name not in enabled:
+                enabled.append(name)
+        declarations = {
+            name: view.modules[name].declaration
+            for name in enabled
+            if view.modules[name].declaration is not None
+        }
+        try:
+            ownership = resolve_input_ownership(
+                enabled,
+                declarations,
+                view.merged.get(INPUTS_KEY),
+                redacted=_secret_set(view),
+            )
+        except ModuleLoadError:
+            ownership = None
+        if ownership is None:
+            content = f'<p id="ownership-unresolved">{esc(OWNERSHIP_UNRESOLVED)}</p>'
+        else:
+            rows: list[str] = []
+            for family, platform in ownership.rows():
+                owner = ownership.owner(family, platform)
+                origin = ownership.origin(family, platform)
+                if owner is None:
+                    owner_text = (
+                        INPUT_OWNER_NONE
+                        if ownership.is_set_none(family, platform)
+                        else OWNERSHIP_UNOWNED
+                    )
+                else:
+                    owner_text = owner
+                candidates = ", ".join(sorted(ownership.candidates(family, platform)))
+                rows.append(
+                    f'<tr data-input-family="{esc(family)}" data-input-platform="{esc(platform)}">'
+                    f"<td>{esc(family)}</td><td>{esc(platform)}</td>"
+                    f'<td class="owner">{esc(owner_text)}</td>'
+                    f'<td class="origin">{esc(origin)}</td>'
+                    f'<td class="candidates">{esc(candidates)}</td></tr>'
+                )
+            content = (
+                "<table><tr><th>family</th><th>platform</th><th>owner</th>"
+                "<th>origin</th><th>candidates</th></tr>"
+                f"{''.join(rows)}</table>"
+            )
+        return (
+            '<section id="input-ownership" class="read-only"><h2>Input ownership</h2>'
+            f'<p class="reason">{esc(OWNERSHIP_READ_ONLY_REASON)}</p>'
+            f'<p class="origin">origin: {esc(view.origin((INPUTS_KEY,)))}</p>'
+            f"{content}</section>"
         )
 
     def _module_page(self, request: UIRequest, session: _Session) -> UIResponse:
