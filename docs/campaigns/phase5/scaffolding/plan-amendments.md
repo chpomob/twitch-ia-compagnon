@@ -80,3 +80,44 @@ allowlist entry does not grow: it is the same test, adapted for the same reason.
   non-string node.
 - The suite is green, the seven allowlisted tests are adapted (not weakened), and the four shipped
   profiles still have zero changed lines.
+
+## D10 — a module's own health report is not overwritten by a successful phase observation
+
+**Where it was found.** Step P14 stopped before editing anything (a second time in this campaign) and
+reported that implementing the plan literally would leave the bridge **ready** with an unreachable
+instance. Report preserved at
+`docs/campaigns/phase5/scaffolding/loop-out/phase5-p14/01_build.json`.
+
+**The defect, re-verified in the code.** `core/lifecycle.py`, `PhaseCoordinator._run_hook` ends with
+`await self._observe(phase, name, failure, ...)` for every hook that returned, failing or not.
+`core/runtime.py` maps `PHASE_START_INPUTS` to `MODULE_STATE_READY` in `_PHASE_STATES`, and the state
+transition deduplicates on `(state, reason)`. So after a module reports
+`(degraded, "unreachable")` itself, the coordinator's `(ready, None)` is a new fact: it publishes
+`module.ready` and records the module ready. The comment above `_PHASE_STATES` reasoned only about a
+module that never spoke.
+
+**Why it matters beyond this step.** The plan's degraded report is how R1 (an unavailable instance
+never breaks the companion) and R6 (the bridge is ready only while connected, authenticated and holding
+a reconciled inventory) are honoured. AC3's literal wording — "exactly 1 `module.degraded` with
+`unreachable`" — would still have passed, so the defect would have survived the step, its review and
+probably the gate. That is the value of a DEV that stops instead of building on a broken invariant.
+
+**Resolution, chosen to remove the class rather than the instance.** New step `steps/P14F1-spec.md`:
+`core/runtime.py` reports a phase's state only when the module has not reported one itself in this
+activation; a module-authored state stands until the module reports another one, or until the module is
+closed (`PHASE_CLOSE`/`PHASE_CLOSE_OBSERVATION` still report `stopped`). The reporter proposed
+suppressing the observation for `PHASE_START_INPUTS` alone; the general rule also covers `prepare`,
+where the same clobbering exists.
+
+**Why it is safe.** A grep of `modules/` for `supervision.degraded` or `supervision.ready` returns
+**0 hits**: no shipped module reports a state today, so no existing behaviour depends on the
+overwrite. The ordinary lifecycle records (`prepare` → ready, `start_inputs` → ready, `close` →
+stopped) are unchanged for every module that reports nothing, and the phase-0 to phase-4 lifecycle
+tests must stay green.
+
+**Cost accounting.** `core/runtime.py` is already among the specification's five core targets; the
+file count stays at seven (D5, D6). D10 changes when one of them reports a state.
+
+**P14 amendment.** The step now depends on P14F1, and its AC3 test must assert the **final state**
+(degraded after the startup budget, with no `module.ready` after the `module.degraded`) — the record
+count alone is not the criterion.

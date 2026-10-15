@@ -75,14 +75,18 @@ If you believe another file must change, stop and report it instead of editing i
 
 ## Dependencies
 
-[P13]
+[P13, P14F1]
+
+P14F1 (a module's own health report is not overwritten by a successful phase observation, deviation
+D10) must have landed first: without it, the degraded report below is overwritten by the coordinator's
+`start_inputs` → `ready` observation, and an unreachable instance would leave the bridge **ready**.
 
 All dependencies are already merged into `main` when this step runs.
 
 ## Tests
 
 Against `FakeInstance`:
-  - **AC3 (run-action half).** A loopback port where nothing listens; use a full `run` with a tmp profile enabling the bridge and a granted `automation.run` rule. The companion reaches readiness within its startup budget, the bridge has exactly 1 `module.degraded` with `unreachable`, and a run call ends `refused provider_not_ready` with 0 frames (the executor's not-ready rule, no P15 code needed). Assert the outcome rather than exit status 0 (memory "coordinator-drain-hook-tie"). The test is written as a parametrised helper so P18 adds the `users.read` half (finding P3).
+  - **AC3 (run-action half).** A loopback port where nothing listens; use a full `run` with a tmp profile enabling the bridge and a granted `automation.run` rule. The companion reaches readiness within its startup budget, the bridge has exactly 1 `module.degraded` with `unreachable`, and a run call ends `refused provider_not_ready` with 0 frames (the executor's not-ready rule, no P15 code needed). Assert the outcome rather than exit status 0 (memory "coordinator-drain-hook-tie"). The test is written as a parametrised helper so P18 adds the `users.read` half (finding P3). **Amendment (P14 blocker report):** assert also the **final state** — after the startup budget, the bridge's state is `degraded`, and no `module.ready` record was published after its `module.degraded`. AC3's literal wording would pass while an unreachable instance left the bridge ready (R6), so the record count alone is not the criterion.
   - **AC4.** The four failure modes give the four reasons, and a trace/log sweep finds the password, the URL and frame text 0 times.
   - **AC24.** The exact auth response for known salt, challenge and password; ready only after the inventory is read.
   - **AC25.** Closing the socket while ready → 1 `module.degraded` at once. After advancing the injected clock by `min_delay` → 1 `module.ready`. The recorded delays never exceed `max_delay`.

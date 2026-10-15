@@ -80,6 +80,10 @@ where this kind of feature breaks.
   `docs/campaigns/phase5/scaffolding/plan-amendments.md`, is approved. The bridge's
   `companion_name` setting and the three extra assertions in an already allowlisted test are approved
   corrections of step P12, recorded in the same file.
+- `core/runtime.py`'s health observation no longer lets a successful phase overwrite a state the module
+  reported itself: deviation D10, added by step P14F1, is approved — without it an unreachable
+  instance left the bridge ready while AC3's literal wording still passed. Verify the invariant, do not
+  report the change.
 - The confirmation round trip is absent on purpose (assumption A6): an acknowledged run ends
   `external_unknown execution_unconfirmed`.
 - The `viewers` family merges "viewer reading" and "presence" (assumption A4): the repository has one
