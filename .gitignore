@@ -32,3 +32,4 @@ venv/
 # Patch leftovers
 *.orig
 *.rej
+/.adversarial-spec/
