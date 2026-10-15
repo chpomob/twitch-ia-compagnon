@@ -958,7 +958,7 @@ def test_ac15_the_base_page_lists_every_module_and_the_origin(
     page = response.body.decode("utf-8")
 
     listed = dict(re.findall(r'<tr data-module="([^"]+)" data-enabled="(true|false)">', page))
-    assert len(SHIPPED_MODULES) == 17
+    assert len(SHIPPED_MODULES) == 18  # phase 5 P12 adds streamerbot
     assert sorted(listed) == list(SHIPPED_MODULES)
     enabled = set(read_base(REPO / profile)["enabled_modules"])
     assert {name for name, state in listed.items() if state == "true"} == enabled

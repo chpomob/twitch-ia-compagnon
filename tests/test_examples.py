@@ -110,6 +110,8 @@ MODULE_NAMES = (
     "watch",
     "kick",
     "youtube",
+    # Phase 5 R10 (plan P12): the automation bridge, the 18th manifest.
+    "streamerbot",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -387,6 +389,16 @@ EXPECTED_MANIFESTS = {
         "middleware": False,
         "lifecycle": {"roles": ["input"]},
         "settings_validator": "validate_settings",
+    },    # Phase 5 R1, R6 (plan P12): the automation bridge is an input.
+    "streamerbot": {
+        "name": "streamerbot",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": ["channel.chat.message"],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": ["input"]},
+        "settings_validator": "validate_settings",
     },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
@@ -425,6 +437,9 @@ DECLARATION_KEYS = {
     # Phase 3 R7 (plans P20, P21): the youtube chat input declares its
     # triggers, its credentials and its `chat.write`.
     "youtube": {"triggers", "actions", "credentials", "input_families"},
+    # Phase 5 R4, R6, R7 (plan P12): the bridge declares its triggers, its
+    # run action, its password and its three families.
+    "streamerbot": {"triggers", "actions", "credentials", "input_families"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -443,6 +458,9 @@ DECLARED_ACTIONS = {
     "kick": {"chat.write"},
     # Phase 3 R7 (plan P21): youtube is the third declarer of `chat.write`.
     "youtube": {"chat.write"},
+    # Phase 5 R4 (plan P12): the bridge's one write; `users.read` is declared
+    # at prepare from the `users` manifest, not in the bridge's own.
+    "streamerbot": {"automation.action.run"},
 }
 
 #: The credentials each manifest declares, by dotted setting path (R8).
@@ -456,6 +474,8 @@ SECRET_SETTINGS = {
     "stream_control": ("scenes.provider.password",),
     "kick": ("client_secret", "access_token"),
     "youtube": ("client_secret", "refresh_token"),
+    # Phase 5 R6 (plan P12): the bridge's instance password.
+    "streamerbot": ("password",),
 }
 #: The optional credentials shipped unconfigured — empty, never a literal —
 #: with the speech and transcription endpoints they go with (AC43).
@@ -591,6 +611,10 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     kick and youtube; and R1 (plan step P7) gives ``twitch`` the ``notices``
     setting and the ``event_kind`` trigger type, its keys otherwise
     unchanged.
+    Phase 5 R10 (plan step P12, allowlisted) ships the automation bridge as
+    the 18th manifest, and R4 adds its ``automation.action.run`` — 14
+    action names, the new one declared by the bridge alone; R6 declares its
+    ``password`` credential.
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -608,7 +632,7 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 17
+    assert len(names) == 18
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():
@@ -675,8 +699,10 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
         "memory.recall",
         "memory.record",
         "moderation.request",
+        # Phase 5 R4 (plan P12): shipped, enabled by no shipped profile (R1).
+        "automation.action.run",
     }
-    assert len(declared) == 13
+    assert len(declared) == 14
     # Phase 3 R7 (plan P19, decision 11), superseding "declared once each, by
     # one manifest": each action name has exactly one declaring manifest,
     # except `chat.write`, declared by exactly twitch, kick and youtube
@@ -1591,7 +1617,12 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
     phase 2, R4 adds ``memory.recall`` and ``memory.record`` and R5 adds
     ``moderation.request``; R7 (decision 11) makes kick and youtube further
     declarers of ``chat.write``, so each name is declared once except
-    ``chat.write``, declared three times (twitch, kick and youtube)."""
+    ``chat.write``, declared three times (twitch, kick and youtube).
+
+    Superseded in part by phase 5's R4 and R10 (plan step P12): the 18th
+    shipped manifest declares ``automation.action.run``, so the catalog
+    declares 14 names, the new one once; the chat-only profile does not
+    enable the bridge (R1), so its registered-ready view is unchanged."""
 
     path = _chat_only_profile(tmp_path)
     environ = _phase1_environ(path)
@@ -1610,7 +1641,7 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
         assert set(started.registry.registered_ready()) == PHASE1_ACTIONS
         assert set(started.registry.discovered()) == PHASE1_ACTIONS
         catalog = started.catalog_actions()
-        assert len(set(catalog)) == 13
+        assert len(set(catalog)) == 14
         assert catalog.count("chat.write") == 3
         assert all(catalog.count(name) == 1 for name in set(catalog) - {"chat.write"})
         assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS | {
@@ -1618,6 +1649,7 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
             "memory.recall",
             "memory.record",
             "moderation.request",
+            "automation.action.run",
         }
 
         completed = await started.chat_scenario()

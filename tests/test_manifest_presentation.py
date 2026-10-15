@@ -147,6 +147,8 @@ PRESENTED = (
     "moderation",
     "proxy",
     "stream_control",
+    # Phase 5 R6 (plan P12, AC23): the automation bridge.
+    "streamerbot",
     "twitch",
     "users",
     "viewer_memory",
@@ -236,10 +238,12 @@ def _shipped_manifests() -> set[str]:
 
 
 def test_presented_covers_every_shipped_manifest() -> None:
-    """AC12: the title and default checks run over all 17 shipped manifests."""
+    """AC12: the title and default checks run over all shipped manifests —
+    18 since phase 5 R10 (plan P12, AC23) ships the automation bridge
+    (allowlisted: 17 → 18)."""
 
     shipped = _shipped_manifests()
-    assert len(shipped) == 17
+    assert len(shipped) == 18
     assert len(PRESENTED) == len(set(PRESENTED))
     assert set(PRESENTED) == shipped
 
