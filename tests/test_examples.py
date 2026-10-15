@@ -402,7 +402,8 @@ DECLARATION_KEYS = {
     "brain": {"credentials"},
     "audit": set(),
     "chat_context": {"actions", "credentials"},
-    "users": {"actions", "credentials"},
+    # Phase 5 R2 (plan P10): users declares the (`viewers`, '*') pair.
+    "users": {"actions", "credentials", "input_families"},
     "capture": {"actions", "credentials"},
     "proxy": {"credentials"},
     "agent_link": {"credentials"},
@@ -642,6 +643,10 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
         assert manifests[platform]["input_families"] == [
             {"family": "chat", "platforms": [platform], "default": True}
         ]
+    # Phase 5 R2/R3 (plan P10): users answers `viewers` on every platform.
+    assert manifests["users"]["input_families"] == [
+        {"family": "viewers", "platforms": ["*"], "default": True}
+    ]
     assert isinstance(manifests["twitch"]["actions"], list) and manifests["twitch"]["actions"]
     # Phase 3 R1 (plan P7, decision 11): the twitch manifest gains the
     # optional `notices` setting and the `event_kind` trigger type; its keys,

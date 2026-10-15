@@ -23,6 +23,18 @@ consumes:
   - channel.chat.message
 middleware: false
 
+# Input ownership (phase 5 R2, R3, R7). The directory is this module's answer
+# for the `viewers` family on every platform, by default. The profile's
+# `inputs` block may hand a pair to another provider — one that reports who is
+# active rather than who spoke — and the runtime then binds `users.read` here
+# only on the platforms this module still owns: never two providers for one
+# pair, and no ownership code in this module.
+input_families:
+  - family: viewers
+    platforms:
+      - "*"
+    default: true
+
 # No lifecycle role: the handle takes part in `prepare` (subscribe to the chat
 # event, bind the provider, mark ready) and in `close` (withdraw readiness)
 # and in nothing else (R4). The subscription is passive: the handler is
@@ -81,14 +93,18 @@ credentials: []
 # channel, most recently seen first, with the freshness and the coverage the
 # caller needs: the directory lists who *spoke*, never the whole audience, so
 # `coverage.complete` is always `false`. A `read` carries no delivery
-# capability.
+# capability. The declaration is shared (phase 5 R7): a provider owning the
+# `viewers` pair of a platform registers this very spec, read from this file,
+# and reports `coverage.kind: active_viewers`; this module's pages always
+# report `observed_authors`.
 actions:
   - name: users.read
     version: 1
     description: >-
-      Read one page of the chat authors observed on the destination's
-      channel, most recently seen first, with the freshness and coverage of
-      the bounded directory. The page is never the whole audience.
+      Read one page of the users of the destination's channel — who was
+      observed in chat, or who the provider reports as active — most recently
+      seen first, with the freshness and coverage of the bounded list. The
+      page is never the whole audience.
     argument_schema:
       type: object
       properties:
@@ -169,7 +185,7 @@ actions:
               description: When this page was read, on the runtime clock.
             window_seconds:
               type: number
-              description: How long an author stays listed after its last message.
+              description: How long a user stays listed after last being seen.
           required:
             - observed_at
             - window_seconds
@@ -181,12 +197,16 @@ actions:
               type: string
               enum:
                 - observed_authors
-              description: What the directory lists — the authors who spoke, not the audience.
+                - active_viewers
+              description: >-
+                What the page lists — the authors who spoke (`observed_authors`)
+                or the users the provider reports as active (`active_viewers`),
+                never the whole audience.
             complete:
               type: boolean
               enum:
                 - false
-              description: Always false — an observed-author list is never the whole audience.
+              description: Always false — the page is never the whole audience.
             retained_users:
               type: integer
               description: Authors the channel's directory retained at read, inside the window.

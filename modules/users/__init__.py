@@ -54,6 +54,16 @@ provider is never entered (AC30). No platform name appears here: the
 platform is the event's and the destination's, runtime values the directory
 is keyed by.
 
+**Viewers ownership (phase 5 R3, R7).** The manifest declares the
+``viewers`` family on every platform, by default. When the profile hands a
+platform's pair to another provider, the runtime's action facade binds
+``users.read`` here only on the platforms this module still owns, so the
+module carries no ownership code. Whoever serves a destination, this
+module's pages report ``observed_authors``; the shared result schema also
+admits ``active_viewers`` for a provider that reports who is active. A
+``cue`` is a command from the operator's own instance, not chat: its author
+is never recorded.
+
 Lifecycle: the manifest declares no role, so the handle takes part in
 ``prepare`` — subscribe to the chat event, bind the provider over
 ``*/*/chat`` and mark ready — and in ``close``, which withdraws readiness
@@ -75,6 +85,7 @@ from urllib.parse import quote, unquote
 import yaml
 
 from core.contracts import (
+    CUE_KIND,
     PART_TYPE_TEXT,
     ActionObservation,
     ActionSpec,
@@ -596,10 +607,14 @@ class UsersModule:
         Returns ``None`` so the event is never replaced or stopped: this
         module is an observer of the input path, not a middleware. A
         malformed event is ignored — a subscriber that raised would fail the
-        input's own publication — and nothing is recorded once closed.
+        input's own publication — and nothing is recorded once closed. A
+        ``cue`` is not chat: its author is never recorded (phase 5 R7).
         """
 
         if self._closed:
+            return None
+        payload = event.get("payload") if isinstance(event, Mapping) else None
+        if isinstance(payload, Mapping) and payload.get("kind") == CUE_KIND:
             return None
         try:
             self._directory.observe(event, self._clock())

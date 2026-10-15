@@ -34,12 +34,13 @@ import yaml
 
 from core.actions import (
     ERROR_INVALID_ARGUMENTS,
+    ERROR_NO_PROVIDER,
     ERROR_NOT_AUTHORIZED,
     AuthorizationRule,
 )
 from core.contracts import ActionCall, ActionObservation, Destination
 from core.lifecycle import PhaseCoordinator
-from core.loader import ModuleLoader
+from core.loader import ModuleLoader, _validate_manifest, resolve_input_ownership
 from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext
 from core.triggers import TriggerRegistry
 from conftest import ManualClock, runtime_context
@@ -739,6 +740,156 @@ def test_directory_observe_reports_whether_an_event_was_recorded() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 5 R7: cues are not chat; R3/AC34: owned-platform binding
+# --------------------------------------------------------------------------- #
+
+
+def cue_event(platform: str, channel_id: str, author: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A ``cue`` as an instance routes it: a command, not a chat message."""
+
+    payload, metadata = chat_event(platform, channel_id, author, "cue-1")
+    payload["kind"] = "cue"
+    payload["text"] = "!brb"
+    return payload, metadata
+
+
+async def test_a_cue_leaves_the_directory_unchanged() -> None:
+    """Phase 5 R7: a ``cue``'s author is never recorded — not on a fresh
+    channel, and not over an author already observed on the channel (whose
+    ``last_seen`` and display name stay as the chat left them)."""
+
+    clock = ManualClock()
+    context = module_context(clock)
+    handle = await prepared_module(context)
+    grant_users_read(context)
+    bus = runtime_of(context).bus
+    try:
+        await bus.publish(CHAT_EVENT, *cue_event("fake", "channel-9", {"id": "operator"}))
+        assert handle.directory.channels() == ()
+
+        await speak(context, "fake", "channel-9", ["a"])
+        before = (await read(context, FAKE_CHAT, 10)).result
+        clock.advance(5.0)
+        await bus.publish(
+            CHAT_EVENT, *cue_event("fake", "channel-9", {"id": "a", "display_name": "Other"})
+        )
+        await bus.publish(CHAT_EVENT, *cue_event("fake", "channel-9", {"id": "operator"}))
+        after = (await read(context, FAKE_CHAT, 10, call_id="call-2")).result
+
+        assert handle.directory.channels() == (("fake", "channel-9"),)
+        assert after["users"] == before["users"]
+        assert after["coverage"]["retained_users"] == 1
+    finally:
+        await handle.close()
+
+
+async def test_pages_still_report_observed_authors() -> None:
+    """Phase 5 R7 (AC34, last clause): the shared enum admits
+    ``active_viewers``, yet every page of this module reports
+    ``coverage.kind: observed_authors`` with ``complete`` false."""
+
+    context = module_context()
+    handle = await prepared_module(context)
+    grant_users_read(context)
+    try:
+        await speak(context, "fake", "channel-9", authors(3))
+        pages = await walk(context, FAKE_CHAT, 2)
+        assert len(pages) == 2
+        for page in pages:
+            assert page.result["coverage"]["kind"] == "observed_authors"
+            assert page.result["coverage"]["complete"] is False
+        empty = await read(context, TWITCH_CHAT, 5, call_id="call-empty")
+        assert empty.result["coverage"]["kind"] == "observed_authors"
+    finally:
+        await handle.close()
+
+
+#: A stand-in second `viewers` provider: declares the pair, opt-in, never activated.
+VIEWERS_STAND_IN = "viewers-stand-in"
+
+
+def _owned_context(inputs: dict[str, Any]) -> ModuleContext:
+    """The users module's context under a resolved ownership table (R3)."""
+
+    users = _validate_manifest(
+        MODULE_NAME, yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+    )
+    stand_in = _validate_manifest(
+        VIEWERS_STAND_IN,
+        {
+            "name": VIEWERS_STAND_IN,
+            "manifest_version": 2,
+            "runtime_api": RUNTIME_API,
+            "produces": [],
+            "consumes": [],
+            "middleware": False,
+            "settings_validator": "validate_settings",
+            "input_families": [
+                {"family": "viewers", "platforms": ["twitch", "kick"], "default": False}
+            ],
+        },
+    )
+    ownership = resolve_input_ownership(
+        [MODULE_NAME, VIEWERS_STAND_IN],
+        {MODULE_NAME: users, VIEWERS_STAND_IN: stand_in},
+        inputs,
+    )
+    return runtime_context(clock=ManualClock()).for_module(
+        MODULE_NAME,
+        owned_inputs=ownership.view_for(MODULE_NAME),
+        ownership=ownership,
+        declared=users.declares_input_families,
+    )
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [{"viewers": {"twitch": VIEWERS_STAND_IN}}, {"viewers": {"twitch": "none"}}],
+    ids=["owned-elsewhere", "set-to-none"],
+)
+async def test_users_read_is_not_served_on_a_platform_users_does_not_own(
+    inputs: dict[str, Any],
+) -> None:
+    """Phase 5 R3 (AC14, users half): with (`viewers`, twitch) owned
+    elsewhere or set to none, the facade binds ``users.read`` here on the
+    wildcard excluding twitch — so a granted read at twitch finds no binding
+    and, no other provider being bound, the executor reports ``no_provider``
+    with this provider entered 0 times; at kick, which users still owns, the
+    same read is served by the directory."""
+
+    context = _owned_context(inputs)
+    handle = await prepared_module(context)
+    grant_users_read(context)
+    entered: list[Any] = []
+    serve = handle._invoke_users_read
+
+    async def spy(invocation: Any) -> ActionObservation:
+        entered.append(invocation)
+        return await serve(invocation)
+
+    handle._invoke_users_read = spy  # type: ignore[method-assign]
+    try:
+        (binding,) = runtime_of(context).actions.bindings(USERS_READ_ACTION)
+        assert binding.destination == Destination("*", "*", "chat")
+        assert binding.excluded_platforms == frozenset({"twitch"})
+        await speak(context, "twitch", "channel-1", ["t"])
+        await speak(context, "kick", "channel-2", ["k"])
+
+        at_twitch = await read(context, TWITCH_CHAT, 10)
+        assert at_twitch.status == "error"
+        assert at_twitch.error is not None
+        assert at_twitch.error["code"] == ERROR_NO_PROVIDER
+        assert entered == []
+
+        at_kick = await read(context, Destination("kick", "channel-2", "chat"), 10, call_id="call-2")
+        assert ids_of(at_kick) == ["k"]
+        assert at_kick.result["coverage"]["kind"] == "observed_authors"
+        assert len(entered) == 1
+    finally:
+        await handle.close()
+
+
+# --------------------------------------------------------------------------- #
 # AC30: default-deny on both platforms
 # --------------------------------------------------------------------------- #
 
@@ -877,7 +1028,9 @@ def test_manifest_is_v2_and_declares_users_read_without_granting_it() -> None:
     nothing, no credential, a settings schema requiring the three bounds
     (plus the reserved ``limits`` block), the declared hook, and exactly the
     ``users.read`` read action over ``*/*/chat`` — a `read` carries no
-    delivery capability and no grant lives in the file.
+    delivery capability and no grant lives in the file. Phase 5 R7 (AC34)
+    widens ``coverage.kind`` to ``[observed_authors, active_viewers]`` and
+    R2 adds the ``viewers`` input family.
 
     Phase-4 R3 supersedes the former exact-dict assertion on
     ``max_channels``: the node now carries a ``title``, so the check keeps
@@ -949,7 +1102,11 @@ def test_manifest_is_v2_and_declares_users_read_without_granting_it() -> None:
     assert set(result["properties"]["freshness"]["required"]) == {"observed_at", "window_seconds"}
     coverage = result["properties"]["coverage"]
     assert set(coverage["required"]) == {"kind", "complete", "retained_users", "evicted"}
-    assert coverage["properties"]["kind"]["enum"] == [COVERAGE_KIND] == ["observed_authors"]
+    # Phase 5 R7 (AC34) supersedes the one-member enum: the shared result
+    # schema admits the active-viewer pages of a provider owning a `viewers`
+    # pair; this module's own pages still report `observed_authors`.
+    assert coverage["properties"]["kind"]["enum"] == [COVERAGE_KIND, "active_viewers"]
+    assert COVERAGE_KIND == "observed_authors"
     assert coverage["properties"]["complete"]["enum"] == [False]
     assert action["timeout_seconds"] == 5
     assert action["idempotency"] == "natural"
@@ -978,7 +1135,13 @@ def test_manifest_is_v2_and_declares_users_read_without_granting_it() -> None:
         "settings_validator",
         "credentials",
         "actions",
+        "input_families",
     }
+    # Phase 5 R2/R3: the module owns the `viewers` family on every platform,
+    # by default; the profile's `inputs` block may hand a pair elsewhere.
+    assert manifest["input_families"] == [
+        {"family": "viewers", "platforms": ["*"], "default": True}
+    ]
     # No grant lives in the file: the permission is *required* by the
     # action and appears nowhere else in the declaration.
     assert not any(key in manifest for key in ("rules", "authorization", "grants"))
