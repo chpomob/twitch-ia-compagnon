@@ -31,6 +31,15 @@ bounded queue drops and counts what overflows without stalling the connection
 (AC26), and a cue envelope becomes one normalised ``cue`` event, decided by
 the trigger policy under ``triggers.<bridge>`` (R7; AC29, AC30) whose
 anti-echo refuses the configured companion identities (AC33, engine half).
+
+Plan step P17 adds the chat mapping for owned platforms (R7b): each
+documented chat and notice fixture of twitch, kick and youtube maps to one
+event whose ``kind`` and payload key set equal the native module's — the
+native shape computed inline by the native normaliser on its own test
+payload — and an unmapped type is dropped and counted (AC43); instance roles
+satisfy an audience rule only under ``trust_instance_roles`` (AC32); and the
+companion identity is required by ``--check-config`` and enforced by the
+engine on a mapped chat event (AC33).
 """
 
 from __future__ import annotations
@@ -90,13 +99,20 @@ from core.contracts import (
     Destination,
     validate_against_schema,
 )
+from core.context import ChatContext
 from core.lifecycle import DEFAULT_HOOK_TIMEOUT_SECONDS, PhaseCoordinator
 from core.loader import ModuleLoader, _validate_manifest
 from core.runtime import RUNTIME_API, OwnedInputs
 from core.triggers import REASON_SELF_AUTHORED, TriggerRegistry
 from conftest import ManualClock, RecordingScheduler, runtime_context
+import test_kick as native_kick
+import test_twitch as native_twitch
+import test_youtube as native_youtube
 
+from modules import kick as kick_module
 from modules import streamerbot
+from modules import twitch as twitch_module
+from modules import youtube as youtube_module
 from modules.streamerbot import (
     ACKNOWLEDGEMENT_MARGIN_SECONDS,
     MANIFEST_PATH,
@@ -1243,7 +1259,12 @@ class _Bridge:
         self.clock = ManualClock()
         self.registry = TriggerRegistry()
         self.context = runtime_context(
-            clock=self.clock, trigger_registry=self.registry, scheduler=scheduler
+            clock=self.clock,
+            trigger_registry=self.registry,
+            scheduler=scheduler,
+            chat=ChatContext(
+                max_messages=16, max_bytes=8192, max_age_seconds=600.0, clock=self.clock
+            ),
         )
         self.traces: list[dict[str, Any]] = []
         self.context.bus.subscribe("**", self.traces.append, order=100)
@@ -3143,3 +3164,432 @@ async def test_ac33_the_refusal_comes_from_the_identities_the_bridge_hands_over(
             assert decision.reason != REASON_SELF_AUTHORED
         finally:
             await bridge.stop()
+
+
+# -- P17: chat mapping for owned platforms and role trust (R7b) -------------- #
+
+#: The broadcaster accounts the bridge falls back to, and the companions.
+CHAT_INSTANCE_IDENTITY = {"twitch": "90001", "kick": "k-broadcaster", "youtube": "UC-broadcaster"}
+CHAT_COMPANIONS = {"twitch": "companion-7", "kick": "companion-k", "youtube": "UC-companion"}
+CHAT_FIXTURES = {
+    platform: (f"chat_{platform}", f"notices_{platform}")
+    for platform in ("twitch", "kick", "youtube")
+}
+#: A type the events index (ledger id 6) documents for each platform that has
+#: no native notice kind (fixtures README, "left out on purpose").
+UNDOCUMENTED_TYPES = {"twitch": "Cheer", "kick": "KicksGifted", "youtube": "JewelsGifted"}
+
+
+def _native_twitch() -> dict[str, dict[str, Any]]:
+    """The twitch module's own events, per kind, from its own test payloads."""
+
+    kinds = frozenset(twitch_module.NOTICE_KINDS)
+    envelopes = {
+        "message": native_twitch.notification("n-message"),
+        **{
+            kind: native_twitch.chat_notice(f"n-{kind}", kind)
+            for kind in ("sub", "resub", "sub_gift", "community_sub_gift")
+        },
+        "raid": native_twitch.raid_notice("n-raid"),
+        "follow": native_twitch.follow_notice("n-follow"),
+    }
+    return {
+        kind: twitch_module._normalize_notification(envelope, kinds).event()
+        for kind, envelope in envelopes.items()
+    }
+
+
+def _native_kick() -> dict[str, dict[str, Any]]:
+    kinds = frozenset(kick_module.NOTICE_KINDS)
+    channel = native_kick.person(int(native_kick.CHANNEL), "streamer")
+    deliveries = [(kick_module.EVENT_CHAT_MESSAGE, native_kick.chat_body("hello"))] + [
+        (event_type, {"broadcaster": channel, **fields})
+        for event_type, _kind, fields in native_kick.NOTICE_CASES
+    ]
+    events = [
+        kick_module.normalize_delivery(event_type, body, f"d-{event_type}", kinds).event()
+        for event_type, body in deliveries
+    ]
+    return {event["payload"].get("kind", "message"): event for event in events}
+
+
+def _native_youtube() -> dict[str, dict[str, Any]]:
+    kinds = frozenset(youtube_module.NOTICE_KINDS)
+    items = [native_youtube.chat_item("y-message")] + [
+        native_youtube.chat_item(f"y-{item_type}", "", item_type=item_type, details=details)
+        for item_type, _kind, details in native_youtube.NOTICE_CASES
+    ]
+    events = [
+        youtube_module.normalize_item(item, native_youtube.CHANNEL, kinds).event()
+        for item in items
+    ]
+    return {event["payload"].get("kind", "message"): event for event in events}
+
+
+NATIVE_EVENTS = {"twitch": _native_twitch, "kick": _native_kick, "youtube": _native_youtube}
+
+
+def _chat_frames(platform: str) -> list[dict[str, Any]]:
+    """Every documented chat and notice frame of *platform*, chat first."""
+
+    return [
+        copy.deepcopy(entry["frame"])
+        for name in CHAT_FIXTURES[platform]
+        for entry in fixture_entries(name)
+    ]
+
+
+def _retyped(platform: str, event_type: str) -> dict[str, Any]:
+    """A documented notice frame of *platform* naming *event_type* instead.
+
+    Only ``event.type`` changes, to a type the events index documents with no
+    mapping here; the body stays the fixture's, so the frame claims nothing
+    about the instance the fixtures do not (the drop happens on the type)."""
+
+    frame = fixture_frame(CHAT_FIXTURES[platform][1])
+    frame["event"]["type"] = event_type
+    return frame
+
+
+def _shape(event: Mapping[str, Any]) -> tuple[str | None, frozenset[str]]:
+    payload = event["payload"]
+    return payload.get("kind"), frozenset(payload)
+
+
+@contextlib.asynccontextmanager
+async def _chat_bridge(owned: tuple[str, ...], **settings: Any) -> Any:
+    """A bridge connected to a fake instance, owning (``chat``, P) for each
+    P in *owned*, with every companion and broadcaster identity set."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(
+            url=fake.url,
+            inputs={"chat": {platform: MODULE_NAME for platform in owned}},
+            instance_identity=CHAT_INSTANCE_IDENTITY,
+            companion_identities=CHAT_COMPANIONS,
+            **settings,
+        )
+        try:
+            yield bridge, fake
+        finally:
+            await bridge.stop()
+
+
+def test_ac43_the_table_is_the_subscribed_list_and_covers_every_native_kind() -> None:
+    """R7b: the mapping table is keyed by (platform, documented event type)
+    and is exactly what the subscription names; per platform, its kinds are
+    ``message`` plus every notice kind the native module produces."""
+
+    table = streamerbot._CHAT_MAPPINGS
+    assert set(table) == {
+        (platform, event_type)
+        for platform, types in streamerbot._CHAT_EVENT_TYPES.items()
+        for event_type in types
+    }
+    natives = {
+        "twitch": twitch_module.NOTICE_KINDS,
+        "kick": kick_module.NOTICE_KINDS,
+        "youtube": youtube_module.NOTICE_KINDS,
+    }
+    for platform, notice_kinds in natives.items():
+        kinds = {mapping.kind for (owner, _), mapping in table.items() if owner == platform}
+        assert kinds == {"message", *notice_kinds}, platform
+        assert set(NATIVE_EVENTS[platform]()) == kinds, platform
+
+
+@pytest.mark.parametrize("platform", ["twitch", "kick", "youtube"])
+def test_ac43_each_fixture_maps_to_the_native_kind_and_key_set(platform: str) -> None:
+    """AC43, the mapping alone: each documented chat and notice fixture of P
+    gives one event whose ``kind`` and payload key set equal those P's native
+    module produces for the equivalent input — the native shape computed by
+    the native normaliser on its own test payload — and the author carries
+    the native author keys; with no role trust, no ``roles``."""
+
+    native = NATIVE_EVENTS[platform]()
+    frames = _chat_frames(platform)
+    assert len(frames) == len(native) + (1 if platform == "youtube" else 0)
+    for frame in frames:
+        mapped = streamerbot.chat_event(frame, CHAT_INSTANCE_IDENTITY)
+        assert mapped is not None, frame["event"]
+        event, claims = mapped
+        kind = event["payload"].get("kind", "message")
+        assert _shape(event) == _shape(native[kind]), frame["event"]
+        assert event["type"] == native[kind]["type"] == "channel.chat.message"
+        assert event["metadata"] == {"source": MODULE_NAME, "schema_version": 2}
+        assert event["payload"]["platform"] == platform
+        assert set(event["payload"]["author"]) == {"id", "display_name"}
+        assert claims == ()
+
+
+@pytest.mark.parametrize("platform", ["twitch", "kick", "youtube"])
+async def test_ac43_owning_chat_each_fixture_gives_one_event_and_unmapped_is_dropped(
+    platform: str,
+) -> None:
+    """AC43 (R7b) through the bridge: owning (``chat``, P), every documented
+    chat and notice frame of P is published as exactly 1 event with the
+    native kind and key set; a notice of a type with no documented mapping
+    publishes 0 events and adds exactly 1 to the drop count."""
+
+    native = NATIVE_EVENTS[platform]()
+    frames = _chat_frames(platform)
+    async with _chat_bridge((platform,)) as (bridge, fake):
+        for index, frame in enumerate(frames):
+            await _push(bridge, fake, frame)
+            assert len(_published(bridge)) == index + 1, frame["event"]
+        assert bridge.handle.dropped_events == 0
+        for event in _published(bridge):
+            kind = event["payload"].get("kind", "message")
+            assert _shape(event) == _shape(native[kind])
+        # Every published event was decided by the engine, under this input.
+        assert len(_decisions(bridge)) == len(frames)
+
+        await _push(bridge, fake, _retyped(platform, UNDOCUMENTED_TYPES[platform]))
+        assert len(_published(bridge)) == len(frames)
+        assert bridge.handle.dropped_events == 1
+
+
+async def test_ac43_owning_only_twitch_the_kick_and_youtube_fixtures_give_nothing() -> None:
+    """AC43 (R7b): owning only (``chat``, twitch), every kick and youtube
+    chat and notice frame publishes 0 events and is counted as dropped by
+    the bridge itself — the ownership guard never sees one."""
+
+    others = _chat_frames("kick") + _chat_frames("youtube")
+    async with _chat_bridge(("twitch",)) as (bridge, fake):
+        await _push(bridge, fake, *others)
+        assert _published(bridge) == []
+        assert _decisions(bridge) == []
+        assert bridge.handle.dropped_events == len(others)
+        await _push(bridge, fake, fixture_frame("chat_twitch"))
+        assert len(_published(bridge)) == 1
+        snapshot = bridge.context.supervision.snapshot()
+        assert snapshot[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 0
+
+
+def test_r7b_a_notice_lacking_a_field_its_mapping_needs_is_not_mapped() -> None:
+    """R7b, by rule: no author, an author id holding ``:``, no chat text,
+    no event id where one is documented, no channel at all, an anonymous
+    gift — none is repaired; an event without a documented id gets a stable
+    one derived from its frame."""
+
+    identity = CHAT_INSTANCE_IDENTITY
+    no_user = fixture_frame("chat_twitch")
+    del no_user["data"]["user"]
+    reserved = fixture_frame("chat_twitch")
+    reserved["data"]["user"]["id"] = "instance:twitch"
+    no_text = fixture_frame("chat_youtube")
+    del no_text["data"]["message"]
+    no_id = fixture_frame("notices_youtube", 0)
+    del no_id["data"]["eventId"]
+    anonymous = fixture_frame("notices_kick", 3)
+    anonymous["data"]["isAnonymous"] = True
+    no_system_message = fixture_frame("notices_twitch", 0)
+    del no_system_message["data"]["systemMessage"]
+    for frame in (no_user, reserved, no_text, no_id, anonymous, no_system_message):
+        assert streamerbot.chat_event(frame, identity) is None
+    # A youtube notice's comment is the viewer's optional text: absent, empty.
+    for index in (1, 3):
+        uncommented = fixture_frame("notices_youtube", index)
+        del uncommented["data"]["message"]
+        event, _ = streamerbot.chat_event(uncommented, identity)
+        assert event["payload"]["text"] == ""
+    # Kick events carry no channel: without the instance identity, no event.
+    assert streamerbot.chat_event(fixture_frame("chat_kick"), {}) is None
+    assert streamerbot.chat_event(fixture_frame("custom_event"), identity) is None
+
+    raid = fixture_frame("notices_twitch", 4)
+    first, _ = streamerbot.chat_event(raid, identity)
+    again, _ = streamerbot.chat_event(fixture_frame("notices_twitch", 4), identity)
+    assert first["payload"]["message_id"] == again["payload"]["message_id"]
+    assert first["payload"]["channel_id"] == identity["twitch"]
+    follow, _ = streamerbot.chat_event(fixture_frame("notices_twitch", 5), identity)
+    assert follow["payload"]["message_id"] != first["payload"]["message_id"]
+    assert ":" not in first["payload"]["message_id"]
+
+
+async def test_r7b_a_replayed_event_without_an_id_is_not_published_twice() -> None:
+    """R7b: the derived id of a frame sent twice is the same, so the
+    engine's dedup window keeps the replay from a second publication."""
+
+    async with _chat_bridge(("twitch",)) as (bridge, fake):
+        await _push(bridge, fake, fixture_frame("notices_twitch", 4))
+        await fake.push_frames([fixture_frame("notices_twitch", 4)])
+        await _push(bridge, fake, fixture_frame("chat_twitch"))
+        assert [event["payload"].get("kind") for event in _published(bridge)] == [
+            "raid",
+            None,
+        ]
+        assert bridge.handle.dropped_events == 0
+
+
+async def test_r7b_mapped_chat_feeds_the_shared_transcript_once() -> None:
+    """R7b: owning (``chat``, twitch), the bridge feeds the shared chat
+    transcript the native input no longer feeds — a chat message and a
+    notice, each once, a replay not again."""
+
+    async with _chat_bridge(("twitch",)) as (bridge, fake):
+        chat = fixture_frame("chat_twitch")
+        await _push(bridge, fake, chat, fixture_frame("notices_twitch", 0))
+        await fake.push_frames([fixture_frame("chat_twitch")])
+        await _push(bridge, fake, fixture_frame("notices_twitch", 5))
+        records = bridge.context.chat.read(
+            "twitch", CHAT_INSTANCE_IDENTITY["twitch"], limit=10
+        )
+        published = _published(bridge)
+        assert len(published) == 3
+        assert [(r.author_id, r.message_id, r.text) for r in records] == [
+            (
+                event["payload"]["author"]["id"],
+                event["payload"]["message_id"],
+                event["payload"]["text"],
+            )
+            for event in published
+        ]
+        assert records[0].text == chat["data"]["text"]
+
+
+AUDIENCE_MODERATORS = {
+    MODULE_NAME: {
+        "channels": {
+            CHAT_INSTANCE_IDENTITY["twitch"]: {
+                "combination": "all_of",
+                "rules": [{"type": "audience", "parameters": {"audience": "moderators"}}],
+            }
+        }
+    }
+}
+
+
+@pytest.mark.parametrize("trusted", [False, True])
+async def test_ac32_instance_roles_satisfy_an_audience_only_when_trusted(
+    trusted: bool,
+) -> None:
+    """AC32 (R7b): owning (``chat``, twitch), the twitch chat fixture —
+    author with a ``moderator`` badge — maps to the native key set (no
+    ``kind``); an ``audience: moderators`` rule under ``triggers.<bridge>``
+    is unmet with ``trust_instance_roles`` false (no ``roles`` key, no
+    claim) and met with it true (``roles_provenance`` names the bridge)."""
+
+    settings: dict[str, Any] = {"triggers": AUDIENCE_MODERATORS}
+    if trusted:
+        settings["trust_instance_roles"] = True
+    async with _chat_bridge(("twitch",), **settings) as (bridge, fake):
+        await _push(bridge, fake, fixture_frame("chat_twitch"))
+        (event,) = _published(bridge)
+        assert _shape(event) == _shape(_native_twitch()["message"])
+        assert "kind" not in event["payload"]
+        author = event["payload"]["author"]
+        (decision,) = _decisions(bridge)
+        if trusted:
+            assert author["roles"] == ["moderator"]
+            assert author["roles_provenance"] == MODULE_NAME
+            assert decision["accepted"] is True
+            assert decision["reason"] == "accepted:audience_moderators"
+        else:
+            assert set(author) == {"id", "display_name"}
+            assert decision["accepted"] is False
+            assert decision["reason"] == "rejected:audience_moderators_untrusted"
+
+
+def test_r7b_trusted_roles_read_badges_and_flags_with_the_bridge_provenance() -> None:
+    """R7b: under trust, twitch reads the badge list and youtube the user
+    flags, each claim tagged with the bridge's module; the broadcaster is
+    recognised by identity; a user with no role source carries no roles."""
+
+    identity = CHAT_INSTANCE_IDENTITY
+    event, claims = streamerbot.chat_event(
+        fixture_frame("chat_twitch"), identity, trust_roles=True
+    )
+    assert event["payload"]["author"]["roles"] == ["moderator"]
+    assert [(claim.name, claim.provenance) for claim in claims] == [("moderator", MODULE_NAME)]
+
+    sponsor, claims = streamerbot.chat_event(
+        fixture_frame("notices_youtube", 0), identity, trust_roles=True
+    )
+    assert sponsor["payload"]["author"]["roles"] == ["subscription"]
+    assert sponsor["payload"]["author"]["roles_provenance"] == MODULE_NAME
+
+    raid, claims = streamerbot.chat_event(
+        fixture_frame("notices_twitch", 4), identity, trust_roles=True
+    )
+    assert set(raid["payload"]["author"]) == {"id", "display_name"} and claims == ()
+
+    broadcaster = fixture_frame("chat_twitch")
+    broadcaster["data"]["user"]["id"] = identity["twitch"]
+    _, claims = streamerbot.chat_event(broadcaster, identity, trust_roles=True)
+    assert [claim.name for claim in claims] == ["broadcaster", "moderator"]
+    # Untrusted, the same frames carry no claim at all.
+    _, claims = streamerbot.chat_event(broadcaster, identity)
+    assert claims == ()
+
+
+def _bridge_profile(tmp_path: Path, **settings: Any) -> Path:
+    """A profile enabling the bridge alone, owning (``chat``, twitch), with
+    the shipped example's ``limits`` (so the runtime has a trigger engine)."""
+
+    shipped = yaml.safe_load((ROOT / "config.yaml.example").read_text(encoding="utf-8"))
+    profile = {
+        "modules_directory": application.MODULES_DIRECTORY_BUILTIN,
+        "limits": shipped["limits"],
+        "enabled_modules": [MODULE_NAME],
+        "modules": {MODULE_NAME: {**BASE_SETTINGS, **settings}},
+        "inputs": {"chat": {"twitch": MODULE_NAME}},
+    }
+    path = tmp_path / "profile.yaml"
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    return path
+
+
+async def test_ac33_check_config_refuses_owned_twitch_chat_without_an_identity(
+    tmp_path: Path,
+) -> None:
+    """AC33 (R7b), through ``--check-config``: a profile handing the bridge
+    (``chat``, twitch) with no ``companion_identities.twitch`` fails with a
+    diagnostic naming ``twitch``; with the identity set, it is accepted."""
+
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        _bridge_profile(tmp_path), environ={}, diagnostic_reporter=diagnostics.append
+    )
+    assert status == 2
+    assert len(diagnostics) == 1 and "twitch" in diagnostics[0]
+    assert "companion_identities.twitch" in diagnostics[0]
+
+    diagnostics.clear()
+    status = await application.check_config(
+        _bridge_profile(tmp_path, companion_identities={"twitch": "1002"}),
+        environ={},
+        diagnostic_reporter=diagnostics.append,
+    )
+    assert (status, diagnostics) == (0, [])
+
+
+async def test_ac33_a_mapped_chat_event_authored_by_the_companion_is_refused() -> None:
+    """AC33 (R7b, engine half): with ``companion_identities.twitch`` equal to
+    the twitch chat fixture's author, the mapped instance chat event is
+    rejected by the engine's anti-echo invariant; with another identity, the
+    same event is not refused for that reason."""
+
+    author = fixture_frame("chat_twitch")["data"]["user"]["id"]
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(
+            url=fake.url,
+            inputs={"chat": {"twitch": MODULE_NAME}},
+            instance_identity=CHAT_INSTANCE_IDENTITY,
+            companion_identities={"twitch": author},
+        )
+        try:
+            await _push(bridge, fake, fixture_frame("chat_twitch"))
+            (event,) = _published(bridge)
+            assert event["payload"]["author"]["id"] == author
+            (decision,) = _decisions(bridge)
+            assert decision["accepted"] is False
+            assert decision["reason"] == REASON_SELF_AUTHORED
+        finally:
+            await bridge.stop()
+
+    async with _chat_bridge(("twitch",)) as (bridge, fake):
+        await _push(bridge, fake, fixture_frame("chat_twitch"))
+        (decision,) = _decisions(bridge)
+        assert decision["reason"] != REASON_SELF_AUTHORED

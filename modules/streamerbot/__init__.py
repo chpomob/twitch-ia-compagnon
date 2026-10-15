@@ -84,7 +84,7 @@ ignored. Its author is the envelope user or, absent one, the stable identity
 ``:``, so it is distinct from every viewer and every configured companion
 identity, and an envelope ``user_id`` holding ``:`` is refused. A malformed
 or oversized envelope, a cue for a platform this module does not own, and
-any other event (no mapping yet) are dropped and counted, never truncated or
+any event with no mapping are dropped and counted, never truncated or
 repaired. A cue is evaluated by the trigger policy under
 ``triggers.<module>`` with no role claims, then published on the bus, and
 its decision traced, as the native chat inputs do; an accepted cue is
@@ -94,6 +94,26 @@ are handed to the trigger engine at activation, so its anti-echo refuses
 what the companion authored. A ``cue_id`` the instance sends again inside
 the engine's dedup window reuses the decision already recorded and is not
 published twice: the instance must not reuse a ``cue_id`` for a new cue.
+
+**Chat (R7b).** For each owned (``chat``, P), P's documented chat-message
+event and each documented notice event — one module-local table keyed by
+(platform, instance event type), the fixtures README's enumerated list —
+becomes one ``channel.chat.message`` whose payload keys and ``kind`` are
+those P's native input publishes: ``platform``, ``channel_id``, ``author``
+(``id``, ``display_name``), ``message_id``, ``text``, and ``kind`` for a
+notice only. The channel is the event's broadcaster account when it carries
+one, else ``instance_identity.<P>``; an event the instance documents
+without an id (a raid, a follow, every kick notice) is identified by the
+digest of its frame, so a replay falls in the dedup window. A documented
+field the mapping needs and the frame lacks, an anonymous gift and any
+other event type are dropped and counted. Role claims from the instance —
+badges, or the user flags on youtube — are trusted only when
+``trust_instance_roles`` is true: then the author carries ``roles`` and
+``roles_provenance`` = this module and the claims reach the trigger
+engine; otherwise the event carries no ``roles`` and is evaluated with no
+claim, so no audience rule above ``everyone`` is met. Chat events take the
+cue path — dedup, decision, publication, trace, admission — so the engine's
+anti-echo refuses what a companion identity authored.
 
 Nothing here logs: the URL, the password and frame text never reach a trace
 or a diagnostic, only reasons do. No endpoint, port, password, version or
@@ -138,6 +158,7 @@ from core.actions import (
 )
 from core.contracts import (
     CUE_KIND,
+    EVENT_KIND_DEFAULT,
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
     ActionObservation,
@@ -149,7 +170,8 @@ from core.contracts import (
     validate_schema,
 )
 from core.admission import Work
-from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext
+from core.context import ChatEntry
+from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
 
 MODULE_NAME = "streamerbot"
 
@@ -930,6 +952,273 @@ def cue_event(
         "metadata": {"source": MODULE_NAME, "schema_version": NORMALIZED_SCHEMA_VERSION},
     }
 
+# --------------------------------------------------------------------------- #
+# Chat mapping for owned platforms (R7b)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class _ChatMapping:
+    """How one documented instance event becomes one normalised event.
+
+    ``author`` names the ``data`` key holding the author user; ``message_id``
+    the key of the event's own identifier, ``None`` when the instance
+    documents none (the identifier is then derived from the frame);
+    ``text`` the key of the text, ``None`` when the event carries none (the
+    text is then empty, as the native notice without one); ``text_optional``
+    whether that text is a viewer's optional comment (absent, it is empty)
+    rather than a required field (absent, the event is dropped); ``channel`` the
+    path to the broadcaster's account id, ``None`` when the event carries
+    none (the ``instance_identity`` of the platform is used).
+    """
+
+    kind: str
+    author: str
+    message_id: str | None
+    text: str | None
+    channel: tuple[str, ...] | None
+    text_optional: bool = False
+
+
+_TWITCH_CHANNEL = ("broadcaster", "id")
+_YOUTUBE_CHANNEL = ("broadcast", "channelId")
+
+#: The documented chat-message and notice events, keyed by (platform,
+#: instance event type), each with the native kind it maps to (the fixtures
+#: README's enumerated list). Anything else is dropped and counted (R7b).
+_CHAT_MAPPINGS: Mapping[tuple[str, str], _ChatMapping] = MappingProxyType(
+    {
+        ("twitch", "ChatMessage"): _ChatMapping(
+            EVENT_KIND_DEFAULT, "user", "messageId", "text", _TWITCH_CHANNEL
+        ),
+        ("twitch", "Sub"): _ChatMapping(
+            "sub", "user", "messageId", "systemMessage", _TWITCH_CHANNEL
+        ),
+        ("twitch", "ReSub"): _ChatMapping(
+            "resub", "user", "messageId", "systemMessage", _TWITCH_CHANNEL
+        ),
+        ("twitch", "GiftSub"): _ChatMapping(
+            "sub_gift", "user", "messageId", "systemMessage", _TWITCH_CHANNEL
+        ),
+        ("twitch", "GiftBomb"): _ChatMapping(
+            "community_sub_gift", "user", "messageId", "systemMessage", _TWITCH_CHANNEL
+        ),
+        ("twitch", "Raid"): _ChatMapping("raid", "raider", None, None, _TWITCH_CHANNEL),
+        ("twitch", "Follow"): _ChatMapping("follow", "targetUser", None, None, _TWITCH_CHANNEL),
+        ("kick", "ChatMessage"): _ChatMapping(
+            EVENT_KIND_DEFAULT, "user", "messageId", "text", None
+        ),
+        ("kick", "Follow"): _ChatMapping("follow", "user", None, None, None),
+        ("kick", "Subscription"): _ChatMapping("sub", "user", None, None, None),
+        ("kick", "Resubscription"): _ChatMapping("resub", "user", None, None, None),
+        ("kick", "GiftSubscription"): _ChatMapping("sub_gift", "user", None, None, None),
+        ("youtube", "Message"): _ChatMapping(
+            EVENT_KIND_DEFAULT, "user", "eventId", "message", _YOUTUBE_CHANNEL
+        ),
+        ("youtube", "NewSponsor"): _ChatMapping(
+            "sub", "user", "eventId", None, _YOUTUBE_CHANNEL
+        ),
+        ("youtube", "MemberMileStone"): _ChatMapping(
+            "resub", "user", "eventId", "message", _YOUTUBE_CHANNEL, text_optional=True
+        ),
+        ("youtube", "MembershipGift"): _ChatMapping(
+            "sub_gift", "user", "eventId", None, _YOUTUBE_CHANNEL
+        ),
+        ("youtube", "SuperChat"): _ChatMapping(
+            "tip", "user", "eventId", "message", _YOUTUBE_CHANNEL, text_optional=True
+        ),
+        ("youtube", "SuperSticker"): _ChatMapping(
+            "tip", "user", "eventId", None, _YOUTUBE_CHANNEL
+        ),
+    }
+)
+
+#: The instance's badge names mapped to the claim each attests (twitch, kick).
+_BADGE_CLAIMS: Mapping[str, str] = MappingProxyType(
+    {
+        "broadcaster": "broadcaster",
+        "moderator": "moderator",
+        "subscriber": "subscription",
+        "founder": "subscription",
+        "vip": "vip",
+    }
+)
+#: The instance's user flags mapped to the claim each attests (youtube).
+_FLAG_CLAIMS: tuple[tuple[str, str], ...] = (
+    ("isOwner", "broadcaster"),
+    ("isModerator", "moderator"),
+    ("isSponsor", "subscription"),
+)
+#: Where each platform's instance user reports its roles.
+_ROLES_FROM_BADGES = "badges"
+_ROLES_FROM_FLAGS = "flags"
+_ROLE_SOURCES: Mapping[str, str] = MappingProxyType(
+    {"twitch": _ROLES_FROM_BADGES, "kick": _ROLES_FROM_BADGES, "youtube": _ROLES_FROM_FLAGS}
+)
+_DERIVED_ID_LENGTH = 32
+
+
+def _chat_platform(frame: Mapping[str, Any]) -> tuple[str, str] | None:
+    """The (platform, instance event type) a frame's envelope names."""
+
+    event = frame.get("event")
+    if not isinstance(event, Mapping):
+        return None
+    source, event_type = event.get("source"), event.get("type")
+    for platform, spelled in _PLATFORM_SOURCES.items():
+        if source == spelled and isinstance(event_type, str):
+            return platform, event_type
+    return None
+
+
+def _identifier(value: Any) -> str | None:
+    """An account or event id as text: an integer, or a non-blank string."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    return value if _is_text(value) else None
+
+
+def _channel_at(data: Mapping[str, Any], path: tuple[str, ...] | None) -> str | None:
+    """The broadcaster's account id at *path* in *data*, when documented."""
+
+    if path is None:
+        return None
+    value: Any = data
+    for key in path:
+        value = value.get(key) if isinstance(value, Mapping) else None
+    return _identifier(value)
+
+
+def _derived_message_id(frame: Mapping[str, Any]) -> str | None:
+    """A stable id for an event the instance documents without one.
+
+    The digest of the whole frame: the same frame sent again is the same
+    event (the engine's dedup window then applies), and two events differ by
+    their timestamp or their author.
+    """
+
+    try:
+        canonical = json.dumps(frame, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{MODULE_NAME}-{digest[:_DERIVED_ID_LENGTH]}"
+
+
+def _instance_claims(
+    platform: str, user: Mapping[str, Any], author_id: str, channel_id: str
+) -> tuple[tuple[TrustedClaim, ...], bool]:
+    """The role claims the instance reports for *user*, and whether it
+    reported any role source at all (a badge list, the user flags, or the
+    author being the broadcaster). Every claim's provenance is this module."""
+
+    claims: list[TrustedClaim] = []
+    names: set[str] = set()
+
+    def claim(name: str) -> None:
+        if name not in names:
+            names.add(name)
+            claims.append(TrustedClaim(name, provenance=MODULE_NAME))
+
+    attested = author_id == channel_id
+    if attested:
+        claim("broadcaster")
+    if _ROLE_SOURCES[platform] == _ROLES_FROM_FLAGS:
+        if any(flag in user for flag, _ in _FLAG_CLAIMS):
+            attested = True
+        for flag, name in _FLAG_CLAIMS:
+            if user.get(flag) is True:
+                claim(name)
+    else:
+        badges = user.get(_ROLES_FROM_BADGES)
+        if isinstance(badges, (list, tuple)):
+            attested = True
+            for badge in badges:
+                badge_name = badge.get("name") if isinstance(badge, Mapping) else None
+                name = _BADGE_CLAIMS.get(badge_name) if isinstance(badge_name, str) else None
+                if name is not None:
+                    claim(name)
+    return tuple(claims), attested
+
+
+def chat_event(
+    frame: Mapping[str, Any],
+    instance_identity: Mapping[str, str],
+    *,
+    trust_roles: bool = False,
+) -> tuple[dict[str, Any], tuple[TrustedClaim, ...]] | None:
+    """The normalised event of one chat or notice frame and its trusted
+    claims, or ``None`` (R7b).
+
+    The frame's (platform, event type) must be in :data:`_CHAT_MAPPINGS`.
+    The payload has exactly the native input's keys — ``platform``,
+    ``channel_id``, ``author``, ``message_id``, ``text``, and ``kind`` only
+    for a notice. A documented field the mapping needs and the frame lacks —
+    the author, its id, the chat or required notice text, the channel with no
+    ``instance_identity`` for the platform — gives ``None``, as does an
+    author id holding ``:`` or an anonymous gift (no author to map). Role
+    claims are returned, and ``author.roles`` with ``roles_provenance`` =
+    this module emitted, only when *trust_roles* is true and the instance
+    reported a role source; otherwise there are none.
+    """
+
+    named = _chat_platform(frame)
+    mapping = _CHAT_MAPPINGS.get(named) if named is not None else None
+    data = frame.get("data")
+    if mapping is None or not isinstance(data, Mapping):
+        return None
+    platform = named[0]
+    if data.get("isAnonymous") is True:
+        return None
+    user = data.get(mapping.author)
+    if not isinstance(user, Mapping):
+        return None
+    author_id = _identifier(user.get("id"))
+    if author_id is None or _RESERVED_SEPARATOR in author_id:
+        return None
+    channel_id = _channel_at(data, mapping.channel) or instance_identity.get(platform)
+    if not _is_text(channel_id):
+        return None
+    if mapping.message_id is None:
+        message_id = _derived_message_id(frame)
+    else:
+        message_id = _identifier(data.get(mapping.message_id))
+    if message_id is None:
+        return None
+    text = data.get(mapping.text) if mapping.text is not None else ""
+    if not isinstance(text, str):
+        if not mapping.text_optional:
+            return None
+        text = ""
+
+    author: dict[str, Any] = {"id": author_id}
+    if _is_text(user.get("name")):
+        author["display_name"] = user["name"]
+    claims: tuple[TrustedClaim, ...] = ()
+    if trust_roles:
+        claims, attested = _instance_claims(platform, user, author_id, channel_id)
+        if attested:
+            author["roles"] = [claim.name for claim in claims]
+            author["roles_provenance"] = MODULE_NAME
+    payload: dict[str, Any] = {
+        "platform": platform,
+        "channel_id": channel_id,
+        "author": author,
+        "message_id": message_id,
+        "text": text,
+    }
+    if mapping.kind != EVENT_KIND_DEFAULT:
+        payload["kind"] = mapping.kind
+    event = {
+        "type": _CHAT_EVENT,
+        "payload": payload,
+        "metadata": {"source": MODULE_NAME, "schema_version": NORMALIZED_SCHEMA_VERSION},
+    }
+    return event, claims
+
 
 # --------------------------------------------------------------------------- #
 # The handle
@@ -1179,6 +1468,7 @@ class AutomationBridge:
         self._bus = getattr(context, "bus", None)
         self._triggers = getattr(context, "triggers", None)
         self._inputs = getattr(context, "inputs", None)
+        self._chat = getattr(context, "chat", None)
         # A shared scheduler is fed by the producer that decided the trigger
         # (the brain admits into an owned one only), so an accepted cue is
         # admitted here, as the native chat inputs admit theirs.
@@ -1187,6 +1477,7 @@ class AutomationBridge:
         self._instance_identity: Mapping[str, str] = MappingProxyType(
             dict(settings.get(_SETTING_INSTANCE_IDENTITY) or {})
         )
+        self._trust_roles = settings.get(_SETTING_TRUST_INSTANCE_ROLES) is True
         self._queue: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue(
             maxsize=int(settings.get(_SETTING_QUEUE_MAX_EVENTS, _DEFAULT_QUEUE_MAX_EVENTS))
         )
@@ -1273,32 +1564,36 @@ class AutomationBridge:
         decision, then the publication — the bus carries the event decided
         either way, and its consumer reads the recorded decision — then the
         decision's trace, then — accepted, with a scheduler in the context —
-        the admission. A cue for a platform this module does not own is
-        dropped here, before the ownership guard would count it.
+        the admission. A chat event past the dedup window feeds the shared
+        transcript before it is decided, as the native inputs feed theirs. A cue or a chat event for a platform this module does
+        not own is dropped here, before the ownership guard would count it.
         """
 
-        event = cue_event(frame, self._instance_identity)
-        if event is None or not self._owns(_CUES_FAMILY, event["payload"]["platform"]):
+        mapped = self._map(frame)
+        if mapped is None:
             self._drop()
             return
-        payload, metadata = event["payload"], event["metadata"]
+        event, claims = mapped
+        payload = event["payload"]
         engine = self._triggers
         decision = None
+        if engine is not None and engine.recorded(
+            platform=payload["platform"],
+            channel_id=payload["channel_id"],
+            source_event_id=payload["message_id"],
+        ) is not None:
+            return
+        if not _is_cue_frame(frame):
+            self._feed_chat_context(payload)
         if engine is not None:
-            if engine.recorded(
-                platform=payload["platform"],
-                channel_id=payload["channel_id"],
-                source_event_id=payload["message_id"],
-            ) is not None:
-                return
             try:
-                decision = engine.evaluate(event, context=TriggerContext(()))
+                decision = engine.evaluate(event, context=TriggerContext(claims))
             except Exception:
                 # Fail closed: published below, but nothing reads a decision.
                 decision = None
         if self._bus is not None:
             try:
-                await self._bus.publish(_CHAT_EVENT, payload, metadata)
+                await self._bus.publish(_CHAT_EVENT, payload, event["metadata"])
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1308,8 +1603,55 @@ class AutomationBridge:
             if decision.accepted and self._scheduler is not None:
                 self._admit(event)
 
+    def _map(
+        self, frame: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], tuple[TrustedClaim, ...]] | None:
+        """The normalised event of *frame* and its trusted claims, or
+        ``None`` for anything to drop (R7).
+
+        A custom event is a cue, kept when this module owns (``cues``, P);
+        any other frame is mapped through :data:`_CHAT_MAPPINGS`, kept when
+        this module owns (``chat``, P). A cue never carries claims; a chat
+        event carries the instance's only under ``trust_instance_roles``.
+        """
+
+        if _is_cue_frame(frame):
+            event = cue_event(frame, self._instance_identity)
+            mapped = None if event is None else (event, ())
+            family = _CUES_FAMILY
+        else:
+            mapped = chat_event(
+                frame, self._instance_identity, trust_roles=self._trust_roles
+            )
+            family = _CHAT_FAMILY
+        if mapped is None or not self._owns(family, mapped[0]["payload"]["platform"]):
+            return None
+        return mapped
+
+    def _feed_chat_context(self, payload: Mapping[str, Any]) -> None:
+        """Append one mapped chat event to the shared transcript (R7b).
+
+        The bridge owning (chat, P) means the native input no longer feeds it;
+        a failed append changes nothing about what is decided.
+        """
+
+        if self._chat is None:
+            return
+        try:
+            self._chat.append(
+                payload["platform"],
+                payload["channel_id"],
+                ChatEntry(
+                    author_id=payload["author"]["id"],
+                    message_id=payload["message_id"],
+                    text=payload["text"],
+                ),
+            )
+        except Exception:
+            pass
+
     def _admit(self, event: Mapping[str, Any]) -> None:
-        """Hand the accepted cue to the scheduler and return at once.
+        """Hand the accepted event to the scheduler and return at once.
 
         The scheduler copies the event, decides and traces its own admission;
         a refusal or a failure here changes nothing about what was decided.
