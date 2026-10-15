@@ -14,22 +14,56 @@ any socket opens. Ownership-aware (D7): when the runtime hands it the pairs
 this module owns, a (``chat``, P) pair without a configured companion
 identity for P is refused naming the platform.
 
-At this stage the handle opens no connection: ``prepare`` binds
-``automation.action.run`` to a provider that answers ``refused
-provider_not_ready`` and never marks the module ready, so the executor
-refuses every run before the provider is reached. No endpoint, port,
-password, version or action name has a default anywhere (R6).
+**The connection (R6).** One ``aiohttp`` client session holds at most one
+WebSocket to the configured ``url``. ``prepare`` binds
+``automation.action.run``; ``start_inputs`` makes the first attempt — read
+the hello, answer its challenge when it carries one, read the inventory — and
+only then marks the action ready and reports ``module.ready``. Each step has
+its own deadline. An attempt that fails never fails startup (R1): it is one
+``module.degraded`` record carrying one of five value-free reasons
+(``unreachable``, ``authentication_failed``, ``authentication_required``,
+``protocol_error``, ``inventory_unavailable``), and a connection-owner task
+spawned through the context retries with a capped, jitter-free exponential
+backoff on the context clock. A lost connection withdraws readiness at once
+and reports ``degraded`` (``unreachable``); a reconnection that succeeds
+reports ``ready`` again. Events the instance sends while disconnected are
+lost.
+
+One reader per connection resolves each answer to its request's future; when
+the connection ends, every pending future fails with
+:class:`ConnectionClosed`. ``stop_inputs`` stops the owner and leaves an open
+connection to ``close``, which fails what is still pending and closes the
+socket within the coordinator's close budget. A cancellation of the owner
+outside shutdown releases the connection and propagates.
+
+Until the allowlist arrives the run provider answers ``refused
+provider_not_ready``; the executor refuses first anyway while the bridge is
+not ready. Nothing here logs: the URL, the password and frame text never
+reach a trace or a diagnostic, only reasons do. No endpoint, port, password,
+version or action name has a default anywhere (R6).
+
+**Seam, for the tests.** ``_sleeper`` (the sleep the backoff waits on,
+``asyncio.sleep`` by default) is read from *settings* at ``activate`` and
+never from a configuration file.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 import ipaddress
+import itertools
+import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
+import aiohttp
 import yaml
 
 from core.actions import ERROR_PROVIDER_NOT_READY
@@ -76,6 +110,9 @@ _SETTING_TRUST_INSTANCE_ROLES = "trust_instance_roles"
 #: The reserved setting the entry point hands its accepted ``limits`` block
 #: over in (``core.main.LIMITS_KEY``). Accepted, never read.
 _ACCEPTED_LIMITS_SETTING = "limits"
+#: The test seam: the sleeper the reconnection backoff waits on. Read at
+#: ``activate`` from code-built settings, never from a configuration file.
+_SEAM_SLEEPER = "_sleeper"
 
 _SETTINGS = frozenset(
     {
@@ -90,6 +127,7 @@ _SETTINGS = frozenset(
         _SETTING_INSTANCE_IDENTITY,
         _SETTING_TRUST_INSTANCE_ROLES,
         _ACCEPTED_LIMITS_SETTING,
+        _SEAM_SLEEPER,
     }
 )
 _DEADLINE_FIELDS = (
@@ -145,6 +183,9 @@ def validate_settings(settings: Any, *, owned_inputs: Any = None) -> list[str]:
         diagnostics.append(_setting_diagnostic(_SETTING_URL, "must be a non-empty string"))
     else:
         diagnostics.extend(_url_diagnostics(url))
+
+    if _SEAM_SLEEPER in settings and not callable(settings[_SEAM_SLEEPER]):
+        diagnostics.append(_setting_diagnostic(_SEAM_SLEEPER, "must be callable"))
 
     if _SETTING_PASSWORD in settings and not isinstance(settings[_SETTING_PASSWORD], str):
         diagnostics.append(_setting_diagnostic(_SETTING_PASSWORD, "must be a string"))
@@ -264,17 +305,28 @@ def _reconnect_diagnostics(settings: Mapping[str, Any]) -> list[str]:
             diagnostics.append(_setting_diagnostic(label, "must be a finite positive number"))
         else:
             valid[key] = reconnect[key]
-    if (
-        _MIN_DELAY_FIELD in valid
-        and _MAX_DELAY_FIELD in valid
-        and valid[_MIN_DELAY_FIELD] > valid[_MAX_DELAY_FIELD]
-    ):
-        diagnostics.append(
-            _setting_diagnostic(
-                f"{_SETTING_RECONNECT}.{_MIN_DELAY_FIELD}",
-                f"must not exceed {_MAX_DELAY_FIELD}",
+    if any(key in reconnect and key not in valid for key in _RECONNECT_FIELDS):
+        return diagnostics
+    # The bounds are compared after the defaults apply: an omitted field is
+    # its default, and a configured maximum is never raised silently (R6).
+    minimum = valid.get(_MIN_DELAY_FIELD, _DEFAULT_MIN_DELAY_SECONDS)
+    maximum = valid.get(_MAX_DELAY_FIELD, _DEFAULT_MAX_DELAY_SECONDS)
+    if minimum > maximum:
+        if _MIN_DELAY_FIELD in valid:
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{_SETTING_RECONNECT}.{_MIN_DELAY_FIELD}",
+                    f"must not exceed {_MAX_DELAY_FIELD}",
+                )
             )
-        )
+        else:
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{_SETTING_RECONNECT}.{_MAX_DELAY_FIELD}",
+                    f"must not be below {_MIN_DELAY_FIELD} "
+                    f"(default {_DEFAULT_MIN_DELAY_SECONDS:g})",
+                )
+            )
     return diagnostics
 
 
@@ -434,16 +486,216 @@ def declared_run_spec() -> ActionSpec:
 
 
 # --------------------------------------------------------------------------- #
+# The connection (R6)
+# --------------------------------------------------------------------------- #
+
+#: The five value-free reasons a connection attempt reports (R1).
+REASON_UNREACHABLE = "unreachable"
+REASON_AUTHENTICATION_FAILED = "authentication_failed"
+REASON_AUTHENTICATION_REQUIRED = "authentication_required"
+REASON_PROTOCOL_ERROR = "protocol_error"
+REASON_INVENTORY_UNAVAILABLE = "inventory_unavailable"
+DEGRADED_REASONS = (
+    REASON_UNREACHABLE,
+    REASON_AUTHENTICATION_FAILED,
+    REASON_AUTHENTICATION_REQUIRED,
+    REASON_PROTOCOL_ERROR,
+    REASON_INVENTORY_UNAVAILABLE,
+)
+
+#: The manifest's declared defaults, applied when a field is absent.
+_DEFAULT_DEADLINES = {
+    "connect_seconds": 5.0,
+    "authentication_seconds": 5.0,
+    "request_seconds": 5.0,
+    "acknowledgement_seconds": 10.0,
+}
+_DEFAULT_MIN_DELAY_SECONDS = 1.0
+_DEFAULT_MAX_DELAY_SECONDS = 60.0
+
+_OWNER_TASK = "automation-bridge.connection"
+
+#: How long ``start_inputs`` waits for the first attempt to settle. Well
+#: inside the coordinator's default hook timeout (60 s), whatever deadlines
+#: are configured: an instance that withholds its answers leaves the bridge
+#: degraded instead of exhausting the startup budget (R1).
+_STARTUP_ATTEMPT_SECONDS = 10.0
+
+_REQUEST_HELLO = "Hello"
+_REQUEST_AUTHENTICATE = "Authenticate"
+_REQUEST_GET_ACTIONS = "GetActions"
+_STATUS_OK = "ok"
+
+Sleeper = Callable[[float], Awaitable[Any]]
+
+
+class ConnectionClosed(Exception):
+    """A request whose connection ended before its answer arrived.
+
+    The generic outcome every pending request future is failed with when the
+    connection is lost or the bridge shuts down; the run waiter (P15) maps it
+    to ``acknowledgement_lost`` (D8). The message carries no value.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(f"{MODULE_NAME}: the connection to the instance is closed")
+
+
+class _HandshakeFailure(Exception):
+    """One connection attempt that ended with a degraded *reason*."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class InstanceAction:
+    """One action of the instance's inventory, as ``GetActions`` lists it."""
+
+    id: str
+    name: str
+    group: str | None
+    enabled: bool
+
+
+Inventory = Mapping[str, tuple[InstanceAction, ...]]
+
+
+def authentication_response(password: str, salt: str, challenge: str) -> str:
+    """The instance's documented challenge answer (R6, AC24).
+
+    ``base64(sha256(base64(sha256(password + salt)) + challenge))``.
+    """
+
+    secret = base64.b64encode(hashlib.sha256((password + salt).encode("utf-8")).digest())
+    answer = hashlib.sha256(secret.decode("ascii").encode("utf-8") + challenge.encode("utf-8"))
+    return base64.b64encode(answer.digest()).decode("ascii")
+
+
+def _parse_inventory(answer: Any) -> Inventory | None:
+    """Name → entries of a ``GetActions`` answer; ``None`` when malformed."""
+
+    if not isinstance(answer, Mapping) or answer.get("status") != _STATUS_OK:
+        return None
+    actions = answer.get("actions")
+    if not isinstance(actions, list):
+        return None
+    inventory: dict[str, list[InstanceAction]] = {}
+    for item in actions:
+        if not isinstance(item, Mapping):
+            return None
+        identifier, name = item.get("id"), item.get("name")
+        group, enabled = item.get("group"), item.get("enabled")
+        if not _is_text(identifier) or not _is_text(name) or not isinstance(enabled, bool):
+            return None
+        if group is not None and not isinstance(group, str):
+            return None
+        inventory.setdefault(name, []).append(
+            InstanceAction(id=identifier, name=name, group=group or None, enabled=enabled)
+        )
+    return MappingProxyType({name: tuple(entries) for name, entries in inventory.items()})
+
+
+class _Connection:
+    """One open WebSocket, its reader and its pending requests.
+
+    The reader is the only consumer of the socket: it resolves each answer
+    to the future registered under its request id and hands every other
+    frame to *on_event*. When the socket ends, for any reason, every pending
+    future fails with :class:`ConnectionClosed` and :attr:`lost` is set.
+    """
+
+    def __init__(self, ws: Any, on_event: Callable[[Mapping[str, Any]], None]) -> None:
+        self.ws = ws
+        self.lost = asyncio.Event()
+        self._on_event = on_event
+        self._pending: dict[str, asyncio.Future[Any]] = {}
+        self._ids = itertools.count(1)
+        self.reader: asyncio.Task[None] = asyncio.ensure_future(self._read())
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    async def request(self, frame: Mapping[str, Any], deadline_seconds: float) -> Any:
+        """Send *frame* under a fresh id and return its answer.
+
+        Raises :class:`ConnectionClosed` when the connection ends first and
+        :class:`asyncio.TimeoutError` past *deadline_seconds*.
+        """
+
+        if self.lost.is_set() or self.ws.closed:
+            raise ConnectionClosed()
+        request_id = f"{RUN_PROVIDER}-{next(self._ids)}"
+        answer: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = answer
+        try:
+            try:
+                await self.ws.send_str(json.dumps({**frame, "id": request_id}))
+            except (ConnectionError, aiohttp.ClientError, RuntimeError):
+                raise ConnectionClosed() from None
+            return await asyncio.wait_for(answer, deadline_seconds)
+        finally:
+            self._pending.pop(request_id, None)
+
+    def fail_pending(self) -> None:
+        """Fail every request still waiting; none is left hanging."""
+
+        pending, self._pending = self._pending, {}
+        for answer in pending.values():
+            if not answer.done():
+                answer.set_exception(ConnectionClosed())
+
+    async def close(self) -> None:
+        """Fail what waits, close the socket and stop the reader."""
+
+        self.fail_pending()
+        try:
+            await self.ws.close()
+        finally:
+            if not self.reader.done():
+                self.reader.cancel()
+            await asyncio.gather(self.reader, return_exceptions=True)
+            self.lost.set()
+
+    async def _read(self) -> None:
+        try:
+            async for message in self.ws:
+                if message.type is not aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    frame = json.loads(message.data)
+                except ValueError:
+                    continue
+                if not isinstance(frame, Mapping):
+                    continue
+                request_id = frame.get("id")
+                if isinstance(request_id, str) and "event" not in frame:
+                    answer = self._pending.get(request_id)
+                    if answer is not None and not answer.done():
+                        answer.set_result(frame)
+                    # A late answer to an abandoned request is dropped.
+                    continue
+                self._on_event(frame)
+        except (ConnectionError, aiohttp.ClientError):
+            pass
+        finally:
+            self.fail_pending()
+            self.lost.set()
+
+
+# --------------------------------------------------------------------------- #
 # The handle
 # --------------------------------------------------------------------------- #
 
 
 class _RunProvider:
-    """The run action's provider before any connection exists.
+    """The run action's provider until the allowlist arrives (P15).
 
-    The executor refuses ``provider_not_ready`` first, since the module is
-    never marked ready; a call reaching this provider anyway is refused on
-    the same terms, with nothing sent.
+    The executor refuses ``provider_not_ready`` first while the bridge is not
+    ready; a call reaching this provider anyway is refused on the same terms,
+    with nothing sent.
     """
 
     __slots__ = ()
@@ -464,16 +716,65 @@ class _RunProvider:
 
 
 class AutomationBridge:
-    """The v2 handle: bind the run action at ``prepare``, open nothing yet."""
+    """The v2 handle: one connection, its readiness and its reconnection.
 
-    def __init__(self, context: Any) -> None:
+    ``prepare`` binds the run action. ``start_inputs`` spawns the connection
+    owner — a task spawned through the context — whose first attempt it
+    waits for, bounded, and never raises for its failure: a failure is one
+    ``module.degraded`` record with its reason, and the owner retries with
+    bounded backoff. The
+    bridge is ready only while connected, authenticated and holding the
+    instance's inventory; a lost connection withdraws readiness at once.
+    """
+
+    def __init__(
+        self, context: Any, settings: Mapping[str, Any], *, sleeper: Sleeper
+    ) -> None:
         self._actions = context.actions
+        self._supervision = context.supervision
+        self._tasks = context.tasks
+        self._clock: Callable[[], float] = context.clock
+        self._sleeper = sleeper
+        self._url: str = settings[_SETTING_URL]
+        password = settings.get(_SETTING_PASSWORD)
+        self._password: str | None = password if password else None
+        deadlines = {**_DEFAULT_DEADLINES, **(settings.get(_SETTING_DEADLINES) or {})}
+        self._connect_seconds = float(deadlines["connect_seconds"])
+        self._authentication_seconds = float(deadlines["authentication_seconds"])
+        self._request_seconds = float(deadlines["request_seconds"])
+        reconnect = settings.get(_SETTING_RECONNECT) or {}
+        self._min_delay = float(reconnect.get(_MIN_DELAY_FIELD, _DEFAULT_MIN_DELAY_SECONDS))
+        self._max_delay = float(reconnect.get(_MAX_DELAY_FIELD, _DEFAULT_MAX_DELAY_SECONDS))
         self._provider = _RunProvider()
+        self._session: aiohttp.ClientSession | None = None
+        self._connection: _Connection | None = None
+        self._owner: asyncio.Task[None] | None = None
+        self._inventory: Inventory = MappingProxyType({})
+        # Health reports are serialised so the startup verdict and the
+        # first attempt's own report cannot interleave.
+        self._health = asyncio.Lock()
+        self._first_settled = asyncio.Event()
+        self._first_reported = False
         self._prepared = False
+        self._started = False
+        self._stopping = False
         self._closed = False
 
+    @property
+    def connected(self) -> bool:
+        """Whether a handshake completed and its connection is still open."""
+
+        connection = self._connection
+        return connection is not None and not connection.lost.is_set()
+
+    @property
+    def inventory(self) -> Inventory:
+        """The inventory read at the last successful connection."""
+
+        return self._inventory
+
     async def prepare(self) -> None:
-        """Bind the run action; the module stays not ready (no connection)."""
+        """Bind the run action; the bridge is not ready until connected."""
 
         if self._prepared or self._closed:
             return
@@ -487,19 +788,241 @@ class AutomationBridge:
         self._prepared = True
 
     async def start_inputs(self) -> None:
-        """No source is opened at this stage."""
+        """Hand the connection to its owner and wait for its first attempt.
+
+        Never raises for an unavailable instance (R1): the attempt's failure
+        is reported ``degraded`` with its reason, and the owner retries. The
+        wait is bounded by :data:`_STARTUP_ATTEMPT_SECONDS`; an attempt still
+        pending then is reported ``degraded`` (``unreachable``) and goes on in
+        the owner, which reports its outcome when it settles.
+        """
+
+        if self._started or self._closed:
+            return
+        self._started = True
+        self._session = aiohttp.ClientSession()
+        owner = self._owner = self._tasks.spawn(self._own(), name=_OWNER_TASK)
+        settled = asyncio.ensure_future(self._first_settled.wait())
+        try:
+            await asyncio.wait(
+                {settled, owner},
+                timeout=_STARTUP_ATTEMPT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            settled.cancel()
+        async with self._health:
+            if not self._first_reported:
+                self._first_reported = True
+                await self._supervision.degraded(reason=REASON_UNREACHABLE)
 
     async def stop_inputs(self) -> None:
-        """Nothing to cut: no source was opened."""
+        """Stop the connection owner; an open connection stays for ``close``."""
+
+        self._stopping = True
+        await self._stop_owner()
 
     async def close(self) -> None:
-        """Withdraw readiness; idempotent."""
+        """Withdraw readiness, fail every pending request, close the socket.
+
+        Idempotent. Bounded by the coordinator's close budget.
+        """
 
         if self._closed:
             return
         self._closed = True
+        self._stopping = True
         if self._prepared:
             self._actions.mark_not_ready()
+        await self._stop_owner()
+        connection, self._connection = self._connection, None
+        try:
+            if connection is not None:
+                await connection.close()
+        finally:
+            session, self._session = self._session, None
+            if session is not None:
+                await session.close()
+
+    # -- the connection owner ------------------------------------------------ #
+
+    async def _own(self) -> None:
+        """Hold the connection; on loss, degrade at once and reconnect.
+
+        The delay starts at the minimum after every loss and doubles after
+        each failed attempt, capped at the maximum (no jitter). A cancellation
+        outside shutdown releases the connection and propagates.
+        """
+
+        delay = self._min_delay
+        try:
+            await self._attempt()
+            while True:
+                connection = self._connection
+                if connection is not None:
+                    await connection.lost.wait()
+                    await self._lose(connection)
+                    delay = self._min_delay
+                await self._pause(delay)
+                delay = min(delay * 2, self._max_delay)
+                await self._attempt()
+        except asyncio.CancelledError:
+            if not self._stopping:
+                # Cancelled outside shutdown: the connection has no owner any
+                # more, so it is released and the loss is reported (R6).
+                connection, self._connection = self._connection, None
+                self._actions.mark_not_ready()
+                try:
+                    if connection is not None:
+                        await connection.close()
+                finally:
+                    await self._supervision.degraded(reason=REASON_UNREACHABLE)
+            raise
+
+    async def _pause(self, delay: float) -> None:
+        """Wait *delay* seconds on the context clock, via the sleeper."""
+
+        resume_at = self._clock() + delay
+        remaining = delay
+        while remaining > 0:
+            await self._sleeper(remaining)
+            remaining = resume_at - self._clock()
+
+    async def _stop_owner(self) -> None:
+        owner, self._owner = self._owner, None
+        if owner is None or owner.done():
+            return
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+
+    async def _lose(self, connection: _Connection) -> None:
+        """A lost connection: not ready at once, then one degraded record."""
+
+        if self._connection is connection:
+            self._connection = None
+        self._actions.mark_not_ready()
+        await connection.close()
+        await self._supervision.degraded(reason=REASON_UNREACHABLE)
+
+    async def _attempt(self) -> bool:
+        """One connection attempt; ready on success, degraded otherwise."""
+
+        try:
+            connection, inventory = await self._handshake()
+        except _HandshakeFailure as failure:
+            async with self._health:
+                self._first_reported = True
+                await self._supervision.degraded(reason=failure.reason)
+            self._first_settled.set()
+            return False
+        self._inventory = inventory
+        self._connection = connection
+        # Reconcile (P15) and subscribe (P16) go here, before readiness.
+        async with self._health:
+            self._first_reported = True
+            self._actions.mark_ready()
+            await self._supervision.ready()
+        self._first_settled.set()
+        return True
+
+    async def _handshake(self) -> tuple[_Connection, Inventory]:
+        """Connect, read the hello, authenticate, read the inventory.
+
+        Each step is bounded by its own deadline; a failure closes whatever
+        was opened and raises :class:`_HandshakeFailure` with its reason.
+        """
+
+        session = self._session
+        if session is None:
+            raise _HandshakeFailure(REASON_UNREACHABLE)
+        try:
+            ws = await asyncio.wait_for(
+                session.ws_connect(self._url, compress=0), self._connect_seconds
+            )
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError):
+            raise _HandshakeFailure(REASON_UNREACHABLE) from None
+        connection: _Connection | None = None
+        try:
+            hello = await self._receive_hello(ws)
+            connection = _Connection(ws, self._on_event)
+            await self._authenticate(connection, hello)
+            try:
+                answer = await connection.request(
+                    {"request": _REQUEST_GET_ACTIONS}, self._request_seconds
+                )
+            except ConnectionClosed:
+                raise _HandshakeFailure(REASON_UNREACHABLE) from None
+            except asyncio.TimeoutError:
+                raise _HandshakeFailure(REASON_INVENTORY_UNAVAILABLE) from None
+            inventory = _parse_inventory(answer)
+            if inventory is None:
+                raise _HandshakeFailure(REASON_INVENTORY_UNAVAILABLE)
+            if connection.lost.is_set():
+                raise _HandshakeFailure(REASON_UNREACHABLE)
+            return connection, inventory
+        except BaseException:
+            if connection is not None:
+                await connection.close()
+            else:
+                await ws.close()
+            raise
+
+    async def _receive_hello(self, ws: Any) -> Mapping[str, Any]:
+        try:
+            message = await asyncio.wait_for(ws.receive(), self._authentication_seconds)
+        except asyncio.TimeoutError:
+            raise _HandshakeFailure(REASON_PROTOCOL_ERROR) from None
+        except (ConnectionError, aiohttp.ClientError):
+            raise _HandshakeFailure(REASON_UNREACHABLE) from None
+        if message.type in (
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSING,
+            aiohttp.WSMsgType.CLOSED,
+            aiohttp.WSMsgType.ERROR,
+        ):
+            raise _HandshakeFailure(REASON_UNREACHABLE)
+        if message.type is not aiohttp.WSMsgType.TEXT:
+            raise _HandshakeFailure(REASON_PROTOCOL_ERROR)
+        try:
+            hello = json.loads(message.data)
+        except ValueError:
+            raise _HandshakeFailure(REASON_PROTOCOL_ERROR) from None
+        if not isinstance(hello, Mapping) or hello.get("request") != _REQUEST_HELLO:
+            raise _HandshakeFailure(REASON_PROTOCOL_ERROR)
+        return hello
+
+    async def _authenticate(self, connection: _Connection, hello: Mapping[str, Any]) -> None:
+        """Answer the hello's challenge, when it carries one."""
+
+        if "authentication" not in hello:
+            return
+        challenge = hello["authentication"]
+        if not isinstance(challenge, Mapping) or not all(
+            isinstance(challenge.get(key), str) for key in ("salt", "challenge")
+        ):
+            raise _HandshakeFailure(REASON_PROTOCOL_ERROR)
+        if self._password is None:
+            raise _HandshakeFailure(REASON_AUTHENTICATION_REQUIRED)
+        response = authentication_response(
+            self._password, challenge["salt"], challenge["challenge"]
+        )
+        try:
+            answer = await connection.request(
+                {"request": _REQUEST_AUTHENTICATE, "authentication": response},
+                self._authentication_seconds,
+            )
+        except ConnectionClosed:
+            raise _HandshakeFailure(REASON_UNREACHABLE) from None
+        except asyncio.TimeoutError:
+            raise _HandshakeFailure(REASON_AUTHENTICATION_FAILED) from None
+        if not isinstance(answer, Mapping) or answer.get("status") != _STATUS_OK:
+            raise _HandshakeFailure(REASON_AUTHENTICATION_FAILED)
+
+    def _on_event(self, frame: Mapping[str, Any]) -> None:
+        """An inbound event. Subscriptions and the bounded queue come in P16;
+        until then nothing is subscribed and an event is not ingested."""
+
+        del frame
 
 
 # --------------------------------------------------------------------------- #
@@ -516,14 +1039,25 @@ async def activate(
 
     Nothing here reaches the network. Settings are checked through the same
     hook the loader ran, so a handle built outside the loader is refused on
-    the same terms; the diagnostics themselves are never raised.
+    the same terms; the diagnostics themselves are never raised. The
+    ``_sleeper`` seam is read from *settings* (``asyncio.sleep`` by default).
     """
 
     del catalog
     actions = getattr(context, "actions", None)
-    if actions is None or not all(
-        callable(getattr(actions, method, None))
-        for method in ("register", "mark_ready", "mark_not_ready")
+    supervision = getattr(context, "supervision", None)
+    tasks = getattr(context, "tasks", None)
+    if (
+        actions is None
+        or not all(
+            callable(getattr(actions, method, None))
+            for method in ("register", "mark_ready", "mark_not_ready")
+        )
+        or not all(
+            callable(getattr(supervision, method, None)) for method in ("ready", "degraded")
+        )
+        or not callable(getattr(tasks, "spawn", None))
+        or not callable(getattr(context, "clock", None))
     ):
         raise AutomationBridgeError(f"{MODULE_NAME} activation: runtime context is invalid")
     if not isinstance(settings, Mapping):
@@ -534,19 +1068,30 @@ async def activate(
             f"{MODULE_NAME} configuration: settings were refused "
             f"({len(diagnostics)} diagnostics)"
         )
-    return AutomationBridge(context)
+    return AutomationBridge(
+        context, settings, sleeper=settings.get(_SEAM_SLEEPER, asyncio.sleep)
+    )
 
 
 __all__ = [
     "ACKNOWLEDGEMENT_MARGIN_SECONDS",
     "CHAT_PLATFORMS",
+    "DEGRADED_REASONS",
     "MANIFEST_PATH",
     "MODULE_NAME",
+    "REASON_AUTHENTICATION_FAILED",
+    "REASON_AUTHENTICATION_REQUIRED",
+    "REASON_INVENTORY_UNAVAILABLE",
+    "REASON_PROTOCOL_ERROR",
+    "REASON_UNREACHABLE",
     "RUN_ACTION",
     "RUN_PROVIDER",
     "AutomationBridge",
     "AutomationBridgeError",
+    "ConnectionClosed",
+    "InstanceAction",
     "activate",
+    "authentication_response",
     "declared_run_spec",
     "run_action_timeout_seconds",
     "validate_settings",

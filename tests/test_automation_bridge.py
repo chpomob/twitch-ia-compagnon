@@ -9,15 +9,26 @@ and the vendor-free kernel (AC11, re-run). Nothing here opens a socket.
 Plan step P13 adds the instance fixtures' provenance guard (R8, AC35) and
 :class:`FakeInstance`, the loopback WebSocket server that replays them; only
 its own self-tests open a socket, on ``127.0.0.1``.
+
+Plan step P14 adds the connection lifecycle against :class:`FakeInstance`:
+startup that never fails (R1; AC3 run-action half, AC4), the challenge answer
+and readiness only after the inventory (R6, AC24), the degraded/ready pair
+around a lost connection and the capped backoff on an injected clock (AC25),
+cancellation and shutdown (AC28 connection half), and the password sweep over
+these scenarios (AC23).
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import hashlib
 import json
+import logging
 import math
 import re
+import socket
 import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -33,14 +44,17 @@ import pytest
 import yaml
 from aiohttp import WSMsgType, web
 
+from core import main as application
 from core.actions import ERROR_PROVIDER_NOT_READY, AuthorizationRule
 from core.contracts import (
+    TRACE_MODULE_DEGRADED,
+    TRACE_MODULE_READY,
     ActionCall,
     ContractError,
     Destination,
     validate_against_schema,
 )
-from core.lifecycle import PhaseCoordinator
+from core.lifecycle import DEFAULT_HOOK_TIMEOUT_SECONDS, PhaseCoordinator
 from core.loader import ModuleLoader, _validate_manifest
 from core.runtime import RUNTIME_API, OwnedInputs
 from core.triggers import TriggerRegistry
@@ -377,6 +391,19 @@ def test_reconnect_delays_and_the_queue_bound_are_checked() -> None:
     assert validate_settings(_with(reconnect={"max_delay_seconds": math.nan})) == [
         _diagnostic("reconnect.max_delay_seconds", "must be a finite positive number")
     ]
+    # The bounds are compared after the defaults apply (min 1, max 60): a
+    # configured maximum is never raised silently to the default minimum.
+    assert validate_settings(_with(reconnect={"max_delay_seconds": 0.5})) == [
+        _diagnostic(
+            "reconnect.max_delay_seconds", "must not be below min_delay_seconds (default 1)"
+        )
+    ]
+    assert validate_settings(_with(reconnect={"min_delay_seconds": 120})) == [
+        _diagnostic("reconnect.min_delay_seconds", "must not exceed max_delay_seconds")
+    ]
+    assert validate_settings(
+        _with(reconnect={"min_delay_seconds": 0.25, "max_delay_seconds": 0.5})
+    ) == []
     for value in (0, -3, 1.5, True):
         assert validate_settings(_with(queue_max_events=value)) == [
             _diagnostic("queue_max_events", "must be a positive integer")
@@ -794,6 +821,8 @@ class FakeInstance:
     - ``malformed_hello`` sends :data:`MALFORMED_HELLO` instead of a hello;
     - ``fail_inventory`` answers ``GetActions`` with the error frame;
     - ``inventory`` picks the ``get_actions`` frame (default: the first);
+    - ``hold_inventory`` delays every ``GetActions`` answer until
+      :meth:`release_inventory`;
     - ``reject_runs`` answers ``DoAction`` with the error frame;
     - ``hold_acknowledgements`` delays every ``DoAction`` answer until
       :meth:`release_acknowledgements`;
@@ -812,6 +841,7 @@ class FakeInstance:
         malformed_hello: bool = False,
         fail_inventory: bool = False,
         inventory: int = 0,
+        hold_inventory: bool = False,
         reject_runs: bool = False,
         hold_acknowledgements: bool = False,
         withhold_acknowledgements: bool = False,
@@ -821,6 +851,7 @@ class FakeInstance:
         self.malformed_hello = malformed_hello
         self.fail_inventory = fail_inventory
         self.inventory = inventory
+        self.hold_inventory = hold_inventory
         self.reject_runs = reject_runs
         self.hold_acknowledgements = hold_acknowledgements
         self.withhold_acknowledgements = withhold_acknowledgements
@@ -834,6 +865,7 @@ class FakeInstance:
         self._runner: web.AppRunner | None = None
         self._socket: web.WebSocketResponse | None = None
         self._released = asyncio.Event()
+        self._inventory_released = asyncio.Event()
         self._changed = asyncio.Event()
         self._pending: set[asyncio.Task[None]] = set()
 
@@ -890,6 +922,9 @@ class FakeInstance:
 
     def release_acknowledgements(self) -> None:
         self._released.set()
+
+    def release_inventory(self) -> None:
+        self._inventory_released.set()
 
     async def close_connection(self) -> None:
         socket = self._socket
@@ -949,6 +984,10 @@ class FakeInstance:
                 if self.fail_inventory
                 else fixture_frame("get_actions", self.inventory)
             )
+            if self.hold_inventory:
+                reply["id"] = frame.get("id")
+                self._answer_later(socket, reply, self._inventory_released)
+                return
         elif name == "Subscribe":
             reply = fixture_frame("subscribe")
             reply["events"] = copy.deepcopy(frame.get("events"))
@@ -960,19 +999,24 @@ class FakeInstance:
             reply = fixture_frame("do_action", 1 if self.reject_runs else 0)
             if self.hold_acknowledgements:
                 reply["id"] = frame.get("id")
-                task = asyncio.ensure_future(self._answer_when_released(socket, reply))
-                self._pending.add(task)
-                task.add_done_callback(self._pending.discard)
+                self._answer_later(socket, reply, self._released)
                 return
         else:
             return
         reply["id"] = frame.get("id")
         await socket.send_json(reply)
 
-    async def _answer_when_released(
-        self, socket: web.WebSocketResponse, reply: dict[str, Any]
+    def _answer_later(
+        self, socket: web.WebSocketResponse, reply: dict[str, Any], gate: asyncio.Event
     ) -> None:
-        await self._released.wait()
+        task = asyncio.ensure_future(self._answer_when_released(socket, reply, gate))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def _answer_when_released(
+        self, socket: web.WebSocketResponse, reply: dict[str, Any], gate: asyncio.Event
+    ) -> None:
+        await gate.wait()
         if not socket.closed:
             await socket.send_json(reply)
 
@@ -1089,3 +1133,597 @@ async def test_fake_instance_stop_ends_the_connection() -> None:
             await fake.stop()
             assert (await _receive(client)).type in (WSMsgType.CLOSE, WSMsgType.CLOSED)
     assert fake.by_request_id["v-1"] == [{"request": "GetActiveViewers", "id": "v-1"}]
+
+
+# -- P14: the connection lifecycle (R1, R6) --------------------------------- #
+
+#: The configured password of the connection scenarios; every sweep looks for
+#: it in every trace, diagnostic and log record (AC4, AC23).
+PASSWORD = "p14-configured-password"
+#: The bound every hook and every wait of these scenarios runs under.
+CLOSE_BUDGET_SECONDS = FAKE_WAIT_SECONDS
+RECONNECT = {"min_delay_seconds": 1, "max_delay_seconds": 4}
+
+
+def _expected_authentication(password: str, salt: str, challenge: str) -> str:
+    """AC24's formula, written out independently of the module."""
+
+    inner = base64.b64encode(hashlib.sha256((password + salt).encode()).digest()).decode()
+    return base64.b64encode(hashlib.sha256((inner + challenge).encode()).digest()).decode()
+
+
+def _silent_loopback_port() -> int:
+    """A loopback port nothing listens on: bound once, then released."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((LOOPBACK, 0))
+        return int(probe.getsockname()[1])
+
+
+async def _until(predicate: Any) -> None:
+    """Yield to the loop until *predicate* holds, bounded; never a sleep."""
+
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(poll(), FAKE_WAIT_SECONDS)
+
+
+class _Bridge:
+    """The bridge activated through the loader on a manual-clock runtime.
+
+    Every trace is recorded; the reconnection sleeper records each delay it
+    is asked for and parks on the manual clock until a test advances it.
+    """
+
+    def __init__(self) -> None:
+        self.clock = ManualClock()
+        self.context = runtime_context(clock=self.clock, trigger_registry=TriggerRegistry())
+        self.traces: list[dict[str, Any]] = []
+        self.context.bus.subscribe("**", self.traces.append, order=100)
+        self.delays: list[float] = []
+        self.diagnostics: list[str] = []
+        self.coordinator: PhaseCoordinator | None = None
+        self.handle: Any = None
+
+    async def sleeper(self, delay: float) -> None:
+        self.delays.append(delay)
+        await self.clock.sleep(delay)
+
+    async def activate(self, **settings: Any) -> None:
+        loader = ModuleLoader(self.context.bus, ROOT / "modules", context=self.context, environ={})
+        activations = await loader.activate_enabled(
+            {
+                "enabled_modules": [MODULE_NAME],
+                "modules": {
+                    MODULE_NAME: {**BASE_SETTINGS, "_sleeper": self.sleeper, **settings}
+                },
+            }
+        )
+        (activation,) = activations
+        self.handle = activation.handle
+        self.coordinator = PhaseCoordinator(
+            activations,
+            tasks=self.context.tasks,
+            reporter=self.diagnostics.append,
+            observer=self.context.health.observe_phase,
+            hook_timeout_seconds=CLOSE_BUDGET_SECONDS,
+        )
+
+    async def start(self, **settings: Any) -> None:
+        await self.activate(**settings)
+        assert self.coordinator is not None
+        report = await asyncio.wait_for(self.coordinator.start(), FAKE_WAIT_SECONDS)
+        assert report.status == 0, report.diagnostics
+
+    async def stop(self) -> None:
+        assert self.coordinator is not None
+        await asyncio.wait_for(self.coordinator.stop(), FAKE_WAIT_SECONDS)
+
+    def records(self, event_type: str) -> list[Mapping[str, Any]]:
+        return [
+            trace["payload"]
+            for trace in self.traces
+            if trace["type"] == event_type and trace["payload"].get("module") == MODULE_NAME
+        ]
+
+    def health(self) -> list[tuple[str, str | None]]:
+        """This module's ready/degraded records, in order, with their reason."""
+
+        return [
+            (trace["type"], trace["payload"].get("reason"))
+            for trace in self.traces
+            if trace["type"] in (TRACE_MODULE_READY, TRACE_MODULE_DEGRADED)
+            and trace["payload"].get("module") == MODULE_NAME
+        ]
+
+    @property
+    def state(self) -> str | None:
+        return self.context.health.state(MODULE_NAME)
+
+    @property
+    def module(self) -> Any:
+        """The bridge package as the loader imported it (its own name)."""
+
+        return sys.modules[type(self.handle).__module__]
+
+    @property
+    def run_ready(self) -> bool:
+        return RUN_ACTION in self.context.actions.registered_ready()
+
+    def sweep(self, logs: str, *needles: str) -> None:
+        """AC4/AC23: no needle in any trace, diagnostic or log record."""
+
+        corpus = "\n".join([*map(repr, self.traces), *self.diagnostics, logs])
+        for needle in needles:
+            assert needle and corpus.count(needle) == 0, "a value leaked"
+
+
+def _frame_texts(fake: FakeInstance) -> tuple[str, ...]:
+    """The URL and the frame text the sweeps look for."""
+
+    challenge = fixture_frame("hello", 1)["authentication"]
+    return (
+        PASSWORD,
+        fake.url,
+        fake.url.removeprefix("ws://").rstrip("/"),
+        challenge["salt"],
+        challenge["challenge"],
+        MALFORMED_HELLO,
+        fixture_frame("hello")["session"],
+        fixture_frame("get_actions")["actions"][0]["id"],
+    )
+
+
+def _grant(destination: Mapping[str, str]) -> dict[str, Any]:
+    return {
+        "rule_id": "grant-run",
+        "action_name": RUN_ACTION,
+        "destination": dict(destination),
+        "principals": [PRINCIPAL],
+        "natures": ["write"],
+        "granted_permissions": ["automation.run"],
+    }
+
+
+#: AC3's calls, one per action the bridge serves while unreachable. P18 adds
+#: the ``users.read`` half here (finding P3).
+AC3_CALLS = [
+    pytest.param(
+        _grant({"platform": "twitch", "channel_id": "channel-1", "scope": "automation"}),
+        _run_call({"action": "A"}),
+        id="run-action",
+    ),
+]
+
+
+@pytest.mark.parametrize(("rule", "call"), AC3_CALLS)
+async def test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degraded_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    rule: dict[str, Any],
+    call: ActionCall,
+) -> None:
+    """AC3 (R1), through the whole ``run``: a profile enabling the bridge on a
+    loopback port where nothing listens reaches readiness; the bridge has
+    exactly 1 ``module.degraded`` (``unreachable``) and, after the startup
+    budget, is still degraded with no ``module.ready`` after that record (the
+    P14 amendment: the count alone would pass with a bridge left ready); a
+    granted call ends ``refused provider_not_ready`` with the provider never
+    invoked, so 0 frames. The outcome is asserted, not the exit status."""
+
+    caplog.set_level(logging.DEBUG)
+    url = f"ws://{LOOPBACK}:{_silent_loopback_port()}/"
+    profile = {
+        "modules_directory": str(ROOT / "modules"),
+        "enabled_modules": [MODULE_NAME],
+        "modules": {
+            MODULE_NAME: {
+                "url": url,
+                "companion_name": "Companion",
+                "password": "${BRIDGE_PASSWORD}",
+            }
+        },
+        "actions": [rule],
+        # The shipped profile's bounds: the trigger engine the bridge's
+        # declaration registers with exists only with a limits block.
+        "limits": yaml.safe_load((ROOT / "config.yaml.example").read_text(encoding="utf-8"))[
+            "limits"
+        ],
+    }
+    path = tmp_path / "profile.yaml"
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+
+    runtimes: list[Any] = []
+    assemble = application._assemble_runtime
+
+    def capture(config: Mapping[str, Any]) -> Any:
+        runtime = assemble(config)
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(application, "_assemble_runtime", capture)
+    traces: list[dict[str, Any]] = []
+    ready = asyncio.Event()
+    stop = asyncio.Event()
+    diagnostics: list[str] = []
+    outcome: dict[str, Any] = {}
+
+    def report_ready(_message: str) -> None:
+        (runtime,) = runtimes
+        runtime.bus.subscribe("**", traces.append, order=100)
+        ready.set()
+
+    async def drive() -> None:
+        try:
+            await asyncio.wait_for(ready.wait(), FAKE_WAIT_SECONDS)
+            (runtime,) = runtimes
+            health = runtime.context.health
+            outcome["state"] = health.state(MODULE_NAME)
+            executor = runtime.context.executor
+            before = executor.provider_invocations
+            outcome["observation"] = await executor.invoke(call)
+            outcome["invocations"] = executor.provider_invocations - before
+        finally:
+            stop.set()
+
+    await asyncio.gather(
+        application.run(
+            path,
+            stop,
+            environ={"BRIDGE_PASSWORD": PASSWORD},
+            ready_reporter=report_ready,
+            diagnostic_reporter=diagnostics.append,
+        ),
+        drive(),
+    )
+    (runtime,) = runtimes
+    history = [*runtime.bus.list_events(), *traces]
+
+    module_records = [
+        (event["type"], event["payload"].get("reason"))
+        for event in runtime.bus.list_events()
+        if event["type"] in (TRACE_MODULE_READY, TRACE_MODULE_DEGRADED)
+        and event["payload"].get("module") == MODULE_NAME
+    ]
+    degraded = [record for record in module_records if record[0] == TRACE_MODULE_DEGRADED]
+    assert degraded == [(TRACE_MODULE_DEGRADED, "unreachable")]
+    after = module_records[module_records.index(degraded[0]) + 1 :]
+    assert all(kind != TRACE_MODULE_READY for kind, _ in after)
+    assert outcome["state"] == "degraded"
+
+    observation = outcome["observation"]
+    assert observation.status == "refused"
+    assert observation.error["code"] == ERROR_PROVIDER_NOT_READY
+    assert outcome["invocations"] == 0
+
+    corpus = "\n".join([*map(repr, history), *diagnostics, caplog.text])
+    assert corpus.count(PASSWORD) == 0
+    assert corpus.count(url) == 0
+
+
+async def test_ac24_the_challenge_answer_and_readiness_only_after_the_inventory(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC24 (R6): the instance receives exactly
+    ``base64(sha256(base64(sha256(password + salt)) + challenge))``, and the
+    bridge is not ready while the inventory is still unanswered — only once
+    it is read; the inventory is kept by name, with id, group and enabled."""
+
+    caplog.set_level(logging.DEBUG)
+    hello = fixture_frame("hello", 1)["authentication"]
+    expected = _expected_authentication(PASSWORD, hello["salt"], hello["challenge"])
+    assert streamerbot.authentication_response(
+        PASSWORD, hello["salt"], hello["challenge"]
+    ) == expected
+
+    async with FakeInstance(require_authentication=True, hold_inventory=True) as fake:
+        bridge = _Bridge()
+        await bridge.activate(url=fake.url, password=PASSWORD)
+        assert bridge.coordinator is not None
+        starting = asyncio.ensure_future(bridge.coordinator.start())
+        try:
+            await _until(lambda: len(fake.requests("GetActions")) == 1)
+            (authenticate,) = fake.requests("Authenticate")
+            assert authenticate["authentication"] == expected
+            # Authenticated, inventory requested but unanswered: not ready.
+            assert not starting.done()
+            assert not bridge.run_ready
+            assert not bridge.handle.connected
+            assert bridge.records(TRACE_MODULE_DEGRADED) == []
+
+            fake.release_inventory()
+            report = await asyncio.wait_for(starting, FAKE_WAIT_SECONDS)
+            assert report.status == 0
+            assert bridge.run_ready and bridge.handle.connected
+            assert bridge.state == "ready"
+            assert bridge.records(TRACE_MODULE_DEGRADED) == []
+            assert [frame["request"] for frame in fake.received] == [
+                "Authenticate",
+                "GetActions",
+            ]
+            inventory = bridge.handle.inventory
+            assert sorted(inventory) == ["A", "B", "C", "D"]
+            assert len(inventory["C"]) == 2
+            (disabled,) = inventory["D"]
+            assert disabled == bridge.module.InstanceAction(
+                id="00000000-0000-4000-8000-00000000000d",
+                name="D",
+                group="Companion",
+                enabled=False,
+            )
+        finally:
+            fake.release_inventory()
+            await asyncio.gather(starting, return_exceptions=True)
+            await bridge.stop()
+        bridge.sweep(caplog.text, *_frame_texts(fake), expected)
+
+
+async def test_r1_a_withheld_inventory_degrades_within_the_startup_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1: an instance that withholds ``GetActions`` under a long accepted
+    request deadline does not hold ``start_inputs`` past its startup bound —
+    itself well inside the coordinator's default hook timeout. The bridge is
+    left degraded (``unreachable``) with startup successful, and the pending
+    attempt goes on in the owner: once answered, the bridge reports ready."""
+
+    assert streamerbot._STARTUP_ATTEMPT_SECONDS < DEFAULT_HOOK_TIMEOUT_SECONDS
+    async with FakeInstance(hold_inventory=True) as fake:
+        bridge = _Bridge()
+        await bridge.activate(url=fake.url, deadlines={"request_seconds": 120})
+        monkeypatch.setattr(bridge.module, "_STARTUP_ATTEMPT_SECONDS", 0.2)
+        assert bridge.coordinator is not None
+        try:
+            report = await asyncio.wait_for(bridge.coordinator.start(), FAKE_WAIT_SECONDS)
+            assert report.status == 0, report.diagnostics
+            assert len(fake.requests("GetActions")) == 1
+            assert bridge.state == "degraded" and not bridge.run_ready
+            assert bridge.health()[-1] == (TRACE_MODULE_DEGRADED, "unreachable")
+
+            fake.release_inventory()
+            await _until(lambda: bridge.state == "ready")
+            assert bridge.health()[-2:] == [
+                (TRACE_MODULE_DEGRADED, "unreachable"),
+                (TRACE_MODULE_READY, None),
+            ]
+            assert bridge.run_ready and fake.connections == 1
+        finally:
+            fake.release_inventory()
+            await bridge.stop()
+
+
+async def test_an_instance_without_a_challenge_is_not_sent_an_authentication() -> None:
+    """A hello without ``authentication``: no ``Authenticate`` frame, even
+    with a password configured; ready once the inventory is read."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, password=PASSWORD)
+        try:
+            assert bridge.run_ready and bridge.state == "ready"
+            assert [frame["request"] for frame in fake.received] == ["GetActions"]
+        finally:
+            await bridge.stop()
+
+
+AC4_CASES = [
+    pytest.param(
+        {"require_authentication": True, "refuse_authentication": True},
+        {"password": PASSWORD},
+        "authentication_failed",
+        id="wrong-password",
+    ),
+    pytest.param(
+        {"require_authentication": True}, {}, "authentication_required", id="no-password"
+    ),
+    pytest.param({"malformed_hello": True}, {"password": PASSWORD}, "protocol_error", id="hello"),
+    pytest.param(
+        {"fail_inventory": True}, {"password": PASSWORD}, "inventory_unavailable", id="inventory"
+    ),
+]
+
+
+@pytest.mark.parametrize(("faults", "settings", "reason"), AC4_CASES)
+async def test_ac4_each_failure_mode_degrades_with_its_reason_and_leaks_nothing(
+    caplog: pytest.LogCaptureFixture,
+    faults: dict[str, Any],
+    settings: dict[str, Any],
+    reason: str,
+) -> None:
+    """AC4 (R1): startup succeeds, the bridge is degraded with the mode's
+    reason and stays degraded, the run action is not ready, and no password,
+    URL or frame text is in any trace, diagnostic or log (AC23 sweep)."""
+
+    caplog.set_level(logging.DEBUG)
+    async with FakeInstance(**faults) as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, **settings)
+        try:
+            assert bridge.health() == [
+                (TRACE_MODULE_READY, None),  # the coordinator's prepare observation
+                (TRACE_MODULE_DEGRADED, reason),
+            ]
+            assert bridge.state == "degraded"
+            assert not bridge.run_ready
+            assert reason in streamerbot.DEGRADED_REASONS
+        finally:
+            await bridge.stop()
+        if "password" not in settings:
+            assert fake.requests("Authenticate") == []
+        bridge.sweep(caplog.text, *_frame_texts(fake))
+
+
+async def test_ac25_a_lost_connection_degrades_at_once_and_reconnects_after_the_minimum(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC25 (R6): closing the server's connection while ready gives 1
+    ``module.degraded`` (``unreachable``) at once and withdraws readiness;
+    advancing the injected clock by the minimum delay gives 1 ``module.ready``
+    and a fresh handshake. No delay exceeds the maximum."""
+
+    caplog.set_level(logging.DEBUG)
+    async with FakeInstance(require_authentication=True) as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, password=PASSWORD, reconnect=RECONNECT)
+        try:
+            assert bridge.run_ready
+            before = len(bridge.health())
+
+            await fake.close_connection()
+            await _until(lambda: len(bridge.health()) == before + 1)
+            assert bridge.health()[before:] == [(TRACE_MODULE_DEGRADED, "unreachable")]
+            assert not bridge.run_ready and not bridge.handle.connected
+            assert bridge.state == "degraded"
+
+            await _until(lambda: bridge.clock.next_deadline() is not None)
+            assert bridge.delays == [RECONNECT["min_delay_seconds"]]
+            assert fake.connections == 1
+            bridge.clock.advance(RECONNECT["min_delay_seconds"])
+            await _until(lambda: len(bridge.health()) == before + 2)
+            assert bridge.health()[before:] == [
+                (TRACE_MODULE_DEGRADED, "unreachable"),
+                (TRACE_MODULE_READY, None),
+            ]
+            assert bridge.run_ready and bridge.state == "ready"
+            assert fake.connections == 2
+            assert len(fake.requests("Authenticate")) == 2
+            assert max(bridge.delays) <= RECONNECT["max_delay_seconds"]
+        finally:
+            await bridge.stop()
+        bridge.sweep(caplog.text, *_frame_texts(fake))
+
+
+async def test_ac25_the_backoff_doubles_from_the_minimum_and_is_capped_at_the_maximum(
+) -> None:
+    """R6: with nothing listening, each failed attempt doubles the delay from
+    the minimum, never past the maximum, and repeats no record (the same
+    ``unreachable`` reason is not a new fact)."""
+
+    bridge = _Bridge()
+    await bridge.start(url=f"ws://{LOOPBACK}:{_silent_loopback_port()}/", reconnect=RECONNECT)
+    try:
+        assert bridge.state == "degraded"
+        for expected in (1, 2, 4, 4, 4):
+            await _until(lambda: bridge.clock.next_deadline() is not None)
+            assert bridge.delays[-1] == expected
+            bridge.clock.advance(expected)
+        await _until(lambda: len(bridge.delays) == 6)
+        assert bridge.delays == [1, 2, 4, 4, 4, 4]
+        assert max(bridge.delays) <= RECONNECT["max_delay_seconds"]
+        assert bridge.records(TRACE_MODULE_DEGRADED) == [
+            {**bridge.records(TRACE_MODULE_DEGRADED)[0], "reason": "unreachable"}
+        ]
+        assert bridge.records(TRACE_MODULE_READY)[1:] == []
+    finally:
+        await bridge.stop()
+
+
+async def test_ac25_a_failed_start_retries_and_a_success_reports_ready() -> None:
+    """R6, never silently: an instance unavailable at startup and reachable
+    at the next attempt produces 1 ``module.ready`` after the degradation."""
+
+    async with FakeInstance(fail_inventory=True) as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, reconnect=RECONNECT)
+        try:
+            assert bridge.state == "degraded" and not bridge.run_ready
+            fake.fail_inventory = False
+            await _until(lambda: bridge.clock.next_deadline() is not None)
+            bridge.clock.advance(RECONNECT["min_delay_seconds"])
+            await _until(lambda: bridge.state == "ready")
+            assert bridge.health()[-2:] == [
+                (TRACE_MODULE_DEGRADED, "inventory_unavailable"),
+                (TRACE_MODULE_READY, None),
+            ]
+            assert bridge.run_ready
+        finally:
+            await bridge.stop()
+
+
+async def test_ac28_cancelling_the_owner_task_propagates_and_releases_the_connection(
+) -> None:
+    """AC28 (R6, connection half): cancelling the connection owner raises
+    ``CancelledError`` to whoever awaits it; the connection is released, the
+    bridge is no longer ready and the loss is reported degraded."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url)
+        try:
+            owner = bridge.handle._owner
+            assert owner is not None and not owner.done()
+            owner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            assert not bridge.run_ready and not bridge.handle.connected
+            assert bridge.state == "degraded"
+            assert bridge.health()[-1] == (TRACE_MODULE_DEGRADED, "unreachable")
+            await asyncio.wait_for(fake.wait_for_disconnections(1), FAKE_WAIT_SECONDS)
+        finally:
+            await bridge.stop()
+
+
+async def test_ac28_shutdown_closes_within_budget_and_fails_a_pending_request(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC28 (R6, connection half): shutdown fails a pending ``GetActions``
+    request with :class:`ConnectionClosed` instead of leaving it hanging, and
+    the fake server observes the close within the close budget. The in-flight
+    run clause is P15's."""
+
+    caplog.set_level(logging.DEBUG)
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, password=PASSWORD)
+        assert bridge.run_ready
+        fake.hold_inventory = True
+        connection = bridge.handle._connection
+        pending = asyncio.ensure_future(
+            connection.request({"request": "GetActions"}, 10 * FAKE_WAIT_SECONDS)
+        )
+        await _until(lambda: len(fake.requests("GetActions")) == 2)
+        assert connection.pending == 1
+
+        await asyncio.wait_for(bridge.stop(), CLOSE_BUDGET_SECONDS)
+        await asyncio.wait_for(fake.wait_for_disconnections(1), CLOSE_BUDGET_SECONDS)
+        assert pending.done()
+        with pytest.raises(bridge.module.ConnectionClosed):
+            pending.result()
+        assert connection.pending == 0
+        assert not bridge.run_ready
+        assert bridge.state == "stopped"
+        assert bridge.handle._owner is None
+        assert bridge.diagnostics == []
+        fake.release_inventory()
+    bridge.sweep(caplog.text, *_frame_texts(fake))
+
+
+async def test_a_connection_loss_fails_every_pending_request() -> None:
+    """The reader fails what waits when the server closes: no request is
+    left hanging on a lost connection either."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, reconnect=RECONNECT)
+        try:
+            fake.hold_inventory = True
+            connection = bridge.handle._connection
+            pending = asyncio.ensure_future(
+                connection.request({"request": "GetActions"}, 10 * FAKE_WAIT_SECONDS)
+            )
+            await _until(lambda: len(fake.requests("GetActions")) == 2)
+            await fake.close_connection()
+            with pytest.raises(bridge.module.ConnectionClosed):
+                await asyncio.wait_for(pending, FAKE_WAIT_SECONDS)
+            await _until(lambda: bridge.state == "degraded")
+        finally:
+            fake.release_inventory()
+            await bridge.stop()
+
+
+def test_the_sleeper_seam_must_be_callable() -> None:
+    assert validate_settings(_with(_sleeper=1)) == [_diagnostic("_sleeper", "must be callable")]
+    assert validate_settings(_with(_sleeper=asyncio.sleep)) == []

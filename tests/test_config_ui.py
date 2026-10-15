@@ -3443,7 +3443,9 @@ def _assert_unusable(ui: ConfigUI, cookie: str, data: bytes, values: Sequence[st
         assert _supervision(page) == NO_RUNNING_PROCESS
         if data:
             assert data.decode("utf-8", errors="replace") not in reason
-        visible = _visible(page)
+        # The base and overlay paths sit under the pytest temporary directory,
+        # whose numbered name (pytest-123) can contain a canary value.
+        visible = _visible(page).replace(str(ui.base_path.parent), "")
         for value in values:
             if len(value) >= 3:
                 assert value not in reason, (path, value)
