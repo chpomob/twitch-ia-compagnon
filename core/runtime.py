@@ -562,7 +562,8 @@ _PHASE_STATES: Mapping[str, str] = MappingProxyType(
         # Preparation succeeded: consumers, handlers and resources are in
         # place. A module with no producer role is ready at this point and an
         # input module re-reports nothing when its producer opens, because a
-        # repeated state is not re-emitted.
+        # repeated state is not re-emitted. Neither phase speaks for a module
+        # that reported a state of its own: see ModuleHealth.observe_phase.
         PHASE_PREPARE: MODULE_STATE_READY,
         PHASE_START_INPUTS: MODULE_STATE_READY,
         # Ordinary teardown. ``stop_inputs`` and ``drain`` are not terminal:
@@ -599,9 +600,14 @@ class ModuleHealth:
     twice reports one ``module.stopped``. The reason is part of what changes:
     a module degrading for a *new* reason is a new fact and is reported, while
     the same degradation repeated is not.
+
+    A state the module reported itself stands until the module reports another
+    one or is stopped: a successful phase does not overwrite it (D10). Without
+    this, a module that reported ``degraded`` inside ``start_inputs`` would be
+    re-reported ready the moment the hook returned (spec R1, R6).
     """
 
-    __slots__ = ("_clock", "_reported", "_states", "_supervision")
+    __slots__ = ("_clock", "_reported", "_self_reported", "_states", "_supervision")
 
     def __init__(self, supervision: Supervision, *, clock: Clock = time.monotonic) -> None:
         if not callable(getattr(supervision, "record_and_emit", None)):
@@ -616,6 +622,9 @@ class ModuleHealth:
         # What was last published for each module, reason included, so a new
         # degradation reason is reported and a repeated one is not.
         self._reported: dict[str, tuple[str, str | None]] = {}
+        # Modules that reported a state of their own in this activation, until
+        # they are stopped. A successful phase does not speak for them.
+        self._self_reported: set[str] = set()
 
     @property
     def states(self) -> Mapping[str, str]:
@@ -637,6 +646,7 @@ class ModuleHealth:
     ) -> bool:
         """Report *module* as ready. Returns whether a trace was published."""
 
+        self._self_reported.add(module)
         return await self._transition(
             module, MODULE_STATE_READY, capabilities=capabilities, **details
         )
@@ -651,6 +661,7 @@ class ModuleHealth:
     ) -> bool:
         """Report *module* as degraded, with a bounded, sanitised *reason*."""
 
+        self._self_reported.add(module)
         return await self._transition(
             module,
             MODULE_STATE_DEGRADED,
@@ -691,7 +702,10 @@ class ModuleHealth:
         carrying the phase it failed in alongside the sanitised reason. A hook
         that succeeded reports the state :data:`_PHASE_STATES` maps the phase
         to, and nothing at all for a phase that is not a state change of its
-        own. An unknown phase is refused rather than silently unreported.
+        own — unless the module reported a state itself in this activation,
+        which a successful ``prepare`` or ``start_inputs`` does not overwrite.
+        Closing reports ``stopped`` whatever the module said. An unknown phase
+        is refused rather than silently unreported.
         """
 
         _require_text(phase, "module health.observe_phase.phase")
@@ -702,8 +716,10 @@ class ModuleHealth:
                 f"the sequence is: {known}"
             )
         if failure is not None:
-            return await self.degraded(
+            # The coordinator's fact, not the module's: no self-report mark.
+            return await self._transition(
                 module,
+                MODULE_STATE_DEGRADED,
                 reason=failure,
                 capabilities=capabilities,
                 phase=phase,
@@ -711,6 +727,8 @@ class ModuleHealth:
             )
         state = _PHASE_STATES.get(phase)
         if state is None:
+            return False
+        if state != MODULE_STATE_STOPPED and module in self._self_reported:
             return False
         return await self._transition(
             module, state, capabilities=capabilities, phase=phase, **details
@@ -765,6 +783,9 @@ class ModuleHealth:
 
         self._states[module] = state
         self._reported[module] = fact
+        if state == MODULE_STATE_STOPPED:
+            # The activation is over; the next one starts with no self-report.
+            self._self_reported.discard(module)
 
 
 # --------------------------------------------------------------------------- #

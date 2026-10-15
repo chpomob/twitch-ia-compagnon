@@ -1414,6 +1414,171 @@ async def test_a_failed_hook_is_reported_degraded_and_the_sequence_goes_on() -> 
     assert all("secret-token" not in message for message in report.diagnostics)
 
 
+def _reporting(health: Any, events: list[str], label: str, *reports: tuple[str, str | None]):
+    """A hook that reports *reports* through the module's own health calls."""
+
+    async def run(*_arguments: Any) -> None:
+        events.append(label)
+        name = label.split(":", 1)[1]
+        for state, reason in reports:
+            if state == "degraded":
+                await health.degraded(name, reason=reason)
+            else:
+                await health.ready(name)
+
+    return run
+
+
+@pytest.mark.parametrize("phase", ["prepare", "start_inputs"])
+async def test_a_state_the_module_reported_is_not_overwritten_by_its_phase(
+    phase: str,
+) -> None:
+    """D10, phase 5 spec R1/R6: a module's own report stands over the phase's.
+
+    A module that reports ``degraded`` inside ``prepare`` or ``start_inputs``
+    and whose hook then returns stays degraded: exactly one
+    ``module.degraded``, and no ``module.ready`` after it. Closing still
+    reports it stopped.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    health, _ = _health_over(events)
+    hooks: dict[str, Any] = {
+        "prepare": hook(events, "prepare:bridge"),
+        "start_inputs": hook(events, "start:bridge"),
+    }
+    label = "prepare:bridge" if phase == "prepare" else "start:bridge"
+    hooks[phase] = _reporting(health, events, label, ("degraded", "unreachable"))
+    coordinator = coordinator_for(
+        [module("bridge", roles=("input",), **hooks)],
+        timeline,
+        observer=health.observe_phase,
+    )
+
+    # Before reporting anything, a module whose prepare succeeded is ready.
+    before = [] if phase == "prepare" else ["module.ready:bridge:prepare"]
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    published = [event for event in events if event.startswith("module.")]
+    assert published == [*before, "module.degraded:bridge"]
+    assert events.index("module.degraded:bridge") == events.index(label) + 1
+    assert health.state("bridge") == "degraded"
+
+    assert (await asyncio.wait_for(coordinator.stop(), 1)).status == 0
+    assert [event for event in events if event.startswith("module.")] == [
+        *before,
+        "module.degraded:bridge",
+        "module.stopped:bridge:close",
+    ]
+    assert health.state("bridge") == "stopped"
+
+
+async def test_a_module_that_reports_nothing_keeps_todays_records() -> None:
+    """D10 changes nothing for a silent module: ready once, stopped once.
+
+    ``prepare`` reports it ready and ``start_inputs`` re-reports nothing,
+    so the two phases yield one ``module.ready``; close reports it stopped.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    health, _ = _health_over(events)
+    coordinator = coordinator_for(
+        [
+            module(
+                "feed",
+                roles=("input",),
+                prepare=hook(events, "prepare:feed"),
+                start_inputs=hook(events, "start:feed"),
+                close=hook(events, "close:feed"),
+            )
+        ],
+        timeline,
+        observer=health.observe_phase,
+    )
+
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    assert events == ["prepare:feed", "module.ready:feed:prepare", "start:feed"]
+    assert health.state("feed") == "ready"
+
+    assert (await asyncio.wait_for(coordinator.stop(), 1)).status == 0
+    assert events[3:] == ["close:feed", "module.stopped:feed:close"]
+    assert health.state("feed") == "stopped"
+
+
+async def test_the_module_keeps_control_of_its_own_state() -> None:
+    """D10: a module that degraded and then reports ready itself is ready.
+
+    Its own later report is a new fact and is published; the phase that
+    follows does not speak over it either.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    health, _ = _health_over(events)
+    coordinator = coordinator_for(
+        [
+            module(
+                "bridge",
+                roles=("input",),
+                prepare=_reporting(
+                    health, events, "prepare:bridge", ("degraded", "unreachable")
+                ),
+                start_inputs=_reporting(health, events, "start:bridge", ("ready", None)),
+            )
+        ],
+        timeline,
+        observer=health.observe_phase,
+    )
+
+    assert (await asyncio.wait_for(coordinator.start(), 1)).status == 0
+    assert events == [
+        "prepare:bridge",
+        "module.degraded:bridge",
+        "start:bridge",
+        "module.ready:bridge",
+    ]
+    assert health.state("bridge") == "ready"
+
+    # And back: degrading again after the phases is the module's to say.
+    assert await health.degraded("bridge", reason="refused")
+    assert health.state("bridge") == "degraded"
+    assert (await asyncio.wait_for(coordinator.stop(), 1)).status == 0
+    assert events[-1] == "module.stopped:bridge:close"
+    assert health.state("bridge") == "stopped"
+
+
+async def test_a_hook_failure_still_degrades_after_a_self_report() -> None:
+    """D10 suppresses only a *successful* phase: a failure is still reported.
+
+    The failure is the coordinator's fact, not the module's; the startup
+    rollback that follows still closes the module and reports it stopped.
+    """
+
+    timeline = Timeline()
+    events: list[str] = []
+    health, _ = _health_over(events)
+
+    async def report_then_fail(*_arguments: Any) -> None:
+        await health.degraded("bridge", reason="unreachable")
+        raise RuntimeError("boom")
+
+    coordinator = coordinator_for(
+        [module("bridge", roles=("input",), start_inputs=report_then_fail)],
+        timeline,
+        observer=health.observe_phase,
+    )
+    await asyncio.wait_for(coordinator.start(), 1)
+    published = [event for event in events if event.startswith("module.")]
+    assert published[:3] == [
+        "module.ready:bridge:prepare",
+        "module.degraded:bridge",
+        "module.degraded:bridge:start_inputs",
+    ]
+    assert published[-1] == "module.stopped:bridge:close"
+    assert health.state("bridge") == "stopped"
+
+
 async def test_an_observer_that_fails_or_overruns_never_stops_the_sequence() -> None:
     """R8 must not cost R4: a health report is a diagnostic, never a failure.
 
