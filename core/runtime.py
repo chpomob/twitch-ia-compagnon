@@ -88,18 +88,23 @@ import random
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
 from .contracts import (
+    COUNTER_INPUT_OWNERSHIP_REJECTIONS,
     COUNTER_LOST_TRACES,
+    INPUT_FAMILIES,
     TERMINAL_TRACE_TYPES,
+    TRACE_INPUT_OWNERSHIP_REJECTED,
     TRACE_MAX_BYTES,
     TRACE_MODULE_DEGRADED,
     TRACE_MODULE_READY,
     TRACE_MODULE_STOPPED,
+    WILDCARD,
     Counters,
+    input_family_of_event,
     sanitize_trace,
 )
 from .lifecycle import (
@@ -109,6 +114,7 @@ from .lifecycle import (
     PHASE_START_INPUTS,
     PHASES,
 )
+from .triggers import TriggerDecision
 
 __all__ = [
     "MODULE_STATE_DEGRADED",
@@ -123,6 +129,7 @@ __all__ = [
     "ModuleServices",
     "ModuleSupervision",
     "ModuleTasks",
+    "OwnedInputs",
     "RuntimeContext",
     "RuntimeContextError",
     # A bounded key->service table the core does not interpret.
@@ -998,6 +1005,248 @@ class ModuleSupervision:
 
 
 # --------------------------------------------------------------------------- #
+# Input ownership at runtime (R3, D3)
+# --------------------------------------------------------------------------- #
+
+MAX_OWNERSHIP_DIAGNOSTICS = 256
+"""How many distinct ``(module, family, platform)`` diagnostics one guard keeps.
+
+Platforms come from the events themselves, so the set is capped: beyond it a
+rejection is still counted, and still never traced per event.
+"""
+
+REASON_INPUT_NOT_OWNED = "input_not_owned"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedInputs:
+    """One module's read-only view of the (family, platform) pairs it owns.
+
+    ``pairs`` holds the resolved rows the module owns, the wildcard row
+    included. A platform outside them is owned through the wildcard row
+    unless that platform is assigned to someone else — what ``excluded``
+    holds per family.
+    """
+
+    pairs: frozenset[tuple[str, str]] = frozenset()
+    excluded: Mapping[str, frozenset[str]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    @classmethod
+    def unrestricted(cls) -> "OwnedInputs":
+        """The view used when no ownership table is installed: every pair."""
+
+        return cls(pairs=frozenset((family, WILDCARD) for family in INPUT_FAMILIES))
+
+    def owns(self, family: str, platform: str) -> bool:
+        if (family, platform) in self.pairs:
+            return True
+        if platform == WILDCARD or (family, WILDCARD) not in self.pairs:
+            return False
+        return platform not in self.excluded.get(family, frozenset())
+
+    def platforms(self, family: str) -> tuple[str, ...]:
+        """The rows of *family* this view owns, sorted, ``'*'`` included."""
+
+        return tuple(sorted(platform for owned, platform in self.pairs if owned == family))
+
+
+class _InputGuard:
+    """The one ownership predicate a module's facades share (R3).
+
+    *ownership* is the resolved table (duck-typed: ``owner`` and
+    ``is_set_none``). A module that **declares** ``input_families`` delivers a
+    pair only when it is that pair's owner; an **undeclared** one — every v1
+    module, and a v2 module without the key — delivers a pair unless the pair
+    has a resolved owner or was set to ``none`` explicitly, so an
+    unconstrained configuration behaves exactly as before.
+
+    The diagnostic set is owned here, so the bus, the trigger and the chat
+    facades of one module report a given pair once between them.
+    """
+
+    __slots__ = ("_declared", "_module", "_ownership", "_reported", "_supervision")
+
+    def __init__(
+        self, *, module: str, ownership: Any, declared: bool, supervision: Any
+    ) -> None:
+        self._module = _require_text(module, "input guard.module")
+        for method in ("owner", "is_set_none"):
+            if not callable(getattr(ownership, method, None)):
+                raise RuntimeContextError(
+                    f"input guard: field 'ownership': must expose {method}()"
+                )
+        self._ownership = ownership
+        self._declared = bool(declared)
+        self._supervision = supervision
+        self._reported: set[tuple[str, str, str]] = set()
+
+    @property
+    def module(self) -> str:
+        return self._module
+
+    def admits(self, family: str, platform: str) -> bool:
+        owner = self._ownership.owner(family, platform)
+        if self._declared:
+            return owner == self._module
+        return owner is None and not self._ownership.is_set_none(family, platform)
+
+    def refused_pair(self, event: Any) -> tuple[str, str] | None:
+        """The pair *event* is refused for, or ``None`` when it passes.
+
+        An event that belongs to no family (D1) — another event type, a
+        ``watch_tick``, a malformed payload — always passes.
+        """
+
+        pair = input_family_of_event(event)
+        if pair is None or self.admits(*pair):
+            return None
+        return pair
+
+    async def reject(self, family: str, platform: str) -> None:
+        """Count one refused publication; trace the pair the first time only."""
+
+        self._supervision.count(COUNTER_INPUT_OWNERSHIP_REJECTIONS)
+        key = (self._module, family, platform)
+        if key in self._reported or len(self._reported) >= MAX_OWNERSHIP_DIAGNOSTICS:
+            return
+        self._reported.add(key)
+        try:
+            await self._supervision.emit(
+                TRACE_INPUT_OWNERSHIP_REJECTED,
+                {"module": self._module, "family": family, "platform": platform},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The publication stays refused whatever happens to its trace; a
+            # trace that cannot be published is counted, never propagated
+            # into the publisher (R8).
+            self._supervision.count(COUNTER_LOST_TRACES)
+
+
+class _OwnedBus:
+    """A module-scoped bus: a non-owned input publication never reaches it.
+
+    ``publish`` is the only intercepted call. The check runs before the bus
+    is called at all, so no subscriber — not even a middleware ordered first
+    — sees a refused event. Every other attribute is the shared bus's own.
+    It is built either by :meth:`RuntimeContext.for_module` or directly by
+    the loader's v1 route, so the predicate, the counter and the
+    once-per-pair diagnostic are the same code for both (D3).
+    """
+
+    __slots__ = ("_bus", "_guard")
+
+    def __init__(
+        self,
+        bus: Any,
+        *,
+        module: str | None = None,
+        ownership: Any = None,
+        declared: bool = False,
+        supervision: Any = None,
+        guard: _InputGuard | None = None,
+    ) -> None:
+        self._bus = bus
+        if guard is None:
+            if supervision is None:
+                raise RuntimeContextError(
+                    "owned bus: field 'supervision': is required"
+                )
+            guard = _InputGuard(
+                module=module,  # type: ignore[arg-type]
+                ownership=ownership,
+                declared=declared,
+                supervision=supervision,
+            )
+        self._guard = guard
+
+    async def publish(
+        self,
+        event_type: str,
+        payload: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> Any:
+        pair = self._guard.refused_pair(
+            {"type": event_type, "payload": payload, "metadata": metadata}
+        )
+        if pair is not None:
+            await self._guard.reject(*pair)
+            return None
+        return await self._bus.publish(event_type, payload, metadata)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._bus, name)
+
+
+class _OwnedTriggers:
+    """A module-scoped trigger engine: a non-owned input is refused unread.
+
+    The refusal is a decision, not a publication, so it is not counted (D4)
+    and not traced here: the publication that follows it is the one the
+    guard counts and reports.
+    """
+
+    __slots__ = ("_engine", "_guard")
+
+    def __init__(self, engine: Any, guard: _InputGuard) -> None:
+        self._engine = engine
+        self._guard = guard
+
+    def evaluate(self, event: Mapping[str, Any], **kwargs: Any) -> Any:
+        pair = self._guard.refused_pair(event)
+        if pair is None:
+            return self._engine.evaluate(event, **kwargs)
+        payload = event.get("payload")
+        metadata = event.get("metadata")
+        payload = payload if isinstance(payload, Mapping) else {}
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        return TriggerDecision(
+            accepted=False,
+            reason=REASON_INPUT_NOT_OWNED,
+            policy_version=None,
+            source_event_id=_optional_text(payload.get("message_id")),
+            input_name=_optional_text(metadata.get("source")),
+            platform=pair[1],
+            channel_id=_optional_text(payload.get("channel_id")),
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine, name)
+
+
+class _OwnedChat:
+    """A module-scoped chat context: a non-owned platform's append is dropped."""
+
+    __slots__ = ("_chat", "_guard")
+
+    def __init__(self, chat: Any, guard: _InputGuard) -> None:
+        self._chat = chat
+        self._guard = guard
+
+    def append(self, platform: str, channel_id: str, entry: Any) -> Any:
+        if isinstance(platform, str) and platform.strip():
+            if not self._guard.admits("chat", platform):
+                return None
+        return self._chat.append(platform, channel_id, entry)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chat, name)
+
+
+@dataclass(frozen=True, slots=True)
+class _ModuleInputs:
+    """The guard of one module and the facades built over it."""
+
+    guard: _InputGuard
+    bus: _OwnedBus
+    triggers: _OwnedTriggers | None
+    chat: _OwnedChat | None
+
+
+# --------------------------------------------------------------------------- #
 # The context itself
 # --------------------------------------------------------------------------- #
 
@@ -1093,19 +1342,59 @@ class RuntimeContext:
 
     # -- scoped access -------------------------------------------------------- #
 
-    def for_module(self, module: str) -> "ModuleContext":
+    def for_module(
+        self,
+        module: str,
+        *,
+        owned_inputs: OwnedInputs | None = None,
+        ownership: Any = None,
+        declared: bool = False,
+    ) -> "ModuleContext":
         """Return the scoped view activation hands to *module*.
 
         The shared collaborators are passed through unchanged; the three
         surfaces a module writes to — its action registrations, its supervised
         tasks, its own health and its service publications — arrive already
         bound to its name.
+
+        With an *ownership* table installed (R3, D3), the bus, the trigger
+        engine and the chat context arrive as module-scoped facades that
+        refuse an input the module may not deliver; *declared* says whether
+        its manifest carries ``input_families``. Without one, the shared
+        objects are returned unchanged and :attr:`ModuleContext.inputs` is
+        :meth:`OwnedInputs.unrestricted`.
         """
 
         name = _require_text(module, "runtime context.for_module.module")
+        if owned_inputs is None:
+            owned_inputs = OwnedInputs.unrestricted()
+        elif not isinstance(owned_inputs, OwnedInputs):
+            raise RuntimeContextError(
+                "runtime context.for_module.owned_inputs: must be an OwnedInputs, "
+                f"got {type(owned_inputs).__name__}"
+            )
+        scoped: _ModuleInputs | None = None
+        if ownership is not None:
+            guard = _InputGuard(
+                module=name,
+                ownership=ownership,
+                declared=declared,
+                supervision=self.supervision,
+            )
+            scoped = _ModuleInputs(
+                guard=guard,
+                bus=_OwnedBus(self.bus, guard=guard),
+                triggers=(
+                    None if self.triggers is None
+                    else _OwnedTriggers(self.triggers, guard)
+                ),
+                chat=None if self.chat is None else _OwnedChat(self.chat, guard),
+            )
         return ModuleContext(
             module=name,
             _runtime=self,
+            inputs=owned_inputs,
+            _guard=scoped,
             actions=ModuleActions(self.actions, name),
             tasks=ModuleTasks(self.tasks, name),
             supervision=ModuleSupervision(self.supervision, self.health, name),
@@ -1131,6 +1420,12 @@ class ModuleContext:
     stops the collaborator being *replaced*, not being *used*. The properties
     republish exactly the collaborators that are shared by design; the three
     write surfaces arrive only through their scoped facades.
+
+    When the loader installed an input ownership table that applies to this
+    module (R3, D3), ``bus``, ``triggers`` and ``chat`` are module-scoped
+    facades instead: an input the module may not deliver reaches no
+    subscriber, no rule and no transcript. ``inputs`` is the module's
+    read-only view of the pairs it owns.
     """
 
     module: str
@@ -1139,6 +1434,10 @@ class ModuleContext:
     tasks: ModuleTasks
     supervision: ModuleSupervision
     services: ModuleServices
+    #: The (family, platform) pairs this module owns (R2); every pair when no
+    #: ownership table is installed.
+    inputs: OwnedInputs = field(default_factory=OwnedInputs.unrestricted)
+    _guard: _ModuleInputs | None = None
 
     @property
     def runtime_api(self) -> int:
@@ -1146,6 +1445,8 @@ class ModuleContext:
 
     @property
     def bus(self) -> Any:
+        if self._guard is not None:
+            return self._guard.bus
         return self._runtime.bus
 
     @property
@@ -1154,10 +1455,14 @@ class ModuleContext:
 
     @property
     def triggers(self) -> Any:
+        if self._guard is not None and self._guard.triggers is not None:
+            return self._guard.triggers
         return self._runtime.triggers
 
     @property
     def chat(self) -> Any:
+        if self._guard is not None and self._guard.chat is not None:
+            return self._guard.chat
         return self._runtime.chat
 
     @property
@@ -1190,6 +1495,12 @@ def _require_text(value: Any, field_name: str) -> str:
     if not value.strip():
         raise RuntimeContextError(f"{field_name}: must not be empty")
     return value
+
+
+def _optional_text(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def _require_surface(value: Any, methods: Sequence[str], field_name: str) -> Any:

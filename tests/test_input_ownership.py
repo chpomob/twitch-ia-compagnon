@@ -989,3 +989,464 @@ async def test_run_and_check_config_give_the_same_diagnostics(
     assert _marks(marker) == []
     if inputs is None:
         assert checked == [_AC7_DIAGNOSTIC]
+
+
+# --------------------------------------------------------------------------- #
+# P4: the runtime guard — owned view, guarded facades, counter, diagnostic (R3)
+# --------------------------------------------------------------------------- #
+
+from core.contracts import COUNTER_LOST_TRACES  # noqa: E402
+from core.runtime import ModuleContext, _OwnedBus  # noqa: E402
+from core.triggers import TriggerDecision  # noqa: E402
+
+#: A module whose activation publishes ``settings["count"]`` chat events for
+#: ``settings["platform"]`` through the bus it received — the context's for a
+#: v2 manifest, the positional bus for a v1 one.
+_PUBLISHER_SOURCE = """
+class Handle:
+    async def close(self):
+        pass
+
+
+def validate_settings(settings):
+    pass
+
+
+async def activate(first, settings, catalog):
+    bus = first.bus if settings["v2"] else first
+    settings["received"].append((first, bus))
+    for index in range(settings["count"]):
+        await bus.publish(
+            "channel.chat.message",
+            {
+                "platform": settings["platform"],
+                "channel_id": "c",
+                "message_id": "m%d" % index,
+                "text": "hi",
+                "author": {"id": "u"},
+            },
+            {"source": "publisher"},
+        )
+    return Handle()
+"""
+
+#: A module that keeps the context it was handed.
+_KEEPER_SOURCE = """
+class Handle:
+    async def close(self):
+        pass
+
+
+def validate_settings(settings):
+    pass
+
+
+async def activate(context, settings, catalog):
+    settings["contexts"].append(context)
+    return Handle()
+"""
+
+#: The four consumers AC13 names, by the order they would subscribe in.
+_CONSUMERS = (("triggers", -100), ("users", 0), ("chat_context", 10), ("brain", 20))
+
+
+def _make_v1(root: Path, name: str, source: str) -> None:
+    directory = root / name
+    directory.mkdir()
+    (directory / "module.yaml").write_text(
+        yaml.safe_dump(_manifest(name, None, version=None)), encoding="utf-8"
+    )
+    (directory / "__init__.py").write_text(source, encoding="utf-8")
+
+
+class _Recorder:
+    """Recording subscribers standing in for every chat consumer, plus traces."""
+
+    def __init__(self, bus: Any) -> None:
+        self.delivered: dict[str, list[Any]] = {name: [] for name, _ in _CONSUMERS}
+        self.traces: list[Any] = []
+        for name, order in _CONSUMERS:
+            bus.subscribe("channel.chat.message", self._handler(name), order=order)
+        bus.subscribe(TRACE_INPUT_OWNERSHIP_REJECTED, self._trace)
+
+    def _handler(self, name: str) -> Any:
+        async def handle(event: Any) -> None:
+            self.delivered[name].append(event)
+
+        return handle
+
+    async def _trace(self, event: Any) -> None:
+        self.traces.append(dict(event["payload"]))
+
+    def counts(self) -> set[int]:
+        return {len(events) for events in self.delivered.values()}
+
+
+def _rejections(loader: ModuleLoader) -> int:
+    return loader.context.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS]
+
+
+def _publisher_settings(platform: str = "x", *, v2: bool = True) -> dict[str, Any]:
+    return {"platform": platform, "count": 3, "v2": v2, "received": []}
+
+
+async def _run_publisher(
+    tmp_path: Path,
+    *,
+    publisher_families: list[dict[str, Any]] | None,
+    others: dict[str, list[dict[str, Any]]],
+    inputs: Any = None,
+    v1: bool = False,
+) -> tuple[ModuleLoader, _Recorder, dict[str, Any]]:
+    if v1:
+        _make_v1(tmp_path, "publisher", _PUBLISHER_SOURCE)
+    else:
+        _make(tmp_path, "publisher", publisher_families, _PUBLISHER_SOURCE)
+    for name, families in others.items():
+        _make(tmp_path, name, families)
+    loader = _loader(tmp_path)
+    recorder = _Recorder(loader.bus)
+    settings = _publisher_settings(v2=not v1)
+    config: dict[str, Any] = {
+        "enabled_modules": [*others, "publisher"],
+        "modules": {
+            "publisher": settings,
+            **{name: {"calls": []} for name in others},
+        },
+    }
+    if inputs is not None:
+        config["inputs"] = inputs
+    await loader.activate_enabled(config)
+    return loader, recorder, settings
+
+
+@pytest.mark.asyncio
+async def test_ac13_a_declared_module_never_delivers_a_pair_it_does_not_own(
+    tmp_path: Path,
+) -> None:
+    """AC13: 3 non-owned publications reach no subscriber, count 3, trace once."""
+
+    loader, recorder, _ = await _run_publisher(
+        tmp_path,
+        publisher_families=_families(("chat", ["y"], True)),
+        others={"native": NATIVE},
+    )
+    assert recorder.counts() == {0}
+    assert _rejections(loader) == 3
+    assert recorder.traces == [{"module": "publisher", "family": "chat", "platform": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_ac13_the_owner_itself_delivers(tmp_path: Path) -> None:
+    loader, recorder, _ = await _run_publisher(
+        tmp_path, publisher_families=NATIVE, others={}
+    )
+    assert recorder.counts() == {3}
+    assert _rejections(loader) == 0
+    assert recorder.traces == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("v1", [False, True], ids=["v2", "v1"])
+async def test_ac44_an_undeclared_publisher_is_delivered_when_nobody_owns_the_pair(
+    tmp_path: Path, v1: bool
+) -> None:
+    """AC44 case 1, v2 and v1 (finding P1): delivered as today, counter 0."""
+
+    loader, recorder, settings = await _run_publisher(
+        tmp_path, publisher_families=None, others={}, v1=v1
+    )
+    assert recorder.counts() == {3}
+    assert _rejections(loader) == 0
+    assert recorder.traces == []
+    ((_, bus),) = settings["received"]
+    # Nothing is constrained, so the shared bus itself is handed out (D3).
+    assert bus is loader.bus
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("v1", [False, True], ids=["v2", "v1"])
+@pytest.mark.parametrize(
+    ("others", "inputs"),
+    [({"native": NATIVE}, None), ({}, {"chat": {"x": "none"}})],
+    ids=["second-module-default", "inputs-none"],
+)
+async def test_ac44_an_undeclared_publisher_is_refused_a_resolved_or_none_pair(
+    tmp_path: Path, v1: bool, others: dict[str, Any], inputs: Any
+) -> None:
+    """AC44 cases 2 and 3, v2 and v1: 0 delivered, counter 3, 1 diagnostic."""
+
+    loader, recorder, settings = await _run_publisher(
+        tmp_path, publisher_families=None, others=others, inputs=inputs, v1=v1
+    )
+    assert recorder.counts() == {0}
+    assert _rejections(loader) == 3
+    assert recorder.traces == [{"module": "publisher", "family": "chat", "platform": "x"}]
+    ((first, bus),) = settings["received"]
+    assert isinstance(bus, _OwnedBus)
+    assert isinstance(first, ModuleContext) is not v1
+
+
+@pytest.mark.asyncio
+async def test_ac9_the_native_view_is_empty_and_the_owner_view_holds_the_pair(
+    tmp_path: Path,
+) -> None:
+    _make(tmp_path, "twitch", _families(("chat", ["twitch"], True)), _KEEPER_SOURCE)
+    _make(tmp_path, "bridge", _families(("chat", ["twitch"], False)), _KEEPER_SOURCE)
+    settings = {name: {"contexts": []} for name in ("twitch", "bridge")}
+    loader = _loader(tmp_path)
+    await loader.activate_enabled(
+        {
+            "enabled_modules": ["twitch", "bridge"],
+            "modules": settings,
+            "inputs": {"chat": {"twitch": "bridge"}},
+        }
+    )
+    (native,) = settings["twitch"]["contexts"]
+    (owner,) = settings["bridge"]["contexts"]
+    assert native.inputs.pairs == frozenset()
+    assert not native.inputs.owns("chat", "twitch")
+    assert owner.inputs.pairs == frozenset({("chat", "twitch")})
+    assert owner.inputs.owns("chat", "twitch")
+
+
+# -- the facades, built through for_module ------------------------------------ #
+
+
+class _FakeEngine:
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    def evaluate(self, event: Any, **kwargs: Any) -> str:
+        self.calls.append(event)
+        return "evaluated"
+
+    def recorded(self) -> str:
+        return "delegated"
+
+
+class _FakeChat:
+    def __init__(self) -> None:
+        self.appended: list[tuple[str, str, Any]] = []
+
+    def append(self, platform: str, channel_id: str, entry: Any) -> str:
+        self.appended.append((platform, channel_id, entry))
+        return "record"
+
+
+def _guarded_runtime() -> tuple[RuntimeContext, _FakeEngine, _FakeChat]:
+    bus = EventBus()
+    engine, chat = _FakeEngine(), _FakeChat()
+    runtime = RuntimeContext(
+        bus=bus,
+        actions=ActionRegistry(authorization=AuthorizationPolicy()),
+        supervision=Supervision(bus),
+        tasks=SupervisedTasks(),
+        triggers=engine,
+        chat=chat,
+    )
+    return runtime, engine, chat
+
+
+def _chat_event(platform: str, kind: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "platform": platform,
+        "channel_id": "c",
+        "message_id": "m1",
+        "text": "hi",
+        "author": {"id": "u"},
+    }
+    if kind is not None:
+        payload["kind"] = kind
+    return {
+        "type": "channel.chat.message",
+        "payload": payload,
+        "metadata": {"source": "intruder"},
+    }
+
+
+def _intruder(runtime: RuntimeContext) -> ModuleContext:
+    ownership = _resolve({"native": NATIVE, "intruder": _families(("chat", ["y"], True))})
+    return runtime.for_module(
+        "intruder",
+        owned_inputs=ownership.view_for("intruder"),
+        ownership=ownership,
+        declared=True,
+    )
+
+
+def test_for_module_without_ownership_returns_the_shared_objects() -> None:
+    runtime, engine, chat = _guarded_runtime()
+    context = runtime.for_module("m")
+    assert context.bus is runtime.bus
+    assert context.triggers is engine
+    assert context.chat is chat
+    assert context.inputs == OwnedInputs.unrestricted()
+    assert context.inputs.owns("chat", "anything")
+    with pytest.raises(AttributeError):
+        context.inputs = OwnedInputs()  # type: ignore[misc]
+
+
+def test_for_module_with_ownership_returns_stable_scoped_facades() -> None:
+    runtime, engine, chat = _guarded_runtime()
+    context = _intruder(runtime)
+    assert context.bus is not runtime.bus and context.bus is context.bus
+    assert context.triggers is not engine and context.chat is not chat
+    assert context.inputs.pairs == frozenset({("chat", "y")})
+    # Every other attribute is the shared object's own.
+    assert context.bus.list_events() == runtime.bus.list_events()
+    assert context.bus.subscribe.__self__ is runtime.bus
+    assert context.triggers.recorded() == "delegated"
+
+
+@pytest.mark.asyncio
+async def test_watch_ticks_and_other_events_pass_the_bus_facade_untouched() -> None:
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    other: list[Any] = []
+
+    async def record(event: Any) -> None:
+        other.append(event)
+
+    runtime.bus.subscribe("module.custom.event", record)
+    for kind in ("watch_tick", "not-a-kind"):
+        event = _chat_event("x", kind)
+        await context.bus.publish(event["type"], event["payload"], event["metadata"])
+    await context.bus.publish("module.custom.event", {"platform": "x"}, {})
+    # An event with no platform belongs to no family (D1).
+    await context.bus.publish("channel.chat.message", {"text": "hi"}, {})
+
+    assert recorder.counts() == {3}
+    assert len(other) == 1
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 0
+    assert recorder.traces == []
+
+
+@pytest.mark.asyncio
+async def test_notices_and_cues_are_guarded_like_messages() -> None:
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    for kind in ("message", PLATFORM_NOTICE_KINDS[0], CUE_KIND):
+        event = _chat_event("x", kind)
+        await context.bus.publish(event["type"], event["payload"], event["metadata"])
+    assert recorder.counts() == {0}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 3
+    assert recorder.traces == [
+        {"module": "intruder", "family": "chat", "platform": "x"},
+        {"module": "intruder", "family": "cues", "platform": "x"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_event_reaches_not_even_a_first_ordered_middleware() -> None:
+    runtime, _, _ = _guarded_runtime()
+    seen: list[Any] = []
+
+    async def audit(event: Any) -> None:
+        seen.append(event)
+
+    runtime.bus.subscribe("**", audit, order=-10_000)
+    context = _intruder(runtime)
+    event = _chat_event("x")
+    result = await context.bus.publish(event["type"], event["payload"], event["metadata"])
+    assert result is None
+    assert [item["type"] for item in seen] == [TRACE_INPUT_OWNERSHIP_REJECTED]
+
+
+def test_the_evaluate_facade_refuses_without_counting() -> None:
+    runtime, engine, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    decision = context.triggers.evaluate(_chat_event("x"))
+    assert isinstance(decision, TriggerDecision)
+    assert decision.accepted is False
+    assert decision.reason == "input_not_owned"
+    assert (decision.platform, decision.channel_id) == ("x", "c")
+    assert decision.source_event_id == "m1"
+    assert engine.calls == []
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 0
+
+    # An owned event and an event with no family reach the engine.
+    assert context.triggers.evaluate(_chat_event("y")) == "evaluated"
+    assert context.triggers.evaluate(_chat_event("x", "watch_tick")) == "evaluated"
+    assert len(engine.calls) == 2
+
+
+def test_the_chat_facade_drops_a_non_owned_append() -> None:
+    runtime, _, chat = _guarded_runtime()
+    context = _intruder(runtime)
+    assert context.chat.append("x", "c", "entry") is None
+    assert context.chat.append("y", "c", "entry") == "record"
+    assert chat.appended == [("y", "c", "entry")]
+
+
+@pytest.mark.asyncio
+async def test_the_diagnostic_set_is_bounded_and_the_counter_is_not() -> None:
+    from core import runtime as runtime_module
+
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    cap = runtime_module.MAX_OWNERSHIP_DIAGNOSTICS
+    for index in range(cap + 5):
+        event = _chat_event(f"p{index}")
+        await context.bus.publish(event["type"], event["payload"], event["metadata"])
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == cap + 5
+    assert len(recorder.traces) == cap
+
+
+@pytest.mark.asyncio
+async def test_a_lost_rejection_trace_is_counted_and_never_propagates() -> None:
+    bus = EventBus()
+
+    class _FailingSupervision:
+        def __init__(self) -> None:
+            self.counters: dict[str, int] = {}
+
+        def count(self, name: str, amount: int = 1) -> int:
+            self.counters[name] = self.counters.get(name, 0) + amount
+            return self.counters[name]
+
+        async def emit(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("trace sink down")
+
+    supervision = _FailingSupervision()
+    facade = _OwnedBus(
+        bus,
+        module="legacy",
+        ownership=_resolve({"native": NATIVE}),
+        declared=False,
+        supervision=supervision,
+    )
+    event = _chat_event("x")
+    assert await facade.publish(event["type"], event["payload"], event["metadata"]) is None
+    assert supervision.counters == {
+        COUNTER_INPUT_OWNERSHIP_REJECTIONS: 1,
+        COUNTER_LOST_TRACES: 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_v1_facade_delegates_every_other_bus_call() -> None:
+    """A v1 module subscribing through its facade receives what it may."""
+
+    bus = EventBus()
+    facade = _OwnedBus(
+        bus,
+        module="legacy",
+        ownership=_resolve({"native": NATIVE}),
+        declared=False,
+        supervision=Supervision(bus),
+    )
+    received: list[Any] = []
+
+    async def handle(event: Any) -> None:
+        received.append(event["payload"]["platform"])
+
+    facade.subscribe("channel.chat.message", handle)
+    for platform in ("x", "z"):
+        event = _chat_event(platform)
+        await facade.publish(event["type"], event["payload"], event["metadata"])
+    # (chat, x) is the native module's; (chat, z) has no owner: delivered.
+    assert received == ["z"]

@@ -113,7 +113,13 @@ from .lifecycle import (
     _wait_bounded,
     request_cancellation,
 )
-from .runtime import SUPPORTED_RUNTIME_APIS, ServiceConflictError
+from .runtime import (
+    SUPPORTED_RUNTIME_APIS,
+    OwnedInputs,
+    ServiceConflictError,
+    Supervision,
+    _OwnedBus,
+)
 from .triggers import COMPANION_NAME_SETTING
 
 
@@ -413,6 +419,7 @@ class ModuleLoader:
         #: (R2), before any secret, setting or module was touched. ``None``
         #: until one is resolved.
         self.input_ownership: InputOwnership | None = None
+        self._v1_supervision: Supervision | None = None
 
     @property
     def abandoned(self) -> tuple[asyncio.Task[Any], ...]:
@@ -629,13 +636,15 @@ class ModuleLoader:
         """
 
         if declaration.is_v2:
-            first_argument: Any = self.context.for_module(name)
+            first_argument: Any = self._scoped_context(name, declaration)
         else:
             # --- v1 COMPATIBILITY ROUTE ---------------------------------- #
             # The bus itself, positionally, exactly as before v2 existed. No
             # collaborator is smuggled onto it: the bus keeps the attributes
-            # its class defines (AC26).
-            first_argument = self.bus
+            # its class defines (AC26). A v1 module is an undeclared
+            # publisher, so once the table constrains any pair it receives
+            # the same guarded facade a v2 module does (D3).
+            first_argument = self._v1_bus(name)
 
         def activation_of(late: Any) -> ModuleActivation:
             return ModuleActivation(
@@ -1225,6 +1234,50 @@ class ModuleLoader:
             ]
         return []
 
+    def _scoped_context(self, name: str, declaration: ManifestDeclaration) -> Any:
+        """The module context *name* is handed, guarded by the table (R3).
+
+        The facades are installed for a module that declares
+        ``input_families`` and, as on the v1 route, for every module once
+        the table constrains any pair (D3). An undeclared module under a
+        table that constrains nothing would be refused nothing, so it keeps
+        the shared objects themselves, exactly as before.
+        """
+
+        ownership = self.input_ownership
+        if ownership is None:
+            return self.context.for_module(name)
+        declared = declaration.declares_input_families
+        guarded = declared or ownership.constrains_any()
+        return self.context.for_module(
+            name,
+            owned_inputs=ownership.view_for(name),
+            ownership=ownership if guarded else None,
+            declared=declared,
+        )
+
+    def _v1_bus(self, name: str) -> Any:
+        """The bus a v1 ``activate`` receives: guarded only when it matters."""
+
+        ownership = self.input_ownership
+        supervision = getattr(self.context, "supervision", None)
+        if ownership is None or not ownership.constrains_any():
+            return self.bus
+        if supervision is None:
+            # A loader built without a runtime context activates v1 modules
+            # only; the refusal still holds and is still counted and traced,
+            # on a supervision of this loader's own bus, built once.
+            if self._v1_supervision is None:
+                self._v1_supervision = Supervision(self.bus)
+            supervision = self._v1_supervision
+        return _OwnedBus(
+            self.bus,
+            module=name,
+            ownership=ownership,
+            declared=False,
+            supervision=supervision,
+        )
+
     def _register_declarations(
         self,
         name: str,
@@ -1249,7 +1302,7 @@ class ModuleLoader:
         if not declaration.is_v2:
             return
 
-        scoped = self.context.for_module(name)
+        scoped = self._scoped_context(name, declaration)
         for spec in declaration.actions:
             try:
                 scoped.actions.declare(spec)
@@ -2294,40 +2347,6 @@ ORIGIN_UNOWNED = "unowned"
 
 _INPUTS_KEY = "inputs"
 _MAX_KEY_LENGTH = 64
-
-
-@dataclass(frozen=True, slots=True)
-class OwnedInputs:
-    """One module's read-only view of the (family, platform) pairs it owns.
-
-    ``pairs`` holds the resolved rows the module owns, the wildcard row
-    included. A platform outside them is owned through the wildcard row
-    unless that platform is assigned to someone else — what ``excluded``
-    holds per family.
-    """
-
-    pairs: frozenset[tuple[str, str]] = frozenset()
-    excluded: Mapping[str, frozenset[str]] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
-
-    @classmethod
-    def unrestricted(cls) -> "OwnedInputs":
-        """The view used when no ownership table is installed: every pair."""
-
-        return cls(pairs=frozenset((family, WILDCARD) for family in INPUT_FAMILIES))
-
-    def owns(self, family: str, platform: str) -> bool:
-        if (family, platform) in self.pairs:
-            return True
-        if platform == WILDCARD or (family, WILDCARD) not in self.pairs:
-            return False
-        return platform not in self.excluded.get(family, frozenset())
-
-    def platforms(self, family: str) -> tuple[str, ...]:
-        """The rows of *family* this view owns, sorted, ``'*'`` included."""
-
-        return tuple(sorted(platform for owned, platform in self.pairs if owned == family))
 
 
 @dataclass(frozen=True, slots=True)
