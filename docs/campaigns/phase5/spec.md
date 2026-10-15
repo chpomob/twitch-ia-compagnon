@@ -57,6 +57,8 @@ targets:
     description: "Adapt the shipped-manifest and package-data counts from 17 to 18 (allowlisted)."
   - file: tests/test_users.py
     description: "Adapt the exact coverage.kind enum assertion to the widened enum (allowlisted); the module still reports `observed_authors`."
+  - file: tests/test_docs_bilingual.py
+    description: "Extend the `GUIDES` tuple with `automation-bridge`, so the two new guide files are the declared bilingual pair the file's existing checks cover (each names the other, same section count and fenced blocks, every backticked command, flag and identifier of the English text present in the French one)."
   - file: docs/automation-bridge.md
     description: "New operator guide (English, normative): what the bridge does and does not, settings, allowlist, ownership, the outcome vocabulary, the combination table of R9, the cue recipe, the trial status."
   - file: docs/automation-bridge.fr.md
@@ -504,7 +506,7 @@ combinations, verified by check-config) and R10 (static constraints) are trivial
 | Viewer presence from the instance | active-viewer pages instead of authors-who-spoke | 1 enum value added to `users.read` | AC34 |
 | Deterministic input ownership for every module, bridge or not | duplicate ingestion of one (family, platform) pair: from possible to refused at preparation (0 duplicate runs to absorb) | 1 manifest key, 1 profile block, 1 counter | AC7–AC9, AC13 |
 | Honest silence | 0 run-action outcomes reported as success; 100 % of acknowledged runs reported `external_unknown execution_unconfirmed` | no confirmation (A6) | AC16, AC17 |
-| What it costs | 0 new runtime dependencies; 0 shipped-profile changes; 5 core files touched additively; 7 existing tests adapted (allowlist); 1 module page more in the UI; a real-instance trial on Windows before "delivered" | — | AC1, AC2, AC36–AC41 |
+| What it costs | 0 new runtime dependencies; 0 shipped-profile changes; 5 core files touched additively; 8 existing tests adapted (7 via allowlist, 1 extended outside it); 1 module page more in the UI; a real-instance trial on Windows before "delivered" | — | AC1, AC2, AC36–AC41 |
 
 ## Test failure allowlist
 
