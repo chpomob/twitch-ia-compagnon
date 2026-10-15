@@ -24,6 +24,13 @@ authorization first (AC21), the transmission boundary of D8 — before the
 frame left, a pre-write failure, an interruption after the write, the static
 shape of the segment and the canary on the installed client — the in-flight
 run at shutdown (AC28) and the password sweep over the run scenarios (AC23).
+
+Plan step P16 adds the subscription and the inbound path: the ``Subscribe``
+request names only the categories the owned pairs need (R6, AC27), the
+bounded queue drops and counts what overflows without stalling the connection
+(AC26), and a cue envelope becomes one normalised ``cue`` event, decided by
+the trigger policy under ``triggers.<bridge>`` (R7; AC29, AC30) whose
+anti-echo refuses the configured companion identities (AC33, engine half).
 """
 
 from __future__ import annotations
@@ -73,6 +80,7 @@ from core.actions import (
     AuthorizationRule,
 )
 from core.contracts import (
+    COUNTER_INPUT_OWNERSHIP_REJECTIONS,
     TRACE_ACTION_COMPLETED,
     TRACE_MODULE_DEGRADED,
     TRACE_MODULE_READY,
@@ -85,8 +93,8 @@ from core.contracts import (
 from core.lifecycle import DEFAULT_HOOK_TIMEOUT_SECONDS, PhaseCoordinator
 from core.loader import ModuleLoader, _validate_manifest
 from core.runtime import RUNTIME_API, OwnedInputs
-from core.triggers import TriggerRegistry
-from conftest import ManualClock, runtime_context
+from core.triggers import REASON_SELF_AUTHORED, TriggerRegistry
+from conftest import ManualClock, RecordingScheduler, runtime_context
 
 from modules import streamerbot
 from modules.streamerbot import (
@@ -544,6 +552,16 @@ def test_identity_maps_must_map_platforms_to_non_empty_text() -> None:
     ]
 
 
+def test_a_companion_identity_holding_the_reserved_separator_is_refused() -> None:
+    """R7a: ``:`` is reserved for the ``instance:<platform>`` cue author, so
+    no companion identity can collide with it and turn every user-less cue
+    into a self-authored one."""
+
+    assert validate_settings(_with(companion_identities={"twitch": "instance:twitch"})) == [
+        _diagnostic("companion_identities.twitch", "must not contain ':'")
+    ]
+
+
 # -- the loader, the placeholder provider ------------------------------------ #
 
 
@@ -967,6 +985,14 @@ class FakeInstance:
         if socket is not None and not socket.closed:
             await socket.close()
 
+    async def push_frames(self, frames: list[dict[str, Any]]) -> None:
+        """Send each of *frames*, in order (built from fixture frames)."""
+
+        socket = self._socket
+        assert socket is not None and not socket.closed
+        for frame in frames:
+            await socket.send_json(frame)
+
     async def push_events(self, name: str, count: int, index: int = 0) -> None:
         """Send frame *index* of fixture *name* *count* times."""
 
@@ -1213,9 +1239,12 @@ class _Bridge:
     is asked for and parks on the manual clock until a test advances it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, scheduler: Any = None) -> None:
         self.clock = ManualClock()
-        self.context = runtime_context(clock=self.clock, trigger_registry=TriggerRegistry())
+        self.registry = TriggerRegistry()
+        self.context = runtime_context(
+            clock=self.clock, trigger_registry=self.registry, scheduler=scheduler
+        )
         self.traces: list[dict[str, Any]] = []
         self.context.bus.subscribe("**", self.traces.append, order=100)
         self.delays: list[float] = []
@@ -1227,16 +1256,25 @@ class _Bridge:
         self.delays.append(delay)
         await self.clock.sleep(delay)
 
-    async def activate(self, **settings: Any) -> None:
+    async def activate(
+        self,
+        *,
+        inputs: Mapping[str, Any] | None = None,
+        triggers: Mapping[str, Any] | None = None,
+        **settings: Any,
+    ) -> None:
         loader = ModuleLoader(self.context.bus, ROOT / "modules", context=self.context, environ={})
-        activations = await loader.activate_enabled(
-            {
-                "enabled_modules": [MODULE_NAME],
-                "modules": {
-                    MODULE_NAME: {**BASE_SETTINGS, "_sleeper": self.sleeper, **settings}
-                },
-            }
-        )
+        config: dict[str, Any] = {
+            "enabled_modules": [MODULE_NAME],
+            "modules": {
+                MODULE_NAME: {**BASE_SETTINGS, "_sleeper": self.sleeper, **settings}
+            },
+        }
+        if inputs is not None:
+            config["inputs"] = inputs
+        if triggers is not None:
+            config["triggers"] = triggers
+        activations = await loader.activate_enabled(config)
         (activation,) = activations
         self.handle = activation.handle
         self.coordinator = PhaseCoordinator(
@@ -1446,7 +1484,11 @@ async def test_ac24_the_challenge_answer_and_readiness_only_after_the_inventory(
     """AC24 (R6): the instance receives exactly
     ``base64(sha256(base64(sha256(password + salt)) + challenge))``, and the
     bridge is not ready while the inventory is still unanswered — only once
-    it is read; the inventory is kept by name, with id, group and enabled."""
+    it is read; the inventory is kept by name, with id, group and enabled.
+
+    Superseded in part by R6 (AC27, plan step P16): the bridge now also
+    subscribes, after the inventory and before readiness, so the frames end
+    with one ``Subscribe``."""
 
     caplog.set_level(logging.DEBUG)
     hello = fixture_frame("hello", 1)["authentication"]
@@ -1479,6 +1521,7 @@ async def test_ac24_the_challenge_answer_and_readiness_only_after_the_inventory(
             assert [frame["request"] for frame in fake.received] == [
                 "Authenticate",
                 "GetActions",
+                "Subscribe",
             ]
             inventory = bridge.handle.inventory
             assert sorted(inventory) == ["A", "B", "C", "D"]
@@ -1533,14 +1576,15 @@ async def test_r1_a_withheld_inventory_degrades_within_the_startup_bound(
 
 async def test_an_instance_without_a_challenge_is_not_sent_an_authentication() -> None:
     """A hello without ``authentication``: no ``Authenticate`` frame, even
-    with a password configured; ready once the inventory is read."""
+    with a password configured; ready once the inventory is read (and, since
+    R6's subscription of plan step P16, the owned categories subscribed)."""
 
     async with FakeInstance() as fake:
         bridge = _Bridge()
         await bridge.start(url=fake.url, password=PASSWORD)
         try:
             assert bridge.run_ready and bridge.state == "ready"
-            assert [frame["request"] for frame in fake.received] == ["GetActions"]
+            assert [frame["request"] for frame in fake.received] == ["GetActions", "Subscribe"]
         finally:
             await bridge.stop()
 
@@ -2628,3 +2672,474 @@ async def test_ac28_a_run_in_flight_at_shutdown_is_acknowledgement_lost(
         )
         assert len(runs.frames()) == 1
         assert runs.state == "stopped"
+
+
+# -- P16: subscriptions, the bounded queue and cues (R6, R7a) ---------------- #
+
+#: The broadcaster account the cues default to, and the companion's own one.
+INSTANCE_IDENTITY = {"twitch": "90001"}
+COMPANION_IDENTITIES = {"twitch": "companion-7"}
+
+
+def _cue_frame(**envelope: Any) -> dict[str, Any]:
+    """The documented custom-event frame carrying *envelope* as its ``args``.
+
+    The frame is the fixture's; only ``args`` changes, and ``args`` is not
+    the instance's to define — it is whatever the operator's action passes
+    (here, the cue envelope R7a specifies)."""
+
+    frame = fixture_frame("custom_event")
+    frame["data"]["args"] = envelope
+    return frame
+
+
+def _cue(cue_id: str, **fields: Any) -> dict[str, Any]:
+    return _cue_frame(**{"cue_id": cue_id, "platform": "twitch", "text": "!brb", **fields})
+
+
+def _published(bridge: _Bridge) -> list[dict[str, Any]]:
+    """The bridge's normalised events on the bus, in order."""
+
+    return [
+        trace
+        for trace in bridge.traces
+        if trace["type"] == "channel.chat.message"
+        and trace["metadata"].get("source") == MODULE_NAME
+    ]
+
+
+def _decisions(bridge: _Bridge) -> list[Mapping[str, Any]]:
+    return [
+        {**trace["payload"], "accepted": trace["type"] == "input.trigger.accepted"}
+        for trace in bridge.traces
+        if trace["type"] in ("input.trigger.accepted", "input.trigger.rejected")
+        and trace["payload"].get("input") == MODULE_NAME
+    ]
+
+
+@contextlib.asynccontextmanager
+async def _cue_bridge(**settings: Any) -> Any:
+    """A bridge connected to a fake instance, owning cues on every platform."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(
+            url=fake.url,
+            instance_identity=INSTANCE_IDENTITY,
+            companion_identities=COMPANION_IDENTITIES,
+            **settings,
+        )
+        try:
+            yield bridge, fake
+        finally:
+            await bridge.stop()
+
+
+async def _push(bridge: _Bridge, fake: FakeInstance, *frames: dict[str, Any]) -> None:
+    """Push *frames*; return once each was published or dropped (the
+    consumer handles them in order, one at a time)."""
+
+    def handled() -> int:
+        return len(_published(bridge)) + bridge.handle.dropped_events
+
+    expected = handled() + len(frames)
+    await fake.push_frames(list(frames))
+    await _until(lambda: handled() >= expected)
+
+
+async def test_ac27_owning_only_cues_subscribes_to_the_custom_category_only() -> None:
+    """AC27 (R6): with the bridge owning only (``cues``, ``*``) — the
+    manifest default — the one ``Subscribe`` names the custom-event category
+    and nothing else; viewers need no subscription."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, inputs={"viewers": {"twitch": MODULE_NAME}})
+        try:
+            (subscribe,) = fake.requests("Subscribe")
+            assert subscribe["events"] == {"Custom": ["Event"]}
+            assert bridge.state == "ready"
+        finally:
+            await bridge.stop()
+
+
+async def test_ac27_owning_twitch_chat_adds_only_twitch_chat_and_notices() -> None:
+    """AC27 (R6): adding (``chat``, twitch) adds the twitch chat-message
+    category and the twitch notice categories — no other platform's."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(
+            url=fake.url,
+            inputs={"chat": {"twitch": MODULE_NAME}},
+            companion_identities=COMPANION_IDENTITIES,
+        )
+        try:
+            (subscribe,) = fake.requests("Subscribe")
+            assert subscribe["events"] == {
+                "Custom": ["Event"],
+                "Twitch": ["ChatMessage", "Sub", "ReSub", "GiftSub", "GiftBomb", "Raid", "Follow"],
+            }
+        finally:
+            await bridge.stop()
+
+
+def test_ac27_the_categories_follow_the_owned_pairs_only() -> None:
+    """The pure mapping behind the request: nothing owned, nothing named;
+    cues owned on one concrete platform still name the custom category."""
+
+    assert streamerbot.subscription_events(OwnedInputs()) == {}
+    assert streamerbot.subscription_events(
+        OwnedInputs(pairs=frozenset({("viewers", "kick")}))
+    ) == {}
+    assert streamerbot.subscription_events(
+        OwnedInputs(pairs=frozenset({("cues", "kick")}))
+    ) == {"Custom": ["Event"]}
+    assert set(
+        streamerbot.subscription_events(
+            OwnedInputs(pairs=frozenset({("chat", "kick"), ("chat", "youtube")}))
+        )
+    ) == {"Kick", "YouTube"}
+
+
+async def test_r6_a_refused_subscription_leaves_the_bridge_not_ready() -> None:
+    """R6: readiness follows the subscription; an instance refusing it
+    leaves the bridge degraded (``protocol_error``), never ready."""
+
+    async with FakeInstance() as fake:
+        original = fake._answer
+
+        async def refuse_subscribe(socket: Any, frame: dict[str, Any]) -> None:
+            if frame.get("request") == "Subscribe":
+                reply = fixture_frame("error_response")
+                reply["id"] = frame.get("id")
+                await socket.send_json(reply)
+                return
+            await original(socket, frame)
+
+        fake._answer = refuse_subscribe  # type: ignore[method-assign]
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, reconnect=RECONNECT)
+        try:
+            assert bridge.state == "degraded" and not bridge.run_ready
+            assert bridge.health()[-1] == (TRACE_MODULE_DEGRADED, "protocol_error")
+            assert len(fake.requests("Subscribe")) == 1
+            await asyncio.wait_for(fake.wait_for_disconnections(1), FAKE_WAIT_SECONDS)
+        finally:
+            await bridge.stop()
+
+
+async def test_ac26_a_full_queue_drops_and_counts_and_never_stalls_the_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC26 (R6): with a bound of 4 and 10 events delivered before the
+    consumer runs, the reader drops 6 and counts them without waiting; a run
+    request sent afterwards is acknowledged; once the consumer runs, the 4
+    queued cues are published, and the count is a readiness detail."""
+
+    held = asyncio.Event()
+
+    def hold_consumer(runs: _Runs) -> None:
+        runs.handle._before_consume = held.wait
+
+    async with _scenario(
+        caplog,
+        allowlist=[{"action": "A"}],
+        before_start=hold_consumer,
+        queue_max_events=4,
+        instance_identity=INSTANCE_IDENTITY,
+    ) as runs:
+        await runs.fake.push_frames([_cue(f"cue-{index}") for index in range(10)])
+        await _until(lambda: runs.handle.dropped_events == 6)
+        assert runs.handle._queue.qsize() == 4
+        assert _published(runs) == []
+
+        # The reader was never blocked: the run is acknowledged.
+        _outcome(
+            await runs.run(runs.call("A")),
+            "external_unknown",
+            ERROR_EXTERNAL_UNKNOWN,
+            "execution_unconfirmed",
+        )
+
+        held.set()
+        await _until(lambda: len(_published(runs)) == 4)
+        assert [event["payload"]["message_id"] for event in _published(runs)] == [
+            "cue-0",
+            "cue-1",
+            "cue-2",
+            "cue-3",
+        ]
+        assert runs.handle.dropped_events == 6
+
+        # The count is a readiness detail: the bridge's own next ready
+        # record, after a reconnection, carries it.
+        await runs.fake.close_connection()
+        await _until(lambda: runs.state == "degraded")
+        await _until(lambda: runs.clock.next_deadline() is not None)
+        runs.clock.advance(RECONNECT["min_delay_seconds"])
+        await _until(lambda: runs.state == "ready")
+        assert runs.records(TRACE_MODULE_READY)[-1]["dropped_events"] == 6
+
+
+async def test_ac29_a_valid_cue_is_one_normalised_event_the_default_policy_accepts() -> None:
+    """AC29 (R7): a valid envelope for ``twitch`` gives exactly 1 event with
+    the exact fields, decided by the policy under ``triggers.<bridge>`` —
+    the module default, which accepts every cue."""
+
+    async with _cue_bridge() as (bridge, fake):
+        await _push(bridge, fake, _cue("cue-29", text="intro"))
+        (event,) = _published(bridge)
+        assert event["type"] == "channel.chat.message"
+        assert event["metadata"] == {"source": MODULE_NAME, "schema_version": 2}
+        assert event["payload"] == {
+            "platform": "twitch",
+            "channel_id": INSTANCE_IDENTITY["twitch"],
+            "author": {"id": "instance:twitch"},
+            "message_id": "cue-29",
+            "text": "intro",
+            "kind": "cue",
+        }
+        policy = bridge.registry.resolve(MODULE_NAME, INSTANCE_IDENTITY["twitch"])
+        assert policy is not None
+        (decision,) = _decisions(bridge)
+        assert decision["accepted"] is True
+        assert decision["input"] == MODULE_NAME
+        assert decision["source_event_id"] == "cue-29"
+        assert decision["policy_version"] == policy.version
+        recorded = bridge.context.triggers.recorded(
+            platform="twitch", channel_id=INSTANCE_IDENTITY["twitch"], source_event_id="cue-29"
+        )
+        assert recorded is not None and recorded.accepted
+        assert bridge.handle.dropped_events == 0
+
+
+async def test_r7_an_accepted_cue_is_admitted_to_the_shared_scheduler() -> None:
+    """R7: with a shared scheduler in the context (the brain then admits
+    nothing itself), an accepted cue is admitted by the bridge under its
+    author's session; a refused one is not."""
+
+    triggers = {
+        MODULE_NAME: {
+            "channels": {
+                "chan-strict": {
+                    "combination": "all_of",
+                    "rules": [{"type": "keyword", "parameters": {"keywords": ["!never"]}}],
+                }
+            }
+        }
+    }
+    scheduler = RecordingScheduler()
+    async with FakeInstance() as fake:
+        bridge = _Bridge(scheduler=scheduler)
+        await bridge.start(url=fake.url, instance_identity=INSTANCE_IDENTITY, triggers=triggers)
+        try:
+            await _push(bridge, fake, _cue("cue-refused", channel_id="chan-strict"), _cue("cue-ok"))
+            ((session_key, work),) = scheduler.admissions
+            assert session_key.platform == "twitch"
+            assert session_key.channel_id == INSTANCE_IDENTITY["twitch"]
+            assert session_key.viewer_id == "instance:twitch"
+            assert work.source_event_id == "cue-ok"
+            assert work.payload["payload"]["kind"] == "cue"
+        finally:
+            await bridge.stop()
+
+
+async def test_ac29_a_configured_policy_under_the_bridge_decides_its_cues() -> None:
+    """AC29 (R7): the policy configured under ``triggers.<bridge>`` for a
+    channel replaces the default there — a cue to that channel is refused
+    by it (still published, as a decided fact), the default still accepts
+    elsewhere; and an envelope's own channel and user are kept."""
+
+    triggers = {
+        MODULE_NAME: {
+            "channels": {
+                "chan-strict": {
+                    "combination": "all_of",
+                    "rules": [{"type": "keyword", "parameters": {"keywords": ["!never"]}}],
+                }
+            }
+        }
+    }
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, instance_identity=INSTANCE_IDENTITY, triggers=triggers)
+        try:
+            await _push(
+                bridge,
+                fake,
+                _cue("cue-a", channel_id="chan-strict", user_id="555", user_name="Viewer"),
+                _cue("cue-b"),
+            )
+            strict, default = _published(bridge)
+            assert strict["payload"]["channel_id"] == "chan-strict"
+            assert strict["payload"]["author"] == {"id": "555", "display_name": "Viewer"}
+            assert [decision["accepted"] for decision in _decisions(bridge)] == [False, True]
+            assert default["payload"]["channel_id"] == INSTANCE_IDENTITY["twitch"]
+        finally:
+            await bridge.stop()
+
+
+async def test_ac30_a_cue_without_user_has_one_stable_author_unlike_the_companion() -> None:
+    """AC30 (R7): two cues without ``user_id`` share one author id, distinct
+    from every configured companion identity (case-insensitively too)."""
+
+    async with _cue_bridge() as (bridge, fake):
+        await _push(bridge, fake, _cue("cue-1"), _cue("cue-2"))
+        first, second = _published(bridge)
+        assert first["payload"]["author"]["id"] == second["payload"]["author"]["id"]
+        author = first["payload"]["author"]["id"]
+        assert author.casefold() not in {
+            identity.casefold() for identity in COMPANION_IDENTITIES.values()
+        }
+        assert all(decision["accepted"] for decision in _decisions(bridge))
+
+
+AC30_REFUSED = [
+    pytest.param({"cue_id": "c", "platform": "twitch", "text": "é" * 501}, id="501-code-points"),
+    pytest.param({"cue_id": "", "platform": "twitch", "text": "x"}, id="empty-cue-id"),
+    pytest.param({"cue_id": "c", "text": "x"}, id="no-platform"),
+]
+
+
+@pytest.mark.parametrize("envelope", AC30_REFUSED)
+async def test_ac30_a_malformed_or_oversized_envelope_is_dropped_and_counted(
+    envelope: dict[str, Any],
+) -> None:
+    """AC30 (R7): 501 code points of text, an empty ``cue_id`` or no
+    ``platform`` publishes 0 events and adds exactly 1 to the drop count —
+    never truncated or repaired, never decided."""
+
+    async with _cue_bridge() as (bridge, fake):
+        await _push(bridge, fake, _cue_frame(**envelope))
+        assert _published(bridge) == []
+        assert _decisions(bridge) == []
+        assert bridge.handle.dropped_events == 1
+
+
+def test_r7_the_envelope_rules_at_their_bounds() -> None:
+    """R7a, strictly: 500 code points and 128 characters pass; one more
+    fails; a missing default channel, a lone ``user_name``, a reserved
+    ``:`` in ``user_id``, a non-string text and a non-cue frame all fail."""
+
+    identity = INSTANCE_IDENTITY
+    assert streamerbot.cue_event(_cue("c", text="é" * 500), identity) is not None
+    assert streamerbot.cue_event(_cue("c" * 128), identity) is not None
+    assert streamerbot.cue_event(_cue("c" * 129), identity) is None
+    assert streamerbot.cue_event(_cue("c", platform="kick"), identity) is None
+    assert streamerbot.cue_event(_cue("c", platform="kick", channel_id="k1"), identity) is not None
+    assert streamerbot.cue_event(_cue("c", user_name="Viewer"), identity) is None
+    assert streamerbot.cue_event(_cue("c", user_id="1"), identity) is None
+    assert streamerbot.cue_event(_cue("c", user_id="instance:twitch", user_name="X"), identity) is None
+    assert streamerbot.cue_event(_cue("c", text=None), identity) is None
+    assert streamerbot.cue_event(_cue_frame(), identity) is None
+    assert streamerbot.cue_event(fixture_frame("custom_event"), identity) is None
+    assert streamerbot.cue_event(fixture_frame("chat_twitch"), identity) is None
+    # Keys the operator's action passes along besides the envelope are ignored.
+    assert streamerbot.cue_event(_cue("c", scene="intro"), identity) is not None
+
+
+async def test_r7_a_cue_for_a_platform_not_owned_is_dropped_by_the_bridge() -> None:
+    """Plan risk (wildcard platform): a cue for a platform whose cues another
+    module owns is dropped and counted by the bridge itself — the ownership
+    guard never sees it — and an event with no mapping is counted too."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(
+            url=fake.url,
+            inputs={"cues": {"kick": "none"}},
+            instance_identity={"kick": "k1", **INSTANCE_IDENTITY},
+        )
+        try:
+            await _push(bridge, fake, _cue("cue-k", platform="kick"), fixture_frame("chat_twitch"))
+            assert _published(bridge) == []
+            assert bridge.handle.dropped_events == 2
+            snapshot = bridge.context.supervision.snapshot()
+            assert snapshot[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 0
+        finally:
+            await bridge.stop()
+
+
+async def test_r7_a_replayed_cue_id_is_neither_republished_nor_redecided() -> None:
+    """Plan risk (replays): a ``cue_id`` the instance sends again inside the
+    engine's dedup window reuses the recorded decision and is not published
+    a second time."""
+
+    async with _cue_bridge() as (bridge, fake):
+        await _push(bridge, fake, _cue("cue-r"))
+        # The replay is handled before the next cue: one consumer, in order.
+        await fake.push_frames([_cue("cue-r")])
+        await _push(bridge, fake, _cue("cue-s"))
+        assert [event["payload"]["message_id"] for event in _published(bridge)] == [
+            "cue-r",
+            "cue-s",
+        ]
+        assert len(_decisions(bridge)) == 2
+        assert bridge.handle.dropped_events == 0
+
+
+def _authored_by(author_id: str, message_id: str) -> dict[str, Any]:
+    """A relayed twitch chat event authored by *author_id*, as the bridge
+    publishes one (the shape P17's chat mapping produces)."""
+
+    return {
+        "type": "channel.chat.message",
+        "payload": {
+            "platform": "twitch",
+            "channel_id": INSTANCE_IDENTITY["twitch"],
+            "author": {"id": author_id, "display_name": "Companion"},
+            "message_id": message_id,
+            "text": "Companion said this",
+        },
+        "metadata": {"source": MODULE_NAME, "schema_version": 2},
+    }
+
+
+async def test_ac33_engine_half_an_event_authored_by_the_companion_is_refused() -> None:
+    """AC33 (R7, engine half; D6): owning (``chat``, twitch) with
+    ``companion_identities.twitch`` set, the bridge hands the identity to the
+    trigger engine at activation. An event it relays authored by that
+    identity — whatever its case — is rejected by the engine's anti-echo
+    invariant on the bridge's own evaluate → publish path, while a viewer's
+    is accepted. (P17 feeds the chat-mapped instance event through the same
+    path.)"""
+
+    async with _cue_bridge(inputs={"chat": {"twitch": MODULE_NAME}}) as (bridge, fake):
+        await _push(
+            bridge,
+            fake,
+            _cue("cue-echo", user_id="COMPANION-7", user_name="Companion"),
+            _cue("cue-viewer", user_id="555", user_name="Viewer"),
+        )
+        assert [
+            (decision["source_event_id"], decision["accepted"], decision["reason"])
+            for decision in _decisions(bridge)
+        ][0] == ("cue-echo", False, REASON_SELF_AUTHORED)
+        assert _decisions(bridge)[1]["accepted"] is True
+
+        echo = bridge.context.triggers.evaluate(
+            _authored_by(COMPANION_IDENTITIES["twitch"], "chat-echo")
+        )
+        assert not echo.accepted and echo.reason == REASON_SELF_AUTHORED
+
+
+async def test_ac33_the_refusal_comes_from_the_identities_the_bridge_hands_over() -> None:
+    """The control for AC33: a bridge configured without companion
+    identities leaves the engine accepting what the configured one refuses."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, instance_identity=INSTANCE_IDENTITY)
+        try:
+            await _push(bridge, fake, _cue("cue-echo", user_id="companion-7", user_name="C"))
+            ((_, accepted, reason),) = [
+                (d["source_event_id"], d["accepted"], d["reason"]) for d in _decisions(bridge)
+            ]
+            assert accepted and reason != REASON_SELF_AUTHORED
+            decision = bridge.context.triggers.evaluate(
+                _authored_by(COMPANION_IDENTITIES["twitch"], "chat-echo")
+            )
+            assert decision.reason != REASON_SELF_AUTHORED
+        finally:
+            await bridge.stop()

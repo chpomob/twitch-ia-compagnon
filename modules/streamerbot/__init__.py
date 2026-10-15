@@ -1,4 +1,4 @@
-"""Automation bridge on the v2 runtime (phase 5 R1, R4, R6, R10).
+"""Automation bridge on the v2 runtime (phase 5 R1, R4, R6, R7, R10).
 
 The manifest beside this package declares ``manifest_version: 2``: the
 loader runs :func:`validate_settings` before anything is activated, hands
@@ -61,6 +61,40 @@ provider_failed`` (``instance_rejected``), and a missing acknowledgement, a
 lost connection or a cancellation after sending is ``external_unknown``
 (``acknowledgement_lost``). Never a success, never a retry.
 
+**Subscriptions and the inbound queue (R6).** Before readiness, one
+``Subscribe`` request names only the event categories the owned pairs need:
+the custom-event category when the bridge owns cues on any platform, and for
+each owned (``chat``, P) P's chat-message and notice categories; viewers are
+read on demand and need none. The reader never waits on an event: it hands
+each one to a queue bounded by ``queue_max_events`` without blocking, an
+event arriving at a full queue is dropped and counted (``dropped_events``,
+also a detail of every ``module.ready`` record the bridge reports), and
+request answers keep flowing. One consumer task drains the queue.
+
+**Cues (R7a).** A custom event whose ``args`` carry the cue envelope —
+``cue_id`` (non-empty, at most 128 characters), ``platform`` (non-empty), an
+optional ``channel_id`` (by default the ``instance_identity`` of that
+platform; with neither, the cue is dropped), an optional ``user_id`` with its
+``user_name``, and ``text`` (a string of at most 500 code points) — becomes
+one schema-version-2 ``channel.chat.message`` with ``payload.kind: cue``,
+``message_id`` = ``cue_id`` and ``metadata.source`` = this module. Other
+``args`` keys — the instance hands an action's own arguments along — are
+ignored. Its author is the envelope user or, absent one, the stable identity
+``instance:<platform>``: every platform module refuses an account id holding
+``:``, so it is distinct from every viewer and every configured companion
+identity, and an envelope ``user_id`` holding ``:`` is refused. A malformed
+or oversized envelope, a cue for a platform this module does not own, and
+any other event (no mapping yet) are dropped and counted, never truncated or
+repaired. A cue is evaluated by the trigger policy under
+``triggers.<module>`` with no role claims, then published on the bus, and
+its decision traced, as the native chat inputs do; an accepted cue is
+admitted to the runtime's shared scheduler when the context carries one. A
+companion identity holding ``:`` is refused. The companion identities
+are handed to the trigger engine at activation, so its anti-echo refuses
+what the companion authored. A ``cue_id`` the instance sends again inside
+the engine's dedup window reuses the decision already recorded and is not
+published twice: the instance must not reuse a ``cue_id`` for a new cue.
+
 Nothing here logs: the URL, the password and frame text never reach a trace
 or a diagnostic, only reasons do. No endpoint, port, password, version or
 action name has a default anywhere (R6).
@@ -71,7 +105,9 @@ acknowledgement deadline wait on, ``asyncio.sleep`` by default) is read from
 ``AutomationBridge._before_transmit`` is awaited by the run provider after
 every decision and strictly before the transmission segment; by default it
 returns at once. Replacing it makes the interval before the frame leaves
-observable.
+observable. ``AutomationBridge._before_consume`` is awaited by the consumer
+before it takes each event from the queue; by default it returns at once.
+Replacing it holds the consumer, so the queue's bound is observable.
 """
 
 from __future__ import annotations
@@ -101,13 +137,19 @@ from core.actions import (
     ERROR_PROVIDER_NOT_READY,
 )
 from core.contracts import (
+    CUE_KIND,
+    TRACE_INPUT_TRIGGER_ACCEPTED,
+    TRACE_INPUT_TRIGGER_REJECTED,
     ActionObservation,
     ActionSpec,
     ContractError,
     Destination,
+    SessionKey,
     validate_against_schema,
     validate_schema,
 )
+from core.admission import Work
+from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext
 
 MODULE_NAME = "streamerbot"
 
@@ -126,6 +168,7 @@ ACKNOWLEDGEMENT_MARGIN_SECONDS = 1.0
 #: one requires a companion identity for it (R7, AC33).
 CHAT_PLATFORMS = ("twitch", "kick", "youtube")
 _CHAT_FAMILY = "chat"
+_CUES_FAMILY = "cues"
 
 _SCHEME_PLAIN = "ws"
 _SCHEME_TLS = "wss"
@@ -414,7 +457,12 @@ def _allowlist_diagnostics(allowlist: Any) -> list[str]:
 
 
 def _identity_diagnostics(name: str, identities: Any) -> list[str]:
-    """A platform → account identifier mapping, both sides non-empty text."""
+    """A platform → account identifier mapping, both sides non-empty text.
+
+    A companion identity holding ``:`` is refused: that separator is reserved
+    for the ``instance:<platform>`` author of a cue without a user, which must
+    never be taken for the companion (R7a).
+    """
 
     if not isinstance(identities, Mapping):
         return [_setting_diagnostic(name, "must be a mapping of platform to identifier")]
@@ -425,6 +473,12 @@ def _identity_diagnostics(name: str, identities: Any) -> list[str]:
         elif not _is_text(identity):
             diagnostics.append(
                 _setting_diagnostic(f"{name}.{platform}", "must be a non-empty string")
+            )
+        elif name == _SETTING_COMPANION_IDENTITIES and _RESERVED_SEPARATOR in identity:
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{name}.{platform}", f"must not contain {_RESERVED_SEPARATOR!r}"
+                )
             )
     return diagnostics
 
@@ -548,6 +602,8 @@ _DEFAULT_MIN_DELAY_SECONDS = 1.0
 _DEFAULT_MAX_DELAY_SECONDS = 60.0
 
 _OWNER_TASK = "automation-bridge.connection"
+_CONSUMER_TASK = "automation-bridge.events"
+_DEFAULT_QUEUE_MAX_EVENTS = 256
 
 #: How long ``start_inputs`` waits for the first attempt to settle. Well
 #: inside the coordinator's default hook timeout (60 s), whatever deadlines
@@ -559,6 +615,7 @@ _REQUEST_HELLO = "Hello"
 _REQUEST_AUTHENTICATE = "Authenticate"
 _REQUEST_GET_ACTIONS = "GetActions"
 _REQUEST_DO_ACTION = "DoAction"
+_REQUEST_SUBSCRIBE = "Subscribe"
 _STATUS_OK = "ok"
 _STATUS_ERROR = "error"
 
@@ -745,6 +802,133 @@ class _Connection:
         finally:
             self.fail_pending()
             self.lost.set()
+
+
+# --------------------------------------------------------------------------- #
+# Subscriptions and cues (R6, R7)
+# --------------------------------------------------------------------------- #
+
+#: The instance's custom-event category: the one cues arrive in.
+_CUSTOM_SOURCE = "Custom"
+_CUSTOM_TYPE = "Event"
+
+#: Each chat platform's event source, as the instance spells it.
+_PLATFORM_SOURCES = MappingProxyType(
+    {"twitch": "Twitch", "kick": "Kick", "youtube": "YouTube"}
+)
+#: Each chat platform's chat-message event type first, then its documented
+#: notice types (the fixtures README's enumerated list).
+_CHAT_EVENT_TYPES = MappingProxyType(
+    {
+        "twitch": ("ChatMessage", "Sub", "ReSub", "GiftSub", "GiftBomb", "Raid", "Follow"),
+        "kick": (
+            "ChatMessage",
+            "Follow",
+            "Subscription",
+            "Resubscription",
+            "GiftSubscription",
+        ),
+        "youtube": (
+            "Message",
+            "NewSponsor",
+            "MemberMileStone",
+            "MembershipGift",
+            "SuperChat",
+            "SuperSticker",
+        ),
+    }
+)
+
+#: The cue envelope's bounds (R7a).
+CUE_ID_MAX_CHARACTERS = 128
+CUE_TEXT_MAX_CODE_POINTS = 500
+#: The author prefix of a cue without a user; ``:`` is refused in every
+#: platform account id, so the identity is never a viewer's or the companion's.
+INSTANCE_AUTHOR_PREFIX = "instance:"
+_RESERVED_SEPARATOR = ":"
+_CHAT_EVENT = "channel.chat.message"
+
+
+def subscription_events(inputs: Any) -> dict[str, list[str]]:
+    """The categories the ``Subscribe`` request names, from the owned pairs.
+
+    Cues owned on any platform → the custom-event category only; each owned
+    (``chat``, P) → P's chat-message and notice categories only; viewers are
+    pulled on demand and need none (R6, AC27).
+    """
+
+    events: dict[str, list[str]] = {}
+    if inputs.platforms(_CUES_FAMILY):
+        events[_CUSTOM_SOURCE] = [_CUSTOM_TYPE]
+    for platform in CHAT_PLATFORMS:
+        if inputs.owns(_CHAT_FAMILY, platform):
+            events[_PLATFORM_SOURCES[platform]] = list(_CHAT_EVENT_TYPES[platform])
+    return events
+
+
+def _is_cue_frame(frame: Mapping[str, Any]) -> bool:
+    event = frame.get("event")
+    return (
+        isinstance(event, Mapping)
+        and event.get("source") == _CUSTOM_SOURCE
+        and event.get("type") == _CUSTOM_TYPE
+    )
+
+
+def cue_event(
+    frame: Mapping[str, Any], instance_identity: Mapping[str, str]
+) -> dict[str, Any] | None:
+    """The normalised event of one custom-event frame, or ``None`` (R7a).
+
+    The envelope is the frame's ``data.args``. It is checked strictly and
+    never repaired: a missing, empty or overlong ``cue_id``, a missing
+    ``platform``, a ``channel_id`` neither given nor configured, a
+    ``user_name`` without ``user_id`` (or the reverse), a ``user_id`` holding
+    ``:``, or a ``text`` that is not a string of at most 500 code points
+    gives ``None``.
+    """
+
+    if not _is_cue_frame(frame):
+        return None
+    data = frame.get("data")
+    envelope = data.get("args") if isinstance(data, Mapping) else None
+    if not isinstance(envelope, Mapping):
+        return None
+    cue_id = envelope.get("cue_id")
+    if not _is_text(cue_id) or len(cue_id) > CUE_ID_MAX_CHARACTERS:
+        return None
+    platform = envelope.get("platform")
+    if not _is_text(platform):
+        return None
+    channel_id = envelope.get("channel_id", instance_identity.get(platform))
+    if not _is_text(channel_id):
+        return None
+    text = envelope.get("text")
+    if not isinstance(text, str) or len(text) > CUE_TEXT_MAX_CODE_POINTS:
+        return None
+    user_id, user_name = envelope.get("user_id"), envelope.get("user_name")
+    if user_id is None and user_name is None:
+        author = {"id": f"{INSTANCE_AUTHOR_PREFIX}{platform}"}
+    elif (
+        _is_text(user_id)
+        and _is_text(user_name)
+        and _RESERVED_SEPARATOR not in user_id
+    ):
+        author = {"id": user_id, "display_name": user_name}
+    else:
+        return None
+    return {
+        "type": _CHAT_EVENT,
+        "payload": {
+            "platform": platform,
+            "channel_id": channel_id,
+            "author": author,
+            "message_id": cue_id,
+            "text": text,
+            "kind": CUE_KIND,
+        },
+        "metadata": {"source": MODULE_NAME, "schema_version": NORMALIZED_SCHEMA_VERSION},
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -992,6 +1176,22 @@ class AutomationBridge:
         self._min_delay = float(reconnect.get(_MIN_DELAY_FIELD, _DEFAULT_MIN_DELAY_SECONDS))
         self._max_delay = float(reconnect.get(_MAX_DELAY_FIELD, _DEFAULT_MAX_DELAY_SECONDS))
         self._provider = _RunProvider(self)
+        self._bus = getattr(context, "bus", None)
+        self._triggers = getattr(context, "triggers", None)
+        self._inputs = getattr(context, "inputs", None)
+        # A shared scheduler is fed by the producer that decided the trigger
+        # (the brain admits into an owned one only), so an accepted cue is
+        # admitted here, as the native chat inputs admit theirs.
+        scheduler = getattr(context, "scheduler", None)
+        self._scheduler = scheduler if callable(getattr(scheduler, "admit", None)) else None
+        self._instance_identity: Mapping[str, str] = MappingProxyType(
+            dict(settings.get(_SETTING_INSTANCE_IDENTITY) or {})
+        )
+        self._queue: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue(
+            maxsize=int(settings.get(_SETTING_QUEUE_MAX_EVENTS, _DEFAULT_QUEUE_MAX_EVENTS))
+        )
+        self._dropped_events = 0
+        self._consumer: asyncio.Task[None] | None = None
         self._session: aiohttp.ClientSession | None = None
         self._connection: _Connection | None = None
         self._owner: asyncio.Task[None] | None = None
@@ -1019,8 +1219,167 @@ class AutomationBridge:
 
         return self._inventory
 
+    @property
+    def dropped_events(self) -> int:
+        """Inbound events dropped: a full queue, a malformed or oversized
+        envelope, a platform not owned, an event with no mapping (R6, R7)."""
+
+        return self._dropped_events
+
     async def _before_transmit(self) -> None:
         """The test seam before the transmission segment; returns at once."""
+
+    async def _before_consume(self) -> None:
+        """The test seam before each dequeue; returns at once."""
+
+    # -- inbound events (R6, R7) ------------------------------------------- #
+
+    def _on_event(self, frame: Mapping[str, Any]) -> None:
+        """Hand one inbound event to the bounded queue, never waiting.
+
+        Called by the reader: a full queue drops the event and counts it, so
+        the reader goes on and request answers keep flowing (R6, AC26).
+        """
+
+        try:
+            self._queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            self._drop()
+
+    def _drop(self) -> None:
+        """Count one dropped inbound event."""
+
+        self._dropped_events += 1
+
+    async def _consume(self) -> None:
+        """Drain the queue, one event at a time, until cancelled."""
+
+        while True:
+            await self._before_consume()
+            frame = await self._queue.get()
+            try:
+                await self._ingest(frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One event that cannot be handled never stops the consumer.
+                self._drop()
+
+    async def _ingest(self, frame: Mapping[str, Any]) -> None:
+        """Map, evaluate, publish, trace and admit one inbound event (R7).
+
+        The order mirrors the native chat inputs: the dedup window first (a
+        replay is neither re-published nor re-decided), then the trigger
+        decision, then the publication — the bus carries the event decided
+        either way, and its consumer reads the recorded decision — then the
+        decision's trace, then — accepted, with a scheduler in the context —
+        the admission. A cue for a platform this module does not own is
+        dropped here, before the ownership guard would count it.
+        """
+
+        event = cue_event(frame, self._instance_identity)
+        if event is None or not self._owns(_CUES_FAMILY, event["payload"]["platform"]):
+            self._drop()
+            return
+        payload, metadata = event["payload"], event["metadata"]
+        engine = self._triggers
+        decision = None
+        if engine is not None:
+            if engine.recorded(
+                platform=payload["platform"],
+                channel_id=payload["channel_id"],
+                source_event_id=payload["message_id"],
+            ) is not None:
+                return
+            try:
+                decision = engine.evaluate(event, context=TriggerContext(()))
+            except Exception:
+                # Fail closed: published below, but nothing reads a decision.
+                decision = None
+        if self._bus is not None:
+            try:
+                await self._bus.publish(_CHAT_EVENT, payload, metadata)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        if decision is not None:
+            await self._trace_decision(decision)
+            if decision.accepted and self._scheduler is not None:
+                self._admit(event)
+
+    def _admit(self, event: Mapping[str, Any]) -> None:
+        """Hand the accepted cue to the scheduler and return at once.
+
+        The scheduler copies the event, decides and traces its own admission;
+        a refusal or a failure here changes nothing about what was decided.
+        """
+
+        payload = event["payload"]
+        try:
+            self._scheduler.admit(
+                SessionKey(
+                    platform=payload["platform"],
+                    channel_id=payload["channel_id"],
+                    viewer_id=payload["author"]["id"],
+                ),
+                Work(
+                    payload=event,
+                    source_event_id=payload["message_id"],
+                    kind="chat.message",
+                ),
+            )
+        except Exception:
+            pass
+
+    def _owns(self, family: str, platform: str) -> bool:
+        inputs = self._inputs
+        return inputs is not None and inputs.owns(family, platform)
+
+    async def _trace_decision(self, decision: Any) -> None:
+        """The decision's supervision fact, as the native inputs trace it."""
+
+        if not getattr(decision, "traceable", True):
+            return
+        try:
+            await self._supervision.emit(
+                TRACE_INPUT_TRIGGER_ACCEPTED
+                if decision.accepted
+                else TRACE_INPUT_TRIGGER_REJECTED,
+                {
+                    "source_event_id": decision.source_event_id,
+                    "input": decision.input_name,
+                    "platform": decision.platform,
+                    "channel_id": decision.channel_id,
+                    "policy_version": decision.policy_version,
+                    "reason": decision.reason,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A lost trace changes nothing about what was decided.
+            pass
+
+    async def _subscribe(self, connection: _Connection) -> None:
+        """One ``Subscribe`` naming only what the owned pairs need (R6).
+
+        Nothing is sent when nothing is owned that arrives as an event.
+        """
+
+        events = subscription_events(self._inputs) if self._inputs is not None else {}
+        if not events:
+            return
+        try:
+            answer = await connection.request(
+                {"request": _REQUEST_SUBSCRIBE, "events": events}, self._request_seconds
+            )
+        except ConnectionClosed:
+            raise _HandshakeFailure(REASON_UNREACHABLE) from None
+        except asyncio.TimeoutError:
+            raise _HandshakeFailure(REASON_PROTOCOL_ERROR) from None
+        if not isinstance(answer, Mapping) or answer.get("status") != _STATUS_OK:
+            raise _HandshakeFailure(REASON_PROTOCOL_ERROR)
 
     # -- the run provider's decisions and boundary (R4, R5, D8) ------------- #
 
@@ -1208,6 +1567,7 @@ class AutomationBridge:
             return
         self._started = True
         self._session = aiohttp.ClientSession()
+        self._consumer = self._tasks.spawn(self._consume(), name=_CONSUMER_TASK)
         owner = self._owner = self._tasks.spawn(self._own(), name=_OWNER_TASK)
         settled = asyncio.ensure_future(self._first_settled.wait())
         try:
@@ -1228,6 +1588,7 @@ class AutomationBridge:
 
         self._stopping = True
         await self._stop_owner()
+        await self._stop_consumer()
 
     async def close(self) -> None:
         """Withdraw readiness, fail every pending request, close the socket.
@@ -1242,6 +1603,7 @@ class AutomationBridge:
         if self._prepared:
             self._actions.mark_not_ready()
         await self._stop_owner()
+        await self._stop_consumer()
         connection, self._connection = self._connection, None
         try:
             if connection is not None:
@@ -1302,6 +1664,13 @@ class AutomationBridge:
         owner.cancel()
         await asyncio.gather(owner, return_exceptions=True)
 
+    async def _stop_consumer(self) -> None:
+        consumer, self._consumer = self._consumer, None
+        if consumer is None or consumer.done():
+            return
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
     async def _lose(self, connection: _Connection) -> None:
         """A lost connection: not ready at once, then one degraded record."""
 
@@ -1317,21 +1686,32 @@ class AutomationBridge:
         try:
             connection, inventory = await self._handshake()
         except _HandshakeFailure as failure:
-            async with self._health:
-                self._first_reported = True
-                await self._supervision.degraded(reason=failure.reason)
-            self._first_settled.set()
-            return False
+            return await self._failed(failure.reason)
         self._inventory = inventory
         self._connection = connection
         await self._reconcile(inventory)
-        # Subscribe (P16) goes here, before readiness.
+        try:
+            await self._subscribe(connection)
+        except _HandshakeFailure as failure:
+            if self._connection is connection:
+                self._connection = None
+            await connection.close()
+            return await self._failed(failure.reason)
         async with self._health:
             self._first_reported = True
             self._actions.mark_ready()
-            await self._supervision.ready()
+            await self._supervision.ready(dropped_events=self._dropped_events)
         self._first_settled.set()
         return True
+
+    async def _failed(self, reason: str) -> bool:
+        """One failed attempt: one degraded record with its *reason*."""
+
+        async with self._health:
+            self._first_reported = True
+            await self._supervision.degraded(reason=reason)
+        self._first_settled.set()
+        return False
 
     async def _handshake(self) -> tuple[_Connection, Inventory]:
         """Connect, read the hello, authenticate, read the inventory.
@@ -1426,12 +1806,6 @@ class AutomationBridge:
         if not isinstance(answer, Mapping) or answer.get("status") != _STATUS_OK:
             raise _HandshakeFailure(REASON_AUTHENTICATION_FAILED)
 
-    def _on_event(self, frame: Mapping[str, Any]) -> None:
-        """An inbound event. Subscriptions and the bounded queue come in P16;
-        until then nothing is subscribed and an event is not ingested."""
-
-        del frame
-
 
 def _reachable(actions: Sequence[InstanceAction]) -> bool:
     """One action of that name, and enabled (R5)."""
@@ -1495,6 +1869,12 @@ async def activate(
             f"{MODULE_NAME} configuration: settings were refused "
             f"({len(diagnostics)} diagnostics)"
         )
+    identities = settings.get(_SETTING_COMPANION_IDENTITIES) or {}
+    triggers = getattr(context, "triggers", None)
+    if identities and triggers is not None:
+        # The engine's anti-echo refuses what the companion authored on every
+        # platform this module relays (D6).
+        triggers.add_companion_identities(identities.values())
     return AutomationBridge(
         context, settings, sleeper=settings.get(_SEAM_SLEEPER, asyncio.sleep)
     )
@@ -1506,11 +1886,14 @@ __all__ = [
     "CAUSE_EXECUTION_UNCONFIRMED",
     "CAUSE_INSTANCE_REJECTED",
     "CHAT_PLATFORMS",
+    "CUE_ID_MAX_CHARACTERS",
+    "CUE_TEXT_MAX_CODE_POINTS",
     "DEGRADED_REASONS",
     "ERROR_INSTANCE_ACTION_AMBIGUOUS",
     "ERROR_INSTANCE_ACTION_DISABLED",
     "ERROR_INSTANCE_ACTION_MISSING",
     "ERROR_NOT_ALLOWLISTED",
+    "INSTANCE_AUTHOR_PREFIX",
     "MANIFEST_PATH",
     "MODULE_NAME",
     "REASON_AUTHENTICATION_FAILED",
@@ -1529,7 +1912,9 @@ __all__ = [
     "InstanceAction",
     "activate",
     "authentication_response",
+    "cue_event",
     "declared_run_spec",
     "run_action_timeout_seconds",
+    "subscription_events",
     "validate_settings",
 ]
