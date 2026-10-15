@@ -107,6 +107,7 @@ from core.actions import (
     ERROR_PROVIDER_NOT_READY,
     ERROR_TIMED_OUT,
     ActionExecutor,
+    ActionInvocation,
     AuthorizationRule,
 )
 from core.contracts import (
@@ -2691,25 +2692,45 @@ def test_d8_the_segment_has_no_await_between_the_check_the_mark_and_the_send() -
     assert hook.lineno < check.lineno
 
 
-def test_d8_canary_the_installed_client_writes_before_its_first_suspension() -> None:
-    """D8 canary on the installed client: in ``WebSocketWriter.send_frame``'s
-    uncompressed branch no ``await`` precedes the ``_write_websocket_frame``
-    call, and the only raises before the transport write — across
-    ``send_frame`` and ``_write_websocket_frame`` — are its two
-    closing-transport checks. If this fails after an upgrade, the bridge
-    must take D8's fallback route: a module-local writer that writes the
-    already-built masked frame synchronously through the protocol transport,
-    then marks."""
+#: The route D8 names when the installed writer could suspend before the write.
+D8_ROUTE = "D8 fallback route: module-local synchronous writer"
 
-    from aiohttp._websocket.writer import WebSocketWriter
+#: Every syntactic form that can hand control back to the loop: an explicit
+#: ``await``, the implicit awaits of ``async with`` (enter and exit) and of
+#: ``async for`` (each step), and a bare ``yield`` in a generator-based
+#: coroutine. Finding F2: an ``async with`` suspends with no ``Await`` node.
+_SUSPENSION_NODES = (ast.Await, ast.AsyncWith, ast.AsyncFor, ast.Yield, ast.YieldFrom)
 
-    route = "D8 fallback route: module-local synchronous writer"
+#: The finding's mutation (F2): the uncompressed write moved under a lock.
+_F2_WRITE_LINE = "        self._write_websocket_frame(message, opcode, 0)"
 
-    def parse(function: Any) -> ast.AST:
-        (tree,) = ast.parse(textwrap.dedent(inspect.getsource(function))).body
+
+def _is_suspension(node: ast.AST) -> bool:
+    return isinstance(node, _SUSPENSION_NODES) or (
+        isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+        and any(generator.is_async for generator in node.generators)
+    )
+
+
+def _suspends(tree: ast.AST) -> bool:
+    return any(_is_suspension(node) for node in ast.walk(tree))
+
+
+def _d8_canary(send_frame_source: str, write_frame_source: str) -> None:
+    """The static half of the D8 canary, run on the given sources.
+
+    In ``send_frame``'s uncompressed branch no suspension of any form
+    (:data:`_SUSPENSION_NODES`, async comprehensions) precedes or encloses
+    the ``_write_websocket_frame`` call, and the only raises before the
+    transport write — across ``send_frame`` and ``_write_websocket_frame``
+    — are its two closing-transport checks. Every failure names
+    :data:`D8_ROUTE`."""
+
+    def parse(source: str) -> ast.AST:
+        (tree,) = ast.parse(textwrap.dedent(source)).body
         return tree
 
-    send_frame = parse(WebSocketWriter.send_frame)
+    send_frame = parse(send_frame_source)
     (write_call,) = _calls_named(send_frame, "_write_websocket_frame")
     branch = next(
         node
@@ -2722,28 +2743,208 @@ def test_d8_canary_the_installed_client_writes_before_its_first_suspension() -> 
         for node in ast.walk(send_frame)
         if getattr(node, "lineno", write_call.lineno) < write_call.lineno
     ]
-    assert not any(isinstance(node, ast.Await) for node in before_write), route
-    assert not any(isinstance(node, ast.Await) for node in ast.walk(branch.test)), route
+    assert not any(_is_suspension(node) for node in before_write), D8_ROUTE
+    assert not _suspends(branch.test), D8_ROUTE
+    enclosing = [
+        node
+        for node in ast.walk(send_frame)
+        if isinstance(node, (ast.AsyncWith, ast.AsyncFor))
+        and any(write_call is child for child in ast.walk(node))
+    ]
+    assert not enclosing, D8_ROUTE
     raises = [node for node in before_write if isinstance(node, ast.Raise)]
 
-    write_frame = parse(WebSocketWriter._write_websocket_frame)
+    write_frame = parse(write_frame_source)
     transport_writes = [
         call
         for call in _calls_named(write_frame, "write")
         if isinstance(call.func.value, ast.Attribute) and call.func.value.attr == "transport"
     ]
+    assert transport_writes, D8_ROUTE
     first_write = min(call.lineno for call in transport_writes)
     raises += [
         node
         for node in ast.walk(write_frame)
         if isinstance(node, ast.Raise) and node.lineno < first_write
     ]
-    assert not any(isinstance(node, ast.Await) for node in ast.walk(write_frame)), route
-    assert len(raises) == 2, route
+    assert not _suspends(write_frame), D8_ROUTE
+    assert len(raises) == 2, D8_ROUTE
     for node in raises:
-        assert isinstance(node.exc, ast.Call), route
-        assert getattr(node.exc.func, "id", None) == "ClientConnectionResetError", route
-        assert node.exc.args and "closing" in getattr(node.exc.args[0], "value", ""), route
+        assert isinstance(node.exc, ast.Call), D8_ROUTE
+        assert getattr(node.exc.func, "id", None) == "ClientConnectionResetError", D8_ROUTE
+        assert node.exc.args and "closing" in getattr(node.exc.args[0], "value", ""), D8_ROUTE
+
+
+def _installed_writer_sources() -> tuple[str, str]:
+    from aiohttp._websocket.writer import WebSocketWriter
+
+    return (
+        textwrap.dedent(inspect.getsource(WebSocketWriter.send_frame)),
+        textwrap.dedent(inspect.getsource(WebSocketWriter._write_websocket_frame)),
+    )
+
+
+def _mutated_send_frame_source(statement: str) -> str:
+    """The installed ``send_frame`` with *statement* (a block opener such as
+    ``async with self._send_lock:``, or a plain statement ending in a
+    newline) put before the uncompressed write — F2's executed mutation and
+    its siblings, built from the installed source, never from a copy."""
+
+    source, _ = _installed_writer_sources()
+    assert source.count(_F2_WRITE_LINE) == 1
+    if statement.endswith(":"):
+        replacement = f"        {statement}\n    {_F2_WRITE_LINE}"
+    else:
+        replacement = f"        {statement}\n{_F2_WRITE_LINE}"
+    return source.replace(_F2_WRITE_LINE, replacement)
+
+
+def _compiled_send_frame(source: str) -> Any:
+    """*source* compiled in the installed writer module's namespace."""
+
+    from aiohttp._websocket.writer import WebSocketWriter
+
+    namespace = dict(WebSocketWriter.send_frame.__globals__)
+    exec(compile(source, "<d8-negative-control>", "exec"), namespace)
+    return namespace["send_frame"]
+
+
+def test_d8_canary_the_installed_client_writes_before_its_first_suspension() -> None:
+    """D8 canary on the installed client, static half: see :func:`_d8_canary`.
+
+    Finding F2 restored: the former canary looked only for ``ast.Await``,
+    so an ``async with`` before the write passed it; every suspension form
+    is now refused, and the behavioural half
+    (:func:`test_d8_behaviour_the_frame_reaches_the_transport_in_the_marking_segment`)
+    runs the real path. If this fails after an upgrade, the bridge must take
+    D8's fallback route: a module-local writer that writes the already-built
+    masked frame synchronously through the protocol transport, then marks."""
+
+    _d8_canary(*_installed_writer_sources())
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "async with self._send_lock:",  # F2's executed mutation
+        "await asyncio.sleep(0)\n",
+        "async for _ in self._pending():",
+        "[_ async for _ in self._pending()]\n",
+    ],
+    ids=["async-with", "await", "async-for", "async-comprehension"],
+)
+def test_d8_negative_control_a_suspension_before_the_write_fails_the_canary(
+    statement: str,
+) -> None:
+    """Finding F2: the canary runs against the *mutated* installed source —
+    the uncompressed write preceded by a suspension, explicit or implicit —
+    and must fail naming the fallback route. The unmutated source passes, so
+    the failure is the mutation's."""
+
+    source, write_frame = _installed_writer_sources()
+    _d8_canary(source, write_frame)
+    mutated = _mutated_send_frame_source(statement)
+    compile(mutated, "<d8-negative-control>", "exec")  # a real, valid writer change
+    with pytest.raises(AssertionError, match=D8_ROUTE):
+        _d8_canary(mutated, write_frame)
+
+
+async def _d8_transmission_segment(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    hold: asyncio.Lock | None = None,
+) -> list[str]:
+    """Run one call through the bridge's real path — its ``compress=0``
+    client, the installed ``ClientWebSocketResponse.send_str`` and writer,
+    the live socket transport to the fake instance — and return the events
+    in order: ``mark`` when the provider calls ``mark_emitted()``, ``turn``
+    when the loop next runs a callback (scheduled at the mark, so it runs
+    only once the marking segment has suspended), ``write`` for each
+    transport write of the run's frame.
+
+    *hold*, a lock the writer may wait on, is released once the segment has
+    suspended, so a blocked write still leaves and the run settles."""
+
+    events: list[str] = []
+    loop = asyncio.get_running_loop()
+    marked = ActionInvocation.mark_emitted
+
+    def mark_emitted(invocation: ActionInvocation) -> None:
+        events.append("mark")
+        loop.call_soon(events.append, "turn")
+        marked(invocation)
+
+    monkeypatch.setattr(ActionInvocation, "mark_emitted", mark_emitted)
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        gate = runs.gate()
+        call = runs.call("A")
+        running = asyncio.ensure_future(runs.run(call))
+        await asyncio.wait_for(gate.entered.wait(), FAKE_WAIT_SECONDS)
+        ws = runs.handle._connection.ws
+        assert ws.compress == 0 and ws._writer.compress == 0
+        transport = ws._writer.transport
+        written = transport.write
+
+        def write(data: Any) -> None:
+            if "mark" in events:
+                events.append("write")
+            written(data)
+
+        monkeypatch.setattr(transport, "write", write)
+        if hold is not None:
+            ws._writer._send_lock = hold
+        gate.released.set()
+        if hold is not None:
+            await _until(lambda: "turn" in events)
+            hold.release()
+        await running
+        assert len(runs.frames(call)) == 1
+    return events
+
+
+def _d8_assert_written_in_the_marking_segment(events: list[str]) -> None:
+    assert events.count("mark") == 1, events
+    assert "write" in events, D8_ROUTE
+    assert events.index("mark") < events.index("write") < events.index("turn"), (
+        f"{D8_ROUTE}: {events}"
+    )
+
+
+async def test_d8_behaviour_the_frame_reaches_the_transport_in_the_marking_segment(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D8 canary, behavioural half (finding F2): on the real uncompressed
+    path the frame reaches the socket transport after ``mark_emitted()`` and
+    before the loop runs anything else — the same synchronous segment.
+
+    Its limit, stated: one run observes one schedule. A suspension that
+    happens only under contention (an uncontended lock acquires without
+    yielding) is invisible to it; the static half refuses every suspension
+    form for that reason, and the negative control below contends the lock."""
+
+    events = await _d8_transmission_segment(caplog, monkeypatch)
+    _d8_assert_written_in_the_marking_segment(events)
+
+
+async def test_d8_negative_control_the_behavioural_check_catches_f2s_mutation(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding F2: the installed writer's ``send_frame`` replaced by the
+    finding's mutation (its uncompressed write under ``async with
+    self._send_lock``), the lock held: the frame leaves only after the
+    marking segment suspended, and the behavioural check fails naming the
+    fallback route."""
+
+    from aiohttp._websocket.writer import WebSocketWriter
+
+    mutated = _compiled_send_frame(_mutated_send_frame_source("async with self._send_lock:"))
+    monkeypatch.setattr(WebSocketWriter, "send_frame", mutated)
+    hold = asyncio.Lock()
+    await hold.acquire()
+    events = await _d8_transmission_segment(caplog, monkeypatch, hold)
+    assert events[:2] == ["mark", "turn"] and "write" in events
+    with pytest.raises(AssertionError, match=D8_ROUTE):
+        _d8_assert_written_in_the_marking_segment(events)
 
 
 def test_d8_the_bridge_connects_without_compression() -> None:
