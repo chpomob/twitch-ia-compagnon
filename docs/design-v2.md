@@ -758,3 +758,101 @@ for the core. Capture is naturally action-driven, on the brain's observation req
 background capture; every capture stays subject to the explicit authorization rules and the budgets.
 The phase scenarios use a configured source to verify the contract, without imposing that source on
 the product.
+
+## 8. Addendum — input ownership (phase 5)
+
+Added by phase 5 (spec `phase5-automation-bridge`, plan decisions D1–D8). Normative for the kernel:
+it states the rule by which at most one module ingests each input stream. The rule names no vendor
+and no platform; the optional automation bridge that motivated it is documented in
+[`docs/automation-bridge.md`](automation-bridge.md).
+
+### 8.1. Vocabulary
+
+- **Input families** (`INPUT_FAMILIES`, closed): `chat`, `viewers`, `cues`.
+  - `chat` — ingestion of `channel.chat.message` events of the kinds `CHAT_FAMILY_KINDS`, that is
+    `message` plus the seven `PLATFORM_NOTICE_KINDS`, per platform (D1). It does **not** cover
+    `watch_tick` (never published on the bus, evaluated by the `watch` module through the shared
+    engine) nor `cue`.
+  - `viewers` — the viewer read `users.read`, per platform. It is the one family gated by an action
+    (`INPUT_FAMILY_GATED_ACTIONS`).
+  - `cues` — events of the kind `cue`, per platform: what an operator automation deliberately routed
+    to the companion. `cue` is the tenth member of `EVENT_KINDS`, outside `PLATFORM_NOTICE_KINDS`.
+- **Declaration.** A v2 manifest may declare the optional key `input_families`: a list of
+  `{family, platforms, default}` entries, `platforms` being concrete names or the single wildcard
+  `*`. A malformed declaration is refused at discovery (`parse_input_families`). A v1 manifest may
+  not declare it.
+- **Profile.** The optional top-level `inputs` block maps family → platform (or `*`) → owner: one
+  enabled module name or the literal `none` (`INPUT_OWNER_NONE`, deliberately unowned).
+- **Mapping an event to a pair.** `input_family_of_event(event)` returns `(family, platform)` for a
+  `channel.chat.message` of a `chat` kind or of kind `cue`, and nothing for any other event.
+
+### 8.2. Resolution (D2)
+
+Ownership is resolved at preparation, before settings validation and before any module is
+prepared, from the enabled manifests and the `inputs` block (`resolve_input_ownership`, pure). The
+domain of a family is its wildcard row, every pair an enabled module declares and every pair the
+`inputs` block names; a platform outside it is answered by the wildcard row. For one pair:
+
+1. the explicit `inputs.F.P` entry;
+2. otherwise the explicit `inputs.F.'*'` entry;
+3. otherwise the single enabled module declaring `(F, P)` concretely with `default: true`;
+4. otherwise the single enabled module declaring `(F, '*')` with `default: true`;
+5. otherwise the pair is unowned.
+
+A concrete default declarer beats a wildcard one. Refused, every refusal collected and reported as
+one value-free line each, by `run` and `--check-config` alike and before any transport opens: two
+default declarers at the same specificity (naming family, platform and both modules), an owner
+list of two or more modules, an owner that is not enabled or does not declare the pair (an owner
+under `*` must declare `(F, '*')`), a family outside the vocabulary. The result, `InputOwnership`,
+gives each row its owner, its origin (explicit, default rule or unowned) and its candidates; the
+configuration UI renders it read-only.
+
+### 8.3. Runtime guard (D3, D4)
+
+Each module reads the pairs it owns through `ModuleContext.inputs`, an `OwnedInputs` view. When the
+loader installed an ownership table, `ModuleContext.bus`, `triggers` and `chat` return
+module-scoped facades sharing one predicate:
+
+- a module that **declares** `input_families` passes a pair only when it is that pair's owner;
+- an **undeclared** module — every v1 module, and a v2 module without the key — passes a pair
+  unless the pair has a resolved owner or was set to `none` explicitly, so an unconstrained
+  configuration behaves exactly as before the rule existed.
+
+A refused bus publication reaches no subscriber, not even a middleware ordered first, and
+increments the counter `input_ownership_rejections` once (D4). A refused `triggers.evaluate`
+returns a refused decision with the reason `input_not_owned`, and a refused `chat.append` is
+dropped, both without counting. The three facades of one module share one value-free diagnostic,
+the trace `input.ownership.rejected` (module, family, platform), emitted once per pair and never
+per event. Without a table, the shared objects are returned exactly as before.
+
+**The guarded v1 route.** The v1 entry point `activate(bus, settings, catalog)` receives an
+`_OwnedBus` facade for the module whenever the resolved table constrains any pair — at least one
+pair has a resolved owner or is set to `none` (`InputOwnership.constrains_any()`). The facade
+applies the undeclared-publisher predicate to `publish` and delegates every other attribute to the
+shared bus. When the table constrains nothing, the v1 route keeps the bare bus: every pair is then
+unowned, so the predicate would pass every event — identical behaviour, not an exemption.
+
+### 8.4. Gated binding (D5)
+
+A family gated by an action is bound only for the platforms its module owns. `ActionBinding` gains
+the additive field `excluded_platforms` and `ActionRegistry.bind` the matching keyword: the owner
+of the wildcard row binds the wildcard destination minus the platforms assigned to another owner,
+and an owner of a concrete row binds that platform. Overlap and containment ignore excluded
+platforms, so no two bindings of `users.read` overlap and `AmbiguousBindingError` stays unreachable
+for a valid ownership. Only the runtime's `ModuleActions` facade passes an exclusion.
+
+### 8.5. Engine identities (D6)
+
+`TriggerEngine.add_companion_identities(identities)` adds identities to those the engine's
+anti-echo invariant refuses: additive, idempotent, case-folded like the constructor's, it never
+removes one and validates every identity before adding any. An input that relays another
+transport's chat — it learns the companion's account from its own settings, after the engine was
+built — calls it at activation, before any evaluation.
+
+### 8.6. Ownership-aware settings hook (D7)
+
+Because ownership is resolved before settings validation, the loader calls a module's settings
+hook as `validator(settings, owned_inputs=view)` when, and only when, the hook's signature declares
+the keyword parameter `owned_inputs`; every other hook is called exactly as before. A module can so
+refuse at `--check-config` a configuration that is only invalid for the pairs it owns, such as an
+owned chat pair without a companion identity for it.

@@ -48,7 +48,8 @@ Actions matrix runs that suite on **Python 3.10, 3.11, 3.12 and 3.13** — see t
 - The kernel: bounded admission, explicit terminal outcomes for every action call, a single global
   startup/shutdown deadline, bounded retention, and secret redaction in traces and diagnostics.
 - **Default-deny authorization**, reads included: nothing happens without a rule the operator wrote.
-- 17 modules with declared manifests and machine-readable settings schemas.
+- 18 modules with declared manifests and machine-readable settings schemas (one of them, the
+  automation bridge, is not delivered — see below).
 - The configuration UI: a separate process, loopback-bound, token- and CSRF-guarded, generating one page
   per module from its manifest, writing an **overlay** and never the base file.
 - The full specification/plan pipeline output, including nine closing-gate passes whose reports are in
@@ -66,6 +67,11 @@ Actions matrix runs that suite on **Python 3.10, 3.11, 3.12 and 3.13** — see t
   opt-in test nodes that require your own credentials; they are collected and skipped in a normal run.
   One real integration trial was performed during development (an OBS `obs-websocket` v5 scene change),
   and its record is in `docs/campaigns/phase2/scaffolding/obs-trial-record.md`.
+- **Automation bridge (`streamerbot`): not delivered — awaiting real-instance trial.** The optional
+  module that connects the companion to a stream-automation application you already run (sink,
+  cues, replaced chat or viewer inputs) is proven only against a fake instance replaying documented
+  frames. Its eight trial questions are opt-in nodes in `tests/test_phase5_trials.py`; see the
+  [operator guide](docs/automation-bridge.md) (also [in French](docs/automation-bridge.fr.md)).
 - **No production hardening.** No deployment story beyond "run it on your machine", no upgrade path, no
   multi-user operation, no load or soak testing.
 - The configuration model is heavy: a ~500-line YAML profile plus up to 25 environment variables. The UI
@@ -84,7 +90,7 @@ or you want to help make it real — read on.
               ↑ manifests                 ↓ observations
      modules/twitch · kick · youtube · chat_context · users · capture · clips ·
      audio_input · audio_output · stream_control · viewer_memory · moderation ·
-     watch · brain · proxy · agent_link · audit
+     watch · brain · proxy · agent_link · audit · streamerbot (optional bridge)
 ```
 
 - **The brain** runs a bounded multi-turn loop: it reasons, proposes a *read* action, receives the
@@ -144,13 +150,15 @@ python -m pytest tests/ -q
 | `core/` | The kernel: bus, admission, triggers, brain loop, actions, loader, runtime, audit |
 | `core/config_ui/` | The local web configuration UI (separate process) |
 | `demo/` | The offline demo (`python -m demo`): the scripted scenario, narrated |
-| `modules/` | 17 modules, each with a `module.yaml` manifest declaring its actions, schema and capabilities |
+| `modules/` | 18 modules, each with a `module.yaml` manifest declaring its actions, schema and capabilities |
+| `modules/streamerbot/` | The optional automation bridge — not delivered — awaiting real-instance trial |
 | `tests/` | ~3,100 tests over Python 3.10–3.13, plus opt-in real-integration trials |
 | `docs/design-v2.md` | The design blueprint the phases implement |
 | `docs/installation.md` | Installing and running it, for a non-technical reader (French) |
 | `docs/config-ui.md` | Operator documentation for the configuration UI |
 | `docs/proxy-protocol.md` | The remote-deployment proxy protocol |
-| `docs/campaigns/phase{1,2,3,4}/` | The specifications, plans, per-step specs, gate prompts and **gate reports** of each delivery phase |
+| `docs/automation-bridge.md` | Operator guide for the optional automation bridge (also in French) |
+| `docs/campaigns/phase{1,2,3,4,5}/` | The specifications, plans, per-step specs, gate prompts and **gate reports** of each delivery phase |
 
 ## How this was built
 

@@ -49,6 +49,17 @@ active viewers that validates against the shared result schema, with
 cursor pages over the same fetched list; another channel is ``refused
 unsupported_destination`` (AC34); a withheld answer stays ``timeout``; and
 AC3's ``users.read`` half (finding P3).
+
+Plan step P21 checks the operator guide ``docs/automation-bridge.md``: each
+of its 12 marked fragments, inserted into a tmp copy of the shipped profile it
+names with test ``${NAME}`` values, passes ``--check-config`` (combinations
+1–8) or fails it with the diagnostic the guide quotes (9–12), with 0 sockets
+and 0 loop endpoints opened (R9, AC39) — combination 8's brain-host side
+included, through ``--check-config`` and the catalog lookup the proxy makes;
+the combination table has 12 filled rows and row 8 says families and cues do
+not reach the brain (AC40); the guide is a declared bilingual pair, normative
+in English (R10, AC42); and the AC37 status guard runs unmarked while the
+trial file keeps its 8 nodes.
 """
 
 from __future__ import annotations
@@ -68,6 +79,7 @@ import logging
 import math
 import re
 import socket
+import subprocess
 import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -3946,3 +3958,315 @@ def test_a_snapshot_is_bounded_and_counts_what_it_left_out() -> None:
         "last_seen": 7.0,
     }
 
+
+
+# --------------------------------------------------------------------------- #
+# P21: the operator guide — its combinations, checked as documented (R9, R10)
+# --------------------------------------------------------------------------- #
+
+from core.bus import EventBus  # noqa: E402
+from modules.proxy import spec_from_declaration  # noqa: E402
+from test_examples import _sample_value  # noqa: E402
+import test_docs_bilingual as bilingual  # noqa: E402
+import test_phase5_docs_status as docs_status  # noqa: E402
+
+GUIDE = ROOT / "docs" / "automation-bridge.md"
+GUIDE_FR = ROOT / "docs" / "automation-bridge.fr.md"
+SHIPPED_PROFILES = (
+    "config.yaml.example",
+    "config.server.yaml.example",
+    "agent.yaml.example",
+    "presence.yaml.example",
+)
+COMBINATIONS = range(1, 13)
+REFUSED_COMBINATIONS = range(9, 13)
+#: What AC40 requires combination 8 to state.
+AGENT_PLACEMENT_SENTENCE = "Families and cues do not reach the brain in this placement"
+
+#: One marked fragment: its marker, its fenced YAML and, for a refused row,
+#: the diagnostic quoted under it (either language's label).
+_FRAGMENT = re.compile(
+    r"^<!-- combination (?P<number>\d+) base=(?P<base>\S+) -->\n"
+    r"```yaml\n(?P<body>.*?)^```\n"
+    r"(?:\nDiagnostic ?: `(?P<diagnostic>[^`\n]+)`\n)?",
+    re.MULTILINE | re.DOTALL,
+)
+_ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+@dataclasses.dataclass(frozen=True)
+class _Combination:
+    number: int
+    base: str
+    body: str
+    diagnostic: str | None
+
+
+def _combinations(path: Path = GUIDE) -> dict[int, _Combination]:
+    found: dict[int, _Combination] = {}
+    for match in _FRAGMENT.finditer(path.read_text(encoding="utf-8")):
+        number = int(match.group("number"))
+        assert number not in found, f"combination {number} has two fragments"
+        found[number] = _Combination(
+            number, match.group("base"), match.group("body"), match.group("diagnostic")
+        )
+    return found
+
+
+def _insert(profile: Mapping[str, Any], fragment: Mapping[str, Any]) -> dict[str, Any]:
+    """The guide's insertion rule: a mapping merges key by key, a list extends
+    the profile's list of the same key, any other value replaces it."""
+
+    merged = copy.deepcopy(dict(profile))
+    for key, value in fragment.items():
+        current = merged.get(key)
+        if isinstance(value, Mapping) and isinstance(current, Mapping):
+            merged[key] = _insert(current, value)
+        elif isinstance(value, list) and isinstance(current, list):
+            merged[key] = current + copy.deepcopy(value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _combination_profile(
+    tmp_path: Path, base: str, fragment: Mapping[str, Any]
+) -> tuple[Path, dict[str, str]]:
+    """A tmp copy of the shipped *base* with *fragment* inserted, on the
+    shipped modules, and a test value for every ``${NAME}`` it references."""
+
+    shipped = yaml.safe_load((ROOT / base).read_text(encoding="utf-8"))
+    profile = _insert(shipped, fragment)
+    profile["modules_directory"] = application.MODULES_DIRECTORY_BUILTIN
+    text = yaml.safe_dump(profile)
+    path = tmp_path / "profile.yaml"
+    path.write_text(text, encoding="utf-8")
+    environ = {name: _sample_value(name) for name in _ENV_REFERENCE.findall(text)}
+    if "AUTOMATION_URL" in environ:
+        environ["AUTOMATION_URL"] = BASE_SETTINGS["url"]
+    return path, environ
+
+
+def _spy_on_transports(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Every socket created and every loop endpoint opened from now on."""
+
+    opened: list[Any] = []
+    real_socket = socket.socket
+
+    class CountingSocket(real_socket):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            opened.append(("socket", args))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(socket, "socket", CountingSocket)
+    loop = asyncio.get_running_loop()
+    for name in ("create_connection", "create_server", "create_datagram_endpoint"):
+
+        async def refuse(*args: Any, _name: str = name, **kwargs: Any) -> Any:
+            opened.append((_name, args))
+            raise OSError(f"--check-config must not call loop.{_name}")
+
+        monkeypatch.setattr(loop, name, refuse)
+    return opened
+
+
+def test_ac39_the_guide_marks_twelve_fragments_on_shipped_profiles() -> None:
+    """AC39 (R9): one marked fragment per combination, each on a shipped
+    profile; the four refused rows, and only they, quote a diagnostic."""
+
+    combinations = _combinations()
+    assert sorted(combinations) == list(COMBINATIONS)
+    for number, combination in combinations.items():
+        assert combination.base in SHIPPED_PROFILES, number
+        assert isinstance(yaml.safe_load(combination.body), dict), number
+        assert (combination.diagnostic is not None) == (number in REFUSED_COMBINATIONS), number
+    # Combination 8 is the agent-process placement the plan names.
+    assert combinations[8].base == "agent.yaml.example"
+    assert combinations[7].base == "config.server.yaml.example"
+    assert yaml.safe_load(combinations[7].body)["modules"][MODULE_NAME]["url"].startswith(
+        "wss://"
+    )
+
+
+@pytest.mark.parametrize("number", COMBINATIONS)
+async def test_ac39_each_fragment_checks_as_the_guide_says(
+    number: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC39 (R9): each fragment, inserted into a tmp copy of its shipped
+    profile with test ``${NAME}`` values, passes ``--check-config`` for
+    combinations 1–8 and fails it with the documented diagnostic for 9–12,
+    with 0 sockets and 0 loop endpoints opened."""
+
+    combination = _combinations()[number]
+    path, environ = _combination_profile(
+        tmp_path, combination.base, yaml.safe_load(combination.body)
+    )
+    diagnostics: list[str] = []
+    opened = _spy_on_transports(monkeypatch)
+
+    status = await application.check_config(
+        path, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+
+    assert opened == []
+    if number in REFUSED_COMBINATIONS:
+        assert status == 2
+        assert len(diagnostics) == 1, diagnostics
+        assert combination.diagnostic in diagnostics[0]
+    else:
+        assert (status, diagnostics) == (0, [])
+    # Test values only: no configured value reaches a diagnostic.
+    for value in environ.values():
+        assert all(value not in diagnostic for diagnostic in diagnostics)
+
+
+async def test_ac39_combination_8_the_brain_host_finds_the_run_action_in_the_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC39, combination 8 (finding: through ``--check-config``, not a live
+    proxy): the brain-host side the guide describes — the run action added to
+    ``modules.proxy.actions`` of the server profile and granted there — checks
+    with the bridge disabled on that host, and the proxy's catalog lookup
+    finds exactly one specification, the bridge manifest's."""
+
+    fragment = yaml.safe_load(_combinations()[8].body)
+    brain_host = {
+        "modules": {"proxy": {"actions": [RUN_ACTION]}},
+        "actions": fragment["actions"],
+    }
+    path, environ = _combination_profile(tmp_path, "config.server.yaml.example", brain_host)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert MODULE_NAME not in profile["enabled_modules"]
+    assert RUN_ACTION in profile["modules"]["proxy"]["actions"]
+    diagnostics: list[str] = []
+    opened = _spy_on_transports(monkeypatch)
+
+    status = await application.check_config(
+        path, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+
+    assert (status, diagnostics, opened) == (0, [], [])
+    discovered = ModuleLoader(EventBus(), str(ROOT / "modules"))._discover()
+    declaring = sorted(
+        name
+        for name, module in discovered.items()
+        for entry in module.manifest.get("actions") or ()
+        if isinstance(entry, Mapping) and entry.get("name") == RUN_ACTION
+    )
+    assert declaring == [MODULE_NAME]
+    (entry,) = [
+        entry
+        for entry in discovered[MODULE_NAME].manifest["actions"]
+        if entry["name"] == RUN_ACTION
+    ]
+    assert spec_from_declaration(entry) is not None
+
+
+def test_ac39_the_insertion_rule_extends_lists_and_merges_mappings() -> None:
+    """The rule the guide states, which the AC39 tests apply."""
+
+    profile = {"enabled_modules": ["a"], "modules": {"a": {"x": 1}}, "limits": {"n": 1}}
+    merged = _insert(profile, {"enabled_modules": ["b"], "modules": {"b": {}}, "limits": 2})
+    assert merged == {
+        "enabled_modules": ["a", "b"],
+        "modules": {"a": {"x": 1}, "b": {}},
+        "limits": 2,
+    }
+    assert profile["enabled_modules"] == ["a"]
+    text = GUIDE.read_text(encoding="utf-8")
+    assert "a list extends\nthe profile's list of the same key" in text
+
+
+def test_ac39_the_french_guide_carries_the_same_fragments() -> None:
+    """The translation's fragments are the English ones, byte for byte: a
+    profile is copied from either."""
+
+    assert _combinations(GUIDE_FR) == _combinations(GUIDE)
+
+
+def _combination_table() -> tuple[list[str], list[list[str]]]:
+    """The header and the rows of the guide's combination table."""
+
+    text = GUIDE.read_text(encoding="utf-8")
+    section = text.split("\n## Combinations\n", 1)[1].split("\n### ", 1)[0]
+    lines = [line for line in section.splitlines() if line.startswith("|")]
+    header = [cell.strip() for cell in lines[0].strip("|").split("|")]
+    assert set(lines[1].replace("|", "").replace(" ", "")) == {"-"}
+    rows = [[cell.strip() for cell in line.strip().strip("|").split("|")] for line in lines[2:]]
+    return header, rows
+
+
+def test_ac40_the_table_has_twelve_rows_with_every_cell_filled() -> None:
+    """AC40 (R9): 12 rows, numbered 1–12, each with non-empty "enabled",
+    "disabled" and "refused" cells naming its fragment's base profile, and
+    combination 8 stating that families and cues do not reach the brain."""
+
+    header, rows = _combination_table()
+    assert header == ["#", "Setup", "Enabled", "Disabled", "Refused"]
+    assert [row[0] for row in rows] == [str(number) for number in COMBINATIONS]
+    combinations = _combinations()
+    for row in rows:
+        assert len(row) == len(header), row
+        assert all(cell.strip("—- ") for cell in row), row
+        assert f"(`{combinations[int(row[0])].base}`)" in row[1], row
+    assert AGENT_PLACEMENT_SENTENCE in " | ".join(rows[7])
+    assert AGENT_PLACEMENT_SENTENCE not in " | ".join(cell for row in rows[:7] for cell in row)
+
+
+def test_ac42_the_guide_is_a_declared_bilingual_pair() -> None:
+    """AC42 (R10): both files exist, are the declared guide pair the
+    bilingual checks cover, the English one marks itself normative and the
+    French one says the English text wins."""
+
+    assert "automation-bridge" in bilingual.GUIDES
+    assert (GUIDE, GUIDE_FR) in bilingual.PAIRS
+    english = GUIDE.read_text(encoding="utf-8")
+    french = GUIDE_FR.read_text(encoding="utf-8")
+    assert "**Status: normative.**" in english
+    assert "this English text wins" in english
+    assert re.search(r"\*\*le texte\s*(?:>\s*)?anglais fait foi\*\*", french)
+
+
+def test_r10_the_guide_names_every_setting_the_manifest_declares() -> None:
+    """R9: the guide covers every setting: each top-level setting of the
+    schema (and each deadline and reconnect field) has its table row."""
+
+    text = GUIDE.read_text(encoding="utf-8")
+    properties = _manifest()["settings_schema"]["properties"]
+    for name, node in properties.items():
+        if name == "limits":
+            assert "`limits`" in text
+            continue
+        nested = node.get("properties")
+        if nested:
+            for field_name in nested:
+                assert f"| `{name}.{field_name}` |" in text, (name, field_name)
+        else:
+            assert f"| `{name}` |" in text, name
+
+
+def test_ac37_the_status_guard_runs_unmarked_and_the_trial_file_keeps_eight_nodes() -> None:
+    """AC37 (R8): the status test carries no ``xfail`` any more and holds on
+    the repository; the trial file still collects exactly its 8 nodes."""
+
+    status_test = docs_status.test_ac37_readme_and_index_state_the_bridge_not_delivered
+    assert not getattr(status_test, "pytestmark", [])
+    assert not docs_status.RECORD.exists()
+    for path in docs_status.STATUS_FILES:
+        assert docs_status.states_not_delivered(docs_status.read(path)), path
+    for path in (GUIDE, GUIDE_FR):
+        assert docs_status.states_not_delivered(path.read_text(encoding="utf-8")), path
+    assert docs_status.every_claim(docs_status.tracked_markdown()) == []
+
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+         "tests/test_phase5_trials.py"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    nodes = [line for line in collected.stdout.splitlines() if "::" in line]
+    assert len(nodes) == 8, collected.stdout

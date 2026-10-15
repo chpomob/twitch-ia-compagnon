@@ -790,6 +790,32 @@ sur lequel l'essai a tourné (ou aurait tourné). AC41 est vérifié par
 | YouTube | `0c170ef` (P24) | `youtube {client_id: ${YOUTUBE_CLIENT_ID}, client_secret: ${YOUTUBE_CLIENT_SECRET}, refresh_token: ${YOUTUBE_REFRESH_TOKEN}, channels: [${YOUTUBE_CHANNEL_ID}], quota {daily_units: 10000, write_reserve_units: 1000}}` ; rafraîchissement, une scrutation, un `chat.write` | **Non exécuté** — aucun identifiant YouTube (`PHASE3_TRIAL_YOUTUBE` et `YOUTUBE_*` absentes) ; l'essai exige aussi un direct actif | Jeton, cadence, registre de quota et envoi éprouvés contre le point de jeton et l'API de chat scriptés (AC36–AC38) | 2026-09-27 |
 | veille d'écran | `0c170ef` (P24) | `capture {sources.screen {kind: command, argv: [ffmpeg, -loglevel, error, -f, x11grab, -video_size, 640x480, -i, ":0", -frames:v, 1, -f, image2pipe, -vcodec, png, -]}}`, `watch {channels: [trial/screen], interval_seconds: 15, activation: startup, max_active_seconds: 60}` ; règle `screen.capture` pour le principal `brain.watch` | Exécuté : `PHASE3-TRIAL veille d'écran commit=0c170ef4dc0c outcome=success,ticks=2,captured=2,content_type=image/png,width=640,height=480 date=2026-09-27` | Session Wayland capturée par XWayland : contenu de l'image non vérifié (peut être noir) ; démarrage par `activation: startup`, pas par `!watch` sur une vraie chaîne ; pas de modèle réel (le corps du run appelle la capture directement) ; 2 ticks seulement, plafond horaire non atteint | 2026-09-27 |
 
+## Phase 5 — pont d'automatisation (automation bridge)
+
+La phase 5 (spec `phase5-automation-bridge` v1.0, exigences R1–R10 et
+AC1–AC45, plan v1.2 et ses décisions D1–D8) ajoute au noyau la règle de
+propriété des entrées et un module optionnel, `streamerbot`, qui relie le
+compagnon à une application d'automatisation de stream. Les documents :
+
+- [`automation-bridge.md`](automation-bridge.md) — le guide opérateur du pont
+  (anglais, normatif) : réglages, liste blanche, propriété des entrées, table
+  des résultats, recette des cues, modèle de confiance, les douze combinaisons ;
+- [`automation-bridge.fr.md`](automation-bridge.fr.md) — sa traduction
+  française ; le texte anglais fait foi ;
+- [`design-v2.md`](design-v2.md), section 8 (et
+  [`design-v2.fr.md`](design-v2.fr.md)) — l'addendum de conception de la
+  propriété des entrées.
+
+Le pont n'est pas livré tant que l'enregistrement d'essai
+`docs/campaigns/phase5/bridge-trial-record.md` n'existe pas : il doit donner la
+version de l'instance, la date et une réponse à chacune des huit questions de
+l'étude (`tests/test_phase5_trials.py`, sautés par défaut en nommant leurs
+variables). `tests/test_phase5_docs_status.py` fait respecter ce statut.
+
+| Essai | Lanceur | Statut |
+| --- | --- | --- |
+| Automation bridge (`streamerbot`) contre une instance réelle | `tests/test_phase5_trials.py` (8 nœuds opt-in) | not delivered — awaiting real-instance trial |
+
 ## Lecture des manifests de runs
 
 [runs/](runs/) conserve les cinq manifests originaux, sans suppression ni

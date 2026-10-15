@@ -18,9 +18,9 @@ with an ISO ``YYYY-MM-DD`` date) and one answer for each study question 1–8:
 exactly one table row per question whose first cell is the number (``1`` or
 ``Q1``) and whose last cell is a non-empty answer, not a placeholder.
 
-The status test is marked ``xfail(strict=True)`` until plan step P21 adds the
-README and index rows it checks; P21 removes the marker. The mark is not a
-relaxed test: strict, it fails as soon as the rows exist and the mark stays.
+Plan step P20 marked the status test ``xfail(strict=True)`` until the README
+and index rows existed; plan step P21 added them with the operator guide and
+removed the marker, so the test now runs unmarked.
 
 AC36's meta-check lives here, not in ``tests/test_phase5_trials.py``, so that
 file collects exactly its eight trial nodes (finding P5): run with no trial
@@ -153,7 +153,6 @@ def every_claim(paths: Iterable[str]) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.xfail(strict=True, reason="guide rows land in P21")
 def test_ac37_readme_and_index_state_the_bridge_not_delivered() -> None:
     """AC37: without the trial record, both the README and the documentation
     index state the bridge "not delivered"; with it, the record is complete."""

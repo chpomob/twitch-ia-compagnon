@@ -386,3 +386,52 @@ Critères de sortie :
 | Profils de déploiement et premier transport proxy (9) | **Décidé — sections 4.3 et 6, phase 1 :** brain et plateformes/sinks sur PC du streamer ou serveur distant, profils distincts, petit agent PC exposant les capacités locales via proxy WebSocket JSON avec token d'appairage. Un agent PC par brain en v1, reconnexion avec backoff, pièces jointes transférées dans les bornes du store et référencées sans chemins locaux distants. Formats exacts et paramètres : **à préciser à l'implémentation**. |
 
 **Configuration des modules, hors arbitrages du cœur :** source de capture (OBS/OS/jeu), zone, cadence et sources/sorties audio appartiennent à chaque module et à sa configuration, avec la mécanique dans le module, jamais dans brain. Ces choix ne sont ni une décision produit globale ni un gate de phase pour le core. La capture est naturellement action-driven, à la demande d'observation du brain, sans capture de fond ; toute capture reste soumise aux règles d'autorisation explicites et aux budgets. Les scénarios de phase utilisent une source configurée pour vérifier le contrat, sans imposer cette source au produit.
+
+## 8. Addendum — propriété des entrées (phase 5)
+
+Ajouté par la phase 5 (spec `phase5-automation-bridge`, décisions D1–D8 du plan). Normatif pour le noyau : il énonce la règle par laquelle au plus un module ingère chaque flux d'entrée. La règle ne nomme aucun éditeur ni aucune plateforme ; le pont d'automatisation optionnel qui l'a motivée est documenté dans [`docs/automation-bridge.md`](automation-bridge.md) (en français : [`docs/automation-bridge.fr.md`](automation-bridge.fr.md)). Le texte anglais de cet addendum fait foi.
+
+### 8.1. Vocabulaire
+
+- **Familles d'entrées** (`INPUT_FAMILIES`, fermé) : `chat`, `viewers`, `cues`.
+  - `chat` — l'ingestion des événements `channel.chat.message` des genres `CHAT_FAMILY_KINDS`, c'est-à-dire `message` plus les sept `PLATFORM_NOTICE_KINDS`, par plateforme (D1). Elle ne couvre **pas** `watch_tick` (jamais publié sur le bus, évalué par le module `watch` via le moteur partagé) ni `cue`.
+  - `viewers` — la lecture des spectateurs `users.read`, par plateforme. C'est la seule famille conditionnée par une action (`INPUT_FAMILY_GATED_ACTIONS`).
+  - `cues` — les événements de genre `cue`, par plateforme : ce qu'une automatisation de l'opérateur a délibérément acheminé vers le compagnon. `cue` est le dixième membre de `EVENT_KINDS`, hors de `PLATFORM_NOTICE_KINDS`.
+- **Déclaration.** Un manifest v2 peut déclarer la clé optionnelle `input_families` : une liste d'entrées `{family, platforms, default}`, `platforms` étant des noms concrets ou le seul joker `*`. Une déclaration malformée est refusée à la découverte (`parse_input_families`). Un manifest v1 ne peut pas la déclarer.
+- **Profil.** Le bloc optionnel de premier niveau `inputs` associe famille → plateforme (ou `*`) → propriétaire : un nom de module activé ou le littéral `none` (`INPUT_OWNER_NONE`, délibérément sans propriétaire).
+- **D'un événement à une paire.** `input_family_of_event(event)` rend `(family, platform)` pour un `channel.chat.message` d'un genre `chat` ou de genre `cue`, et rien pour tout autre événement.
+
+### 8.2. Résolution (D2)
+
+La propriété est résolue à la préparation, avant la validation des réglages et avant qu'aucun module ne soit préparé, à partir des manifests activés et du bloc `inputs` (`resolve_input_ownership`, pure). Le domaine d'une famille est sa ligne joker, chaque paire qu'un module activé déclare et chaque paire que nomme le bloc `inputs` ; une plateforme hors du domaine est répondue par la ligne joker. Pour une paire :
+
+1. l'entrée explicite `inputs.F.P` ;
+2. sinon l'entrée explicite `inputs.F.'*'` ;
+3. sinon le seul module activé qui déclare `(F, P)` concrètement avec `default: true` ;
+4. sinon le seul module activé qui déclare `(F, '*')` avec `default: true` ;
+5. sinon la paire n'a pas de propriétaire.
+
+Un déclarant concret par défaut l'emporte sur un déclarant joker. Sont refusés, chaque refus collecté et rapporté en une ligne sans valeur, par `run` comme par `--check-config` et avant qu'aucun transport ne s'ouvre : deux déclarants par défaut à la même spécificité (en nommant la famille, la plateforme et les deux modules), une liste de deux modules propriétaires ou plus, un propriétaire non activé ou qui ne déclare pas la paire (un propriétaire sous `*` doit déclarer `(F, '*')`), une famille hors du vocabulaire. Le résultat, `InputOwnership`, donne à chaque ligne son propriétaire, son origine (explicite, règle par défaut ou sans propriétaire) et ses candidats ; l'interface de configuration l'affiche en lecture seule.
+
+### 8.3. Garde à l'exécution (D3, D4)
+
+Chaque module lit les paires qu'il possède via `ModuleContext.inputs`, une vue `OwnedInputs`. Quand le chargeur a installé une table de propriété, `ModuleContext.bus`, `triggers` et `chat` rendent des façades propres au module qui partagent un prédicat :
+
+- un module qui **déclare** `input_families` ne laisse passer une paire que s'il en est le propriétaire ;
+- un module **non déclarant** — tout module v1, et un module v2 sans la clé — laisse passer une paire sauf si elle a un propriétaire résolu ou a été mise à `none` explicitement, si bien qu'une configuration sans contrainte se comporte exactement comme avant l'existence de la règle.
+
+Une publication refusée sur le bus n'atteint aucun abonné, pas même un middleware placé en premier, et incrémente une fois le compteur `input_ownership_rejections` (D4). Un `triggers.evaluate` refusé rend une décision refusée de raison `input_not_owned`, et un `chat.append` refusé est abandonné, tous deux sans comptage. Les trois façades d'un module partagent un diagnostic sans valeur, la trace `input.ownership.rejected` (module, famille, plateforme), émise une fois par paire et jamais par événement. Sans table, les objets partagés sont rendus exactement comme avant.
+
+**La route v1 gardée.** Le point d'entrée v1 `activate(bus, settings, catalog)` reçoit une façade `_OwnedBus` pour le module dès que la table résolue contraint une paire — au moins une paire a un propriétaire résolu ou est mise à `none` (`InputOwnership.constrains_any()`). La façade applique le prédicat du publieur non déclarant à `publish` et délègue tout autre attribut au bus partagé. Quand la table ne contraint rien, la route v1 garde le bus nu : chaque paire est alors sans propriétaire, le prédicat laisserait donc passer chaque événement — comportement identique, pas une exemption.
+
+### 8.4. Liaison conditionnée (D5)
+
+Une famille conditionnée par une action n'est liée que pour les plateformes que son module possède. `ActionBinding` reçoit le champ additif `excluded_platforms` et `ActionRegistry.bind` le mot-clé correspondant : le propriétaire de la ligne joker lie la destination joker moins les plateformes attribuées à un autre propriétaire, et le propriétaire d'une ligne concrète lie cette plateforme. Le chevauchement et l'inclusion ignorent les plateformes exclues, si bien que deux liaisons de `users.read` ne se chevauchent jamais et que `AmbiguousBindingError` reste inatteignable pour une propriété valide. Seule la façade `ModuleActions` du runtime passe une exclusion.
+
+### 8.5. Identités du moteur (D6)
+
+`TriggerEngine.add_companion_identities(identities)` ajoute des identités à celles que refuse l'invariant anti-écho du moteur : additive, idempotente, normalisée en casse comme celles du constructeur, elle n'en retire jamais et valide chaque identité avant d'en ajouter une. Une entrée qui relaie le chat d'un autre transport — elle apprend le compte du compagnon de ses propres réglages, après la construction du moteur — l'appelle à l'activation, avant toute évaluation.
+
+### 8.6. Hook de réglages conscient de la propriété (D7)
+
+Comme la propriété est résolue avant la validation des réglages, le chargeur appelle le hook de réglages d'un module sous la forme `validator(settings, owned_inputs=view)` si, et seulement si, la signature du hook déclare le paramètre mot-clé `owned_inputs` ; tout autre hook est appelé exactement comme avant. Un module peut ainsi refuser à `--check-config` une configuration qui n'est invalide que pour les paires qu'il possède, comme une paire de chat possédée sans identité du compagnon pour elle.
