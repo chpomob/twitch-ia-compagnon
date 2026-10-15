@@ -752,3 +752,240 @@ def test_resolution_is_pure() -> None:
     assert repr(inputs) == snapshot
     assert first == second
     assert asyncio.iscoroutinefunction(resolve_input_ownership) is False
+
+
+# --------------------------------------------------------------------------- #
+# P3: the ``inputs`` block through load_config, run and --check-config (R2, R1)
+# --------------------------------------------------------------------------- #
+
+from core import main as application  # noqa: E402
+from core.config_ui import _run_socket_free  # noqa: E402
+from test_integration import _environment  # noqa: E402
+
+EXAMPLE_CONFIG = ROOT / "config.yaml.example"
+
+#: A test module that records every hook it receives in the file its settings
+#: name, so a profile run from disk can still be observed.
+_MARKER_SOURCE = """
+from pathlib import Path
+
+
+def _mark(settings, step):
+    with Path(settings["marker"]).open("a", encoding="utf-8") as marker:
+        marker.write(step + "\\n")
+
+
+class Handle:
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def prepare(self):
+        _mark(self.settings, "prepare")
+
+    async def close(self):
+        pass
+
+
+def validate_settings(settings):
+    _mark(settings, "validate")
+
+
+async def activate(context, settings, catalog):
+    _mark(settings, "activate")
+    return Handle(settings)
+"""
+
+_AC7_DIAGNOSTIC = (
+    "inputs: family 'chat': platform 'x': owned by default by both 'a' and 'b'; "
+    "set inputs.chat.x"
+)
+
+
+def _profile(tmp_path: Path, inputs: Any = None, *, omit: bool = False) -> tuple[Path, Path]:
+    """A profile enabling the two AC7 test modules, and their marker file."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir(exist_ok=True)
+    for name in ("a", "b"):
+        if not (modules / name).exists():
+            _make(modules, name, NATIVE, _MARKER_SOURCE)
+    marker = tmp_path / "marker.log"
+    profile: dict[str, Any] = {
+        "modules_directory": str(modules),
+        "enabled_modules": ["a", "b"],
+        "modules": {name: {"marker": str(marker)} for name in ("a", "b")},
+    }
+    if not omit:
+        profile["inputs"] = inputs
+    path = tmp_path / "profile.yaml"
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    return path, marker
+
+
+def _marks(marker: Path) -> list[str]:
+    return marker.read_text(encoding="utf-8").split() if marker.exists() else []
+
+
+def test_ac7_end_to_end_check_config_exits_2_with_one_diagnostic_and_no_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC7 through the command line: the ambiguity is refused by
+    ``--check-config`` with exactly the resolver's one diagnostic, 0 modules
+    touched and 0 sockets created — the event loop included."""
+
+    path, marker = _profile(tmp_path, omit=True)
+    attempts: list[Any] = []
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        attempts.append(args)
+        raise AssertionError("socket created")
+
+    monkeypatch.setattr(asyncio, "run", _run_socket_free)
+    monkeypatch.setattr(socket.socket, "__init__", refuse)
+    for name in ("socketpair", "fromfd", "create_connection", "create_server"):
+        monkeypatch.setattr(socket, name, refuse)
+
+    status = application.main(["--config", str(path), "--check-config"])
+
+    assert status == 2
+    assert capsys.readouterr().err == f"error: {_AC7_DIAGNOSTIC}\n"
+    assert _marks(marker) == []
+    assert attempts == []
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_entry_lets_the_check_accept_the_ac7_modules(
+    tmp_path: Path,
+) -> None:
+    path, marker = _profile(tmp_path, {"chat": {"x": "b"}})
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+
+    assert (status, diagnostics) == (0, [])
+    # Settings validated, nothing activated or prepared.
+    assert _marks(marker) == ["validate", "validate"]
+
+
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    [
+        (["chat"], "inputs: must be a mapping of family to platform to owner"),
+        ("chat", "inputs: must be a mapping of family to platform to owner"),
+        (None, "inputs: must be a mapping of family to platform to owner"),
+        ({"chat": ["x"]}, "inputs.chat: must be a mapping of platform to owner"),
+        ({"chat": {1: "a"}}, "inputs.chat: platform keys must be strings"),
+        (
+            {"chat": {"x": {"owner": "a"}}},
+            "inputs.chat.x: owner must be a module name or a list of module names",
+        ),
+        (
+            {"chat": {"x": ["a", 2]}},
+            "inputs.chat.x: owner must be a module name or a list of module names",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_malformed_inputs_block_is_refused_naming_inputs(
+    tmp_path: Path, inputs: Any, expected: str
+) -> None:
+    path, marker = _profile(tmp_path, inputs)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+
+    assert (status, diagnostics) == (2, [expected])
+    assert _marks(marker) == []
+    with pytest.raises(application.ConfigurationError) as caught:
+        application.load_config(path, environ={})
+    assert str(caught.value) == expected
+
+
+def test_load_config_leaves_inputs_unresolved_and_absent_means_absent(
+    tmp_path: Path,
+) -> None:
+    """Owner names are not secrets: a ``${NAME}`` there is neither looked up
+    nor counted as a reference; a profile without the block is unchanged."""
+
+    path, _marker = _profile(tmp_path, {"chat": {"x": "${OWNER}", "*": ["a", "b"]}})
+    config = application.load_config(path, environ={})
+    assert config["inputs"] == {"chat": {"x": "${OWNER}", "*": ["a", "b"]}}
+
+    path, _marker = _profile(tmp_path, omit=True)
+    assert "inputs" not in application.load_config(path, environ={})
+
+
+@pytest.mark.asyncio
+async def test_a_profile_without_inputs_checks_exactly_as_before(tmp_path: Path) -> None:
+    """R1/AC1 shape: a tmp copy of the fixture profile ``tests/test_main.py``
+    checks (the shipped example) gives the same status and diagnostics —
+    accepted with its environment, the one unresolved-reference diagnostic
+    without the access token."""
+
+    profile = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert "inputs" not in profile
+    profile["modules_directory"] = application.MODULES_DIRECTORY_BUILTIN
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+
+    environ = _environment()
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        path, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+    assert (status, diagnostics) == (0, [])
+
+    del environ["TWITCH_ACCESS_TOKEN"]
+    status = await application.check_config(
+        path, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+    assert (status, diagnostics) == (
+        2,
+        ["modules.twitch.access_token: environment reference is unresolved"],
+    )
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        None,  # AC7: two default declarers, no explicit entry
+        {"chat": {"x": ["a", "b"]}},  # AC8: an owner list of two
+        {"chat": {"x": "c"}, "weather": {"x": "a"}},  # AC8: two refusals at once
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_and_check_config_give_the_same_diagnostics(
+    tmp_path: Path, inputs: Any
+) -> None:
+    """R2 parity: the same invalid profile is refused through ``run`` and
+    ``--check-config`` with the same diagnostic list, before any module is
+    validated, activated or prepared."""
+
+    path, marker = _profile(tmp_path, inputs, omit=inputs is None)
+
+    checked: list[str] = []
+    check_status = await application.check_config(
+        path, environ={}, diagnostic_reporter=checked.append
+    )
+    ran: list[str] = []
+    ready: list[str] = []
+    run_status = await application.run(
+        path,
+        asyncio.Event(),
+        environ={},
+        ready_reporter=ready.append,
+        diagnostic_reporter=ran.append,
+    )
+
+    assert check_status == 2 and run_status == 1
+    assert checked and ran == checked
+    assert ready == []
+    assert _marks(marker) == []
+    if inputs is None:
+        assert checked == [_AC7_DIAGNOSTIC]

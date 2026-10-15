@@ -108,8 +108,10 @@ from .loader import (
     ModuleActivation,
     ModuleLoadError,
     ModuleLoader,
+    _credential_literals,
     _declaration,
     _entry_point,
+    resolve_input_ownership,
 )
 from .overlay import (
     STATUS_FILE_VARIABLE,
@@ -282,6 +284,16 @@ so a credential of a disabled module is never looked up (R7, AC25).
 when the configuration names none.
 """
 
+INPUTS_KEY = "inputs"
+"""The optional block naming the owner of each (family, platform) pair (R2).
+
+Family → platform (or ``'*'``) → owner, the owner one enabled module name or
+``none``. It is optional as a whole — absent means ``{}``, and the ownership
+then follows the manifests' defaults alone — and never ``${NAME}``-resolved:
+owner names are not secrets. :func:`_validate_inputs` checks its shape; the
+loader's resolver decides its meaning, for ``run`` and the check alike.
+"""
+
 
 def load_config(
     config_path: str | os.PathLike[str],
@@ -372,7 +384,7 @@ def _load_documents(
     config = {
         key: (
             value
-            if key in (MODULES_KEY, SECRETS_KEY)
+            if key in (MODULES_KEY, SECRETS_KEY, INPUTS_KEY)
             else _resolve_environment(
                 value,
                 environ=resolver,
@@ -386,8 +398,13 @@ def _load_documents(
     _validate_config(config)
     _validate_secrets(
         config,
+        # An ``inputs`` owner is never resolved, so it references nothing.
         referenced=_referenced_variables(
-            {key: value for key, value in loaded.items() if key != SECRETS_KEY}
+            {
+                key: value
+                for key, value in loaded.items()
+                if key not in (SECRETS_KEY, INPUTS_KEY)
+            }
         ),
     )
 
@@ -972,6 +989,17 @@ async def _validate_enabled(
     }
     declarations = {name: _declaration(discovered[name]) for name in enabled}
     loader._validate_compatibility(enabled, declarations)
+    # Input ownership, resolved where activate_enabled resolves it — after
+    # the compatibility check, before any secret or setting — through the
+    # same resolver and the same redaction set, so an ambiguous profile is
+    # refused here with exactly the diagnostics startup gives (R2, AC7).
+    loader.input_ownership = resolve_input_ownership(
+        enabled,
+        declarations,
+        config.get(INPUTS_KEY),
+        redacted=loader._environment_values()
+        | _credential_literals(enabled, declarations, settings),
+    )
     # The one global startup deadline every awaited hook is bounded by: the
     # attribute activate_enabled sets from its own argument (R4).
     loader._deadline_at = deadline_at
@@ -1248,7 +1276,8 @@ def _startup_diagnostics(exc: Exception) -> tuple[str, ...]:
 
     The loader validates every enabled module's settings before it raises,
     so its error may name several refusals — one per module and field —
-    and each is reported on its own (R7, AC24).
+    and each is reported on its own (R7, AC24). Input ownership refusals
+    travel the same way: each line the resolver wrote, verbatim (R2).
     """
 
     if isinstance(exc, ModuleLoadError):
@@ -1523,6 +1552,43 @@ def _validate_config(config: Mapping[str, Any]) -> None:
 
     _validate_limits(config)
     _validate_actions(config)
+    _validate_inputs(config)
+
+
+def _validate_inputs(config: Mapping[str, Any]) -> None:
+    """The ``inputs`` block has the shape the ownership resolver reads (R2).
+
+    Only the structure is checked here: family → platform (or ``'*'``) →
+    owner, an owner being a text or a list of texts. Whether a family is in
+    the vocabulary, whether an owner is enabled, declares the pair or is one
+    name are the loader's resolver's to say, so ``run`` and
+    ``--check-config`` report one diagnostic per refusal from one source.
+    """
+
+    if INPUTS_KEY not in config:
+        return
+    inputs = config[INPUTS_KEY]
+    if not isinstance(inputs, Mapping):
+        raise ConfigurationError(
+            f"{INPUTS_KEY}: must be a mapping of family to platform to owner"
+        )
+    for family, entries in inputs.items():
+        if not isinstance(family, str):
+            raise ConfigurationError(f"{INPUTS_KEY}: family keys must be strings")
+        path = _display_path(_mapping_path(f"configuration.{INPUTS_KEY}", family))
+        if not isinstance(entries, Mapping):
+            raise ConfigurationError(f"{path}: must be a mapping of platform to owner")
+        for platform, owner in entries.items():
+            if not isinstance(platform, str):
+                raise ConfigurationError(f"{path}: platform keys must be strings")
+            if isinstance(owner, str):
+                continue
+            if isinstance(owner, list) and all(isinstance(item, str) for item in owner):
+                continue
+            raise ConfigurationError(
+                f"{_mapping_path(path, platform)}: owner must be a "
+                "module name or a list of module names"
+            )
 
 
 def _validate_secrets(config: Mapping[str, Any], *, referenced: set[str]) -> None:
