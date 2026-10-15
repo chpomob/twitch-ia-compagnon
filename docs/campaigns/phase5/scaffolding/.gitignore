@@ -1,0 +1,12 @@
+# Volatile campaign output — durable scaffolding stays tracked, run artefacts do not.
+logs/
+loop-out/
+wip/
+campaign.log
+commit-msg-*.txt
+wip-*.patch
+
+# The closing report IS tracked on purpose, as in phase 4: it is the durable evidence of the gate.
+# For phase 5 it lives one level up, at `docs/campaigns/phase5/full-branch-review.md`, which is the
+# path the approved plan's step P22 declares and the path the runner writes.
+*.log
