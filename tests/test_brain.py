@@ -86,6 +86,7 @@ from conftest import (
     wait_until,
 )
 from modules.brain import _Settings as brain_settings
+from modules.streamerbot import cue_event
 from modules.brain import (
     CHAT_SCOPE,
     DELIVERY_NOT_ATTEMPTED,
@@ -3769,6 +3770,65 @@ async def test_a_watch_run_records_no_memory() -> None:
         assert watch.status == "success"
         assert factory.providers[MEMORY_RECORD].calls == []
         assert "memory_record" not in harness.traces(TRACE_BRAIN_RUN_COMPLETED)[-1]["payload"]
+    finally:
+        await harness.close()
+
+
+def bridge_cue(cue_id: str, text: str, *, user_id: str | None = None) -> dict[str, Any]:
+    """The event the bridge's normaliser makes of one custom-event frame:
+    naming the viewer *user_id* when given, else of the instance's own
+    anonymous identity."""
+
+    envelope: dict[str, Any] = {
+        "cue_id": cue_id, "platform": PLATFORM, "channel_id": CHANNEL, "text": text,
+    }
+    if user_id is not None:
+        envelope.update(user_id=user_id, user_name="Viewer")
+    event = cue_event(
+        {"event": {"source": "Custom", "type": "Event"}, "data": {"args": envelope}}, {}
+    )
+    assert event is not None and event["payload"]["kind"] == "cue"
+    return event
+
+
+@pytest.mark.asyncio
+async def test_f3_a_cue_is_never_recorded_as_the_speech_of_the_viewer_it_names() -> None:
+    """Phase 5 F3: a cue is an instruction of the operator's automation, not
+    an utterance, so the post-run record leaves it out — a cue naming a
+    viewer and a cue of the instance's anonymous identity each run to a
+    confirmed success and make 0 ``memory.record`` calls (no viewer text, no
+    reply attached as a confirmed exchange), while an ordinary chat message
+    in the same harness still makes exactly one, with the viewer's own text
+    and its delivery outcome."""
+
+    factory = owned_rules(
+        replace(MEMORY_RECORD_PROPOSABLE_SPEC, model_proposable=False),
+        rules=[BRAIN_GRANT, grant_to(MEMORY_RECORD, PRINCIPAL)],
+    )
+    harness = await activate_with(
+        FakeResponse(200, completion("Back soon.")),
+        FakeResponse(200, completion("Starting now.")),
+        FakeResponse(200, completion("Hello.")),
+        context_factory=factory,
+    )
+    calls = factory.providers[MEMORY_RECORD].calls
+    try:
+        cues = (
+            bridge_cue("cue-memory-1", "!brb", user_id=VIEWER),
+            bridge_cue("cue-memory-2", "!start"),
+        )
+        assert ":" in cues[1]["payload"]["author"]["id"]
+        for count, event in enumerate(cues, start=1):
+            await harness.bus.publish(event["type"], event["payload"], event["metadata"])
+            records = await harness.completed(count)
+            assert [(r.status, r.delivery) for r in records] == [("success", "success")] * count
+            assert calls == []
+        await harness.send(message_id="chat-1")
+        records = await harness.completed(3)
+        assert [r.status for r in records] == ["success"] * 3
+        assert calls == [
+            {"viewer_text": "What is up?", "reply_text": "Hello.", "delivery": "confirmed"}
+        ]
     finally:
         await harness.close()
 

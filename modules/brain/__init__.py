@@ -216,7 +216,7 @@ memory untouched, so the model is never told it said something it did not
 
 **Viewer memory record** (phase 3 R4). After the terminal step — the final
 response's, the fallback's, or none when the run ended before it — a run
-whose session has a platform viewer calls ``memory.record`` once, when that
+whose session has a platform viewer, triggered by anything but a cue, calls ``memory.record`` once, when that
 action is in the run principal's authorized view of its declared scope
 (:meth:`BrainModule._record_memory`): the triggering text and a delivery note
 (``confirmed`` with the delivered text when every entry succeeded,
@@ -3257,7 +3257,10 @@ class BrainModule:
         """Record the exchange with the session viewer after the terminal step (R4).
 
         Only for a platform viewer (a reserved ``:`` identity has no memory),
-        and only when :data:`MEMORY_RECORD_ACTION` is in the run principal's
+        never for a cue — an instruction of the operator's automation, not
+        the words of the viewer it may name, so neither its text nor the
+        reply is recorded as that viewer's exchange (phase 5 F3) — and only
+        when :data:`MEMORY_RECORD_ACTION` is in the run principal's
         authorized view of ``(platform, channel_id, its declared scope)`` —
         which holds bound, ready and granted at once. Otherwise *outcome* is
         returned as it is. The step is skipped — ``memory_record: skipped``
@@ -3275,7 +3278,7 @@ class BrainModule:
         of the run propagates.
         """
 
-        if _RESERVED_VIEWER_SEPARATOR in key.viewer_id:
+        if message.kind == CUE_KIND or _RESERVED_VIEWER_SEPARATOR in key.viewer_id:
             return outcome
         spec = self._catalog().get(MEMORY_RECORD_ACTION)
         if spec is None:
