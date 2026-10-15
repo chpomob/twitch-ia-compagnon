@@ -2375,3 +2375,263 @@ async def test_a_late_interruption_with_an_invalid_audio_ref_is_rejected_whole()
     _assert_rejected(observation, ERROR_INVALID_RESULT)
     assert store.lookup(ref.attachment_id) is None
     _assert_single_record(harness, call, "error")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 R4 (P15F1) — the executor keeps a provider's cause when it takes
+# over an emitted call
+# --------------------------------------------------------------------------- #
+
+UNCERTAIN_WORDS = "the companion does not know whether the action ran"
+"""The provider's own wording; the executor's messages never say this."""
+
+
+def _uncertain_record(status: str, *, cause: str | None = "acknowledgement_lost",
+                      message: str = UNCERTAIN_WORDS) -> ActionObservation:
+    """A provider-authored record of an emitted write it cannot confirm."""
+
+    error = {
+        "code": ERROR_EXTERNAL_UNKNOWN if status == "external_unknown" else "cancelled",
+        "message": message,
+        "retryable": False,
+    }
+    if cause is not None:
+        error["cause"] = cause
+    return ActionObservation(status=status, provenance={"transport": "fake"}, error=error)
+
+
+def _answers_its_cancel(record: ActionObservation, entered: asyncio.Event):
+    """A write that signals emission, then answers its cancellation with *record*."""
+
+    async def behaviour(invocation) -> ActionObservation:
+        invocation.mark_not_emitted()
+        invocation.mark_emitted()
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return record
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    return behaviour
+
+
+async def _cancelled_from_above(record: ActionObservation):
+    """Path 1: the executor's caller cancels the call after the emission."""
+
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    entered = asyncio.Event()
+    provider = Provider("sender", _answers_its_cancel(record, entered))
+    harness.bind(WRITE_SPEC, provider)
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    call = make_call(WRITE_SPEC)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(provider.calls) == 1
+    return harness, call, harness.executor.outcome(call.call_id)
+
+
+async def _cut_by_the_deadline(record: ActionObservation):
+    """Path 2: the executor's own deadline expires after the emission."""
+
+    entered = asyncio.Event()
+    harness, sleeper, provider = _late_harness(
+        WRITE_SPEC, _answers_its_cancel(record, entered)
+    )
+    call = make_call(WRITE_SPEC, deadline=LATE_DEADLINE)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await entered.wait()
+    await _settle()
+    assert len(sleeper.waiters) == 1  # only the executor's timer
+    sleeper.advance_to(LATE_DEADLINE)
+    observation = await task
+    assert len(provider.calls) == 1
+    assert harness.executor.outcome(call.call_id) is observation
+    return harness, call, observation
+
+
+_TAKE_OVERS = {"cancelled_from_above": _cancelled_from_above,
+               "cut_by_the_deadline": _cut_by_the_deadline}
+
+
+@pytest.mark.parametrize("path", sorted(_TAKE_OVERS))
+@pytest.mark.parametrize("shape", ["cancelled", "external_unknown"])
+async def test_an_executor_take_over_keeps_the_providers_cause(path, shape):
+    """Phase 5 R4/D8: a call the executor interrupts after its frame was sent
+    ends with the provider's ``cause`` and wording, status and code as before."""
+
+    harness, call, observation = await _TAKE_OVERS[path](_uncertain_record(shape))
+
+    assert observation.status == "external_unknown"
+    assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
+    assert observation.error["cause"] == "acknowledgement_lost"
+    assert UNCERTAIN_WORDS in observation.error["message"]
+    assert observation.error["retryable"] is False
+    assert observation.provenance["emission"] == EMISSION_EMITTED
+    assert observation.result is None
+    _assert_single_record(harness, call, "external_unknown")
+    assert harness.counters.get(COUNTER_ACTION_TIMEOUTS) == 0
+
+
+def _todays_message(path: str, shape: str) -> str:
+    if path == "cancelled_from_above":
+        return "'chat.send' was cancelled with emission 'emitted'; reported as 'external_unknown'"
+    if shape == "cancelled":
+        return "provider 'late' reported 'cancelled' with emission 'emitted'; reported as 'external_unknown'"
+    return "'chat.send' timed out with emission 'emitted'; reported as 'external_unknown'"
+
+
+@pytest.mark.parametrize("path", sorted(_TAKE_OVERS))
+@pytest.mark.parametrize("shape", ["cancelled", "external_unknown"])
+async def test_a_take_over_without_a_cause_keeps_todays_record_exactly(path, shape):
+    """Phase 5 R4 is additive: a record with no cause leaves the executor's
+    error mapping exactly what it was, member for member."""
+
+    _harness, _call, observation = await _TAKE_OVERS[path](
+        _uncertain_record(shape, cause=None)
+    )
+
+    assert observation.status == "external_unknown"
+    assert dict(observation.error) == {
+        "code": ERROR_EXTERNAL_UNKNOWN,
+        "message": _todays_message(path, shape),
+        "retryable": False,
+    }
+
+
+async def test_a_provider_that_never_answers_its_cancel_lends_nothing():
+    """Phase 5 R4: past the grace the timer is in force — the generic record,
+    no cause, the cancellation propagated, whatever the abandoned task says."""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stubborn(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return _uncertain_record("external_unknown")
+
+    harness = Harness(cancel_grace=0.01)
+    harness.declare(WRITE_SPEC)
+    harness.bind(WRITE_SPEC, Provider("sender", stubborn))
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+
+    call = make_call(WRITE_SPEC)
+    task = asyncio.ensure_future(harness.executor.invoke(call))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    recorded = harness.executor.outcome(call.call_id)
+    assert dict(recorded.error) == {
+        "code": ERROR_EXTERNAL_UNKNOWN,
+        "message": _todays_message("cancelled_from_above", "external_unknown"),
+        "retryable": False,
+    }
+
+    release.set()
+    await _settle()
+    assert harness.executor.outcome(call.call_id) is recorded
+
+
+@pytest.mark.parametrize("cause", ["acknowledgement_lost", None])
+async def test_an_answer_inside_the_deadline_is_still_adopted_as_written(cause):
+    """Phase 5 R4: the provider's own in-time ``external_unknown`` is adopted
+    verbatim, with or without a cause."""
+
+    record = _uncertain_record("external_unknown", cause=cause)
+
+    def answers(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        return record
+
+    _harness, _provider, observation = await _terminal(WRITE_SPEC, answers)
+
+    assert observation.status == "external_unknown"
+    assert observation.error == record.error
+    assert observation.provenance["transport"] == "fake"
+
+
+async def test_an_in_time_conversion_keeps_the_cause_beside_its_note():
+    """Phase 5 R4: an emitted write's own ``timeout`` converted to
+    ``external_unknown`` in time keeps its cause and message (step 4c)."""
+
+    record = replace(
+        _uncertain_record("cancelled"),
+        status="timeout",
+        error={"code": "timed_out", "cause": "acknowledgement_lost",
+               "message": UNCERTAIN_WORDS, "retryable": True},
+    )
+
+    def answers(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        return record
+
+    _harness, _provider, observation = await _terminal(WRITE_SPEC, answers)
+
+    assert observation.status == "external_unknown"
+    assert dict(observation.error) == {
+        "code": ERROR_EXTERNAL_UNKNOWN,
+        "message": (
+            f"{UNCERTAIN_WORDS} (provider 'sender' reported 'timeout' with emission "
+            "'emitted'; reported as 'external_unknown')"
+        ),
+        "retryable": False,
+        "cause": "acknowledgement_lost",
+    }
+
+
+async def test_a_rejected_conversion_keeps_the_cause_too():
+    """Phase 5 R4: an emitted write's ``cancelled`` whose parts are rejected is
+    still ``external_unknown`` — and still says why it is uncertain."""
+
+    harness = Harness(max_observation_bytes=64)
+    harness.declare(WRITE_SPEC)
+    record = replace(_uncertain_record("cancelled"), parts=(_text(1_000),))
+
+    def answers(invocation) -> ActionObservation:
+        invocation.mark_emitted()
+        return record
+
+    harness.bind(WRITE_SPEC, Provider("sender", answers))
+    harness.ready()
+    harness.allow(WRITE_SPEC)
+    observation = await harness.executor.invoke(make_call(WRITE_SPEC))
+
+    assert observation.status == "external_unknown"
+    assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
+    assert observation.error["cause"] == "acknowledgement_lost"
+    assert observation.error["message"].startswith(UNCERTAIN_WORDS)
+    assert ERROR_OBSERVATION_TOO_LARGE in observation.error["message"]
+    assert observation.parts == ()
+
+
+@pytest.mark.parametrize("path", sorted(_TAKE_OVERS))
+@pytest.mark.parametrize("shape", ["cancelled", "external_unknown"])
+async def test_a_shipped_confirmation_lost_cause_survives_a_take_over(path, shape):
+    """Regression (phase 5 R4): the ``confirmation_lost`` cause a clip or
+    stream-control provider publishes when cancelled after its request left
+    used to be dropped on every executor-driven path; it now surfaces."""
+
+    record = _uncertain_record(
+        shape, cause="confirmation_lost", message="the call was cancelled"
+    )
+    _harness, _call, observation = await _TAKE_OVERS[path](record)
+
+    assert observation.status == "external_unknown"
+    assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
+    assert observation.error["cause"] == "confirmation_lost"
+    assert "the call was cancelled" in observation.error["message"]

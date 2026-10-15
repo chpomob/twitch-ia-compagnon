@@ -1425,10 +1425,11 @@ class ActionExecutor:
             # Cancelled from the outside: record the terminal state and publish
             # it before letting the cancellation continue, so the run never
             # loses the fact that this call may have emitted something.
-            await self._cancel(provider_task)
+            stopped = await self._cancel(provider_task)
             await self._cancel(timer_task)
             await self._terminate_uncertain(
-                call, binding, started_at, invocation.emission, spec, certain="cancelled"
+                call, binding, started_at, invocation.emission, spec, certain="cancelled",
+                record=_returned_observation(provider_task) if stopped else None,
             )
             raise
 
@@ -1456,7 +1457,8 @@ class ActionExecutor:
                     )
                 _consume(provider_task)
                 return await self._terminate_uncertain(
-                    call, binding, started_at, invocation.emission, spec, certain="timeout"
+                    call, binding, started_at, invocation.emission, spec, certain="timeout",
+                    record=_returned_observation(provider_task),
                 )
             if provider_task.cancelled():
                 # The provider was cancelled from below; the executor's own task
@@ -1493,14 +1495,16 @@ class ActionExecutor:
         # and answered within the grace with its own interruption record has
         # the true record (R10); one that never answers — or answers only
         # after it was abandoned — gets the executor's generic record, so the
-        # timer stays in force.
+        # timer stays in force. A provider that answered within the grace with
+        # an uncertain record still lends it its cause (phase 5 R4).
         stopped = await self._cancel(provider_task)
         if stopped and _is_interruption_record(provider_task):
             return await self._validate_observation(
                 call, spec, binding, started_at, invocation, provider_task.result()
             )
         return await self._terminate_uncertain(
-            call, binding, started_at, invocation.emission, spec, certain="timeout"
+            call, binding, started_at, invocation.emission, spec, certain="timeout",
+            record=_returned_observation(provider_task) if stopped else None,
         )
 
     async def _observe(self, binding: ActionBinding, invocation: ActionInvocation) -> Any:
@@ -1579,16 +1583,19 @@ class ActionExecutor:
             status, code = _uncertain_status(invocation.emission, spec, observation.status)
             if status != observation.status:
                 self._discard_images(call.run_id, observation.parts)
+                cause, message = _carried_uncertainty(
+                    observation,
+                    f"provider {binding.provider_name!r} reported "
+                    f"{observation.status!r} with emission "
+                    f"{invocation.emission!r}; reported as {status!r}",
+                )
                 return await self._terminate(
                     call, binding, started_at, status,
                     code=code,
-                    message=(
-                        f"provider {binding.provider_name!r} reported "
-                        f"{observation.status!r} with emission "
-                        f"{invocation.emission!r}; reported as {status!r}"
-                    ),
+                    message=message,
                     emission=invocation.emission,
                     invoked=True,
+                    cause=cause,
                 )
 
         provenance = self._provenance(
@@ -1624,7 +1631,8 @@ class ActionExecutor:
         observation as licence to retry a write that may already have gone
         out. Every other rejection is ``error`` with the rejection's own
         code (a schema-invalid ``success`` stays ``invalid_result``, AC18);
-        the rejection is kept in the message either way.
+        the rejection is kept in the message either way, and an
+        ``external_unknown`` keeps the provider's cause (phase 5 R4).
         """
 
         self._discard_images(call.run_id, observation.parts)
@@ -1632,17 +1640,20 @@ class ActionExecutor:
         if observation.status in ("timeout", "cancelled"):
             status, _ = _uncertain_status(invocation.emission, spec, observation.status)
         if status == "external_unknown":
+            cause, note = _carried_uncertainty(
+                observation,
+                f"provider {binding.provider_name!r} reported "
+                f"{observation.status!r} with emission {invocation.emission!r}, "
+                f"and its observation was rejected ({code}: {message}); "
+                "reported as 'external_unknown'",
+            )
             return await self._terminate(
                 call, binding, started_at, "external_unknown",
                 code=ERROR_EXTERNAL_UNKNOWN,
-                message=(
-                    f"provider {binding.provider_name!r} reported "
-                    f"{observation.status!r} with emission {invocation.emission!r}, "
-                    f"and its observation was rejected ({code}: {message}); "
-                    "reported as 'external_unknown'"
-                ),
+                message=note,
                 emission=invocation.emission,
                 invoked=True,
+                cause=cause,
             )
         return await self._terminate(
             call, binding, started_at, "error",
@@ -1784,25 +1795,43 @@ class ActionExecutor:
         spec: ActionSpec,
         *,
         certain: str,
+        record: ActionObservation | None = None,
     ) -> ActionObservation:
         """Record an interruption the executor itself detected.
 
         The status comes from :func:`_uncertain_status`, the single place the
         emission rule lives, so an interruption the *provider* reports is
         resolved exactly the same way.
+
+        *record* is what the provider returned when it stopped, if anything.
+        It never decides the status or the code; but when the outcome is
+        ``external_unknown`` and the record says the same — an
+        ``external_unknown`` of its own, or an interruption the emission rule
+        resolves that way — its cause and message are kept (phase 5 R4): they
+        are what tells the model the companion does not know whether the
+        action ran. A ``success`` or ``refused`` lends nothing.
         """
 
         status, code = _uncertain_status(emission, spec, certain)
         verb = "timed out" if certain == "timeout" else "was cancelled"
+        message = (
+            f"{call.action_name!r} {verb} with emission {emission!r}; "
+            f"reported as {status!r}"
+        )
+        cause = None
+        if (
+            status == "external_unknown"
+            and record is not None
+            and record.status in ("external_unknown", "timeout", "cancelled")
+        ):
+            cause, message = _carried_uncertainty(record, message)
         return await self._terminate(
             call, binding, started_at, status,
             code=code,
-            message=(
-                f"{call.action_name!r} {verb} with emission {emission!r}; "
-                f"reported as {status!r}"
-            ),
+            message=message,
             emission=emission,
             invoked=True,
+            cause=cause,
         )
 
     async def _terminate(
@@ -1817,16 +1846,20 @@ class ActionExecutor:
         emission: str = EMISSION_UNKNOWN,
         invoked: bool = False,
         extra: Mapping[str, Any] | None = None,
+        cause: str | None = None,
     ) -> ActionObservation:
         provenance = self._provenance(
             call, binding, self._duration(started_at), emission, invoked=invoked
         )
         if extra:
             provenance.update(dict(extra))
+        error: dict[str, Any] = {"code": code, "message": message, "retryable": False}
+        if cause is not None:
+            error["cause"] = cause
         observation = ActionObservation(
             status=status,
             provenance=provenance,
-            error={"code": code, "message": message, "retryable": False},
+            error=error,
         )
         return await self._publish(call, observation, started_at)
 
@@ -1948,6 +1981,43 @@ def _is_interruption_record(task: "asyncio.Future[Any]") -> bool:
         isinstance(observation, ActionObservation)
         and observation.status in _INTERRUPTION_STATUSES
     )
+
+
+def _returned_observation(task: "asyncio.Future[Any]") -> ActionObservation | None:
+    """The observation a finished *task* returned, or ``None``.
+
+    ``None`` when the task is still running, was cancelled, raised, or
+    returned something that is not an :class:`ActionObservation`.
+    """
+
+    if not task.done() or task.cancelled() or task.exception() is not None:
+        return None
+    observation = task.result()
+    return observation if isinstance(observation, ActionObservation) else None
+
+
+def _carried_uncertainty(
+    observation: ActionObservation, note: str
+) -> tuple[str | None, str]:
+    """The cause and message an uncertain provider record leaves behind.
+
+    When the executor replaces a provider's record by its own
+    ``external_unknown``, the record's ``error["cause"]`` — and its message,
+    put before the executor's *note* — survive into the terminal error
+    (phase 5 R4). A record without a cause leaves exactly *note* and no
+    cause, so the records of phase 2 R10 are unchanged byte for byte.
+    """
+
+    error = observation.error
+    if not isinstance(error, Mapping):
+        return None, note
+    cause = error.get("cause")
+    if not isinstance(cause, str) or not cause.strip():
+        return None, note
+    said = error.get("message")
+    if isinstance(said, str) and said.strip():
+        return cause, f"{said} ({note})"
+    return cause, note
 
 
 def _consume(task: "asyncio.Future[Any]") -> None:
