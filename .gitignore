@@ -33,3 +33,4 @@ venv/
 *.orig
 *.rej
 /.adversarial-spec/
+/docs/campaigns/phase5/scaffolding/*.log
