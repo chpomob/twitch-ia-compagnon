@@ -422,26 +422,60 @@ Un « enregistrement d'essai » (au sens de `docs/campaigns/phase2/scaffolding/o
 devrait consigner ces huit points, avec la version exacte de l'instance et la date — c'est ce que le
 dépôt demande avant d'écrire « livré ».
 
-## 10. Décisions à trancher
+## 10. Décisions retenues (15 octobre 2026)
 
-1. **Périmètre de la première intégration** — a) variante B seule (exécuter des actions Streamer.bot
-   depuis le compagnon) ; b) B + C (Streamer.bot peut aussi déclencher le compagnon via le proxy) ;
-   c) A d'abord (Streamer.bot comme source de chat) ; d) étude seule, on ne code rien encore.
-2. **Liste blanche ou inventaire dynamique** — a) noms d'actions déclarés en configuration, refus
+Retenues par le propriétaire du projet, qui remplacent les questions ouvertes de la première version
+de cette section.
+
+1. **Streamer.bot est optionnel, toujours.** Absent, désactivé ou mal configuré, le compagnon se
+   comporte exactement comme aujourd'hui : aucun réglage requis au démarrage, aucun chemin par défaut
+   modifié, aucune capacité conditionnée par sa présence. Aucun profil livré ne doit en dépendre.
+2. **Périmètre minimal avec Streamer.bot présent : le puits et les déclencheurs.** Le puits (variante B)
+   exécute une action Streamer.bot nommée par notre exécuteur d'actions ; les déclencheurs (variante C)
+   font entrer dans le compagnon un événement que Streamer.bot achemine vers nous. Les deux doivent
+   fonctionner ensemble.
+3. **Les sources sont un remplacement, pas un second chemin.** Quand Streamer.bot est présent, ses
+   événements peuvent **remplacer nos entrées basiques** — lecture du chat, des spectateurs, de la
+   présence — au lieu de nos modules de plateforme. Ce qui est remplacé cesse d'être actif : jamais
+   deux sources ingérant le même flux en parallèle.
+
+### Ce qui reste à trancher
+
+1. **Arbitrage des entrées** (conséquence directe du point 3 ci-dessus) — a) une **sélection explicite
+   de la source par famille d'entrée** dans le profil (`lecture du chat : twitch | streamerbot | …`),
+   le module non sélectionné n'étant pas activé ; b) une exclusivité déclarée par les manifests, le
+   chargeur refusant à la préparation une configuration qui demande deux fournisseurs pour la même
+   famille ; c) laisser les deux actifs et compter sur la fenêtre de dédoublonnage.
+   Recommandation : **b, adossée à a** — le dépôt sait déjà refuser une liaison d'action ambiguë
+   (`AmbiguousBindingError`) ; l'ingestion d'événements mérite la même règle, faute de quoi le
+   dédoublonnage absorberait des doublons à latence variable et la configuration cesserait d'être la
+   vérité. L'option c est un piège : elle masque le problème au lieu de le résoudre.
+2. **Envoi dans le chat quand Streamer.bot fournit la lecture** — a) l'envoi reste le nôtre (Helix/API
+   de la plateforme) ; b) l'envoi passe par le `SendMessage` de Streamer.bot — ce qui exige
+   l'authentification du socket et rend Streamer.bot nécessaire pour parler ; c) l'envoi passe par
+   Streamer.bot **seulement** si la plateforme n'est pas configurée chez nous.
+   Recommandation : **c**, avec repli explicite et tracé — sinon une panne de Streamer.bot rend le
+   compagnon muet sans raison.
+3. **Liste blanche ou inventaire dynamique** — a) noms d'actions déclarés en configuration, refus
    sinon ; b) `GetActions` au démarrage, puis les actions de l'instance deviennent disponibles
-   automatiquement (moins sûr, plus pratique) ; c) hybride : inventaire affiché dans l'UI de config,
-   sélection explicite stockée.
-3. **Round-trip** — a) aucun (fire-and-forget assumé et documenté) ; b) `Custom.Event` obligatoire pour
-   les actions de la liste blanche (l'utilisateur doit adapter ses actions) ; c) par action, selon un
-   drapeau de configuration.
-4. **Topologie** — a) Streamer.bot et compagnon sur la même machine (localhost, cas de l'ami) ;
-   b) cerveau distant, client WS sortant de Streamer.bot vers notre proxy ; c) les deux, adressées par
-   configuration.
-5. **Lecture** — a) module d'écriture seul pour commencer ; b) écriture + lecture (`GetActiveViewers`,
-   `GetCredits`, `GetGlobals`) dans le même module ; c) deux modules séparés (un puits, une source).
-6. **Avant tout code** — a) essai réel sur l'instance de l'ami avec un enregistrement d'essai (les huit
-   points de la section 9) ; b) développement contre un faux serveur WS d'abord, essai réel ensuite ;
-   c) attendre que l'utilisateur tranche 1 à 5.
+   automatiquement ; c) hybride : inventaire affiché dans l'UI de configuration, sélection explicite
+   stockée. Recommandation : **c**, parce que le default-deny ne se négocie pas mais que personne ne
+   connaît les GUID de ses actions.
+4. **Round-trip** — a) aucun (fire-and-forget assumé et documenté) ; b) `Custom.Event` obligatoire
+   pour les actions de la liste blanche ; c) par action, selon un drapeau de configuration.
+   Recommandation : **a** au départ, **c** dès qu'un cas réel l'exige.
+5. **Topologie** — a) Streamer.bot et compagnon sur la même machine ; b) cerveau distant, client
+   WebSocket sortant de Streamer.bot vers notre proxy ; c) les deux, adressées par configuration.
+   Recommandation : **a et b**, sans attendre : le client sortant ne demande aucun code chez
+   l'utilisateur[29].
+6. **Lecture** (`GetActiveViewers`, `GetCredits`, `GetGlobals`) — a) seulement quand elle remplace une
+   entrée (point 3 ci-dessus) ; b) en plus, comme capacité propre du module ; c) jamais.
+   Recommandation : **a** — une action de lecture dont personne n'a demandé le remplacement est un
+   élargissement de surface gratuit.
+7. **Avant toute ligne de code** — a) essai réel sur l'instance de l'ami, avec enregistrement d'essai
+   sur les huit points de la section 9 ; b) développement contre un faux serveur WebSocket d'abord ;
+   c) les deux, dans cet ordre. Recommandation : **c** — le faux serveur permet d'écrire le module, et
+   l'essai réel est ce que le dépôt exige avant d'écrire « livré ».
 
 ## Sources
 
@@ -460,6 +494,7 @@ dépôt demande avant d'écrire « livré ».
 [13] https://docs.streamer.bot/api/csharp/methods — Streamer.bot Docs - Methodes C# (Core 175, Obs Studio 69, Integrations 43, Elgato 35, Kick 28, Meld 9)
 [14] https://docs.streamer.bot/api/csharp/guide/intro — Streamer.bot Docs - Introduction au C# (classe CPHInline, Execute(), return false arrete les sub-actions)
 [15] https://streamerbot.github.io/client/guide/actions — Streamer.bot Client - Actions (getActions, doAction, arguments, customEventResponse depuis @streamerbot/client v1.10.0)
+[16] https://github.com/Streamerbot/client — GitHub Streamerbot/client - client WebSocket officiel TypeScript (MIT, 83 etoiles, dernier push 2026-07-20)
 [17] https://raw.githubusercontent.com/Streamerbot/client/main/packages/client/src/ws/StreamerbotClient.ts — Streamerbot/client - StreamerbotClient.ts (doActionWithCustomEventResponse, argument sbClientResponse, timeout 10s)
 [18] https://streamer.bot/api/releases/streamer.bot — streamer.bot - API des releases (canal stable : 1.0.7, notes de la ligne 1.0.5)
 [19] https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/5.changelogs/.archive/v1.0.0.md — Streamer.bot v1.0.0 - notes de version (Kick, refonte UI WPF, Decks 2.0, .NET 4.8.1, perks Patreon : backups cloud et webhooks custom)
