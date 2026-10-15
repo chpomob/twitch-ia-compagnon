@@ -996,7 +996,12 @@ async def test_run_and_check_config_give_the_same_diagnostics(
 # --------------------------------------------------------------------------- #
 
 from core.contracts import COUNTER_LOST_TRACES  # noqa: E402
-from core.runtime import ModuleContext, _OwnedBus  # noqa: E402
+from core.runtime import (  # noqa: E402
+    ModuleContext,
+    RuntimeContextError,
+    SupervisionError,
+    _OwnedBus,
+)
 from core.triggers import TriggerDecision  # noqa: E402
 
 #: A module whose activation publishes ``settings["count"]`` chat events for
@@ -1353,6 +1358,231 @@ async def test_a_refused_event_reaches_not_even_a_first_ordered_middleware() -> 
     result = await context.bus.publish(event["type"], event["payload"], event["metadata"])
     assert result is None
     assert [item["type"] for item in seen] == [TRACE_INPUT_OWNERSHIP_REJECTED]
+
+
+# -- every public publication route shares the guard (F1) --------------------- #
+
+
+async def _publish_through(context: ModuleContext, route: str, event: Any) -> list[str]:
+    """Publish *event* through one of a module's three public routes.
+
+    Returns what the recorder of ``record_and_emit`` saw, so a caller can
+    check the owner's write ran.
+    """
+
+    records: list[str] = []
+    if route == "bus":
+        await context.bus.publish(event["type"], event["payload"], event["metadata"])
+    elif route == "emit":
+        await context.supervision.emit(
+            event["type"], event["payload"], metadata=event["metadata"]
+        )
+    else:
+        await context.supervision.record_and_emit(
+            lambda: records.append("recorded"),
+            event["type"],
+            event["payload"],
+            metadata=event["metadata"],
+        )
+    return records
+
+
+_ROUTES = ("bus", "emit", "record_and_emit")
+
+
+@pytest.mark.asyncio
+async def test_f1_no_public_route_publishes_a_non_owned_input() -> None:
+    """F1: the supervision surface no longer bypasses input ownership (R3).
+
+    The closing gate's counterexample: through a context owning (chat, y),
+    with a native owner of (chat, x), a chat/x event published through the
+    bus, ``supervision.emit`` and ``supervision.record_and_emit`` reaches no
+    subscriber, and each attempt is counted. The diagnostic is the bus
+    route's own: one shared guard, so one trace for the pair across routes.
+    """
+
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    seen: list[Any] = []
+    runtime.bus.subscribe("channel.chat.message", lambda event: seen.append(event))
+    for route in _ROUTES:
+        await _publish_through(context, route, _chat_event("x"))
+    assert seen == []
+    assert recorder.counts() == {0}
+    assert context.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 3
+    assert recorder.traces == [{"module": "intruder", "family": "chat", "platform": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_f1_each_route_diagnoses_its_rejection_like_the_bus_route() -> None:
+    """F1: a rejection on any route is traced with the bus route's shape."""
+
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    for route, platform in zip(_ROUTES, ("x", "z", "w")):
+        await _publish_through(context, route, _chat_event(platform))
+    assert recorder.counts() == {0}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 3
+    assert recorder.traces == [
+        {"module": "intruder", "family": "chat", "platform": platform}
+        for platform in ("x", "z", "w")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", _ROUTES)
+async def test_f1_an_owned_pair_is_delivered_once_through_each_route(route: str) -> None:
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    records = await _publish_through(context, route, _chat_event("y"))
+    assert recorder.counts() == {1}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 0
+    assert recorder.traces == []
+    if route == "record_and_emit":
+        assert records == ["recorded"]
+
+
+@pytest.mark.asyncio
+async def test_f1_a_refused_record_and_emit_still_records_its_record() -> None:
+    """F1, chosen behaviour: the owner's write runs, only the publication is refused.
+
+    ``record_and_emit`` orders the owner's record before its publication
+    (R8); the record is the module's own state, so the guard leaves it in
+    place and refuses the publication that would follow it — counted and
+    diagnosed exactly as a refused bus publication.
+    """
+
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    order: list[str] = []
+
+    async def record() -> None:
+        order.append("recorded")
+
+    async def trace(event: Any) -> None:
+        order.append("traced")
+
+    runtime.bus.subscribe(TRACE_INPUT_OWNERSHIP_REJECTED, trace)
+    event = _chat_event("x")
+    await context.supervision.record_and_emit(
+        record, event["type"], event["payload"], metadata=event["metadata"]
+    )
+    assert order == ["recorded", "traced"]
+    assert recorder.counts() == {0}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 1
+    with pytest.raises(SupervisionError):
+        context.supervision.record_and_emit(
+            "not callable", event["type"], event["payload"]  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_f1_supervision_without_ownership_is_unguarded() -> None:
+    runtime, _, _ = _guarded_runtime()
+    context = runtime.for_module("m")
+    recorder = _Recorder(runtime.bus)
+    for route in _ROUTES:
+        await _publish_through(context, route, _chat_event("x"))
+    assert recorder.counts() == {3}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 0
+
+
+# -- the check reads the payload as it is published (F1, round 2) ------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "change"),
+    [
+        (_chat_event("y"), {"platform": "x"}),
+        (_chat_event("x", kind="not-an-input"), {"kind": "message"}),
+    ],
+    ids=["platform", "kind"],
+)
+async def test_f1_a_recorder_that_changes_the_payload_is_checked_after_it(
+    start: dict[str, Any], change: dict[str, Any]
+) -> None:
+    """The check follows *record*: a payload it turns non-owned is refused.
+
+    Admitted as called — chat/y is owned, an unknown kind belongs to no
+    family — but *record* turns it into chat/x, which the module does not
+    own: it reaches no subscriber, and is counted and diagnosed.
+    """
+
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    payload = dict(start["payload"])
+    await context.supervision.record_and_emit(
+        lambda: payload.update(change),
+        start["type"],
+        payload,
+        metadata=start["metadata"],
+    )
+    assert recorder.counts() == {0}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 1
+    assert recorder.traces == [{"module": "intruder", "family": "chat", "platform": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_f1_a_recorder_that_makes_the_payload_owned_is_delivered() -> None:
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    event = _chat_event("x")
+    payload = dict(event["payload"])
+    await context.supervision.record_and_emit(
+        lambda: payload.update(platform="y"),
+        event["type"],
+        payload,
+        metadata=event["metadata"],
+    )
+    assert recorder.counts() == {1}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 0
+    assert recorder.traces == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["emit", "record_and_emit"])
+async def test_f1_a_payload_changed_between_call_and_await_is_checked(route: str) -> None:
+    """The supervision routes check when they publish, not when called."""
+
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    recorder = _Recorder(runtime.bus)
+    event = _chat_event("y")
+    payload = dict(event["payload"])
+    if route == "emit":
+        pending = context.supervision.emit(
+            event["type"], payload, metadata=event["metadata"]
+        )
+    else:
+        pending = context.supervision.record_and_emit(
+            lambda: None, event["type"], payload, metadata=event["metadata"]
+        )
+    payload["platform"] = "x"
+    await pending
+    assert recorder.counts() == {0}
+    assert runtime.supervision.snapshot()[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 1
+    assert recorder.traces == [{"module": "intruder", "family": "chat", "platform": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_f1_guarded_routes_keep_the_call_site_refusals() -> None:
+    """A terminal trace on emit, or a blank type, still fails at the call."""
+
+    runtime, _, _ = _guarded_runtime()
+    context = _intruder(runtime)
+    with pytest.raises(SupervisionError):
+        context.supervision.emit("module.stopped", {})
+    recorded: list[str] = []
+    with pytest.raises(RuntimeContextError):
+        context.supervision.record_and_emit(lambda: recorded.append("x"), 7, {})  # type: ignore[arg-type]
+    assert recorded == []
 
 
 def test_the_evaluate_facade_refuses_without_counting() -> None:

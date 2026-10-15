@@ -1103,6 +1103,10 @@ class ModuleServices:
         return self._registry.entries()
 
 
+def _recorded() -> None:
+    """A record already written: :class:`ModuleSupervision` ran it first."""
+
+
 class ModuleSupervision:
     """A module's supervision surface: the facade plus its own health calls.
 
@@ -1110,16 +1114,45 @@ class ModuleSupervision:
     the ordering guarantee and the terminal refusal are exactly the shared
     ones. ``ready``, ``degraded`` and ``stopped`` are the module's own state
     transitions, with its name already bound.
+
+    With an input *guard* (R3, D3) — the one :class:`_InputGuard` the module's
+    bus facade shares — both publication methods refuse an input-family event
+    the module may not deliver: no subscriber sees it, and the guard counts
+    and reports it exactly as the bus route does. The check reads the payload
+    when the publication runs, immediately before it is sanitised and
+    published with no suspension in between — never at the call — so a
+    payload changed between the call and the await, or by ``record_and_emit``'s
+    own *record*, is checked as it is published. ``record_and_emit`` still
+    runs *record* first, since the owner's write is its own, and only its
+    publication is refused (F1).
     """
 
-    __slots__ = ("_health", "_module", "_supervision")
+    __slots__ = ("_guard", "_health", "_module", "_supervision")
 
     def __init__(
-        self, supervision: Supervision, health: ModuleHealth, module: str
+        self,
+        supervision: Supervision,
+        health: ModuleHealth,
+        module: str,
+        *,
+        guard: "_InputGuard | None" = None,
     ) -> None:
         self._supervision = supervision
         self._health = health
         self._module = _require_text(module, "module supervision.module")
+        self._guard = guard
+
+    def _refused_pair(
+        self,
+        event_type: str,
+        payload: Mapping[str, Any],
+        metadata: Mapping[str, Any] | None,
+    ) -> tuple[str, str] | None:
+        if self._guard is None:
+            return None
+        return self._guard.refused_pair(
+            {"type": event_type, "payload": payload, "metadata": metadata}
+        )
 
     @property
     def module(self) -> str:
@@ -1132,7 +1165,32 @@ class ModuleSupervision:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> Awaitable[None]:
-        return self._supervision.emit(event_type, payload, metadata=metadata)
+        publication = self._supervision.emit(event_type, payload, metadata=metadata)
+        if self._guard is None:
+            return publication
+        return self._checked_emit(publication, event_type, payload, metadata)
+
+    async def _checked_emit(
+        self,
+        publication: Awaitable[None],
+        event_type: str,
+        payload: Mapping[str, Any],
+        metadata: Mapping[str, Any] | None,
+    ) -> None:
+        """Check the payload as it is published; refuse in its place if needed.
+
+        The shared facade's call-site refusals already ran when *publication*
+        was built; nothing suspends between this check and its sanitising.
+        """
+
+        pair = self._refused_pair(event_type, payload, metadata)
+        if pair is None:
+            await publication
+            return
+        close = getattr(publication, "close", None)
+        if callable(close):
+            close()
+        await self._guard.reject(*pair)  # type: ignore[union-attr]
 
     def record_and_emit(
         self,
@@ -1142,8 +1200,41 @@ class ModuleSupervision:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> Awaitable[None]:
-        return self._supervision.record_and_emit(
-            record, event_type, payload, metadata=metadata
+        if self._guard is None:
+            return self._supervision.record_and_emit(
+                record, event_type, payload, metadata=metadata
+            )
+        if not callable(record):
+            raise SupervisionError(
+                "supervision.record_and_emit: field 'record': must be callable"
+            )
+        _require_text(event_type, "supervision.record_and_emit.event_type")
+        return self._record_then_check(record, event_type, payload, metadata)
+
+    async def _record_then_check(
+        self,
+        record: Recorder,
+        event_type: str,
+        payload: Mapping[str, Any],
+        metadata: Mapping[str, Any] | None,
+    ) -> None:
+        """The owner's write, then the check, then the publication or refusal.
+
+        The check follows *record*, which may change the payload it is about
+        to publish; the shared facade is then handed a record already done,
+        so it sanitises and publishes the checked payload without suspending
+        in between, and still files a failed publication as a lost trace.
+        """
+
+        outcome = record()
+        if inspect.isawaitable(outcome):
+            await outcome
+        pair = self._refused_pair(event_type, payload, metadata)
+        if pair is not None:
+            await self._guard.reject(*pair)  # type: ignore[union-attr]
+            return
+        await self._supervision.record_and_emit(
+            _recorded, event_type, payload, metadata=metadata
         )
 
     def snapshot(self) -> Mapping[str, int]:
@@ -1221,7 +1312,8 @@ class _InputGuard:
     unconstrained configuration behaves exactly as before.
 
     The diagnostic set is owned here, so the bus, the trigger and the chat
-    facades of one module report a given pair once between them.
+    facades of one module — and its supervision surface (F1) — report a
+    given pair once between them.
     """
 
     __slots__ = ("_declared", "_module", "_ownership", "_reported", "_supervision")
@@ -1517,7 +1609,8 @@ class RuntimeContext:
 
         With an *ownership* table installed (R3, D3), the bus, the trigger
         engine and the chat context arrive as module-scoped facades that
-        refuse an input the module may not deliver; *declared* says whether
+        refuse an input the module may not deliver, and the supervision
+        surface's two publication methods apply the same guard (F1); *declared* says whether
         its manifest carries ``input_families``. Without one, the shared
         objects are returned unchanged and :attr:`ModuleContext.inputs` is
         :meth:`OwnedInputs.unrestricted`.
@@ -1557,7 +1650,12 @@ class RuntimeContext:
                 self.actions, name, ownership=ownership, declared=declared
             ),
             tasks=ModuleTasks(self.tasks, name),
-            supervision=ModuleSupervision(self.supervision, self.health, name),
+            supervision=ModuleSupervision(
+                self.supervision,
+                self.health,
+                name,
+                guard=None if scoped is None else scoped.guard,
+            ),
             services=ModuleServices(self.services, name),
         )
 
