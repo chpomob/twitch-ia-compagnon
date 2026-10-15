@@ -121,3 +121,53 @@ file count stays at seven (D5, D6). D10 changes when one of them reports a state
 **P14 amendment.** The step now depends on P14F1, and its AC3 test must assert the **final state**
 (degraded after the startup budget, with no `module.ready` after the `module.degraded`) — the record
 count alone is not the criterion.
+
+## D11 — the executor carries a provider's cause when it takes over an emitted call
+
+**Where it was found.** Step P15 stopped before editing anything (the third time in this campaign) and
+reported that the kernel drops the reason an uncertain outcome is uncertain on the paths the executor
+owns. Report preserved at
+`docs/campaigns/phase5/scaffolding/loop-out/phase5-p15/01_build.json`.
+
+**The defect, re-verified in the code.** In `core/actions.py`: `_terminate_uncertain` builds its own
+generic message and passes no cause; `_terminate` assembles
+`error = {"code", "message", "retryable"}` with **no `cause` member**; the conversion path (`_reject`,
+step 4c of `_validate_observation`) rebuilds the error mapping from scratch when a provider-authored
+`timeout`/`cancelled`/`error` record becomes `external_unknown`; and `_is_interruption_record` reads
+status names only. The cause therefore survives **only** where the provider's answer is adopted as
+written. The reporter tabulated all four executor-owned paths on the real `ActionExecutor` — outer
+cancellation and the executor's own deadline, each with a `cancelled` and an `external_unknown` record
+shape — and every one ended `external_unknown` / `external_effect_unknown` with the executor's message
+and no cause.
+
+**Why it matters.** Status and code stay correct, so an assertion on status and code alone passes today
+while the defect hides — and the cause plus the "the companion does not know whether the action ran"
+wording is exactly what tells the model and the audit what happened. D8 of the plan also *claims* this
+adoption happens, so the plan was describing behaviour the kernel does not have.
+
+**Latent in shipped modules.** `modules/clips` publishes `external_unknown` with cause
+`confirmation_lost` and documents it twice; `modules/stream_control` does the same. Their tests assert
+the cause only where the provider answers, so the executor-owned paths were never covered. The fix
+makes their already-published causes visible where they were being dropped.
+
+**Resolution.** New step `steps/P15F1-spec.md`, files `core/actions.py` and `tests/test_actions.py`:
+carry the provider's `cause` (and its message) on conversion and on take-over; a provider that reports
+no cause keeps today's record byte for byte; no status or code changes anywhere; `CancelledError` still
+propagates and the timer stays in force.
+
+**Cost accounting.** `core/actions.py` is already among the specification's five core targets (D5
+added the `excluded_platforms` field there), so the file count stays at seven.
+
+**P15 amendment.** The step now depends on P15F1. The paths where the provider answers — its own
+acknowledgement deadline, a late acknowledgement, a connection loss after sending, an in-flight run at
+shutdown, a send that raises after the mark — were never affected and need no amendment.
+
+## What the amendments cost, in one place
+
+    spec's five core targets          contracts.py, loader.py, runtime.py, main.py, config_ui/
+    D5  core/actions.py               excluded_platforms on the binding
+    D6  core/triggers.py              add_companion_identities
+    D9  core/contracts.py (in list)   minLength / maxLength on string nodes
+    D10 core/runtime.py (in list)     a module's own health report survives a phase observation
+    D11 core/actions.py (in list)     the provider's cause survives the executor taking over
+    files added beyond the spec's five: 2 (D5, D6) — count unchanged by D9, D10, D11

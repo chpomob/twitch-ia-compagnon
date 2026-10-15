@@ -84,6 +84,10 @@ where this kind of feature breaks.
   reported itself: deviation D10, added by step P14F1, is approved — without it an unreachable
   instance left the bridge ready while AC3's literal wording still passed. Verify the invariant, do not
   report the change.
+- `core/actions.py`'s terminal records now carry a provider's `cause` on the paths the executor owns
+  (conversion to `external_unknown`, and take-over on cancellation or deadline): deviation D11, added by
+  step P15F1, is approved. It closes a latent gap in the shipped `clips` and `stream_control` modules
+  too. Verify that no status or code changed, do not report the amendment.
 - The confirmation round trip is absent on purpose (assumption A6): an acknowledged run ends
   `external_unknown execution_unconfirmed`.
 - The `viewers` family merges "viewer reading" and "presence" (assumption A4): the repository has one

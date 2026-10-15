@@ -85,7 +85,14 @@ If you believe another file must change, stop and report it instead of editing i
 
 ## Dependencies
 
-[P14]
+[P14, P15F1]
+
+P15F1 (the executor carries a provider's cause when it takes over an emitted call, deviation D11) must
+have landed first: without it, a cancellation coming from the **executor** (its caller, or its own
+deadline) drops the provider's cause, and this step's `cause: acknowledgement_lost` assertions on those
+paths cannot hold. The paths where the provider answers — its own acknowledgement deadline, a late
+acknowledgement, a connection loss after sending, an in-flight run at shutdown, a send that raises
+after the mark — are unaffected either way.
 
 All dependencies are already merged into `main` when this step runs.
 
