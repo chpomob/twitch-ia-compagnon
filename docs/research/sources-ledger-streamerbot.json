@@ -1,0 +1,257 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": 1,
+      "url": "https://docs.streamer.bot/api/websocket",
+      "title": "Streamer.bot Docs - WebSocket Server (vue d ensemble des evenements et requetes)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 2,
+      "url": "https://docs.streamer.bot/api/websocket/requests",
+      "title": "Streamer.bot Docs - WebSocket Requests (les 22 requetes et leurs schemas)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 3,
+      "url": "https://docs.streamer.bot/api/websocket/guide/configuration",
+      "title": "Streamer.bot Docs - Configuration du serveur WebSocket (127.0.0.1:8080, endpoint /, auth, enforce)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 4,
+      "url": "https://docs.streamer.bot/api/websocket/guide/authentication",
+      "title": "Streamer.bot Docs - Authentification (ajoutee en v0.2.5, salt/challenge SHA256, SendMessage privilegie)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 5,
+      "url": "https://docs.streamer.bot/api/websocket/guide/requests",
+      "title": "Streamer.bot Docs - Envoi de requetes (schema requete/reponse JSON)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 6,
+      "url": "https://docs.streamer.bot/api/websocket/events",
+      "title": "Streamer.bot Docs - WebSocket Events (45 categories, Twitch 139, Elgato 131, YouTube 31, Kick 21)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 7,
+      "url": "https://docs.streamer.bot/api/websocket/recipes/remote-access",
+      "title": "Streamer.bot Docs - Acces distant (LAN, 0.0.0.0, restrictions mixed content, Tailscale Serve)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 8,
+      "url": "https://docs.streamer.bot/api/http/guide/configuration",
+      "title": "Streamer.bot Docs - Configuration du serveur HTTP (127.0.0.1:7474, auto-start desactive)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 9,
+      "url": "https://docs.streamer.bot/api/http/requests/do-action",
+      "title": "Streamer.bot Docs - HTTP POST /DoAction (reponse 204 No Content)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 10,
+      "url": "https://docs.streamer.bot/api/udp/requests/do-action",
+      "title": "Streamer.bot Docs - UDP DoAction",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 11,
+      "url": "https://docs.streamer.bot/api/sub-actions",
+      "title": "Streamer.bot Docs - Reference des sub-actions (444 entrees, core/elgato/integrations/kick/meld/obs/polypop/settings/speakerbot/streamerbot/streamlabs/twitch/youtube)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 12,
+      "url": "https://docs.streamer.bot/api/triggers",
+      "title": "Streamer.bot Docs - Reference des triggers (444 entrees, meme arborescence)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 13,
+      "url": "https://docs.streamer.bot/api/csharp/methods",
+      "title": "Streamer.bot Docs - Methodes C# (Core 175, Obs Studio 69, Integrations 43, Elgato 35, Kick 28, Meld 9)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 14,
+      "url": "https://docs.streamer.bot/api/csharp/guide/intro",
+      "title": "Streamer.bot Docs - Introduction au C# (classe CPHInline, Execute(), return false arrete les sub-actions)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 15,
+      "url": "https://streamerbot.github.io/client/guide/actions",
+      "title": "Streamer.bot Client - Actions (getActions, doAction, arguments, customEventResponse depuis @streamerbot/client v1.10.0)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 16,
+      "url": "https://github.com/Streamerbot/client",
+      "title": "GitHub Streamerbot/client - client WebSocket officiel TypeScript (MIT, 83 etoiles, dernier push 2026-07-20)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 17,
+      "url": "https://raw.githubusercontent.com/Streamerbot/client/main/packages/client/src/ws/StreamerbotClient.ts",
+      "title": "Streamerbot/client - StreamerbotClient.ts (doActionWithCustomEventResponse, argument sbClientResponse, timeout 10s)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 18,
+      "url": "https://streamer.bot/api/releases/streamer.bot",
+      "title": "streamer.bot - API des releases (canal stable : 1.0.7, notes de la ligne 1.0.5)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 19,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/5.changelogs/.archive/v1.0.0.md",
+      "title": "Streamer.bot v1.0.0 - notes de version (Kick, refonte UI WPF, Decks 2.0, .NET 4.8.1, perks Patreon : backups cloud et webhooks custom)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 20,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/5.changelogs/.archive/v1.0.1.md",
+      "title": "Streamer.bot v1.0.1 - notes de version (hotfix ; limite d abonnements webhook cote Kick)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 21,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/1.get-started/1.installation/0.index.md",
+      "title": "Streamer.bot Docs - Installation Windows (application portable, auto-updater, canaux stable/beta/alpha)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 22,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/1.get-started/1.installation/1.linux/0.index.md",
+      "title": "Streamer.bot Docs - Installation Linux (experimentale, Wine 11.9+, dotnet48, d3dcompiler_47, dxvk, corefonts, sapi)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 23,
+      "url": "https://github.com/Streamerbot/sb-linux-installer",
+      "title": "GitHub Streamerbot/sb-linux-installer - script d installation Linux (GPL-3.0, 37 etoiles, dernier push 2026-05-06)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 24,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/1.get-started/1.installation/2.macos.md",
+      "title": "Streamer.bot Docs - Installation macOS (experimentale, Whisky en maintenance, guide limite a la ligne 0.2.8)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 25,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/faq/27.platform-support.md",
+      "title": "Streamer.bot Docs - Support des plateformes (Kick uniquement en 1.0.0 et via webhooks, TikTok non, TikFinity en integration)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 26,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/3.api/1.sub-actions/core/network/fetch-url.md",
+      "title": "Streamer.bot Docs - sub-action Fetch URL (GET uniquement, renvoi vers C# pour POST)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 27,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/4.examples/http-post.md",
+      "title": "Streamer.bot Docs - exemple POST/PUT/PATCH via HttpClient en C# (Newtonsoft.Json)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 28,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/3.api/1.sub-actions/core/triggers/custom-event-trigger.md",
+      "title": "Streamer.bot Docs - sub-action Trigger Custom Event (Evenement/Evenement code, Use Args)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 29,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/3.api/2.triggers/core/websocket/client/websocket-client-message.md",
+      "title": "Streamer.bot Docs - trigger Websocket Client Message (un message recu d un serveur WebSocket externe)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 30,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/3.api/2.triggers/core/websocket/custom-server/message.md",
+      "title": "Streamer.bot Docs - trigger WebSocket Custom Server Message (message recu d un client connecte au serveur custom de SB)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 31,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/2.guide/01.core/01.actions.md",
+      "title": "Streamer.bot Docs - guide Actions (actions, sub-actions, pile d arguments, files d actions)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 32,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/faq/09.action-blocking.md",
+      "title": "Streamer.bot Docs - FAQ file d actions bloquante (une action n attend la fin de la precedente que si la file est marquee Blocking)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 33,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/speakerbot/2.api/0.websocket/1.requests.md",
+      "title": "Speaker.bot Docs - requetes du serveur WebSocket (Speak, Stop, Enable/Disable, Mode, Pause/Resume/Clear)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 34,
+      "url": "https://github.com/miichom/pystreamerbot",
+      "title": "GitHub miichom/pystreamerbot - client Python communautaire (MIT, 0 etoile, cree 2026-08-15, dernier push 2026-09-05)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 35,
+      "url": "https://api.github.com/orgs/Streamerbot/repos",
+      "title": "API GitHub - depots de l organisation Streamerbot (Streamer.bot, client, docs, sb-linux-installer, streamerbot-wiki, TwitchSpeaker)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 36,
+      "url": "https://api.github.com/repos/Streamerbot/Streamer.bot",
+      "title": "API GitHub - depot Streamerbot/Streamer.bot (aucune licence, aucun langage, aucune release : le binaire est distribue hors GitHub)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 37,
+      "url": "https://github.com/sandraschi/streamfog-mcp",
+      "title": "GitHub sandraschi/streamfog-mcp - precedent d integration IA : serveur MCP qui traduit des appels d outils en DoAction Streamer.bot, avec l avertissement fire-and-forget",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 38,
+      "url": "https://discord.com/invite/hYqQGG3puC",
+      "title": "Discord officiel Streamer.bot - environ 32 000 membres (chiffre vu en extrait de recherche, non verifie sur la page)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 39,
+      "url": "https://contentcreators.com/tools/streamerbot-review",
+      "title": "Content Creators - revue Streamer.bot (129+ extensions communautaires ; extrait de recherche, non verifie sur la page)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 40,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/3.api/.variables/websocket-client/WebsocketClient.md",
+      "title": "Streamer.bot Docs - variables du client WebSocket (wsName, wsUrl, wsHost, wsPort, wsPath, wsQuery)",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 41,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/3.api/1.sub-actions/core/system/run-a-program.md",
+      "title": "Streamer.bot Docs - sub-action Run a Program",
+      "accessed": "2026-10-15"
+    },
+    {
+      "id": 42,
+      "url": "https://raw.githubusercontent.com/Streamerbot/docs/main/streamerbot/3.api/5.http/0.guide/2.serving-files.md",
+      "title": "Streamer.bot Docs - servir des fichiers locaux via le serveur HTTP (mappings de chemins)",
+      "accessed": "2026-10-15"
+    }
+  ]
+}
