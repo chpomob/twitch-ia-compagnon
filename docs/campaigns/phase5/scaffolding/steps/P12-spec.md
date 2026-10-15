@@ -34,9 +34,27 @@ Non-trivial: a public manifest, a new action contract, and a packaging change.
     - `viewers` on `[twitch, kick, youtube]`, default false;
     - `cues` on `['*']`, default true.
   - **`triggers` declaration.** The trigger types the native chat inputs declare, plus `event_kind`. The default policy is `any_of`: `event_kind: [cue]` OR `keyword: ['${companion_name}']`. These are existing rule types (`core/triggers.py:128-131`, `COMBINATION_OPERATORS`).
+
+    **Amendment (2026-10-15, second gap of the P12 blocker report).** A default policy that names
+    `${companion_name}` requires the module to configure one: `core/loader.py` reads
+    `companion_name` from the module's own settings, `core/main.py` builds the trigger registry
+    without a fallback name, and `core/triggers.py:1342` raises "uses ${companion_name} but no
+    companion name is configured". As the step was first written, **any profile enabling the bridge
+    would fail startup at trigger registration**, contradicting the R1 standing decision that the
+    bridge is optional and that its absence or misconfiguration never breaks the companion.
+    Therefore the `settings_schema` also declares an optional `companion_name` string setting (with a
+    `title`, no `default`, no `required` — AC5 holds), and `validate_settings` refuses a missing or
+    blank one with a value-free diagnostic naming the field, exactly as it does for `url`, so
+    `--check-config` reports it without opening a socket.
   - **`actions`:**
     - `automation.action.run`: `nature: write`, `idempotency: none`, `required_permissions: [automation.run]`, `destinations: [{platform: '*', channel_id: '*', scope: automation}]`, `delivery: {text_argument: none}`, not model-proposable.
     - Its `argument_schema` is `{type: object, properties: {action: {type: string, minLength: 1, maxLength: 128}, arguments: {type: object}}, required: [action], additionalProperties: false}`.
+      **Amendment (2026-10-15, first gap of the P12 blocker report).** AC15 requires *this schema
+      itself* to refuse an `action` of 0 or 129 characters, and the kernel's schema subset did not
+      support `minLength`/`maxLength` — declaring the action would have failed at load with
+      `SchemaError: ... unsupported schema keyword`. Step **P12F1** adds both keywords to
+      `core/contracts.py` (deviation D9). They must be present in this manifest exactly as written;
+      do not move the length check into the provider and do not touch AC15's wording.
     - `timeout_seconds` is a fixed value; the validator refuses an `acknowledgement_seconds` greater than it minus a margin (R4: timeout ≥ acknowledgement deadline).
     - The description contains the sentence "Acceptance by the automation application is not a confirmation that the action ran."
     - `users.read` is **not** copied into the manifest. It is declared at prepare from the users manifest (P18), and the manifest comment says so, so the spec stays single-sourced. If the loader requires every registered action to be manifest-declared, the declaration is instead copied verbatim and a test asserts equality with the users manifest (decide at build by running `tests/test_loader.py`).
@@ -46,7 +64,8 @@ Non-trivial: a public manifest, a new action contract, and a packaging change.
   - **No defaults.** There is no default endpoint, port, password, version or action name anywhere (R6).
   - **`pyproject.toml`:** add `"modules.streamerbot" = ["module.yaml"]`. Dependencies are unchanged (memory "phase1-module-step-pyproject-line").
   - **Allowlisted count adaptations, 17 → 18:**
-    - `tests/test_examples.py`: `MODULE_NAMES`, `EXPECTED_MANIFESTS`, `DECLARATION_KEYS` with `input_families`, `DECLARED_ACTIONS` with `automation.action.run`.
+    - `tests/test_examples.py`: `MODULE_NAMES`, `EXPECTED_MANIFESTS`, `DECLARATION_KEYS` with `input_families`, `DECLARED_ACTIONS` with `automation.action.run`. **Amendment (same report):** the same allowlisted test carries two more assertions the step must adapt — `SECRET_SETTINGS` needs the bridge's `("password",)` entry, and the `len(declared) == 13` / `declared == PROVIDED_ACTIONS["pc"] | {...}` assertions need `automation.action.run`. The blocker report located all three at
+      `tests/test_examples.py`; they belong to the same test function, so the allowlist entry does not grow.
     - `tests/test_manifest_presentation.py`: the count.
     - `tests/test_profiles.py`: both count tests.
 
@@ -95,7 +114,10 @@ If you believe another file must change, stop and report it instead of editing i
 
 ## Dependencies
 
-[P2, P6, P10]
+[P2, P6, P10, P12F1]
+
+P12F1 (the kernel's string length bounds, deviation D9) must have landed first: without it, declaring
+this manifest's `argument_schema` fails at load with `unsupported schema keyword`.
 
 All dependencies are already merged into `main` when this step runs.
 

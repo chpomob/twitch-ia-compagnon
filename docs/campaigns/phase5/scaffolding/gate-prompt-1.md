@@ -10,7 +10,11 @@ per (family, platform) pair, refused at preparation). Its integration study is
 The phase 5 specification (`docs/campaigns/phase5/spec.md`, 10 requirements, 45 acceptance criteria,
 approved after a hand verification of the pipeline's rounds) and plan (`docs/campaigns/phase5/plan.md`,
 22 steps, with its deviations D1–D8) are the authority; the brief
-(`docs/campaigns/phase5/brief.md`) carries the operator's binding decisions.
+(`docs/campaigns/phase5/brief.md`) carries the operator's binding decisions. **Read
+`docs/campaigns/phase5/scaffolding/plan-amendments.md` as well**: it records deviation D9, the kernel's
+string length bounds added by step P12F1, and the two corrections to step P12 (the `companion_name`
+setting and three more assertions inside an already allowlisted test), each with the evidence and the
+alternative that was refused.
 
 **Write your report to `docs/campaigns/phase5/full-branch-review.md`.** Writing THAT ONE FILE is
 explicitly authorized and required. Create, stage or modify nothing else — no `git add`, no commits,
@@ -71,6 +75,11 @@ where this kind of feature breaks.
   the reason stated; only a weakened assertion is a finding.
 - `core/actions.py` and `core/triggers.py` are touched although the specification's cost row said five
   core files: deviations D5 and D6 of the plan approve both.
+- `core/contracts.py` accepts two schema keywords (`minLength`, `maxLength`) that no requirement of
+  this phase expected: deviation D9, recorded with its evidence in
+  `docs/campaigns/phase5/scaffolding/plan-amendments.md`, is approved. The bridge's
+  `companion_name` setting and the three extra assertions in an already allowlisted test are approved
+  corrections of step P12, recorded in the same file.
 - The confirmation round trip is absent on purpose (assumption A6): an acknowledged run ends
   `external_unknown execution_unconfirmed`.
 - The `viewers` family merges "viewer reading" and "presence" (assumption A4): the repository has one
