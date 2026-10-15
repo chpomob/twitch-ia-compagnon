@@ -128,6 +128,7 @@ from core.contracts import (
     Destination,
     SessionKey,
 )
+from core.runtime import OwnedInputs
 from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
 
 try:  # Keep the module importable for transport-injected contract tests.
@@ -234,6 +235,8 @@ DEDUP_MAX_ENTRIES = 4096
 
 _CHAT_EVENT = "channel.chat.message"
 _CHAT_SCOPE = "chat"
+# The input family this module ingests (phase 5 R2), as its manifest declares.
+_CHAT_FAMILY = "chat"
 
 CHAT_WRITE_ACTION = "chat.write"
 MANIFEST_PATH = Path(__file__).with_name("module.yaml")
@@ -991,11 +994,24 @@ class _YouTubeModerationService:
             if _optional_string(target_author_id) is None:
                 module._diagnose("youtube moderation timeout: refused (no target)")
                 return ModerationResult(OUTCOME_REJECTED)
+            label = "youtube moderation timeout"
             live_chat_id = module.live_chat_id(channel_id)
+            if live_chat_id is None and module._resolves_on_demand(channel_id):
+                # No poller resolves the live chat while ingestion is
+                # elsewhere (phase 5 R3): the ban looks it up itself, as a
+                # send does. A rate block keeps that read back too.
+                if module._rate_block_remaining() is not None:
+                    module._diagnose(f"{label}: refused (rate limited)")
+                    return ModerationResult(OUTCOME_RATE)
+                withheld = await module._look_up_on_demand(channel_id, label)
+                if withheld is not None:
+                    module._diagnose(f"{label}: refused ({withheld.code})")
+                    return ModerationResult(OUTCOME_REJECTED)
+                live_chat_id = module.live_chat_id(channel_id)
             if live_chat_id is None:
-                module._diagnose("youtube moderation timeout: refused (no live chat)")
+                module._diagnose(f"{label}: refused (no live chat)")
                 return ModerationResult(OUTCOME_REJECTED)
-            op, label = OP_BAN, "youtube moderation timeout"
+            op = OP_BAN
             ban = {
                 "snippet": {
                     "liveChatId": live_chat_id,
@@ -1031,6 +1047,8 @@ class _YouTubeModerationService:
             module._block_sends(answer_headers, label)
             return ModerationResult(OUTCOME_RATE)
         module._check_quota_refusal(status, body)
+        if op == OP_BAN and status in (403, 404):
+            module._forget_ended_chat(channel_id)
         return ModerationResult(OUTCOME_REJECTED)
 
 
@@ -1095,6 +1113,10 @@ class YouTubeModule:
         self._triggers = runtime.triggers
         self._chat = runtime.chat
         self._scheduler = runtime.scheduler
+        self._inputs = runtime.inputs
+        # Set once ``start_inputs`` found (``chat``, youtube) owned elsewhere:
+        # a repeated call starts nothing and reports nothing again.
+        self._ingestion_elsewhere = False
         self._tasks = getattr(context, "tasks", None)
         self._settings = settings
         self._session = session
@@ -1212,12 +1234,23 @@ class YouTubeModule:
 
     async def start_inputs(self) -> None:
         """Start one poller per channel. Only the coordinator, past the
-        barrier, calls this."""
+        barrier, calls this.
 
-        if self._running or self._stopping or self._closed:
+        The pollers start only while this module owns (``chat``, youtube)
+        (phase 5 R3). Owned elsewhere, no poll request leaves and one
+        value-free diagnostic says so; ``chat.write`` stays bound and ready
+        from :meth:`prepare`, which never depended on a poll, and a send
+        resolves its live chat itself (:meth:`_look_up_on_demand`).
+        """
+
+        if self._running or self._ingestion_elsewhere or self._stopping or self._closed:
             return
         if not self._prepared:
             raise YouTubeModuleError("youtube lifecycle: start_inputs requires prepare")
+        if not self._inputs.owns(_CHAT_FAMILY, PLATFORM):
+            self._ingestion_elsewhere = True
+            self._diagnose("youtube: chat ingestion owned elsewhere")
+            return
         self._running = True
         for index, poller in enumerate(self._pollers.values(), start=1):
             poller.task = self._spawn(self._poll_loop(poller), name=f"youtube-poll-{index}")
@@ -1297,6 +1330,13 @@ class YouTubeModule:
     async def _look_up(self, poller: _Poller) -> float:
         """One active-broadcast lookup; the delay before the next request."""
 
+        _status, _body, delay = await self._look_up_answered(poller)
+        return delay
+
+    async def _look_up_answered(self, poller: _Poller) -> tuple[int | None, Any, float]:
+        """One active-broadcast lookup; ``(status, body, delay before the
+        next request)``. ``poller.live_chat_id`` is set when it resolved."""
+
         status, body = await self._read(
             OP_BROADCAST_LOOKUP,
             "youtube broadcast lookup",
@@ -1307,17 +1347,17 @@ class YouTubeModule:
             ),
         )
         if status is None or status >= 500:
-            return TRANSIENT_RETRY_SECONDS
+            return status, body, TRANSIENT_RETRY_SECONDS
         if status == 401:
             self._tokens.invalidate()
-            return float(self._settings.min_poll_interval_seconds)
+            return status, body, float(self._settings.min_poll_interval_seconds)
         self._check_quota_refusal(status, body)
         live_chat_id = _active_live_chat(body, poller.channel_id) if status == 200 else None
         if live_chat_id is None:
-            return LOOKUP_RETRY_SECONDS
+            return status, body, LOOKUP_RETRY_SECONDS
         poller.live_chat_id = live_chat_id
         poller.page_token = None
-        return 0.0
+        return status, body, 0.0
 
     async def _list(self, poller: _Poller) -> float:
         """One list request; the delay before the next one (R7)."""
@@ -1574,6 +1614,10 @@ class YouTubeModule:
                 f"{label}: rate limited by the platform",
                 trace_fields={"retry_after_seconds": round(remaining, 3)},
             )
+        if self.live_chat_id(channel_id) is None and self._resolves_on_demand(channel_id):
+            withheld = await self._look_up_on_demand(channel_id, label)
+            if withheld is not None:
+                return withheld
         live_chat_id = self.live_chat_id(channel_id)
         if not self._closed and live_chat_id is None:
             return _SendOutcome(
@@ -1613,6 +1657,8 @@ class YouTubeModule:
             )
         if status == 401:
             self._tokens.invalidate()
+        if status in (403, 404):
+            self._forget_ended_chat(channel_id)
         if not 200 <= status < 300:
             return _SendOutcome(
                 _STATUS_ERROR, _ERROR_PLATFORM_REJECTED, f"{label}: rejected (status {status})"
@@ -1625,6 +1671,64 @@ class YouTubeModule:
             )
         _remember(self._sent_ids, message_id)
         return _SendOutcome(_STATUS_SUCCESS, message_id=message_id)
+
+    def _resolves_on_demand(self, channel_id: str) -> bool:
+        """Whether a write resolves *channel_id*'s live chat itself: with
+        (``chat``, youtube) owned elsewhere no poller does (phase 5 R3)."""
+
+        return not self._closed and self._ingestion_elsewhere and channel_id in self._pollers
+
+    def _forget_ended_chat(self, channel_id: str) -> None:
+        """A write answered 403/404 while ingestion is elsewhere: no poller
+        notices an ended chat, so the next write looks the broadcast up again."""
+
+        if self._ingestion_elsewhere and channel_id in self._pollers:
+            self._pollers[channel_id].live_chat_id = None
+
+    async def _look_up_on_demand(self, channel_id: str, label: str) -> _SendOutcome | None:
+        """Resolve *channel_id*'s live chat for a write; the outcome withholding it.
+
+        With (``chat``, youtube) owned elsewhere no poller runs, so nothing
+        resolves the live chat a send or a timeout needs (phase 5 R3): the
+        write makes one broadcast lookup first, charged to the ledger as a
+        read. Nothing is listed. ``None`` when the lookup was answered 200,
+        resolved or not — an absent broadcast is the caller's
+        ``no_live_chat``; a lookup that failed (lost, 5xx, refused, quota) is
+        its own outcome, never reported as an absent broadcast.
+        """
+
+        try:
+            status, body, _delay = await self._look_up_answered(self._pollers[channel_id])
+        except _ReadWithheld:
+            return _SendOutcome(
+                _STATUS_REFUSED, ERROR_QUOTA_EXHAUSTED, f"{label}: daily quota exhausted"
+            )
+        except AuthRefreshRefused:
+            await self._report_auth_failed()
+            return _SendOutcome(
+                _STATUS_ERROR, ERROR_AUTH_REFRESH_FAILED, f"{label}: authentication refused"
+            )
+        except AuthRefreshUnavailable:
+            return _SendOutcome(
+                _STATUS_ERROR, _ERROR_TRANSPORT_FAILED, f"{label}: token endpoint unavailable"
+            )
+        if status is None or status >= 500:
+            return _SendOutcome(
+                _STATUS_ERROR,
+                _ERROR_TRANSPORT_FAILED,
+                f"{label}: broadcast lookup failed ({_safe_status(status)})",
+            )
+        if status == 403 and _error_reason(body) in QUOTA_REASONS:
+            return _SendOutcome(
+                _STATUS_ERROR, ERROR_QUOTA_EXHAUSTED, f"{label}: daily quota exhausted"
+            )
+        if status != 200:
+            return _SendOutcome(
+                _STATUS_ERROR,
+                _ERROR_PLATFORM_REJECTED,
+                f"{label}: broadcast lookup rejected (status {status})",
+            )
+        return None
 
     def _rate_block_remaining(self) -> float | None:
         """Seconds until writes may resume after a rate refusal; ``None``
@@ -1950,6 +2054,7 @@ class _RuntimeSurfaces:
     triggers: Any | None
     chat: Any | None
     scheduler: Any | None
+    inputs: Any
 
 
 _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -1961,6 +2066,11 @@ _OPTIONAL_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("triggers", ("evaluate", "recorded")),
     ("chat", ("append",)),
     ("scheduler", ("admit",)),
+    # The pairs this module owns (phase 5 R3). A context built without an
+    # ownership table carries ``OwnedInputs.unrestricted()``; a harness
+    # context without the field is read the same way, so an absent table
+    # means "own everything I declare".
+    ("inputs", ("owns",)),
 )
 
 
@@ -1978,6 +2088,8 @@ def _runtime_surfaces(context: Any) -> _RuntimeSurfaces:
         if value is not None and not all(callable(getattr(value, m, None)) for m in methods):
             raise YouTubeModuleError("youtube activation: runtime context is invalid")
         surfaces[name] = value
+    if surfaces["inputs"] is None:
+        surfaces["inputs"] = OwnedInputs.unrestricted()
     return _RuntimeSurfaces(**surfaces)
 
 

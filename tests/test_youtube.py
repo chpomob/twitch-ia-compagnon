@@ -70,6 +70,7 @@ from core.actions import AuthorizationRule
 from core.admission import AdmissionScheduler
 from core.context import ChatContext
 from core.contracts import (
+    INPUT_OWNER_NONE,
     ActionCall,
     ActionObservation,
     Destination,
@@ -178,6 +179,7 @@ async def start_harness(
     inserts: tuple[Any, ...] = (),
     deletes: tuple[Any, ...] = (),
     bans: tuple[Any, ...] = (),
+    inputs: dict[str, Any] | None = None,
     **overrides: Any,
 ) -> Harness:
     """Activate ``youtube`` through the real loader, prepare it and start its
@@ -213,9 +215,10 @@ async def start_harness(
         "diagnostic_reporter": diagnostics.append,
     }
     loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
-    (activation,) = await loader.activate_enabled(
-        {"enabled_modules": ["youtube"], "modules": {"youtube": settings}}
-    )
+    config: dict[str, Any] = {"enabled_modules": ["youtube"], "modules": {"youtube": settings}}
+    if inputs is not None:
+        config["inputs"] = inputs
+    (activation,) = await loader.activate_enabled(config)
     module = activation.handle
     if policy is not None:
         registry.configure("youtube", policy)
@@ -1739,3 +1742,198 @@ def test_the_broad_core_scan_names_no_platform_or_vendor() -> None:
     assert _PLATFORM_OR_VENDOR_WORD.search("the Twitch AI companion")
     assert _PLATFORM_OR_VENDOR_WORD.search("OpenAI") and _PLATFORM_OR_VENDOR_WORD.search("gemini")
     assert not _PLATFORM_OR_VENDOR_WORD.search("twitchy anthropics")
+
+
+# -- Phase 5: input ownership of (chat, youtube) (R2, R3; AC12 analogue) -------- #
+
+#: The profile's ``inputs`` block handing (``chat``, youtube) to nobody: this
+#: module no longer owns its pair.
+CHAT_OWNED_ELSEWHERE = {"chat": {"youtube": INPUT_OWNER_NONE}}
+
+
+def test_manifest_declares_its_chat_pair_by_default() -> None:
+    """R2 (plan P9): youtube declares exactly (``chat``, youtube), ``default: true``."""
+
+    manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+    assert manifest["input_families"] == [
+        {"family": "chat", "platforms": ["youtube"], "default": True}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_owning_by_default_the_pollers_start_as_before() -> None:
+    """R2, R3: no ``inputs`` block, youtube owns its pair by default and
+    ``start_inputs`` looks the broadcast up and lists, exactly as before."""
+
+    h = await start_harness(pages=(page(chat_item("m-1", "hello")),))
+    try:
+        await h.drive(0)
+        assert h.api.counts["broadcast_lookup"] == 1
+        assert h.api.counts["list"] >= 1
+        assert len(h.events()) == 1
+        assert h.diagnostics == []
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_owned_elsewhere_polls_nothing_and_keeps_chat_write() -> None:
+    """AC12 analogue (R3): with (``chat``, youtube) not owned,
+    ``start_inputs`` starts no poller — 0 lookups, 0 lists, 0 token refreshes
+    and 0 events however long the clock runs — and says so once, value-free;
+    a second call starts nothing. ``chat.write`` is bound and ready, and a
+    granted call reaches the platform: one broadcast lookup resolves the live
+    chat (no poller does), then one insert; still 0 lists."""
+
+    h = await start_harness(
+        inputs=CHAT_OWNED_ELSEWHERE,
+        pages=(page(chat_item("m-1", "hello")),),
+        inserts=(FakeResponse(200, {"id": "yt-msg-1"}),),
+    )
+    try:
+        await h.module.start_inputs()
+        await h.drive(3600)
+        assert h.api.requests == []
+        assert h.tokens.refreshes == 0
+        assert h.events() == []
+        assert h.diagnostics == ["youtube: chat ingestion owned elsewhere"]
+        assert BASE_SETTINGS["refresh_token"] not in h.diagnostics[0]
+
+        [binding] = h.runtime.actions.bindings(CHAT_WRITE_ACTION)
+        assert binding.destination == Destination("youtube", "*", "chat")
+        assert CHAT_WRITE_ACTION in h.runtime.actions.registered_ready()
+        grant_chat_write(h.runtime)
+        observation = await write(h, "hello from the companion")
+        assert observation.status == "success", observation
+        assert observation.result["message_id"] == "yt-msg-1"
+        assert h.api.counts["broadcast_lookup"] == 1
+        assert h.api.counts["insert"] == 1
+        assert h.api.counts["list"] == 0
+        assert h.events() == []
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_elsewhere_a_send_with_no_active_broadcast_is_no_live_chat() -> None:
+    """R3: owned elsewhere and no active broadcast, the send's lookup finds
+    no live chat: ``error no_live_chat`` with 0 inserts, and the next send
+    looks up again."""
+
+    h = await start_harness(inputs=CHAT_OWNED_ELSEWHERE, broadcasts={})
+    try:
+        grant_chat_write(h.runtime)
+        for expected_lookups in (1, 2):
+            observation = await write(h, "hello")
+            assert observation.status == "error"
+            assert observation.error["code"] == "no_live_chat"
+            assert h.api.counts["broadcast_lookup"] == expected_lookups
+        assert h.api.counts["insert"] == 0
+        assert h.api.counts["list"] == 0
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_elsewhere_an_ended_chat_is_looked_up_again_by_the_next_send() -> None:
+    """R3: no poller notices an ended chat while ingestion is elsewhere, so
+    a send answered 404 forgets the live chat and the next send looks the
+    broadcast up again before its insert."""
+
+    h = await start_harness(
+        inputs=CHAT_OWNED_ELSEWHERE,
+        inserts=(api_error(404, "liveChatNotFound"), FakeResponse(200, {"id": "yt-msg-2"})),
+    )
+    try:
+        grant_chat_write(h.runtime)
+        first = await write(h, "hello")
+        assert first.status == "error" and first.error["code"] == "platform_rejected"
+        assert h.module.live_chat_id(CHANNEL) is None
+        second = await write(h, "hello again")
+        assert second.status == "success", second
+        assert h.api.counts["broadcast_lookup"] == 2
+        assert h.api.counts["insert"] == 2
+        assert h.api.counts["list"] == 0
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "code"),
+    [
+        (FakeResponse(503, {}), "transport_failed"),
+        (OSError("connection reset"), "transport_failed"),
+        (api_error(403, "forbidden"), "platform_rejected"),
+        (api_error(403, "quotaExceeded"), "quota_exhausted"),
+    ],
+)
+async def test_owned_elsewhere_a_failed_send_lookup_is_not_no_live_chat(
+    answer: Any, code: str
+) -> None:
+    """R3: owned elsewhere, a broadcast lookup that failed — lost, 5xx,
+    refused or quota — is its own outcome, never ``no_live_chat`` (which
+    means the lookup answered with no active broadcast). 0 inserts."""
+
+    h = await start_harness(inputs=CHAT_OWNED_ELSEWHERE, lookups=(answer,))
+    try:
+        grant_chat_write(h.runtime)
+        observation = await write(h, "hello")
+        assert observation.status == "error"
+        assert observation.error["code"] == code
+        assert h.api.counts["broadcast_lookup"] == 1
+        assert h.api.counts["insert"] == 0
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_elsewhere_a_timeout_resolves_its_live_chat_itself() -> None:
+    """R3: owned elsewhere no poller resolves the live chat, so a timeout
+    makes one broadcast lookup, then its one ban; a ban answered 404 forgets
+    the chat and the next timeout looks the broadcast up again."""
+
+    h = await start_harness(
+        inputs=CHAT_OWNED_ELSEWHERE,
+        bans=(FakeResponse(200, {"id": "ban-1"}), api_error(404, "liveChatNotFound")),
+    )
+    try:
+        service = h.module.moderation_service
+        first = await service.apply(
+            "timeout", channel_id=CHANNEL, target_author_id=VIEWER, duration_seconds=60
+        )
+        assert first.outcome == "ok"
+        assert (h.api.counts["broadcast_lookup"], h.api.counts["ban"]) == (1, 1)
+        [ban] = [request for request in h.api.requests if request["endpoint"] == "ban"]
+        assert ban["json"]["snippet"]["liveChatId"] == LIVE_CHAT
+        second = await service.apply(
+            "timeout", channel_id=CHANNEL, target_author_id=VIEWER, duration_seconds=60
+        )
+        assert second.outcome == "rejected"
+        assert h.module.live_chat_id(CHANNEL) is None
+        assert h.api.counts["list"] == 0
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_elsewhere_a_timeout_with_no_broadcast_or_failed_lookup_is_rejected() -> None:
+    """R3: owned elsewhere, a timeout whose lookup finds no active broadcast
+    or fails is rejected with 0 bans."""
+
+    h = await start_harness(
+        inputs=CHAT_OWNED_ELSEWHERE, broadcasts={}, lookups=(FakeResponse(503, {}),)
+    )
+    try:
+        service = h.module.moderation_service
+        for expected_lookups in (1, 2):
+            answer = await service.apply(
+                "timeout", channel_id=CHANNEL, target_author_id=VIEWER, duration_seconds=60
+            )
+            assert answer.outcome == "rejected"
+            assert h.api.counts["broadcast_lookup"] == expected_lookups
+        assert h.api.counts["ban"] == 0
+        assert "youtube moderation timeout: refused (transport_failed)" in h.diagnostics
+        assert "youtube moderation timeout: refused (no live chat)" in h.diagnostics
+    finally:
+        await h.close()

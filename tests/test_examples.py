@@ -419,10 +419,11 @@ DECLARATION_KEYS = {
     "watch": {"triggers"},
     # Phase 3 R7 (plans P18, P19): the kick chat input declares its triggers,
     # its credentials and its `chat.write`.
-    "kick": {"triggers", "actions", "credentials"},
+    # Phase 5 R2 (plan P9): kick and youtube declare their chat pair too.
+    "kick": {"triggers", "actions", "credentials", "input_families"},
     # Phase 3 R7 (plans P20, P21): the youtube chat input declares its
     # triggers, its credentials and its `chat.write`.
-    "youtube": {"triggers", "actions", "credentials"},
+    "youtube": {"triggers", "actions", "credentials", "input_families"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -636,6 +637,11 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     assert manifests["twitch"]["input_families"] == [
         {"family": "chat", "platforms": ["twitch"], "default": True}
     ]
+    # Phase 5 R2 (plan P9): kick and youtube likewise, each its own pair.
+    for platform in ("kick", "youtube"):
+        assert manifests[platform]["input_families"] == [
+            {"family": "chat", "platforms": [platform], "default": True}
+        ]
     assert isinstance(manifests["twitch"]["actions"], list) and manifests["twitch"]["actions"]
     # Phase 3 R1 (plan P7, decision 11): the twitch manifest gains the
     # optional `notices` setting and the `event_kind` trigger type; its keys,

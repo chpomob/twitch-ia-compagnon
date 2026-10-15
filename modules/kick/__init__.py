@@ -114,6 +114,7 @@ from core.contracts import (
     Destination,
     SessionKey,
 )
+from core.runtime import OwnedInputs
 from core.timestamps import parse_instant
 from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
 
@@ -267,6 +268,8 @@ REFUSAL_STATUS: Mapping[str, int] = {
 COUNT_INVALID = "invalid"
 COUNT_NOTICES_IGNORED = "notices_ignored"
 COUNT_CHANNEL_IGNORED = "channel_ignored"
+# The input family this module ingests (phase 5 R2), as its manifest declares.
+_CHAT_FAMILY = "chat"
 
 # Badge types mapped to the trusted claim they attest. Only a platform-attested
 # badge becomes a claim; nothing in the message body can (R1, AC4).
@@ -1040,6 +1043,7 @@ class KickModule:
         self._triggers = runtime.triggers
         self._chat = runtime.chat
         self._scheduler = runtime.scheduler
+        self._inputs = runtime.inputs
         self._settings = settings
         self._session = session
         self._reporter = reporter
@@ -1069,7 +1073,8 @@ class KickModule:
         """Delivery refusals — ``too_large``, ``malformed``, ``bad_signature``,
         ``stale_timestamp``, ``duplicate`` — and reception outcomes of accepted
         deliveries: ``invalid`` (an author identifier containing ``:``),
-        ``notices_ignored`` and ``channel_ignored``."""
+        ``notices_ignored`` (an unmapped or unlisted type, or any delivery
+        while (``chat``, kick) is owned elsewhere) and ``channel_ignored``."""
 
         return dict(self._counts)
 
@@ -1178,12 +1183,22 @@ class KickModule:
         return await _read_response(response)
 
     async def start_inputs(self) -> None:
-        """Bind the listener. Only the coordinator, past the barrier, calls this."""
+        """Bind the listener. Only the coordinator, past the barrier, calls this.
+
+        The listener is bound even while (``chat``, kick) is owned elsewhere
+        (phase 5 R3): the platform keeps receiving the success status it gets
+        for an ignored event, so it neither retries nor gives up on the
+        subscription, while :meth:`_handle_delivery` accepts and publishes
+        nothing. One value-free diagnostic says so; ``chat.write`` stays bound
+        and ready from :meth:`prepare`, which never depended on the listener.
+        """
 
         if self._runner is not None or self._stopping or self._closed:
             return
         if not self._prepared:
             raise KickModuleError("kick lifecycle: start_inputs requires prepare")
+        if not self._owns_chat():
+            self._diagnose("kick: chat ingestion owned elsewhere")
         runner = web.AppRunner(
             self.build_application(),
             access_log=None,
@@ -1206,6 +1221,9 @@ class KickModule:
         if addresses:
             self._address = (str(addresses[0][0]), int(addresses[0][1]))
         self._accepting = True
+
+    def _owns_chat(self) -> bool:
+        return bool(self._inputs.owns(_CHAT_FAMILY, PLATFORM))
 
     # -- shutdown phases --------------------------------------------------- #
 
@@ -1515,6 +1533,12 @@ class KickModule:
         now = float(self._clock())
         if abs(now - sent_at) > TIMESTAMP_TOLERANCE_SECONDS:
             return self._refuse(REFUSED_STALE_TIMESTAMP)
+        if not self._owns_chat():
+            # (``chat``, kick) is owned elsewhere (phase 5 R3): an authentic
+            # delivery is neither accepted nor published, and is answered as
+            # an ignored event so the platform does not retry it.
+            self._counts[COUNT_NOTICES_IGNORED] += 1
+            return web.Response(status=200)
         # Checked and recorded with no await in between, so two concurrent
         # redeliveries cannot both pass.
         self._evict_seen(now)
@@ -1785,6 +1809,7 @@ class _RuntimeSurfaces:
     triggers: Any | None
     chat: Any | None
     scheduler: Any | None
+    inputs: Any
 
 
 _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -1796,6 +1821,11 @@ _OPTIONAL_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("triggers", ("evaluate", "recorded")),
     ("chat", ("append",)),
     ("scheduler", ("admit",)),
+    # The pairs this module owns (phase 5 R3). A context built without an
+    # ownership table carries ``OwnedInputs.unrestricted()``; a harness
+    # context without the field is read the same way, so an absent table
+    # means "own everything I declare".
+    ("inputs", ("owns",)),
 )
 
 
@@ -1815,6 +1845,8 @@ def _runtime_surfaces(context: Any) -> _RuntimeSurfaces:
         ):
             raise KickModuleError("kick activation: runtime context is invalid")
         surfaces[name] = value
+    if surfaces["inputs"] is None:
+        surfaces["inputs"] = OwnedInputs.unrestricted()
     return _RuntimeSurfaces(**surfaces)
 
 

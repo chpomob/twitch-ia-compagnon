@@ -19,6 +19,19 @@ produces:
 consumes: []
 middleware: false
 
+# Input ownership (phase 5 R2, R3). This module ingests the (`chat`, kick)
+# pair — messages and every notice kind — and owns it by default. The
+# profile's `inputs` block may hand the pair to another provider; the
+# listener is then still bound (the platform keeps receiving the success
+# status of an ignored event, so it does not retry), but no delivery is
+# accepted or published, while `chat.write` stays bound and ready. Never two
+# providers for one pair.
+input_families:
+  - family: chat
+    platforms:
+      - kick
+    default: true
+
 # Lifecycle role, never the module name, decides what each phase asks of this
 # module (R4). An `input` is a producer: `prepare` binds `chat.write` and reads
 # the platform public key (configured, or fetched once), `start_inputs` binds the listener after

@@ -51,7 +51,14 @@ from conftest import (
 import modules.kick as kick_module
 from core.actions import AuthorizationRule
 from core.context import ChatContext
-from core.contracts import ActionCall, ActionObservation, Destination, TriggerPolicy, TriggerRule
+from core.contracts import (
+    INPUT_OWNER_NONE,
+    ActionCall,
+    ActionObservation,
+    Destination,
+    TriggerPolicy,
+    TriggerRule,
+)
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext
 from core.triggers import TriggerRegistry
@@ -199,7 +206,11 @@ class Harness:
 
 
 async def start_harness(
-    *, policy: TriggerPolicy | None = None, session: PublicKeySession | None = None, **overrides: Any
+    *,
+    policy: TriggerPolicy | None = None,
+    session: PublicKeySession | None = None,
+    inputs: dict[str, Any] | None = None,
+    **overrides: Any,
 ) -> Harness:
     """Activate ``kick`` through the real loader, prepare it, start its
     inputs (listener on loopback, port 0) and open a test client on an
@@ -223,9 +234,10 @@ async def start_harness(
     }
     settings = {key: value for key, value in settings.items() if value is not None}
     loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
-    (activation,) = await loader.activate_enabled(
-        {"enabled_modules": ["kick"], "modules": {"kick": settings}}
-    )
+    config: dict[str, Any] = {"enabled_modules": ["kick"], "modules": {"kick": settings}}
+    if inputs is not None:
+        config["inputs"] = inputs
+    (activation,) = await loader.activate_enabled(config)
     module = activation.handle
     if policy is not None:
         registry.configure("kick", policy)
@@ -1230,3 +1242,72 @@ async def test_each_ban_answer_is_classified_after_one_request(answer: Any, outc
         assert len(session.posts) == 1
     finally:
         await h.close()
+
+
+# -- Phase 5: input ownership of (chat, kick) (R2, R3; AC12 analogue) ----------- #
+
+#: The profile's ``inputs`` block handing (``chat``, kick) to nobody: this
+#: module no longer owns its pair.
+CHAT_OWNED_ELSEWHERE = {"chat": {"kick": INPUT_OWNER_NONE}}
+
+
+def test_manifest_declares_its_chat_pair_by_default() -> None:
+    """R2 (plan P9): kick declares exactly (``chat``, kick), ``default: true``."""
+
+    manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+    assert manifest["input_families"] == [
+        {"family": "chat", "platforms": ["kick"], "default": True}
+    ]
+
+
+async def test_owning_by_default_a_valid_delivery_is_still_published() -> None:
+    """R2, R3: no ``inputs`` block, kick owns its pair by default and a valid
+    delivery is published exactly as before."""
+
+    harness = await start_harness()
+    try:
+        assert await harness.post(CHAT, chat_body(f"hello {COMPANION}", message_id="m-1")) == 200
+        assert len(harness.events()) == 1
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+async def test_chat_owned_elsewhere_publishes_no_delivery_and_keeps_chat_write() -> None:
+    """AC12 analogue (R3): with (``chat``, kick) not owned, the listener is
+    still bound (the platform keeps getting the success status of an ignored
+    event, so it does not retry), but a valid signed chat message and a
+    listed notice are neither accepted nor published: 0 events, 0 admissions,
+    counted as ignored, not recorded in the dedup window. A forged delivery is
+    still refused. ``chat.write`` is bound, ready, and a granted call reaches
+    the chat endpoint once."""
+
+    harness = await start_harness(
+        inputs=CHAT_OWNED_ELSEWHERE,
+        notices={"kinds": ["follow"]},
+        session=PublicKeySession(posts=(sent(),)),
+    )
+    try:
+        assert harness.module.address is not None
+        assert harness.diagnostics == ["kick: chat ingestion owned elsewhere"]
+        assert await harness.post(CHAT, chat_body(f"hello {COMPANION}", message_id="m-1")) == 200
+        follow = {"broadcaster": person(int(CHANNEL)), "follower": person(901)}
+        assert await harness.post("channel.followed", follow) == 200
+        assert harness.events() == []
+        assert harness.scheduler.admissions == []
+        assert not harness.chat.read("kick", CHANNEL, limit=8)
+        assert harness.module.counts["notices_ignored"] == 2
+        assert harness.module.dedup_size == 0
+        assert await harness.post(CHAT, chat_body("forged"), signature="AAAA") == 401
+        assert harness.module.counts["bad_signature"] == 1
+
+        [binding] = harness.runtime.actions.bindings(CHAT_WRITE_ACTION)
+        assert binding.destination == Destination("kick", "*", "chat")
+        assert CHAT_WRITE_ACTION in harness.runtime.actions.registered_ready()
+        grant_chat_write(harness.runtime)
+        observation = await write(harness, "hello from the companion")
+        assert observation.status == "success", observation
+        assert len(chat_posts(harness.session)) == 1
+        assert harness.events() == []
+    finally:
+        await harness.close()

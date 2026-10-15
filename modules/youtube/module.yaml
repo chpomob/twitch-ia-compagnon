@@ -18,6 +18,17 @@ produces:
 consumes: []
 middleware: false
 
+# Input ownership (phase 5 R2, R3). This module ingests the (`chat`, youtube)
+# pair — messages and every notice kind — and owns it by default. The
+# profile's `inputs` block may hand the pair to another provider;
+# `start_inputs` then starts no poller and issues no poll request, while
+# `chat.write` stays bound and ready. Never two providers for one pair.
+input_families:
+  - family: chat
+    platforms:
+      - youtube
+    default: true
+
 # Lifecycle role, never the module name, decides what each phase asks of this
 # module (R4). An `input` is a producer: `prepare` binds `chat.write` and
 # makes no request (an access token is obtained only when a request needs
