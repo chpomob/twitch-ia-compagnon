@@ -36,15 +36,42 @@ connection to ``close``, which fails what is still pending and closes the
 socket within the coordinator's close budget. A cancellation of the owner
 outside shutdown releases the connection and propagates.
 
-Until the allowlist arrives the run provider answers ``refused
-provider_not_ready``; the executor refuses first anyway while the bridge is
-not ready. Nothing here logs: the URL, the password and frame text never
-reach a trace or a diagnostic, only reasons do. No endpoint, port, password,
-version or action name has a default anywhere (R6).
+**The allowlist (R5).** At every successful connection, before readiness,
+the configured allowlist is reconciled against the inventory just read: the
+reachable set is every configured ``action:`` name, plus every instance
+action of a configured ``group:``, that exists exactly once and is enabled,
+and one value-free ``automation.allowlist.reconciled`` trace names the
+entries that reach nothing.
 
-**Seam, for the tests.** ``_sleeper`` (the sleep the backoff waits on,
-``asyncio.sleep`` by default) is read from *settings* at ``activate`` and
-never from a configuration file.
+**The run provider (R4).** It declares nothing emitted first, then decides —
+not allowlisted, missing, ambiguous, disabled, arguments refused by the
+deciding schema — strictly before any frame. A call that passes sends
+exactly one ``DoAction`` frame naming the instance action's *id*, never its
+name. The send is the transmission boundary of D8: in one synchronous
+segment, with no ``await`` before the transport write, the provider checks
+that the frame can be written (the bridge still holds this connection, the
+WebSocket is not closed, the writer is not closing, the protocol's transport
+is present and not closing), marks the call emitted, and hands the frame to
+``ws.send_str`` — whose uncompressed path (``compress=0``) writes before its
+first suspension. A failed check is ``refused provider_not_ready`` with
+nothing sent; anything after the mark is ``external_unknown``. The
+instance's acceptance does not say the action ran, so an acknowledged run is
+``external_unknown`` (``execution_unconfirmed``), an error answer is ``error
+provider_failed`` (``instance_rejected``), and a missing acknowledgement, a
+lost connection or a cancellation after sending is ``external_unknown``
+(``acknowledgement_lost``). Never a success, never a retry.
+
+Nothing here logs: the URL, the password and frame text never reach a trace
+or a diagnostic, only reasons do. No endpoint, port, password, version or
+action name has a default anywhere (R6).
+
+**Seams, for the tests.** ``_sleeper`` (the sleep the backoff and the
+acknowledgement deadline wait on, ``asyncio.sleep`` by default) is read from
+*settings* at ``activate`` and never from a configuration file.
+``AutomationBridge._before_transmit`` is awaited by the run provider after
+every decision and strictly before the transmission segment; by default it
+returns at once. Replacing it makes the interval before the frame leaves
+observable.
 """
 
 from __future__ import annotations
@@ -66,12 +93,19 @@ from urllib.parse import urlsplit
 import aiohttp
 import yaml
 
-from core.actions import ERROR_PROVIDER_NOT_READY
+from core.actions import (
+    ERROR_CANCELLED,
+    ERROR_EXTERNAL_UNKNOWN,
+    ERROR_INVALID_ARGUMENTS,
+    ERROR_PROVIDER_FAILED,
+    ERROR_PROVIDER_NOT_READY,
+)
 from core.contracts import (
     ActionObservation,
     ActionSpec,
     ContractError,
     Destination,
+    validate_against_schema,
     validate_schema,
 )
 
@@ -524,7 +558,9 @@ _STARTUP_ATTEMPT_SECONDS = 10.0
 _REQUEST_HELLO = "Hello"
 _REQUEST_AUTHENTICATE = "Authenticate"
 _REQUEST_GET_ACTIONS = "GetActions"
+_REQUEST_DO_ACTION = "DoAction"
 _STATUS_OK = "ok"
+_STATUS_ERROR = "error"
 
 Sleeper = Callable[[float], Awaitable[Any]]
 
@@ -618,6 +654,33 @@ class _Connection:
     def pending(self) -> int:
         return len(self._pending)
 
+    def new_request_id(self, suffix: str | None = None) -> str:
+        """A request id unique on this connection, optionally tagged."""
+
+        request_id = f"{RUN_PROVIDER}-{next(self._ids)}"
+        return request_id if suffix is None else f"{request_id}.{suffix}"
+
+    def register(self, request_id: str) -> asyncio.Future[Any]:
+        """The future the reader resolves with the answer to *request_id*."""
+
+        answer: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = answer
+        return answer
+
+    def forget(self, request_id: str) -> None:
+        """Stop waiting for *request_id*; a late answer to it is dropped."""
+
+        answer = self._pending.pop(request_id, None)
+        if answer is not None and not answer.done():
+            answer.cancel()
+
+    def abandon(self) -> None:
+        """Give the connection up without a loop turn: fail what waits and
+        mark it lost, so its owner closes it and reports the loss."""
+
+        self.fail_pending()
+        self.lost.set()
+
     async def request(self, frame: Mapping[str, Any], deadline_seconds: float) -> Any:
         """Send *frame* under a fresh id and return its answer.
 
@@ -627,9 +690,8 @@ class _Connection:
 
         if self.lost.is_set() or self.ws.closed:
             raise ConnectionClosed()
-        request_id = f"{RUN_PROVIDER}-{next(self._ids)}"
-        answer: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = answer
+        request_id = self.new_request_id()
+        answer = self.register(request_id)
         try:
             try:
                 await self.ws.send_str(json.dumps({**frame, "id": request_id}))
@@ -690,29 +752,211 @@ class _Connection:
 # --------------------------------------------------------------------------- #
 
 
-class _RunProvider:
-    """The run action's provider until the allowlist arrives (P15).
+#: The trace reconciliation emits at every successful connection (R5).
+TRACE_ALLOWLIST_RECONCILED = "automation.allowlist.reconciled"
 
-    The executor refuses ``provider_not_ready`` first while the bridge is not
-    ready; a call reaching this provider anyway is refused on the same terms,
-    with nothing sent.
+#: The R4 refusal codes the provider decides before any frame.
+ERROR_NOT_ALLOWLISTED = "not_allowlisted"
+ERROR_INSTANCE_ACTION_MISSING = "instance_action_missing"
+ERROR_INSTANCE_ACTION_AMBIGUOUS = "instance_action_ambiguous"
+ERROR_INSTANCE_ACTION_DISABLED = "instance_action_disabled"
+
+#: The R4 causes of the outcomes that follow a sent frame.
+CAUSE_EXECUTION_UNCONFIRMED = "execution_unconfirmed"
+CAUSE_INSTANCE_REJECTED = "instance_rejected"
+CAUSE_ACKNOWLEDGEMENT_LOST = "acknowledgement_lost"
+
+#: What every uncertain outcome says in words (R4).
+UNCERTAINTY_SENTENCE = "the companion does not know whether the action ran"
+
+
+@dataclass(frozen=True, slots=True)
+class AllowlistEntry:
+    """One configured allowlist entry: an action or a group, and its schema.
+
+    ``schema`` is ``None`` when the entry declares no ``arguments`` schema;
+    such an entry accepts only an empty ``arguments`` object (R5).
     """
 
-    __slots__ = ()
+    kind: str
+    name: str
+    schema: Mapping[str, Any] | None
+
+
+def _parse_allowlist(value: Any) -> tuple[AllowlistEntry, ...]:
+    """The validated ``allowlist`` setting as entries, in configured order."""
+
+    entries: list[AllowlistEntry] = []
+    for item in value or ():
+        kind = next(key for key in _ENTRY_KEYS if key in item)
+        entries.append(
+            AllowlistEntry(kind=kind, name=item[kind], schema=item.get(_ENTRY_ARGUMENTS))
+        )
+    return tuple(entries)
+
+
+def _in_group(action: InstanceAction, group: str) -> bool:
+    """Whether the instance files *action* under *group*."""
+
+    return action.group == group
+
+
+def _plain(value: Any) -> Any:
+    """A frozen argument value as plain JSON-serialisable containers."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _run_provenance() -> dict[str, Any]:
+    return {"provider": RUN_PROVIDER, "route": RUN_ACTION}
+
+
+def _refused(code: str, message: str) -> ActionObservation:
+    return ActionObservation(
+        status="refused",
+        provenance=_run_provenance(),
+        error={"code": code, "message": f"{MODULE_NAME}: {message}", "retryable": False},
+    )
+
+
+def _not_ready() -> ActionObservation:
+    return _refused(ERROR_PROVIDER_NOT_READY, "the automation instance is not connected")
+
+
+def _uncertain(cause: str, message: str, *, status: str = "external_unknown") -> ActionObservation:
+    """An outcome after the frame was handed over: never a success (R4).
+
+    *status* is ``external_unknown`` for an outcome the provider settles
+    itself, ``cancelled`` for its interruption record — which the executor
+    resolves to ``external_unknown`` through the emission rule, keeping this
+    cause and message (D8; the clips precedent).
+    """
+
+    return ActionObservation(
+        status=status,
+        provenance=_run_provenance(),
+        error={
+            "code": ERROR_EXTERNAL_UNKNOWN if status == "external_unknown" else ERROR_CANCELLED,
+            "message": f"{MODULE_NAME}: {message}; {UNCERTAINTY_SENTENCE}",
+            "retryable": False,
+            "cause": cause,
+        },
+    )
+
+
+def _acknowledgement_lost(*, cancelled: bool = False) -> ActionObservation:
+    if cancelled:
+        return _uncertain(
+            CAUSE_ACKNOWLEDGEMENT_LOST,
+            "the call was cancelled after the request was sent",
+            status="cancelled",
+        )
+    return _uncertain(
+        CAUSE_ACKNOWLEDGEMENT_LOST,
+        "the request was sent and no acknowledgement arrived",
+    )
+
+
+class _RunProvider:
+    """The run action's provider: the R4 outcome table, one frame at most.
+
+    Every decision is taken before any frame (R5). The transmission segment
+    — the pre-write check, ``mark_emitted()`` and the ``ws.send_str`` call —
+    contains no ``await`` before the transport write (D8); a static test of
+    this method's source keeps it that way.
+    """
+
+    __slots__ = ("_bridge",)
 
     name = RUN_PROVIDER
 
+    def __init__(self, bridge: Any) -> None:
+        self._bridge = bridge
+
     async def invoke(self, invocation: Any) -> ActionObservation:
         invocation.mark_not_emitted()
-        return ActionObservation(
-            status="refused",
-            provenance={"provider": RUN_PROVIDER, "route": RUN_ACTION},
-            error={
-                "code": ERROR_PROVIDER_NOT_READY,
-                "message": f"{MODULE_NAME}: the automation instance is not connected",
-                "retryable": False,
-            },
-        )
+        bridge = self._bridge
+        connection = bridge._connection
+        if connection is None or not bridge.connected:
+            return _not_ready()
+        decided = bridge._decide(invocation.call.arguments)
+        if isinstance(decided, ActionObservation):
+            return decided
+        instance_action, arguments = decided
+        request_id = connection.new_request_id(str(invocation.call.call_id))
+        try:
+            frame = json.dumps(
+                {
+                    "request": _REQUEST_DO_ACTION,
+                    "action": {"id": instance_action.id},
+                    "args": _plain(arguments),
+                    "id": request_id,
+                }
+            )
+        except (TypeError, ValueError):
+            return ActionObservation(
+                status="error",
+                provenance=_run_provenance(),
+                error={
+                    "code": ERROR_INVALID_ARGUMENTS,
+                    "message": f"{MODULE_NAME}: the arguments cannot be serialised",
+                    "retryable": False,
+                },
+            )
+
+        # Before the boundary: a deadline or a cancellation here leaves the
+        # call ``not_emitted``, so the executor reports ``timeout`` or
+        # ``cancelled`` (R4's last row).
+        await bridge._before_transmit()
+
+        sent = False
+        answer: asyncio.Future[Any] | None = None
+        try:
+            # -- the transmission segment (D8): no await before the write -- #
+            if not bridge._writable(connection):
+                bridge._withdraw(connection)
+                return _not_ready()
+            answer = connection.register(request_id)
+            invocation.mark_emitted()
+            sent = True
+            await connection.ws.send_str(frame)
+            # -- the frame was handed to the transport -------------------- #
+            reply = await bridge._acknowledgement(answer)
+        except asyncio.CancelledError:
+            if not sent:
+                raise
+            return _acknowledgement_lost(cancelled=True)
+        except Exception:
+            if not sent:
+                raise
+            return _acknowledgement_lost()
+        finally:
+            if answer is not None:
+                connection.forget(request_id)
+        if not isinstance(reply, Mapping):
+            return _acknowledgement_lost()
+        status = reply.get("status")
+        if status == _STATUS_OK:
+            return _uncertain(
+                CAUSE_EXECUTION_UNCONFIRMED,
+                "the instance accepted the request, which does not confirm that it ran",
+            )
+        if status == _STATUS_ERROR:
+            return ActionObservation(
+                status="error",
+                provenance=_run_provenance(),
+                error={
+                    "code": ERROR_PROVIDER_FAILED,
+                    "message": f"{MODULE_NAME}: the instance answered the request with an error",
+                    "retryable": False,
+                    "cause": CAUSE_INSTANCE_REJECTED,
+                },
+            )
+        return _acknowledgement_lost()
 
 
 class AutomationBridge:
@@ -742,10 +986,12 @@ class AutomationBridge:
         self._connect_seconds = float(deadlines["connect_seconds"])
         self._authentication_seconds = float(deadlines["authentication_seconds"])
         self._request_seconds = float(deadlines["request_seconds"])
+        self._acknowledgement_seconds = float(deadlines[_ACKNOWLEDGEMENT_FIELD])
+        self._allowlist = _parse_allowlist(settings.get(_SETTING_ALLOWLIST))
         reconnect = settings.get(_SETTING_RECONNECT) or {}
         self._min_delay = float(reconnect.get(_MIN_DELAY_FIELD, _DEFAULT_MIN_DELAY_SECONDS))
         self._max_delay = float(reconnect.get(_MAX_DELAY_FIELD, _DEFAULT_MAX_DELAY_SECONDS))
-        self._provider = _RunProvider()
+        self._provider = _RunProvider(self)
         self._session: aiohttp.ClientSession | None = None
         self._connection: _Connection | None = None
         self._owner: asyncio.Task[None] | None = None
@@ -772,6 +1018,167 @@ class AutomationBridge:
         """The inventory read at the last successful connection."""
 
         return self._inventory
+
+    async def _before_transmit(self) -> None:
+        """The test seam before the transmission segment; returns at once."""
+
+    # -- the run provider's decisions and boundary (R4, R5, D8) ------------- #
+
+    def _decide(
+        self, call_arguments: Mapping[str, Any]
+    ) -> ActionObservation | tuple[InstanceAction, Mapping[str, Any]]:
+        """The R4 refusals, in order, before any frame; else the target.
+
+        1. neither an ``action:`` entry nor a matching ``group:`` entry →
+           ``not_allowlisted`` (an empty allowlist refuses everything);
+        2. absent from the inventory → ``instance_action_missing``;
+        3. two or more instance actions of that name → ``ambiguous``;
+        4. disabled → ``instance_action_disabled``;
+        5. the deciding schema refuses the arguments → ``invalid_arguments``:
+           the ``action:`` entry's schema alone when one names the action,
+           otherwise every matching ``group:`` entry's schema.
+        """
+
+        name = call_arguments.get("action")
+        arguments = call_arguments.get("arguments", MappingProxyType({}))
+        candidates = self._inventory.get(name, ()) if isinstance(name, str) else ()
+        named = next(
+            (entry for entry in self._allowlist if entry.kind == "action" and entry.name == name),
+            None,
+        )
+        grouped = [
+            entry
+            for entry in self._allowlist
+            if entry.kind == "group"
+            and any(_in_group(candidate, entry.name) for candidate in candidates)
+        ]
+        if named is None and not grouped:
+            return _refused(ERROR_NOT_ALLOWLISTED, "the action is not in the allowlist")
+        if not candidates:
+            return _refused(
+                ERROR_INSTANCE_ACTION_MISSING, "the instance has no action of that name"
+            )
+        if len(candidates) > 1:
+            return _refused(
+                ERROR_INSTANCE_ACTION_AMBIGUOUS,
+                "the instance has more than one action of that name",
+            )
+        (target,) = candidates
+        if not target.enabled:
+            return _refused(
+                ERROR_INSTANCE_ACTION_DISABLED, "the instance action is disabled"
+            )
+        deciding = (
+            [named]
+            if named is not None
+            else [entry for entry in grouped if _in_group(target, entry.name)]
+        )
+        for entry in deciding:
+            if not _arguments_accepted(arguments, entry.schema):
+                return ActionObservation(
+                    status="error",
+                    provenance=_run_provenance(),
+                    error={
+                        "code": ERROR_INVALID_ARGUMENTS,
+                        "message": (
+                            f"{MODULE_NAME}: the arguments do not satisfy the "
+                            "allowlist entry's schema"
+                        ),
+                        "retryable": False,
+                    },
+                )
+        return target, arguments
+
+    def _writable(self, connection: _Connection) -> bool:
+        """The pre-write check of D8, synchronous.
+
+        Mirrors the installed client's only pre-write failures (the writer's
+        closing flag, the transport closing) and the states they follow
+        from: the bridge still holds *connection*, the WebSocket is not
+        closed, the protocol's transport is present and not closing.
+        """
+
+        ws = connection.ws
+        writer = getattr(ws, "_writer", None)
+        transport = getattr(writer, "transport", None)
+        protocol = getattr(writer, "protocol", None)
+        return (
+            self._connection is connection
+            and self.connected
+            and not ws.closed
+            and writer is not None
+            and not getattr(writer, "_closing", False)
+            and transport is not None
+            and getattr(protocol, "transport", None) is not None
+            and not transport.is_closing()
+        )
+
+    def _withdraw(self, connection: _Connection) -> None:
+        """A connection that cannot be written: not ready at once.
+
+        The connection is abandoned without a loop turn; its owner closes
+        it, reports ``degraded`` and reconnects, as for any loss.
+        """
+
+        if self._connection is connection:
+            self._actions.mark_not_ready()
+            connection.abandon()
+
+    async def _acknowledgement(self, answer: asyncio.Future[Any]) -> Any:
+        """The instance's answer, or ``None`` past the acknowledgement
+        deadline or when the connection ended first (``ConnectionClosed``).
+
+        The deadline runs on the context clock, through the sleeper. The
+        decision is latched when the wait returns: an answer landing while
+        the timer is cleaned up is late, and lost (R4).
+        """
+
+        timer = asyncio.ensure_future(self._pause(self._acknowledgement_seconds))
+        try:
+            done, _ = await asyncio.wait(
+                {answer, timer}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            if not timer.done():
+                timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+        if answer not in done or answer.cancelled() or answer.exception() is not None:
+            return None
+        return answer.result()
+
+    async def _reconcile(self, inventory: Inventory) -> None:
+        """Match the allowlist to *inventory*; one value-free trace (R5).
+
+        An entry is unmatched when it reaches no action that exists exactly
+        once and is enabled; it is named by its configured name only.
+        """
+
+        reachable: set[str] = set()
+        unmatched: dict[str, list[str]] = {key: [] for key in _ENTRY_KEYS}
+        for entry in self._allowlist:
+            if entry.kind == "action":
+                found = [entry.name] if _reachable(inventory.get(entry.name, ())) else []
+            else:
+                found = [
+                    name
+                    for name, actions in inventory.items()
+                    if any(_in_group(action, entry.name) for action in actions)
+                    and _reachable(actions)
+                ]
+            if found:
+                reachable.update(found)
+            else:
+                unmatched[entry.kind].append(entry.name)
+        await self._supervision.emit(
+            TRACE_ALLOWLIST_RECONCILED,
+            {
+                "module": MODULE_NAME,
+                "entries": len(self._allowlist),
+                "reachable": len(reachable),
+                "unmatched_actions": unmatched["action"],
+                "unmatched_groups": unmatched["group"],
+            },
+        )
 
     async def prepare(self) -> None:
         """Bind the run action; the bridge is not ready until connected."""
@@ -917,7 +1324,8 @@ class AutomationBridge:
             return False
         self._inventory = inventory
         self._connection = connection
-        # Reconcile (P15) and subscribe (P16) go here, before readiness.
+        await self._reconcile(inventory)
+        # Subscribe (P16) goes here, before readiness.
         async with self._health:
             self._first_reported = True
             self._actions.mark_ready()
@@ -1025,6 +1433,24 @@ class AutomationBridge:
         del frame
 
 
+def _reachable(actions: Sequence[InstanceAction]) -> bool:
+    """One action of that name, and enabled (R5)."""
+
+    return len(actions) == 1 and actions[0].enabled
+
+
+def _arguments_accepted(arguments: Any, schema: Mapping[str, Any] | None) -> bool:
+    """Whether *arguments* satisfy an entry's schema; no schema accepts ``{}``."""
+
+    if schema is None:
+        return isinstance(arguments, Mapping) and not arguments
+    try:
+        validate_against_schema(arguments, schema, label=_ENTRY_ARGUMENTS)
+    except ContractError:
+        return False
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Activation
 # --------------------------------------------------------------------------- #
@@ -1054,7 +1480,8 @@ async def activate(
             for method in ("register", "mark_ready", "mark_not_ready")
         )
         or not all(
-            callable(getattr(supervision, method, None)) for method in ("ready", "degraded")
+            callable(getattr(supervision, method, None))
+            for method in ("ready", "degraded", "emit")
         )
         or not callable(getattr(tasks, "spawn", None))
         or not callable(getattr(context, "clock", None))
@@ -1075,8 +1502,15 @@ async def activate(
 
 __all__ = [
     "ACKNOWLEDGEMENT_MARGIN_SECONDS",
+    "CAUSE_ACKNOWLEDGEMENT_LOST",
+    "CAUSE_EXECUTION_UNCONFIRMED",
+    "CAUSE_INSTANCE_REJECTED",
     "CHAT_PLATFORMS",
     "DEGRADED_REASONS",
+    "ERROR_INSTANCE_ACTION_AMBIGUOUS",
+    "ERROR_INSTANCE_ACTION_DISABLED",
+    "ERROR_INSTANCE_ACTION_MISSING",
+    "ERROR_NOT_ALLOWLISTED",
     "MANIFEST_PATH",
     "MODULE_NAME",
     "REASON_AUTHENTICATION_FAILED",
@@ -1086,6 +1520,9 @@ __all__ = [
     "REASON_UNREACHABLE",
     "RUN_ACTION",
     "RUN_PROVIDER",
+    "TRACE_ALLOWLIST_RECONCILED",
+    "UNCERTAINTY_SENTENCE",
+    "AllowlistEntry",
     "AutomationBridge",
     "AutomationBridgeError",
     "ConnectionClosed",

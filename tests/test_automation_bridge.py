@@ -16,13 +16,27 @@ and readiness only after the inventory (R6, AC24), the degraded/ready pair
 around a lost connection and the capped backoff on an injected clock (AC25),
 cancellation and shutdown (AC28 connection half), and the password sweep over
 these scenarios (AC23).
+
+Plan step P15 adds the allowlist, its reconciliation and the run provider:
+one test per row of the R4 outcome table (AC16), the late acknowledgement
+(AC17), the allowlist and its argument schemas (R5; AC18, AC19, AC20, AC45),
+authorization first (AC21), the transmission boundary of D8 — before the
+frame left, a pre-write failure, an interruption after the write, the static
+shape of the segment and the canary on the installed client — the in-flight
+run at shutdown (AC28) and the password sweep over the run scenarios (AC23).
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
+import contextlib
 import copy
+import dataclasses
+import inspect
+import itertools
+import textwrap
 import hashlib
 import json
 import logging
@@ -45,11 +59,25 @@ import yaml
 from aiohttp import WSMsgType, web
 
 from core import main as application
-from core.actions import ERROR_PROVIDER_NOT_READY, AuthorizationRule
+from core.actions import (
+    EMISSION_EMITTED,
+    EMISSION_NOT_EMITTED,
+    ERROR_CANCELLED,
+    ERROR_EXTERNAL_UNKNOWN,
+    ERROR_INVALID_ARGUMENTS,
+    ERROR_NOT_AUTHORIZED,
+    ERROR_PROVIDER_FAILED,
+    ERROR_PROVIDER_NOT_READY,
+    ERROR_TIMED_OUT,
+    ActionExecutor,
+    AuthorizationRule,
+)
 from core.contracts import (
+    TRACE_ACTION_COMPLETED,
     TRACE_MODULE_DEGRADED,
     TRACE_MODULE_READY,
     ActionCall,
+    ActionObservation,
     ContractError,
     Destination,
     validate_against_schema,
@@ -554,7 +582,11 @@ async def test_the_loader_activates_the_bridge_and_a_run_is_refused_not_ready() 
         await coordinator.stop()
 
 
-async def test_the_placeholder_provider_answers_provider_not_ready() -> None:
+async def test_the_provider_of_a_disconnected_bridge_answers_provider_not_ready() -> None:
+    """R4 (supersedes P12's placeholder provider, which took no bridge): a
+    call reaching the provider while its bridge holds no connection is
+    declared not emitted first and refused ``provider_not_ready``."""
+
     class _Invocation:
         call = _run_call({"action": "A"})
         emitted: bool | None = None
@@ -562,8 +594,12 @@ async def test_the_placeholder_provider_answers_provider_not_ready() -> None:
         def mark_not_emitted(self) -> None:
             self.emitted = False
 
+    class _Disconnected:
+        _connection = None
+        connected = False
+
     invocation = _Invocation()
-    observation = await streamerbot._RunProvider().invoke(invocation)
+    observation = await streamerbot._RunProvider(_Disconnected()).invoke(invocation)
     assert invocation.emitted is False
     assert observation.status == "refused"
     assert observation.error["code"] == ERROR_PROVIDER_NOT_READY
@@ -1727,3 +1763,868 @@ async def test_a_connection_loss_fails_every_pending_request() -> None:
 def test_the_sleeper_seam_must_be_callable() -> None:
     assert validate_settings(_with(_sleeper=1)) == [_diagnostic("_sleeper", "must be callable")]
     assert validate_settings(_with(_sleeper=asyncio.sleep)) == []
+
+
+# -- P15: the allowlist, reconciliation and the run provider (R4, R5) -------- #
+
+#: The acknowledgement deadline of the run scenarios, on the manual clock.
+ACK_SECONDS = 2.0
+#: The ids of the default inventory's single-named actions (C appears twice).
+INSTANCE_IDS = {
+    entry["name"]: entry["id"]
+    for entry in fixture_frame("get_actions")["actions"]
+    if entry["name"] != "C"
+}
+#: The group the default inventory files ``A`` (and the disabled ``D``) under.
+GROUP_OF_A = "Companion"
+#: AC19's entry schema.
+SCHEMA_N_INTEGER = {
+    "type": "object",
+    "properties": {"n": {"type": "integer"}},
+    "additionalProperties": False,
+}
+#: Every run observation the P15 scenarios produced (AC16's suite-level
+#: assertion: none is a success).
+RUN_OBSERVATIONS: list[ActionObservation] = []
+
+
+class _Gate:
+    """The ``_before_transmit`` seam, blocked until released."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.released = asyncio.Event()
+
+    async def __call__(self) -> None:
+        self.entered.set()
+        await self.released.wait()
+
+
+class _Expiry:
+    """An executor sleeper: its timer fires only when the test says so."""
+
+    def __init__(self) -> None:
+        self.armed = asyncio.Event()
+        self.fired = asyncio.Event()
+
+    async def __call__(self, delay: float) -> None:
+        del delay
+        self.armed.set()
+        await self.fired.wait()
+
+
+class _Runs(_Bridge):
+    """The bridge, connected to *fake*, with run calls and their outcomes."""
+
+    def __init__(self, fake: FakeInstance) -> None:
+        super().__init__()
+        self.fake = fake
+        self._call_ids = itertools.count(1)
+        self._stopped = False
+
+    async def stop(self) -> None:
+        if not self._stopped:
+            self._stopped = True
+            await super().stop()
+
+    def call(self, name: str, arguments: Mapping[str, Any] | None = None) -> ActionCall:
+        payload: dict[str, Any] = {"action": name}
+        if arguments is not None:
+            payload["arguments"] = dict(arguments)
+        return dataclasses.replace(_run_call(payload), call_id=f"call-{next(self._call_ids)}")
+
+    def executor(self, sleeper: Any) -> ActionExecutor:
+        """An executor on the same registry and policy whose own timer is
+        driven by *sleeper* (the default one sleeps in real time)."""
+
+        return ActionExecutor(
+            self.context.actions,
+            self.context.actions._authorization,
+            supervision=self.context.supervision,
+            clock=self.clock,
+            sleeper=sleeper,
+        )
+
+    async def run(self, call: ActionCall, executor: Any = None) -> ActionObservation:
+        target = executor if executor is not None else self.context.executor
+        return self.observed(await asyncio.wait_for(target.invoke(call), FAKE_WAIT_SECONDS))
+
+    def observed(self, observation: ActionObservation | None) -> ActionObservation:
+        """Record a run outcome; no run outcome is ever a success (R4)."""
+
+        assert observation is not None
+        RUN_OBSERVATIONS.append(observation)
+        assert observation.status != "success"
+        assert observation.error is not None and observation.error["retryable"] is False
+        return observation
+
+    def frames(self, call: ActionCall | None = None) -> list[dict[str, Any]]:
+        """The ``DoAction`` request frames the fake received (for *call*)."""
+
+        runs = self.fake.requests("DoAction")
+        if call is None:
+            return runs
+        return [frame for frame in runs if frame["id"].endswith(f".{call.call_id}")]
+
+    def reconciled(self) -> list[Mapping[str, Any]]:
+        return self.records(streamerbot.TRACE_ALLOWLIST_RECONCILED)
+
+    def gate(self) -> _Gate:
+        gate = _Gate()
+        self.handle._before_transmit = gate
+        return gate
+
+
+def _outcome(
+    observation: ActionObservation, status: str, code: str, cause: str | None = None
+) -> None:
+    """Status, code and cause exactly, and never retryable (AC16)."""
+
+    assert observation.status == status, observation
+    assert observation.error is not None
+    assert observation.error["code"] == code, observation.error
+    assert observation.error.get("cause") == cause, observation.error
+    assert observation.error["retryable"] is False
+    if status == "external_unknown":
+        assert streamerbot.UNCERTAINTY_SENTENCE in observation.error["message"]
+
+
+@contextlib.asynccontextmanager
+async def _scenario(
+    caplog: pytest.LogCaptureFixture,
+    *,
+    allowlist: Any = None,
+    faults: Mapping[str, Any] | None = None,
+    grant: bool = True,
+    before_start: Any = None,
+    **settings: Any,
+) -> Any:
+    """A connected bridge against an instance requiring authentication.
+
+    On exit: the bridge is stopped, no ``action.completed`` trace of the run
+    action is a success, and the configured password appears 0 times in any
+    trace, diagnostic or log record (AC23, run scenarios).
+    """
+
+    caplog.set_level(logging.DEBUG)
+    async with FakeInstance(require_authentication=True, **(faults or {})) as fake:
+        runs = _Runs(fake)
+        if allowlist is not None:
+            settings["allowlist"] = allowlist
+        await runs.activate(
+            url=fake.url,
+            password=PASSWORD,
+            deadlines={"acknowledgement_seconds": ACK_SECONDS},
+            reconnect=RECONNECT,
+            **settings,
+        )
+        if before_start is not None:
+            before_start(runs)
+        assert runs.coordinator is not None
+        report = await asyncio.wait_for(runs.coordinator.start(), FAKE_WAIT_SECONDS)
+        assert report.status == 0, report.diagnostics
+        if grant:
+            runs.context.actions._authorization.grant(
+                AuthorizationRule(
+                    rule_id="grant-run",
+                    action_name=RUN_ACTION,
+                    granted_permissions=("automation.run",),
+                )
+            )
+        try:
+            yield runs
+        finally:
+            await runs.stop()
+        completed = [
+            trace["payload"]
+            for trace in runs.traces
+            if trace["type"] == TRACE_ACTION_COMPLETED
+            and trace["payload"].get("action") == RUN_ACTION
+        ]
+        assert all(payload["status"] != "success" for payload in completed)
+        runs.sweep(caplog.text, PASSWORD)
+
+
+# -- AC16: one test per row of the R4 table ---------------------------------- #
+
+
+async def test_ac16_row_not_allowlisted(caplog: pytest.LogCaptureFixture) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        _outcome(await runs.run(runs.call("B")), "refused", "not_allowlisted")
+        assert runs.frames() == []
+
+
+async def test_ac16_row_instance_action_missing(caplog: pytest.LogCaptureFixture) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "E"}]) as runs:
+        _outcome(await runs.run(runs.call("E")), "refused", "instance_action_missing")
+        assert runs.frames() == []
+
+
+async def test_ac16_row_instance_action_ambiguous(caplog: pytest.LogCaptureFixture) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "C"}]) as runs:
+        _outcome(await runs.run(runs.call("C")), "refused", "instance_action_ambiguous")
+        assert runs.frames() == []
+
+
+async def test_ac16_row_instance_action_disabled(caplog: pytest.LogCaptureFixture) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "D"}]) as runs:
+        _outcome(await runs.run(runs.call("D")), "refused", "instance_action_disabled")
+        assert runs.frames() == []
+
+
+async def test_ac16_row_invalid_arguments(caplog: pytest.LogCaptureFixture) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        _outcome(
+            await runs.run(runs.call("A", {"x": 1})), "error", ERROR_INVALID_ARGUMENTS
+        )
+        assert runs.frames() == []
+
+
+async def test_ac16_row_bridge_not_ready(caplog: pytest.LogCaptureFixture) -> None:
+    """The existing executor rule: the provider is never invoked."""
+
+    async with _scenario(
+        caplog, allowlist=[{"action": "A"}], faults={"fail_inventory": True}
+    ) as runs:
+        assert runs.state == "degraded"
+        before = runs.context.executor.provider_invocations
+        _outcome(await runs.run(runs.call("A")), "refused", ERROR_PROVIDER_NOT_READY)
+        assert runs.context.executor.provider_invocations == before
+        assert runs.frames() == []
+
+
+async def test_ac16_row_acknowledged_is_execution_unconfirmed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One frame naming the instance action's *id* (never its name), and the
+    acknowledgement reported as unconfirmed — never a success."""
+
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        call = runs.call("A")
+        observation = await runs.run(call)
+        _outcome(
+            observation, "external_unknown", ERROR_EXTERNAL_UNKNOWN, "execution_unconfirmed"
+        )
+        assert observation.provenance["emission"] == EMISSION_EMITTED
+        (frame,) = runs.frames()
+        assert runs.frames(call) == [frame]
+        assert frame["action"] == {"id": INSTANCE_IDS["A"]}
+        assert frame["args"] == {}
+
+
+async def test_ac16_row_instance_error_answer(caplog: pytest.LogCaptureFixture) -> None:
+    async with _scenario(
+        caplog, allowlist=[{"action": "A"}], faults={"reject_runs": True}
+    ) as runs:
+        _outcome(
+            await runs.run(runs.call("A")), "error", ERROR_PROVIDER_FAILED, "instance_rejected"
+        )
+        assert len(runs.frames()) == 1
+
+
+async def test_ac16_row_no_acknowledgement_before_the_deadline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with _scenario(
+        caplog, allowlist=[{"action": "A"}], faults={"withhold_acknowledgements": True}
+    ) as runs:
+        running = asyncio.ensure_future(runs.context.executor.invoke(runs.call("A")))
+        await _until(lambda: runs.clock.next_deadline() == runs.clock() + ACK_SECONDS)
+        await _until(lambda: len(runs.frames()) == 1)
+        assert not running.done()
+        runs.clock.advance(ACK_SECONDS)
+        observation = runs.observed(await asyncio.wait_for(running, FAKE_WAIT_SECONDS))
+        _outcome(
+            observation, "external_unknown", ERROR_EXTERNAL_UNKNOWN, "acknowledgement_lost"
+        )
+        assert len(runs.frames()) == 1
+
+
+async def test_ac16_row_cancelled_before_the_frame_left(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R4's last row: cancelled while the frame has not left — the existing
+    ``cancelled`` code, no cause, nothing emitted, 0 frames."""
+
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        gate = runs.gate()
+        call = runs.call("A")
+        running = asyncio.ensure_future(runs.context.executor.invoke(call))
+        await asyncio.wait_for(gate.entered.wait(), FAKE_WAIT_SECONDS)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        observation = runs.observed(runs.context.executor.outcome(call.call_id))
+        _outcome(observation, "cancelled", ERROR_CANCELLED)
+        assert observation.provenance["emission"] == EMISSION_NOT_EMITTED
+        assert runs.frames() == []
+
+
+def test_ac16_no_run_observation_is_a_success() -> None:
+    """AC16's suite-level assertion over every outcome the scenarios above
+    recorded (each scenario also checks its own ``action.completed``
+    traces): no run of the action is ever reported a success."""
+
+    assert all(observation.status != "success" for observation in RUN_OBSERVATIONS)
+
+
+# -- AC17: a late acknowledgement --------------------------------------------- #
+
+
+async def test_ac17_a_late_acknowledgement_is_lost_and_never_re_invoked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC17 (R4): the acknowledgement arrives after the deadline — the call
+    is ``acknowledgement_lost``, the late answer changes nothing, the
+    provider is not re-invoked, and the instance received exactly 1 frame
+    for that ``call_id``."""
+
+    async with _scenario(
+        caplog, allowlist=[{"action": "A"}], faults={"hold_acknowledgements": True}
+    ) as runs:
+        executor = runs.context.executor
+        call = runs.call("A")
+        running = asyncio.ensure_future(executor.invoke(call))
+        await _until(lambda: len(runs.frames(call)) == 1)
+        await _until(lambda: runs.clock.next_deadline() is not None)
+        runs.clock.advance(ACK_SECONDS)
+        observation = runs.observed(await asyncio.wait_for(running, FAKE_WAIT_SECONDS))
+        _outcome(
+            observation, "external_unknown", ERROR_EXTERNAL_UNKNOWN, "acknowledgement_lost"
+        )
+        invocations = executor.provider_invocations
+
+        runs.fake.release_acknowledgements()
+        await _until(lambda: not runs.fake._pending)
+        # The reader answers in order: once a later request is answered, the
+        # late acknowledgement has been read (and dropped).
+        connection = runs.handle._connection
+        await connection.request({"request": "GetActions"}, FAKE_WAIT_SECONDS)
+        assert executor.provider_invocations == invocations
+        assert executor.outcome(call.call_id) == observation
+        assert len(runs.frames(call)) == 1
+        assert connection.pending == 0
+
+
+async def test_ac17_an_answer_landing_while_the_timer_is_cleaned_up_is_lost(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC17 (R4): the deadline is latched when the wait returns — an answer
+    resolved during the timer's cleanup is late, never accepted."""
+
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        bridge = runs.handle
+        answer: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        deadline_passed = False
+        gather = asyncio.gather
+
+        def answering_gather(*aws: Any, **kwargs: Any) -> Any:
+            # The timer's cleanup: the acknowledgement arrives just now.
+            if deadline_passed and not answer.done():
+                answer.set_result({"status": "ok"})
+            return gather(*aws, **kwargs)
+
+        monkeypatch.setattr(asyncio, "gather", answering_gather)
+        waiting = asyncio.ensure_future(bridge._acknowledgement(answer))
+        await _until(lambda: runs.clock.next_deadline() is not None)
+        deadline_passed = True
+        runs.clock.advance(ACK_SECONDS)
+        reply = await asyncio.wait_for(waiting, FAKE_WAIT_SECONDS)
+        monkeypatch.undo()
+        assert answer.done()
+        assert reply is None
+
+
+# -- AC18, AC19, AC45, AC20: the allowlist ------------------------------------ #
+
+
+async def test_ac18_only_allowlisted_names_are_reachable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC18 (R5): ``B`` against ``[{action: A}]`` is refused with 0 frames."""
+
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        _outcome(await runs.run(runs.call("B")), "refused", "not_allowlisted")
+        assert runs.frames() == []
+        _outcome(
+            await runs.run(runs.call("A")),
+            "external_unknown",
+            ERROR_EXTERNAL_UNKNOWN,
+            "execution_unconfirmed",
+        )
+        assert len(runs.frames()) == 1
+
+
+@pytest.mark.parametrize("allowlist", [[], None], ids=["empty", "absent"])
+async def test_ac18_an_empty_or_absent_allowlist_refuses_everything(
+    caplog: pytest.LogCaptureFixture, allowlist: Any
+) -> None:
+    async with _scenario(caplog, allowlist=allowlist) as runs:
+        for name in ("A", "B", "C", "D", "E"):
+            _outcome(await runs.run(runs.call(name)), "refused", "not_allowlisted")
+        assert runs.frames() == []
+
+
+async def test_ac18_a_group_entry_reaches_its_actions_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC18 (R5): with ``[{group: G}]``, ``A`` (in G) is reachable and ``B``
+    (not in G) refused."""
+
+    async with _scenario(caplog, allowlist=[{"group": GROUP_OF_A}]) as runs:
+        _outcome(await runs.run(runs.call("B")), "refused", "not_allowlisted")
+        assert runs.frames() == []
+        _outcome(
+            await runs.run(runs.call("A")),
+            "external_unknown",
+            ERROR_EXTERNAL_UNKNOWN,
+            "execution_unconfirmed",
+        )
+        (frame,) = runs.frames()
+        assert frame["action"] == {"id": INSTANCE_IDS["A"]}
+
+
+async def test_ac19_the_entry_schema_decides_the_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC19 (R5): the schema refuses ``{n: "x"}`` and ``{m: 1}`` with 0
+    frames; an entry without ``arguments`` refuses ``{x: 1}`` and accepts
+    ``{}``."""
+
+    allowlist = [{"action": "A", "arguments": SCHEMA_N_INTEGER}, {"action": "B"}]
+    async with _scenario(caplog, allowlist=allowlist) as runs:
+        for arguments in ({"n": "x"}, {"m": 1}):
+            _outcome(
+                await runs.run(runs.call("A", arguments)), "error", ERROR_INVALID_ARGUMENTS
+            )
+        _outcome(await runs.run(runs.call("B", {"x": 1})), "error", ERROR_INVALID_ARGUMENTS)
+        assert runs.frames() == []
+
+        _outcome(
+            await runs.run(runs.call("B", {})),
+            "external_unknown",
+            ERROR_EXTERNAL_UNKNOWN,
+            "execution_unconfirmed",
+        )
+        _outcome(
+            await runs.run(runs.call("A", {"n": 1})),
+            "external_unknown",
+            ERROR_EXTERNAL_UNKNOWN,
+            "execution_unconfirmed",
+        )
+        assert [frame["args"] for frame in runs.frames()] == [{}, {"n": 1}]
+
+
+#: AC45's schemas: S1 accepts ``{n: 1}``, S2 refuses it; both accept ``{m: 2}``.
+SCHEMA_S1 = {"type": "object", "properties": {"n": {"type": "integer"}}}
+SCHEMA_S2 = {
+    "type": "object",
+    "properties": {"n": {"type": "string"}, "m": {"type": "integer"}},
+}
+
+
+async def test_ac45_the_action_entry_beats_the_group_entry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC45 (R5): with ``{action: A, S1}`` and ``{group: G, S2}``, A in G,
+    the action entry alone decides — ``A {n: 1}`` sends 1 frame. Without the
+    action entry, the group's S2 refuses the same run (0 frames)."""
+
+    allowlist = [
+        {"action": "A", "arguments": SCHEMA_S1},
+        {"group": GROUP_OF_A, "arguments": SCHEMA_S2},
+    ]
+    async with _scenario(caplog, allowlist=allowlist) as runs:
+        _outcome(
+            await runs.run(runs.call("A", {"n": 1})),
+            "external_unknown",
+            ERROR_EXTERNAL_UNKNOWN,
+            "execution_unconfirmed",
+        )
+        assert len(runs.frames()) == 1
+    async with _scenario(caplog, allowlist=allowlist[1:]) as runs:
+        _outcome(await runs.run(runs.call("A", {"n": 1})), "error", ERROR_INVALID_ARGUMENTS)
+        assert runs.frames() == []
+
+
+async def test_ac45_every_matching_group_entry_must_accept(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC45 (R5): with ``{group: G, S1}`` and ``{group: H, S2}`` and A in G
+    and H, ``A {n: 1}`` ends ``invalid_arguments`` with 0 frames, and
+    arguments both schemas accept send 1 frame.
+
+    The documented inventory files each action under one group, so the
+    fixture cannot place ``A`` in two; the test widens the bridge's group
+    membership predicate to put ``A`` in both ``G`` and ``H``.
+    """
+
+    def in_g_and_h(runs: _Runs) -> None:
+        def member(action: Any, group: str) -> bool:
+            if action.name == "A":
+                return group in ("G", "H")
+            return action.group == group
+
+        runs.module._in_group = member
+
+    allowlist = [{"group": "G", "arguments": SCHEMA_S1}, {"group": "H", "arguments": SCHEMA_S2}]
+    async with _scenario(caplog, allowlist=allowlist, before_start=in_g_and_h) as runs:
+        try:
+            (reconciled,) = runs.reconciled()
+            assert reconciled["unmatched_groups"] == []
+            _outcome(
+                await runs.run(runs.call("A", {"n": 1})), "error", ERROR_INVALID_ARGUMENTS
+            )
+            assert runs.frames() == []
+            _outcome(
+                await runs.run(runs.call("A", {"m": 2})),
+                "external_unknown",
+                ERROR_EXTERNAL_UNKNOWN,
+                "execution_unconfirmed",
+            )
+            assert [frame["args"] for frame in runs.frames()] == [{"m": 2}]
+        finally:
+            runs.module._in_group = streamerbot._in_group
+
+
+async def test_ac20_reconciliation_names_the_unmatched_entries_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC20 (R5): allowlist {A, C, D, E} against {A, C twice, D disabled}:
+    exactly 1 reconciliation trace naming C, D and E and not A; C, D, E end
+    ambiguous, disabled and missing with 0 frames; A sends exactly 1."""
+
+    allowlist = [{"action": name} for name in ("A", "C", "D", "E")]
+    async with _scenario(caplog, allowlist=allowlist) as runs:
+        (reconciled,) = runs.reconciled()
+        assert reconciled["unmatched_actions"] == ["C", "D", "E"]
+        assert reconciled["unmatched_groups"] == []
+        assert reconciled["reachable"] == 1
+        assert "A" not in repr(reconciled)
+        # Value-free: configured names and counts only.
+        assert set(reconciled) == {
+            "module",
+            "entries",
+            "reachable",
+            "unmatched_actions",
+            "unmatched_groups",
+        }
+        for name, code in (
+            ("C", "instance_action_ambiguous"),
+            ("D", "instance_action_disabled"),
+            ("E", "instance_action_missing"),
+        ):
+            _outcome(await runs.run(runs.call(name)), "refused", code)
+        assert runs.frames() == []
+        _outcome(
+            await runs.run(runs.call("A")),
+            "external_unknown",
+            ERROR_EXTERNAL_UNKNOWN,
+            "execution_unconfirmed",
+        )
+        assert len(runs.frames()) == 1
+
+
+async def test_r5_reconciliation_runs_again_at_every_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R5: a reconnection reconciles again — one more trace — and a group
+    entry reaching nothing is named by its configured name."""
+
+    allowlist = [{"action": "A"}, {"group": "Nowhere"}]
+    async with _scenario(caplog, allowlist=allowlist) as runs:
+        (first,) = runs.reconciled()
+        assert first["unmatched_groups"] == ["Nowhere"]
+        await runs.fake.close_connection()
+        await _until(lambda: runs.state == "degraded")
+        await _until(lambda: runs.clock.next_deadline() is not None)
+        runs.clock.advance(RECONNECT["min_delay_seconds"])
+        await _until(lambda: runs.state == "ready")
+        assert len(runs.reconciled()) == 2
+
+
+# -- AC21: authorization first ------------------------------------------------- #
+
+
+async def test_ac21_a_principal_without_a_rule_is_refused_before_the_provider(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "A"}], grant=False) as runs:
+        before = runs.context.executor.provider_invocations
+        _outcome(await runs.run(runs.call("A")), "refused", ERROR_NOT_AUTHORIZED)
+        assert runs.context.executor.provider_invocations == before
+        assert runs.frames() == []
+
+
+# -- D8: the transmission boundary (finding P6) -------------------------------- #
+
+
+async def test_d8_the_executor_deadline_before_the_frame_left_is_a_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        gate = runs.gate()
+        expiry = _Expiry()
+        observation_task = asyncio.ensure_future(runs.run(runs.call("A"), runs.executor(expiry)))
+        await asyncio.wait_for(gate.entered.wait(), FAKE_WAIT_SECONDS)
+        await asyncio.wait_for(expiry.armed.wait(), FAKE_WAIT_SECONDS)
+        expiry.fired.set()
+        observation = await asyncio.wait_for(observation_task, FAKE_WAIT_SECONDS)
+        _outcome(observation, "timeout", ERROR_TIMED_OUT)
+        assert observation.provenance["emission"] == EMISSION_NOT_EMITTED
+        assert runs.frames() == []
+
+
+async def test_d8_a_connection_closed_before_the_segment_is_provider_not_ready(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        gate = runs.gate()
+        running = asyncio.ensure_future(runs.run(runs.call("A")))
+        await asyncio.wait_for(gate.entered.wait(), FAKE_WAIT_SECONDS)
+        await runs.fake.close_connection()
+        await _until(lambda: not runs.handle.connected)
+        gate.released.set()
+        observation = await asyncio.wait_for(running, FAKE_WAIT_SECONDS)
+        _outcome(observation, "refused", ERROR_PROVIDER_NOT_READY)
+        assert observation.provenance["emission"] == EMISSION_NOT_EMITTED
+        assert runs.frames() == []
+
+
+@pytest.mark.parametrize("fault", ["transport-closed", "is-closing"])
+async def test_d8_a_pre_write_failure_sends_nothing_and_withdraws_readiness(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """Finding P6, round 2: the client's transport becomes closing with no
+    loop turn reaching the bridge, then the hook is released. The pre-write
+    check refuses: ``provider_not_ready``, nothing emitted, 0 frames, and
+    the bridge withdraws readiness at once (then degrades)."""
+
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        gate = runs.gate()
+        call = runs.call("A")
+        running = asyncio.ensure_future(runs.context.executor.invoke(call))
+        await asyncio.wait_for(gate.entered.wait(), FAKE_WAIT_SECONDS)
+        transport = runs.handle._connection.ws._writer.transport
+        if fault == "transport-closed":
+            transport.close()
+        else:
+            monkeypatch.setattr(transport, "is_closing", lambda: True)
+        assert runs.handle.connected and runs.run_ready
+        gate.released.set()  # no await between the fault and the release
+        observation = runs.observed(await asyncio.wait_for(running, FAKE_WAIT_SECONDS))
+        _outcome(observation, "refused", ERROR_PROVIDER_NOT_READY)
+        assert observation.provenance["emission"] == EMISSION_NOT_EMITTED
+        assert not runs.run_ready
+        assert not runs.handle.connected
+        await _until(lambda: runs.state == "degraded")
+        await connection_settled(runs)
+        assert runs.frames() == []
+
+
+async def connection_settled(runs: _Runs) -> None:
+    """Wait for the fake to see the old connection end, so a frame that left
+    would have been recorded by now."""
+
+    await asyncio.wait_for(runs.fake.wait_for_disconnections(1), FAKE_WAIT_SECONDS)
+
+
+async def test_d8_cancelling_after_the_segment_is_acknowledgement_lost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with _scenario(
+        caplog, allowlist=[{"action": "A"}], faults={"withhold_acknowledgements": True}
+    ) as runs:
+        call = runs.call("A")
+        running = asyncio.ensure_future(runs.context.executor.invoke(call))
+        await _until(lambda: len(runs.frames(call)) == 1)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        observation = runs.observed(runs.context.executor.outcome(call.call_id))
+        _outcome(
+            observation, "external_unknown", ERROR_EXTERNAL_UNKNOWN, "acknowledgement_lost"
+        )
+        assert observation.provenance["emission"] == EMISSION_EMITTED
+        assert len(runs.frames()) == 1
+
+
+@pytest.mark.parametrize("interruption", ["cancel", "executor-deadline"])
+async def test_d8_an_interruption_in_the_drain_after_the_write_is_acknowledgement_lost(
+    caplog: pytest.LogCaptureFixture, interruption: str
+) -> None:
+    """Post-write interruption: the protocol's writing is paused and the
+    writer's output pushed over its limit, so ``send_str`` suspends in the
+    drain *after* the write. A cancellation or the executor's deadline there
+    is ``external_unknown`` (``acknowledgement_lost``), emission ``emitted``,
+    and exactly 1 frame reaches the instance once the protocol resumes."""
+
+    async with _scenario(caplog, allowlist=[{"action": "A"}]) as runs:
+        gate = runs.gate()
+        expiry = _Expiry()
+        executor = runs.executor(expiry)
+        call = runs.call("A")
+        running = asyncio.ensure_future(executor.invoke(call))
+        await asyncio.wait_for(gate.entered.wait(), FAKE_WAIT_SECONDS)
+        writer = runs.handle._connection.ws._writer
+        protocol = writer.protocol
+        protocol.pause_writing()
+        writer._output_size = writer._limit
+        gate.released.set()
+        await _until(lambda: protocol._drain_waiter is not None)
+        assert not running.done()
+        if interruption == "cancel":
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+            observation = runs.observed(executor.outcome(call.call_id))
+        else:
+            expiry.fired.set()
+            observation = runs.observed(await asyncio.wait_for(running, FAKE_WAIT_SECONDS))
+        _outcome(
+            observation, "external_unknown", ERROR_EXTERNAL_UNKNOWN, "acknowledgement_lost"
+        )
+        assert observation.provenance["emission"] == EMISSION_EMITTED
+        protocol.resume_writing()
+        await _until(lambda: len(runs.frames(call)) == 1)
+        assert len(runs.frames()) == 1
+
+
+def _invoke_tree() -> ast.AsyncFunctionDef:
+    source = textwrap.dedent(inspect.getsource(streamerbot._RunProvider.invoke))
+    (function,) = ast.parse(source).body
+    assert isinstance(function, ast.AsyncFunctionDef)
+    return function
+
+
+def _calls_named(tree: ast.AST, name: str) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == name
+    ]
+
+
+def test_d8_the_segment_has_no_await_between_the_check_the_mark_and_the_send() -> None:
+    """D8, static: in the provider's source, ``mark_not_emitted()`` is the
+    first statement; the pre-write check comes before ``mark_emitted()``,
+    which comes before ``ws.send_str``; and no ``await`` lies between the
+    check and the send other than the one awaiting ``send_str`` itself."""
+
+    function = _invoke_tree()
+    first = function.body[0]
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+        first = function.body[1]
+    assert isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+    assert first.value.func.attr == "mark_not_emitted"
+    assert not any(
+        isinstance(node, ast.Await)
+        for node in ast.walk(function)
+        if getattr(node, "lineno", first.lineno + 1) <= first.lineno
+    )
+
+    (check,) = _calls_named(function, "_writable")
+    (mark,) = _calls_named(function, "mark_emitted")
+    (send,) = _calls_named(function, "send_str")
+    assert check.lineno < mark.lineno < send.lineno
+    awaits = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Await) and check.lineno <= node.lineno <= send.lineno
+    ]
+    assert [node.value for node in awaits] == [send]
+    (hook,) = _calls_named(function, "_before_transmit")
+    assert hook.lineno < check.lineno
+
+
+def test_d8_canary_the_installed_client_writes_before_its_first_suspension() -> None:
+    """D8 canary on the installed client: in ``WebSocketWriter.send_frame``'s
+    uncompressed branch no ``await`` precedes the ``_write_websocket_frame``
+    call, and the only raises before the transport write — across
+    ``send_frame`` and ``_write_websocket_frame`` — are its two
+    closing-transport checks. If this fails after an upgrade, the bridge
+    must take D8's fallback route: a module-local writer that writes the
+    already-built masked frame synchronously through the protocol transport,
+    then marks."""
+
+    from aiohttp._websocket.writer import WebSocketWriter
+
+    route = "D8 fallback route: module-local synchronous writer"
+
+    def parse(function: Any) -> ast.AST:
+        (tree,) = ast.parse(textwrap.dedent(inspect.getsource(function))).body
+        return tree
+
+    send_frame = parse(WebSocketWriter.send_frame)
+    (write_call,) = _calls_named(send_frame, "_write_websocket_frame")
+    branch = next(
+        node
+        for node in ast.walk(send_frame)
+        if isinstance(node, ast.If)
+        and any(write_call is child for item in node.body for child in ast.walk(item))
+    )
+    before_write = [
+        node
+        for node in ast.walk(send_frame)
+        if getattr(node, "lineno", write_call.lineno) < write_call.lineno
+    ]
+    assert not any(isinstance(node, ast.Await) for node in before_write), route
+    assert not any(isinstance(node, ast.Await) for node in ast.walk(branch.test)), route
+    raises = [node for node in before_write if isinstance(node, ast.Raise)]
+
+    write_frame = parse(WebSocketWriter._write_websocket_frame)
+    transport_writes = [
+        call
+        for call in _calls_named(write_frame, "write")
+        if isinstance(call.func.value, ast.Attribute) and call.func.value.attr == "transport"
+    ]
+    first_write = min(call.lineno for call in transport_writes)
+    raises += [
+        node
+        for node in ast.walk(write_frame)
+        if isinstance(node, ast.Raise) and node.lineno < first_write
+    ]
+    assert not any(isinstance(node, ast.Await) for node in ast.walk(write_frame)), route
+    assert len(raises) == 2, route
+    for node in raises:
+        assert isinstance(node.exc, ast.Call), route
+        assert getattr(node.exc.func, "id", None) == "ClientConnectionResetError", route
+        assert node.exc.args and "closing" in getattr(node.exc.args[0], "value", ""), route
+
+
+def test_d8_the_bridge_connects_without_compression() -> None:
+    """D8: the uncompressed branch is the one the canary pins, so the
+    bridge's single ``ws_connect`` call passes ``compress=0``."""
+
+    tree = ast.parse(Path(streamerbot.__file__).read_text(encoding="utf-8"))
+    (connect,) = _calls_named(tree, "ws_connect")
+    (keyword,) = [item for item in connect.keywords if item.arg == "compress"]
+    assert isinstance(keyword.value, ast.Constant) and keyword.value.value == 0
+
+
+# -- AC28 (in-flight half): a run in flight at shutdown ---------------------- #
+
+
+async def test_ac28_a_run_in_flight_at_shutdown_is_acknowledgement_lost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC28 (R6, moved from P14): a run whose frame was sent and whose
+    acknowledgement is withheld, then the bridge shuts down — the failed
+    request future maps to ``external_unknown`` (``acknowledgement_lost``),
+    with 1 frame."""
+
+    async with _scenario(
+        caplog, allowlist=[{"action": "A"}], faults={"withhold_acknowledgements": True}
+    ) as runs:
+        call = runs.call("A")
+        running = asyncio.ensure_future(runs.context.executor.invoke(call))
+        await _until(lambda: len(runs.frames(call)) == 1)
+        await asyncio.wait_for(runs.stop(), CLOSE_BUDGET_SECONDS)
+        observation = runs.observed(await asyncio.wait_for(running, FAKE_WAIT_SECONDS))
+        _outcome(
+            observation, "external_unknown", ERROR_EXTERNAL_UNKNOWN, "acknowledgement_lost"
+        )
+        assert len(runs.frames()) == 1
+        assert runs.state == "stopped"
