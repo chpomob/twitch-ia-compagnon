@@ -115,6 +115,20 @@ claim, so no audience rule above ``everyone`` is met. Chat events take the
 cue path — dedup, decision, publication, trace, admission — so the engine's
 anti-echo refuses what a companion identity authored.
 
+**Viewers (R7c).** ``prepare`` also registers ``users.read`` with the spec
+read from the ``users`` manifest itself, so the two declarations are equal
+and merge; the runtime binds it only for the (``viewers``, P) pairs this
+module owns. It answers for ``instance_identity.<P>`` only — any other
+channel is ``refused unsupported_destination`` — with one page of the
+instance's active-viewer list of P, fetched within ``request_seconds``:
+at most ``limit`` users, ``coverage.kind: active_viewers``,
+``coverage.complete: false``. The list carries no per-viewer timestamp, so
+``first_seen``, ``last_seen`` and ``freshness.observed_at`` are the fetch
+instant and ``freshness.window_seconds`` is 0. A ``cursor`` pages over the
+same fetched snapshot (the latest per platform, at most
+:data:`VIEWER_SNAPSHOT_MAX_USERS` users) and is refused for another
+destination. A read is never emitted, so its deadline stays ``timeout``.
+
 Nothing here logs: the URL, the password and frame text never reach a trace
 or a diagnostic, only reasons do. No endpoint, port, password, version or
 action name has a default anywhere (R6).
@@ -134,6 +148,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import ipaddress
 import itertools
@@ -144,7 +159,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import aiohttp
 import yaml
@@ -155,10 +170,13 @@ from core.actions import (
     ERROR_INVALID_ARGUMENTS,
     ERROR_PROVIDER_FAILED,
     ERROR_PROVIDER_NOT_READY,
+    ERROR_TIMED_OUT,
+    ERROR_UNSUPPORTED_DESTINATION,
 )
 from core.contracts import (
     CUE_KIND,
     EVENT_KIND_DEFAULT,
+    PART_TYPE_TEXT,
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
     ActionObservation,
@@ -181,6 +199,16 @@ RUN_PROVIDER = "automation-bridge"
 
 MANIFEST_PATH = Path(__file__).with_name("module.yaml")
 
+#: The viewer read this module serves for the (``viewers``, P) pairs it owns
+#: (R7c). Its contract is the ``users`` module's, read from that manifest.
+USERS_READ_ACTION = "users.read"
+USERS_MANIFEST_PATH = MANIFEST_PATH.parent.parent / "users" / "module.yaml"
+#: What the bridge's pages list: the users the instance reports as active.
+COVERAGE_ACTIVE_VIEWERS = "active_viewers"
+#: The most users one fetched snapshot retains; the rest are counted in
+#: ``coverage.evicted``, never kept (bounded retention).
+VIEWER_SNAPSHOT_MAX_USERS = 1000
+
 #: How much of the run action's fixed ``timeout_seconds`` the acknowledgement
 #: deadline must leave free, so the executor's own timeout never pre-empts the
 #: bridge's ``acknowledgement_lost`` cause (R4).
@@ -191,6 +219,7 @@ ACKNOWLEDGEMENT_MARGIN_SECONDS = 1.0
 CHAT_PLATFORMS = ("twitch", "kick", "youtube")
 _CHAT_FAMILY = "chat"
 _CUES_FAMILY = "cues"
+_VIEWERS_FAMILY = "viewers"
 
 _SCHEME_PLAIN = "ws"
 _SCHEME_TLS = "wss"
@@ -543,12 +572,42 @@ def _is_loopback(host: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def _declared_run_entry() -> Mapping[str, Any]:
-    manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+def _declared_entry(path: Path, name: str) -> Mapping[str, Any]:
+    manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
     return next(
         item
         for item in manifest["actions"]
-        if isinstance(item, Mapping) and item.get("name") == RUN_ACTION
+        if isinstance(item, Mapping) and item.get("name") == name
+    )
+
+
+def _declared_run_entry() -> Mapping[str, Any]:
+    return _declared_entry(MANIFEST_PATH, RUN_ACTION)
+
+
+def _spec_from_entry(entry: Mapping[str, Any]) -> ActionSpec:
+    """One manifest ``actions`` entry as the :class:`ActionSpec` it declares."""
+
+    return ActionSpec(
+        name=entry["name"],
+        version=entry["version"],
+        description=entry["description"],
+        argument_schema=entry["argument_schema"],
+        result_schema=entry["result_schema"],
+        nature=entry["nature"],
+        required_permissions=tuple(entry.get("required_permissions", ())),
+        supported_destinations=tuple(
+            Destination(
+                platform=item.get("platform"),
+                channel_id=item.get("channel_id"),
+                scope=item.get("scope"),
+            )
+            for item in entry["supported_destinations"]
+        ),
+        timeout_seconds=entry["timeout_seconds"],
+        idempotency=entry["idempotency"],
+        delivery=entry.get("delivery"),
+        model_proposable=entry.get("model_proposable", False),
     )
 
 
@@ -567,31 +626,27 @@ def declared_run_spec() -> ActionSpec:
     """
 
     try:
-        entry = _declared_run_entry()
-        return ActionSpec(
-            name=entry["name"],
-            version=entry["version"],
-            description=entry["description"],
-            argument_schema=entry["argument_schema"],
-            result_schema=entry["result_schema"],
-            nature=entry["nature"],
-            required_permissions=tuple(entry.get("required_permissions", ())),
-            supported_destinations=tuple(
-                Destination(
-                    platform=item.get("platform"),
-                    channel_id=item.get("channel_id"),
-                    scope=item.get("scope"),
-                )
-                for item in entry["supported_destinations"]
-            ),
-            timeout_seconds=entry["timeout_seconds"],
-            idempotency=entry["idempotency"],
-            delivery=entry.get("delivery"),
-            model_proposable=entry.get("model_proposable", False),
-        )
+        return _spec_from_entry(_declared_run_entry())
     except Exception:
         raise AutomationBridgeError(
             f"{MODULE_NAME} prepare: manifest declaration of {RUN_ACTION!r} is invalid"
+        ) from None
+
+
+def declared_users_read_spec() -> ActionSpec:
+    """Build ``users.read`` from the ``users`` manifest itself (R7c).
+
+    The action is shared: the ``users`` module declares it from the same
+    file, so the two specs are equal field for field and the registry merges
+    the second declaration instead of refusing it. Nothing of the contract is
+    copied here.
+    """
+
+    try:
+        return _spec_from_entry(_declared_entry(USERS_MANIFEST_PATH, USERS_READ_ACTION))
+    except Exception:
+        raise AutomationBridgeError(
+            f"{MODULE_NAME} prepare: manifest declaration of {USERS_READ_ACTION!r} is invalid"
         ) from None
 
 
@@ -638,6 +693,7 @@ _REQUEST_AUTHENTICATE = "Authenticate"
 _REQUEST_GET_ACTIONS = "GetActions"
 _REQUEST_DO_ACTION = "DoAction"
 _REQUEST_SUBSCRIBE = "Subscribe"
+_REQUEST_GET_ACTIVE_VIEWERS = "GetActiveViewers"
 _STATUS_OK = "ok"
 _STATUS_ERROR = "error"
 
@@ -1432,6 +1488,305 @@ class _RunProvider:
         return _acknowledgement_lost()
 
 
+# --------------------------------------------------------------------------- #
+# The viewer read (R7c)
+# --------------------------------------------------------------------------- #
+
+#: The page size bounds of the shared ``users.read`` argument schema.
+VIEWERS_MIN_LIMIT = 1
+VIEWERS_MAX_LIMIT = 100
+#: The tag that tells this module's cursors from every other.
+_VIEWER_CURSOR_TAG = "active"
+_VIEWER_CURSOR_SEPARATOR = "/"
+_EMPTY_VIEWER_PAGE = "(no active viewers)"
+
+
+@dataclass(frozen=True, slots=True)
+class _ViewerSnapshot:
+    """One fetched active-viewer list of one destination.
+
+    Every user carries the fetch instant as ``first_seen`` and ``last_seen``:
+    the instance's list has no per-viewer timestamp the runtime clock could
+    read, so the page states the instant the list was true at, and nothing
+    older. ``evicted`` counts the users past :data:`VIEWER_SNAPSHOT_MAX_USERS`.
+    """
+
+    serial: int
+    platform: str
+    channel_id: str
+    fetched_at: float
+    users: tuple[Mapping[str, Any], ...]
+    evicted: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ViewerCursor:
+    """A position in one snapshot: the destination, the snapshot, the offset."""
+
+    platform: str
+    channel_id: str
+    serial: int
+    offset: int
+
+    def encode(self) -> str:
+        raw = _VIEWER_CURSOR_SEPARATOR.join(
+            quote(field, safe="")
+            for field in (
+                _VIEWER_CURSOR_TAG,
+                self.platform,
+                self.channel_id,
+                str(self.serial),
+                str(self.offset),
+            )
+        )
+        return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+    @classmethod
+    def decode(cls, value: Any) -> "_ViewerCursor | None":
+        """Decode *value*; ``None`` when it is not a cursor this module minted."""
+
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            raw = base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
+        except (ValueError, binascii.Error, UnicodeError):
+            return None
+        fields = [unquote(field) for field in raw.split(_VIEWER_CURSOR_SEPARATOR)]
+        if len(fields) != 5 or fields[0] != _VIEWER_CURSOR_TAG:
+            return None
+        _, platform, channel_id, serial, offset = fields
+        if not (platform and channel_id and serial.isdigit() and offset.isdigit()):
+            return None
+        return cls(platform=platform, channel_id=channel_id, serial=int(serial), offset=int(offset))
+
+
+def _active_viewers(
+    answer: Any, platform: str, fetched_at: float
+) -> tuple[tuple[Mapping[str, Any], ...], int] | None:
+    """The users of a ``GetActiveViewers`` answer on *platform*, and how many
+    were left out past the bound; ``None`` when the answer is not usable.
+
+    The request takes no documented platform parameter: each viewer carries
+    its platform in ``type``, compared without case (the trial confirms the
+    spelling). The order is the instance's; a repeated id is kept once. A
+    viewer without an id is skipped. Role claims are not reported: a page
+    carries ``roles`` only with an attestation, and the instance's roles are
+    not one.
+    """
+
+    if not isinstance(answer, Mapping) or answer.get("status") != _STATUS_OK:
+        return None
+    viewers = answer.get("viewers")
+    if not isinstance(viewers, list):
+        return None
+    users: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    evicted = 0
+    for viewer in viewers:
+        if not isinstance(viewer, Mapping):
+            continue
+        kind = viewer.get("type")
+        if not isinstance(kind, str) or kind.lower() != platform:
+            continue
+        user_id = _identifier(viewer.get("id"))
+        if user_id is None or user_id in seen:
+            continue
+        seen.add(user_id)
+        if len(users) >= VIEWER_SNAPSHOT_MAX_USERS:
+            evicted += 1
+            continue
+        display = next(
+            (
+                value
+                for value in (viewer.get("display"), viewer.get("login"))
+                if _is_text(value)
+            ),
+            user_id,
+        )
+        users.append(
+            MappingProxyType(
+                {
+                    "user_id": user_id,
+                    "display_name": display,
+                    "first_seen": fetched_at,
+                    "last_seen": fetched_at,
+                }
+            )
+        )
+    return tuple(users), evicted
+
+
+def render_viewer_page(users: Sequence[Mapping[str, Any]], page: Mapping[str, Any]) -> str:
+    """One page as the one ``text`` part of a read: one line per user, then
+    whether more follow, so the model knows the page is a cut of the users
+    the instance reports as active, never the audience."""
+
+    lines = [
+        f"{user['display_name']} <{user['user_id']}> active at {float(user['last_seen']):.3f}"
+        for user in users
+    ]
+    if not lines:
+        lines.append(_EMPTY_VIEWER_PAGE)
+    more = "more follow" if page["has_more"] else "no more"
+    lines.append(f"page: {page['returned']} returned, {more}")
+    return "\n".join(lines)
+
+
+class _ViewersProvider:
+    """The bridge's ``users.read`` provider (R7c).
+
+    Bound by the runtime only where this module owns (``viewers``, P). It
+    answers for one channel per platform — ``instance_identity.<P>``, the
+    broadcaster the instance runs for — and refuses any other one
+    ``unsupported_destination``. A first page fetches the instance's
+    active-viewer list once, within ``request_seconds``; a ``cursor`` pages
+    over that same snapshot without another request. Each destination keeps
+    only its latest snapshot, so a cursor into an older one is refused.
+    Reading has no external effect: the call is declared not emitted, so a
+    deadline stays ``timeout``.
+    """
+
+    __slots__ = ("_bridge",)
+
+    name = RUN_PROVIDER
+
+    def __init__(self, bridge: Any) -> None:
+        self._bridge = bridge
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        invocation.mark_not_emitted()
+        bridge = self._bridge
+        destination = invocation.call.destination
+        platform, channel_id = destination.platform, destination.channel_id
+        provenance = {
+            "provider": RUN_PROVIDER,
+            "platform": platform,
+            "channel_id": channel_id,
+            "route": USERS_READ_ACTION,
+        }
+
+        def outcome(status: str, code: str, message: str) -> ActionObservation:
+            return ActionObservation(
+                status=status,
+                provenance=provenance,
+                error={"code": code, "message": f"{MODULE_NAME}: {message}", "retryable": False},
+            )
+
+        connection = bridge._connection
+        if connection is None or not bridge.connected:
+            return outcome(
+                "refused", ERROR_PROVIDER_NOT_READY, "the automation instance is not connected"
+            )
+        if (
+            not bridge._owns(_VIEWERS_FAMILY, platform)
+            or bridge._instance_identity.get(platform) != channel_id
+        ):
+            return outcome(
+                "refused",
+                ERROR_UNSUPPORTED_DESTINATION,
+                "the instance reports active viewers for its broadcaster's channel only",
+            )
+        arguments = invocation.call.arguments
+        limit = arguments.get("limit")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not VIEWERS_MIN_LIMIT <= limit <= VIEWERS_MAX_LIMIT
+        ):
+            return outcome(
+                "error",
+                ERROR_INVALID_ARGUMENTS,
+                f"limit must be an integer between {VIEWERS_MIN_LIMIT} and {VIEWERS_MAX_LIMIT}",
+            )
+
+        if arguments.get("cursor") is not None:
+            cursor = _ViewerCursor.decode(arguments["cursor"])
+            if cursor is None:
+                return outcome(
+                    "error", ERROR_INVALID_ARGUMENTS, "cursor is not one this action issued"
+                )
+            if (cursor.platform, cursor.channel_id) != (platform, channel_id):
+                return outcome(
+                    "error", ERROR_INVALID_ARGUMENTS, "cursor was issued for another destination"
+                )
+            snapshot = bridge._viewer_snapshots.get(platform)
+            if snapshot is None or snapshot.serial != cursor.serial:
+                return outcome(
+                    "error",
+                    ERROR_INVALID_ARGUMENTS,
+                    "cursor belongs to a viewer list that was read again since",
+                )
+            offset = cursor.offset
+        else:
+            try:
+                answer = await connection.request(
+                    {"request": _REQUEST_GET_ACTIVE_VIEWERS}, bridge._request_seconds
+                )
+            except ConnectionClosed:
+                return outcome(
+                    "refused",
+                    ERROR_PROVIDER_NOT_READY,
+                    "the connection to the instance ended before the viewer list arrived",
+                )
+            except asyncio.TimeoutError:
+                return outcome(
+                    "timeout",
+                    ERROR_TIMED_OUT,
+                    "the instance did not answer the viewer read within its deadline",
+                )
+            fetched_at = float(bridge._clock())
+            parsed = _active_viewers(answer, platform, fetched_at)
+            if parsed is None:
+                return outcome(
+                    "error",
+                    ERROR_PROVIDER_FAILED,
+                    "the instance's answer to the viewer read is not a viewer list",
+                )
+            users, evicted = parsed
+            snapshot = _ViewerSnapshot(
+                serial=next(bridge._viewer_serials),
+                platform=platform,
+                channel_id=channel_id,
+                fetched_at=fetched_at,
+                users=users,
+                evicted=evicted,
+            )
+            bridge._viewer_snapshots[platform] = snapshot
+            offset = 0
+
+        selected = [dict(user) for user in snapshot.users[offset : offset + limit]]
+        has_more = offset + limit < len(snapshot.users)
+        page = {
+            "returned": len(selected),
+            "has_more": has_more,
+            "next_cursor": (
+                _ViewerCursor(platform, channel_id, snapshot.serial, offset + limit).encode()
+                if has_more
+                else None
+            ),
+        }
+        result = {
+            "users": selected,
+            "page": page,
+            # The list is true at the fetch instant and no longer: a user
+            # stays listed for no time after it, hence a zero window.
+            "freshness": {"observed_at": snapshot.fetched_at, "window_seconds": 0.0},
+            "coverage": {
+                "kind": COVERAGE_ACTIVE_VIEWERS,
+                # The instance's active viewers are never the whole audience.
+                "complete": False,
+                "retained_users": len(snapshot.users),
+                "evicted": snapshot.evicted,
+            },
+        }
+        return ActionObservation(
+            status="success",
+            provenance=provenance,
+            result=result,
+            parts=({"type": PART_TYPE_TEXT, "text": render_viewer_page(selected, page)},),
+        )
+
+
 class AutomationBridge:
     """The v2 handle: one connection, its readiness and its reconnection.
 
@@ -1465,6 +1820,10 @@ class AutomationBridge:
         self._min_delay = float(reconnect.get(_MIN_DELAY_FIELD, _DEFAULT_MIN_DELAY_SECONDS))
         self._max_delay = float(reconnect.get(_MAX_DELAY_FIELD, _DEFAULT_MAX_DELAY_SECONDS))
         self._provider = _RunProvider(self)
+        self._viewers = _ViewersProvider(self)
+        #: The latest active-viewer snapshot per owned platform (R7c).
+        self._viewer_snapshots: dict[str, _ViewerSnapshot] = {}
+        self._viewer_serials = itertools.count(1)
         self._bus = getattr(context, "bus", None)
         self._triggers = getattr(context, "triggers", None)
         self._inputs = getattr(context, "inputs", None)
@@ -1882,13 +2241,18 @@ class AutomationBridge:
         )
 
     async def prepare(self) -> None:
-        """Bind the run action; the bridge is not ready until connected."""
+        """Bind the run action and the owned viewer reads; the bridge is not
+        ready until connected."""
 
         if self._prepared or self._closed:
             return
         spec = declared_run_spec()
+        viewers = declared_users_read_spec()
         try:
             self._actions.register(spec, self._provider, provider_name=RUN_PROVIDER)
+            # The runtime binds the shared viewer read only where this module
+            # owns (``viewers``, P), and only declares it otherwise (R3, D5).
+            self._actions.register(viewers, self._viewers, provider_name=RUN_PROVIDER)
         except Exception:
             raise AutomationBridgeError(
                 f"{MODULE_NAME} prepare: action binding failed"
@@ -1946,6 +2310,7 @@ class AutomationBridge:
             self._actions.mark_not_ready()
         await self._stop_owner()
         await self._stop_consumer()
+        self._viewer_snapshots.clear()
         connection, self._connection = self._connection, None
         try:
             if connection is not None:
@@ -2228,6 +2593,7 @@ __all__ = [
     "CAUSE_EXECUTION_UNCONFIRMED",
     "CAUSE_INSTANCE_REJECTED",
     "CHAT_PLATFORMS",
+    "COVERAGE_ACTIVE_VIEWERS",
     "CUE_ID_MAX_CHARACTERS",
     "CUE_TEXT_MAX_CODE_POINTS",
     "DEGRADED_REASONS",
@@ -2247,6 +2613,9 @@ __all__ = [
     "RUN_PROVIDER",
     "TRACE_ALLOWLIST_RECONCILED",
     "UNCERTAINTY_SENTENCE",
+    "USERS_MANIFEST_PATH",
+    "USERS_READ_ACTION",
+    "VIEWER_SNAPSHOT_MAX_USERS",
     "AllowlistEntry",
     "AutomationBridge",
     "AutomationBridgeError",
@@ -2256,6 +2625,8 @@ __all__ = [
     "authentication_response",
     "cue_event",
     "declared_run_spec",
+    "declared_users_read_spec",
+    "render_viewer_page",
     "run_action_timeout_seconds",
     "subscription_events",
     "validate_settings",

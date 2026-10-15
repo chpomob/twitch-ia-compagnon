@@ -2017,3 +2017,89 @@ def test_the_registration_names_no_vendor_and_no_platform() -> None:
     assert _VENDOR_OR_BRIDGE.findall(section) == []
     for platform in ("twitch", "kick", "youtube"):
         assert platform not in section.lower(), platform
+
+
+# --------------------------------------------------------------------------- #
+# P18: AC14 with the real modules — `users` and the bridge share the read
+# --------------------------------------------------------------------------- #
+
+from test_automation_bridge import (  # noqa: E402
+    FAKE_WAIT_SECONDS,
+    PRINCIPAL,
+    VIEWER_IDENTITY,
+    FakeInstance,
+    _Runs,
+    _users_read_call,
+)
+
+_BRIDGE = "streamerbot"
+_USERS_SETTINGS = {"max_channels": 4, "max_users_per_channel": 8, "max_age_seconds": 600.0}
+
+
+@pytest.mark.asyncio
+async def test_ac14_the_real_users_and_bridge_split_the_viewer_read() -> None:
+    """AC14 (R3), real modules: ``users`` and the bridge enabled with
+    ``inputs: {viewers: {twitch: <bridge>}}`` prepare without an
+    ``AmbiguousBindingError``; a twitch ``users.read`` reaches the bridge's
+    provider and a kick one the ``users`` provider — 1 invocation each, 0 of
+    the other. The ``users`` page still reports ``observed_authors``."""
+
+    async with FakeInstance() as fake:
+        runs = _Runs(fake)
+        await runs.start(
+            url=fake.url,
+            inputs={"viewers": {"twitch": _BRIDGE}},
+            instance_identity=VIEWER_IDENTITY,
+            modules={"users": _USERS_SETTINGS},
+        )
+        try:
+            bindings = runs.context.actions.bindings(_GATED)
+            assert sorted(
+                (binding.module, binding.destination.platform, binding.excluded_platforms)
+                for binding in bindings
+            ) == [
+                (_BRIDGE, "twitch", frozenset()),
+                ("users", WILDCARD, frozenset({"twitch"})),
+            ]
+            runs.context.actions._authorization.grant(
+                AuthorizationRule(
+                    rule_id="read",
+                    action_name=_GATED,
+                    destination=_ANY_CHAT,
+                    principals=(PRINCIPAL,),
+                    natures=("read",),
+                    granted_permissions=("users.read",),
+                )
+            )
+            executor = runs.context.executor
+
+            async def read(platform: str) -> ActionObservation:
+                before = executor.provider_invocations
+                observation = await asyncio.wait_for(
+                    executor.invoke(
+                        _users_read_call(
+                            {"limit": 10},
+                            platform=platform,
+                            channel_id=VIEWER_IDENTITY[platform],
+                            call_id=f"call-{platform}",
+                        )
+                    ),
+                    FAKE_WAIT_SECONDS,
+                )
+                assert executor.provider_invocations - before == 1
+                return observation
+
+            twitch = await read("twitch")
+            assert twitch.status == "success", twitch
+            assert twitch.provenance["provider"] == "automation-bridge"
+            assert twitch.result["coverage"]["kind"] == "active_viewers"
+            assert len(fake.requests("GetActiveViewers")) == 1
+
+            kick = await read("kick")
+            assert kick.status == "success", kick
+            assert kick.provenance["provider"] == "users-directory"
+            assert kick.result["coverage"]["kind"] == "observed_authors"
+            # The kick read never reached the bridge.
+            assert len(fake.requests("GetActiveViewers")) == 1
+        finally:
+            await runs.stop()

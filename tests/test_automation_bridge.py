@@ -40,6 +40,15 @@ payload — and an unmapped type is dropped and counted (AC43); instance roles
 satisfy an audience rule only under ``trust_instance_roles`` (AC32); and the
 companion identity is required by ``--check-config`` and enforced by the
 engine on a mapped chat event (AC33).
+
+Plan step P18 adds the bridge's ``users.read`` (R7c): its spec equals the
+``users`` module's, read from that manifest; owning (``viewers``, twitch), a
+read at ``instance_identity.twitch`` answers one page of the instance's
+active viewers that validates against the shared result schema, with
+``active_viewers``, ``complete: false`` and at most ``limit`` users, and a
+cursor pages over the same fetched list; another channel is ``refused
+unsupported_destination`` (AC34); a withheld answer stays ``timeout``; and
+AC3's ``users.read`` half (finding P3).
 """
 
 from __future__ import annotations
@@ -896,7 +905,8 @@ class FakeInstance:
     - ``reject_runs`` answers ``DoAction`` with the error frame;
     - ``hold_acknowledgements`` delays every ``DoAction`` answer until
       :meth:`release_acknowledgements`;
-    - ``withhold_acknowledgements`` never answers ``DoAction``.
+    - ``withhold_acknowledgements`` never answers ``DoAction``;
+    - ``withhold_viewers`` never answers ``GetActiveViewers``.
 
     :meth:`close_connection` closes the current socket, :meth:`push_events`
     sends one fixture event N times, :meth:`stop` shuts the server down. A
@@ -915,6 +925,7 @@ class FakeInstance:
         reject_runs: bool = False,
         hold_acknowledgements: bool = False,
         withhold_acknowledgements: bool = False,
+        withhold_viewers: bool = False,
     ) -> None:
         self.require_authentication = require_authentication
         self.refuse_authentication = refuse_authentication
@@ -925,6 +936,7 @@ class FakeInstance:
         self.reject_runs = reject_runs
         self.hold_acknowledgements = hold_acknowledgements
         self.withhold_acknowledgements = withhold_acknowledgements
+        self.withhold_viewers = withhold_viewers
         #: Every received frame, in arrival order (a non-JSON text as ``str``).
         self.received: list[Any] = []
         #: Every received frame carrying an ``id``, by that id.
@@ -1070,6 +1082,8 @@ class FakeInstance:
             reply = fixture_frame("subscribe")
             reply["events"] = copy.deepcopy(frame.get("events"))
         elif name == "GetActiveViewers":
+            if self.withhold_viewers:
+                return
             reply = fixture_frame("active_viewers")
         elif name == "DoAction":
             if self.withhold_acknowledgements:
@@ -1282,13 +1296,19 @@ class _Bridge:
         *,
         inputs: Mapping[str, Any] | None = None,
         triggers: Mapping[str, Any] | None = None,
+        modules: Mapping[str, Mapping[str, Any]] | None = None,
         **settings: Any,
     ) -> None:
+        """Activate the bridge with *settings*, after the other *modules*
+        (name → settings) when any are given."""
+
         loader = ModuleLoader(self.context.bus, ROOT / "modules", context=self.context, environ={})
+        others = dict(modules or {})
         config: dict[str, Any] = {
-            "enabled_modules": [MODULE_NAME],
+            "enabled_modules": [*others, MODULE_NAME],
             "modules": {
-                MODULE_NAME: {**BASE_SETTINGS, "_sleeper": self.sleeper, **settings}
+                **{name: dict(values) for name, values in others.items()},
+                MODULE_NAME: {**BASE_SETTINGS, "_sleeper": self.sleeper, **settings},
             },
         }
         if inputs is not None:
@@ -1296,8 +1316,9 @@ class _Bridge:
         if triggers is not None:
             config["triggers"] = triggers
         activations = await loader.activate_enabled(config)
-        (activation,) = activations
-        self.handle = activation.handle
+        self.handle = next(
+            activation.handle for activation in activations if activation.name == MODULE_NAME
+        )
         self.coordinator = PhaseCoordinator(
             activations,
             tasks=self.context.tasks,
@@ -1382,24 +1403,69 @@ def _grant(destination: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
-#: AC3's calls, one per action the bridge serves while unreachable. P18 adds
-#: the ``users.read`` half here (finding P3).
+def _users_read_call(
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    platform: str = "twitch",
+    channel_id: str = "channel-1",
+    call_id: str = "call-1",
+) -> ActionCall:
+    return ActionCall(
+        action_name=streamerbot.USERS_READ_ACTION,
+        action_version=1,
+        arguments=dict(arguments if arguments is not None else {"limit": 10}),
+        conversation_id="conversation-1",
+        run_id="run-1",
+        call_id=call_id,
+        source_event_id="source-1",
+        destination=Destination(platform, channel_id, "chat"),
+        principal=PRINCIPAL,
+        deadline=10_000.0,
+        message_id="source-1",
+    )
+
+
+def _users_read_grant() -> dict[str, Any]:
+    return {
+        "rule_id": "grant-users-read",
+        "action_name": streamerbot.USERS_READ_ACTION,
+        "destination": {"platform": "*", "channel_id": "*", "scope": "chat"},
+        "principals": [PRINCIPAL],
+        "natures": ["read"],
+        "granted_permissions": ["users.read"],
+    }
+
+
+#: AC3's calls, one per action the bridge serves while unreachable, with what
+#: the profile adds for it. P18 adds the ``users.read`` half (finding P3): the
+#: bridge owns (``viewers``, twitch), and the read is at its twitch channel.
 AC3_CALLS = [
     pytest.param(
         _grant({"platform": "twitch", "channel_id": "channel-1", "scope": "automation"}),
         _run_call({"action": "A"}),
+        {},
         id="run-action",
+    ),
+    pytest.param(
+        _users_read_grant(),
+        _users_read_call(),
+        {
+            "inputs": {"viewers": {"twitch": MODULE_NAME}},
+            "settings": {"instance_identity": {"twitch": "channel-1"}},
+        },
+        id="users-read",
     ),
 ]
 
 
-@pytest.mark.parametrize(("rule", "call"), AC3_CALLS)
+@pytest.mark.parametrize(("rule", "call", "extra"), AC3_CALLS)
 async def test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degraded_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     rule: dict[str, Any],
     call: ActionCall,
+    extra: Mapping[str, Any],
 ) -> None:
     """AC3 (R1), through the whole ``run``: a profile enabling the bridge on a
     loopback port where nothing listens reaches readiness; the bridge has
@@ -1407,7 +1473,9 @@ async def test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degrad
     budget, is still degraded with no ``module.ready`` after that record (the
     P14 amendment: the count alone would pass with a bridge left ready); a
     granted call ends ``refused provider_not_ready`` with the provider never
-    invoked, so 0 frames. The outcome is asserted, not the exit status."""
+    invoked, so 0 frames — the run action, and (P18) the bridge's
+    ``users.read`` at its twitch destination while it owns (``viewers``,
+    twitch). The outcome is asserted, not the exit status."""
 
     caplog.set_level(logging.DEBUG)
     url = f"ws://{LOOPBACK}:{_silent_loopback_port()}/"
@@ -1419,6 +1487,7 @@ async def test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degrad
                 "url": url,
                 "companion_name": "Companion",
                 "password": "${BRIDGE_PASSWORD}",
+                **extra.get("settings", {}),
             }
         },
         "actions": [rule],
@@ -1428,6 +1497,8 @@ async def test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degrad
             "limits"
         ],
     }
+    if "inputs" in extra:
+        profile["inputs"] = extra["inputs"]
     path = tmp_path / "profile.yaml"
     path.write_text(yaml.safe_dump(profile), encoding="utf-8")
 
@@ -1493,6 +1564,10 @@ async def test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degrad
     assert observation.status == "refused"
     assert observation.error["code"] == ERROR_PROVIDER_NOT_READY
     assert outcome["invocations"] == 0
+    # The executor refused because the bridge is bound there and not ready,
+    # not because nothing serves the destination.
+    (binding,) = runtime.context.actions.bindings(call.action_name)
+    assert binding.module == MODULE_NAME
 
     corpus = "\n".join([*map(repr, history), *diagnostics, caplog.text])
     assert corpus.count(PASSWORD) == 0
@@ -3593,3 +3668,281 @@ async def test_ac33_a_mapped_chat_event_authored_by_the_companion_is_refused() -
         await _push(bridge, fake, fixture_frame("chat_twitch"))
         (decision,) = _decisions(bridge)
         assert decision["reason"] != REASON_SELF_AUTHORED
+
+
+# --------------------------------------------------------------------------- #
+# P18: the bridge's `users.read` from the instance's active viewers (R7c)
+# --------------------------------------------------------------------------- #
+
+from core.actions import ERROR_NO_PROVIDER, ERROR_UNSUPPORTED_DESTINATION  # noqa: E402
+from modules import users as users_module  # noqa: E402
+
+#: The broadcaster channels the viewer read answers for.
+VIEWER_IDENTITY = {"twitch": "channel-1", "kick": "kick-channel-1"}
+#: The twitch viewers of the ``active_viewers`` fixture, in the instance's order.
+TWITCH_VIEWERS = [
+    viewer
+    for viewer in fixture_frame("active_viewers")["viewers"]
+    if viewer["type"] == "twitch"
+]
+
+
+def test_the_viewer_read_spec_is_the_users_manifests_own() -> None:
+    """R7c: the bridge's ``users.read`` is the ``users`` module's spec, field
+    for field, parsed from that manifest — so the registry merges the second
+    declaration instead of refusing it — and the bridge's manifest still
+    carries no copy."""
+
+    spec = streamerbot.declared_users_read_spec()
+    assert spec == users_module._declared_users_read_spec()
+    assert streamerbot.USERS_MANIFEST_PATH.resolve() == users_module.MANIFEST_PATH.resolve()
+    assert spec.nature == "read"
+    kinds = spec.result_schema["properties"]["coverage"]["properties"]["kind"]["enum"]
+    assert streamerbot.COVERAGE_ACTIVE_VIEWERS in kinds
+
+
+@contextlib.asynccontextmanager
+async def _viewer_bridge(
+    *,
+    faults: Mapping[str, Any] | None = None,
+    inputs: Mapping[str, Any] | None = None,
+) -> Any:
+    """A connected bridge owning (``viewers``, twitch) by default, with
+    ``users.read`` granted to :data:`PRINCIPAL` everywhere."""
+
+    async with FakeInstance(**(faults or {})) as fake:
+        runs = _Runs(fake)
+        await runs.start(
+            url=fake.url,
+            inputs=inputs if inputs is not None else {"viewers": {"twitch": MODULE_NAME}},
+            instance_identity=VIEWER_IDENTITY,
+        )
+        rule = _users_read_grant()
+        runs.context.actions._authorization.grant(
+            AuthorizationRule(
+                rule_id=rule["rule_id"],
+                action_name=rule["action_name"],
+                destination=Destination("*", "*", "chat"),
+                principals=(PRINCIPAL,),
+                natures=("read",),
+                granted_permissions=("users.read",),
+            )
+        )
+        try:
+            yield runs
+        finally:
+            await runs.stop()
+
+
+async def _read(runs: _Runs, call: ActionCall, executor: Any = None) -> ActionObservation:
+    target = executor if executor is not None else runs.context.executor
+    observation = await asyncio.wait_for(target.invoke(call), FAKE_WAIT_SECONDS)
+    assert observation is not None
+    return observation
+
+
+def _assert_viewer_page(observation: ActionObservation, limit: int) -> dict[str, Any]:
+    """AC34: a success whose result validates against the shared schema,
+    with ``active_viewers``, ``complete: false`` and at most *limit* users."""
+
+    assert observation.status == "success", observation
+    result = observation.result
+    spec = streamerbot.declared_users_read_spec()
+    validate_against_schema(result, spec.result_schema, label="result")
+    spec.validate_result(result)
+    assert result["coverage"]["kind"] == "active_viewers"
+    assert result["coverage"]["complete"] is False
+    assert len(result["users"]) <= limit
+    assert result["page"]["returned"] == len(result["users"])
+    return result
+
+
+async def test_ac34_the_owned_channel_reads_one_page_of_active_viewers() -> None:
+    """AC34 (R7c): at ``instance_identity.twitch``, one ``GetActiveViewers``
+    request answers a page of the twitch viewers only, stamped with the fetch
+    instant (the list carries no per-viewer timestamp), in the instance's
+    order, served by the bridge's provider."""
+
+    async with _viewer_bridge() as runs:
+        runs.clock.advance(42.0)
+        observation = await _read(runs, _users_read_call({"limit": 100}))
+        result = _assert_viewer_page(observation, 100)
+        assert len(runs.fake.requests("GetActiveViewers")) == 1
+        assert observation.provenance["provider"] == streamerbot.RUN_PROVIDER
+
+        now = runs.clock()
+        assert [user["user_id"] for user in result["users"]] == [
+            viewer["id"] for viewer in TWITCH_VIEWERS
+        ]
+        assert [user["display_name"] for user in result["users"]] == [
+            viewer["display"] for viewer in TWITCH_VIEWERS
+        ]
+        assert all(
+            (user["first_seen"], user["last_seen"]) == (now, now) for user in result["users"]
+        )
+        assert all("roles" not in user for user in result["users"])
+        assert result["freshness"] == {"observed_at": now, "window_seconds": 0.0}
+        assert result["page"] == {"returned": 2, "has_more": False, "next_cursor": None}
+        assert result["coverage"]["retained_users"] == 2
+        assert result["coverage"]["evicted"] == 0
+        (part,) = observation.parts
+        assert part["type"] == "text" and "Mod_Two <1002>" in part["text"]
+
+
+async def test_ac34_a_page_holds_at_most_limit_and_the_cursor_pages_the_same_list() -> None:
+    """AC34: ``limit: 1`` returns 1 user and a cursor; the cursor pages over
+    the snapshot already fetched — no second request — and the last page has
+    no cursor. A new first page fetches again, and a cursor into the older
+    snapshot is refused."""
+
+    async with _viewer_bridge() as runs:
+        first = _assert_viewer_page(await _read(runs, _users_read_call({"limit": 1})), 1)
+        assert first["page"]["has_more"] is True
+        cursor = first["page"]["next_cursor"]
+        assert isinstance(cursor, str)
+        assert first["coverage"]["retained_users"] == 2
+
+        runs.clock.advance(5.0)
+        second = _assert_viewer_page(
+            await _read(
+                runs, _users_read_call({"limit": 1, "cursor": cursor}, call_id="call-2")
+            ),
+            1,
+        )
+        assert len(runs.fake.requests("GetActiveViewers")) == 1
+        assert [first["users"][0]["user_id"], second["users"][0]["user_id"]] == [
+            viewer["id"] for viewer in TWITCH_VIEWERS
+        ]
+        assert second["page"] == {"returned": 1, "has_more": False, "next_cursor": None}
+        assert second["freshness"] == first["freshness"]
+
+        _assert_viewer_page(await _read(runs, _users_read_call({"limit": 1}, call_id="call-3")), 1)
+        assert len(runs.fake.requests("GetActiveViewers")) == 2
+        stale = await _read(
+            runs, _users_read_call({"limit": 1, "cursor": cursor}, call_id="call-4")
+        )
+        assert stale.status == "error"
+        assert stale.error["code"] == ERROR_INVALID_ARGUMENTS
+        assert len(runs.fake.requests("GetActiveViewers")) == 2
+
+
+async def test_ac34_another_channel_is_refused_unsupported_destination() -> None:
+    """AC34: any channel other than ``instance_identity.twitch`` is ``refused
+    unsupported_destination`` with no request sent to the instance."""
+
+    async with _viewer_bridge() as runs:
+        before = runs.context.executor.provider_invocations
+        observation = await _read(runs, _users_read_call(channel_id="another-channel"))
+        assert observation.status == "refused"
+        assert observation.error["code"] == ERROR_UNSUPPORTED_DESTINATION
+        assert runs.context.executor.provider_invocations - before == 1
+        assert runs.fake.requests("GetActiveViewers") == []
+
+
+async def test_a_cursor_from_another_destination_or_not_minted_here_is_refused() -> None:
+    """R7c, as ``users`` does: a cursor issued for another destination, a
+    ``users`` cursor and garbage are each ``invalid_arguments``, before any
+    request."""
+
+    async with _viewer_bridge(
+        inputs={"viewers": {"twitch": MODULE_NAME, "kick": MODULE_NAME}}
+    ) as runs:
+        kick_cursor = runs.module._ViewerCursor("kick", VIEWER_IDENTITY["kick"], 1, 1).encode()
+        users_cursor = base64.urlsafe_b64encode(b"twitch/channel-1/1.0/1001").decode()
+        for index, cursor in enumerate((kick_cursor, users_cursor, "not-a-cursor")):
+            observation = await _read(
+                runs,
+                _users_read_call({"limit": 1, "cursor": cursor}, call_id=f"call-{index}"),
+            )
+            assert observation.status == "error", cursor
+            assert observation.error["code"] == ERROR_INVALID_ARGUMENTS
+        assert runs.fake.requests("GetActiveViewers") == []
+
+        # The kick channel of the same bridge pages its own viewers.
+        kick = _assert_viewer_page(
+            await _read(
+                runs,
+                _users_read_call(
+                    {"limit": 5},
+                    platform="kick",
+                    channel_id=VIEWER_IDENTITY["kick"],
+                    call_id="call-kick",
+                ),
+            ),
+            5,
+        )
+        assert [user["user_id"] for user in kick["users"]] == ["2001"]
+
+
+async def test_a_platform_the_bridge_does_not_own_is_never_bound_to_it() -> None:
+    """R3: owning only (``viewers``, twitch), the bridge's provider is bound at
+    twitch only; a kick read finds no provider (``users`` is not enabled)."""
+
+    async with _viewer_bridge() as runs:
+        bindings = runs.context.actions.bindings(streamerbot.USERS_READ_ACTION)
+        assert [(b.module, b.destination.platform) for b in bindings] == [
+            (MODULE_NAME, "twitch")
+        ]
+        observation = await _read(
+            runs,
+            _users_read_call(platform="kick", channel_id=VIEWER_IDENTITY["kick"]),
+        )
+        assert observation.error["code"] == ERROR_NO_PROVIDER
+        assert runs.fake.requests("GetActiveViewers") == []
+
+
+async def test_without_owning_viewers_the_read_is_declared_and_never_bound() -> None:
+    """R3, R7c: a bridge owning no viewer pair declares the shared spec and
+    binds nothing for it."""
+
+    async with _viewer_bridge(inputs={}) as runs:
+        assert runs.context.actions.bindings(streamerbot.USERS_READ_ACTION) == ()
+        assert streamerbot.USERS_READ_ACTION in runs.context.actions.discovered()
+
+
+async def test_a_withheld_viewer_list_ends_timeout_never_external_unknown() -> None:
+    """R7c, the executor's rule: ``users.read`` is a ``read``, so a deadline
+    with the request sent stays ``timeout`` (``timed_out``)."""
+
+    async with _viewer_bridge(faults={"withhold_viewers": True}) as runs:
+        expiry = _Expiry()
+        executor = runs.executor(expiry)
+        pending = asyncio.ensure_future(executor.invoke(_users_read_call()))
+        await asyncio.wait_for(expiry.armed.wait(), FAKE_WAIT_SECONDS)
+        await _until(lambda: len(runs.fake.requests("GetActiveViewers")) == 1)
+        assert len(runs.fake.requests("GetActiveViewers")) == 1
+        expiry.fired.set()
+        observation = await asyncio.wait_for(pending, FAKE_WAIT_SECONDS)
+        assert observation.status == "timeout", observation
+        assert observation.error["code"] == ERROR_TIMED_OUT
+
+
+async def test_a_malformed_viewer_answer_is_a_provider_failure() -> None:
+    """R7c: an answer that is not a viewer list is never paged as one."""
+
+    async with _viewer_bridge() as runs:
+        parse = runs.module._active_viewers
+        assert parse(fixture_frame("error_response"), "twitch", 1.0) is None
+        assert parse({"status": "ok", "viewers": "x"}, "twitch", 1.0) is None
+        users, evicted = parse(fixture_frame("active_viewers"), "youtube", 1.0)
+        assert ([user["user_id"] for user in users], evicted) == (["UC-viewer-3001"], 0)
+
+
+def test_a_snapshot_is_bounded_and_counts_what_it_left_out() -> None:
+    """Bounded retention: past :data:`VIEWER_SNAPSHOT_MAX_USERS`, the users
+    are counted in ``evicted``, never kept; a repeated id is kept once."""
+
+    bound = streamerbot.VIEWER_SNAPSHOT_MAX_USERS
+    viewers = [{"id": str(index), "type": "Twitch"} for index in range(bound + 3)]
+    viewers.append({"id": "0", "type": "twitch"})
+    users, evicted = streamerbot._active_viewers(
+        {"status": "ok", "viewers": viewers}, "twitch", 7.0
+    )
+    assert (len(users), evicted) == (bound, 3)
+    assert users[0] == {
+        "user_id": "0",
+        "display_name": "0",
+        "first_seen": 7.0,
+        "last_seen": 7.0,
+    }
+
