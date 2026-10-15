@@ -256,6 +256,7 @@ from core.contracts import (
     CAPABILITY_AUDIO,
     CAPABILITY_STRUCTURED_OUTPUT,
     CAPABILITY_VISION,
+    CUE_KIND,
     DELIVERY_NO_TEXT_ARGUMENT,
     DELIVERY_REASON_EMPTY,
     DELIVERY_REASON_NOT_A_DELIVERY,
@@ -1305,11 +1306,13 @@ class _Route:
         """Whether a viewer who holds no privileged role can trigger this route.
 
         False when the audience is ``broadcaster`` or ``moderators``, or when
-        every kind is a platform-authored notice (R1 route safety).
+        every kind is a platform-authored notice or a cue (R1 route safety).
+        A cue comes from the operator's own authenticated automation instance
+        (R7, A5), so it is trusted like a notice.
         """
 
         return self.audience not in ROUTE_PRIVILEGED_AUDIENCES and not (
-            self.kinds <= frozenset(PLATFORM_NOTICE_KINDS)
+            self.kinds <= frozenset((*PLATFORM_NOTICE_KINDS, CUE_KIND))
         )
 
 
@@ -2641,7 +2644,7 @@ class BrainModule:
         text — on a route a viewer without a privileged role can reach (see
         :attr:`_Route.viewer_reachable`) stops startup naming the route: a
         chat command may not move the stream unless the broadcaster or a
-        moderator sent it, or a platform notice did.
+        moderator sent it, or a platform notice or a cue did (R7).
         """
 
         routes = [
@@ -2664,7 +2667,7 @@ class BrainModule:
                 raise BrainModuleError(
                     f"module {MODULE_NAME!r}: route {route.name!r}: delivery action "
                     f"{effects[0]!r} is an effect: the route must declare match.audience "
-                    "broadcaster or moderators, or match platform notice kinds only"
+                    "broadcaster or moderators, or match platform notice kinds or cues only"
                 )
             resolved[route.name] = entries
         return resolved
@@ -4837,8 +4840,9 @@ def _message_of_event(event: Any) -> _Message:
     event (R3, AC12).
 
     A community notice (a kind in :data:`PLATFORM_NOTICE_KINDS`) may carry an
-    empty text: a follow, a new member or a gift has no words of its own. Any
-    other kind still needs a nonblank text (R1).
+    empty text: a follow, a new member or a gift has no words of its own. A
+    :data:`CUE_KIND` event may too: a cue is an instance trigger, not words
+    (R7). Any other kind still needs a nonblank text (R1).
     """
 
     if not isinstance(event, Mapping):
@@ -4856,7 +4860,9 @@ def _message_of_event(event: Any) -> _Message:
         kind = validate_event_kind(payload.get("kind"), "payload.kind")
     except ContractError:
         raise ValueError from None
-    if not isinstance(text, str) or (kind not in PLATFORM_NOTICE_KINDS and not text.strip()):
+    if not isinstance(text, str) or (
+        kind not in PLATFORM_NOTICE_KINDS and kind != CUE_KIND and not text.strip()
+    ):
         raise ValueError
     author = payload.get("author")
     viewer_id = author.get("id") if isinstance(author, Mapping) else None

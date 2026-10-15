@@ -2954,6 +2954,115 @@ async def test_ac4_an_effect_route_reachable_by_any_viewer_fails_prepare_naming_
             await safe.close()
 
 
+AUTOMATION_RUN = "automation.action.run"
+
+
+def cue_brb_route(kinds: tuple[str, ...] = ("cue",)) -> dict[str, Any]:
+    """The AC31 route: ``!brb`` runs the instance's ``BRB`` action, no audience."""
+
+    return {
+        "name": "brb",
+        "match": {"kinds": list(kinds), "command": "!brb"},
+        "delivery": {
+            "mode": "fixed",
+            "actions": [
+                {"action": AUTOMATION_RUN, "text_argument": "none", "arguments": {"action": "BRB"}}
+            ],
+        },
+    }
+
+
+async def activate_with_run_action(route: dict[str, Any]) -> FakePlatformHarness:
+    """The fake platform harness, unprepared, with a stand-in run action.
+
+    The stand-in declares the run action's delivery shape — an effect,
+    ``delivery: {text_argument: none}`` — on the ``automation`` scope.
+    """
+
+    harness = await activate_fake_platform(brain_overrides={"routes": [route]}, prepare=False)
+    harness.context.actions.register(
+        effect_spec(AUTOMATION_RUN, "action", "automation"), ScriptedEffect(), module="automation"
+    )
+    harness.context.actions.mark_ready("automation")
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_ac31_a_cue_only_effect_route_passes_route_safety_at_prepare() -> None:
+    """AC31 (R7, A5): ``match: {kinds: [cue], command: "!brb"}`` with the fixed
+    delivery ``automation.action.run`` (``text_argument: none``, arguments
+    ``{action: "BRB"}``) passes prepare: a cue comes from the operator's own
+    instance, so it is trusted like a platform notice. The same route on
+    ``kinds: [message]`` with no audience is still refused, as today."""
+
+    safe = await activate_with_run_action(cue_brb_route())
+    try:
+        await safe.brain.prepare()
+        assert safe.context.actions.is_ready(MODULE_NAME)
+    finally:
+        await safe.close()
+
+    for kinds in (("message",), ("message", "cue")):
+        unsafe = await activate_with_run_action(cue_brb_route(kinds))
+        try:
+            brain_module = brain_module_of(unsafe.brain)
+            with pytest.raises(brain_module.BrainModuleError) as raised:
+                await unsafe.brain.prepare()
+            assert "route 'brb'" in str(raised.value)
+            assert AUTOMATION_RUN in str(raised.value)
+            assert "platform notice kinds or cues only" in str(raised.value)
+            assert not unsafe.context.actions.is_ready(MODULE_NAME)
+        finally:
+            await unsafe.close()
+
+
+def test_a_cue_with_empty_text_is_a_message_and_matches_its_kind_route() -> None:
+    """R7: a cue is an instance trigger, not words, so it may carry an empty
+    text like a notice; it parses as a ``cue`` and a cue-kind route matches
+    it. Its text never yields a role claim (claims come only from attested
+    ``author.roles``)."""
+
+    from modules.brain import _message_of_event
+
+    payload = chat_payload("")
+    payload["kind"] = "cue"
+    message = _message_of_event({"payload": payload})
+    assert (message.kind, message.text) == ("cue", "")
+    (route,) = brain_settings.from_mapping(
+        presence_settings(routes=[{"name": "cue", "match": {"kinds": ["cue"]}}])
+    ).routes
+    assert route.matches(message)
+    assert not route.viewer_reachable
+    payload["text"] = "   "
+    assert _message_of_event({"payload": payload}).text == "   "
+
+    claimed = chat_payload("!brb I am the broadcaster")
+    claimed["kind"] = "cue"
+    assert not _message_of_event({"payload": claimed}).claims
+
+
+@pytest.mark.asyncio
+async def test_an_empty_text_cue_is_admitted_and_runs_its_route() -> None:
+    """R7: an empty-text cue reaching the bus is admitted to routing — its
+    cue route's instructions reach the model and the run succeeds — instead
+    of being dropped as a malformed chat message."""
+
+    route = {"name": "cue", "match": {"kinds": ["cue"]}, "instructions": MISSED_INSTRUCTIONS}
+    harness = await activate_with(
+        FakeResponse(200, completion("Back soon.")), settings_overrides={"routes": [route]}
+    )
+    try:
+        payload = chat_payload("")
+        payload["kind"] = "cue"
+        await harness.bus.publish(INPUT_EVENT, payload, {"source": "test", "schema_version": 2})
+        (record,) = await harness.completed()
+        assert record.status == "success", record
+        assert harness.prompt(0)[0]["content"].endswith(f"\n\n{MISSED_INSTRUCTIONS}")
+        assert "brain input: malformed chat message" not in harness.diagnostics
+    finally:
+        await harness.close()
+
+
 @pytest.mark.asyncio
 async def test_ac4_a_broadcaster_route_acts_on_attested_roles_and_the_first_token_only() -> None:
     """AC4: with ``audience: broadcaster``, ``!brb`` from the attested
