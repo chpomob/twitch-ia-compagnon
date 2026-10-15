@@ -244,3 +244,511 @@ def test_contracts_names_no_vendor_and_no_bridge_module() -> None:
     assert _VENDOR_OR_BRIDGE.findall(text) == []
     assert _VENDOR_OR_BRIDGE.search("modules/streamerbot")
     assert _VENDOR_OR_BRIDGE.search("Streamer.bot")
+
+
+# --------------------------------------------------------------------------- #
+# P2: the loader resolves ownership before any preparation (R2, D2, D3, D7)
+# --------------------------------------------------------------------------- #
+
+import asyncio  # noqa: E402
+import socket  # noqa: E402
+
+import yaml  # noqa: E402
+
+from core.actions import ActionRegistry, AuthorizationPolicy  # noqa: E402
+from core.bus import EventBus  # noqa: E402
+from core.lifecycle import SupervisedTasks  # noqa: E402
+from core.loader import (  # noqa: E402
+    InputOwnership,
+    ManifestDeclaration,
+    ModuleLoader,
+    ModuleLoadError,
+    OwnedInputs,
+    _validate_manifest,
+    resolve_input_ownership,
+)
+from core.runtime import RUNTIME_API, RuntimeContext, Supervision  # noqa: E402
+
+#: Every call an ownership test module receives, by module name.
+_SPY_SOURCE = """
+class Handle:
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def prepare(self):
+        self.settings["calls"].append("prepare")
+
+    async def close(self):
+        pass
+
+
+def validate_settings(settings):
+    settings["calls"].append("validate")
+
+
+async def activate(context, settings, catalog):
+    settings["calls"].append("activate")
+    return Handle(settings)
+"""
+
+_AWARE_SOURCE = """
+class Handle:
+    async def close(self):
+        pass
+
+
+def validate_settings(settings, *, owned_inputs=None):
+    settings["calls"].append(("validate", owned_inputs))
+
+
+async def activate(context, settings, catalog):
+    settings["calls"].append("activate")
+    return Handle()
+"""
+
+_PLAIN_HOOK_SOURCE = """
+class Handle:
+    async def close(self):
+        pass
+
+
+def validate_settings(*args):
+    args[0]["calls"].append(("validate", len(args)))
+
+
+async def activate(context, settings, catalog):
+    return Handle()
+"""
+
+
+def _families(*entries: tuple[str, list[str], bool]) -> list[dict[str, Any]]:
+    return [
+        {"family": family, "platforms": platforms, "default": default}
+        for family, platforms, default in entries
+    ]
+
+
+def _manifest(
+    name: str, families: list[dict[str, Any]] | None, *, version: int | None = 2
+) -> dict[str, Any]:
+    manifest: dict[str, Any] = {
+        "name": name,
+        "produces": [],
+        "consumes": [],
+        "middleware": False,
+    }
+    if version is not None:
+        manifest["manifest_version"] = version
+        manifest["runtime_api"] = RUNTIME_API
+        manifest["settings_validator"] = "validate_settings"
+    if families is not None:
+        manifest["input_families"] = families
+    return manifest
+
+
+def _make(
+    root: Path,
+    name: str,
+    families: list[dict[str, Any]] | None,
+    source: str = _SPY_SOURCE,
+) -> None:
+    directory = root / name
+    directory.mkdir()
+    (directory / "module.yaml").write_text(
+        yaml.safe_dump(_manifest(name, families)), encoding="utf-8"
+    )
+    (directory / "__init__.py").write_text(source, encoding="utf-8")
+
+
+def _context(bus: EventBus) -> RuntimeContext:
+    return RuntimeContext(
+        bus=bus,
+        actions=ActionRegistry(authorization=AuthorizationPolicy()),
+        supervision=Supervision(bus),
+        tasks=SupervisedTasks(),
+    )
+
+
+def _loader(root: Path, environ: dict[str, str] | None = None) -> ModuleLoader:
+    bus = EventBus()
+    return ModuleLoader(bus, root, context=_context(bus), environ=environ or {})
+
+
+def _config(
+    names: list[str], inputs: Any = None
+) -> tuple[dict[str, Any], dict[str, list[Any]]]:
+    settings = {name: {"calls": []} for name in names}
+    config: dict[str, Any] = {"enabled_modules": names, "modules": settings}
+    if inputs is not None:
+        config["inputs"] = inputs
+    return config, {name: settings[name]["calls"] for name in names}
+
+
+def _decl(families: list[dict[str, Any]] | None, name: str = "m") -> ManifestDeclaration:
+    return _validate_manifest(name, _manifest(name, families))
+
+
+def _resolve(
+    modules: dict[str, list[dict[str, Any]] | None], inputs: Any = None
+) -> InputOwnership:
+    return resolve_input_ownership(
+        list(modules),
+        {name: _decl(families, name) for name, families in modules.items()},
+        inputs,
+    )
+
+
+def _refusals(modules: dict[str, Any], inputs: Any) -> list[str]:
+    with pytest.raises(ModuleLoadError) as caught:
+        _resolve(modules, inputs)
+    return list(caught.value.diagnostics)
+
+
+NATIVE = _families(("chat", ["x"], True))
+BRIDGE = _families(
+    ("chat", ["x", "y"], False),
+    ("viewers", ["x", "y"], False),
+    ("cues", ["*"], True),
+)
+
+
+# -- manifest key ------------------------------------------------------------ #
+
+
+def test_the_manifest_key_is_parsed_and_absent_is_distinct_from_empty() -> None:
+    absent = _decl(None)
+    empty = _decl([])
+    declared = _decl(NATIVE)
+    assert (absent.input_families, absent.declares_input_families) == ((), False)
+    assert (empty.input_families, empty.declares_input_families) == ((), True)
+    assert declared.input_families == (InputFamilyDeclaration("chat", ("x",), True),)
+    assert declared.declares_input_families
+
+
+def test_a_malformed_manifest_declaration_is_refused_naming_the_field() -> None:
+    with pytest.raises(ModuleLoadError, match=r"module 'm': field 'input_families\[0\]\.family'"):
+        _decl(_families(("weather", ["x"], True)))
+
+
+def test_a_v1_manifest_declaring_the_key_is_refused() -> None:
+    """D3: a v1 module is always an undeclared publisher."""
+
+    with pytest.raises(ModuleLoadError, match="module 'm': field 'input_families'"):
+        _validate_manifest("m", _manifest("m", NATIVE, version=None))
+    assert not _validate_manifest("m", _manifest("m", None, version=None)).declares_input_families
+
+
+# -- AC7: ambiguity refused before any effect -------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac7_two_default_declarers_are_refused_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make(tmp_path, "a", NATIVE)
+    _make(tmp_path, "b", NATIVE)
+    attempts: list[Any] = []
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        attempts.append(args)
+        raise AssertionError("socket created")
+
+    monkeypatch.setattr(socket.socket, "__init__", refuse)
+    for name in ("socketpair", "fromfd", "create_connection", "create_server"):
+        monkeypatch.setattr(socket, name, refuse)
+    config, calls = _config(["a", "b"])
+    loader = _loader(tmp_path)
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled(config)
+
+    assert list(caught.value.diagnostics) == [
+        "inputs: family 'chat': platform 'x': owned by default by both 'a' and 'b'; "
+        "set inputs.chat.x"
+    ]
+    # No setting validated, no module activated or prepared, no socket.
+    assert calls == {"a": [], "b": []}
+    assert loader.activations == []
+    assert attempts == []
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_entry_decides_the_ambiguity_and_is_stored(tmp_path: Path) -> None:
+    _make(tmp_path, "a", NATIVE)
+    _make(tmp_path, "b", NATIVE)
+    config, calls = _config(["a", "b"], {"chat": {"x": "b"}})
+    loader = _loader(tmp_path)
+    await loader.activate_enabled(config)
+    assert loader.input_ownership is not None
+    assert loader.input_ownership.owner("chat", "x") == "b"
+    assert calls == {"a": ["validate", "activate"], "b": ["validate", "activate"]}
+
+
+def test_a_wildcard_ambiguity_is_reported_once_on_the_wildcard_row() -> None:
+    star = _families(("cues", ["*"], True))
+    refusals = _refusals({"a": star, "b": star, "c": _families(("cues", ["x"], False))}, None)
+    assert refusals == [
+        "inputs: family 'cues': platform '*': owned by default by both 'a' and 'b'; "
+        "set inputs.cues.*"
+    ]
+    assert _resolve({"a": star, "b": star}, {"cues": {"*": "a"}}).owner("cues", "x") == "a"
+
+
+# -- AC8: invalid explicit owners -------------------------------------------- #
+
+
+def test_ac8_an_owner_list_of_two_is_refused_naming_both() -> None:
+    refusals = _refusals(
+        {"native": NATIVE, "bridge": BRIDGE}, {"chat": {"x": ["native", "bridge"]}}
+    )
+    assert len(refusals) == 1
+    assert "family 'chat'" in refusals[0] and "platform 'x'" in refusals[0]
+    assert "'native'" in refusals[0] and "'bridge'" in refusals[0]
+
+
+def test_ac8_an_owner_that_is_not_enabled_is_refused() -> None:
+    refusals = _refusals({"native": NATIVE}, {"chat": {"x": "bridge"}})
+    assert refusals == ["inputs: family 'chat': platform 'x': owner 'bridge' is not enabled"]
+
+
+def test_ac8_an_owner_that_does_not_declare_the_platform_is_refused() -> None:
+    refusals = _refusals({"native": NATIVE, "bridge": BRIDGE}, {"chat": {"z": "bridge"}})
+    assert refusals == [
+        "inputs: family 'chat': platform 'z': owner 'bridge' does not declare "
+        "family 'chat' for platform 'z'"
+    ]
+
+
+def test_ac8_the_wildcard_key_needs_a_wildcard_declarer() -> None:
+    refusals = _refusals({"native": NATIVE, "bridge": BRIDGE}, {"chat": {"*": "bridge"}})
+    assert len(refusals) == 1
+    assert "platform '*'" in refusals[0] and "'bridge'" in refusals[0]
+
+
+def test_ac8_a_family_outside_the_vocabulary_names_family_platform_and_value() -> None:
+    refusals = _refusals({"native": NATIVE}, {"weather": {"x": "native"}})
+    assert len(refusals) == 1
+    assert "family 'weather'" in refusals[0]
+    assert "platform 'x'" in refusals[0]
+    assert "'native'" in refusals[0]
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        ["chat"],
+        {"chat": "native"},
+        {"chat": {3: "native"}},
+        {"chat": {"x": 3}},
+        {"chat": {"x": []}},
+        {7: {"x": "native"}},
+    ],
+)
+def test_a_malformed_inputs_entry_is_refused(inputs: Any) -> None:
+    assert len(_refusals({"native": NATIVE}, inputs)) == 1
+
+
+def test_every_refusal_is_collected_into_one_error() -> None:
+    refusals = _refusals(
+        {"a": NATIVE, "b": NATIVE},
+        {"weather": {"x": "a"}, "viewers": {"x": "ghost"}},
+    )
+    assert len(refusals) == 3
+
+
+def test_an_owner_value_matching_a_secret_is_never_quoted() -> None:
+    with pytest.raises(ModuleLoadError) as caught:
+        resolve_input_ownership(
+            ["native"],
+            {"native": _decl(NATIVE, "native")},
+            {"chat": {"x": "hunter2-token"}, "viewers": {"x": "two words!"}},
+            redacted=frozenset({"hunter2-token"}),
+        )
+    text = "\n".join(caught.value.diagnostics)
+    assert "hunter2" not in text and "two words" not in text
+    assert text.count("<redacted>") == 2
+
+
+@pytest.mark.asyncio
+async def test_the_loader_never_quotes_an_environment_value(tmp_path: Path) -> None:
+    _make(tmp_path, "native", NATIVE)
+    loader = _loader(tmp_path, {"TOKEN": "s3cr3t-value"})
+    config, _ = _config(["native"], {"chat": {"x": "s3cr3t-value"}})
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled(config)
+    assert "s3cr3t" not in "\n".join(caught.value.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_the_loader_never_quotes_a_literal_credential(tmp_path: Path) -> None:
+    """An owner equal to a configured credential literal is not quoted, though
+    the diagnostic is raised before credential redaction runs."""
+
+    _make(tmp_path, "native", NATIVE)
+    manifest = _manifest("native", NATIVE)
+    manifest["settings_schema"] = {
+        "type": "object",
+        "properties": {"calls": {"type": "array"}, "token": {"type": "string"}},
+    }
+    manifest["credentials"] = ["token"]
+    (tmp_path / "native" / "module.yaml").write_text(
+        yaml.safe_dump(manifest), encoding="utf-8"
+    )
+    loader = _loader(tmp_path)
+    config, _ = _config(["native"], {"chat": {"x": "literal-token"}})
+    config["modules"]["native"]["token"] = "literal-token"
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled(config)
+    text = "\n".join(caught.value.diagnostics)
+    assert "literal-token" not in text
+    assert "<redacted>" in text
+
+
+# -- D2: explicit and default precedence -------------------------------------- #
+
+
+def test_ac6_shape_default_owners_and_no_chat_pair_for_the_bridge() -> None:
+    ownership = _resolve({"native": NATIVE, "bridge": BRIDGE})
+    assert (ownership.owner("chat", "x"), ownership.origin("chat", "x")) == ("native", "default")
+    assert ownership.owner("chat", "y") is None
+    assert ownership.origin("chat", "y") == "unowned"
+    assert ownership.owner("cues", "*") == "bridge"
+    assert ownership.owner("cues", "x") == "bridge"
+    assert ownership.view_for("bridge").platforms("chat") == ()
+    assert ownership.candidates("chat", "x") == ("bridge", "native")
+
+
+def test_ac9_explicit_beats_default() -> None:
+    ownership = _resolve({"native": NATIVE, "bridge": BRIDGE}, {"chat": {"x": "bridge"}})
+    assert (ownership.owner("chat", "x"), ownership.origin("chat", "x")) == ("bridge", "explicit")
+    assert ownership.view_for("native").pairs == frozenset()
+    assert ("chat", "x") in ownership.view_for("bridge").pairs
+
+
+def test_the_wildcard_key_applies_to_undeclared_platforms() -> None:
+    star = _families(("viewers", ["*"], False))
+    ownership = _resolve({"reader": star}, {"viewers": {"*": "reader"}})
+    assert ownership.owner("viewers", "zz") == "reader"
+    assert ownership.origin("viewers", "zz") == "explicit"
+
+
+def test_the_explicit_wildcard_key_beats_a_concrete_default() -> None:
+    star = _families(("chat", ["*"], False))
+    ownership = _resolve({"native": NATIVE, "all": star}, {"chat": {"*": "all"}})
+    assert ownership.owner("chat", "x") == "all"
+
+
+def test_a_concrete_declarer_beats_a_wildcard_declarer() -> None:
+    star = _families(("viewers", ["*"], True))
+    concrete = _families(("viewers", ["x"], True))
+    ownership = _resolve({"wide": star, "narrow": concrete})
+    assert ownership.owner("viewers", "x") == "narrow"
+    assert ownership.owner("viewers", "y") == "wide"
+    assert ownership.origin("viewers", "x") == "default"
+
+
+def test_a_wildcard_only_declarer_owns_by_fallback() -> None:
+    ownership = _resolve({"wide": _families(("viewers", ["*"], True))})
+    assert ownership.owner("viewers", "x") == "wide"
+    assert ownership.view_for("wide").owns("viewers", "x")
+
+
+def test_ac9_none_leaves_the_pair_unowned() -> None:
+    ownership = _resolve({"native": NATIVE, "bridge": BRIDGE}, {"chat": {"x": "none"}})
+    assert ownership.owner("chat", "x") is None
+    assert ownership.origin("chat", "x") == "explicit"
+    assert ownership.is_set_none("chat", "x")
+    assert not ownership.is_set_none("chat", "y")
+    cues_off = _resolve({"bridge": BRIDGE}, {"cues": {"*": "none"}})
+    assert cues_off.owner("cues", "*") is None
+    assert cues_off.owner("cues", "anything") is None
+    assert cues_off.view_for("bridge").pairs == frozenset()
+
+
+def test_rows_are_the_sorted_domain() -> None:
+    ownership = _resolve({"native": NATIVE, "bridge": BRIDGE}, {"viewers": {"q": "none"}})
+    assert ownership.rows() == (
+        ("chat", "*"),
+        ("chat", "x"),
+        ("chat", "y"),
+        ("cues", "*"),
+        ("viewers", "*"),
+        ("viewers", "q"),
+        ("viewers", "x"),
+        ("viewers", "y"),
+    )
+
+
+# -- views and exclusions ----------------------------------------------------- #
+
+
+def test_view_for_and_excluded_for_a_wildcard_owner() -> None:
+    star = _families(("viewers", ["*"], True))
+    ownership = _resolve(
+        {"native": star, "bridge": BRIDGE}, {"viewers": {"x": "bridge"}}
+    )
+    assert ownership.excluded("viewers") == frozenset({"x"})
+    native = ownership.view_for("native")
+    assert native.pairs == frozenset({("viewers", "*"), ("viewers", "y")})
+    assert native.owns("viewers", "y") and native.owns("viewers", "other")
+    assert not native.owns("viewers", "x")
+    assert native.platforms("viewers") == ("*", "y")
+    bridge = ownership.view_for("bridge")
+    assert bridge.pairs == frozenset({("viewers", "x"), ("cues", "*")})
+    assert bridge.owns("viewers", "x") and not bridge.owns("viewers", "y")
+    assert bridge.owns("cues", "x")
+
+
+def test_the_unrestricted_view_owns_everything() -> None:
+    view = OwnedInputs.unrestricted()
+    for family in INPUT_FAMILIES:
+        assert view.owns(family, "x") and view.owns(family, "*")
+    with pytest.raises(AttributeError):
+        view.pairs = frozenset()  # type: ignore[misc]
+
+
+def test_constrains_any() -> None:
+    assert not _resolve({"plain": None}).constrains_any()
+    assert not _resolve({"opt_in": _families(("chat", ["x"], False))}).constrains_any()
+    assert _resolve({"native": NATIVE}).constrains_any()
+    assert _resolve({"plain": None}, {"chat": {"x": "none"}}).constrains_any()
+
+
+# -- D7: the ownership-aware settings hook ----------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_an_aware_hook_receives_the_view_and_a_plain_hook_one_argument(
+    tmp_path: Path,
+) -> None:
+    _make(tmp_path, "aware", _families(("chat", ["x"], True)), _AWARE_SOURCE)
+    _make(tmp_path, "plain", None, _PLAIN_HOOK_SOURCE)
+    config, calls = _config(["aware", "plain"])
+    loader = _loader(tmp_path)
+    await loader.activate_enabled(config)
+    (validated, view), activated = calls["aware"]
+    assert (validated, activated) == ("validate", "activate")
+    assert isinstance(view, OwnedInputs)
+    assert view.pairs == frozenset({("chat", "x")})
+    assert calls["plain"] == [("validate", 1)]
+
+
+# -- R2 / AC11: the resolver names no platform and no vendor ----------------- #
+
+
+def test_the_ownership_code_in_the_loader_names_no_platform_or_vendor() -> None:
+    text = (ROOT / "core" / "loader.py").read_text(encoding="utf-8")
+    section = text[text.index("# Input ownership (R2"):]
+    assert _VENDOR_OR_BRIDGE.findall(text) == []
+    for platform in ("twitch", "kick", "youtube"):
+        assert platform not in section.lower(), platform
+
+
+def test_resolution_is_pure() -> None:
+    inputs = {"chat": {"x": "bridge"}}
+    snapshot = repr(inputs)
+    first = _resolve({"native": NATIVE, "bridge": BRIDGE}, inputs)
+    second = _resolve({"native": NATIVE, "bridge": BRIDGE}, inputs)
+    assert repr(inputs) == snapshot
+    assert first == second
+    assert asyncio.iscoroutinefunction(resolve_input_ownership) is False

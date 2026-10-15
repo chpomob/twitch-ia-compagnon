@@ -80,14 +80,20 @@ from uuid import uuid4
 import yaml
 
 from .contracts import (
+    INPUT_FAMILIES,
+    INPUT_FAMILY_SET,
+    INPUT_OWNER_NONE,
+    WILDCARD,
     ActionSpec,
     ContractError,
     Destination,
+    InputFamilyDeclaration,
     SchemaError,
     TriggerPolicy,
     TriggerRule,
     TriggerSpec,
     TriggerTypeDeclaration,
+    parse_input_families,
     validate_against_schema,
     validate_schema,
 )
@@ -116,10 +122,13 @@ __all__: Sequence[str] = (
     "MANIFEST_VERSION_V2",
     "SUPPORTED_MANIFEST_VERSIONS",
     "DiscoveredModule",
+    "InputOwnership",
     "ManifestDeclaration",
     "ModuleActivation",
     "ModuleLoadError",
     "ModuleLoader",
+    "OwnedInputs",
+    "resolve_input_ownership",
 )
 
 
@@ -162,6 +171,7 @@ MANIFEST_SETTINGS_VALIDATOR_KEY = "settings_validator"
 MANIFEST_ACTIONS_KEY = "actions"
 MANIFEST_TRIGGERS_KEY = "triggers"
 MANIFEST_CREDENTIALS_KEY = "credentials"
+MANIFEST_INPUT_FAMILIES_KEY = "input_families"
 """The settings a module declares as credentials, as dotted setting paths.
 
 Each path names a ``settings_schema`` property of type ``string``. The accepted
@@ -176,6 +186,7 @@ _V2_ONLY_KEYS: tuple[str, ...] = (
     MANIFEST_ACTIONS_KEY,
     MANIFEST_TRIGGERS_KEY,
     MANIFEST_CREDENTIALS_KEY,
+    MANIFEST_INPUT_FAMILIES_KEY,
 )
 """Keys a v1 manifest may not declare: a manifest belongs to one contract."""
 
@@ -232,6 +243,11 @@ class ManifestDeclaration:
     triggers: TriggerSpec | None = None
     #: The declared credential settings, each as its path of mapping keys.
     credentials: tuple[tuple[str, ...], ...] = ()
+    #: The declared input families (R2). Empty both when the key is absent
+    #: and when it is ``[]``; :attr:`declares_input_families` tells them
+    #: apart, which R3's undeclared-publisher rule needs.
+    input_families: tuple[InputFamilyDeclaration, ...] = ()
+    declares_input_families: bool = False
 
     @property
     def is_v2(self) -> bool:
@@ -393,6 +409,10 @@ class ModuleLoader:
         #: module and the step it interrupted (AC15). The entry point reports
         #: them before it lets the cancellation propagate.
         self.cancellation_diagnostics: list[str] = []
+        #: The input ownership resolved by the last :meth:`activate_enabled`
+        #: (R2), before any secret, setting or module was touched. ``None``
+        #: until one is resolved.
+        self.input_ownership: InputOwnership | None = None
 
     @property
     def abandoned(self) -> tuple[asyncio.Task[Any], ...]:
@@ -462,6 +482,20 @@ class ModuleLoader:
         declarations = {name: _declaration(discovered[name]) for name in enabled}
         self._validate_compatibility(enabled, declarations)
 
+        # Input ownership is resolved from the manifests and the profile alone,
+        # before any secret is resolved, any setting validated, any declaration
+        # recorded or any module prepared: an ambiguous configuration is
+        # refused with 0 modules touched (R2, AC7). Its diagnostics are raised
+        # before credential redaction runs, so they never quote an owner equal
+        # to an environment value or to a configured credential literal.
+        self.input_ownership = resolve_input_ownership(
+            enabled,
+            declarations,
+            config.get("inputs"),
+            redacted=self._environment_values()
+            | _credential_literals(enabled, declarations, settings),
+        )
+
         # Secrets belong to the enabled set only (R7, AC25). A disabled module's
         # ``${NAME}`` reference is never looked up, so an unresolvable one does
         # not stop an application that does not run that module.
@@ -522,6 +556,21 @@ class ModuleLoader:
                 self._validate_v1_handle(name, handle)
 
         return list(self.activations)
+
+    def _environment_values(self) -> frozenset[str]:
+        """Every value a ``${NAME}`` reference could have resolved to.
+
+        An ``inputs`` owner may have been resolved from the environment
+        before it reached the loader, so a diagnostic never quotes an owner
+        equal to one of these values.
+        """
+
+        try:
+            return frozenset(
+                value for value in self.environ.values() if isinstance(value, str)
+            )
+        except Exception:
+            return frozenset()
 
     async def load(self, config: Mapping[str, Any]) -> list[ModuleActivation]:
         """Compatibility alias for :meth:`activate_enabled`."""
@@ -1138,7 +1187,18 @@ class ModuleLoader:
             return []
         hook_name = declaration.settings_validator or MANIFEST_SETTINGS_VALIDATOR_KEY
         try:
-            outcome = validator(settings)
+            # D7: an ownership-aware hook receives this module's owned view;
+            # every other hook is called exactly as before.
+            if _declares_owned_inputs(validator):
+                ownership = self.input_ownership
+                view = (
+                    OwnedInputs.unrestricted()
+                    if ownership is None
+                    else ownership.view_for(name)
+                )
+                outcome = validator(settings, owned_inputs=view)
+            else:
+                outcome = validator(settings)
             if inspect.isawaitable(outcome):
                 status, result = await self._await_module(
                     outcome,
@@ -1545,7 +1605,24 @@ def _validate_manifest(directory_name: str, value: Any) -> ManifestDeclaration:
         actions=_manifest_actions(name, manifest),
         triggers=_manifest_triggers(name, manifest),
         credentials=_manifest_credentials(name, manifest, settings_schema),
+        input_families=_manifest_input_families(name, manifest),
+        declares_input_families=MANIFEST_INPUT_FAMILIES_KEY in manifest,
     )
+
+
+def _manifest_input_families(
+    name: str, manifest: Mapping[str, Any]
+) -> tuple[InputFamilyDeclaration, ...]:
+    """Parse the optional ``input_families`` declaration (R2)."""
+
+    if MANIFEST_INPUT_FAMILIES_KEY not in manifest:
+        return ()
+    try:
+        return parse_input_families(
+            manifest[MANIFEST_INPUT_FAMILIES_KEY], MANIFEST_INPUT_FAMILIES_KEY
+        )
+    except ContractError as exc:
+        raise _field_error(name, exc.field, _sanitised_reason(exc.reason)) from None
 
 
 def _manifest_version(name: str, manifest: Mapping[str, Any]) -> int:
@@ -1684,6 +1761,27 @@ def _schema_declares_string(schema: Any, path: Sequence[str]) -> bool:
             return False
         node = properties[segment]
     return isinstance(node, Mapping) and node.get("type") == "string"
+
+
+def _credential_literals(
+    enabled: Sequence[str],
+    declarations: Mapping[str, ManifestDeclaration],
+    settings: Mapping[str, Any],
+) -> frozenset[str]:
+    """Every configured value an enabled module declares as a credential.
+
+    Read from the settings as configured, before any reference is resolved:
+    a resolved credential is already an environment value, and a literal one
+    must be kept out of the diagnostics raised ahead of credential redaction.
+    """
+
+    values: set[str] = set()
+    for name in enabled:
+        for path in declarations[name].credentials:
+            value = _value_at(settings.get(name), path)
+            if isinstance(value, str) and value:
+                values.add(value)
+    return frozenset(values)
 
 
 def _value_at(settings: Any, path: Sequence[str]) -> Any:
@@ -2183,4 +2281,343 @@ def _module_diagnostic(
             field_name = hook_name
     return _field_diagnostic(
         module, field_name, _sanitised_reason(_redact_values(reason, values))
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Input ownership (R2, D2, D3, D7)
+# --------------------------------------------------------------------------- #
+
+ORIGIN_EXPLICIT = "explicit"
+ORIGIN_DEFAULT = "default"
+ORIGIN_UNOWNED = "unowned"
+
+_INPUTS_KEY = "inputs"
+_MAX_KEY_LENGTH = 64
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedInputs:
+    """One module's read-only view of the (family, platform) pairs it owns.
+
+    ``pairs`` holds the resolved rows the module owns, the wildcard row
+    included. A platform outside them is owned through the wildcard row
+    unless that platform is assigned to someone else — what ``excluded``
+    holds per family.
+    """
+
+    pairs: frozenset[tuple[str, str]] = frozenset()
+    excluded: Mapping[str, frozenset[str]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    @classmethod
+    def unrestricted(cls) -> "OwnedInputs":
+        """The view used when no ownership table is installed: every pair."""
+
+        return cls(pairs=frozenset((family, WILDCARD) for family in INPUT_FAMILIES))
+
+    def owns(self, family: str, platform: str) -> bool:
+        if (family, platform) in self.pairs:
+            return True
+        if platform == WILDCARD or (family, WILDCARD) not in self.pairs:
+            return False
+        return platform not in self.excluded.get(family, frozenset())
+
+    def platforms(self, family: str) -> tuple[str, ...]:
+        """The rows of *family* this view owns, sorted, ``'*'`` included."""
+
+        return tuple(sorted(platform for owned, platform in self.pairs if owned == family))
+
+
+@dataclass(frozen=True, slots=True)
+class _Row:
+    owner: str | None
+    origin: str
+    candidates: tuple[str, ...]
+    set_none: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class InputOwnership:
+    """The resolved owner of every (family, platform) pair (R2, D2).
+
+    The domain of each family is its wildcard row, every pair an enabled
+    module declares and every pair the ``inputs`` block names; a platform
+    outside it is answered by the family's wildcard row.
+    """
+
+    _rows: Mapping[tuple[str, str], _Row]
+
+    def _row(self, family: str, platform: str) -> _Row:
+        row = self._rows.get((family, platform))
+        if row is None:
+            row = self._rows.get((family, WILDCARD))
+        if row is None:
+            return _Row(None, ORIGIN_UNOWNED, ())
+        return row
+
+    def owner(self, family: str, platform: str) -> str | None:
+        return self._row(family, platform).owner
+
+    def origin(self, family: str, platform: str) -> str:
+        return self._row(family, platform).origin
+
+    def candidates(self, family: str, platform: str) -> tuple[str, ...]:
+        row = self._rows.get((family, platform))
+        if row is not None:
+            return row.candidates
+        return self._row(family, WILDCARD).candidates
+
+    def is_set_none(self, family: str, platform: str) -> bool:
+        return self._row(family, platform).set_none
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(self._rows))
+
+    def excluded(self, family: str) -> frozenset[str]:
+        wildcard_owner = self.owner(family, WILDCARD)
+        return frozenset(
+            platform
+            for (owned, platform), row in self._rows.items()
+            if owned == family and platform != WILDCARD and row.owner != wildcard_owner
+        )
+
+    def view_for(self, module: str) -> OwnedInputs:
+        pairs = frozenset(pair for pair, row in self._rows.items() if row.owner == module)
+        families = {family for family, _ in pairs}
+        return OwnedInputs(
+            pairs=pairs,
+            excluded=MappingProxyType(
+                {family: self.excluded(family) for family in sorted(families)}
+            ),
+        )
+
+    def constrains_any(self) -> bool:
+        return any(row.owner is not None or row.set_none for row in self._rows.values())
+
+
+def _quoted(value: str) -> str:
+    """A configuration key, bounded, for an ``inputs`` diagnostic."""
+
+    text = " ".join(value.split())
+    if len(text) > _MAX_KEY_LENGTH:
+        text = text[: _MAX_KEY_LENGTH - 1] + "…"
+    return repr(text)
+
+
+def _owner_text(value: Any, redacted: frozenset[str]) -> str:
+    """An owner value for a diagnostic: quoted, unless it may be a secret."""
+
+    if not isinstance(value, str) or value in redacted:
+        return repr(_REDACTED_VALUE)
+    if _FIELD_PATH.fullmatch(value) is None:
+        return repr(_REDACTED_VALUE)
+    return _quoted(value)
+
+
+def _listed(quoted: Sequence[str]) -> str:
+    if len(quoted) == 2:
+        return f"both {quoted[0]} and {quoted[1]}"
+    return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
+
+
+def _inputs_line(family: str, platform: str | None, reason: str) -> str:
+    where = f"{_INPUTS_KEY}: family {_quoted(family)}"
+    if platform is not None:
+        where += f": platform {_quoted(platform)}"
+    return f"{where}: {_value_free_reason(reason)}"
+
+
+def resolve_input_ownership(
+    enabled: Sequence[str],
+    declarations: Mapping[str, ManifestDeclaration],
+    inputs: Mapping[str, Any] | None,
+    *,
+    redacted: frozenset[str] = frozenset(),
+) -> InputOwnership:
+    """Resolve exactly one owner, or none, for every (family, platform) pair.
+
+    Pure: it reads the enabled declarations and the ``inputs`` block and
+    nothing else (R2, D2). For one pair the explicit ``inputs.F.P`` entry
+    wins, then ``inputs.F.'*'``, then the single enabled module declaring the
+    pair concretely with ``default: true``, then the single enabled module
+    declaring the family's wildcard with ``default: true``; otherwise the pair
+    is unowned. Every refusal is collected first and raised as one
+    :class:`ModuleLoadError`, one value-free line per refusal. An owner value
+    equal to one of *redacted* is never quoted.
+    """
+
+    refusals: list[str] = []
+
+    # Every enabled declarer, per (family, platform) row, and the defaults.
+    declared: dict[tuple[str, str], list[str]] = {}
+    defaults: dict[tuple[str, str], list[str]] = {}
+    for name in enabled:
+        declaration = declarations.get(name)
+        if declaration is None:
+            continue
+        for entry in declaration.input_families:
+            for platform in entry.platforms:
+                declared.setdefault((entry.family, platform), []).append(name)
+                if entry.default:
+                    defaults.setdefault((entry.family, platform), []).append(name)
+
+    def declares(module: str, family: str, platform: str) -> bool:
+        if module in declared.get((family, WILDCARD), ()):
+            return True
+        return platform != WILDCARD and module in declared.get((family, platform), ())
+
+    # The explicit entries: (family, platform) -> owner name, or None for none.
+    explicit: dict[tuple[str, str], str | None] = {}
+    enabled_set = set(enabled)
+    if inputs is not None and not isinstance(inputs, Mapping):
+        refusals.append(f"{_INPUTS_KEY}: must be a mapping of family to platform to owner")
+        inputs = None
+    for family, entries in (inputs or {}).items():
+        if not isinstance(family, str) or not family.strip():
+            refusals.append(f"{_INPUTS_KEY}: a family key must be non-empty text")
+            continue
+        if family not in INPUT_FAMILY_SET:
+            allowed = ", ".join(INPUT_FAMILIES)
+            reason = f"is outside the vocabulary ({allowed})"
+            if isinstance(entries, Mapping) and entries:
+                for platform, value in entries.items():
+                    shown = _quoted(platform) if isinstance(platform, str) else "?"
+                    refusals.append(
+                        f"{_INPUTS_KEY}: family {_quoted(family)}: platform {shown}: "
+                        f"value {_owner_text(value, redacted)}: family {reason}"
+                    )
+            else:
+                refusals.append(_inputs_line(family, None, f"family {reason}"))
+            continue
+        if not isinstance(entries, Mapping):
+            refusals.append(
+                _inputs_line(family, None, "must be a mapping of platform to owner")
+            )
+            continue
+        for platform, value in entries.items():
+            if not isinstance(platform, str) or not platform.strip():
+                refusals.append(
+                    _inputs_line(family, None, "a platform key must be non-empty text")
+                )
+                continue
+            owners: list[Any] = value if isinstance(value, list) else [value]
+            if not owners or not all(
+                isinstance(item, str) and item.strip() for item in owners
+            ):
+                refusals.append(
+                    _inputs_line(
+                        family,
+                        platform,
+                        f"owner must be one enabled module name or {INPUT_OWNER_NONE!r}",
+                    )
+                )
+                continue
+            owners = list(dict.fromkeys(owners))
+            if len(owners) > 1:
+                listed = _listed([_owner_text(item, redacted) for item in owners])
+                refusals.append(
+                    _inputs_line(
+                        family,
+                        platform,
+                        f"names more than one owner, {listed}; name one module "
+                        f"or {INPUT_OWNER_NONE!r}",
+                    )
+                )
+                continue
+            owner = owners[0]
+            if owner == INPUT_OWNER_NONE:
+                explicit[(family, platform)] = None
+                continue
+            shown = _owner_text(owner, redacted)
+            if owner not in enabled_set:
+                refusals.append(
+                    _inputs_line(family, platform, f"owner {shown} is not enabled")
+                )
+                continue
+            if not declares(owner, family, platform):
+                refusals.append(
+                    _inputs_line(
+                        family,
+                        platform,
+                        f"owner {shown} does not declare family {family!r} "
+                        f"for platform {platform!r}",
+                    )
+                )
+                continue
+            explicit[(family, platform)] = owner
+
+    # The domain (D2): every wildcard row, every declared pair, every
+    # explicit pair (an invalid explicit entry is already a refusal).
+    domain: set[tuple[str, str]] = {(family, WILDCARD) for family in INPUT_FAMILIES}
+    domain.update(declared)
+    domain.update(explicit)
+    for family, entries in (inputs or {}).items():
+        if family in INPUT_FAMILY_SET and isinstance(entries, Mapping):
+            domain.update(
+                (family, platform)
+                for platform in entries
+                if isinstance(platform, str) and platform.strip()
+            )
+
+    def candidates_of(family: str, platform: str) -> tuple[str, ...]:
+        names = set(declared.get((family, WILDCARD), ()))
+        if platform != WILDCARD:
+            names.update(declared.get((family, platform), ()))
+        return tuple(sorted(names))
+
+    rows: dict[tuple[str, str], _Row] = {}
+    for family, platform in sorted(domain):
+        candidates = candidates_of(family, platform)
+        for key in ((family, platform), (family, WILDCARD)):
+            if key in explicit:
+                owner = explicit[key]
+                rows[(family, platform)] = _Row(
+                    owner, ORIGIN_EXPLICIT, candidates, set_none=owner is None
+                )
+                break
+        else:
+            levels = [(family, WILDCARD)]
+            if platform != WILDCARD:
+                levels.insert(0, (family, platform))
+            owner = None
+            for level in levels:
+                owners = sorted(set(defaults.get(level, ())))
+                if len(owners) > 1:
+                    # A wildcard ambiguity is reported once, on its own row.
+                    if level[1] == platform:
+                        refusals.append(
+                            _inputs_line(
+                                family,
+                                platform,
+                                f"owned by default by {_listed([repr(o) for o in owners])}; set "
+                                f"{_INPUTS_KEY}.{family}.{platform}",
+                            )
+                        )
+                    break
+                if owners:
+                    owner = owners[0]
+                    break
+            rows[(family, platform)] = (
+                _Row(owner, ORIGIN_DEFAULT, candidates)
+                if owner is not None
+                else _Row(None, ORIGIN_UNOWNED, candidates)
+            )
+
+    if refusals:
+        raise ModuleLoadError("\n".join(refusals), diagnostics=refusals)
+    return InputOwnership(MappingProxyType(rows))
+
+
+def _declares_owned_inputs(validator: Any) -> bool:
+    """Whether a settings hook declares the ``owned_inputs`` keyword (D7)."""
+
+    try:
+        parameter = inspect.signature(validator).parameters.get("owned_inputs")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
     )
