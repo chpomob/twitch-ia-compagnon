@@ -737,6 +737,8 @@ _CONSTRAINT_KEYWORDS = frozenset(
         "enum",
         "minimum",
         "maximum",
+        "minLength",
+        "maxLength",
         "required",
         "properties",
         "items",
@@ -761,8 +763,9 @@ _TYPE_NAMES = frozenset(
 def validate_schema(schema: Any, *, label: str) -> None:
     """Raise :class:`SchemaError` unless *schema* uses the supported subset.
 
-    The subset is ``type``, ``enum``, ``minimum``, ``maximum``, ``required``,
-    ``properties``, ``items`` and ``additionalProperties``. A ``default``
+    The subset is ``type``, ``enum``, ``minimum``, ``maximum``, ``minLength``,
+    ``maxLength``, ``required``, ``properties``, ``items`` and
+    ``additionalProperties``. A ``default``
     annotation must satisfy the node that declares it; a nested node's
     ``default`` is checked through the same recursion.
     """
@@ -799,6 +802,22 @@ def validate_schema(schema: Any, *, label: str) -> None:
     if "minimum" in schema and "maximum" in schema:
         if float(schema["minimum"]) > float(schema["maximum"]):
             raise SchemaError(f"{label}.minimum", "must not exceed maximum")
+
+    # Length bounds count code points and are enforced on strings only. A node
+    # declaring one must therefore say ``type: string``: on any other node the
+    # bound could never be enforced, and an unenforced constraint must never
+    # look enforced, so it is refused here instead of being ignored.
+    length_bounds = [b for b in ("minLength", "maxLength") if b in schema]
+    for bound in length_bounds:
+        value = schema[bound]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise SchemaError(f"{label}.{bound}", "must be a non-negative integer")
+        if schema.get("type") != "string":
+            raise SchemaError(
+                f"{label}.{bound}", "applies only to a node declaring type 'string'"
+            )
+    if len(length_bounds) == 2 and schema["minLength"] > schema["maxLength"]:
+        raise SchemaError(f"{label}.minLength", "must not exceed maxLength")
 
     if "required" in schema:
         required = schema["required"]
@@ -884,6 +903,21 @@ def _apply_schema(value: Any, schema: Mapping[str, Any], *, label: str) -> None:
             # float exactly, so the mixed comparison stays precise.
             if not ok(value, schema[bound]):
                 raise ContractError(label, f"{wording} {schema[bound]!r}, got {value!r}")
+
+    for bound, ok, wording in (
+        ("minLength", lambda n, b: n >= b, "must be at least"),
+        ("maxLength", lambda n, b: n <= b, "must be at most"),
+    ):
+        if bound in schema:
+            if not isinstance(value, str):
+                raise ContractError(
+                    label, f"must be a string to satisfy {bound}, got {type(value).__name__}"
+                )
+            if not ok(len(value), schema[bound]):
+                raise ContractError(
+                    f"{label}.{bound}",
+                    f"{wording} {schema[bound]} characters, got {len(value)}",
+                )
 
     object_keywords = {"required", "properties", "additionalProperties"} & set(schema)
     if object_keywords:

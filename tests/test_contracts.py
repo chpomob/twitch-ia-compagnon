@@ -17,11 +17,13 @@ from core.contracts import (
     ContractError,
     Destination,
     TriggerPolicy,
+    SchemaError,
     TriggerRule,
     sanitize_trace,
     validate_against_schema,
     validate_event_kind,
     validate_parts,
+    validate_schema,
 )
 from core.loader import ModuleLoader, ModuleLoadError
 from core.runtime import RUNTIME_API
@@ -85,6 +87,127 @@ def test_bounds_still_reject_non_numbers() -> None:
         validate_against_schema("2", {"maximum": 2}, label="x")
     with pytest.raises(ContractError):
         validate_against_schema(True, {"maximum": 2}, label="x")
+
+
+# --------------------------------------------------------------------------- #
+# String length bounds (phase 5, P12F1)
+# --------------------------------------------------------------------------- #
+
+
+def test_string_length_bounds_are_enforced() -> None:
+    schema = {"type": "string", "minLength": 1, "maxLength": 128}
+    validate_against_schema("a", schema, label="x")
+    validate_against_schema("a" * 128, schema, label="x")
+    # Counted in code points, not bytes.
+    validate_against_schema("é" * 128, schema, label="x")
+
+    with pytest.raises(ContractError) as short:
+        validate_against_schema("", schema, label="x")
+    assert short.value.field == "x.minLength"
+    assert "at least 1" in str(short.value)
+
+    with pytest.raises(ContractError) as long:
+        validate_against_schema("a" * 129, schema, label="x")
+    assert long.value.field == "x.maxLength"
+    assert "at most 128" in str(long.value)
+
+
+def test_string_length_bounds_are_enforced_on_nested_nodes() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "minLength": 1, "maxLength": 128},
+            "tags": {"type": "array", "items": {"type": "string", "maxLength": 3}},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+    validate_against_schema({"action": "go", "tags": ["abc"]}, schema, label="args")
+
+    with pytest.raises(ContractError) as empty:
+        validate_against_schema({"action": ""}, schema, label="args")
+    assert empty.value.field == "args.action.minLength"
+
+    with pytest.raises(ContractError) as long:
+        validate_against_schema({"action": "a" * 129}, schema, label="args")
+    assert long.value.field == "args.action.maxLength"
+
+    with pytest.raises(ContractError) as item:
+        validate_against_schema({"action": "go", "tags": ["ok", "toolong"]}, schema, label="args")
+    assert item.value.field == "args.tags[1].maxLength"
+
+
+def test_run_action_schema_is_accepted_by_an_action_spec() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "minLength": 1, "maxLength": 128},
+            "arguments": {"type": "object"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+    spec = dataclasses.replace(_spec({"type": "object"}), argument_schema=schema)
+    spec.validate_arguments({"action": "a" * 128, "arguments": {}})
+    for bad in ("", "a" * 129):
+        with pytest.raises(ContractError):
+            spec.validate_arguments({"action": bad})
+
+
+@pytest.mark.parametrize(
+    ("schema", "field"),
+    [
+        ({"type": "string", "minLength": True}, "s.minLength"),
+        ({"type": "string", "maxLength": False}, "s.maxLength"),
+        ({"type": "string", "minLength": -1}, "s.minLength"),
+        ({"type": "string", "maxLength": -5}, "s.maxLength"),
+        ({"type": "string", "maxLength": 2.0}, "s.maxLength"),
+        ({"type": "string", "minLength": 3, "maxLength": 2}, "s.minLength"),
+        (
+            {"type": "object", "properties": {"a": {"type": "string", "minLength": -1}}},
+            "s.properties.a.minLength",
+        ),
+        ({"type": "array", "items": {"type": "string", "maxLength": True}}, "s.items.maxLength"),
+    ],
+)
+def test_malformed_length_bounds_are_refused(schema: dict, field: str) -> None:
+    with pytest.raises(SchemaError) as refused:
+        validate_schema(schema, label="s")
+    assert refused.value.field == field
+
+
+@pytest.mark.parametrize("declared", [None, "integer", "number", "array", "object", "boolean", "null"])
+@pytest.mark.parametrize("bound", ["minLength", "maxLength"])
+def test_length_bound_on_a_non_string_node_is_refused(declared: str | None, bound: str) -> None:
+    schema: dict = {bound: 1}
+    if declared is not None:
+        schema["type"] = declared
+    with pytest.raises(SchemaError) as refused:
+        validate_schema(schema, label="s")
+    assert refused.value.field == f"s.{bound}"
+    assert "string" in refused.value.reason
+
+
+def test_schemas_without_length_bounds_validate_as_before() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"n": {"type": "integer", "minimum": 0, "maximum": 3}},
+        "required": ["n"],
+        "additionalProperties": False,
+    }
+    validate_against_schema({"n": 2}, schema, label="x")
+    with pytest.raises(ContractError) as high:
+        validate_against_schema({"n": 4}, schema, label="x")
+    assert high.value.field == "x.n"
+    # A string node with no length bound still accepts any length.
+    validate_against_schema("", {"type": "string"}, label="x")
+    validate_against_schema("a" * 10_000, {"type": "string"}, label="x")
+    # The vocabulary stays closed: other keywords are still refused.
+    for keyword, value in (("pattern", "^a$"), ("minItems", 1), ("format", "uri")):
+        with pytest.raises(SchemaError) as refused:
+            validate_schema({"type": "string", keyword: value}, label="s")
+        assert refused.value.field == f"s.{keyword}"
+        assert "unsupported schema keyword" in refused.value.reason
 
 
 def test_secret_never_reaches_a_trace_diagnostic() -> None:
