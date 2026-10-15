@@ -332,6 +332,7 @@ settings_schema:
                     - follow
                     - tip
                     - watch_tick
+                    - cue
                 description: Non-empty list of event kinds the route matches.
               command:
                 title: Command

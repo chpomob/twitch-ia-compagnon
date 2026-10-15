@@ -52,7 +52,7 @@ PROMISES = (
     "audio.speak → playback completed, 1 500 ms played",
     "the lease was released with the run",
     "status 0 · 0 failures",
-    "8 counters are all zero",
+    "9 counters are all zero",
 )
 """What the narration must say: the run a newcomer is promised, end to end."""
 

@@ -228,6 +228,7 @@ triggers:
                 - follow
                 - tip
                 - watch_tick
+                - cue
         required:
           - kinds
         additionalProperties: false

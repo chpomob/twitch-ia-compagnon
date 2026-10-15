@@ -58,9 +58,14 @@ EVENT_KINDS = (
     "follow",
     "tip",
     "watch_tick",
+    "cue",
 )
 """The closed, ordered vocabulary of an input event's ``payload.kind``
-(R1, R6). It names what happened, never which source produced it."""
+(R1, R6). It names what happened, never which source produced it.
+
+``cue`` (phase 5, A5) is appended last so the earlier indices keep their
+order: an operator automation deliberately routed this event to the
+companion."""
 
 EVENT_KIND_SET = frozenset(EVENT_KINDS)
 """Membership view of :data:`EVENT_KINDS`."""
@@ -69,10 +74,40 @@ EVENT_KIND_DEFAULT = "message"
 """The kind of an event that carries none (every phase-2 event)."""
 
 PLATFORM_NOTICE_KINDS = tuple(
-    kind for kind in EVENT_KINDS if kind not in ("message", "watch_tick")
+    kind for kind in EVENT_KINDS if kind not in ("message", "watch_tick", "cue")
 )
-"""The community-notice kinds: every kind except an ordinary message and the
-continuous-capture tick (R1 route safety)."""
+"""The community-notice kinds: every kind except an ordinary message, the
+continuous-capture tick and a routed cue (R1 route safety, A5)."""
+
+# --------------------------------------------------------------------------- #
+# Input families (phase 5, A4, R2, R3)
+# --------------------------------------------------------------------------- #
+
+INPUT_FAMILIES = ("chat", "viewers", "cues")
+"""The closed, kernel-defined vocabulary of input families (A4).
+
+For every (family, platform) pair at most one provider is active, resolved at
+preparation; the names say what is ingested, never which source provides it.
+"""
+
+INPUT_FAMILY_SET = frozenset(INPUT_FAMILIES)
+"""Membership view of :data:`INPUT_FAMILIES`."""
+
+INPUT_OWNER_NONE = "none"
+"""The owner literal that leaves a (family, platform) pair deliberately unowned."""
+
+CHAT_FAMILY_KINDS = ("message", *PLATFORM_NOTICE_KINDS)
+"""The event kinds the ``chat`` family covers: an ordinary message and every
+platform notice, never ``watch_tick`` nor ``cue`` (D1)."""
+
+CUE_KIND = "cue"
+"""The event kind the ``cues`` family covers (A5)."""
+
+INPUT_FAMILY_GATED_ACTIONS = MappingProxyType({"viewers": "users.read"})
+"""Families whose ingestion is an action rather than a publication: the action
+is bound only for the platforms its module owns in that family (R3)."""
+
+_INPUT_EVENT_TYPE = "channel.chat.message"
 
 IDEMPOTENCY_POLICIES = frozenset({"none", "key", "natural"})
 """How a provider behaves when the same call is replayed.
@@ -114,6 +149,10 @@ TRACE_BRAIN_RUN_COMPLETED = "brain.run.completed"
 TRACE_ACTION_STARTED = "action.started"
 TRACE_ACTION_COMPLETED = "action.completed"
 TRACE_CHANNEL_CHAT_SENT = "channel.chat.sent"
+TRACE_INPUT_OWNERSHIP_REJECTED = "input.ownership.rejected"
+"""Diagnostic published when an input is refused for a (family, platform) pair
+its publisher does not own (R3). Not part of :data:`TRACE_EVENT_TYPES`, whose
+order is the phase-1 publication vocabulary."""
 
 TRACE_EVENT_TYPES = (
     TRACE_MODULE_READY,
@@ -188,7 +227,11 @@ it when the publication of an already-recorded terminal state fails, so the
 loss is visible instead of silent. It is still readable from a snapshot.
 """
 
-DIAGNOSTIC_COUNTERS = (COUNTER_LOST_TRACES,)
+COUNTER_INPUT_OWNERSHIP_REJECTIONS = "input_ownership_rejections"
+"""Diagnostic count of input events refused because their publisher does not
+own the (family, platform) pair they belong to (R3)."""
+
+DIAGNOSTIC_COUNTERS = (COUNTER_LOST_TRACES, COUNTER_INPUT_OWNERSHIP_REJECTIONS)
 """Counters exposed by a snapshot but outside the required set."""
 
 RESERVED_TRACE_KEYS = frozenset({"prompt", "reasoning"})
@@ -476,16 +519,19 @@ __all__ = [
     "CAPABILITY_AUDIO",
     "CAPABILITY_STRUCTURED_OUTPUT",
     "CAPABILITY_VISION",
+    "CHAT_FAMILY_KINDS",
     "COMBINATION_OPERATORS",
     "CONTRACT_VERSION",
     "COUNTER_ACTION_TIMEOUTS",
     "COUNTER_ADMISSION_REJECTIONS",
     "COUNTER_AUDIT_RECORD_LOSSES",
     "COUNTER_DEDUP_EVICTIONS",
+    "COUNTER_INPUT_OWNERSHIP_REJECTIONS",
     "COUNTER_LOST_TRACES",
     "COUNTER_RUN_DEADLINE_EXPIRIES",
     "COUNTER_STALE_DROP",
     "COUNTER_TRIGGER_REJECTIONS",
+    "CUE_KIND",
     "DELIVERY_REASON_EMPTY",
     "DELIVERY_REASON_NOT_A_DELIVERY",
     "DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS",
@@ -510,6 +556,10 @@ __all__ = [
     "IDEMPOTENCY_POLICIES",
     "IMAGE_CONTENT_TYPES",
     "IMAGE_REF_FIELDS",
+    "INPUT_FAMILIES",
+    "INPUT_FAMILY_GATED_ACTIONS",
+    "INPUT_FAMILY_SET",
+    "INPUT_OWNER_NONE",
     "INTERNAL_TRACE_TYPES",
     "PART_TYPES",
     "PLATFORM_NOTICE_KINDS",
@@ -567,6 +617,7 @@ __all__ = [
     "TRACE_BRAIN_RUN_STARTED",
     "TRACE_CHANNEL_CHAT_SENT",
     "TRACE_EVENT_TYPES",
+    "TRACE_INPUT_OWNERSHIP_REJECTED",
     "TRACE_INPUT_TRIGGER_ACCEPTED",
     "TRACE_INPUT_TRIGGER_REJECTED",
     "TRACE_MAX_BYTES",
@@ -582,13 +633,16 @@ __all__ = [
     "ContractError",
     "Counters",
     "Destination",
+    "InputFamilyDeclaration",
     "SchemaError",
     "SessionKey",
     "TriggerPolicy",
     "TriggerRule",
     "TriggerSpec",
     "TriggerTypeDeclaration",
+    "input_family_of_event",
     "observation_size",
+    "parse_input_families",
     "sanitize_trace",
     "trace_size",
     "validate_against_schema",
@@ -1263,6 +1317,114 @@ def validate_event_kind(value: Any, field: str) -> str:
     return value
 
 
+def input_family_of_event(event: Any) -> tuple[str, str] | None:
+    """Return the ``(family, platform)`` pair an input event belongs to (A4, D1).
+
+    Only a ``channel.chat.message`` belongs to a family: its ``payload.kind``
+    (default ``message``) in :data:`CHAT_FAMILY_KINDS` is ``chat`` and
+    :data:`CUE_KIND` is ``cues``. Any other event type, a ``watch_tick``, an
+    unknown kind, or a payload without a non-blank text ``platform`` returns
+    ``None``: a malformed event belongs to no family and is never guessed.
+    """
+
+    if not isinstance(event, Mapping) or event.get("type") != _INPUT_EVENT_TYPE:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    kind = payload.get("kind")
+    if kind is None:
+        kind = EVENT_KIND_DEFAULT
+    if kind == CUE_KIND:
+        family = "cues"
+    elif isinstance(kind, str) and kind in CHAT_FAMILY_KINDS:
+        family = "chat"
+    else:
+        return None
+    platform = payload.get("platform")
+    if not isinstance(platform, str) or not platform.strip():
+        return None
+    return family, platform
+
+
+@dataclass(frozen=True, slots=True)
+class InputFamilyDeclaration:
+    """One ``input_families`` manifest entry (R2): a family of the A4
+    vocabulary, the platforms it covers (concrete names or the single
+    :data:`WILDCARD`) and whether the module owns them by default."""
+
+    family: str
+    platforms: tuple[str, ...]
+    default: bool
+
+
+_INPUT_FAMILY_KEYS = frozenset({"family", "platforms", "default"})
+
+
+def parse_input_families(value: Any, field: str) -> tuple[InputFamilyDeclaration, ...]:
+    """Validate a manifest's ``input_families`` value (R2).
+
+    Refuses, with a :class:`ContractError` naming the field path: a non-list
+    value; an entry that is not a mapping with exactly the keys ``family``,
+    ``platforms`` and ``default``; a family outside :data:`INPUT_FAMILIES`; an
+    empty platform list, a non-text platform, or :data:`WILDCARD` mixed with
+    concrete names; a (family, platform) pair declared twice; a non-bool
+    ``default``.
+    """
+
+    if not isinstance(value, list):
+        raise ContractError(field, f"must be a list, got {type(value).__name__}")
+    declarations: list[InputFamilyDeclaration] = []
+    seen: set[tuple[str, str]] = set()
+    for index, entry in enumerate(value):
+        label = f"{field}[{index}]"
+        _require_mapping(entry, label)
+        keys = set(entry)
+        if keys != _INPUT_FAMILY_KEYS:
+            missing = sorted(_INPUT_FAMILY_KEYS - keys)
+            extra = sorted(keys - _INPUT_FAMILY_KEYS)
+            raise ContractError(
+                label,
+                "must have exactly the keys default, family, platforms"
+                f" (missing: {missing}, unexpected: {extra})",
+            )
+        family = entry["family"]
+        if not isinstance(family, str) or family not in INPUT_FAMILY_SET:
+            allowed = ", ".join(INPUT_FAMILIES)
+            raise ContractError(f"{label}.family", f"must be one of {allowed}, got {family!r}")
+        raw_platforms = entry["platforms"]
+        platforms_field = f"{label}.platforms"
+        if not isinstance(raw_platforms, list):
+            raise ContractError(
+                platforms_field, f"must be a list, got {type(raw_platforms).__name__}"
+            )
+        if not raw_platforms:
+            raise ContractError(platforms_field, "must not be empty")
+        platforms = tuple(
+            _require_text(platform, f"{platforms_field}[{position}]")
+            for position, platform in enumerate(raw_platforms)
+        )
+        if WILDCARD in platforms and len(platforms) > 1:
+            raise ContractError(
+                platforms_field, f"{WILDCARD!r} must be the only platform when present"
+            )
+        for position, platform in enumerate(platforms):
+            pair = (family, platform)
+            if pair in seen:
+                raise ContractError(
+                    f"{platforms_field}[{position}]",
+                    f"duplicates the declaration of ({family}, {platform})",
+                )
+            seen.add(pair)
+        default = entry["default"]
+        if not isinstance(default, bool):
+            raise ContractError(
+                f"{label}.default", f"must be a boolean, got {type(default).__name__}"
+            )
+        declarations.append(InputFamilyDeclaration(family, platforms, default))
+    return tuple(declarations)
+
+
 def _validate_action_name(value: Any, field: str) -> None:
     _validate_dotted_name(value, field, minimum_segments=2)
 
@@ -1887,8 +2049,9 @@ class Counters:
 
     The seven counters R8 requires are pre-declared at construction, so a
     snapshot lists them all and is readable even before anything happened
-    (AC28). The diagnostic :data:`COUNTER_LOST_TRACES` is pre-declared too and
-    is reported alongside them without joining the required set.
+    (AC28). The :data:`DIAGNOSTIC_COUNTERS` (lost traces, input-ownership
+    rejections) are pre-declared too and reported alongside them without
+    joining the required set.
 
     Incrementing an undeclared name raises rather than creating it, so a typo
     surfaces instead of quietly producing a counter nobody reads. A layer that

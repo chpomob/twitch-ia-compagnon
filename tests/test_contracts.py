@@ -372,6 +372,9 @@ def test_delivery_text_argument_value_must_be_a_name() -> None:
 
 
 def test_event_kind_vocabulary_is_the_nine_names_in_order() -> None:
+    """Superseded by phase 5 R7 (A5): ``cue`` is appended as the tenth kind,
+    last, so the nine earlier names keep their order and indices."""
+
     assert EVENT_KINDS == (
         "message",
         "sub",
@@ -382,16 +385,30 @@ def test_event_kind_vocabulary_is_the_nine_names_in_order() -> None:
         "follow",
         "tip",
         "watch_tick",
+        "cue",
     )
+    assert len(EVENT_KINDS) == 10 and EVENT_KINDS[-1] == "cue"
     assert EVENT_KIND_SET == frozenset(EVENT_KINDS)
     assert EVENT_KIND_DEFAULT == "message"
 
 
 def test_platform_notice_kinds_exclude_message_and_watch_tick() -> None:
-    """R1 route safety: a notice kind is never an ordinary message or a tick."""
+    """R1 route safety: a notice kind is never an ordinary message or a tick.
+
+    Phase 5 A5: nor a routed ``cue``, and the seven members are unchanged."""
 
     assert len(PLATFORM_NOTICE_KINDS) == 7
-    assert set(PLATFORM_NOTICE_KINDS) == EVENT_KIND_SET - {"message", "watch_tick"}
+    assert set(PLATFORM_NOTICE_KINDS) == EVENT_KIND_SET - {"message", "watch_tick", "cue"}
+    assert "cue" not in PLATFORM_NOTICE_KINDS
+    assert PLATFORM_NOTICE_KINDS == (
+        "sub",
+        "resub",
+        "sub_gift",
+        "community_sub_gift",
+        "raid",
+        "follow",
+        "tip",
+    )
     assert list(PLATFORM_NOTICE_KINDS) == [
         kind for kind in EVENT_KINDS if kind in PLATFORM_NOTICE_KINDS
     ]
