@@ -91,7 +91,7 @@ import asyncio
 import inspect
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -616,13 +616,41 @@ class AuthorizationPolicy:
 
 @dataclass(frozen=True, slots=True)
 class ActionBinding:
-    """One provider bound to one action over one destination scope."""
+    """One provider bound to one action over one destination scope.
+
+    ``excluded_platforms`` is only ever non-empty on a binding whose platform
+    is the wildcard: the concrete platforms that binding does *not* serve,
+    because another binding (or nobody) serves them (R3, D5). It is set by the
+    runtime's family-gated binding, never by a module.
+    """
 
     spec: ActionSpec
     provider: Any
     provider_name: str
     destination: Destination
     module: str
+    excluded_platforms: frozenset[str] = frozenset()
+
+    def covers(self, destination: Destination) -> bool:
+        """Whether this binding serves every target *destination* designates."""
+
+        if destination.platform in self.excluded_platforms:
+            return False
+        return self.destination.contains(destination)
+
+    def overlaps(self, destination: Destination, excluded: frozenset[str] = frozenset()) -> bool:
+        """Whether some target is served both by this binding and by *destination*.
+
+        *excluded* is the other side's own exclusion set. A wildcard-platform
+        side never covers a concrete platform it excludes, so a concrete
+        binding at an excluded platform does not overlap it.
+        """
+
+        if not self.destination.overlaps(destination):
+            return False
+        if destination.platform in self.excluded_platforms:
+            return False
+        return self.destination.platform not in excluded
 
 
 class ActionRegistry:
@@ -691,6 +719,7 @@ class ActionRegistry:
         module: str,
         destinations: Destination | Sequence[Destination] | None = None,
         provider_name: str | None = None,
+        excluded_platforms: Iterable[str] = (),
     ) -> tuple[ActionBinding, ...]:
         """Bind *provider* to *action_name* over one or more destination scopes.
 
@@ -698,6 +727,10 @@ class ActionRegistry:
         and against every existing binding **before** anything is recorded, so a
         binding that fails leaves the registry exactly as it was and invokes 0
         providers (AC16).
+
+        *excluded_platforms* names concrete platforms a wildcard-platform
+        destination does not serve (D5): they are neither overlapped nor
+        resolved through it. A concrete destination carries no exclusion.
         """
 
         _require_text(action_name, "ActionRegistry.bind.action_name")
@@ -718,6 +751,7 @@ class ActionRegistry:
             )
 
         targets = _destination_sequence(destinations, spec)
+        excluded = _excluded_platforms(excluded_platforms)
         existing = self._bindings.setdefault(action_name, [])
 
         candidates: list[ActionBinding] = []
@@ -728,8 +762,9 @@ class ActionRegistry:
                     f"Provider {name!r} cannot be bound to action {action_name!r} at "
                     f"destination {destination}: the specification supports {declared}."
                 )
+            exclusion = excluded if destination.platform == WILDCARD else frozenset()
             for bound in (*existing, *candidates):
-                if bound.destination.overlaps(destination):
+                if bound.overlaps(destination, exclusion):
                     raise AmbiguousBindingError(
                         action_name,
                         bound.provider_name,
@@ -744,6 +779,7 @@ class ActionRegistry:
                     provider_name=name,
                     destination=destination,
                     module=module,
+                    excluded_platforms=exclusion,
                 )
             )
 
@@ -760,6 +796,7 @@ class ActionRegistry:
         module: str,
         destinations: Destination | Sequence[Destination] | None = None,
         provider_name: str | None = None,
+        excluded_platforms: Iterable[str] = (),
     ) -> tuple[ActionBinding, ...]:
         """Declare *spec* and bind *provider* to it, all or nothing.
 
@@ -791,6 +828,7 @@ class ActionRegistry:
                     spec.supported_destinations if destinations is None else destinations
                 ),
                 provider_name=provider_name,
+                excluded_platforms=excluded_platforms,
             )
         except BaseException:
             self._rollback_declaration(
@@ -891,7 +929,7 @@ class ActionRegistry:
                 if binding.module not in self._ready:
                     continue
                 target = destination if destination is not None else binding.destination
-                if destination is not None and not binding.destination.contains(destination):
+                if destination is not None and not binding.covers(destination):
                     continue
                 if policy.permits(spec, principal=principal, destination=target).allowed:
                     allowed[name] = spec
@@ -921,7 +959,7 @@ class ActionRegistry:
         matches = [
             binding
             for binding in self._bindings.get(action_name, ())
-            if binding.destination.contains(destination)
+            if binding.covers(destination)
         ]
         if not matches:
             return None
@@ -934,6 +972,22 @@ class ActionRegistry:
                 matches[1].destination,
             )
         return matches[0]
+
+
+def _excluded_platforms(platforms: Iterable[str]) -> frozenset[str]:
+    if isinstance(platforms, str) or not isinstance(platforms, Iterable):
+        raise ContractError(
+            "ActionRegistry.bind.excluded_platforms", "must be an iterable of platforms"
+        )
+    excluded = frozenset(platforms)
+    for platform in excluded:
+        _require_text(platform, "ActionRegistry.bind.excluded_platforms")
+        if platform == WILDCARD:
+            raise ContractError(
+                "ActionRegistry.bind.excluded_platforms",
+                f"must name concrete platforms, not {WILDCARD!r}",
+            )
+    return excluded
 
 
 def _destination_sequence(

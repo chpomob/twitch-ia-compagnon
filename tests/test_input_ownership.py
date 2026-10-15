@@ -1450,3 +1450,462 @@ async def test_the_v1_facade_delegates_every_other_bus_call() -> None:
         await facade.publish(event["type"], event["payload"], event["metadata"])
     # (chat, x) is the native module's; (chat, z) has no owner: delivered.
     assert received == ["z"]
+
+
+# --------------------------------------------------------------------------- #
+# P5: family-gated binding — `users.read` bound only where owned (R3, D5)
+# --------------------------------------------------------------------------- #
+
+from core.actions import (  # noqa: E402
+    ActionBinding,
+    ActionExecutor,
+    ActionSpec,
+    AmbiguousBindingError,
+    AuthorizationRule,
+)
+from core.contracts import (  # noqa: E402
+    WILDCARD,
+    ActionCall,
+    ActionObservation,
+    Destination,
+)
+
+_GATED = INPUT_FAMILY_GATED_ACTIONS["viewers"]
+_OPERATOR = "operator:companion"
+_ANY_CHAT = Destination(WILDCARD, WILDCARD, "chat")
+
+
+def _gated_spec(name: str = _GATED) -> ActionSpec:
+    return ActionSpec(
+        name=name,
+        version=1,
+        description="Read one page of the observed chat authors.",
+        argument_schema={
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        result_schema={"type": "object"},
+        nature="read",
+        required_permissions=("users.read",),
+        supported_destinations=(_ANY_CHAT,),
+        timeout_seconds=5.0,
+        idempotency="natural",
+    )
+
+
+class _Spy:
+    """A provider counting what it was actually asked to do."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls: list[Any] = []
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        self.calls.append(invocation)
+        return ActionObservation(
+            status="success", provenance={"transport": "fake"}, result={}
+        )
+
+
+#: A module registering the gated action in activation, as `users` does in
+#: preparation, with the spec and the provider its settings carry.
+_REGISTRAR_SOURCE = """
+class Handle:
+    async def close(self):
+        pass
+
+
+def validate_settings(settings):
+    pass
+
+
+async def activate(context, settings, catalog):
+    settings["bound"].extend(
+        context.actions.register(settings["spec"], settings["provider"])
+    )
+    context.actions.mark_ready()
+    return Handle()
+"""
+
+#: The shipped shape: a `*` default owner and a concrete non-default declarer.
+STAR = _families(("viewers", ["*"], True))
+SECOND = _families(("viewers", ["twitch", "kick", "youtube"], False))
+SECOND_WITH_STAR = _families(
+    ("viewers", ["*"], False), ("viewers", ["twitch", "kick", "youtube"], False)
+)
+DOMAIN = ("twitch", "kick", "youtube")
+
+
+def _gated_context(
+    runtime: RuntimeContext, ownership: InputOwnership, name: str
+) -> ModuleContext:
+    return runtime.for_module(
+        name, owned_inputs=ownership.view_for(name), ownership=ownership, declared=True
+    )
+
+
+def _bare_runtime() -> RuntimeContext:
+    return _context(EventBus())
+
+
+def _register_both(
+    ownership: InputOwnership,
+) -> tuple[ActionRegistry, dict[str, tuple[ActionBinding, ...]]]:
+    runtime = _bare_runtime()
+    bound = {
+        name: _gated_context(runtime, ownership, name).actions.register(
+            _gated_spec(), _Spy(f"{name}-provider")
+        )
+        for name in ("star", "second")
+    }
+    return runtime.actions, bound
+
+
+def _shape(bindings: tuple[ActionBinding, ...]) -> list[tuple[str, frozenset[str]]]:
+    return [(b.destination.platform, b.excluded_platforms) for b in bindings]
+
+
+# -- the registry's exclusion (D5) -------------------------------------------- #
+
+
+def _registry_with(spec: ActionSpec | None = None) -> ActionRegistry:
+    registry = ActionRegistry(authorization=AuthorizationPolicy())
+    registry.declare(spec or _gated_spec(), module="a")
+    return registry
+
+
+@pytest.mark.parametrize("wildcard_first", [True, False])
+def test_an_excluded_platform_is_not_overlapped(wildcard_first: bool) -> None:
+    registry = _registry_with()
+
+    def wildcard() -> Any:
+        return registry.bind(
+            _GATED, _Spy("w"), module="a", excluded_platforms=["twitch"]
+        )
+
+    def concrete() -> Any:
+        return registry.bind(
+            _GATED, _Spy("c"), module="b",
+            destinations=Destination("twitch", WILDCARD, "chat"),
+        )
+
+    first, second = (wildcard, concrete) if wildcard_first else (concrete, wildcard)
+    first()
+    second()
+    bindings = {b.provider_name: b for b in registry.bindings(_GATED)}
+    assert bindings["w"].excluded_platforms == frozenset({"twitch"})
+    assert bindings["c"].excluded_platforms == frozenset()
+    # A platform the wildcard does not exclude still overlaps it.
+    with pytest.raises(AmbiguousBindingError):
+        registry.bind(
+            _GATED, _Spy("k"), module="b",
+            destinations=Destination("kick", WILDCARD, "chat"),
+        )
+    assert registry.resolve(_GATED, Destination("twitch", "c", "chat")) is bindings["c"]
+    assert registry.resolve(_GATED, Destination("kick", "c", "chat")) is bindings["w"]
+
+
+def test_resolve_returns_none_for_an_excluded_platform_with_no_other_binding() -> None:
+    registry = _registry_with()
+    (binding,) = registry.bind(
+        _GATED, _Spy("w"), module="a", excluded_platforms=("kick", "twitch")
+    )
+    assert registry.resolve(_GATED, Destination("kick", "c", "chat")) is None
+    assert registry.resolve(_GATED, Destination("twitch", "c", "chat")) is None
+    assert registry.resolve(_GATED, Destination("other", "c", "chat")) is binding
+
+
+def test_existing_overlap_refusals_are_unchanged_without_an_exclusion() -> None:
+    registry = _registry_with()
+    registry.bind(_GATED, _Spy("w"), module="a")
+    with pytest.raises(AmbiguousBindingError):
+        registry.bind(
+            _GATED, _Spy("c"), module="b",
+            destinations=Destination("twitch", WILDCARD, "chat"),
+        )
+    with pytest.raises(AmbiguousBindingError):
+        registry.bind(_GATED, _Spy("w2"), module="b", excluded_platforms=["twitch"])
+    # A refused binding records nothing.
+    assert [b.provider_name for b in registry.bindings(_GATED)] == ["w"]
+    assert registry.bindings(_GATED)[0].excluded_platforms == frozenset()
+
+
+def test_register_passes_the_exclusion_through() -> None:
+    registry = ActionRegistry(authorization=AuthorizationPolicy())
+    (binding,) = registry.register(
+        _gated_spec(), _Spy("w"), module="a", excluded_platforms=["twitch"]
+    )
+    assert binding.excluded_platforms == frozenset({"twitch"})
+
+
+@pytest.mark.parametrize("excluded", ["twitch", ["*"], [""], [3]])
+def test_a_malformed_exclusion_is_refused(excluded: Any) -> None:
+    registry = _registry_with()
+    with pytest.raises(ContractError):
+        registry.bind(_GATED, _Spy("w"), module="a", excluded_platforms=excluded)
+    assert registry.bindings(_GATED) == ()
+
+
+# -- the facade's rewrite --------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_ac14_stand_ins_split_the_family_between_its_two_providers(
+    tmp_path: Path,
+) -> None:
+    """AC14 (stand-ins): twitch reaches the second; kick and youtube the `*` owner."""
+
+    _make(tmp_path, "star", STAR, _REGISTRAR_SOURCE)
+    _make(tmp_path, "second", SECOND, _REGISTRAR_SOURCE)
+    policy = AuthorizationPolicy()
+    bus = EventBus()
+    runtime = RuntimeContext(
+        bus=bus,
+        actions=ActionRegistry(authorization=policy),
+        supervision=Supervision(bus),
+        tasks=SupervisedTasks(),
+    )
+    loader = ModuleLoader(bus, tmp_path, context=runtime, environ={})
+    spies = {name: _Spy(f"{name}-provider") for name in ("star", "second")}
+    settings = {
+        name: {"spec": _gated_spec(), "provider": spies[name], "bound": []}
+        for name in spies
+    }
+    await loader.activate_enabled(
+        {
+            "enabled_modules": ["star", "second"],
+            "modules": settings,
+            "inputs": {"viewers": {"twitch": "second"}},
+        }
+    )
+
+    assert _shape(tuple(settings["star"]["bound"])) == [("*", frozenset({"twitch"}))]
+    assert _shape(tuple(settings["second"]["bound"])) == [("twitch", frozenset())]
+    assert len(runtime.actions.bindings(_GATED)) == 2
+
+    policy.grant(
+        AuthorizationRule(
+            rule_id="read",
+            action_name=_GATED,
+            destination=_ANY_CHAT,
+            principals=(_OPERATOR,),
+            natures=("read",),
+            granted_permissions=("users.read",),
+        )
+    )
+    executor = ActionExecutor(runtime.actions, policy, clock=lambda: 0.0)
+
+    async def call(platform: str) -> str:
+        observation = await executor.invoke(
+            ActionCall(
+                action_name=_GATED,
+                action_version=1,
+                arguments={"limit": 5},
+                conversation_id="conv-1",
+                run_id="run-1",
+                call_id=f"call-{platform}",
+                source_event_id="evt-1",
+                destination=Destination(platform, "c", "chat"),
+                principal=_OPERATOR,
+                deadline=1000.0,
+            )
+        )
+        return observation.status
+
+    assert await call("twitch") == "success"
+    assert (executor.provider_invocations, len(spies["second"].calls)) == (1, 1)
+    assert spies["star"].calls == []
+    assert await call("kick") == "success"
+    assert await call("youtube") == "success"
+    assert executor.provider_invocations == 3
+    assert (len(spies["star"].calls), len(spies["second"].calls)) == (2, 1)
+
+
+#: Every table the non-overlap invariant is checked over, with the bindings
+#: the facade must produce for each module.
+_INVARIANT_TABLES = {
+    "no inputs": (SECOND, None, [("*", frozenset())], []),
+    "twitch to second": (
+        SECOND,
+        {"viewers": {"twitch": "second"}},
+        [("*", frozenset({"twitch"}))],
+        [("twitch", frozenset())],
+    ),
+    "twitch to second, kick to none": (
+        SECOND,
+        {"viewers": {"twitch": "second", "kick": "none"}},
+        [("*", frozenset({"kick", "twitch"}))],
+        [("twitch", frozenset())],
+    ),
+    "star to second": (
+        SECOND_WITH_STAR,
+        {"viewers": {"*": "second"}},
+        [],
+        [("*", frozenset())],
+    ),
+    "second owns nothing": (
+        SECOND,
+        {"viewers": {"twitch": "star"}},
+        [("*", frozenset())],
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("table", sorted(_INVARIANT_TABLES))
+def test_the_gated_bindings_never_overlap(table: str) -> None:
+    second, inputs, star_shape, second_shape = _INVARIANT_TABLES[table]
+    ownership = _resolve({"star": STAR, "second": second}, inputs)
+    registry, bound = _register_both(ownership)
+
+    assert _shape(bound["star"]) == star_shape
+    assert _shape(bound["second"]) == second_shape
+    bindings = registry.bindings(_GATED)
+    assert len(bindings) == len(star_shape) + len(second_shape)
+    for index, left in enumerate(bindings):
+        for right in bindings[index + 1 :]:
+            assert not left.overlaps(right.destination, right.excluded_platforms)
+            assert not right.overlaps(left.destination, left.excluded_platforms)
+    for platform in (*DOMAIN, "undeclared"):
+        destination = Destination(platform, "c", "chat")
+        covering = [b for b in bindings if b.covers(destination)]
+        assert len(covering) <= 1, platform
+        resolved = registry.resolve(_GATED, destination)
+        assert resolved is (covering[0] if covering else None)
+    if "none" in table:
+        # The operator set (viewers, kick) unowned: no provider serves it.
+        assert registry.resolve(_GATED, Destination("kick", "c", "chat")) is None
+
+
+def test_a_module_owning_nothing_declares_but_does_not_bind() -> None:
+    ownership = _resolve({"star": STAR, "second": SECOND})
+    runtime = _bare_runtime()
+    context = _gated_context(runtime, ownership, "second")
+    assert context.actions.register(_gated_spec(), _Spy("p")) == ()
+    assert _GATED in runtime.actions.discovered()
+    assert runtime.actions.bindings(_GATED) == ()
+    # Binding an already declared gated action binds nothing either.
+    assert context.actions.bind(_GATED, _Spy("p")) == ()
+    assert runtime.actions.bindings(_GATED) == ()
+
+
+def test_a_concrete_owner_binds_through_bind_too() -> None:
+    ownership = _resolve(
+        {"star": STAR, "second": SECOND}, {"viewers": {"twitch": "second", "kick": "second"}}
+    )
+    runtime = _bare_runtime()
+    context = _gated_context(runtime, ownership, "second")
+    context.actions.declare(_gated_spec())
+    bound = context.actions.bind(_GATED, _Spy("p"))
+    assert _shape(bound) == [("kick", frozenset()), ("twitch", frozenset())]
+    assert {b.module for b in bound} == {"second"}
+
+
+def test_without_ownership_a_gated_action_binds_as_before() -> None:
+    """A harness registering before any table exists keeps today's binding."""
+
+    runtime = _bare_runtime()
+    (binding,) = runtime.for_module("m").actions.register(_gated_spec(), _Spy("p"))
+    assert binding.destination == _ANY_CHAT
+    assert binding.excluded_platforms == frozenset()
+
+
+def test_an_undeclared_module_binds_a_gated_action_as_before() -> None:
+    """R3's compatibility rule: no ``input_families`` key, today's binding."""
+
+    ownership = _resolve({"star": STAR}, {"viewers": {"kick": "none"}})
+    runtime = _bare_runtime()
+    context = runtime.for_module(
+        "legacy", owned_inputs=ownership.view_for("legacy"), ownership=ownership
+    )
+    (binding,) = context.actions.register(_gated_spec(), _Spy("p"))
+    assert binding.destination == _ANY_CHAT
+    assert binding.excluded_platforms == frozenset()
+
+
+def test_an_ungated_action_is_never_rewritten() -> None:
+    ownership = _resolve({"star": STAR, "second": SECOND}, {"viewers": {"twitch": "second"}})
+    runtime = _bare_runtime()
+    context = _gated_context(runtime, ownership, "second")
+    (binding,) = context.actions.register(_gated_spec("other.read"), _Spy("p"))
+    assert binding.destination == _ANY_CHAT
+    assert binding.excluded_platforms == frozenset()
+
+
+def test_a_concrete_owner_keeps_the_requested_restrictions() -> None:
+    """Ownership narrows the request; it never widens its platform or channel."""
+
+    ownership = _resolve(
+        {"star": STAR, "second": SECOND}, {"viewers": {"twitch": "second", "kick": "second"}}
+    )
+    runtime = _bare_runtime()
+    context = _gated_context(runtime, ownership, "second")
+    context.actions.declare(_gated_spec())
+    (binding,) = context.actions.bind(
+        _GATED, _Spy("p"), destinations=Destination("twitch", "channel-a", "chat")
+    )
+    assert binding.destination == Destination("twitch", "channel-a", "chat")
+    narrowed = context.actions.bind(
+        _GATED, _Spy("q"), destinations=Destination(WILDCARD, "channel-b", "chat")
+    )
+    assert [b.destination for b in narrowed] == [
+        Destination("kick", "channel-b", "chat"),
+        Destination("twitch", "channel-b", "chat"),
+    ]
+    # A requested platform owned elsewhere is dropped, not rebound.
+    assert context.actions.bind(
+        _GATED, _Spy("r"), destinations=Destination("youtube", "channel-a", "chat")
+    ) == ()
+
+
+def test_the_wildcard_owner_keeps_the_requested_restrictions() -> None:
+    ownership = _resolve({"star": STAR, "second": SECOND}, {"viewers": {"twitch": "second"}})
+    runtime = _bare_runtime()
+    context = _gated_context(runtime, ownership, "star")
+    context.actions.declare(_gated_spec())
+    (channel,) = context.actions.bind(
+        _GATED, _Spy("p"), destinations=Destination(WILDCARD, "channel-a", "chat")
+    )
+    assert channel.destination == Destination(WILDCARD, "channel-a", "chat")
+    assert channel.excluded_platforms == frozenset({"twitch"})
+    (kick,) = context.actions.bind(
+        _GATED, _Spy("q"), destinations=Destination("kick", "channel-b", "chat")
+    )
+    assert (kick.destination, kick.excluded_platforms) == (
+        Destination("kick", "channel-b", "chat"),
+        frozenset(),
+    )
+    assert context.actions.bind(
+        _GATED, _Spy("r"), destinations=Destination("twitch", "channel-b", "chat")
+    ) == ()
+
+
+def test_the_authorized_view_honours_the_exclusion() -> None:
+    """A platform the wildcard excludes is not advertised through it."""
+
+    registry = ActionRegistry(
+        authorization=AuthorizationPolicy(
+            rules=(
+                AuthorizationRule(
+                    rule_id="rule",
+                    action_name=_GATED,
+                    destination=_ANY_CHAT,
+                    principals=(_OPERATOR,),
+                    natures=("read",),
+                    granted_permissions=("users.read",),
+                ),
+            )
+        )
+    )
+    registry.register(
+        _gated_spec(), _Spy("w"), module="w", excluded_platforms=("kick",)
+    )
+    registry.mark_ready("w")
+    assert _GATED in registry.authorized(
+        principal=_OPERATOR, destination=Destination("twitch", "c", "chat")
+    )
+    assert registry.resolve(_GATED, Destination("kick", "c", "chat")) is None
+    assert _GATED not in registry.authorized(
+        principal=_OPERATOR, destination=Destination("kick", "c", "chat")
+    )

@@ -96,6 +96,7 @@ from .contracts import (
     COUNTER_INPUT_OWNERSHIP_REJECTIONS,
     COUNTER_LOST_TRACES,
     INPUT_FAMILIES,
+    INPUT_FAMILY_GATED_ACTIONS,
     TERMINAL_TRACE_TYPES,
     TRACE_INPUT_OWNERSHIP_REJECTED,
     TRACE_MAX_BYTES,
@@ -104,6 +105,7 @@ from .contracts import (
     TRACE_MODULE_STOPPED,
     WILDCARD,
     Counters,
+    Destination,
     input_family_of_event,
     sanitize_trace,
 )
@@ -777,13 +779,38 @@ class ModuleActions:
     module declares, binds and marks ready under its own name only. The shared
     registry itself is not reachable through this facade: reaching it would
     make the scoping advisory.
+
+    With an *ownership* table, for a module that declares ``input_families``,
+    an action gated by a family (``INPUT_FAMILY_GATED_ACTIONS``) is bound only
+    where the module owns that family (R3, D5): the owner of the family's
+    wildcard binds one wildcard destination excluding every platform owned
+    elsewhere, or set to none, and any other owner binds one destination per
+    concrete platform it owns. A module that owns no pair of the family only
+    declares the action. Every other action, and every action of a module
+    without a table or without the declaration, binds exactly as before.
     """
 
-    __slots__ = ("_module", "_registry")
+    __slots__ = ("_module", "_ownership", "_registry")
 
-    def __init__(self, registry: Any, module: str) -> None:
+    def __init__(
+        self,
+        registry: Any,
+        module: str,
+        *,
+        ownership: Any = None,
+        declared: bool = False,
+    ) -> None:
         self._registry = registry
         self._module = _require_text(module, "module actions.module")
+        if ownership is not None and declared:
+            for method in ("owner", "rows", "excluded"):
+                if not callable(getattr(ownership, method, None)):
+                    raise RuntimeContextError(
+                        f"module actions: field 'ownership': must expose {method}()"
+                    )
+            self._ownership = ownership
+        else:
+            self._ownership = None
 
     @property
     def module(self) -> str:
@@ -804,6 +831,20 @@ class ModuleActions:
     ) -> tuple[Any, ...]:
         """Bind *provider* to an already declared action over its scopes."""
 
+        spec = self._gated_spec(action_name)
+        if spec is not None:
+            gated = self._gated_destinations(spec, destinations)
+            if gated is None:
+                return ()
+            targets, excluded = gated
+            return self._registry.bind(
+                action_name,
+                provider,
+                module=self._module,
+                destinations=targets,
+                provider_name=provider_name,
+                excluded_platforms=excluded,
+            )
         return self._registry.bind(
             action_name,
             provider,
@@ -831,6 +872,20 @@ class ModuleActions:
         internals.
         """
 
+        if self._family_of(getattr(spec, "name", None)) is not None:
+            gated = self._gated_destinations(spec, destinations)
+            if gated is None:
+                self._registry.declare(spec, module=self._module)
+                return ()
+            targets, excluded = gated
+            return self._registry.register(
+                spec,
+                provider,
+                module=self._module,
+                destinations=targets,
+                provider_name=provider_name,
+                excluded_platforms=excluded,
+            )
         return self._registry.register(
             spec,
             provider,
@@ -838,6 +893,88 @@ class ModuleActions:
             destinations=destinations,
             provider_name=provider_name,
         )
+
+    # -- family-gated binding (R3, D5) ---------------------------------------- #
+
+    def _family_of(self, action_name: Any) -> str | None:
+        """The family gating *action_name* when this facade gates, else ``None``."""
+
+        if self._ownership is None:
+            return None
+        for family, gated in INPUT_FAMILY_GATED_ACTIONS.items():
+            if gated == action_name:
+                return family
+        return None
+
+    def _gated_spec(self, action_name: Any) -> Any:
+        if self._family_of(action_name) is None:
+            return None
+        # An undeclared action is left to the registry, which refuses it.
+        return self._registry.discovered().get(action_name)
+
+    def _gated_destinations(
+        self, spec: Any, destinations: Any
+    ) -> tuple[tuple[Destination, ...], frozenset[str]] | None:
+        """Where this module serves a gated *spec*, or ``None`` for nowhere.
+
+        The requested destinations (else the spec's declared ones) are
+        intersected with what this module owns: their channels and scopes are
+        kept, a wildcard platform narrows to the concrete platforms owned, and
+        a concrete platform owned elsewhere is dropped. The owner of the
+        wildcard keeps a wildcard platform, excluding exactly the platforms
+        owned elsewhere, and never also binds a concrete row its own wildcard
+        already serves.
+        """
+
+        family = self._family_of(spec.name)
+        assert family is not None
+        ownership = self._ownership
+        if destinations is None:
+            declared = tuple(spec.supported_destinations)
+        elif isinstance(destinations, Destination):
+            declared = (destinations,)
+        else:
+            declared = tuple(destinations)
+        if ownership.owner(family, WILDCARD) == self._module:
+            excluded = frozenset(ownership.excluded(family))
+            targets = [
+                destination
+                for destination in declared
+                if destination.platform == WILDCARD
+                or destination.platform not in excluded
+            ]
+        else:
+            excluded = frozenset()
+            platforms = sorted(
+                platform
+                for owned_family, platform in ownership.rows()
+                if owned_family == family
+                and platform != WILDCARD
+                and ownership.owner(owned_family, platform) == self._module
+            )
+            targets = []
+            for destination in declared:
+                if destination.platform != WILDCARD:
+                    if destination.platform in platforms:
+                        targets.append(destination)
+                    continue
+                targets.extend(
+                    Destination(platform, destination.channel_id, destination.scope)
+                    for platform in platforms
+                )
+        unique = tuple(dict.fromkeys(targets))
+        # A target another requested target already serves would only collide
+        # with it: the narrower one is redundant, not ambiguous.
+        kept = tuple(
+            target
+            for target in unique
+            if not any(
+                other != target and other.contains(target) for other in unique
+            )
+        )
+        if not kept:
+            return None
+        return kept, excluded
 
     def mark_ready(self) -> None:
         """Record this module as past the readiness barrier."""
@@ -1395,7 +1532,9 @@ class RuntimeContext:
             _runtime=self,
             inputs=owned_inputs,
             _guard=scoped,
-            actions=ModuleActions(self.actions, name),
+            actions=ModuleActions(
+                self.actions, name, ownership=ownership, declared=declared
+            ),
             tasks=ModuleTasks(self.tasks, name),
             supervision=ModuleSupervision(self.supervision, self.health, name),
             services=ModuleServices(self.services, name),
