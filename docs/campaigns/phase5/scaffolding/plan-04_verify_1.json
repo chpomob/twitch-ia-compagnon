@@ -1,0 +1,82 @@
+{
+  "phase": "verify",
+  "exit_code": 0,
+  "results": [
+    {
+      "id": "P1",
+      "status": "resolved",
+      "note": "D3 and P4 guard v1 publishers; tests cover unowned, owned and explicit-none pairs."
+    },
+    {
+      "id": "P2",
+      "status": "resolved",
+      "note": "P5 gives the wildcard owner one binding with exclusions, avoids redundant concrete bindings and tests non-overlap."
+    },
+    {
+      "id": "P3",
+      "status": "resolved",
+      "note": "The users.read check moves to P18 and the in-flight run check moves to P15."
+    },
+    {
+      "id": "P4",
+      "status": "resolved",
+      "note": "P6 explicitly depends on P5."
+    },
+    {
+      "id": "P5",
+      "status": "resolved",
+      "note": "P20 places the docs guard in a separate file, included in P21 and P22."
+    },
+    {
+      "id": "P6",
+      "status": "disputed",
+      "note": "D8/P15 prevent cancellation between marking and transmission, but still mark emitted before the transport write. A synchronous write failure before any bytes leave remains unhandled and untested; the closed-connection precheck covers only failure detected before marking."
+    }
+  ],
+  "verdict": "REJECT",
+  "stdout": "{\"results\":[{\"id\":\"P1\",\"status\":\"resolved\",\"note\":\"D3 and P4 guard v1 publishers; tests cover unowned, owned and explicit-none pairs.\"},{\"id\":\"P2\",\"status\":\"resolved\",\"note\":\"P5 gives the wildcard owner one binding with exclusions, avoids redundant concrete bindings and tests non-overlap.\"},{\"id\":\"P3\",\"status\":\"resolved\",\"note\":\"The users.read check moves to P18 and the in-flight run check moves to P15.\"},{\"id\":\"P4\",\"status\":\"resolved\",\"note\":\"P6 explicitly depends on P5.\"},{\"id\":\"P5\",\"status\":\"resolved\",\"note\":\"P20 places the docs guard in a separate file, included in P21 and P22.\"},{\"id\":\"P6\",\"status\":\"disputed\",\"note\":\"D8/P15 prevent cancellation between marking and transmission, but still mark emitted before the transport write. A synchronous write failure before any bytes leave remains unhandled and untested; the closed-connection precheck covers only failure detected before marking.\"}],\"read_files\":[\"plan.md\",\"findings.json\"],\"verdict\":\"REJECT\"}",
+  "execution": {
+    "calls": [
+      {
+        "attempts": [
+          {
+            "attempt": 1,
+            "returncode": 0,
+            "elapsed": 50.55072656599805,
+            "retryable": false,
+            "reason": "success",
+            "usage": {
+              "model": "other",
+              "prompt_tokens": 2800,
+              "completion_tokens": 242,
+              "est_cost_usd": 0.0,
+              "estimated": true,
+              "phase": "verify",
+              "persona": "plan-challenger"
+            }
+          }
+        ],
+        "cap_events": [
+          {
+            "kind": "output",
+            "stream": "stderr",
+            "attempt": 1,
+            "limit": 131072,
+            "original_chars": 363491,
+            "truncated": true
+          }
+        ],
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 2800,
+          "completion_tokens": 242,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "verify",
+          "persona": "plan-challenger"
+        }
+      }
+    ]
+  },
+  "provider_history": []
+}

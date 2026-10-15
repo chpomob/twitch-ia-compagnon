@@ -1,0 +1,107 @@
+{
+  "phase": "challenge",
+  "exit_code": 0,
+  "findings": [
+    {
+      "id": "P1",
+      "severity": "blocker",
+      "step": "P4",
+      "summary": "Ownership enforcement is missing for v1 undeclared publishers.",
+      "evidence": "D3 states: \"v1 modules are outside the guard\" and \"a v1 manifest gets no wrapper\"; P4 preserves the bare-bus route. R3 requires undeclared publishers to be rejected whenever their pair has a resolved owner or is explicitly set to none, without a manifest-version exemption. No step implements that requirement for v1 publishers.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "P2",
+      "severity": "major",
+      "step": "P5",
+      "summary": "The proposed destination rewrite creates overlapping bindings within the wildcard owner.",
+      "evidence": "P5 creates \"one Destination(P, '*', scope) per concrete platform P the module owns\" plus a wildcard destination excluding only ownership.excluded(F). Under D2 and P12, enabling users and the bridge creates concrete viewers rows for twitch, kick and youtube. With viewers.twitch assigned to the bridge, users owns both the wildcard and the concrete kick/youtube rows. P5 therefore produces overlapping concrete and wildcard bindings for users, contradicting R3 and AC14's no-AmbiguousBindingError requirement.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "P3",
+      "severity": "blocker",
+      "step": "P14",
+      "summary": "P14's acceptance tests require implementations scheduled for later steps.",
+      "evidence": "P14 depends only on P13, but its AC3 test runs a full profile and requires the bridge's users.read to return provider_not_ready; P18 first registers that provider. P14's AC28 test also requires a run whose frame was sent, while P15 implements sending run requests. These tests cannot pass at P14 with its declared prerequisites. Move the dependent checks to the steps implementing those behaviors or restructure the steps.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "P4",
+      "severity": "major",
+      "step": "P6",
+      "summary": "P5 and P6 modify the same test file without a dependency between them.",
+      "evidence": "P5 and P6 both list tests/test_input_ownership.py in Files and both declare Dependencies: [P4]. The ordering rationale nevertheless claims the dependency chain \"P4 \u2192 P5 \u2192 P6\" for that file. P6 needs an explicit dependency on P5 to encode the stated shared-file ordering.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "P5",
+      "severity": "major",
+      "step": "P20",
+      "summary": "The docs guard conflicts with the required eight-test trial collection.",
+      "evidence": "P20 assigns both \"One pytest node per study question\" and the separate AC37 docs guard to tests/test_phase5_trials.py. AC36 requires that exact file to collect eight tests, all skipped without trial variables. A separate docs test produces a ninth node; skipping it with the trial nodes leaves AC37 unchecked. Assign the docs guard to another test file and include that file in the relevant steps.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "P6",
+      "severity": "major",
+      "step": "P15",
+      "summary": "Emission is marked before sending without handling failures before any frame leaves.",
+      "evidence": "D8 and P15 prescribe \"invocation.mark_emitted() ... then send one DoAction frame\" and leave a pre-send deadline or cancellation to the executor's emission rule. If cancellation or a send failure occurs after marking but before transmission, that rule will treat the call as emitted. R4 requires timeout/cancelled when the frame has not left. The plan needs an explicit transmission boundary and a test interrupting that interval; whether the chosen transport API permits such an interval must be verified during implementation.",
+      "confidence": "medium",
+      "basis": "inference"
+    }
+  ],
+  "verdict": "REJECT",
+  "summary": "2 blockers, 4 majors, 0 minors, 0 nits",
+  "stdout": "{\n  \"findings\": [\n    {\n      \"id\": \"P1\",\n      \"severity\": \"blocker\",\n      \"step\": \"P4\",\n      \"summary\": \"Ownership enforcement is missing for v1 undeclared publishers.\",\n      \"evidence\": \"D3 states: \\\"v1 modules are outside the guard\\\" and \\\"a v1 manifest gets no wrapper\\\"; P4 preserves the bare-bus route. R3 requires undeclared publishers to be rejected whenever their pair has a resolved owner or is explicitly set to none, without a manifest-version exemption. No step implements that requirement for v1 publishers.\",\n      \"confidence\": \"high\",\n      \"basis\": \"spec\"\n    },\n    {\n      \"id\": \"P2\",\n      \"severity\": \"major\",\n      \"step\": \"P5\",\n      \"summary\": \"The proposed destination rewrite creates overlapping bindings within the wildcard owner.\",\n      \"evidence\": \"P5 creates \\\"one Destination(P, '*', scope) per concrete platform P the module owns\\\" plus a wildcard destination excluding only ownership.excluded(F). Under D2 and P12, enabling users and the bridge creates concrete viewers rows for twitch, kick and youtube. With viewers.twitch assigned to the bridge, users owns both the wildcard and the concrete kick/youtube rows. P5 therefore produces overlapping concrete and wildcard bindings for users, contradicting R3 and AC14's no-AmbiguousBindingError requirement.\",\n      \"confidence\": \"high\",\n      \"basis\": \"spec\"\n    },\n    {\n      \"id\": \"P3\",\n      \"severity\": \"blocker\",\n      \"step\": \"P14\",\n      \"summary\": \"P14's acceptance tests require implementations scheduled for later steps.\",\n      \"evidence\": \"P14 depends only on P13, but its AC3 test runs a full profile and requires the bridge's users.read to return provider_not_ready; P18 first registers that provider. P14's AC28 test also requires a run whose frame was sent, while P15 implements sending run requests. These tests cannot pass at P14 with its declared prerequisites. Move the dependent checks to the steps implementing those behaviors or restructure the steps.\",\n      \"confidence\": \"high\",\n      \"basis\": \"code\"\n    },\n    {\n      \"id\": \"P4\",\n      \"severity\": \"major\",\n      \"step\": \"P6\",\n      \"summary\": \"P5 and P6 modify the same test file without a dependency between them.\",\n      \"evidence\": \"P5 and P6 both list tests/test_input_ownership.py in Files and both declare Dependencies: [P4]. The ordering rationale nevertheless claims the dependency chain \\\"P4 \u2192 P5 \u2192 P6\\\" for that file. P6 needs an explicit dependency on P5 to encode the stated shared-file ordering.\",\n      \"confidence\": \"high\",\n      \"basis\": \"code\"\n    },\n    {\n      \"id\": \"P5\",\n      \"severity\": \"major\",\n      \"step\": \"P20\",\n      \"summary\": \"The docs guard conflicts with the required eight-test trial collection.\",\n      \"evidence\": \"P20 assigns both \\\"One pytest node per study question\\\" and the separate AC37 docs guard to tests/test_phase5_trials.py. AC36 requires that exact file to collect eight tests, all skipped without trial variables. A separate docs test produces a ninth node; skipping it with the trial nodes leaves AC37 unchecked. Assign the docs guard to another test file and include that file in the relevant steps.\",\n      \"confidence\": \"high\",\n      \"basis\": \"spec\"\n    },\n    {\n      \"id\": \"P6\",\n      \"severity\": \"major\",\n      \"step\": \"P15\",\n      \"summary\": \"Emission is marked before sending without handling failures before any frame leaves.\",\n      \"evidence\": \"D8 and P15 prescribe \\\"invocation.mark_emitted() ... then send one DoAction frame\\\" and leave a pre-send deadline or cancellation to the executor's emission rule. If cancellation or a send failure occurs after marking but before transmission, that rule will treat the call as emitted. R4 requires timeout/cancelled when the frame has not left. The plan needs an explicit transmission boundary and a test interrupting that interval; whether the chosen transport API permits such an interval must be verified during implementation.\",\n      \"confidence\": \"medium\",\n      \"basis\": \"inference\"\n    }\n  ],\n  \"verdict\": \"REJECT\",\n  \"summary\": \"2 blockers, 4 majors, 0 minors, 0 nits\"\n}",
+  "execution": {
+    "calls": [
+      {
+        "attempts": [
+          {
+            "attempt": 1,
+            "returncode": 0,
+            "elapsed": 92.07009408902377,
+            "retryable": false,
+            "reason": "success",
+            "usage": {
+              "model": "other",
+              "prompt_tokens": 2775,
+              "completion_tokens": 1013,
+              "est_cost_usd": 0.0,
+              "estimated": true,
+              "phase": "challenge",
+              "persona": "plan-challenger"
+            }
+          }
+        ],
+        "cap_events": [
+          {
+            "kind": "output",
+            "stream": "stderr",
+            "attempt": 1,
+            "limit": 131072,
+            "original_chars": 341714,
+            "truncated": true
+          }
+        ],
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 2775,
+          "completion_tokens": 1013,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "challenge",
+          "persona": "plan-challenger"
+        }
+      }
+    ]
+  },
+  "provider_history": []
+}
