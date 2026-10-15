@@ -396,7 +396,9 @@ EXPECTED_MANIFESTS = {
 # declare a credential and no action (R7: the proxy binds allowlisted
 # actions from the catalog, it declares none of its own).
 DECLARATION_KEYS = {
-    "twitch": {"triggers", "actions", "credentials"},
+    # Phase 5 R2 (plan P8): the chat input declares the (`chat`, twitch)
+    # pair it ingests, by default.
+    "twitch": {"triggers", "actions", "credentials", "input_families"},
     "brain": {"credentials"},
     "audit": set(),
     "chat_context": {"actions", "credentials"},
@@ -630,6 +632,10 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
         assert type(manifest["middleware"]) is bool
     assert type(manifests["audit"]["order"]) is int
     assert isinstance(manifests["twitch"]["triggers"], Mapping)
+    # Phase 5 R2 (plan P8): twitch declares exactly its chat pair, by default.
+    assert manifests["twitch"]["input_families"] == [
+        {"family": "chat", "platforms": ["twitch"], "default": True}
+    ]
     assert isinstance(manifests["twitch"]["actions"], list) and manifests["twitch"]["actions"]
     # Phase 3 R1 (plan P7, decision 11): the twitch manifest gains the
     # optional `notices` setting and the `event_kind` trigger type; its keys,

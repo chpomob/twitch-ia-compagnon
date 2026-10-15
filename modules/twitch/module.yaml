@@ -17,6 +17,17 @@ consumes:
   - channel.chat.send
 middleware: false
 
+# Input ownership (phase 5 R2, R3). This module ingests the (`chat`, twitch)
+# pair — messages and every notice kind, follow included — and owns it by
+# default. The profile's `inputs` block may hand the pair to another provider;
+# `start_inputs` then opens no EventSub socket and no subscription, while
+# `chat.write` stays bound and ready. Never two providers for one pair.
+input_families:
+  - family: chat
+    platforms:
+      - twitch
+    default: true
+
 # Lifecycle role, never the module name, decides what each phase asks of this
 # module (R4). An `input` is a producer: its handle exposes `prepare`, is held
 # at the readiness barrier, then `start_inputs`, `stop_inputs` and `close`;

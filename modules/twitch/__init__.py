@@ -130,6 +130,7 @@ from core.contracts import (
     SessionKey,
 )
 from core.lifecycle import request_cancellation
+from core.runtime import OwnedInputs
 from core.timestamps import parse_instant
 from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
 
@@ -184,6 +185,8 @@ _NOTIFICATION_EVENT = "channel.chat.notification"
 _FOLLOW_EVENT = "channel.follow"
 _CHAT_SEND_EVENT = "channel.chat.send"
 _CHAT_SCOPE = "chat"
+# The input family this module ingests (phase 5 R2), as its manifest declares.
+_CHAT_FAMILY = "chat"
 _ROUTE_ACTION = CHAT_WRITE_ACTION
 _ROUTE_COMPATIBILITY = _CHAT_SEND_EVENT
 _CHAT_SEND_TIMEOUT_SECONDS = 10.0
@@ -1019,6 +1022,10 @@ class TwitchModule:
         self._triggers = runtime.triggers
         self._chat = runtime.chat
         self._scheduler = runtime.scheduler
+        self._inputs = runtime.inputs
+        # Set once ``start_inputs`` found (``chat``, twitch) owned elsewhere:
+        # a repeated call opens nothing and reports nothing again.
+        self._ingestion_elsewhere = False
         self._settings = settings
         self._session = session
         self._reporter = reporter
@@ -1146,12 +1153,28 @@ class TwitchModule:
         self._bound = True
 
     async def start_inputs(self) -> None:
-        """Open the EventSub source. Only the coordinator, past the barrier, calls this."""
+        """Open the EventSub source. Only the coordinator, past the barrier, calls this.
 
-        if self._receive_task is not None or self._stopping or self._closed:
+        The socket and every chat, notice and follow subscription are opened
+        only while this module owns (``chat``, twitch) (phase 5 R3, AC12).
+        Owned elsewhere, nothing is opened and one value-free diagnostic says
+        so; ``chat.write`` stays bound and ready from :meth:`prepare`, which
+        never depended on the socket.
+        """
+
+        if (
+            self._receive_task is not None
+            or self._ingestion_elsewhere
+            or self._stopping
+            or self._closed
+        ):
             return
         if not self._prepared:
             raise TwitchModuleError("twitch lifecycle: start_inputs requires prepare")
+        if not self._inputs.owns(_CHAT_FAMILY, PLATFORM):
+            self._ingestion_elsewhere = True
+            self._diagnose("twitch: chat ingestion owned elsewhere")
+            return
 
         websocket = await self._connect(EVENTSUB_URL)
         try:
@@ -2409,6 +2432,7 @@ class _RuntimeSurfaces:
     triggers: Any | None
     chat: Any | None
     scheduler: Any | None
+    inputs: Any
 
 
 _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -2426,6 +2450,11 @@ _OPTIONAL_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("triggers", ("evaluate", "recorded")),
     ("chat", ("append",)),
     ("scheduler", ("admit",)),
+    # The pairs this module owns (phase 5 R3). A context built without an
+    # ownership table carries ``OwnedInputs.unrestricted()``; a harness
+    # context without the field is read the same way, so an absent table
+    # means "own everything I declare".
+    ("inputs", ("owns",)),
 )
 
 
@@ -2449,6 +2478,8 @@ def _runtime_surfaces(context: Any) -> _RuntimeSurfaces:
         ):
             raise TwitchModuleError("twitch activation: runtime context is invalid")
         surfaces[name] = value
+    if surfaces["inputs"] is None:
+        surfaces["inputs"] = OwnedInputs.unrestricted()
     return _RuntimeSurfaces(**surfaces)
 
 

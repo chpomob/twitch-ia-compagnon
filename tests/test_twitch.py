@@ -317,6 +317,9 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     ``notices`` (its ``kinds`` the six Twitch notice kinds, not required) and
     the trigger types gain ``event_kind`` with the built-in schema; the
     default policy, the action and the credentials are unchanged.
+
+    Extended by phase 5 R2 (plan P8): the manifest gains ``input_families``,
+    declaring exactly (``chat``, twitch) with ``default: true``.
     """
 
     from core.runtime import RUNTIME_API
@@ -331,6 +334,9 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     assert manifest["consumes"] == ["channel.chat.send"]
     assert manifest["middleware"] is False
     assert manifest["lifecycle"] == {"roles": ["input"]}
+    assert manifest["input_families"] == [
+        {"family": "chat", "platforms": ["twitch"], "default": True}
+    ]
 
     schema = manifest["settings_schema"]
     assert set(schema["required"]) == set(SETTINGS)
@@ -408,6 +414,7 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
         "credentials",
         "triggers",
         "actions",
+        "input_families",
     }
 
 
@@ -3158,3 +3165,158 @@ async def test_a_closed_handle_sends_no_clip_or_moderation_request() -> None:
     )
     assert moderation.outcome == "uncertain"
     assert session.requests == []
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5: input ownership of (chat, twitch) (R2, R3; AC5, AC6, AC12)
+# --------------------------------------------------------------------------- #
+
+BRIDGE = "bridge_stand_in"
+
+
+def bridge_stand_in_families() -> list[dict[str, Any]]:
+    """The shape the bridge declares: chat and viewers on request, cues by default."""
+
+    return [
+        {"family": "chat", "platforms": ["twitch"], "default": False},
+        {"family": "viewers", "platforms": ["twitch"], "default": False},
+        {"family": "cues", "platforms": ["*"], "default": True},
+    ]
+
+
+def ownership_of(inputs: Any) -> Any:
+    """Resolve the real twitch manifest beside a bridge stand-in, as the loader does."""
+
+    from core.loader import _validate_manifest, resolve_input_ownership
+    from core.runtime import RUNTIME_API
+
+    bridge = {
+        "name": BRIDGE,
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": [],
+        "consumes": [],
+        "middleware": False,
+        "settings_validator": "validate_settings",
+        "input_families": bridge_stand_in_families(),
+    }
+    return resolve_input_ownership(
+        ["twitch", BRIDGE],
+        {
+            "twitch": _validate_manifest("twitch", manifest()),
+            BRIDGE: _validate_manifest(BRIDGE, bridge),
+        },
+        inputs,
+    )
+
+
+def owned_context(runtime: RuntimeContext, ownership: Any) -> ModuleContext:
+    return runtime.for_module(
+        "twitch",
+        owned_inputs=ownership.view_for("twitch"),
+        ownership=ownership,
+        declared=True,
+    )
+
+
+BRIDGE_OWNS_CHAT = {"chat": {"twitch": BRIDGE}}
+
+
+def test_twitch_owns_its_chat_pair_by_default_beside_the_bridge() -> None:
+    """AC6 (R2): ``twitch`` and a bridge stand-in, no ``inputs`` block:
+    (``chat``, twitch) resolves to ``twitch`` by default rule, the bridge owns
+    no chat pair and (``cues``, ``*``) resolves to the bridge."""
+
+    from core.loader import ORIGIN_DEFAULT
+
+    ownership = ownership_of(None)
+    assert ownership.owner("chat", "twitch") == "twitch"
+    assert ownership.origin("chat", "twitch") == ORIGIN_DEFAULT
+    assert ownership.owner("cues", "*") == BRIDGE
+    assert ownership.view_for("twitch").owns("chat", "twitch")
+    assert not any(
+        family == "chat" for family, _ in ownership.view_for(BRIDGE).pairs
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_ownership_opens_the_eventsub_source_as_before() -> None:
+    """AC6 (R2, R3): owning (``chat``, twitch) by default, ``start_inputs``
+    opens the socket and its subscription exactly as without a table."""
+
+    context = owned_context(runtime_context(), ownership_of(None))
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, _, diagnostics = await activate_with(session, context=context)
+    try:
+        assert session.ws_calls == [EVENTSUB_URL]
+        assert len(subscription_requests(session)) == 1
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_owned_elsewhere_opens_no_socket_and_keeps_chat_write() -> None:
+    """AC12 (R3): with (``chat``, twitch) owned by the bridge stand-in, the
+    ingestion entry point opens 0 sockets and 0 subscriptions — notices and
+    follow included — and reports it once, value-free; ``chat.write`` is still
+    bound and ready, and a granted call reaches the Helix send endpoint once."""
+
+    ownership = ownership_of(BRIDGE_OWNS_CHAT)
+    context = owned_context(runtime_context(), ownership)
+    assert context.inputs.pairs == frozenset()
+    grant_chat_write(context)
+    session = FakeSession([], sends=[sent_response()])
+    diagnostics: list[str] = []
+    settings = {
+        **SETTINGS,
+        "notices": {"kinds": ["sub", "raid", "follow"]},
+        "_session_factory": lambda: session,
+        "_retry_delay": no_delay,
+        "diagnostic_reporter": diagnostics.append,
+    }
+    handle = await start_module(settings, context=context)
+    try:
+        # Idempotent: a second call opens nothing and reports nothing again.
+        await handle.start_inputs()
+        assert session.ws_calls == []
+        assert subscription_requests(session) == []
+        assert diagnostics == ["twitch: chat ingestion owned elsewhere"]
+        assert_sanitized(diagnostics)
+
+        registry = context._runtime.actions
+        binding = registry.resolve(
+            CHAT_WRITE_ACTION, Destination("twitch", SETTINGS["broadcaster_id"], "chat")
+        )
+        assert binding is not None and binding.provider_name == CHAT_WRITE_PROVIDER
+        assert CHAT_WRITE_ACTION in registry.registered_ready()
+        outcome = await context.executor.invoke(chat_write_call("call-1"))
+        assert outcome.status == "success"
+        sends = [call for call in session.post_calls if call["url"] == HELIX_CHAT_URL]
+        assert len(sends) == 1
+    finally:
+        await handle.close()
+    assert session.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_notification_owned_elsewhere_is_dropped_by_the_guard() -> None:
+    """AC5 (R3, no fallback): with the bridge stand-in owning (``chat``,
+    twitch), a notification driven straight into the twitch handler publishes
+    nothing — the guard drops it and counts it."""
+
+    from core.contracts import COUNTER_INPUT_OWNERSHIP_REJECTIONS
+
+    context = owned_context(runtime_context(), ownership_of(BRIDGE_OWNS_CHAT))
+    session = FakeSession([])
+    handle, bus, _ = await activate_with(session, context=context)
+    rejections = lambda: context.supervision.snapshot()[  # noqa: E731
+        COUNTER_INPUT_OWNERSHIP_REJECTIONS
+    ]
+    try:
+        before = rejections()
+        await _ingest(handle, notification("m-1", "hello Companion"))
+        assert chat_events(bus) == []
+        assert rejections() == before + 1
+    finally:
+        await handle.close()
