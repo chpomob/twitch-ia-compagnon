@@ -3225,6 +3225,79 @@ async def test_check_config_refuses_the_v1_input_startup_refuses(
     assert "cannot honour the readiness barrier" in diagnostics[0]
 
 
+_F4_SECRET = "review-secret-4521"
+
+
+async def _f4_check(tmp_path: Path, inputs: dict[str, Any]) -> tuple[int, list[str]]:
+    config = {
+        "modules_directory": str(Path(__file__).resolve().parents[1] / "modules"),
+        "enabled_modules": ["streamerbot"],
+        "modules": {"streamerbot": {
+            "url": "ws://127.0.0.1:9/",
+            "companion_name": "Companion",
+            "password": _F4_SECRET,
+        }},
+        "limits": _finite_limits(),
+        "inputs": inputs,
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        config_path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+    return status, diagnostics
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    [
+        (
+            {_F4_SECRET: {"x": "streamerbot"}},
+            "inputs: family '<redacted>': platform 'x': value 'streamerbot': "
+            "family is outside the vocabulary (chat, viewers, cues)",
+        ),
+        (
+            {"chat": {_F4_SECRET: "not-enabled"}},
+            "inputs: family 'chat': platform '<redacted>': "
+            "owner 'not-enabled' is not enabled",
+        ),
+    ],
+)
+async def test_f4_check_config_never_echoes_a_credential_used_as_an_inputs_key(
+    tmp_path: Path, inputs: dict[str, Any], expected: str
+) -> None:
+    """F4: ``--check-config`` reports the ownership refusal with the text
+    startup gives, the configured password redacted out of the family or
+    platform key — neither the secret nor a prefix of it reaches the report."""
+
+    status, diagnostics = await _f4_check(tmp_path, inputs)
+    assert (status, diagnostics) == (2, [expected])
+    assert not any(
+        _F4_SECRET[:end] in diagnostics[0] for end in range(8, len(_F4_SECRET) + 1)
+    )
+
+
+@pytest.mark.asyncio
+async def test_f4_check_config_keeps_a_refusal_with_no_credential_whole(
+    tmp_path: Path,
+) -> None:
+    """F4's redaction is not over-broad: refusals that involve no credential
+    keep their full text through ``--check-config``."""
+
+    status, diagnostics = await _f4_check(
+        tmp_path, {"weather": {"x": "streamerbot"}, "chat": {"twitch": "not-enabled"}}
+    )
+    assert status == 2
+    # The profile is written sorted, so the ``chat`` refusal comes first.
+    assert diagnostics == [
+        "inputs: family 'chat': platform 'twitch': owner 'not-enabled' is not enabled",
+        "inputs: family 'weather': platform 'x': value 'streamerbot': "
+        "family is outside the vocabulary (chat, viewers, cues)",
+    ]
+
+
 def _example_environment(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     """Export the dummy environment the example references into the process."""
 

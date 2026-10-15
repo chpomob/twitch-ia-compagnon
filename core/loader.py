@@ -2416,13 +2416,26 @@ class InputOwnership:
         return any(row.owner is not None or row.set_none for row in self._rows.values())
 
 
-def _quoted(value: str) -> str:
-    """A configuration key, bounded, for an ``inputs`` diagnostic."""
+def _quoted(value: str, redacted: frozenset[str] = frozenset()) -> str:
+    """A configuration key, bounded, for an ``inputs`` diagnostic.
 
-    text = " ".join(value.split())
+    Every known credential embedded in *value* is cut out before the key is
+    normalised and bounded, so neither the credential nor a prefix of it
+    left behind by the bound can be quoted (F4).
+    """
+
+    text = " ".join(_redact_known(value, redacted).split())
     if len(text) > _MAX_KEY_LENGTH:
         text = text[: _MAX_KEY_LENGTH - 1] + "…"
     return repr(text)
+
+
+def _redact_known(text: str, redacted: frozenset[str]) -> str:
+    """*text* with every non-empty known credential cut out, longest first."""
+
+    return _redact_values(
+        text, sorted((value for value in redacted if value), key=len, reverse=True)
+    )
 
 
 def _owner_text(value: Any, redacted: frozenset[str]) -> str:
@@ -2432,7 +2445,7 @@ def _owner_text(value: Any, redacted: frozenset[str]) -> str:
         return repr(_REDACTED_VALUE)
     if _FIELD_PATH.fullmatch(value) is None:
         return repr(_REDACTED_VALUE)
-    return _quoted(value)
+    return _quoted(value, redacted)
 
 
 def _listed(quoted: Sequence[str]) -> str:
@@ -2441,10 +2454,12 @@ def _listed(quoted: Sequence[str]) -> str:
     return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
 
 
-def _inputs_line(family: str, platform: str | None, reason: str) -> str:
-    where = f"{_INPUTS_KEY}: family {_quoted(family)}"
+def _inputs_line(
+    family: str, platform: str | None, reason: str, redacted: frozenset[str]
+) -> str:
+    where = f"{_INPUTS_KEY}: family {_quoted(family, redacted)}"
     if platform is not None:
-        where += f": platform {_quoted(platform)}"
+        where += f": platform {_quoted(platform, redacted)}"
     return f"{where}: {_value_free_reason(reason)}"
 
 
@@ -2464,8 +2479,24 @@ def resolve_input_ownership(
     declaring the family's wildcard with ``default: true``; otherwise the pair
     is unowned. Every refusal is collected first and raised as one
     :class:`ModuleLoadError`, one value-free line per refusal. An owner value
-    equal to one of *redacted* is never quoted.
+    equal to one of *redacted* is never quoted, and every value in
+    *redacted* is cut out of every quoted family key, platform key and owner
+    before it is bounded (F4): this resolver runs before credential
+    redaction, so it is the only protection its diagnostics have. The fixed
+    text around them — vocabulary, reason — is never redacted, since the
+    set holds every environment value and would otherwise mangle it.
     """
+
+    if redacted is None or isinstance(redacted, (str, bytes)) or not all(
+        isinstance(value, str) for value in redacted
+    ):
+        # Refused rather than reported partially redacted: without the
+        # known-credential set no diagnostic below could be protected.
+        raise TypeError(
+            "resolve_input_ownership: the known-credential set must be a "
+            "collection of text before any diagnostic can be redacted"
+        )
+    redacted = frozenset(redacted)
 
     refusals: list[str] = []
 
@@ -2502,23 +2533,30 @@ def resolve_input_ownership(
             reason = f"is outside the vocabulary ({allowed})"
             if isinstance(entries, Mapping) and entries:
                 for platform, value in entries.items():
-                    shown = _quoted(platform) if isinstance(platform, str) else "?"
+                    shown = (
+                        _quoted(platform, redacted) if isinstance(platform, str) else "?"
+                    )
                     refusals.append(
-                        f"{_INPUTS_KEY}: family {_quoted(family)}: platform {shown}: "
+                        f"{_INPUTS_KEY}: family {_quoted(family, redacted)}: "
+                        f"platform {shown}: "
                         f"value {_owner_text(value, redacted)}: family {reason}"
                     )
             else:
-                refusals.append(_inputs_line(family, None, f"family {reason}"))
+                refusals.append(_inputs_line(family, None, f"family {reason}", redacted))
             continue
         if not isinstance(entries, Mapping):
             refusals.append(
-                _inputs_line(family, None, "must be a mapping of platform to owner")
+                _inputs_line(
+                    family, None, "must be a mapping of platform to owner", redacted
+                )
             )
             continue
         for platform, value in entries.items():
             if not isinstance(platform, str) or not platform.strip():
                 refusals.append(
-                    _inputs_line(family, None, "a platform key must be non-empty text")
+                    _inputs_line(
+                        family, None, "a platform key must be non-empty text", redacted
+                    )
                 )
                 continue
             owners: list[Any] = value if isinstance(value, list) else [value]
@@ -2530,6 +2568,7 @@ def resolve_input_ownership(
                         family,
                         platform,
                         f"owner must be one enabled module name or {INPUT_OWNER_NONE!r}",
+                        redacted,
                     )
                 )
                 continue
@@ -2542,6 +2581,7 @@ def resolve_input_ownership(
                         platform,
                         f"names more than one owner, {listed}; name one module "
                         f"or {INPUT_OWNER_NONE!r}",
+                        redacted,
                     )
                 )
                 continue
@@ -2552,7 +2592,9 @@ def resolve_input_ownership(
             shown = _owner_text(owner, redacted)
             if owner not in enabled_set:
                 refusals.append(
-                    _inputs_line(family, platform, f"owner {shown} is not enabled")
+                    _inputs_line(
+                        family, platform, f"owner {shown} is not enabled", redacted
+                    )
                 )
                 continue
             if not declares(owner, family, platform):
@@ -2561,7 +2603,8 @@ def resolve_input_ownership(
                         family,
                         platform,
                         f"owner {shown} does not declare family {family!r} "
-                        f"for platform {platform!r}",
+                        f"for platform {_quoted(platform, redacted)}",
+                        redacted,
                     )
                 )
                 continue
@@ -2612,6 +2655,7 @@ def resolve_input_ownership(
                                 platform,
                                 f"owned by default by {_listed([repr(o) for o in owners])}; set "
                                 f"{_INPUTS_KEY}.{family}.{platform}",
+                                redacted,
                             )
                         )
                     break

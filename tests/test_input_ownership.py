@@ -604,6 +604,122 @@ async def test_the_loader_never_quotes_a_literal_credential(tmp_path: Path) -> N
     assert "<redacted>" in text
 
 
+# -- F4: a configured credential used as a key is never echoed ---------------- #
+
+_F4_SECRET = "review-secret-4521"
+_F4_VOCABULARY = "(chat, viewers, cues)"
+
+
+def _f4_leaks(text: str, secret: str) -> bool:
+    """Whether *text* holds *secret* or any prefix of it longer than a word stem."""
+
+    return any(secret[:end] in text for end in range(8, len(secret) + 1))
+
+
+async def _f4_streamerbot_refusal(inputs: Any) -> tuple[str, ModuleLoader]:
+    loader = _loader(ROOT / "modules")
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled({
+            "enabled_modules": ["streamerbot"],
+            "modules": {"streamerbot": {
+                "url": "ws://127.0.0.1:9/",
+                "companion_name": "Companion",
+                "password": _F4_SECRET,
+            }},
+            "inputs": inputs,
+        })
+    return str(caught.value), loader
+
+
+@pytest.mark.asyncio
+async def test_f4_a_credential_used_as_a_family_key_is_never_echoed() -> None:
+    """F4: ownership resolution runs before credential redaction, so it redacts
+    the configured password out of the family key itself; the offender, the
+    vocabulary and the reason stay identifiable, and nothing is activated."""
+
+    text, loader = await _f4_streamerbot_refusal({_F4_SECRET: {"x": "streamerbot"}})
+    assert not _f4_leaks(text, _F4_SECRET)
+    assert text == (
+        "inputs: family '<redacted>': platform 'x': value 'streamerbot': "
+        f"family is outside the vocabulary {_F4_VOCABULARY}"
+    )
+    assert loader.activations == []
+
+
+@pytest.mark.asyncio
+async def test_f4_a_credential_used_as_a_platform_key_is_never_echoed() -> None:
+    """F4: the same password as a platform key is redacted; the family and the
+    rejected owner are still named, with the refusal reason."""
+
+    text, loader = await _f4_streamerbot_refusal({"chat": {_F4_SECRET: "not-enabled"}})
+    assert not _f4_leaks(text, _F4_SECRET)
+    assert text == (
+        "inputs: family 'chat': platform '<redacted>': owner 'not-enabled' is not enabled"
+    )
+    assert loader.activations == []
+
+
+@pytest.mark.asyncio
+async def test_f4_a_refusal_with_no_credential_involved_is_unchanged() -> None:
+    """F4's redaction is not over-broad: with the password configured but used
+    nowhere, both refusals keep their full text."""
+
+    text, _ = await _f4_streamerbot_refusal({
+        "weather": {"x": "streamerbot"},
+        "chat": {"twitch": "not-enabled"},
+    })
+    assert text == (
+        "inputs: family 'weather': platform 'x': value 'streamerbot': "
+        f"family is outside the vocabulary {_F4_VOCABULARY}\n"
+        "inputs: family 'chat': platform 'twitch': owner 'not-enabled' is not enabled"
+    )
+
+
+def test_f4_an_embedded_credential_leaves_no_prefix_behind_the_key_bound() -> None:
+    """F4: a credential embedded in a long key, or in an owner value, is cut out
+    before the key is bounded, so the bound cannot leave a prefix of it."""
+
+    secret = "embedded-credential-" + "q" * 60
+    padding = "k" * 50
+    refusals = []
+    for inputs in (
+        {padding + secret: {"x": "native"}},
+        {"chat": {padding + secret: "native"}},
+        {"chat": {"x": f"mod-{secret}"}},
+        {"chat": {"x": ["native", f"mod-{secret}"]}},
+        {"chat": {"x": "native", "y" + secret: "native"}},
+    ):
+        with pytest.raises(ModuleLoadError) as caught:
+            resolve_input_ownership(
+                ["native"],
+                {"native": _decl(NATIVE, "native")},
+                inputs,
+                redacted=frozenset({secret, ""}),
+            )
+        refusals.extend(caught.value.diagnostics)
+        assert str(caught.value) == "\n".join(caught.value.diagnostics)
+    assert len(refusals) == 5
+    assert not any(_f4_leaks(line, secret) for line in refusals)
+    assert all("<redacted>" in line for line in refusals)
+    assert refusals[1].startswith("inputs: family 'chat': platform 'kkkk")
+    assert refusals[4].endswith(
+        "does not declare family 'chat' for platform 'y<redacted>'"
+    )
+
+
+def test_f4_an_unknown_credential_set_is_refused_before_any_diagnostic() -> None:
+    """F4: with no known-credential set the resolver stops rather than report
+    a diagnostic it could not redact."""
+
+    with pytest.raises(TypeError, match="known-credential set"):
+        resolve_input_ownership(
+            ["native"],
+            {"native": _decl(NATIVE, "native")},
+            {"weather": {"x": "native"}},
+            redacted=None,  # type: ignore[arg-type]
+        )
+
+
 # -- D2: explicit and default precedence -------------------------------------- #
 
 
