@@ -1,0 +1,61 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "YouTube",
+          "type": "Message"
+        },
+        "data": {
+          "message": "hello youtube",
+          "meta": {
+            "internal": false,
+            "FirstMessage": false,
+            "FirstMessageTimestamp": "2026-10-15T20:00:00.0000000+02:00",
+            "ReturningChatter": false
+          },
+          "emotes": [],
+          "parts": [],
+          "user": {
+            "id": "UC-viewer-3001",
+            "login": "yt_viewer",
+            "name": "YT Viewer",
+            "type": "youtube",
+            "url": null,
+            "profileImageUrl": null,
+            "isOwner": false,
+            "isModerator": false,
+            "isSponsor": false,
+            "isVerified": false
+          },
+          "eventId": "yt-msg-1",
+          "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "broadcast": {
+            "id": "broadcast-1",
+            "channelId": "UC-broadcaster",
+            "liveChatId": "live-chat-1",
+            "title": "Stream",
+            "description": null,
+            "categoryId": null,
+            "privacy": "public",
+            "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "tags": [],
+            "defaultLanguage": null,
+            "defaultAudioLanguage": null,
+            "status": "live"
+          },
+          "isTest": false
+        }
+      }
+    }
+  ]
+}

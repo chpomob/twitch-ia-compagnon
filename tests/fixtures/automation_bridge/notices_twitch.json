@@ -1,0 +1,269 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Twitch",
+          "type": "Sub"
+        },
+        "data": {
+          "user": {
+            "id": "1003",
+            "login": "new_sub",
+            "name": "New_Sub",
+            "type": "twitch",
+            "role": 1,
+            "badges": [],
+            "color": "#1E90FF",
+            "subscribed": true,
+            "subscriptionTier": "1000",
+            "monthsSubscribed": 1
+          },
+          "messageId": "tw-sub-1",
+          "systemMessage": "New_Sub subscribed at Tier 1.",
+          "isTest": false,
+          "broadcaster": {
+            "id": "90001",
+            "login": "the_broadcaster",
+            "name": "The_Broadcaster",
+            "type": "twitch"
+          },
+          "isInSharedChat": false,
+          "isSharedChatHost": false,
+          "isFromSharedChatGuest": false,
+          "createdAt": "2026-10-15T20:00:00.0000000+02:00",
+          "subTier": "1000",
+          "isPrime": false,
+          "durationMonths": 1
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Twitch",
+          "type": "ReSub"
+        },
+        "data": {
+          "text": "still here",
+          "parts": [],
+          "user": {
+            "id": "1004",
+            "login": "old_sub",
+            "name": "Old_Sub",
+            "type": "twitch",
+            "role": 1,
+            "badges": [],
+            "color": "#1E90FF",
+            "subscribed": true,
+            "subscriptionTier": "1000",
+            "monthsSubscribed": 12
+          },
+          "messageId": "tw-resub-1",
+          "systemMessage": "Old_Sub subscribed at Tier 1. They've subscribed for 12 months!",
+          "isTest": false,
+          "broadcaster": {
+            "id": "90001",
+            "login": "the_broadcaster",
+            "name": "The_Broadcaster",
+            "type": "twitch"
+          },
+          "isInSharedChat": false,
+          "isSharedChatHost": false,
+          "isFromSharedChatGuest": false,
+          "createdAt": "2026-10-15T20:00:00.0000000+02:00",
+          "cumulativeMonths": 12,
+          "durationMonths": 1,
+          "streakMonths": 12,
+          "subTier": "1000",
+          "isPrime": false,
+          "isGift": false,
+          "gifterIsAnonymous": null,
+          "gifter": null
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Twitch",
+          "type": "GiftSub"
+        },
+        "data": {
+          "broadcaster": {
+            "id": "90001",
+            "login": "the_broadcaster",
+            "name": "The_Broadcaster",
+            "type": "twitch"
+          },
+          "communityGiftId": null,
+          "communitySubGiftCount": 0,
+          "communitySubGiftCumulativeTotal": 0,
+          "createdAt": "2026-10-15T20:00:00.0000000+02:00",
+          "cumlativeTotal": 5,
+          "durationMonths": 1,
+          "fromCommunitySubGift": false,
+          "isInSharedChat": false,
+          "isSharedChatHost": false,
+          "isFromSharedChatGuest": false,
+          "isTest": false,
+          "messageId": "tw-gift-1",
+          "randomCommunitySubGift": false,
+          "recipient": {
+            "id": "1006",
+            "login": "lucky_one",
+            "name": "Lucky_One",
+            "type": "twitch"
+          },
+          "subTier": "1000",
+          "systemMessage": "Gifter_Five gifted a Tier 1 sub to Lucky_One!",
+          "user": {
+            "id": "1005",
+            "login": "gifter_five",
+            "name": "Gifter_Five",
+            "type": "twitch",
+            "role": 1,
+            "badges": [],
+            "color": "#1E90FF",
+            "subscribed": false,
+            "subscriptionTier": null,
+            "monthsSubscribed": 0
+          }
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Twitch",
+          "type": "GiftBomb"
+        },
+        "data": {
+          "user": {
+            "id": "1005",
+            "login": "gifter_five",
+            "name": "Gifter_Five",
+            "type": "twitch",
+            "role": 1,
+            "badges": [],
+            "color": "#1E90FF",
+            "subscribed": false,
+            "subscriptionTier": null,
+            "monthsSubscribed": 0
+          },
+          "messageId": "tw-bomb-1",
+          "systemMessage": "Gifter_Five is gifting 2 Tier 1 Subs to the community!",
+          "isTest": false,
+          "broadcaster": {
+            "id": "90001",
+            "login": "the_broadcaster",
+            "name": "The_Broadcaster",
+            "type": "twitch"
+          },
+          "isInSharedChat": false,
+          "isSharedChatHost": false,
+          "isFromSharedChatGuest": false,
+          "createdAt": "2026-10-15T20:00:00.0000000+02:00",
+          "id": "community-gift-1",
+          "total": 2,
+          "cumulativeTotal": 7,
+          "subTier": "1000",
+          "recipients": [
+            {
+              "id": "1006",
+              "login": "lucky_one",
+              "name": "Lucky_One",
+              "type": "twitch"
+            },
+            {
+              "id": "1007",
+              "login": "lucky_two",
+              "name": "Lucky_Two",
+              "type": "twitch"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Twitch",
+          "type": "Raid"
+        },
+        "data": {
+          "isInSharedChat": false,
+          "isSharedChatHost": false,
+          "isFromSharedChatGuest": false,
+          "createdAt": "2026-10-15T20:00:00.0000000+02:00",
+          "isTest": false,
+          "raider": {
+            "id": "1008",
+            "login": "raider_eight",
+            "name": "Raider_Eight",
+            "type": "twitch"
+          },
+          "viewers": 42
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Twitch",
+          "type": "Follow"
+        },
+        "data": {
+          "broadcaster": {
+            "id": "90001",
+            "login": "the_broadcaster",
+            "name": "The_Broadcaster",
+            "type": "twitch"
+          },
+          "isInSharedChat": false,
+          "isSharedChatHost": false,
+          "isFromSharedChatGuest": false,
+          "createdAt": "2026-10-15T20:00:00.0000000+02:00",
+          "isTest": false,
+          "targetUser": {
+            "id": "1009",
+            "login": "new_follower",
+            "name": "New_Follower",
+            "type": "twitch"
+          },
+          "followedAt": "2026-10-15T20:00:00.0000000+02:00"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 2
+      },
+      "frame": {
+        "count": 4,
+        "viewers": [
+          {
+            "id": "1001",
+            "type": "twitch",
+            "login": "viewer_one",
+            "display": "Viewer_One",
+            "subscribed": false,
+            "role": "Viewer",
+            "groups": [],
+            "channelPointsUsed": 0,
+            "previousActive": "2026-10-15T20:00:00.0000000+02:00",
+            "exempt": false
+          },
+          {
+            "id": "1002",
+            "type": "twitch",
+            "login": "mod_two",
+            "display": "Mod_Two",
+            "subscribed": true,
+            "role": "Moderator",
+            "groups": [],
+            "channelPointsUsed": 0,
+            "previousActive": "2026-10-15T20:00:00.0000000+02:00",
+            "exempt": false
+          },
+          {
+            "id": "2001",
+            "type": "kick",
+            "login": "kick_viewer",
+            "display": "Kick_Viewer",
+            "subscribed": false,
+            "role": "Viewer",
+            "groups": [],
+            "channelPointsUsed": 0,
+            "previousActive": "2026-10-15T20:00:00.0000000+02:00",
+            "exempt": false
+          },
+          {
+            "id": "UC-viewer-3001",
+            "type": "youtube",
+            "login": "yt_viewer",
+            "display": "YT Viewer",
+            "subscribed": false,
+            "role": "Viewer",
+            "groups": [],
+            "channelPointsUsed": 0,
+            "previousActive": "2026-10-15T20:00:00.0000000+02:00",
+            "exempt": false
+          }
+        ],
+        "status": "ok",
+        "id": "request-1"
+      }
+    }
+  ]
+}

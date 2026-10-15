@@ -1,0 +1,14 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 5
+      },
+      "frame": {
+        "status": "ok",
+        "id": "request-1"
+      }
+    }
+  ]
+}

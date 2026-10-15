@@ -1,0 +1,22 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 2
+      },
+      "frame": {
+        "status": "ok",
+        "id": "request-1",
+        "events": {
+          "Twitch": [
+            "ChatMessage"
+          ],
+          "Custom": [
+            "Event"
+          ]
+        }
+      }
+    }
+  ]
+}

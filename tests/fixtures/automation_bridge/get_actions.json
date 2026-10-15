@@ -1,0 +1,69 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 2
+      },
+      "frame": {
+        "count": 5,
+        "actions": [
+          {
+            "enabled": true,
+            "group": "Companion",
+            "id": "00000000-0000-4000-8000-00000000000a",
+            "name": "A",
+            "subaction_count": 1,
+            "trigger_count": 0
+          },
+          {
+            "enabled": true,
+            "group": "Other",
+            "id": "00000000-0000-4000-8000-00000000000b",
+            "name": "B",
+            "subaction_count": 1,
+            "trigger_count": 0
+          },
+          {
+            "enabled": true,
+            "group": "Other",
+            "id": "00000000-0000-4000-8000-0000000000c1",
+            "name": "C",
+            "subaction_count": 1,
+            "trigger_count": 0
+          },
+          {
+            "enabled": true,
+            "group": "Other",
+            "id": "00000000-0000-4000-8000-0000000000c2",
+            "name": "C",
+            "subaction_count": 1,
+            "trigger_count": 0
+          },
+          {
+            "enabled": false,
+            "group": "Companion",
+            "id": "00000000-0000-4000-8000-00000000000d",
+            "name": "D",
+            "subaction_count": 1,
+            "trigger_count": 0
+          }
+        ],
+        "status": "ok",
+        "id": "request-1"
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 2
+      },
+      "frame": {
+        "count": 0,
+        "actions": [],
+        "status": "ok",
+        "id": "request-1"
+      }
+    }
+  ]
+}

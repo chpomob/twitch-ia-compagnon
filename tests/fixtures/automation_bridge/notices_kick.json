@@ -1,0 +1,122 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Kick",
+          "type": "Follow"
+        },
+        "data": {
+          "user": {
+            "id": "2002",
+            "login": "kick_follower",
+            "name": "Kick_Follower",
+            "type": "kick",
+            "profilePicture": null,
+            "role": 1,
+            "isSubscribed": false
+          },
+          "timestamp": "2026-10-15T20:00:00.0000000+02:00"
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Kick",
+          "type": "Subscription"
+        },
+        "data": {
+          "user": {
+            "id": "2003",
+            "login": "kick_sub",
+            "name": "Kick_Sub",
+            "type": "kick",
+            "profilePicture": null,
+            "role": 1,
+            "isSubscribed": true
+          },
+          "duration": 1,
+          "subscribedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "expiresAt": "2026-10-15T20:00:00.0000000+02:00",
+          "isTest": false
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Kick",
+          "type": "Resubscription"
+        },
+        "data": {
+          "user": {
+            "id": "2004",
+            "login": "kick_resub",
+            "name": "Kick_Resub",
+            "type": "kick",
+            "profilePicture": null,
+            "role": 1,
+            "isSubscribed": true
+          },
+          "duration": 6,
+          "subscribedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "expiresAt": "2026-10-15T20:00:00.0000000+02:00",
+          "isTest": false
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Kick",
+          "type": "GiftSubscription"
+        },
+        "data": {
+          "isAnonymous": false,
+          "user": {
+            "id": "2005",
+            "login": "kick_gifter",
+            "name": "Kick_Gifter",
+            "type": "kick",
+            "profilePicture": null,
+            "role": 1,
+            "isSubscribed": false
+          },
+          "recipient": {
+            "id": "2006",
+            "login": "kick_lucky",
+            "name": "Kick_Lucky",
+            "type": "kick",
+            "profilePicture": null,
+            "role": 1,
+            "isSubscribed": false
+          },
+          "subscribedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "expiresAt": "2026-10-15T20:00:00.0000000+02:00",
+          "isTest": false
+        }
+      }
+    }
+  ]
+}

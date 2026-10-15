@@ -5,10 +5,17 @@ contract (R4, AC15), its settings schema without any ``required`` key (R1,
 AC5), the value-free settings hook (R6, AC22; R5, AC45 first half; R7, AC33
 first half), the package-data line and unchanged dependencies (R10, AC41),
 and the vendor-free kernel (AC11, re-run). Nothing here opens a socket.
+
+Plan step P13 adds the instance fixtures' provenance guard (R8, AC35) and
+:class:`FakeInstance`, the loopback WebSocket server that replays them; only
+its own self-tests open a socket, on ``127.0.0.1``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import json
 import math
 import re
 import sys
@@ -21,8 +28,10 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover - exercised on the 3.10 floor only
     import tomli as tomllib
 
+import aiohttp
 import pytest
 import yaml
+from aiohttp import WSMsgType, web
 
 from core.actions import ERROR_PROVIDER_NOT_READY, AuthorizationRule
 from core.contracts import (
@@ -583,3 +592,500 @@ def test_ac11_the_kernel_never_names_the_bridge_or_its_vendor() -> None:
         and VENDOR_PATTERN.search(path.read_text(encoding="utf-8", errors="ignore"))
     ]
     assert matches == []
+
+
+# -- P13: the instance fixtures and their provenance (R8, AC35) -------------- #
+
+FIXTURE_DIR = ROOT / "tests" / "fixtures" / "automation_bridge"
+LEDGER_PATH = ROOT / "docs" / "research" / "sources-ledger-streamerbot.json"
+TRIAL_RECORD = "docs/campaigns/phase5/bridge-trial-record.md"
+#: Every fixture file, by stem. A file outside this list is a failure too.
+FIXTURE_FILES = (
+    "hello",
+    "authentication",
+    "get_actions",
+    "do_action",
+    "subscribe",
+    "custom_event",
+    "active_viewers",
+    "chat_twitch",
+    "chat_kick",
+    "chat_youtube",
+    "notices_twitch",
+    "notices_kick",
+    "notices_youtube",
+    "error_response",
+)
+#: The section 9 questions of the integration study.
+TRIAL_QUESTIONS = range(1, 9)
+#: The event source each per-platform fixture's frames carry.
+PLATFORM_SOURCES = {"twitch": "Twitch", "kick": "Kick", "youtube": "YouTube"}
+
+
+def _ledger_ids() -> frozenset[int]:
+    ledger = json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
+    return frozenset(source["id"] for source in ledger["sources"])
+
+
+def fixture_entries(name: str) -> list[dict[str, Any]]:
+    """The entries of fixture *name*: provenance, optional question, frame."""
+
+    loaded = json.loads((FIXTURE_DIR / f"{name}.json").read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict) and set(loaded) == {"frames"}, name
+    assert isinstance(loaded["frames"], list) and loaded["frames"], name
+    return loaded["frames"]
+
+
+def fixture_frame(name: str, index: int = 0) -> dict[str, Any]:
+    """A private copy of frame *index* of fixture *name*."""
+
+    return copy.deepcopy(fixture_entries(name)[index]["frame"])
+
+
+def _provenance_violations(
+    name: str, entries: list[Any], ledger_ids: frozenset[int]
+) -> list[str]:
+    """Every AC35 violation of one fixture file, as ``file#index: reason``."""
+
+    violations: list[str] = []
+    for index, entry in enumerate(entries):
+        where = f"{name}#{index}"
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("frame"), Mapping):
+            violations.append(f"{where}: not a frame entry")
+            continue
+        if set(entry) - {"provenance", "question", "frame"}:
+            violations.append(f"{where}: unknown keys")
+        provenance = entry.get("provenance")
+        kind = provenance.get("kind") if isinstance(provenance, Mapping) else None
+        if kind == "documented":
+            ledger_id = provenance.get("ledger_id")
+            if (
+                set(provenance) != {"kind", "ledger_id"}
+                or isinstance(ledger_id, bool)
+                or ledger_id not in ledger_ids
+            ):
+                violations.append(f"{where}: documented id absent from the ledger")
+        elif kind == "observed":
+            reference = provenance.get("trial_record")
+            if set(provenance) != {"kind", "trial_record"} or not (
+                isinstance(reference, str)
+                and re.fullmatch(re.escape(TRIAL_RECORD) + r"#q[1-8]", reference)
+            ):
+                violations.append(f"{where}: observed without a trial-record reference")
+        else:
+            violations.append(f"{where}: no provenance")
+        if "question" in entry:
+            question = entry["question"]
+            if isinstance(question, bool) or question not in TRIAL_QUESTIONS:
+                violations.append(f"{where}: question outside 1-8")
+            elif kind != "observed":
+                violations.append(f"{where}: names question {question} but is not observed")
+            elif provenance["trial_record"] != f"{TRIAL_RECORD}#q{question}":
+                violations.append(f"{where}: observed for another question")
+    return violations
+
+
+def test_ac35_the_fixture_directory_holds_exactly_the_listed_files() -> None:
+    """R8: the fixture set is closed — a replayed frame cannot come from a
+    file the guard does not load."""
+
+    stored = sorted(path.stem for path in FIXTURE_DIR.glob("*.json"))
+    assert stored == sorted(FIXTURE_FILES)
+    assert (FIXTURE_DIR / "README.md").is_file()
+
+
+def test_ac35_every_frame_carries_a_provenance_and_no_question_is_answered() -> None:
+    """AC35 (R8): no frame lacks a provenance, every ``documented`` one
+    names a ledger id, a frame naming a question 1–8 is ``observed``; with
+    no trial record, the count of frames naming a question is 0."""
+
+    ledger_ids = _ledger_ids()
+    violations: list[str] = []
+    naming_a_question = 0
+    for name in FIXTURE_FILES:
+        entries = fixture_entries(name)
+        violations += _provenance_violations(name, entries, ledger_ids)
+        naming_a_question += sum(1 for entry in entries if "question" in entry)
+    assert violations == []
+    if not (ROOT / TRIAL_RECORD).exists():
+        assert naming_a_question == 0
+
+
+def test_ac35_the_guard_rejects_each_violation() -> None:
+    """The guard itself: each kind of violation is reported, a valid
+    observed frame for its own question passes."""
+
+    ledger_ids = frozenset({2, 4, 6})
+    frame = {"status": "ok", "id": "request-1"}
+    observed = {"kind": "observed", "trial_record": f"{TRIAL_RECORD}#q1"}
+    cases = {
+        "no provenance": {"frame": frame},
+        "documented id absent from the ledger": {
+            "provenance": {"kind": "documented", "ledger_id": 99},
+            "frame": frame,
+        },
+        "names question 1 but is not observed": {
+            "provenance": {"kind": "documented", "ledger_id": 2},
+            "question": 1,
+            "frame": frame,
+        },
+        "observed without a trial-record reference": {
+            "provenance": {"kind": "observed", "trial_record": "elsewhere.md#q1"},
+            "frame": frame,
+        },
+        "question outside 1-8": {"provenance": observed, "question": 9, "frame": frame},
+        "observed for another question": {"provenance": observed, "question": 6, "frame": frame},
+    }
+    for reason, entry in cases.items():
+        assert _provenance_violations("case", [entry], ledger_ids) == [f"case#0: {reason}"]
+    valid = {"provenance": observed, "question": 1, "frame": frame}
+    assert _provenance_violations("case", [valid], ledger_ids) == []
+
+
+def test_r8_the_fixtures_hold_the_planned_frames() -> None:
+    """R8 contents: both hellos, the inventory, the run acknowledgement and
+    error, the subscription, the custom event, the active viewers, one chat
+    message per platform, and per-platform notices of that platform only."""
+
+    hellos = [fixture_frame("hello", index) for index in range(len(fixture_entries("hello")))]
+    assert [hello["request"] for hello in hellos] == ["Hello", "Hello"]
+    assert ["authentication" in hello for hello in hellos] == [False, True]
+    assert set(hellos[1]["authentication"]) == {"salt", "challenge"}
+    assert fixture_frame("authentication")["status"] == "ok"
+    assert fixture_frame("error_response")["status"] == "error"
+    inventory = fixture_frame("get_actions")
+    assert inventory["count"] == len(inventory["actions"]) > 0
+    assert [entry["frame"]["status"] for entry in fixture_entries("do_action")] == ["ok", "error"]
+    assert fixture_frame("subscribe")["status"] == "ok"
+    assert fixture_frame("custom_event")["event"] == {"source": "Custom", "type": "Event"}
+    assert fixture_frame("active_viewers")["viewers"]
+    readme = (FIXTURE_DIR / "README.md").read_text(encoding="utf-8")
+    for platform, source in PLATFORM_SOURCES.items():
+        chat = fixture_entries(f"chat_{platform}")
+        assert len(chat) == 1 and chat[0]["frame"]["event"]["source"] == source
+        notices = [entry["frame"]["event"] for entry in fixture_entries(f"notices_{platform}")]
+        assert {event["source"] for event in notices} == {source}
+        types = [event["type"] for event in notices]
+        assert len(types) == len(set(types))
+        for event_type in types:
+            # The README enumerates every documented notice kind (the AC43 list).
+            assert f"| {platform} | `{event_type}` |" in readme
+
+
+# -- P13: the fake instance -------------------------------------------------- #
+
+LOOPBACK = "127.0.0.1"
+#: The fault ``malformed_hello`` sends: not an instance frame, not JSON.
+MALFORMED_HELLO = '{"request": "Hello"'
+#: A bound on each self-test's wait; a deadline, never a sleep.
+FAKE_WAIT_SECONDS = 5.0
+
+
+class FakeInstance:
+    """A loopback WebSocket server replaying the fixture frames (R8).
+
+    It listens on ``127.0.0.1`` at an ephemeral port, sends the hello on each
+    connection, records every received frame in arrival order and by request
+    id, and answers each documented request with its fixture frame, the
+    request's id substituted. The fault switches:
+
+    - ``require_authentication`` sends the hello carrying ``authentication``;
+    - ``refuse_authentication`` answers ``Authenticate`` with the error frame;
+    - ``malformed_hello`` sends :data:`MALFORMED_HELLO` instead of a hello;
+    - ``fail_inventory`` answers ``GetActions`` with the error frame;
+    - ``inventory`` picks the ``get_actions`` frame (default: the first);
+    - ``reject_runs`` answers ``DoAction`` with the error frame;
+    - ``hold_acknowledgements`` delays every ``DoAction`` answer until
+      :meth:`release_acknowledgements`;
+    - ``withhold_acknowledgements`` never answers ``DoAction``.
+
+    :meth:`close_connection` closes the current socket, :meth:`push_events`
+    sends one fixture event N times, :meth:`stop` shuts the server down. A
+    request with no documented answer gets none.
+    """
+
+    def __init__(
+        self,
+        *,
+        require_authentication: bool = False,
+        refuse_authentication: bool = False,
+        malformed_hello: bool = False,
+        fail_inventory: bool = False,
+        inventory: int = 0,
+        reject_runs: bool = False,
+        hold_acknowledgements: bool = False,
+        withhold_acknowledgements: bool = False,
+    ) -> None:
+        self.require_authentication = require_authentication
+        self.refuse_authentication = refuse_authentication
+        self.malformed_hello = malformed_hello
+        self.fail_inventory = fail_inventory
+        self.inventory = inventory
+        self.reject_runs = reject_runs
+        self.hold_acknowledgements = hold_acknowledgements
+        self.withhold_acknowledgements = withhold_acknowledgements
+        #: Every received frame, in arrival order (a non-JSON text as ``str``).
+        self.received: list[Any] = []
+        #: Every received frame carrying an ``id``, by that id.
+        self.by_request_id: dict[str, list[dict[str, Any]]] = {}
+        self.connections = 0
+        self.disconnections = 0
+        self.url = ""
+        self._runner: web.AppRunner | None = None
+        self._socket: web.WebSocketResponse | None = None
+        self._released = asyncio.Event()
+        self._changed = asyncio.Event()
+        self._pending: set[asyncio.Task[None]] = set()
+
+    async def __aenter__(self) -> FakeInstance:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.stop()
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.router.add_get("/", self._handle)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, LOOPBACK, 0)
+        await site.start()
+        server = getattr(site, "_server", None)
+        assert server is not None and server.sockets
+        port = server.sockets[0].getsockname()[1]
+        self.url = f"ws://{LOOPBACK}:{port}/"
+
+    async def stop(self) -> None:
+        for task in self._pending:
+            task.cancel()
+        await asyncio.gather(*self._pending, return_exceptions=True)
+        await self.close_connection()
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+
+    def requests(self, name: str) -> list[dict[str, Any]]:
+        """The received frames naming request *name*."""
+
+        return [
+            frame
+            for frame in self.received
+            if isinstance(frame, dict) and frame.get("request") == name
+        ]
+
+    async def wait_for_frames(self, count: int) -> None:
+        """Return once *count* frames were received (the caller bounds it)."""
+
+        while len(self.received) < count:
+            self._changed.clear()
+            await self._changed.wait()
+
+    async def wait_for_disconnections(self, count: int) -> None:
+        """Return once *count* connections ended (the caller bounds it)."""
+
+        while self.disconnections < count:
+            self._changed.clear()
+            await self._changed.wait()
+
+    def release_acknowledgements(self) -> None:
+        self._released.set()
+
+    async def close_connection(self) -> None:
+        socket = self._socket
+        if socket is not None and not socket.closed:
+            await socket.close()
+
+    async def push_events(self, name: str, count: int, index: int = 0) -> None:
+        """Send frame *index* of fixture *name* *count* times."""
+
+        socket = self._socket
+        assert socket is not None and not socket.closed
+        frame = fixture_frame(name, index)
+        for _ in range(count):
+            await socket.send_json(frame)
+
+    async def _handle(self, request: web.Request) -> web.WebSocketResponse:
+        socket = web.WebSocketResponse()
+        await socket.prepare(request)
+        self.connections += 1
+        self._socket = socket
+        try:
+            if self.malformed_hello:
+                await socket.send_str(MALFORMED_HELLO)
+            else:
+                await socket.send_json(fixture_frame("hello", 1 if self.require_authentication else 0))
+            async for message in socket:
+                if message.type is not WSMsgType.TEXT:
+                    continue
+                frame = self._record(message.data)
+                if isinstance(frame, dict):
+                    await self._answer(socket, frame)
+        finally:
+            if self._socket is socket:
+                self._socket = None
+            self.disconnections += 1
+            self._changed.set()
+        return socket
+
+    def _record(self, text: str) -> Any:
+        try:
+            frame: Any = json.loads(text)
+        except ValueError:
+            frame = text
+        self.received.append(frame)
+        if isinstance(frame, dict) and isinstance(frame.get("id"), str):
+            self.by_request_id.setdefault(frame["id"], []).append(frame)
+        self._changed.set()
+        return frame
+
+    async def _answer(self, socket: web.WebSocketResponse, frame: dict[str, Any]) -> None:
+        name = frame.get("request")
+        if name == "Authenticate":
+            reply = fixture_frame("error_response" if self.refuse_authentication else "authentication")
+        elif name == "GetActions":
+            reply = (
+                fixture_frame("error_response")
+                if self.fail_inventory
+                else fixture_frame("get_actions", self.inventory)
+            )
+        elif name == "Subscribe":
+            reply = fixture_frame("subscribe")
+            reply["events"] = copy.deepcopy(frame.get("events"))
+        elif name == "GetActiveViewers":
+            reply = fixture_frame("active_viewers")
+        elif name == "DoAction":
+            if self.withhold_acknowledgements:
+                return
+            reply = fixture_frame("do_action", 1 if self.reject_runs else 0)
+            if self.hold_acknowledgements:
+                reply["id"] = frame.get("id")
+                task = asyncio.ensure_future(self._answer_when_released(socket, reply))
+                self._pending.add(task)
+                task.add_done_callback(self._pending.discard)
+                return
+        else:
+            return
+        reply["id"] = frame.get("id")
+        await socket.send_json(reply)
+
+    async def _answer_when_released(
+        self, socket: web.WebSocketResponse, reply: dict[str, Any]
+    ) -> None:
+        await self._released.wait()
+        if not socket.closed:
+            await socket.send_json(reply)
+
+
+async def _receive(client: aiohttp.ClientWebSocketResponse) -> aiohttp.WSMessage:
+    return await asyncio.wait_for(client.receive(), FAKE_WAIT_SECONDS)
+
+
+async def _receive_json(client: aiohttp.ClientWebSocketResponse) -> Any:
+    message = await _receive(client)
+    assert message.type is WSMsgType.TEXT
+    return json.loads(message.data)
+
+
+async def test_fake_instance_answers_one_hello_and_records_one_frame() -> None:
+    """R8 self-test: one hello replayed from its fixture, one request
+    recorded by id and answered with the fixture frame under that id."""
+
+    async with FakeInstance() as fake, aiohttp.ClientSession() as session:
+        assert fake.url.startswith(f"ws://{LOOPBACK}:")
+        async with session.ws_connect(fake.url) as client:
+            assert await _receive_json(client) == fixture_frame("hello")
+            await client.send_json({"request": "GetActions", "id": "r-1"})
+            answer = await _receive_json(client)
+        assert answer == {**fixture_frame("get_actions"), "id": "r-1"}
+        assert fake.received == [{"request": "GetActions", "id": "r-1"}]
+        assert fake.by_request_id == {"r-1": [{"request": "GetActions", "id": "r-1"}]}
+        assert fake.connections == 1
+
+
+async def test_fake_instance_authentication_switches() -> None:
+    """The hello carries the challenge when authentication is required; a
+    refusal answers the error frame."""
+
+    async with FakeInstance(require_authentication=True) as fake, aiohttp.ClientSession() as session:
+        async with session.ws_connect(fake.url) as client:
+            assert await _receive_json(client) == fixture_frame("hello", 1)
+            await client.send_json({"request": "Authenticate", "id": "a-1", "authentication": "x"})
+            assert await _receive_json(client) == {**fixture_frame("authentication"), "id": "a-1"}
+    async with FakeInstance(
+        require_authentication=True, refuse_authentication=True
+    ) as fake, aiohttp.ClientSession() as session:
+        async with session.ws_connect(fake.url) as client:
+            await _receive_json(client)
+            await client.send_json({"request": "Authenticate", "id": "a-2", "authentication": "x"})
+            assert await _receive_json(client) == {"status": "error", "id": "a-2"}
+
+
+async def test_fake_instance_malformed_hello_and_failed_inventory() -> None:
+    async with FakeInstance(malformed_hello=True, fail_inventory=True) as fake, (
+        aiohttp.ClientSession()
+    ) as session:
+        async with session.ws_connect(fake.url) as client:
+            message = await _receive(client)
+            assert message.data == MALFORMED_HELLO
+            await client.send_json({"request": "GetActions", "id": "g-1"})
+            assert await _receive_json(client) == {"status": "error", "id": "g-1"}
+
+
+async def test_fake_instance_holds_withholds_and_rejects_acknowledgements() -> None:
+    """A held acknowledgement leaves only once released, a withheld one
+    never, a rejected run answers the error frame; every run is recorded."""
+
+    async with FakeInstance(hold_acknowledgements=True) as fake, aiohttp.ClientSession() as session:
+        async with session.ws_connect(fake.url) as client:
+            await _receive_json(client)
+            await client.send_json({"request": "DoAction", "id": "d-1", "action": {"id": "x"}})
+            await client.send_json({"request": "GetActions", "id": "g-1"})
+            # The inventory answer overtakes the held acknowledgement.
+            assert (await _receive_json(client))["id"] == "g-1"
+            fake.release_acknowledgements()
+            assert await _receive_json(client) == {"status": "ok", "id": "d-1"}
+    async with FakeInstance(withhold_acknowledgements=True) as fake, (
+        aiohttp.ClientSession()
+    ) as session:
+        async with session.ws_connect(fake.url) as client:
+            await _receive_json(client)
+            await client.send_json({"request": "DoAction", "id": "d-2", "action": {"id": "x"}})
+            await client.send_json({"request": "GetActions", "id": "g-2"})
+            assert (await _receive_json(client))["id"] == "g-2"
+        assert [frame["id"] for frame in fake.requests("DoAction")] == ["d-2"]
+    async with FakeInstance(reject_runs=True) as fake, aiohttp.ClientSession() as session:
+        async with session.ws_connect(fake.url) as client:
+            await _receive_json(client)
+            await client.send_json({"request": "DoAction", "id": "d-3", "action": {"id": "x"}})
+            assert await _receive_json(client) == {"status": "error", "id": "d-3"}
+
+
+async def test_fake_instance_pushes_events_echoes_subscriptions_and_closes() -> None:
+    async with FakeInstance() as fake, aiohttp.ClientSession() as session:
+        async with session.ws_connect(fake.url) as client:
+            await _receive_json(client)
+            events = {"Custom": ["Event"]}
+            await client.send_json({"request": "Subscribe", "id": "s-1", "events": events})
+            assert await _receive_json(client) == {"status": "ok", "id": "s-1", "events": events}
+            await fake.push_events("custom_event", 3)
+            for _ in range(3):
+                assert await _receive_json(client) == fixture_frame("custom_event")
+            await fake.close_connection()
+            assert (await _receive(client)).type in (WSMsgType.CLOSE, WSMsgType.CLOSED)
+        await asyncio.wait_for(fake.wait_for_disconnections(1), FAKE_WAIT_SECONDS)
+        assert fake.connections == fake.disconnections == 1
+
+
+async def test_fake_instance_stop_ends_the_connection() -> None:
+    fake = FakeInstance()
+    await fake.start()
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(fake.url) as client:
+            await _receive_json(client)
+            await client.send_json({"request": "GetActiveViewers", "id": "v-1"})
+            await asyncio.wait_for(fake.wait_for_frames(1), FAKE_WAIT_SECONDS)
+            assert (await _receive_json(client))["viewers"]
+            await fake.stop()
+            assert (await _receive(client)).type in (WSMsgType.CLOSE, WSMsgType.CLOSED)
+    assert fake.by_request_id["v-1"] == [{"request": "GetActiveViewers", "id": "v-1"}]

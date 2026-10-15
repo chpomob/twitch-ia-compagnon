@@ -1,0 +1,24 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Custom",
+          "type": "Event"
+        },
+        "data": {
+          "eventName": "companion.cue",
+          "useArgs": true,
+          "args": {
+            "scene": "intro"
+          }
+        }
+      }
+    }
+  ]
+}

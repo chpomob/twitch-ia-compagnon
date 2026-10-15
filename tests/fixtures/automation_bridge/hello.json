@@ -1,0 +1,50 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 4
+      },
+      "frame": {
+        "timestamp": "2026-10-15T20:00:00.0000000+02:00",
+        "session": "session-1",
+        "request": "Hello",
+        "info": {
+          "instanceId": "instance-1",
+          "name": "Instance",
+          "version": "1.0.7",
+          "os": "windows",
+          "osVersion": "10.0.22631.0",
+          "mode": "ui",
+          "darkMode": true,
+          "source": "websocketServer"
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 4
+      },
+      "frame": {
+        "timestamp": "2026-10-15T20:00:00.0000000+02:00",
+        "session": "session-1",
+        "request": "Hello",
+        "info": {
+          "instanceId": "instance-1",
+          "name": "Instance",
+          "version": "1.0.7",
+          "os": "windows",
+          "osVersion": "10.0.22631.0",
+          "mode": "ui",
+          "darkMode": true,
+          "source": "websocketServer"
+        },
+        "authentication": {
+          "salt": "zqv0/ttLiBe4ULROD8ji06d/8HBCsuJpAEo+N/KeU64=",
+          "challenge": "+IsMI1ZfPg5AVF5FYNbI6m1M/cjjSL0ehAjj9oD1A1E="
+        }
+      }
+    }
+  ]
+}

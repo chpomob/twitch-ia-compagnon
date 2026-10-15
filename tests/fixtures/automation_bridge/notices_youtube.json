@@ -1,0 +1,268 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "YouTube",
+          "type": "NewSponsor"
+        },
+        "data": {
+          "user": {
+            "id": "UC-3002",
+            "login": "yt_member",
+            "name": "YT Member",
+            "type": "youtube",
+            "url": null,
+            "profileImageUrl": null,
+            "isOwner": false,
+            "isModerator": false,
+            "isSponsor": true,
+            "isVerified": false
+          },
+          "eventId": "yt-sponsor-1",
+          "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "broadcast": {
+            "id": "broadcast-1",
+            "channelId": "UC-broadcaster",
+            "liveChatId": "live-chat-1",
+            "title": "Stream",
+            "description": null,
+            "categoryId": null,
+            "privacy": "public",
+            "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "tags": [],
+            "defaultLanguage": null,
+            "defaultAudioLanguage": null,
+            "status": "live"
+          },
+          "isTest": false,
+          "levelName": "Member",
+          "isUpgrade": false
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "YouTube",
+          "type": "MemberMileStone"
+        },
+        "data": {
+          "user": {
+            "id": "UC-3003",
+            "login": "yt_loyal",
+            "name": "YT Loyal",
+            "type": "youtube",
+            "url": null,
+            "profileImageUrl": null,
+            "isOwner": false,
+            "isModerator": false,
+            "isSponsor": true,
+            "isVerified": false
+          },
+          "eventId": "yt-milestone-1",
+          "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "broadcast": {
+            "id": "broadcast-1",
+            "channelId": "UC-broadcaster",
+            "liveChatId": "live-chat-1",
+            "title": "Stream",
+            "description": null,
+            "categoryId": null,
+            "privacy": "public",
+            "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "tags": [],
+            "defaultLanguage": null,
+            "defaultAudioLanguage": null,
+            "status": "live"
+          },
+          "isTest": false,
+          "months": 6,
+          "levelName": "Member",
+          "message": "six months"
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "YouTube",
+          "type": "MembershipGift"
+        },
+        "data": {
+          "user": {
+            "id": "UC-3004",
+            "login": "yt_gifter",
+            "name": "YT Gifter",
+            "type": "youtube",
+            "url": null,
+            "profileImageUrl": null,
+            "isOwner": false,
+            "isModerator": false,
+            "isSponsor": false,
+            "isVerified": false
+          },
+          "eventId": "yt-gift-1",
+          "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "broadcast": {
+            "id": "broadcast-1",
+            "channelId": "UC-broadcaster",
+            "liveChatId": "live-chat-1",
+            "title": "Stream",
+            "description": null,
+            "categoryId": null,
+            "privacy": "public",
+            "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "tags": [],
+            "defaultLanguage": null,
+            "defaultAudioLanguage": null,
+            "status": "live"
+          },
+          "isTest": false,
+          "count": 5,
+          "tier": "Member"
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "YouTube",
+          "type": "SuperChat"
+        },
+        "data": {
+          "user": {
+            "id": "UC-3005",
+            "login": "yt_tipper",
+            "name": "YT Tipper",
+            "type": "youtube",
+            "url": null,
+            "profileImageUrl": null,
+            "isOwner": false,
+            "isModerator": false,
+            "isSponsor": false,
+            "isVerified": false
+          },
+          "eventId": "yt-superchat-1",
+          "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "broadcast": {
+            "id": "broadcast-1",
+            "channelId": "UC-broadcaster",
+            "liveChatId": "live-chat-1",
+            "title": "Stream",
+            "description": null,
+            "categoryId": null,
+            "privacy": "public",
+            "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "tags": [],
+            "defaultLanguage": null,
+            "defaultAudioLanguage": null,
+            "status": "live"
+          },
+          "isTest": false,
+          "message": "great stream",
+          "currencyCode": "EUR",
+          "microAmount": 5000000,
+          "decimalAmount": 5.0,
+          "amount": "€5.00",
+          "tier": 2
+        }
+      }
+    },
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "YouTube",
+          "type": "SuperSticker"
+        },
+        "data": {
+          "user": {
+            "id": "UC-3006",
+            "login": "yt_sticker",
+            "name": "YT Sticker",
+            "type": "youtube",
+            "url": null,
+            "profileImageUrl": null,
+            "isOwner": false,
+            "isModerator": false,
+            "isSponsor": false,
+            "isVerified": false
+          },
+          "eventId": "yt-supersticker-1",
+          "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+          "broadcast": {
+            "id": "broadcast-1",
+            "channelId": "UC-broadcaster",
+            "liveChatId": "live-chat-1",
+            "title": "Stream",
+            "description": null,
+            "categoryId": null,
+            "privacy": "public",
+            "publishedAt": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "scheduledEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualStartTime": "2026-10-15T20:00:00.0000000+02:00",
+            "actualEndTime": "2026-10-15T20:00:00.0000000+02:00",
+            "tags": [],
+            "defaultLanguage": null,
+            "defaultAudioLanguage": null,
+            "status": "live"
+          },
+          "isTest": false,
+          "currencyCode": "EUR",
+          "microAmount": 2000000,
+          "decimalAmount": 2.0,
+          "amount": "€2.00",
+          "tier": 1,
+          "sticker": {
+            "id": "sticker-1",
+            "alternativeText": "a sticker",
+            "language": "en",
+            "imageUrl": null
+          }
+        }
+      }
+    }
+  ]
+}

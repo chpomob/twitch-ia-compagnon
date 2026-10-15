@@ -1,0 +1,43 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Kick",
+          "type": "ChatMessage"
+        },
+        "data": {
+          "isAnonymous": false,
+          "user": {
+            "id": "2001",
+            "login": "kick_viewer",
+            "name": "Kick_Viewer",
+            "type": "kick",
+            "profilePicture": null,
+            "role": 1,
+            "isSubscribed": false,
+            "badges": [],
+            "color": "#00FF00",
+            "monthsSubscribed": 0,
+            "isVerified": false
+          },
+          "messageId": "kick-msg-1",
+          "parts": [],
+          "text": "hello kick",
+          "isReply": false,
+          "reply": null,
+          "FirstMessage": false,
+          "FirstMessageTimestamp": "2026-10-15T20:00:00.0000000+02:00",
+          "ReturningChatter": false,
+          "isInternal": false,
+          "isTest": false
+        }
+      }
+    }
+  ]
+}

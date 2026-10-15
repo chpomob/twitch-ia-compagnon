@@ -1,0 +1,67 @@
+{
+  "frames": [
+    {
+      "provenance": {
+        "kind": "documented",
+        "ledger_id": 6
+      },
+      "frame": {
+        "timeStamp": "2026-10-15T20:00:00.0000000+02:00",
+        "event": {
+          "source": "Twitch",
+          "type": "ChatMessage"
+        },
+        "data": {
+          "user": {
+            "id": "1002",
+            "login": "mod_two",
+            "name": "Mod_Two",
+            "type": "twitch",
+            "role": 3,
+            "badges": [
+              {
+                "name": "moderator",
+                "version": "1",
+                "imageUrl": null,
+                "info": null
+              }
+            ],
+            "color": "#1E90FF",
+            "subscribed": true,
+            "subscriptionTier": "1000",
+            "monthsSubscribed": 3
+          },
+          "messageId": "tw-msg-1",
+          "meta": {
+            "isTest": false,
+            "internal": false,
+            "firstMessage": false,
+            "firstMessageTimestamp": "2026-10-15T20:00:00.0000000+02:00",
+            "returningChatter": false,
+            "isHighlighted": false,
+            "isMe": false,
+            "isCustomReward": false
+          },
+          "anonymous": false,
+          "text": "hello chat",
+          "emotes": [],
+          "parts": [],
+          "isReply": false,
+          "reply": null,
+          "sharedChatSource": null,
+          "broadcaster": {
+            "id": "90001",
+            "login": "the_broadcaster",
+            "name": "The_Broadcaster",
+            "type": "twitch"
+          },
+          "isInSharedChat": false,
+          "isSharedChatHost": false,
+          "isFromSharedChatGuest": false,
+          "createdAt": "2026-10-15T20:00:00.0000000+02:00",
+          "isTest": false
+        }
+      }
+    }
+  ]
+}
