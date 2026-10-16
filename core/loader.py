@@ -71,7 +71,7 @@ import re
 import string
 import sys
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType, ModuleType
@@ -2277,11 +2277,42 @@ def _configured_values(settings: Any) -> tuple[str, ...]:
     return tuple(sorted(found, key=len, reverse=True))
 
 
-def _redact_values(text: str, values: Sequence[str]) -> str:
-    for value in values:
-        if value in text:
-            text = text.replace(value, _REDACTED_VALUE)
-    return text
+def _redact_values(text: str, values: Iterable[str]) -> str:
+    """*text* with the union of every known value's occurrences masked (R8, N2).
+
+    Every occurrence of every non-empty value is located in the *original*
+    text — overlapping occurrences, and occurrences overlapping another
+    value, included — and the union of those spans is masked in one pass,
+    each maximal masked run becoming one marker. Nothing is searched in an
+    already-masked string, so no value's removal can break another value's
+    match and leave a fragment of it behind; the result does not depend on
+    the order of *values*.
+    """
+
+    masked = [False] * len(text)
+    for value in set(values):
+        if not value:
+            continue
+        start = text.find(value)
+        while start != -1:
+            masked[start : start + len(value)] = [True] * len(value)
+            start = text.find(value, start + 1)
+    if not any(masked):
+        return text
+    pieces: list[str] = []
+    index = 0
+    while index < len(text):
+        if masked[index]:
+            while index < len(text) and masked[index]:
+                index += 1
+            pieces.append(_REDACTED_VALUE)
+        else:
+            end = index
+            while end < len(text) and not masked[end]:
+                end += 1
+            pieces.append(text[index:end])
+            index = end
+    return "".join(pieces)
 
 
 _FIELD_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-\[\]]{0,119}\Z")
@@ -2437,11 +2468,9 @@ def _quoted(value: str, redacted: frozenset[str] = frozenset()) -> str:
 
 
 def _redact_known(text: str, redacted: frozenset[str]) -> str:
-    """*text* with every non-empty known credential cut out, longest first."""
+    """*text* with the union of every known credential's matches masked."""
 
-    return _redact_values(
-        text, sorted((value for value in redacted if value), key=len, reverse=True)
-    )
+    return _redact_values(text, redacted)
 
 
 def _owner_text(value: Any, redacted: frozenset[str]) -> str:

@@ -3473,7 +3473,9 @@ def _n1_profile(tmp_path: Path, inputs: Any, *, modules_directory: Path) -> Path
 
 
 async def _n1_both_routes(
-    path: Path, monkeypatch: pytest.MonkeyPatch
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environ: dict[str, str] | None = None,
 ) -> list[tuple[str, int, list[str]]]:
     """The profile through ``run`` and ``check_config``, with assembly refused."""
 
@@ -3487,12 +3489,13 @@ async def _n1_both_routes(
     outcomes = []
     ran: list[str] = []
     status = await application.run(
-        path, asyncio.Event(), environ={}, diagnostic_reporter=ran.append
+        path, asyncio.Event(), environ=dict(environ or {}),
+        diagnostic_reporter=ran.append,
     )
     outcomes.append(("run", status, ran))
     checked: list[str] = []
     status = await application.check_config(
-        path, environ={}, diagnostic_reporter=checked.append
+        path, environ=dict(environ or {}), diagnostic_reporter=checked.append
     )
     outcomes.append(("check_config", status, checked))
     assert assemblies == []
@@ -3575,3 +3578,72 @@ async def test_n1_a_unreadable_manifests_over_redact_rather_than_leak(
         "inputs.chat.<redacted>: owner must be a module name or a list of module names"
     )
     assert outcomes == [("run", 2, [expected]), ("check_config", 2, [expected])]
+
+
+# -- N2: overlapping known values never fragment a credential ---------------- #
+
+_N2_OTHER = "context-prefix-review-"
+_N2_KEY = "context-prefix-" + _N1_SECRET
+
+
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    [
+        (
+            {_N2_KEY: "not-a-mapping"},
+            "inputs.<redacted>: must be a mapping of platform to owner",
+        ),
+        (
+            {"chat": {_N2_KEY: 42}},
+            "inputs.chat.<redacted>: owner must be a module name or a list of "
+            "module names",
+        ),
+    ],
+)
+@pytest.mark.parametrize("source", ["environment", "declared"])
+@pytest.mark.asyncio
+async def test_n2_overlapping_known_values_leave_no_credential_fragment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inputs: Any,
+    expected: str,
+    source: str,
+) -> None:
+    """N2, R8: a known value overlapping the beginning of the configured
+    password — from the environment, or a second declared credential — no
+    longer breaks the password's match while the key is redacted. Both
+    ``run`` and ``--check-config`` refuse before the runtime is assembled,
+    and neither whole value nor either half of the password survives the
+    joined diagnostics."""
+
+    path = tmp_path / "profile.yaml"
+    modules: dict[str, Any] = {"streamerbot": {
+        "url": "ws://127.0.0.1:9/",
+        "companion_name": "Companion",
+        "password": _N1_SECRET,
+    }}
+    enabled = ["streamerbot"]
+    environ = {"OTHER_PASSWORD": _N2_OTHER}
+    if source == "declared":
+        enabled.append("twitch")
+        modules["twitch"] = {"access_token": _N2_OTHER}
+        environ = {}
+    path.write_text(
+        yaml.safe_dump({
+            "modules_directory": str(ROOT / "modules"),
+            "enabled_modules": enabled,
+            "modules": modules,
+            "limits": _finite_limits(),
+            "inputs": inputs,
+        }),
+        encoding="utf-8",
+    )
+    outcomes = await _n1_both_routes(path, monkeypatch, environ)
+
+    assert [(route, status) for route, status, _ in outcomes] == [
+        ("run", 2), ("check_config", 2)
+    ]
+    joined = "\n".join(line for _, _, lines in outcomes for line in lines)
+    for fragment in (*_n1_fragments(_N1_SECRET), _N2_OTHER):
+        assert fragment not in joined
+    assert [lines for _, _, lines in outcomes] == [[expected], [expected]]

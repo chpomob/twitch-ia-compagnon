@@ -264,6 +264,8 @@ from core.loader import (  # noqa: E402
     ModuleLoader,
     ModuleLoadError,
     OwnedInputs,
+    _redact_known,
+    _redact_values,
     _validate_manifest,
     resolve_input_ownership,
 )
@@ -829,6 +831,108 @@ def test_n1_every_resolver_refusal_shape_leaves_no_credential_fragment() -> None
         "inputs: family 'chat': platform '<redacted>': owned by default by both "
         "'a' and 'b'; set inputs.chat.<redacted>",
     ]
+
+
+# -- N2: redaction masks the union of every credential match ---------------- #
+
+_N2_SECRET = "review-secret-4521"
+_N2_OTHER = "context-prefix-review-"
+_N2_KEY = "context-prefix-" + _N2_SECRET
+
+
+def test_n2_an_overlapping_known_value_leaves_no_fragment_of_the_credential() -> None:
+    """N2, R8: a known value overlapping the beginning of a credential no
+    longer breaks the credential's match during redaction. The conflict's
+    location and its correction both lose the whole key; neither known value
+    nor either half of the credential survives the joined text, and the
+    refusal, both providers and the correction path remain."""
+
+    declarations = {
+        name: _decl(_families(("chat", [_N2_KEY], True)), name) for name in ("a", "b")
+    }
+    with pytest.raises(ModuleLoadError) as caught:
+        resolve_input_ownership(
+            ["a", "b"], declarations, {},
+            redacted=frozenset({_N2_SECRET, _N2_OTHER}),
+        )
+    refusals = list(caught.value.diagnostics)
+    assert refusals == [
+        "inputs: family 'chat': platform '<redacted>': owned by default by both "
+        "'a' and 'b'; set inputs.chat.<redacted>"
+    ]
+    joined = "\n".join(refusals)
+    assert str(caught.value) == joined
+    for fragment in (*_n1_fragments(_N2_SECRET), _N2_OTHER):
+        assert fragment not in joined
+
+
+@pytest.mark.parametrize(
+    ("text", "values", "expected"),
+    [
+        # N2 itself: a longer value overlapping the start of a shorter one.
+        (
+            "k=context-prefix-review-secret-4521;",
+            {"review-secret-4521", "context-prefix-review-"},
+            "k=<redacted>;",
+        ),
+        # One value nested inside another.
+        ("a=xxsecretyy b=secret", {"secret", "xxsecretyy"}, "a=<redacted> b=<redacted>"),
+        # Two values sharing a prefix.
+        ("[abcdef] [abcxyz]", {"abcdef", "abcxyz"}, "[<redacted>] [<redacted>]"),
+        ("[abcdefxyz]", {"abcdef", "abcxyz"}, "[<redacted>xyz]"),
+        # Two values sharing a suffix, overlapping in the text.
+        ("[12345678]", {"123456", "345678"}, "[<redacted>]"),
+        # Identical values, given twice.
+        ("p=secret!", ["secret", "secret"], "p=<redacted>!"),
+        # Three-way overlap chain.
+        ("<aaaabbbbccccdddd>", {"aaaabbbb", "bbbbcccc", "ccccdddd"}, "<<redacted>>"),
+        # A value overlapping itself, and repeated after its first match.
+        ("x=abababa y=aba", {"aba"}, "x=<redacted> y=<redacted>"),
+        # A value that only appears once another is cut out is not formed.
+        ("[sec<REM>ret]", {"<REM>", "secret"}, "[sec<redacted>ret]"),
+        # A value equal to the replacement marker.
+        ("v=<redacted> w=<redacted>x", {"<redacted>"}, "v=<redacted> w=<redacted>x"),
+        ("v=secret", {"<redacted>", "secret"}, "v=<redacted>"),
+        # An empty value, alone and among others.
+        ("unchanged text", {""}, "unchanged text"),
+        ("v=secret", {"", "secret"}, "v=<redacted>"),
+        # No values at all; and an empty text.
+        ("unchanged text", set(), "unchanged text"),
+        ("", {"secret"}, ""),
+        # The whole text is a credential.
+        ("secret", {"secret"}, "<redacted>"),
+    ],
+)
+def test_n2_the_redaction_primitive_masks_the_union_of_all_matches(
+    text: str, values: Any, expected: str
+) -> None:
+    """N2, R8: every match of every value is found in the *original* text,
+    overlaps included, and their union is masked in one pass — whatever the
+    order the values come in."""
+
+    assert _redact_values(text, values) == expected
+    assert _redact_values(text, list(values)[::-1]) == expected
+    assert _redact_known(text, frozenset(values)) == expected
+    for value in values:
+        if value and value != "<redacted>":
+            assert value not in expected
+
+
+def test_n2_the_primitive_leaves_no_half_of_any_overlapping_credential() -> None:
+    """N2: across every arrangement of two overlapping credentials in a key,
+    neither credential nor either half of either survives redaction."""
+
+    first, second = "review-secret-4521", "context-prefix-review-"
+    for text in (
+        "context-prefix-review-secret-4521",
+        "review-secret-4521context-prefix-review-",
+        "xx" + first + second + first + "yy",
+        second[:-7] + first,
+    ):
+        out = _redact_values(text, (second, first))
+        for fragment in (*_n1_fragments(first), first):
+            assert fragment not in out
+        assert second not in out
 
 
 # -- D2: explicit and default precedence -------------------------------------- #
