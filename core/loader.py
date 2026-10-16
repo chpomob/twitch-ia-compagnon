@@ -94,6 +94,7 @@ from .contracts import (
     TriggerRule,
     TriggerSpec,
     TriggerTypeDeclaration,
+    mask_known,
     parse_input_families,
     validate_against_schema,
     validate_schema,
@@ -2278,41 +2279,13 @@ def _configured_values(settings: Any) -> tuple[str, ...]:
 
 
 def _redact_values(text: str, values: Iterable[str]) -> str:
-    """*text* with the union of every known value's occurrences masked (R8, N2).
+    """*text* with the union of every known value's occurrences masked (R8, N2, N3).
 
-    Every occurrence of every non-empty value is located in the *original*
-    text — overlapping occurrences, and occurrences overlapping another
-    value, included — and the union of those spans is masked in one pass,
-    each maximal masked run becoming one marker. Nothing is searched in an
-    already-masked string, so no value's removal can break another value's
-    match and leave a fragment of it behind; the result does not depend on
-    the order of *values*.
+    The loader's spelling of the one known-value contract,
+    :func:`core.contracts.mask_known`, with the loader's marker.
     """
 
-    masked = [False] * len(text)
-    for value in set(values):
-        if not value:
-            continue
-        start = text.find(value)
-        while start != -1:
-            masked[start : start + len(value)] = [True] * len(value)
-            start = text.find(value, start + 1)
-    if not any(masked):
-        return text
-    pieces: list[str] = []
-    index = 0
-    while index < len(text):
-        if masked[index]:
-            while index < len(text) and masked[index]:
-                index += 1
-            pieces.append(_REDACTED_VALUE)
-        else:
-            end = index
-            while end < len(text) and not masked[end]:
-                end += 1
-            pieces.append(text[index:end])
-            index = end
-    return "".join(pieces)
+    return mask_known(text, values, marker=_REDACTED_VALUE)
 
 
 _FIELD_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-\[\]]{0,119}\Z")

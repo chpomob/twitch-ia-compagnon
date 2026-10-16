@@ -3180,3 +3180,133 @@ def test_ac11_the_ownership_code_has_no_platform_name_literal(filename: str) -> 
     # The scan does see a platform literal where one is.
     planted = ast.parse('def f():\n    return {"family": "chat", "platform": "Twitch"}\n')
     assert _platform_literals(planted) == ["Twitch"]
+
+
+# --------------------------------------------------------------------------- #
+# N3 (gate 4): one protection contract reaches every consumer that emits
+# ownership data — the configuration UI's page and the rejection trace
+# --------------------------------------------------------------------------- #
+
+_N3_PUBLIC = "review-public-room"
+
+
+def _n3_configuration() -> dict[str, Any]:
+    """N3's configuration: complete accepted settings, both credentials
+    declared, an ``inputs`` key that is one credential behind the other's
+    prefix, and a non-secret control key."""
+
+    from test_main import _finite_limits
+
+    return {
+        "modules_directory": str((ROOT / "modules").resolve()),
+        "enabled_modules": [_BRIDGE, "twitch"],
+        "modules": {
+            _BRIDGE: {
+                "url": "ws://127.0.0.1:9/",
+                "companion_name": "Companion",
+                "password": _N2_SECRET,
+            },
+            "twitch": {
+                "client_id": "review-client-id",
+                "client_secret": "review-native-key",
+                "access_token": _N2_OTHER,
+                "broadcaster_id": "channel-1",
+                "bot_user_id": "bot-1",
+                "companion_name": "Companion",
+            },
+        },
+        "limits": _finite_limits(),
+        "inputs": {"chat": {_N2_KEY: "none", _N3_PUBLIC: "none"}},
+    }
+
+
+def _n3_fragments_absent(text: str) -> None:
+    for fragment in (*_n1_fragments(_N2_SECRET), *_n1_fragments(_N2_OTHER)):
+        assert fragment not in text, fragment
+
+
+def test_n3_the_ownership_page_and_the_rejection_trace_leave_no_credential_fragment() -> None:
+    """N3, R8: the gate-4 reproduction end to end. The configuration passes
+    the real ``check_config`` with status 0; the authenticated UI request
+    renders the ownership table with neither credential nor either half of
+    either in any row (cell text and data attribute); the rejection trace
+    carries no fragment in any key or value and the chat publication is
+    still refused. The non-secret controls keep their exact full text, so
+    the protection is not over-broad."""
+
+    from unittest.mock import patch
+
+    import core.config_ui as ui_app
+    from test_config_ui import _get, _logged_in, _section
+
+    config = _n3_configuration()
+
+    async def checked() -> tuple[int, list[str]]:
+        lines: list[str] = []
+        with patch.object(application, "read_base", return_value=config), patch.object(
+            application, "read_overlay", return_value={}
+        ):
+            status = await application.check_config(
+                "config.yaml.example", environ={}, diagnostic_reporter=lines.append
+            )
+        return status, lines
+
+    assert asyncio.run(checked()) == (0, [])
+
+    with patch.object(ui_app, "read_base", return_value=config), patch.object(
+        ui_app, "read_overlay", return_value={}
+    ):
+        ui = ui_app.ConfigUI(
+            ui_app.UISettings.from_argv(["--config", "config.yaml.example"]), environ={}
+        )
+        response = _get(ui, "/core", _logged_in(ui))
+    assert response.status == 200
+    assert {_N2_SECRET, _N2_OTHER} <= ui.secret_values
+    body = response.body.decode()
+    section = _section(body, "input-ownership")
+    rows = re.findall(r"<tr.*?</tr>", section)
+    _n3_fragments_absent(body)
+    _n3_fragments_absent("\n".join(rows))
+    hidden = ui_app.REDACTED
+    assert (
+        f'<tr data-input-family="chat" data-input-platform="{hidden}"><td>chat</td>'
+        f'<td>{hidden}</td><td class="owner">none</td><td class="origin">explicit</td>'
+        '<td class="candidates"></td></tr>'
+    ) in rows
+    assert (
+        f'<tr data-input-family="chat" data-input-platform="{_N3_PUBLIC}"><td>chat</td>'
+        f'<td>{_N3_PUBLIC}</td><td class="owner">none</td><td class="origin">explicit</td>'
+        '<td class="candidates"></td></tr>'
+    ) in rows
+
+    async def traced() -> tuple[list[Any], list[Any], Any, Any]:
+        runtime, engine, chat = _guarded_runtime()
+        runtime.supervision.redact((_N2_SECRET, _N2_OTHER))
+        context = _intruder(runtime)
+        seen: list[Any] = []
+
+        async def observe(event: Any) -> None:
+            seen.append(event)
+
+        runtime.bus.subscribe("**", observe)
+        results = []
+        for platform in (_N2_KEY, _N3_PUBLIC):
+            event = _chat_event(platform)
+            results.append(
+                await context.bus.publish(event["type"], event["payload"], event["metadata"])
+            )
+        return seen, results, runtime.supervision.snapshot(), chat
+
+    seen, results, snapshot, chat = asyncio.run(traced())
+    assert results == [None, None]
+    assert chat.appended == []
+    assert snapshot[COUNTER_INPUT_OWNERSHIP_REJECTIONS] == 2
+    assert [event["type"] for event in seen] == [TRACE_INPUT_OWNERSHIP_REJECTED] * 2
+    assert [event["payload"] for event in seen] == [
+        {"module": "intruder", "family": "chat", "platform": contracts.REDACTION_PLACEHOLDER},
+        {"module": "intruder", "family": "chat", "platform": _N3_PUBLIC},
+    ]
+    trace_text = "\n".join(
+        f"{key}={value}" for event in seen for key, value in event["payload"].items()
+    )
+    _n3_fragments_absent(trace_text)

@@ -1342,6 +1342,26 @@ def test_redaction_covers_values_of_every_length() -> None:
     assert _redact("unchanged", {""}) == "unchanged"
 
 
+def test_n3_the_ui_redaction_masks_the_union_of_every_response_form() -> None:
+    """N3, R8: ``_redact`` used to replace each form longest first, so a
+    longer known value overlapping a credential's start destroyed the
+    credential's match and left its suffix in the page. It now delegates to
+    the shared contract: every raw, JSON and HTML form of every value is
+    located in the original text and their union masked in one pass."""
+
+    secret, other = "review-secret-4521", "context-prefix-review-"
+    key = "context-prefix-" + secret
+    for values in ({secret, other}, [other, secret], [secret, other]):
+        for shown in (key, _html.escape(key), json.dumps(key)[1:-1]):
+            assert _redact(f"<td>{shown}</td>", values) == f"<td>{config_ui.REDACTED}</td>"
+    # A value overlapping another value's JSON form, and a value overlapping
+    # its own HTML form.
+    assert _redact('k=x\\"yz-secret-9;', {'x"y', "yz-secret-9"}) == f"k={config_ui.REDACTED};"
+    assert _redact("x&amp;amp;y", {"&amp"}) == f"x{config_ui.REDACTED};y"
+    # Non-secret text is kept exactly.
+    assert _redact("review-public-room", {secret, other}) == "review-public-room"
+
+
 # -- R9: inline assets, relative forms, no external URL -------------------------
 
 

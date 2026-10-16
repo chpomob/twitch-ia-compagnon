@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -641,6 +641,7 @@ __all__ = [
     "TriggerSpec",
     "TriggerTypeDeclaration",
     "input_family_of_event",
+    "mask_known",
     "observation_size",
     "parse_input_families",
     "sanitize_trace",
@@ -2231,11 +2232,64 @@ def _validated_budget(max_bytes: Any) -> int:
     return max_bytes
 
 
+def mask_known(
+    text: str,
+    values: Iterable[str],
+    *,
+    marker: str = REDACTION_PLACEHOLDER,
+    forms: Callable[[str], Iterable[str]] | None = None,
+) -> str:
+    """*text* with every known value masked, in every form the caller emits (R8, N2, N3).
+
+    The contract, in one sentence: every occurrence, in the *original* text,
+    of every serialization form (``forms(value)``, the raw value alone by
+    default) of every known value is located, and the union of those spans
+    is masked in one pass — each maximal masked run becoming one *marker* —
+    before the caller bounds, escapes or truncates the result.
+
+    Overlaps between two values, between two forms, and between a value and
+    its own escaped form all belong to the union; nothing is ever searched in
+    an already-masked string, so the result depends on neither the order of
+    *values* nor the order of their forms, and no removal can break another
+    match and leave a fragment of it behind. This is the only known-value
+    redactor in the tree: the loader's diagnostics, :func:`sanitize_trace`
+    and the configuration UI's responses all delegate to it, and a structural
+    test refuses any sequential known-value replacement elsewhere.
+    """
+
+    needles: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        if forms is None:
+            needles.add(value)
+        else:
+            needles.update(form for form in forms(value) if form)
+    masked: list[bool] | None = None
+    for needle in needles:
+        start = text.find(needle)
+        if start != -1 and masked is None:
+            masked = [False] * len(text)
+        while start != -1:
+            masked[start : start + len(needle)] = [True] * len(needle)  # type: ignore[index]
+            start = text.find(needle, start + 1)
+    if masked is None:
+        return text
+    pieces: list[str] = []
+    index = 0
+    while index < len(text):
+        end = index
+        while end < len(text) and masked[end] == masked[index]:
+            end += 1
+        pieces.append(marker if masked[index] else text[index:end])
+        index = end
+    return "".join(pieces)
+
+
 def _redact(text: str, secrets: Sequence[str]) -> str:
-    for secret in secrets:
-        if secret in text:
-            text = text.replace(secret, REDACTION_PLACEHOLDER)
-    return text
+    """*text* with every configured secret masked by :func:`mask_known`."""
+
+    return mask_known(text, secrets, marker=REDACTION_PLACEHOLDER)
 
 
 def _clean(value: Any, secrets: Sequence[str], path: str) -> Any:

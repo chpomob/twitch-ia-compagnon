@@ -756,3 +756,305 @@ async def test_only_moderation_request_is_model_proposable() -> None:
     assert [spec.name for spec in specs if spec.model_proposable] == [
         "moderation.request"
     ]
+
+
+# --------------------------------------------------------------------------- #
+# N3 (gate 4): one known-value protection contract, and no copy of it
+# --------------------------------------------------------------------------- #
+
+import ast  # noqa: E402
+import html as _html  # noqa: E402
+import json as _json  # noqa: E402
+
+from core.contracts import REDACTION_PLACEHOLDER, mask_known  # noqa: E402
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+#: The three consumers that emit known-value-bearing text, by file: each
+#: delegates to :func:`mask_known` and holds no replacement of its own.
+_KNOWN_VALUE_CONSUMERS = {
+    "core/loader.py": "_redact_values",
+    "core/contracts.py": "_redact",
+    "core/config_ui/__init__.py": "_redact",
+}
+
+#: The project's own source trees; tests, build output and the virtualenv
+#: are not shipped code.
+_SOURCE_TREES = ("core", "modules", "demo", "docs")
+
+
+def _response_forms(value: str) -> set[str]:
+    """Raw, JSON-escaped and HTML-escaped spellings of *value*."""
+
+    json_form = _json.dumps(value)[1:-1]
+    return {value, json_form, _html.escape(value), _html.escape(json_form)}
+
+
+def _fragments(value: str) -> tuple[str, str, str]:
+    half = len(value) // 2
+    return value, value[:half], value[half:]
+
+
+@pytest.mark.parametrize(
+    ("text", "values", "expected"),
+    [
+        # One value raw, JSON-escaped and HTML-escaped in the same text.
+        (
+            'raw=a"b<c json=a\\"b<c html=a&quot;b&lt;c',
+            ['a"b<c'],
+            "raw=# json=# html=#",
+        ),
+        # A value overlapping another value's escaped form: the JSON form of
+        # the first ends where the second begins.
+        ('k=x\\"yz-secret-9;', ['x"y', "yz-secret-9"], "k=#;"),
+        # A value overlapping its own escaped form: the raw ``&amp`` is the
+        # start of its HTML form ``&amp;amp``, so masking the raw match first
+        # would leave the escaped form's ``;amp`` tail behind.
+        ("x&amp;amp;y", ["&amp"], "x#;y"),
+        # Identical values, in two forms, given twice.
+        ("a=<s> b=&lt;s&gt;", ["<s>", "<s>"], "a=# b=#"),
+        # N3 itself, with the second value only present in an escaped form.
+        (
+            "p=context-prefix-review-secret-4521",
+            ["review-secret-4521", "context-prefix-review-"],
+            "p=#",
+        ),
+        # No form present: the text is returned exactly.
+        ("plain review-public-room", ["review-secret-4521"], "plain review-public-room"),
+    ],
+)
+def test_n3_the_contract_masks_the_union_of_every_form_of_every_value(
+    text: str, values: list[str], expected: str
+) -> None:
+    """N3, R8: every form of every value is located in the original text and
+    the union masked in one pass — independent of the order of the values
+    and of the order of their forms."""
+
+    def reversed_forms(value: str) -> list[str]:
+        return sorted(_response_forms(value), key=len)
+
+    def longest_first(value: str) -> list[str]:
+        return sorted(_response_forms(value), key=len, reverse=True)
+
+    for forms in (_response_forms, reversed_forms, longest_first):
+        assert mask_known(text, values, marker="#", forms=forms) == expected
+        assert mask_known(text, values[::-1], marker="#", forms=forms) == expected
+    for value in values:
+        for form in _response_forms(value):
+            assert form not in expected
+
+
+def test_n3_the_contract_defaults_to_the_raw_form_and_the_trace_marker() -> None:
+    """Without *forms* only the raw value is a needle; the default marker is
+    the trace's placeholder, and adjacent matches form one masked run."""
+
+    assert mask_known("a=<s> b=&lt;s&gt;", ["<s>"]) == f"a={REDACTION_PLACEHOLDER} b=&lt;s&gt;"
+    assert mask_known("xyxy", ["xy"]) == REDACTION_PLACEHOLDER
+    assert mask_known("unchanged", ["", "absent"]) == "unchanged"
+
+
+def test_n3_sanitize_trace_leaves_no_fragment_in_any_key_or_value() -> None:
+    """N3, R8: ``sanitize_trace`` — the route of ``input.ownership.rejected``
+    — masks the union of both credentials' matches in keys and values; a
+    removal of the overlapping value no longer leaves the other's suffix."""
+
+    secret, other = "review-secret-4521", "context-prefix-review-"
+    key = "context-prefix-" + secret
+    for secrets in ((secret, other), (other, secret)):
+        cleaned = sanitize_trace(
+            {"platform": key, key: [key, {"nested": key}], "public": "review-public-room"},
+            secrets=secrets,
+        )
+        assert cleaned == {
+            "platform": REDACTION_PLACEHOLDER,
+            REDACTION_PLACEHOLDER: [REDACTION_PLACEHOLDER, {"nested": REDACTION_PLACEHOLDER}],
+            "public": "review-public-room",
+        }
+        text = _json.dumps(cleaned)
+        for fragment in (*_fragments(secret), *_fragments(other)):
+            assert fragment not in text
+
+
+def _names(node: ast.AST) -> set[str]:
+    return {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+
+
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+
+def _sequential_replacements(tree: ast.AST) -> list[int]:
+    """Lines of every sequential known-value replacement in *tree*.
+
+    A ``.replace``/``.sub`` call whose needle (the first argument, or the
+    receiver of a compiled pattern's ``.sub``) depends on the target of an
+    enclosing ``for`` loop or comprehension, or any non-literal ``.replace``
+    inside a ``while`` loop: each searches a string the previous iteration
+    already modified, which is the shape N3 found twice. ``os.replace`` (a
+    file rename) and keyword-only ``.replace`` (``datetime``) are not text
+    replacement.
+    """
+
+    found: list[int] = []
+
+    def needle_names(call: ast.Call) -> set[str] | None:
+        func = call.func
+        if not isinstance(func, ast.Attribute) or func.attr not in ("replace", "sub"):
+            return None
+        if isinstance(func.value, ast.Name) and func.value.id == "os":
+            return None
+        if not call.args:
+            return None
+        names = _names(call.args[0])
+        if func.attr == "sub":
+            names |= _names(func.value)
+        return names
+
+    def visit(node: ast.AST, bound: frozenset[str], in_while: bool) -> None:
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            visit(node.iter, bound, in_while)
+            inner = bound | _names(node.target)
+            for child in (*node.body, *node.orelse):
+                visit(child, inner, in_while)
+            return
+        if isinstance(node, ast.While):
+            visit(node.test, bound, in_while)
+            for child in (*node.body, *node.orelse):
+                visit(child, bound, True)
+            return
+        if isinstance(node, _COMPREHENSIONS):
+            inner = bound
+            for generator in node.generators:
+                inner = inner | _names(generator.target)
+            for child in ast.iter_child_nodes(node):
+                visit(child, inner, in_while)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            bound, in_while = frozenset(), False
+        if isinstance(node, ast.Call):
+            names = needle_names(node)
+            if names is not None:
+                literal = isinstance(node.args[0], ast.Constant)
+                if names & bound or (in_while and not literal):
+                    found.append(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            visit(child, bound, in_while)
+
+    visit(tree, frozenset(), False)
+    return found
+
+
+def _source_files() -> list[Path]:
+    return sorted(
+        path
+        for tree in _SOURCE_TREES
+        for path in (_ROOT / tree).rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+
+
+def test_n3_no_module_defines_its_own_sequential_known_value_replacement() -> None:
+    """N3, R8: the known-value protection has one implementation. No shipped
+    source file replaces known values one after another; the three
+    consumers that emit known-value-bearing text — the loader's
+    diagnostics, ``sanitize_trace`` and the configuration UI's responses —
+    each delegate to :func:`mask_known`, which is defined once, in
+    ``core/contracts.py``. Ordering is part of no correctness argument."""
+
+    files = _source_files()
+    assert any(path.name == "contracts.py" for path in files)
+    offending = {
+        str(path.relative_to(_ROOT)): lines
+        for path in files
+        for lines in [_sequential_replacements(ast.parse(path.read_text(encoding="utf-8")))]
+        if lines
+    }
+    assert offending == {}
+
+    definitions = [
+        str(path.relative_to(_ROOT))
+        for path in files
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "mask_known"
+    ]
+    assert definitions == ["core/contracts.py"]
+
+    for filename, function in _KNOWN_VALUE_CONSUMERS.items():
+        tree = ast.parse((_ROOT / filename).read_text(encoding="utf-8"))
+        [definition] = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == function
+        ]
+        calls = [
+            node.func.id
+            for node in ast.walk(definition)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "mask_known" in calls, filename
+        assert not any(
+            isinstance(node, (ast.For, ast.While, *_COMPREHENSIONS))
+            for node in ast.walk(definition)
+        ), filename
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # The pre-N3 trace redactor.
+        "def _redact(text, secrets):\n"
+        "    for secret in secrets:\n"
+        "        if secret in text:\n"
+        "            text = text.replace(secret, '[REDACTED]')\n"
+        "    return text\n",
+        # The pre-N3 UI redactor, over a helper's forms.
+        "def _redact(text, values):\n"
+        "    for form in _redaction_forms(values):\n"
+        "        text = text.replace(form, '[hidden]')\n"
+        "    return text\n",
+        # A tuple target and a regular expression.
+        "import re\n"
+        "def scrub(text, pairs):\n"
+        "    for _, value in pairs:\n"
+        "        text = re.sub(re.escape(value), '#', text)\n"
+        "    return text\n",
+        # A compiled pattern per value.
+        "import re\n"
+        "def scrub(text, values):\n"
+        "    for value in values:\n"
+        "        text = re.compile(re.escape(value)).sub('#', text)\n"
+        "    return text\n",
+        # A reduction through a comprehension's side effect.
+        "def scrub(text, values):\n"
+        "    return [text := text.replace(value, '#') for value in values][-1]\n",
+        # A while loop draining the values.
+        "def scrub(text, values):\n"
+        "    while values:\n"
+        "        value = values.pop()\n"
+        "        text = text.replace(value, '#')\n"
+        "    return text\n",
+    ],
+)
+def test_n3_the_structural_guard_fails_on_a_reintroduced_loop(source: str) -> None:
+    """Negative control: the guard sees each spelling of a sequential
+    known-value replacement a module could reintroduce."""
+
+    assert _sequential_replacements(ast.parse(source)) != []
+
+
+def test_n3_the_structural_guard_passes_a_delegating_redactor() -> None:
+    """Positive control: delegation, a file rename, a keyword-only replace and
+    a literal replace outside any loop are not sequential replacements."""
+
+    source = (
+        "import os\n"
+        "def _redact(text, values):\n"
+        "    return mask_known(text, values, marker='#')\n"
+        "def save(names, temporary):\n"
+        "    for name in names:\n"
+        "        os.replace(temporary, name)\n"
+        "def stamp(instant, items):\n"
+        "    for item in items:\n"
+        "        instant = instant.replace(tzinfo=item)\n"
+        "    return instant.isoformat().replace('+00:00', 'Z')\n"
+    )
+    assert _sequential_replacements(ast.parse(source)) == []

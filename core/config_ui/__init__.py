@@ -65,6 +65,7 @@ from core.bus import EventBus
 from core.contracts import (
     INPUT_OWNER_NONE,
     ContractError,
+    mask_known,
     validate_against_schema,
     validate_schema,
 )
@@ -1116,27 +1117,26 @@ _PROCESS_FIELD_KEY = secrets.token_bytes(32)
 _RENDERING_FOR: ContextVar[ConfigUI | None] = ContextVar("_RENDERING_FOR", default=None)
 
 
-def _redaction_forms(secret_values: Iterable[str]) -> list[str]:
-    """Every form a value can take in a response, longest first.
+def _redaction_forms(value: str) -> set[str]:
+    """Every form *value* can take in a response.
 
     The raw text, its HTML form, and the body of its JSON string literal (both
     ``ensure_ascii`` spellings) with that body's HTML form: a secret with a
     quote, a backslash or a control character is spelled differently once
     serialized, and a substring of serialized configured data must still be
-    caught (gate-3 F2).
+    caught (gate-3 F2). :func:`_redact` hands these forms to
+    :func:`core.contracts.mask_known`, which masks the union of all of them
+    against the original text, so no order among them matters (N3).
     """
 
+    spellings = {value}
+    for ascii_only in (False, True):
+        spellings.add(json.dumps(value, ensure_ascii=ascii_only)[1:-1])
     forms: set[str] = set()
-    for value in secret_values:
-        if not value:
-            continue
-        spellings = {value}
-        for ascii_only in (False, True):
-            spellings.add(json.dumps(value, ensure_ascii=ascii_only)[1:-1])
-        for spelling in spellings:
-            forms.add(spelling)
-            forms.add(html.escape(spelling, quote=True))
-    return sorted(forms, key=len, reverse=True)
+    for spelling in spellings:
+        forms.add(spelling)
+        forms.add(html.escape(spelling, quote=True))
+    return forms
 
 
 def _is_secret_scalar(value: Any, secret_values: frozenset[str] | set[str]) -> bool:
@@ -1483,11 +1483,14 @@ def _secret_set(view: ConfigView | None = None) -> frozenset[str]:
 
 
 def _redact(text: str, secret_values: Iterable[str]) -> str:
-    """*text* with every secret-set value replaced by ``[hidden]``."""
+    """*text* with every secret-set value, in every response form, masked as ``[hidden]``.
 
-    for form in _redaction_forms(secret_values):
-        text = text.replace(form, REDACTED)
-    return text
+    One call of the shared contract, :func:`core.contracts.mask_known`: the
+    union of every form of every value is located in the original text and
+    masked in one pass (R8, N3).
+    """
+
+    return mask_known(text, secret_values, marker=REDACTED, forms=_redaction_forms)
 
 
 class _RedactionFilter(logging.Filter):
