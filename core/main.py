@@ -108,9 +108,11 @@ from .loader import (
     ModuleActivation,
     ModuleLoadError,
     ModuleLoader,
+    _configured_values,
     _credential_literals,
     _declaration,
     _entry_point,
+    _redact_known,
     resolve_input_ownership,
 )
 from .overlay import (
@@ -395,7 +397,14 @@ def _load_documents(
         )
         for key, value in loaded.items()
     }
-    _validate_config(config)
+    try:
+        _validate_config(config)
+    except _InputsShapeError as exc:
+        # Rendered only here, where the known-credential set can be built:
+        # a key of the block may be a configured credential (R8, N1).
+        raise ConfigurationError(
+            exc.diagnostic(_known_credentials(config, path, resolver))
+        ) from None
     _validate_secrets(
         config,
         # An ``inputs`` owner is never resolved, so it references nothing.
@@ -435,21 +444,55 @@ def _load_documents(
         if variable in resolved
     ]
 
-    raw_modules_directory = config["modules_directory"]
-    if raw_modules_directory == MODULES_DIRECTORY_BUILTIN:
-        config["modules_directory"] = str(_builtin_modules_directory())
-        return unresolved, config
+    config["modules_directory"] = _modules_directory(config["modules_directory"], path)
+    return unresolved, config
+
+
+def _modules_directory(raw: Any, path: Path) -> str:
+    """The configured modules directory, resolved from the base file (R8)."""
+
+    if raw == MODULES_DIRECTORY_BUILTIN:
+        return str(_builtin_modules_directory())
     try:
-        modules_directory = Path(raw_modules_directory).expanduser()
+        modules_directory = Path(raw).expanduser()
         if not modules_directory.is_absolute():
             modules_directory = path.parent / modules_directory
-        config["modules_directory"] = str(modules_directory.resolve())
+        return str(modules_directory.resolve())
     except (OSError, RuntimeError, ValueError, TypeError):
         raise ConfigurationError(
             "modules_directory: must be a valid path"
         ) from None
 
-    return unresolved, config
+
+def _known_credentials(
+    config: Mapping[str, Any], path: Path, environ: Mapping[str, str]
+) -> frozenset[str]:
+    """The known-credential set the loader redacts ``inputs`` diagnostics of.
+
+    The set :func:`_validate_enabled` and the loader hand the ownership
+    resolver: every environment value, and every literal an enabled module's
+    manifest declares as a credential. It is needed here, before the loader
+    exists, by a structural ``inputs`` refusal (N1); discovery only reads the
+    manifests. When they cannot be read, every string the enabled modules
+    are configured with stands in for the declared credentials, so the
+    diagnostic is over-redacted rather than reported unprotected.
+    """
+
+    try:
+        values = {value for value in environ.values() if isinstance(value, str)}
+    except Exception:
+        values = set()
+    enabled = list(config["enabled_modules"])
+    settings = config[MODULES_KEY]
+    try:
+        directory = _modules_directory(config["modules_directory"], path)
+        discovered = ModuleLoader(None, directory)._discover()
+        declarations = {name: _declaration(discovered[name]) for name in enabled}
+        values |= _credential_literals(enabled, declarations, settings)
+    except Exception:
+        for name in enabled:
+            values.update(_configured_values(settings.get(name)))
+    return frozenset(values)
 
 
 def _overlay_arguments(
@@ -1575,20 +1618,41 @@ def _validate_inputs(config: Mapping[str, Any]) -> None:
     for family, entries in inputs.items():
         if not isinstance(family, str):
             raise ConfigurationError(f"{INPUTS_KEY}: family keys must be strings")
-        path = _display_path(_mapping_path(f"configuration.{INPUTS_KEY}", family))
         if not isinstance(entries, Mapping):
-            raise ConfigurationError(f"{path}: must be a mapping of platform to owner")
+            raise _InputsShapeError((family,), "must be a mapping of platform to owner")
         for platform, owner in entries.items():
             if not isinstance(platform, str):
-                raise ConfigurationError(f"{path}: platform keys must be strings")
+                raise _InputsShapeError((family,), "platform keys must be strings")
             if isinstance(owner, str):
                 continue
             if isinstance(owner, list) and all(isinstance(item, str) for item in owner):
                 continue
-            raise ConfigurationError(
-                f"{_mapping_path(path, platform)}: owner must be a "
-                "module name or a list of module names"
+            raise _InputsShapeError(
+                (family, platform),
+                "owner must be a module name or a list of module names",
             )
+
+
+class _InputsShapeError(Exception):
+    """A structural ``inputs`` refusal whose path is made of configured keys.
+
+    It carries the keys and the fixed reason, never a composed message: a key
+    may be a configured credential, so the path is composed only by
+    :meth:`diagnostic`, given the known-credential set (R8, N1).
+    """
+
+    def __init__(self, keys: tuple[str, ...], reason: str) -> None:
+        super().__init__(f"{INPUTS_KEY}: {reason}")
+        self.keys = keys
+        self.reason = reason
+
+    def diagnostic(self, redacted: frozenset[str]) -> str:
+        """The refusal, every key redacted of *redacted* before it is shown."""
+
+        path = f"configuration.{INPUTS_KEY}"
+        for key in self.keys:
+            path = _mapping_path(path, _redact_known(key, redacted))
+        return f"{_display_path(path)}: {self.reason}"
 
 
 def _validate_secrets(config: Mapping[str, Any], *, referenced: set[str]) -> None:

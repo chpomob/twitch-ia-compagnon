@@ -3439,3 +3439,139 @@ def test_pyproject_declares_the_console_script_and_the_build_backend_for_tests()
     ) == ["aiohttp", "pyyaml"]
     assert "setuptools>=69" in project["project"]["optional-dependencies"]["test"]
     assert "setuptools>=69" in project["build-system"]["requires"]
+
+
+# -- N1-A: a structural inputs refusal never echoes a configured credential --- #
+
+_N1_SECRET = "review-secret-4521"
+
+
+def _n1_fragments(secret: str) -> tuple[str, ...]:
+    """The whole credential, its first half and its last half."""
+
+    half = len(secret) // 2
+    return (secret, secret[:half], secret[half:])
+
+
+def _n1_profile(tmp_path: Path, inputs: Any, *, modules_directory: Path) -> Path:
+    path = tmp_path / "profile.yaml"
+    path.write_text(
+        yaml.safe_dump({
+            "modules_directory": str(modules_directory),
+            "enabled_modules": ["streamerbot"],
+            "modules": {"streamerbot": {
+                "url": "ws://127.0.0.1:9/",
+                "companion_name": "Companion",
+                "password": _N1_SECRET,
+            }},
+            "limits": _finite_limits(),
+            "inputs": inputs,
+        }),
+        encoding="utf-8",
+    )
+    return path
+
+
+async def _n1_both_routes(
+    path: Path, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[str, int, list[str]]]:
+    """The profile through ``run`` and ``check_config``, with assembly refused."""
+
+    assemblies: list[Any] = []
+
+    def assemble(config: Any) -> Any:
+        assemblies.append(config)
+        raise AssertionError("runtime assembled")
+
+    monkeypatch.setattr(application, "_assemble_runtime", assemble)
+    outcomes = []
+    ran: list[str] = []
+    status = await application.run(
+        path, asyncio.Event(), environ={}, diagnostic_reporter=ran.append
+    )
+    outcomes.append(("run", status, ran))
+    checked: list[str] = []
+    status = await application.check_config(
+        path, environ={}, diagnostic_reporter=checked.append
+    )
+    outcomes.append(("check_config", status, checked))
+    assert assemblies == []
+    return outcomes
+
+
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    [
+        (
+            {_N1_SECRET: "not-a-mapping"},
+            "inputs.<redacted>: must be a mapping of platform to owner",
+        ),
+        (
+            {"chat": {_N1_SECRET: 42}},
+            "inputs.chat.<redacted>: owner must be a module name or a list of "
+            "module names",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_n1_a_structural_inputs_refusal_never_echoes_a_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inputs: Any, expected: str
+) -> None:
+    """N1-A, R8: a configured password copied into an ``inputs`` key is
+    refused by both ``run`` and ``--check-config`` before the runtime is
+    assembled, naming the field with the credential cut out of the whole
+    reported text — not one fragment of it survives."""
+
+    path = _n1_profile(tmp_path, inputs, modules_directory=ROOT / "modules")
+    outcomes = await _n1_both_routes(path, monkeypatch)
+
+    for route, status, diagnostics in outcomes:
+        assert (route, status, diagnostics) == (route, 2, [expected])
+        joined = "\n".join(diagnostics)
+        assert not any(fragment in joined for fragment in _n1_fragments(_N1_SECRET))
+
+
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    [
+        (
+            {"weather": "not-a-mapping"},
+            "inputs.weather: must be a mapping of platform to owner",
+        ),
+        (
+            {"chat": {"twitch": 42}},
+            "inputs.chat.twitch: owner must be a module name or a list of "
+            "module names",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_n1_a_structural_inputs_refusal_without_a_credential_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inputs: Any, expected: str
+) -> None:
+    """N1-A's redaction is not over-broad: with the password configured but
+    used in no key, both routes report the refusal's full original text."""
+
+    path = _n1_profile(tmp_path, inputs, modules_directory=ROOT / "modules")
+    outcomes = await _n1_both_routes(path, monkeypatch)
+
+    assert outcomes == [("run", 2, [expected]), ("check_config", 2, [expected])]
+
+
+@pytest.mark.asyncio
+async def test_n1_a_unreadable_manifests_over_redact_rather_than_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1-A: when the manifests naming the credentials cannot be read, every
+    string the enabled module is configured with stands in for them, so the
+    refusal is still reported, and still without the credential."""
+
+    path = _n1_profile(
+        tmp_path, {"chat": {_N1_SECRET: 42}}, modules_directory=tmp_path / "absent"
+    )
+    outcomes = await _n1_both_routes(path, monkeypatch)
+
+    expected = (
+        "inputs.chat.<redacted>: owner must be a module name or a list of module names"
+    )
+    assert outcomes == [("run", 2, [expected]), ("check_config", 2, [expected])]

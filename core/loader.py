@@ -68,6 +68,7 @@ import inspect
 import math
 import os
 import re
+import string
 import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -2416,18 +2417,23 @@ class InputOwnership:
         return any(row.owner is not None or row.set_none for row in self._rows.values())
 
 
-def _quoted(value: str, redacted: frozenset[str] = frozenset()) -> str:
-    """A configuration key, bounded, for an ``inputs`` diagnostic.
+def _bounded(value: str, redacted: frozenset[str]) -> str:
+    """A configuration key with every known credential cut out, then bounded.
 
-    Every known credential embedded in *value* is cut out before the key is
-    normalised and bounded, so neither the credential nor a prefix of it
-    left behind by the bound can be quoted (F4).
+    The credentials go first: normalising or bounding the text before would
+    let a credential split by either survive as a fragment (F4, N1).
     """
 
     text = " ".join(_redact_known(value, redacted).split())
     if len(text) > _MAX_KEY_LENGTH:
         text = text[: _MAX_KEY_LENGTH - 1] + "…"
-    return repr(text)
+    return text
+
+
+def _quoted(value: str, redacted: frozenset[str] = frozenset()) -> str:
+    """A configuration key, redacted and bounded, quoted for a diagnostic."""
+
+    return repr(_bounded(value, redacted))
 
 
 def _redact_known(text: str, redacted: frozenset[str]) -> str:
@@ -2448,19 +2454,85 @@ def _owner_text(value: Any, redacted: frozenset[str]) -> str:
     return _quoted(value, redacted)
 
 
+def _module_text(value: Any, redacted: frozenset[str]) -> str:
+    """A declared module name for a diagnostic: quoted, credentials cut out.
+
+    Unlike an owner taken from the ``inputs`` block, a provider the manifests
+    declare is a validated module name, not arbitrary configuration text, so
+    it is not held to the field-path shape: any declared name is shown, with
+    only the known credentials redacted.
+    """
+
+    if not isinstance(value, str) or value in redacted:
+        return repr(_REDACTED_VALUE)
+    return _quoted(value, redacted)
+
+
 def _listed(quoted: Sequence[str]) -> str:
     if len(quoted) == 2:
         return f"both {quoted[0]} and {quoted[1]}"
     return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
 
 
+class _InputsDiagnostic(string.Formatter):
+    """The one composition every ``inputs`` diagnostic goes through (R8, N1).
+
+    A diagnostic is a template whose literal text is the fixed vocabulary and
+    whose replacement fields are everything taken from the configuration or
+    the declarations — keys, owners, the correction a refusal suggests. Every
+    field is redacted of the whole known-credential set before it is
+    normalised or bounded, so no route can interpolate a raw key; the literal
+    text is never redacted, since the set holds every environment value and
+    would otherwise mangle the wording. ``{x!r}`` quotes a key, ``{x!o}`` an
+    owner, ``{x!l}`` lists owners, ``{x!m}`` lists declared module names
+    (credential-aware, not held to the field-path shape) and a bare ``{x}`` is a key spelt in a
+    path; any other conversion is refused rather than shown unredacted.
+    """
+
+    def __init__(self, redacted: frozenset[str]) -> None:
+        self._redacted = redacted
+
+    def convert_field(self, value: Any, conversion: str | None) -> str:
+        if conversion == "o":
+            return _owner_text(value, self._redacted)
+        if conversion == "l":
+            return _listed([_owner_text(item, self._redacted) for item in value])
+        if conversion == "m":
+            return _listed([_module_text(item, self._redacted) for item in value])
+        if not isinstance(value, str):
+            return "?"
+        if conversion == "r":
+            return _quoted(value, self._redacted)
+        if conversion is None:
+            return _bounded(value, self._redacted)
+        raise ValueError(f"inputs diagnostic: unknown conversion {conversion!r}")
+
+    def format_field(self, value: Any, format_spec: str) -> str:
+        if format_spec:
+            raise ValueError("inputs diagnostic: a field takes no format")
+        return value
+
+
 def _inputs_line(
-    family: str, platform: str | None, reason: str, redacted: frozenset[str]
+    family: str,
+    platform: str | None,
+    reason: str,
+    redacted: frozenset[str],
+    **fields: Any,
 ) -> str:
-    where = f"{_INPUTS_KEY}: family {_quoted(family, redacted)}"
+    """One ``inputs`` refusal: its location, then its reason template.
+
+    *reason* is a template rendered through :class:`_InputsDiagnostic` with
+    ``family``, ``platform`` and *fields*, so its dynamic parts are redacted
+    exactly as the location is, before the reason is bounded.
+    """
+
+    render = _InputsDiagnostic(redacted).format
+    where = render(_INPUTS_KEY + ": family {family!r}", family=family)
     if platform is not None:
-        where += f": platform {_quoted(platform, redacted)}"
-    return f"{where}: {_value_free_reason(reason)}"
+        where += render(": platform {platform!r}", platform=platform)
+    shown = render(reason, family=family, platform=platform, **fields)
+    return f"{where}: {_value_free_reason(shown)}"
 
 
 def resolve_input_ownership(
@@ -2479,12 +2551,14 @@ def resolve_input_ownership(
     declaring the family's wildcard with ``default: true``; otherwise the pair
     is unowned. Every refusal is collected first and raised as one
     :class:`ModuleLoadError`, one value-free line per refusal. An owner value
-    equal to one of *redacted* is never quoted, and every value in
-    *redacted* is cut out of every quoted family key, platform key and owner
-    before it is bounded (F4): this resolver runs before credential
-    redaction, so it is the only protection its diagnostics have. The fixed
-    text around them — vocabulary, reason — is never redacted, since the
-    set holds every environment value and would otherwise mangle it.
+    equal to one of *redacted* is never quoted, and every diagnostic is
+    composed through :class:`_InputsDiagnostic`, which cuts every value in
+    *redacted* out of every dynamic part — family and platform keys, owners,
+    the path a correction names — before it is bounded (F4, N1): this
+    resolver runs before credential redaction, so it is the only protection
+    its diagnostics have. The fixed vocabulary of a diagnostic is never
+    redacted, since the set holds every environment value and would
+    otherwise mangle it.
     """
 
     if redacted is None or isinstance(redacted, (str, bytes)) or not all(
@@ -2529,20 +2603,21 @@ def resolve_input_ownership(
             refusals.append(f"{_INPUTS_KEY}: a family key must be non-empty text")
             continue
         if family not in INPUT_FAMILY_SET:
-            allowed = ", ".join(INPUT_FAMILIES)
-            reason = f"is outside the vocabulary ({allowed})"
+            reason = "family is outside the vocabulary (" + ", ".join(INPUT_FAMILIES) + ")"
             if isinstance(entries, Mapping) and entries:
+                render = _InputsDiagnostic(redacted).format
                 for platform, value in entries.items():
-                    shown = (
-                        _quoted(platform, redacted) if isinstance(platform, str) else "?"
-                    )
                     refusals.append(
-                        f"{_INPUTS_KEY}: family {_quoted(family, redacted)}: "
-                        f"platform {shown}: "
-                        f"value {_owner_text(value, redacted)}: family {reason}"
+                        render(
+                            _INPUTS_KEY + ": family {family!r}: platform {platform!r}: "
+                            "value {value!o}: " + reason,
+                            family=family,
+                            platform=platform,
+                            value=value,
+                        )
                     )
             else:
-                refusals.append(_inputs_line(family, None, f"family {reason}", redacted))
+                refusals.append(_inputs_line(family, None, reason, redacted))
             continue
         if not isinstance(entries, Mapping):
             refusals.append(
@@ -2567,21 +2642,22 @@ def resolve_input_ownership(
                     _inputs_line(
                         family,
                         platform,
-                        f"owner must be one enabled module name or {INPUT_OWNER_NONE!r}",
+                        "owner must be one enabled module name or "
+                        + repr(INPUT_OWNER_NONE),
                         redacted,
                     )
                 )
                 continue
             owners = list(dict.fromkeys(owners))
             if len(owners) > 1:
-                listed = _listed([_owner_text(item, redacted) for item in owners])
                 refusals.append(
                     _inputs_line(
                         family,
                         platform,
-                        f"names more than one owner, {listed}; name one module "
-                        f"or {INPUT_OWNER_NONE!r}",
+                        "names more than one owner, {owners!l}; name one module "
+                        "or " + repr(INPUT_OWNER_NONE),
                         redacted,
+                        owners=owners,
                     )
                 )
                 continue
@@ -2589,11 +2665,14 @@ def resolve_input_ownership(
             if owner == INPUT_OWNER_NONE:
                 explicit[(family, platform)] = None
                 continue
-            shown = _owner_text(owner, redacted)
             if owner not in enabled_set:
                 refusals.append(
                     _inputs_line(
-                        family, platform, f"owner {shown} is not enabled", redacted
+                        family,
+                        platform,
+                        "owner {owner!o} is not enabled",
+                        redacted,
+                        owner=owner,
                     )
                 )
                 continue
@@ -2602,9 +2681,10 @@ def resolve_input_ownership(
                     _inputs_line(
                         family,
                         platform,
-                        f"owner {shown} does not declare family {family!r} "
-                        f"for platform {_quoted(platform, redacted)}",
+                        "owner {owner!o} does not declare family {family!r} "
+                        "for platform {platform!r}",
                         redacted,
+                        owner=owner,
                     )
                 )
                 continue
@@ -2653,9 +2733,11 @@ def resolve_input_ownership(
                             _inputs_line(
                                 family,
                                 platform,
-                                f"owned by default by {_listed([repr(o) for o in owners])}; set "
-                                f"{_INPUTS_KEY}.{family}.{platform}",
+                                "owned by default by {owners!m}; set "
+                                + _INPUTS_KEY
+                                + ".{family}.{platform}",
                                 redacted,
+                                owners=owners,
                             )
                         )
                     break

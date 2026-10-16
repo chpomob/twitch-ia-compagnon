@@ -720,6 +720,117 @@ def test_f4_an_unknown_credential_set_is_refused_before_any_diagnostic() -> None
         )
 
 
+# -- N1-B: every dynamic part of a refusal is redacted, the correction too ---- #
+
+
+def _n1_fragments(secret: str) -> tuple[str, ...]:
+    """The whole credential, its first half and its last half."""
+
+    half = len(secret) // 2
+    return (secret, secret[:half], secret[half:])
+
+
+def _n1_default_conflict(platform: str) -> list[str]:
+    declarations = {
+        name: _decl(_families(("chat", [platform], True)), name) for name in ("a", "b")
+    }
+    with pytest.raises(ModuleLoadError) as caught:
+        resolve_input_ownership(
+            ["a", "b"], declarations, {}, redacted=frozenset({_F4_SECRET})
+        )
+    assert str(caught.value) == "\n".join(caught.value.diagnostics)
+    return list(caught.value.diagnostics)
+
+
+def test_n1_b_a_default_conflict_on_a_credential_platform_never_echoes_it() -> None:
+    """N1-B, R8: a declared platform equal to a configured credential is cut
+    out of the location *and* of the correction the refusal suggests; the
+    refusal, both conflicting providers and the correction path remain."""
+
+    refusals = _n1_default_conflict(_F4_SECRET)
+    assert refusals == [
+        "inputs: family 'chat': platform '<redacted>': owned by default by both "
+        "'a' and 'b'; set inputs.chat.<redacted>"
+    ]
+    joined = "\n".join(refusals)
+    assert not any(fragment in joined for fragment in _n1_fragments(_F4_SECRET))
+
+
+def test_n1_b_a_default_conflict_without_a_credential_is_unchanged() -> None:
+    """N1-B's redaction is not over-broad: a non-secret platform keeps the
+    refusal's full original text, its correction path included."""
+
+    assert _n1_default_conflict("twitch") == [
+        "inputs: family 'chat': platform 'twitch': owned by default by both "
+        "'a' and 'b'; set inputs.chat.twitch"
+    ]
+
+
+def test_a_default_conflict_names_declared_providers_outside_the_field_path_shape() -> None:
+    """A declared provider name is shown whatever its spelling: the
+    field-path shape guards owners typed in the ``inputs`` block, not the
+    module names the manifests declare; only a known credential is cut."""
+
+    names = ("émetteur_a", "émetteur_b")
+    declarations = {name: _decl(_families(("chat", ["x"], True)), name) for name in names}
+    with pytest.raises(ModuleLoadError) as caught:
+        resolve_input_ownership(list(names), declarations, {}, redacted=frozenset())
+    assert list(caught.value.diagnostics) == [
+        "inputs: family 'chat': platform 'x': owned by default by both "
+        "'émetteur_a' and 'émetteur_b'; set inputs.chat.x"
+    ]
+    with pytest.raises(ModuleLoadError) as caught:
+        resolve_input_ownership(
+            list(names), declarations, {}, redacted=frozenset({"émetteur_b"})
+        )
+    assert list(caught.value.diagnostics) == [
+        "inputs: family 'chat': platform 'x': owned by default by both "
+        "'émetteur_a' and '<redacted>'; set inputs.chat.x"
+    ]
+
+
+def test_n1_every_resolver_refusal_shape_leaves_no_credential_fragment() -> None:
+    """N1: whichever refusal a credential-bearing key or owner reaches —
+    vocabulary, shape, owner list, unknown or non-declaring owner, default
+    conflict — no fragment of the credential survives the joined text, and
+    the fixed vocabulary of each refusal is intact."""
+
+    secret = _F4_SECRET
+    native = {"native": _decl(NATIVE, "native")}
+    refusals: list[str] = []
+    for inputs in (
+        {secret: {"x": "native"}},
+        {secret: "native"},
+        {"chat": {secret: 3}},
+        {"chat": {secret: ["native", secret]}},
+        {"chat": {secret: "ghost"}},
+        {"chat": {secret: "native"}},
+    ):
+        with pytest.raises(ModuleLoadError) as caught:
+            resolve_input_ownership(
+                ["native"], native, inputs, redacted=frozenset({secret})
+            )
+        refusals.extend(caught.value.diagnostics)
+    refusals.extend(_n1_default_conflict(secret))
+    joined = "\n".join(refusals)
+    assert not any(fragment in joined for fragment in _n1_fragments(secret))
+    assert refusals == [
+        "inputs: family '<redacted>': platform 'x': value 'native': "
+        f"family is outside the vocabulary {_F4_VOCABULARY}",
+        "inputs: family '<redacted>': family is outside the vocabulary "
+        f"{_F4_VOCABULARY}",
+        "inputs: family 'chat': platform '<redacted>': owner must be one enabled "
+        "module name or 'none'",
+        "inputs: family 'chat': platform '<redacted>': names more than one owner, "
+        "both 'native' and '<redacted>'; name one module or 'none'",
+        "inputs: family 'chat': platform '<redacted>': owner 'ghost' is not enabled",
+        "inputs: family 'chat': platform '<redacted>': owner 'native' does not "
+        "declare family 'chat' for platform '<redacted>'",
+        "inputs: family 'chat': platform '<redacted>': owned by default by both "
+        "'a' and 'b'; set inputs.chat.<redacted>",
+    ]
+
+
 # -- D2: explicit and default precedence -------------------------------------- #
 
 
@@ -2886,6 +2997,7 @@ _OWNERSHIP_CODE = {
         "_Row",
         "InputOwnership",
         "_owner_text",
+        "_module_text",
         "_inputs_line",
         "resolve_input_ownership",
         "_declares_owned_inputs",
