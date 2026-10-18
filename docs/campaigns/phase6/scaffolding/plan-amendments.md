@@ -143,5 +143,8 @@ discrepancy" without making it the reason for refusal; the second pass, with eve
 closed, refused to treat the two names as interchangeable on its own authority. It was right not to:
 an acceptance criterion is the operator's contract, and only a recorded amendment can change it.
 
-**What the gate must check in the third pass.** That AC2 now names `action.started`, that the named test
-asserts exactly that pair, and that no `action.requested` remains anywhere in the phase's documents.
+**What the gate must check.** That AC2 now names `action.started`, that the named test asserts exactly
+that pair, and that **no PRESCRIPTIVE text** still names the old token — the specification's criteria, the
+plan's steps, the step specs and the tests. This record, the gate reports and the gate prompts quote
+`action.requested` on purpose: they are the history of the change, and an absence check that counted them
+would forbid the very record that documents why the name changed.

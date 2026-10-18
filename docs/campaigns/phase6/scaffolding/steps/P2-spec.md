@@ -74,7 +74,7 @@ All dependencies are already merged into `main` when this step runs.
 New in `tests/test_twitch.py`: AC1 — with an executor and no rule, publishing
   `channel.chat.send {"text": "hi"}` → 0 POSTs on the fake Helix, provider invoke count 0,
   `delivery_status == "failed"` and `delivery_outcome` equal to the executor's refusal status; with a
-  matching rule → exactly 1 POST and `sent`. AC2 — exactly 1 `action.requested` and 1
+  matching rule → exactly 1 POST and `sent`. AC2 — exactly 1 `action.started` and 1
   `action.completed` trace carrying the compatibility principal and Twitch destination, equal in
   shape to a direct executor call's traces. Run against `8010edc` (fails). Full `tests/test_twitch.py`
   plus `tests/test_integration.py`, `tests/test_examples.py`, `tests/test_users.py` pass.
@@ -118,3 +118,7 @@ Non-trivial (module/service boundary). Any other fixture/test that sends to Twit
   config or commit messages.
 - Report at the end: what changed, the exact test command output count, and anything you could
   not do because the plan did not cover it.
+
+> Note (amendment A1): this step spec said `action.requested` when it was written; the canonical
+> executor start trace is `action.started` (`core/contracts.py:149`). No code change — see
+> `scaffolding/plan-amendments.md`.
