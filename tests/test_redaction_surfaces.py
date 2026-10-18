@@ -23,26 +23,29 @@ code:
   ``unknown = sorted(set(entry) - KNOWN)`` idiom that lists unknown keys.
 
 A function **formats a key path** — and is therefore a configuration
-diagnostic surface — when it holds:
-
-* an f-string interpolating a configured key (or ``str(key)``) right after a
-  ``.`` or a ``[`` — a dotted or indexed path segment;
-* an f-string interpolating ``<text>.join(<configured key set>)``;
-* a call to a **path builder** with a bare configured key among its
-  arguments; a path builder is any function of the same file that returns an
-  f-string interpolating one of its parameters — bare, or handed to a call
-  such as the primitive — right after a ``.`` (the helper indirection of
-  ``core.main._mapping_path`` and ``core.contracts._key_label``, found, not
-  listed).
+diagnostic surface — at each **occurrence** of a configured key (or
+``str(key)``) placed right after a ``.`` or a ``[`` — a dotted or indexed path
+segment — in any spelling: an f-string, a ``'….{}'.format(key)``, a
+``'….' + key`` concatenation or a ``'….%s' % key``; at each
+``<text>.join(<configured key set>)`` in one of those; and at each bare
+configured key handed to a **path builder** — any function of the same file
+that returns an f-string interpolating one of its parameters, bare or handed
+to a call such as the primitive, right after a ``.`` (the helper indirection
+of ``core.main._mapping_path`` and ``core.contracts._key_label``, found, not
+listed).
 
 A surface is **routed** when one of these holds:
 
 direct
-    The function calls :func:`mask_known` or a registered wrapper
-    (:data:`WRAPPERS`) with its known-values argument supplied and not an
-    empty literal. The check is per function, not per string: a function
-    that routes one diagnostic is trusted to route its others, which the
-    behavioural AC10 tests pin for the shipped surfaces.
+    *Every* occurrence is routed by itself (F4, N1): it is an argument, at
+    any depth, of :func:`mask_known` or a registered wrapper
+    (:data:`WRAPPERS`) given its known-values argument, not an empty literal;
+    or it is assigned to a name every read of which is routed; or it is
+    handed to a function of the same file whose parameter is, at every read,
+    routed. A wrapper is judged by its call alone — called without its
+    values it routes nothing, whatever its body does with the empty default.
+    A redactor call elsewhere in the function, on another string, routes
+    nothing: that was probe D's fourth fixture.
 
 guarded
     The function is reachable, through calls by name (``f()``, ``self.f()``)
@@ -53,26 +56,36 @@ guarded
 
 hook-routed
     In ``modules/``, the function is the module's manifest-declared
-    ``settings_validator`` or reachable from it. What a hook returns is
-    reported only by :meth:`core.loader.ModuleLoader._validate_settings`
-    through :func:`core.loader._module_diagnostic`, which refuses a field
-    carrying any known credential and masks the reason; both are asserted
-    direct below. A module that also reports its own hook's output somewhere
-    else is outside what a call graph by name can see.
+    ``settings_validator`` or reachable from it. What a hook returns or
+    raises becomes text only through the one constructor,
+    :func:`core.loader.hook_diagnostics`, which masks every known value out
+    of the field and the reason and never reads an exception's text. That
+    is not trusted, it is checked: :func:`hook_outcome_renderers` fails on any
+    function of ``core/`` or ``modules/`` — the loader, a ``__main__`` command,
+    an activation — that renders a hook's outcome, its field path, its reason
+    or its ``str()``, anywhere but the constructor (probe C).
 
-What the walk cannot see: a key path built by ``%``/``.format``/``+``, a
-path builder in another file, a key smuggled through a container, and a
-function that routes one diagnostic but not another. Those are pinned by the
-behavioural tests (``tests/test_main.py``, ``tests/test_loader.py``: AC10).
-Surfaces that format a key path from data that is not configuration are
-listed in :data:`NOT_CONFIGURATION` with the reason, and every entry must
-still be a surface, so the list cannot go stale silently.
+What the walk cannot see: a key path built by a path builder in another
+file, a key smuggled through a container or an attribute, and a hook reached
+by a name the file neither imports from the module package nor resolves from
+``settings_validator``, and a hook's outcome handed to a helper of another
+file (helpers of the same file are followed). Those are pinned by the behavioural tests
+(``tests/test_main.py``, ``tests/test_loader.py``: AC10). Surfaces that format
+a key path from data that is not configuration are listed in
+:data:`NOT_CONFIGURATION`, and consumers that render a hook's outcome no
+reporter reads in :data:`HOOK_OUTCOME_UNREPORTED`, each with the reason;
+every entry must still be what it is listed as, so neither list can go stale
+silently.
 """
 
 from __future__ import annotations
 
 import ast
 import re
+import shutil
+import string
+import sys
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import pytest
@@ -291,39 +304,280 @@ def _mentions(expression: ast.AST, parameters: set[str]) -> bool:
     )
 
 
-def _key_path_lines(function: ast.AST, builders: set[str]) -> list[int]:
-    """The lines at which *function* formats a configured key into a path."""
+def _key_path_occurrences(function: ast.AST, builders: set[str]) -> list[ast.AST]:
+    """The nodes at which *function* formats a configured key into a path.
+
+    Each occurrence is the key expression itself — not the string around it —
+    so whether it is routed is decided for that one key (F4, N1): an
+    f-string, ``.format``, ``+`` concatenation and ``%`` all format the key
+    after a ``.`` or a ``[``, and a path builder takes it as an argument.
+    """
 
     nodes = _own_nodes(function)
     keys, key_sets = _configured_keys(nodes)
-    lines: list[int] = []
+
+    def is_key(expression: ast.AST) -> bool:
+        expression = _unwrapped(expression)
+        return isinstance(expression, ast.Name) and expression.id in keys
+
+    def is_key_list(expression: ast.AST) -> bool:
+        return (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "join"
+            and bool(expression.args)
+            and isinstance(expression.args[0], ast.Name)
+            and expression.args[0].id in key_sets | keys
+        )
+
+    found: list[ast.AST] = []
     for node in nodes:
         if isinstance(node, ast.JoinedStr):
             for before, expression in _segments(node):
-                expression = _unwrapped(expression)
-                if (
-                    isinstance(expression, ast.Name)
-                    and expression.id in keys
-                    and before.endswith((".", "["))
-                ):
-                    lines.append(node.lineno)
-                elif (
-                    isinstance(expression, ast.Call)
-                    and isinstance(expression.func, ast.Attribute)
-                    and expression.func.attr == "join"
-                    and expression.args
-                    and isinstance(expression.args[0], ast.Name)
-                    and expression.args[0].id in key_sets | keys
-                ):
-                    lines.append(node.lineno)
+                if is_key(expression) and before.endswith((".", "[")):
+                    found.append(_unwrapped(expression))
+                elif is_key_list(expression):
+                    found.append(expression)
         elif isinstance(node, ast.Call) and _called_name(node) in builders:
-            if any(
-                isinstance(_unwrapped(argument), ast.Name)
-                and _unwrapped(argument).id in keys  # type: ignore[attr-defined]
-                for argument in node.args[1:]
+            found.extend(
+                _unwrapped(argument) for argument in node.args[1:] if is_key(argument)
+            )
+        elif _is_format_call(node):
+            for before, expression in _format_fields(node):  # type: ignore[arg-type]
+                if is_key(expression) and before.endswith((".", "[")):
+                    found.append(_unwrapped(expression))
+                elif is_key_list(expression):
+                    found.append(expression)
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            operands = _added(node)
+            for previous, operand in zip(operands, operands[1:]):
+                if is_key(operand) and _trailing_text(previous).endswith((".", "[")):
+                    found.append(_unwrapped(operand))
+                elif is_key_list(operand):
+                    found.append(operand)
+        elif (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+        ):
+            arguments = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            for before, expression in zip(_percent_prefixes(node.left.value), arguments):
+                if is_key(expression) and before.endswith((".", "[")):
+                    found.append(_unwrapped(expression))
+                elif is_key_list(expression):
+                    found.append(expression)
+    unique: dict[int, ast.AST] = {id(node): node for node in found}
+    return list(unique.values())
+
+
+def _key_path_lines(function: ast.AST, builders: set[str]) -> list[int]:
+    """The lines at which *function* formats a configured key into a path."""
+
+    return sorted({node.lineno for node in _key_path_occurrences(function, builders)})
+
+
+def _is_format_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+    )
+
+
+def _format_fields(call: ast.Call) -> list[tuple[str, ast.AST]]:
+    """(the literal text right before it, argument) for each ``{}`` of a ``.format``."""
+
+    template = call.func.value.value  # type: ignore[attr-defined]
+    keywords = {argument.arg: argument.value for argument in call.keywords if argument.arg}
+    found: list[tuple[str, ast.AST]] = []
+    automatic = 0
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError:
+        return found
+    for literal, field_name, _spec, _conversion in parsed:
+        if field_name is None:
+            continue
+        head = re.split(r"[.\[]", field_name, maxsplit=1)[0]
+        if head == "":
+            index: int | str = automatic
+            automatic += 1
+        elif head.isdigit():
+            index = int(head)
+        else:
+            index = head
+        if isinstance(index, int):
+            if index < len(call.args):
+                found.append((literal, call.args[index]))
+        elif index in keywords:
+            found.append((literal, keywords[index]))
+    return found
+
+
+def _percent_prefixes(template: str) -> list[str]:
+    """The literal text right before each conversion of a ``%`` template."""
+
+    prefixes: list[str] = []
+    position = 0
+    for match in re.finditer(r"%(?:\([^)]*\))?[-#0 +]*\d*(?:\.\d+)?([a-zA-Z%])", template):
+        if match.group(1) == "%":
+            continue
+        prefixes.append(template[position : match.start()])
+        position = match.end()
+    return prefixes
+
+
+def _added(node: ast.AST) -> list[ast.AST]:
+    """The operands of a ``+`` chain, left to right."""
+
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _added(node.left) + _added(node.right)
+    return [node]
+
+
+def _trailing_text(node: ast.AST) -> str:
+    """The literal text a string operand ends with, or ``""``."""
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr) and node.values:
+        last = node.values[-1]
+        if isinstance(last, ast.Constant):
+            return str(last.value)
+    return ""
+
+
+def _parents(function: ast.AST) -> dict[int, ast.AST]:
+    """child id → parent, for every node under *function*."""
+
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(function):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    return parents
+
+
+class _Routing:
+    """Whether one key-path occurrence reaches the primitive, in one file.
+
+    An occurrence is routed when it is an argument — at any depth — of a call
+    to the primitive or a registered wrapper given its known values; when it
+    is assigned to a name every read of which is itself routed; or when it is
+    handed to a function of the same file whose parameter receiving it is, at
+    every read, routed. Routing is decided per occurrence: a redactor call
+    elsewhere in the function, on another string, routes nothing (F4, N1).
+    """
+
+    def __init__(self, functions: dict[str, list[ast.AST]]) -> None:
+        self._functions = functions
+        self._parents: dict[int, dict[int, ast.AST]] = {}
+        self._nodes: dict[int, list[ast.AST]] = {}
+
+    def unrouted(self, function: ast.AST, builders: set[str]) -> list[int]:
+        """The lines of *function*'s key-path occurrences no routing call holds."""
+
+        return sorted(
+            {
+                node.lineno
+                for node in _key_path_occurrences(function, builders)
+                if not self._routed(function, node, set())
+            }
+        )
+
+    def _name_routed(self, function: ast.AST, name: str, seen: set[tuple[int, str]]) -> bool:
+        if (id(function), name) in seen:
+            return True
+        seen.add((id(function), name))
+        if id(function) not in self._nodes:
+            self._nodes[id(function)] = _own_nodes(function)
+        return all(
+            self._routed(function, node, seen)
+            for node in self._nodes[id(function)]
+            if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)
+        )
+
+    def _routed(self, function: ast.AST, occurrence: ast.AST, seen: set[tuple[int, str]]) -> bool:
+        if id(function) not in self._parents:
+            self._parents[id(function)] = _parents(function)
+        parents = self._parents[id(function)]
+        node = occurrence
+        while node is not function:
+            parent = parents.get(id(node))
+            if parent is None:
+                return False
+            if isinstance(parent, ast.keyword):
+                keyword, node, parent = parent.arg, parent, parents.get(id(parent))
+                if not isinstance(parent, ast.Call):
+                    return False
+                if _routes(parent):
+                    return True
+                return self._parameter_routed(parent, None, keyword, seen)
+            if isinstance(parent, ast.Call) and node is not parent.func:
+                if _routes(parent):
+                    return True
+                if any(node is argument for argument in parent.args):
+                    index = next(i for i, a in enumerate(parent.args) if a is node)
+                    if self._parameter_routed(parent, index, None, seen):
+                        return True
+            if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and (
+                node is parent.value
             ):
-                lines.append(node.lineno)
-    return sorted(set(lines))
+                targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                if not all(isinstance(target, ast.Name) for target in targets):
+                    return False
+                return all(
+                    self._name_routed(function, target.id, seen)  # type: ignore[attr-defined]
+                    for target in targets
+                )
+            if isinstance(parent, ast.stmt):
+                return False
+            node = parent
+        return False
+
+    def _parameter_routed(
+        self,
+        call: ast.Call,
+        index: int | None,
+        keyword: str | None,
+        seen: set[tuple[int, str]],
+    ) -> bool:
+        """Whether the same-file callee of *call* routes the parameter it is handed."""
+
+        func = call.func
+        if isinstance(func, ast.Name):
+            name, bound = func.id, False
+        elif (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id in ("self", "cls")
+        ):
+            name, bound = func.attr, True
+        else:
+            return False
+        # A wrapper routes by its known values or not at all: called without
+        # them, what its own body does with an empty default routes nothing.
+        definitions = self._functions.get(name)
+        if not definitions or name in WRAPPERS:
+            return False
+        for definition in definitions:
+            arguments = definition.args  # type: ignore[attr-defined]
+            positional = [a.arg for a in (*arguments.posonlyargs, *arguments.args)]
+            if bound and positional[:1] in (["self"], ["cls"]):
+                positional = positional[1:]
+            if keyword is not None:
+                parameter = keyword
+                if parameter not in positional + [a.arg for a in arguments.kwonlyargs]:
+                    return False
+            elif index is not None and index < len(positional):
+                parameter = positional[index]
+            else:
+                return False
+            if not self._name_routed(definition, parameter, seen):
+                return False
+        return True
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -463,21 +717,33 @@ def violations(
 
     unrouted: dict[tuple[str, str], list[int]] = {}
     trees: dict[str, tuple[Path, dict[str, list[ast.AST]]]] = {}
-    for (relative, name), lines in surfaces(root).items():
+    builders: dict[str, set[str]] = {}
+    routing: dict[str, _Routing] = {}
+    for relative, name in surfaces(root):
         if (relative, name) in excluded:
             continue
         if relative not in trees:
             path = root / relative
-            trees[relative] = (path, _functions(ast.parse(path.read_text(encoding="utf-8"))))
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            trees[relative] = (path, _functions(tree))
+            builders[relative] = _path_builders(tree)
+            routing[relative] = _Routing(trees[relative][1])
         path, functions = trees[relative]
-        if all(_is_direct(definition) for definition in functions[name]):
+        missed = sorted(
+            {
+                line
+                for definition in functions[name]
+                for line in routing[relative].unrouted(definition, builders[relative])
+            }
+        )
+        if not missed:
             continue
         if _is_guarded(functions, name, guards.get(relative, ())):
             continue
         hook = _settings_validator(path) if relative.startswith("modules/") else None
         if hook is not None and _is_guarded(functions, name, ((hook, None),)):
             continue
-        unrouted[(relative, name)] = lines
+        unrouted[(relative, name)] = missed
     return unrouted
 
 
@@ -503,6 +769,362 @@ def _is_guarded(
 
 
 # --------------------------------------------------------------------------- #
+# A settings hook's outcome becomes text only through the constructor
+# --------------------------------------------------------------------------- #
+
+#: The one constructor of a hook's diagnostics, :func:`core.loader.hook_diagnostics`.
+CONSTRUCTOR = "hook_diagnostics"
+
+_CONSTRUCTOR_HOME = ("core/loader.py", CONSTRUCTOR)
+
+#: Calls that read a property of a value and never its text.
+_VALUE_FREE_CALLS = frozenset({"len", "bool", "isinstance", "type", "id", "callable", "isawaitable"})
+
+#: Calls that render their argument as text, or keep it for a later render.
+_RENDERING_CALLS = frozenset(
+    {"str", "repr", "format", "print", "join", "write", "writelines", "append", "extend",
+     "insert", "add", "update", "setdefault", "warn", "debug", "info", "warning", "error",
+     "exception", "critical", "log"}
+)
+
+#: Consumers that render a hook's outcome but whose text no reporter reads,
+#: each with the reason; every entry must still be a violation.
+HOOK_OUTCOME_UNREPORTED: dict[tuple[str, str], str] = {
+    (f"modules/{module}/__init__.py", "_Settings.from_mapping"): (
+        "raises the hook's first diagnostic as the exception of activate(); the "
+        "loader replaces every activation exception by its own value-free refusal "
+        "and never reads its text (ModuleLoader._activate). Outside this step's "
+        "files: reported for a follow-up rather than changed here"
+    )
+    for module in ("brain", "kick", "twitch", "youtube")
+} | {
+    ("core/loader.py", "ModuleLoader._abandon"): (
+        "reached through _await_module with the task wrapping a settings hook's "
+        "still-pending awaitable, which it appends to self._abandoned only so "
+        "the loop's teardown observes the task's end (abandoned_tasks); the "
+        "task's outcome is consumed by _consume_result and never rendered"
+    ),
+}
+
+
+def _settings_hooks(root: Path) -> dict[str, str]:
+    """Each module package's import path → the hook its manifest declares."""
+
+    hooks: dict[str, str] = {}
+    for manifest in sorted((root / "modules").glob("*/module.yaml")):
+        document = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        hook = document.get("settings_validator") if isinstance(document, dict) else None
+        if isinstance(hook, str):
+            hooks[f"modules.{manifest.parent.name}"] = hook
+    return hooks
+
+
+def _hook_names(tree: ast.Module, relative: str, hooks: dict[str, str]) -> set[str]:
+    """The names that call a settings hook in this file.
+
+    A hook imported from its module package (``from modules.x import
+    validate_settings``, under any alias), and, inside a module's own
+    package, the hook it declares.
+    """
+
+    names: set[str] = set()
+    package = ".".join(Path(relative).parent.parts)
+    if package in hooks:
+        names.add(hooks[package])
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        source = node.module or ""
+        if node.level:
+            parts = package.split(".")
+            base = parts[: len(parts) - node.level + 1]
+            source = ".".join([*base, source] if source else base)
+        hook = hooks.get(source)
+        names.update(alias.asname or alias.name for alias in node.names if alias.name == hook)
+    return names
+
+
+class _HookOutcome:
+    """Where one function lets a settings hook's outcome become text.
+
+    The outcome is what a hook call returns and, in a ``try`` whose body calls
+    a hook, the exception its handler binds. It flows by assignment, by
+    unpacking, by iteration and through any call that is not one of the
+    stops below; handed to a function of the same file (a bare name, or
+    ``self.``/``cls.`` within a class) it also taints the parameter it binds
+    there (:attr:`handoffs`), so a helper that renders it is a violation too. It is **stopped** as an argument of :data:`CONSTRUCTOR`, of
+    the primitive or a registered wrapper given its values, or of a call that
+    reads no text (:data:`_VALUE_FREE_CALLS`). It is **rendered** in an
+    f-string, a ``.format``, a ``+`` or ``%``, a rendering call
+    (:data:`_RENDERING_CALLS`), an exception's arguments, a ``raise``, a
+    ``return`` or ``yield``, or a store into an attribute or a container —
+    anything that hands its text, or the outcome itself, onward.
+    """
+
+    def __init__(
+        self,
+        function: ast.AST,
+        hook_names: set[str],
+        *,
+        parameters: set[str] | frozenset[str] = frozenset(),
+        resolve: Callable[[ast.Call], ast.AST | None] = lambda call: None,
+    ) -> None:
+        self._function = function
+        self._parameters = set(parameters)
+        self._resolve = resolve
+        #: Each same-file function this one hands the outcome to → the
+        #: parameters the outcome binds there. Given *parameters*, the walk
+        #: follows only them — the function's own hook calls are walked
+        #: separately — and a ``return`` of them is not a render.
+        self.handoffs: dict[int, tuple[ast.AST, set[str]]] = {}
+        self._parents = _parents(function)
+        self._nodes = _own_nodes(function)
+        self._hook_names = set(hook_names) | {
+            target.id
+            for node in self._nodes
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "settings_validator"
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        self._hooks = set(hook_names) - {"settings_validator"}
+
+    def _is_hook_call(self, node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        if isinstance(node.func, ast.Name):
+            return node.func.id in self._hook_names
+        return isinstance(node.func, ast.Attribute) and (
+            node.func.attr == "settings_validator" or node.func.attr in self._hooks
+        )
+
+    def rendered(self) -> list[int]:
+        """The lines at which this function renders a hook's outcome."""
+
+        tainted: set[str] = set(self._parameters)
+        # An exception a hook raised is the outcome only inside the handler
+        # that binds it: the same name bound by another handler is not.
+        handlers: dict[str, list[ast.ExceptHandler]] = {}
+        for node in self._nodes:
+            if not self._parameters and isinstance(node, ast.Try) and any(
+                self._is_hook_call(inner) for statement in node.body for inner in ast.walk(statement)
+            ):
+                for handler in node.handlers:
+                    if handler.name:
+                        handlers.setdefault(handler.name, []).append(handler)
+        lines: set[int] = set()
+        while True:
+            before = len(tainted)
+            for occurrence in self._nodes:
+                if not (
+                    (not self._parameters and self._is_hook_call(occurrence))
+                    or (
+                        isinstance(occurrence, ast.Name)
+                        and isinstance(occurrence.ctx, ast.Load)
+                        and (
+                            occurrence.id in tainted
+                            or self._inside(occurrence, handlers.get(occurrence.id, ()))
+                        )
+                    )
+                ):
+                    continue
+                verdict, names = self._follow(occurrence)
+                if verdict == "rendered":
+                    lines.add(occurrence.lineno)
+                tainted.update(names)
+            if len(tainted) == before:
+                return sorted(lines)
+
+    def _inside(self, node: ast.AST, scopes: Iterable[ast.AST]) -> bool:
+        ids = {id(scope) for scope in scopes}
+        while node is not None and node is not self._function:
+            if id(node) in ids:
+                return True
+            node = self._parents.get(id(node))
+        return False
+
+    def _follow(self, occurrence: ast.AST) -> tuple[str, set[str]]:
+        node = occurrence
+        while node is not self._function:
+            parent = self._parents.get(id(node))
+            if parent is None:
+                return "dropped", set()
+            if isinstance(parent, ast.keyword):
+                node, parent = parent, self._parents.get(id(parent))
+            if isinstance(parent, ast.Call) and node is not parent.func:
+                name = _called_name(parent) or ""
+                if name == CONSTRUCTOR or _routes(parent) or name in _VALUE_FREE_CALLS:
+                    return "stopped", set()
+                if name in _RENDERING_CALLS or name.endswith(("Error", "Exception", "Warning")):
+                    return "rendered", set()
+                self._hand_off(parent, node)
+            elif isinstance(parent, (ast.FormattedValue, ast.JoinedStr)):
+                return "rendered", set()
+            elif isinstance(parent, ast.BinOp) and isinstance(parent.op, (ast.Add, ast.Mod)):
+                return "rendered", set()
+            elif isinstance(parent, (ast.Return, ast.Yield, ast.YieldFrom)) and self._parameters:
+                # A helper's result goes back to the caller that handed the
+                # outcome in, which follows the call onward itself.
+                return "returned", set()
+            elif isinstance(parent, (ast.Raise, ast.Return, ast.Yield, ast.YieldFrom)):
+                return "rendered", set()
+            elif isinstance(parent, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                if node is not parent.value:
+                    return "dropped", set()
+                targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                if any(not isinstance(t, (ast.Name, ast.Tuple, ast.List, ast.Starred)) for t in targets):
+                    return "rendered", set()
+                return "assigned", _bound_names(targets)
+            elif isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension)):
+                if node is parent.iter:
+                    return "assigned", _bound_names([parent.target])
+                return "dropped", set()
+            elif isinstance(parent, ast.stmt):
+                return "dropped", set()
+            node = parent
+        return "dropped", set()
+
+
+    def _hand_off(self, call: ast.Call, argument: ast.AST) -> None:
+        """Taint the parameters *argument* binds in a same-file callee."""
+
+        callee = self._resolve(call)
+        if callee is None:
+            return
+        arguments = callee.args
+        positional = [arg.arg for arg in (*arguments.posonlyargs, *arguments.args)]
+        if isinstance(call.func, ast.Attribute):
+            positional = positional[1:]
+        bound: set[str] = set()
+        if isinstance(argument, ast.keyword):
+            if argument.arg is None:
+                bound.update(positional, (arg.arg for arg in arguments.kwonlyargs))
+                if arguments.kwarg:
+                    bound.add(arguments.kwarg.arg)
+            elif argument.arg in positional or argument.arg in {
+                arg.arg for arg in arguments.kwonlyargs
+            }:
+                bound.add(argument.arg)
+            elif arguments.kwarg:
+                bound.add(arguments.kwarg.arg)
+        else:
+            index = next(i for i, arg in enumerate(call.args) if arg is argument)
+            if any(isinstance(arg, ast.Starred) for arg in call.args[: index + 1]):
+                bound.update(positional[index:])
+                if arguments.vararg:
+                    bound.add(arguments.vararg.arg)
+            elif index < len(positional):
+                bound.add(positional[index])
+            elif arguments.vararg:
+                bound.add(arguments.vararg.arg)
+        if bound:
+            _, names = self.handoffs.setdefault(id(callee), (callee, set()))
+            names.update(bound)
+
+
+def _bound_names(targets: list[ast.AST]) -> set[str]:
+    names: set[str] = set()
+    for target in targets:
+        for node in ast.walk(target):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+    return names
+
+
+def hook_outcome_renderers(
+    root: Path,
+    *,
+    unreported: dict[tuple[str, str], str] = HOOK_OUTCOME_UNREPORTED,
+) -> dict[tuple[str, str], list[int]]:
+    """Every function of ``core/`` and ``modules/`` that renders a settings
+    hook's outcome — its field path, its reason or its ``str()`` — anywhere
+    but :data:`CONSTRUCTOR` (R3, F4)."""
+
+    hooks = _settings_hooks(root)
+    found: dict[tuple[str, str], list[int]] = {}
+    for tree_name in _SOURCE_TREES:
+        for path in sorted((root / tree_name).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            relative = path.relative_to(root).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            names = _hook_names(tree, relative, hooks)
+            functions = _qualified_functions(tree)
+            by_name = dict(functions)
+            parameters: dict[int, set[str]] = {id(d): set() for _, d in functions}
+            while True:
+                lines_of: dict[str, list[int]] = {}
+                grew = False
+                for name, definition in functions:
+                    if (relative, name) == _CONSTRUCTOR_HOME or (relative, name) in unreported:
+                        continue
+                    resolve = _same_file_callee(name, by_name)
+                    walks = [_HookOutcome(definition, names, resolve=resolve)]
+                    if parameters[id(definition)]:
+                        walks.append(
+                            _HookOutcome(
+                                definition,
+                                names,
+                                parameters=parameters[id(definition)],
+                                resolve=resolve,
+                            )
+                        )
+                    lines_of[name] = sorted({line for walk in walks for line in walk.rendered()})
+                    for walk in walks:
+                        for callee, bound in walk.handoffs.values():
+                            if not bound <= parameters[id(callee)]:
+                                parameters[id(callee)] |= bound
+                                grew = True
+                if not grew:
+                    break
+            found.update(
+                ((relative, name), lines) for name, lines in lines_of.items() if lines
+            )
+    return found
+
+
+def _same_file_callee(
+    caller: str, functions: dict[str, ast.AST]
+) -> Callable[[ast.Call], ast.AST | None]:
+    """Resolve a call in *caller* to a function of the same file: a bare name
+    to a module-level function, ``self.m``/``cls.m`` to a method of the
+    caller's class."""
+
+    owner = caller.rpartition(".")[0]
+
+    def resolve(call: ast.Call) -> ast.AST | None:
+        if isinstance(call.func, ast.Name):
+            return functions.get(call.func.id)
+        if (
+            owner
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in {"self", "cls"}
+        ):
+            return functions.get(f"{owner}.{call.func.attr}")
+        return None
+
+    return resolve
+
+
+def _qualified_functions(tree: ast.Module) -> list[tuple[str, ast.AST]]:
+    """Every function of *tree* by its dotted name (``_Settings.from_mapping``)."""
+
+    found: list[tuple[str, ast.AST]] = []
+    pending: list[tuple[str, ast.AST]] = [("", tree)]
+    while pending:
+        prefix, scope = pending.pop()
+        for node in ast.iter_child_nodes(scope):
+            if isinstance(node, (*_FUNCTIONS, ast.ClassDef)):
+                name = prefix + node.name
+                if isinstance(node, _FUNCTIONS):
+                    found.append((name, node))
+                pending.append((name + ".", node))
+    return found
+
+
+# --------------------------------------------------------------------------- #
 # The shipped tree
 # --------------------------------------------------------------------------- #
 
@@ -511,7 +1133,8 @@ def test_ac11_every_configuration_diagnostic_surface_routes_through_the_primitiv
     """AC11 (R3, F4): every function of ``core/`` and ``modules/`` that names a
     configured key in a diagnostic routes it through :func:`mask_known` —
     directly, by a registered wrapper, behind a registered guard, or as a
-    settings hook the loader's guard reports."""
+    settings hook the loader's guard reports — and no function renders a
+    settings hook's outcome except the one constructor (F4, probes C and D)."""
 
     found = surfaces(_ROOT)
     # The enumeration sees the surfaces this step routed, so it is not vacuous.
@@ -526,6 +1149,8 @@ def test_ac11_every_configuration_diagnostic_surface_routes_through_the_primitiv
     ):
         assert expected in found, expected
     assert violations(_ROOT) == {}
+    # F4, N1: no reporter renders a settings hook's outcome but the constructor.
+    assert hook_outcome_renderers(_ROOT) == {}
 
 
 def test_ac11_the_registries_name_what_is_there() -> None:
@@ -548,6 +1173,18 @@ def test_ac11_the_registries_name_what_is_there() -> None:
         if isinstance(node, _FUNCTIONS)
     }
     assert sorted(set(WRAPPERS) - defined) == []
+    # Every hook-outcome exemption is still a renderer, and the constructor
+    # the check trusts is defined once, where the exemption says it is.
+    renderers = hook_outcome_renderers(_ROOT, unreported={})
+    assert [entry for entry in HOOK_OUTCOME_UNREPORTED if entry not in renderers] == []
+    constructors = [
+        path.relative_to(_ROOT).as_posix()
+        for tree_name in _SOURCE_TREES
+        for path in (_ROOT / tree_name).rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, _FUNCTIONS) and node.name == CONSTRUCTOR
+    ]
+    assert constructors == [_CONSTRUCTOR_HOME[0]]
 
 
 def test_ac11_the_loader_hook_guard_and_the_settings_check_are_direct() -> None:
@@ -632,6 +1269,43 @@ _BYPASSING_SOURCES = {
         "    for key in settings:\n"
         "        raise _field_error('m', f'settings.{key}', 'unknown', values=())\n"
     ),
+    # Probe D of the gate's first pass (F4, N1): the same raw surface in the
+    # spellings the per-function heuristic let through.
+    "probe-d-format": (
+        "def check(settings):\n"
+        "    for key in settings:\n"
+        "        raise ValueError('settings.{}: unknown'.format(key))\n"
+    ),
+    "probe-d-concatenation": (
+        "def check(settings):\n"
+        "    for key in settings:\n"
+        "        raise ValueError('settings.' + key + ': unknown')\n"
+    ),
+    "probe-d-unrelated-redactor": (
+        "def check(settings, known):\n"
+        "    safe = mask_known('fixed', known)\n"
+        "    for key in settings:\n"
+        "        raise ValueError(f'settings.{key}: unknown')\n"
+    ),
+    "percent": (
+        "def check(settings):\n"
+        "    for key in settings:\n"
+        "        raise ValueError('settings.%s: unknown' % key)\n"
+    ),
+    "label-then-raw": (
+        "def check(settings, known):\n"
+        "    for key in settings:\n"
+        "        label = f'settings.{key}'\n"
+        "        mask_known(label, known)\n"
+        "        raise ValueError(label)\n"
+    ),
+    "helper-wrapper-without-values": (
+        "def _report(path):\n"
+        "    raise _field_error('m', path, 'unknown')\n"
+        "def check(settings):\n"
+        "    for key in settings:\n"
+        "        _report(f'settings.{key}')\n"
+    ),
 }
 
 
@@ -672,6 +1346,15 @@ def test_ac11_self_test_a_surface_formatting_a_key_path_without_the_primitive_fa
         "def check(settings):\n"
         "    for index, item in enumerate(settings):\n"
         "        raise ContractError(f'settings[{index}]', 'must be a mapping')\n",
+        "def check(settings, known):\n"
+        "    for key in settings:\n"
+        "        raise ValueError(mask_known('settings.{}: unknown'.format(key), known))\n",
+        "def _report(path, known):\n"
+        "    raise _field_error('m', path, 'unknown', values=known)\n"
+        "def check(settings, known):\n"
+        "    for key in settings:\n"
+        "        label = 'settings.' + key\n"
+        "        _report(label, known)\n",
     ],
 )
 def test_ac11_self_test_a_routed_or_constant_path_passes(
@@ -722,3 +1405,310 @@ def test_ac11_self_test_a_module_hook_is_routed_only_when_declared(tmp_path: Pat
         "settings_validator: validate_settings\n", encoding="utf-8"
     )
     assert violations(root) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Probe D, replayed: the real AC11 test over the real tree plus one fixture
+# --------------------------------------------------------------------------- #
+
+_PROBE_D_FIXTURE = "core/_gate_virtual_fixture.py"
+
+_PROBE_D_BODIES = {
+    "f-string": "        raise ValueError(f'settings.{key}: unknown')\n",
+    "format": "        raise ValueError('settings.{}: unknown'.format(key))\n",
+    "concatenation": "        raise ValueError('settings.' + key + ': unknown')\n",
+    "unrelated-redactor": (
+        "        safe = mask_known('fixed', known)\n"
+        "        raise ValueError(f'settings.{key}: unknown')\n"
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def real_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A copy of the shipped ``core/`` and ``modules/`` the fixture is added to."""
+
+    root = tmp_path_factory.mktemp("real-tree")
+    for tree_name in _SOURCE_TREES:
+        shutil.copytree(
+            _ROOT / tree_name, root / tree_name, ignore=shutil.ignore_patterns("__pycache__")
+        )
+    return root
+
+
+def _with_probe_d_fixture(
+    root: Path, body: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (root / _PROBE_D_FIXTURE).write_text(
+        "from core.contracts import mask_known\n"
+        "def check(settings, known):\n"
+        "    for key in settings:\n" + body,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_ROOT", root)
+
+
+@pytest.mark.parametrize("case", sorted(_PROBE_D_BODIES))
+def test_ac11_probe_d_every_spelling_fails_the_real_structural_test(
+    real_tree: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """F4, N1 (probe D): the gate appended a virtual fixture to the real scan
+    and ran the unchanged AC11 test. Each of its four bodies is a negative
+    control: the test must fail and name the fixture."""
+
+    _with_probe_d_fixture(real_tree, _PROBE_D_BODIES[case], monkeypatch)
+    try:
+        with pytest.raises(AssertionError):
+            test_ac11_every_configuration_diagnostic_surface_routes_through_the_primitive()
+        assert list(violations(real_tree)) == [(_PROBE_D_FIXTURE, "check")]
+    finally:
+        (real_tree / _PROBE_D_FIXTURE).unlink()
+
+
+def test_ac11_probe_d_the_routed_spelling_passes_the_real_structural_test(
+    real_tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control of probe D: the same fixture, its key path built
+    through the primitive, passes the real test."""
+
+    _with_probe_d_fixture(
+        real_tree,
+        "        raise ValueError(mask_known('settings.' + key, known) + ': unknown')\n",
+        monkeypatch,
+    )
+    try:
+        test_ac11_every_configuration_diagnostic_surface_routes_through_the_primitive()
+    finally:
+        (real_tree / _PROBE_D_FIXTURE).unlink()
+
+
+# --------------------------------------------------------------------------- #
+# Self-test: a hook's outcome rendered outside the constructor fails
+# --------------------------------------------------------------------------- #
+
+_HOOK_MODULE = (
+    "def validate_settings(settings):\n"
+    "    return [f\"module 'fixture': field '{key}': unknown\" for key in settings]\n"
+)
+
+_HOOK_RENDERERS = {
+    # Probe C's shape: the pre-fix offline command joined the hook's entries.
+    "joined": (
+        "from modules.fixture import validate_settings\n"
+        "def main(settings):\n"
+        "    diagnostics = validate_settings(settings)\n"
+        "    if diagnostics:\n"
+        "        raise SystemExit('; '.join(diagnostics))\n"
+    ),
+    "printed-entry": (
+        "from modules.fixture import validate_settings as check\n"
+        "def main(settings):\n"
+        "    for line in check(settings):\n"
+        "        print(f'error: {line}')\n"
+    ),
+    "raised-exception-text": (
+        "from modules.fixture import validate_settings\n"
+        "def main(settings):\n"
+        "    try:\n"
+        "        validate_settings(settings)\n"
+        "    except Exception as exc:\n"
+        "        return 'refused: ' + str(exc)\n"
+    ),
+    "first-entry-as-exception": (
+        "from modules.fixture import validate_settings\n"
+        "def main(settings):\n"
+        "    diagnostics = validate_settings(settings)\n"
+        "    if diagnostics:\n"
+        "        raise ValueError(diagnostics[0])\n"
+    ),
+    "resolved-attribute": (
+        "def main(entry_point, settings):\n"
+        "    validator = entry_point.settings_validator\n"
+        "    outcome = validator(settings)\n"
+        "    return outcome\n"
+    ),
+    "unrelated-constructor-call": (
+        "from modules.fixture import validate_settings\n"
+        "def main(settings):\n"
+        "    outcome = validate_settings(settings)\n"
+        "    hook_diagnostics('fixture', 'validate_settings', [], settings=settings)\n"
+        "    return '; '.join(outcome)\n"
+    ),
+}
+
+
+def _hook_tree(tmp_path: Path, consumer: str) -> Path:
+    root = _fixture_tree(tmp_path, _HOOK_MODULE, relative="modules/fixture/__init__.py")
+    (root / "modules/fixture/module.yaml").write_text(
+        "settings_validator: validate_settings\n", encoding="utf-8"
+    )
+    (root / "modules/fixture/__main__.py").write_text(consumer, encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize("case", sorted(_HOOK_RENDERERS))
+def test_f4_self_test_a_hook_outcome_rendered_outside_the_constructor_fails(
+    tmp_path: Path, case: str
+) -> None:
+    """F4 (R3): a reporter that renders a settings hook's entries, its field,
+    its reason or what it raised — joined, interpolated, concatenated, raised,
+    returned onward — is a violation naming it."""
+
+    root = _hook_tree(tmp_path, _HOOK_RENDERERS[case])
+
+    assert list(hook_outcome_renderers(root)) == [("modules/fixture/__main__.py", "main")]
+
+
+_HELPER_RENDERERS = {
+    # The review's shape: the outcome handed to a helper that prints it.
+    "helper-printed": (
+        "from modules.fixture import validate_settings\n"
+        "def report(lines):\n"
+        "    print('; '.join(lines))\n"
+        "def main(settings):\n"
+        "    report(validate_settings(settings))\n",
+        "report",
+    ),
+    "helper-by-keyword-through-a-name": (
+        "from modules.fixture import validate_settings\n"
+        "def _report(prefix, *, lines):\n"
+        "    for line in lines:\n"
+        "        print(prefix + line)\n"
+        "def main(settings):\n"
+        "    outcome = validate_settings(settings)\n"
+        "    _report('error: ', lines=outcome)\n",
+        "_report",
+    ),
+    "helper-of-a-helper": (
+        "from modules.fixture import validate_settings\n"
+        "def _emit(text):\n"
+        "    raise SystemExit(text)\n"
+        "def _relay(entries):\n"
+        "    _emit(entries)\n"
+        "def main(settings):\n"
+        "    _relay(validate_settings(settings))\n",
+        "_emit",
+    ),
+    "method-on-self": (
+        "from modules.fixture import validate_settings\n"
+        "class Command:\n"
+        "    def _report(self, lines):\n"
+        "        return f'refused: {lines}'\n"
+        "    def run(self, settings):\n"
+        "        self._report(validate_settings(settings))\n",
+        "Command._report",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_HELPER_RENDERERS))
+def test_f4_self_test_a_hook_outcome_rendered_by_a_same_file_helper_fails(
+    tmp_path: Path, case: str
+) -> None:
+    """F4 (R3): handing the outcome to a helper of the same file does not
+    hide it — the helper that renders it is the violation."""
+
+    consumer, renderer = _HELPER_RENDERERS[case]
+
+    assert list(hook_outcome_renderers(_hook_tree(tmp_path, consumer))) == [
+        ("modules/fixture/__main__.py", renderer)
+    ]
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        # A helper given the outcome that only counts it, and one that is
+        # given only an unrelated argument.
+        "from modules.fixture import validate_settings\n"
+        "def report(lines, label):\n"
+        "    print(f'{label}: {len(lines)} refused')\n"
+        "def main(settings):\n"
+        "    report(validate_settings(settings), 'fixture')\n",
+        # An exception bound under the same name by a handler whose try calls
+        # no hook is not the hook's outcome.
+        "from modules.fixture import validate_settings\n"
+        "def main(settings):\n"
+        "    try:\n"
+        "        int(settings)\n"
+        "    except ValueError as exc:\n"
+        "        print(exc)\n"
+        "    try:\n"
+        "        outcome = validate_settings(settings)\n"
+        "    except Exception as exc:\n"
+        "        outcome = exc\n"
+        "    return len(outcome)\n",
+        # The shipped offline command's shape: the constructor renders.
+        "from modules.fixture import validate_settings\n"
+        "def main(settings, config):\n"
+        "    try:\n"
+        "        outcome = validate_settings(settings)\n"
+        "    except Exception as exc:\n"
+        "        outcome = exc\n"
+        "    diagnostics = hook_diagnostics('fixture', 'validate_settings', outcome,\n"
+        "                                   settings=settings, profile=config)\n"
+        "    if diagnostics:\n"
+        "        raise SystemExit('; '.join(diagnostics))\n",
+        # An activation that counts the refusals and never shows one.
+        "from modules.fixture import validate_settings\n"
+        "def main(settings):\n"
+        "    diagnostics = validate_settings(settings)\n"
+        "    if diagnostics:\n"
+        "        raise ValueError(f'settings were refused ({len(diagnostics)} diagnostics)')\n",
+    ],
+)
+def test_f4_self_test_a_hook_outcome_through_the_constructor_passes(
+    tmp_path: Path, consumer: str
+) -> None:
+    """Positive control: an outcome handed only to the constructor, or only
+    counted, is not rendered."""
+
+    assert hook_outcome_renderers(_hook_tree(tmp_path, consumer)) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Probe C: the offline settings consumer prints nothing unredacted
+# --------------------------------------------------------------------------- #
+
+_PROBE_C_SECRET = "review-secret-4521"
+
+_PROBE_C_DOCUMENT = (
+    "modules:\n"
+    "  streamerbot:\n"
+    f"    password: {_PROBE_C_SECRET}\n"
+    "  viewer_memory:\n"
+    "    directory: /tmp/phase6-unused-memory\n"
+    f"    {_PROBE_C_SECRET}: 1\n"
+)
+
+
+def test_f4_probe_c_the_offline_command_never_echoes_a_credential_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F4 (probe C): another module's credential, used as an unknown key of
+    ``viewer_memory``, is refused with a non-zero exit and appears nowhere in
+    stdout or stderr — the in-memory document is the gate's, no file is read."""
+
+    from modules.viewer_memory.__main__ import main
+
+    read: list[Path] = []
+
+    def read_text(self: Path, *args: object, **kwargs: object) -> str:
+        read.append(self)
+        return _PROBE_C_DOCUMENT
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    status = main(["stats", "--config", "/virtual/gate.yaml"])
+
+    captured = capsys.readouterr()
+    assert read == [Path("/virtual/gate.yaml")]
+    assert status != 0
+    assert all(
+        _PROBE_C_SECRET[:end] not in captured.out + captured.err
+        for end in range(8, len(_PROBE_C_SECRET) + 1)
+    )
+    assert captured.err == (
+        "viewer_memory: module 'viewer_memory': field 'validate_settings': "
+        "is not a setting this module declares\n"
+    )

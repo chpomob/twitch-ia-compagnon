@@ -137,6 +137,7 @@ __all__: Sequence[str] = (
     "ModuleLoadError",
     "ModuleLoader",
     "OwnedInputs",
+    "hook_diagnostics",
     "resolve_input_ownership",
 )
 
@@ -1144,7 +1145,9 @@ class ModuleLoader:
 
         if isinstance(value, list):
             if id(value) in active:
-                raise _field_error(name, path, "recursive value is invalid")
+                raise _field_error(
+                    name, path, "recursive value is invalid", values=self.redacted_values
+                )
             active.add(id(value))
             try:
                 sequence: list[Any] = []
@@ -1186,7 +1189,9 @@ class ModuleLoader:
             Each entry is the module's own ``module 'x': field 'y': reason``
             and is passed through — that is what lets the report name the
             field the module knows and the core does not — after
-            :func:`_module_diagnostic` has held it to this module's name, to
+            :func:`hook_diagnostics`, the one constructor of a hook's text,
+            has held it through :func:`_module_diagnostic` to this module's
+            name, to
             a field shaped like a setting path and free of any configured
             value, and to a reason from which every configured value has
             been redacted.
@@ -1259,21 +1264,13 @@ class ModuleLoader:
                 if status == "cancelled":
                     return [_field_diagnostic(name, hook_name, "was cancelled")]
                 outcome = result
-        except Exception:
-            return [_field_diagnostic(name, hook_name, "settings were refused by the module")]
-        if isinstance(outcome, (list, tuple)) and outcome:
-            values = tuple(
-                sorted(
-                    set(_configured_values(settings)) | credentials,
-                    key=len,
-                    reverse=True,
-                )
-            )
-            return [
-                _module_diagnostic(name, entry, hook_name, values=values)
-                for entry in outcome
-            ]
-        return []
+        except Exception as exc:
+            outcome = exc
+        # F4: the hook's outcome — its entries or what it raised — becomes
+        # text only through the one constructor, never formatted here.
+        return list(
+            hook_diagnostics(name, hook_name, outcome, settings=settings, known=credentials)
+        )
 
     def _scoped_context(self, name: str, declaration: ManifestDeclaration) -> Any:
         """The module context *name* is handed, guarded by the table (R3).
@@ -2480,6 +2477,54 @@ def _module_diagnostic(
             field_name = hook_name
     return _field_diagnostic(
         module, field_name, _sanitised_reason(_redact_values(reason, values))
+    )
+
+
+def hook_diagnostics(
+    module: str,
+    hook_name: str,
+    outcome: Any,
+    *,
+    settings: Any,
+    known: Iterable[str] = (),
+    profile: Any = None,
+) -> tuple[str, ...]:
+    """The one constructor of a settings hook's diagnostics (R3, F4).
+
+    *outcome* is what the hook named *hook_name* gave back for *settings*:
+    the list it returned, or the exception it raised. This is the only way
+    either becomes text — the loader, ``--check-config``, the config UI and
+    an offline ``__main__`` command all report what it returns, final and
+    redacted, and none of them formats a hook's field, reason or ``str()``
+    itself (``tests/test_redaction_surfaces.py`` holds every module to it).
+
+    The values masked out of every slot are every string of *settings*, the
+    *known* credentials and, for a caller that read a whole configuration
+    document without the loader's credential set, every string of *profile*
+    — a superset of each credential that document holds literally. Each entry
+    goes through :func:`_module_diagnostic`, so a field carrying any of them
+    is replaced by the hook's name and the reason is masked and bounded. An
+    exception's text is never read: a hook that raised is reported as a
+    refusal by that hook, named by the module and the hook alone (both
+    declared in code, never configured). Anything else, an empty list
+    included, is no diagnostic.
+    """
+
+    values = tuple(
+        sorted(
+            set(_configured_values(settings))
+            | set(known)
+            | set(_configured_values(profile)),
+            key=len,
+            reverse=True,
+        )
+    )
+    if isinstance(outcome, BaseException):
+        return (_field_diagnostic(module, hook_name, "settings were refused by the module"),)
+    if not isinstance(outcome, (list, tuple)):
+        return ()
+    return tuple(
+        _module_diagnostic(module, entry, hook_name, values=values) for entry in outcome
     )
 
 

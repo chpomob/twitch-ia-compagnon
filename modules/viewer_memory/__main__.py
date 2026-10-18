@@ -22,7 +22,10 @@ read.
 
 **Exit codes.** 0 on success; 2 on an unreadable or invalid configuration
 (and on a usage error, as ``argparse`` does); 1 when a file operation fails.
-Messages name the field, never a configured value.
+Messages name the field, never a configured value: the hook's diagnostics are
+rendered by :func:`core.loader.hook_diagnostics`, masked of every string in
+the whole document, so a credential of another module used as a key is never
+echoed (F4).
 
 **Isolation.** The command starts no runtime, opens no socket and imports no
 network client. It works on the directory alone: a running runtime's
@@ -40,6 +43,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from core.loader import hook_diagnostics
 from modules.viewer_memory import (
     MEMORY_FILE_PATTERN,
     MODULE_NAME,
@@ -53,6 +57,8 @@ EXIT_FAILED = 1
 EXIT_INVALID_CONFIGURATION = 2
 
 _REFERENCE_MARKER = "${"
+#: The hook the manifest declares as ``settings_validator``.
+_SETTINGS_HOOK = "validate_settings"
 
 
 class _ConfigurationError(Exception):
@@ -122,7 +128,16 @@ def _memory_directory(path: Path) -> Path:
     settings: Any = modules.get(MODULE_NAME)
     if settings is None:
         raise _ConfigurationError(f"field 'modules.{MODULE_NAME}' is missing")
-    diagnostics = validate_settings(settings)
+    # F4: the hook's outcome becomes text only through the loader's one
+    # constructor, masked of every string the document holds — the
+    # credentials of other modules included, which no loader collected here.
+    try:
+        outcome: Any = validate_settings(settings)
+    except Exception as exc:
+        outcome = exc
+    diagnostics = hook_diagnostics(
+        MODULE_NAME, _SETTINGS_HOOK, outcome, settings=settings, profile=config
+    )
     if diagnostics:
         raise _ConfigurationError("; ".join(diagnostics))
     directory = settings["directory"]

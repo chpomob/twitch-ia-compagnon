@@ -3784,3 +3784,89 @@ def test_f26_the_schema_validator_closes_only_when_asked() -> None:
         validate_against_schema({"other": 1}, schema, label="settings", closed=True)
 
     assert caught.value.field == "settings.other"
+
+
+# --------------------------------------------------------------------------- #
+# P20F2 — one constructor renders a settings hook's diagnostics (R3, F4)
+# --------------------------------------------------------------------------- #
+
+
+def test_f4_the_hook_constructor_masks_a_credential_of_the_whole_document() -> None:
+    """F4 (probe C): a caller holding only the document — no loader, no
+    credential set — hands it as *profile*; another module's credential,
+    used as this module's key, is masked out of field and reason alike."""
+
+    from core.loader import hook_diagnostics
+
+    profile = {"modules": {"other": {"password": _AC10_SECRET}}}
+    settings = {"directory": "/tmp/unused", _AC10_SECRET: 1}
+    outcome = [
+        f"module 'mine': field '{_AC10_SECRET}': is not a setting this module declares",
+        f"module 'mine': field 'extras': refused {_AC10_SECRET} here",
+    ]
+
+    rendered = hook_diagnostics(
+        "mine", "validate_settings", outcome, settings=settings, profile=profile
+    )
+
+    assert all(_no_secret_fragment(line) for line in rendered)
+    assert rendered == (
+        "module 'mine': field 'validate_settings': is not a setting this module declares",
+        "module 'mine': field 'extras': refused <redacted> here",
+    )
+    # Without the document, the same credential is unknown to the constructor:
+    # the field still carries it, which is why the offline caller passes it.
+    assert any(
+        _AC10_SECRET in line
+        for line in hook_diagnostics("mine", "validate_settings", outcome, settings={})
+    )
+
+
+def test_f4_the_hook_constructor_never_reads_what_a_hook_raised() -> None:
+    """F4: a hook that raised becomes the hook's refusal by name; the
+    exception's text — here the credential itself — is never rendered."""
+
+    from core.loader import hook_diagnostics
+
+    rendered = hook_diagnostics(
+        "mine",
+        "validate_settings",
+        ValueError(f"field '{_AC10_SECRET}' is wrong"),
+        settings={},
+        known=(_AC10_SECRET,),
+    )
+
+    assert rendered == (
+        "module 'mine': field 'validate_settings': settings were refused by the module",
+    )
+
+
+@pytest.mark.parametrize("outcome", [[], (), None, "module 'mine': field 'x': text", 3])
+def test_f4_the_hook_constructor_renders_nothing_for_no_refusal(outcome: Any) -> None:
+    """F4: anything but a non-empty list or tuple, or an exception, is no
+    diagnostic — as the loader always read a hook's return."""
+
+    from core.loader import hook_diagnostics
+
+    assert hook_diagnostics("mine", "validate_settings", outcome, settings={}) == ()
+
+
+def test_f4_a_recursive_list_under_a_credential_key_is_masked() -> None:
+    """F4 (found by the per-occurrence AC11 walk): reference resolution's
+    refusal of a recursive list names its path with a credential key masked,
+    as the mapping branch already did."""
+
+    loop: list[Any] = []
+    loop.append(loop)
+    loader = ModuleLoader.__new__(ModuleLoader)
+    loader.environ = {}
+    loader.redacted_values = frozenset({_AC10_SECRET})
+    loader.resolved_secrets = 0
+
+    with pytest.raises(ModuleLoadError) as caught:
+        loader._resolve_value({_AC10_SECRET: loop}, "modules.m", set(), "m")
+
+    assert _no_secret_fragment(str(caught.value))
+    assert str(caught.value) == (
+        "module 'm': field 'modules.m.<redacted>[0]': recursive value is invalid"
+    )
