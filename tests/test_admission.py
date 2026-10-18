@@ -979,6 +979,47 @@ async def test_a_full_session_cap_refuses_a_new_session_rather_than_evicting_a_l
         assert harness.scheduler.active_runs == 1
 
 
+async def test_expired_and_evicted_sessions_never_accumulate_in_the_ready_structure():
+    """R6, AC22 (F23): with the only worker busy, 3 × ``max_sessions`` sessions
+    expire and are evicted; the ready structure never holds more than
+    ``max_sessions`` entries, and later legit sessions still run in FIFO order."""
+
+    max_sessions = 4
+    body = RunSpy()
+    holder_gate = body.gate(HOLDER.viewer_id)
+    async with Harness(
+        body, workers=1, max_sessions=max_sessions, wait_seconds=5.0
+    ) as harness:
+        scheduler = harness.scheduler
+        scheduler.admit(HOLDER, message("holder"))
+        await settle()
+        assert scheduler.active_runs == 1
+
+        for index in range(3 * max_sessions):
+            transient = SessionKey(PLATFORM, CHANNEL, f"viewer-transient-{index}")
+            assert scheduler.admit(transient, message(f"t{index}")).accepted
+            assert len(scheduler._ready) <= max_sessions
+            harness.clock.advance(6.0)
+            await settle()
+            assert len(scheduler._ready) <= max_sessions
+            # The expired session was evicted, queue and ready entry alike.
+            assert scheduler.live_sessions == 1
+
+        assert harness.counters.get(COUNTER_STALE_DROP) == 3 * max_sessions
+        assert len(scheduler._ready) == 0
+
+        first = scheduler.admit(SESSION_A, message("a1"))
+        second = scheduler.admit(SESSION_B, message("b1"))
+        assert first.accepted and second.accepted
+        assert len(scheduler._ready) == 2
+
+        holder_gate.set()
+        await settle()
+        assert body.started == ["holder", "a1", "b1"]
+        assert body.finished == ["holder", "a1", "b1"]
+        assert len(scheduler._ready) == 0
+
+
 # --------------------------------------------------------------------------- #
 # R2, R8 — nothing admitted is dropped, and nothing unbounded is held
 # --------------------------------------------------------------------------- #

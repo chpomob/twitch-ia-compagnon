@@ -753,7 +753,10 @@ class AdmissionScheduler:
 
         self._queues: "OrderedDict[str, deque[_Item]]" = OrderedDict()
         self._active: dict[str, str] = {}
-        self._ready: deque[str] = deque()
+        # Insertion-ordered, so FIFO fairness holds, and keyed, so an evicted
+        # session leaves it in O(1): it never holds more than ``max_sessions``
+        # entries (R6, AC22).
+        self._ready: "OrderedDict[str, None]" = OrderedDict()
         self._pending = 0
         self._records: "OrderedDict[str, RunRecord]" = OrderedDict()
         self._traces: set["asyncio.Future[Any]"] = set()
@@ -871,7 +874,7 @@ class AdmissionScheduler:
         self._queues.move_to_end(session)
         self._pending += 1
         if session not in self._active and session not in self._ready:
-            self._ready.append(session)
+            self._ready[session] = None
         self._change.set()
 
         item.trace = self._spawn_trace(
@@ -1052,7 +1055,7 @@ class AdmissionScheduler:
         """
 
         while self._ready:
-            session = self._ready.popleft()
+            session, _ = self._ready.popitem(last=False)
             queue = self._queues.get(session)
             if not queue:
                 self._maybe_evict(session)
@@ -1070,13 +1073,13 @@ class AdmissionScheduler:
         queue = self._queues.get(session)
         if queue:
             if session not in self._ready:
-                self._ready.append(session)
+                self._ready[session] = None
             self._change.set()
             return
         self._maybe_evict(session)
 
     def _maybe_evict(self, session: str) -> None:
-        """Drop a session's queue and lock, and only when it is truly idle.
+        """Drop a session's queue, lock and ready entry, only when truly idle.
 
         Empty queue and no active run: evicting anything else would race a
         drain into a lost or doubly-executed item (AC9).
@@ -1087,6 +1090,7 @@ class AdmissionScheduler:
         if session in self._active:
             return
         self._queues.pop(session, None)
+        self._ready.pop(session, None)
 
     def _evict_idle_sessions(self) -> None:
         for session in list(self._queues):
