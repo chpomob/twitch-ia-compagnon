@@ -1609,3 +1609,61 @@ async def test_ac17_with_no_usage_reported_the_run_estimate_grows_by_the_audio_d
         assert completed["tokens_estimated"] is True
     assert six["tokens"] - three["tokens"] == 30
     assert over["tokens"] - three["tokens"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 R6: the probe on an unbounded answer or on deep arguments (F12, F20)
+# --------------------------------------------------------------------------- #
+
+
+from conftest import FakeBytesResponse  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_ac21_probe_arguments_nested_10000_levels_raise_brain_module_error() -> None:
+    """AC21 (R6, F20): the forced probe call answered with arguments nested
+    10,000 levels deep stops ``prepare`` with :class:`BrainModuleError`
+    naming ``malformed_arguments`` — never a ``RecursionError``."""
+
+    arguments = '{"ok": ' + "[" * 10_000 + "]" * 10_000 + "}"
+    session = FakeSession(probe_results=[FakeResponse(200, tool_call(PROBE_TOOL, arguments))])
+    harness = await activate_with(
+        session=session, settings_overrides=STRUCTURED_ONLY, prepare=False
+    )
+    try:
+        failure = await prepare_fails(harness)
+        assert str(failure) == not_verified("structured_output", "malformed_arguments")
+        assert_not_ready(harness, str(failure))
+        assert len(harness.probes()) == 1
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac19_a_probe_answer_over_the_bound_is_never_decoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC19 (R6, F12): a probe answer one byte over ``max_response_bytes`` is
+    read to bound + 1 bytes, never decoded, and is not the forced call
+    (``no_tool_call``); its response is released."""
+
+    import modules.brain as brain_module
+
+    decoded: list[bytes] = []
+    monkeypatch.setattr(brain_module, "_decode_response_body", decoded.append, raising=False)
+    body = json.dumps(tool_call(PROBE_TOOL, {"ok": True})).encode("utf-8")
+    response = FakeBytesResponse(200, body)
+    session = FakeSession(probe_results=[response])
+    harness = await activate_with(
+        session=session,
+        settings_overrides={**STRUCTURED_ONLY, "max_response_bytes": len(body) - 1},
+        prepare=False,
+    )
+    try:
+        failure = await prepare_fails(harness)
+        assert str(failure) == not_verified("structured_output", "no_tool_call")
+        assert decoded == []
+        assert response._offset == len(body)
+        assert response.release_calls == 1
+    finally:
+        await harness.close()

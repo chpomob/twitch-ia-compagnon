@@ -372,6 +372,17 @@ settings_schema:
         required:
           - name
           - match
+    # The model answer is untrusted input, bounded before it is decoded (R6):
+    # optional, 1048576 bytes when absent. The body is read to one byte past
+    # the bound, counting the bytes read rather than trusting a declared
+    # length; a longer body fails the run `response_too_large`.
+    max_response_bytes:
+      title: Max response bytes
+      type: integer
+      minimum: 1
+      description: >-
+        Largest model answer body read and decoded; a longer one fails the
+        run. Defaults to 1048576.
   required:
     - endpoint
     - model

@@ -401,6 +401,11 @@ before its delivery list was through (R3): the run ends ``timeout``, the
 entries reached at or after the deadline recorded ``skipped:deadline_exceeded``
 and the ones before them keeping their outcomes."""
 
+RUN_FAILURE_RESPONSE_TOO_LARGE = "response_too_large"
+"""The ``failure`` of a run whose model answer exceeded ``max_response_bytes``
+(R6, F12): the body was read to one byte past the bound and never decoded;
+the run ends ``error`` with nothing delivered."""
+
 FALLBACK_REASON_STALE_DROP = REASON_STALE_DROP
 """The reason a fallback runs for a queued work the scheduler dropped stale
 (R3, AC19): the same word the scheduler's record carries."""
@@ -558,6 +563,15 @@ ROUTE_INSTRUCTIONS_MAX_CHARS = 2000
 ROUTE_COMMAND_MAX_CHARS = 32
 """Longest ``routes[].match.command`` accepted: one token (R1)."""
 
+MAX_RESPONSE_BYTES_DEFAULT = 1_048_576
+"""Largest model answer body read when ``max_response_bytes`` is absent (R6):
+a chat reply bounded by ``max_tokens`` is far smaller."""
+
+MAX_ARGUMENT_DEPTH = 32
+"""Deepest container nesting a tool call's arguments may have (R6, F20).
+Deeper arguments are ``malformed_arguments``: nothing past the decode walks
+them, so no later serialisation or validation can exhaust the stack."""
+
 ROUTE_PRIVILEGED_AUDIENCES = frozenset({"broadcaster", "moderators"})
 """The audiences that allow a route to deliver an effect beyond the answer
 text on viewer-authored events (R1 route safety)."""
@@ -710,6 +724,7 @@ def validate_settings(settings: Any) -> list[str]:
     _validate_delivery(settings.get("delivery"), diagnostics)
     _validate_persona(settings.get("persona"), diagnostics)
     _validate_routes(settings.get("routes"), diagnostics)
+    _validate_max_response_bytes(settings.get("max_response_bytes"), diagnostics)
     return diagnostics
 
 
@@ -902,6 +917,17 @@ def _validate_persona(persona: Any, diagnostics: list[str]) -> None:
     elif len(persona) > PERSONA_MAX_CHARS:
         diagnostics.append(
             _setting_diagnostic("persona", f"must be at most {PERSONA_MAX_CHARS} characters")
+        )
+
+
+def _validate_max_response_bytes(value: Any, diagnostics: list[str]) -> None:
+    """``max_response_bytes`` (R6): absent, or a positive integer."""
+
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        diagnostics.append(
+            _setting_diagnostic("max_response_bytes", "must be a positive integer")
         )
 
 
@@ -1691,6 +1717,7 @@ class _Settings:
     delivery: _DeliveryConfig
     persona: str | None = None
     routes: tuple[_Route, ...] = ()
+    max_response_bytes: int = MAX_RESPONSE_BYTES_DEFAULT
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
@@ -1719,6 +1746,11 @@ class _Settings:
             delivery=_DeliveryConfig.from_mapping(settings["delivery"]),
             persona=None if settings.get("persona") is None else settings["persona"].strip(),
             routes=tuple(_Route.from_mapping(route) for route in settings.get("routes") or ()),
+            max_response_bytes=(
+                MAX_RESPONSE_BYTES_DEFAULT
+                if settings.get("max_response_bytes") is None
+                else settings["max_response_bytes"]
+            ),
         )
 
 
@@ -4337,6 +4369,13 @@ class _MalformedResponse(Exception):
     pass
 
 
+class _ResponseTooLarge(_MalformedResponse):
+    """A 2xx body longer than ``max_response_bytes``, never decoded (R6, F12).
+
+    A malformed answer to the probe, which expects a short forced call; its
+    own ``response_too_large`` failure to a run."""
+
+
 class _OverBudgetResponse(Exception):
     """A reply whose run total exceeds ``budget.max_tokens`` (§3.4)."""
 
@@ -4556,6 +4595,9 @@ class _ModelAdapter:
         except _NonSuccessResponse:
             self._diagnose("brain model response: non-success status")
             return _ModelReply(failure="non_success_status")
+        except _ResponseTooLarge:
+            self._diagnose("brain model response: body exceeds max_response_bytes")
+            return _ModelReply(failure=RUN_FAILURE_RESPONSE_TOO_LARGE)
         except _MalformedResponse:
             self._diagnose("brain model response: malformed data")
             return _ModelReply(failure="malformed_response")
@@ -4705,16 +4747,43 @@ class _ModelAdapter:
                     status if isinstance(status, int) and not isinstance(status, bool) else None
                 )
             try:
-                return await _resolve(response.json())
+                return await self._decoded_body(response)
             except asyncio.CancelledError:
                 raise
             except (asyncio.TimeoutError, TimeoutError):
+                raise
+            except _ResponseTooLarge:
                 raise
             except Exception:
                 raise _MalformedResponse from None
         finally:
             if response is not None:
                 await _release_response(response)
+
+    async def _decoded_body(self, response: Any) -> Any:
+        """The 2xx body, read to at most ``max_response_bytes`` + 1 bytes (R6, F12).
+
+        The bytes read are counted, never a ``Content-Length`` the backend
+        declares: one byte past the bound is :class:`_ResponseTooLarge`, and
+        :func:`_decode_response_body` is not called on it. A response that
+        exposes no byte stream — only a decoded body, as a test double does —
+        is taken as it gives it.
+        """
+
+        stream = getattr(response, "content", None)
+        read = getattr(stream, "read", None)
+        if not callable(read):
+            return await _resolve(response.json())
+        bound = self._settings.max_response_bytes
+        body = bytearray()
+        while True:
+            chunk = await _resolve(read(bound + 1 - len(body)))
+            if not chunk:
+                break
+            body += chunk
+            if len(body) > bound:
+                raise _ResponseTooLarge
+        return _decode_response_body(bytes(body))
 
     async def _bounded(self, request: Awaitable[Any], seconds: float) -> Any:
         """Await *request* for at most *seconds* on the injected sleeper.
@@ -4777,7 +4846,15 @@ def _classify(body: Any) -> _Proposal | _Final | _Unsupported:
         name = function.get("name") if isinstance(function, Mapping) else None
         if not _is_text(name):
             return _Unsupported(_UNSUPPORTED_MALFORMED_TOOL_CALL)
-        return _Proposal(name=name.strip(), raw_arguments=function.get("arguments"))
+        raw_arguments = function.get("arguments")
+        if not isinstance(raw_arguments, str) and _nested_deeper_than(
+            raw_arguments, MAX_ARGUMENT_DEPTH
+        ):
+            # Already decoded with the body and too deep to walk again — to
+            # estimate, echo or decode it (R6, F20): no arguments, which the
+            # decode then reports ``malformed_arguments``.
+            raw_arguments = None
+        return _Proposal(name=name.strip(), raw_arguments=raw_arguments)
     if text.strip():
         return _Final(text=text)
     return _Unsupported(_UNSUPPORTED_NO_CONTENT)
@@ -4810,18 +4887,53 @@ def _classification_text(classification: _Proposal | _Final | _Unsupported) -> s
     return ""
 
 
+def _decode_response_body(raw: bytes) -> Any:
+    """Decode a model answer body already held within ``max_response_bytes``."""
+
+    return json.loads(raw)
+
+
 def _decode_arguments(raw: Any) -> Mapping[str, Any] | None:
-    """The JSON object a tool call's arguments decode to, else ``None``."""
+    """The JSON object a tool call's arguments decode to, else ``None``.
+
+    Arguments nested past :data:`MAX_ARGUMENT_DEPTH` — or deep enough that
+    the decoder itself runs out of stack — are ``None`` too (R6, F20): the
+    ``RecursionError`` caught here is the decoder's alone.
+    """
 
     if isinstance(raw, Mapping):
-        return raw
-    if not isinstance(raw, str):
+        decoded: Any = raw
+    elif not isinstance(raw, str):
         return None
-    try:
-        decoded = json.loads(raw)
-    except ValueError:
+    else:
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, RecursionError):
+            return None
+    if not isinstance(decoded, Mapping) or _nested_deeper_than(decoded, MAX_ARGUMENT_DEPTH):
         return None
-    return decoded if isinstance(decoded, Mapping) else None
+    return decoded
+
+
+def _nested_deeper_than(value: Any, limit: int) -> bool:
+    """Whether *value* nests containers more than *limit* levels deep.
+
+    Walked with an explicit stack, so the check itself never recurses.
+    """
+
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, Mapping):
+            children: Any = item.values()
+        elif isinstance(item, (list, tuple)):
+            children = item
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _names_image_input(answer: Any) -> bool:

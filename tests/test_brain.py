@@ -38,7 +38,7 @@ from core.actions import (
     AuthorizationPolicy,
     AuthorizationRule,
 )
-from core.admission import REASON_CANCELLED, REASON_RUN_DEADLINE
+from core.admission import REASON_CANCELLED, REASON_RUN_DEADLINE, REASON_RUN_FAILED
 from core.bus import EventBus
 from core.contracts import (
     EVENT_KINDS,
@@ -66,6 +66,7 @@ from conftest import (
     FAIL_AFTER_EMISSION,
     FAIL_BEFORE_EMISSION,
     HeldSession,
+    FakeBytesResponse,
     FakeResponse,
     FakeSendProvider,
     FakeSession,
@@ -583,6 +584,10 @@ def test_manifest_declares_v2_shape_settings_hook_and_no_grant() -> None:
     Phase 3 R1 supersedes the phase 2 settings set: the properties are the
     phase 2 set plus the optional ``persona`` and ``routes``; the required
     set is unchanged.
+
+    Phase 6 R6 (F12) adds one optional property, ``max_response_bytes``, the
+    model answer's byte bound; the equality stays exact and the required set
+    is unchanged.
     """
 
     manifest_path = ROOT / "modules" / "brain" / "module.yaml"
@@ -602,7 +607,13 @@ def test_manifest_declares_v2_shape_settings_hook_and_no_grant() -> None:
     schema = manifest["settings_schema"]
     assert schema["type"] == "object"
     assert set(schema["required"]) == set(VALID_SETTINGS)
-    assert set(schema["properties"]) == set(VALID_SETTINGS) | {"persona", "routes"}
+    assert set(schema["properties"]) == set(VALID_SETTINGS) | {
+        "persona",
+        "routes",
+        "max_response_bytes",
+    }
+    bound_schema = schema["properties"]["max_response_bytes"]
+    assert (bound_schema["type"], bound_schema["minimum"]) == ("integer", 1)
     for group, limits in LIMITS.items():
         group_schema = schema["properties"][group]
         assert group_schema["type"] == "object"
@@ -4207,3 +4218,192 @@ async def test_a_record_pending_at_5_seconds_left_leaves_the_run_delivered(
     finally:
         provider.release.set()
         await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 R6: the model answer and the tool-call arguments are bounded (F12, F20)
+# --------------------------------------------------------------------------- #
+
+
+BOUND = 256
+
+
+def body_of(size: int) -> bytes:
+    """A final-answer body padded with JSON whitespace to exactly *size* bytes."""
+
+    body = json.dumps(completion("Hello")).encode("utf-8")
+    assert len(body) <= size
+    return body + b" " * (size - len(body))
+
+
+def nested_arguments(levels: int) -> str:
+    """A JSON object whose one value nests *levels* arrays, as wire text."""
+
+    return '{"a": ' + "[" * levels + "]" * levels + "}"
+
+
+class DecodeSpy:
+    """Records every call to the response-body decode hook, then decodes."""
+
+    def __init__(self, decode: Any) -> None:
+        self.decode = decode
+        self.calls: list[bytes] = []
+
+    def __call__(self, raw: bytes) -> Any:
+        self.calls.append(raw)
+        return self.decode(raw)
+
+
+def spy_on_decode(monkeypatch: pytest.MonkeyPatch) -> DecodeSpy:
+    import modules.brain as brain_module
+
+    # Installed even where the hook does not exist, so a build that decodes
+    # elsewhere fails on what it did, not on the spy.
+    spy = DecodeSpy(getattr(brain_module, "_decode_response_body", json.loads))
+    monkeypatch.setattr(brain_module, "_decode_response_body", spy, raising=False)
+    return spy
+
+
+def test_max_response_bytes_is_optional_and_a_positive_integer() -> None:
+    """R6 (F12): ``max_response_bytes`` is optional — absent, the default
+    bound applies — and otherwise a positive integer, refused by name."""
+
+    assert validate_settings(merge_settings(None)) == []
+    assert brain_settings.from_mapping(merge_settings(None)).max_response_bytes > 0
+    accepted = merge_settings({"max_response_bytes": BOUND})
+    assert validate_settings(accepted) == []
+    assert brain_settings.from_mapping(accepted).max_response_bytes == BOUND
+    for value in (0, -1, True, 1.5, "256"):
+        (diagnostic,) = validate_settings(merge_settings({"max_response_bytes": value}))
+        assert "max_response_bytes" in diagnostic
+        assert str(value) not in diagnostic.replace("max_response_bytes", "")
+
+
+@pytest.mark.asyncio
+async def test_ac19_a_body_one_byte_over_the_bound_fails_the_run_undecoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC19 (R6, F12): a 2xx body of ``max_response_bytes`` + 1 bytes fails
+    the run ``error`` / ``response_too_large`` with nothing delivered and
+    one diagnostic; the decode hook is never called and no more than bound
+    + 1 bytes are read, whatever length the response declares."""
+
+    response = FakeBytesResponse(200, body_of(BOUND + 1))
+    response.headers = {"Content-Length": "10"}
+    harness = await activate_with(response, settings_overrides={"max_response_bytes": BOUND})
+    spy = spy_on_decode(monkeypatch)
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert spy.calls == []
+        assert response._offset == BOUND + 1
+        assert response.release_calls == 1
+        assert record.status == "error"
+        assert record.delivery == DELIVERY_NOT_ATTEMPTED
+        assert record.sends == 0
+        assert harness.transport.sends == []
+        (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["failure"] == "response_too_large"
+        assert len(harness.diagnostics) == 1
+        assert "max_response_bytes" in harness.diagnostics[0]
+        assert_sanitized(harness.diagnostics)
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac19_a_long_body_is_read_only_to_one_byte_past_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC19 (R6, F12): a body ten times the bound is read to bound + 1 bytes
+    and no further, and is never decoded."""
+
+    response = FakeBytesResponse(200, body_of(BOUND * 10))
+    harness = await activate_with(response, settings_overrides={"max_response_bytes": BOUND})
+    spy = spy_on_decode(monkeypatch)
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert spy.calls == []
+        assert response._offset == BOUND + 1
+        assert record.status == "error"
+        (completed,) = harness.traces(TRACE_BRAIN_RUN_COMPLETED)
+        assert completed["payload"]["failure"] == "response_too_large"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac19_a_body_exactly_at_the_bound_is_decoded_and_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC19 (R6, F12): a body of exactly ``max_response_bytes`` bytes is
+    decoded once, through the hook, and its answer delivered."""
+
+    response = FakeBytesResponse(200, body_of(BOUND))
+    harness = await activate_with(response, settings_overrides={"max_response_bytes": BOUND})
+    spy = spy_on_decode(monkeypatch)
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert [len(raw) for raw in spy.calls] == [BOUND]
+        assert record.status == "success"
+        assert len(harness.transport.sends) == 1
+        assert harness.transport.sends[0]["text"] == "Hello"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac21_arguments_nested_10000_levels_are_malformed_and_the_run_goes_on() -> None:
+    """AC21 (R6, F20): a ``chat.read`` proposal whose arguments nest 10,000
+    levels yields one ``malformed_arguments`` observation with 0 executor
+    calls for it; the run does not end ``run_failed`` and delivers the
+    next turn's final answer."""
+
+    harness = await activate_with(
+        FakeResponse(200, tool_call("chat.read", nested_arguments(10_000))),
+        FakeResponse(200, completion("Done")),
+        read=True,
+        # The 20,000-character arguments are echoed to the next turn; the
+        # token budget has room for them, so the run reaches that turn.
+        settings_overrides={"budget": {"max_tokens": 65_536}},
+    )
+    try:
+        await harness.send()
+        (record,) = await harness.completed()
+
+        assert record.reason != REASON_RUN_FAILED
+        assert record.status == "success"
+        (observation,) = harness.traces("brain.run.observation")
+        assert observation["payload"]["action"] == "chat.read"
+        assert observation["payload"]["call_id"] is None
+        assert observation["payload"]["error_code"] == "malformed_arguments"
+        assert len(harness.requests()) == 2
+        assert harness.transport.sends[0]["text"] == "Done"
+    finally:
+        await harness.close()
+
+
+def test_argument_depth_is_bounded_on_text_and_on_decoded_arguments() -> None:
+    """R6 (F20): arguments nested to the fixed maximum decode; one level
+    deeper — as wire text or already decoded with the body — is
+    ``malformed_arguments`` (``None``), checked without recursion."""
+
+    from modules.brain import MAX_ARGUMENT_DEPTH, _classify, _decode_arguments
+
+    # The object is level 1, each array one more.
+    assert _decode_arguments(nested_arguments(MAX_ARGUMENT_DEPTH - 1)) is not None
+    assert _decode_arguments(nested_arguments(MAX_ARGUMENT_DEPTH)) is None
+    assert _decode_arguments(nested_arguments(10_000)) is None
+    decoded = json.loads(nested_arguments(MAX_ARGUMENT_DEPTH))
+    assert _decode_arguments(decoded) is None
+    proposal = _classify(
+        {"choices": [{"message": {"tool_calls": [
+            {"function": {"name": "chat.read", "arguments": decoded}}
+        ]}}]}
+    )
+    assert proposal.raw_arguments is None
