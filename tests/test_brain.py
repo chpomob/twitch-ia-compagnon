@@ -1839,6 +1839,119 @@ async def test_offered_tool_definitions_count_toward_the_prompt_token_budget() -
         await offered.close()
 
 
+# The padding of a history scenario's question and reply: every exchange
+# then weighs the same estimate, so a budget splits between whole exchanges.
+HISTORY_PADDING = 240
+
+
+async def converse(count: int, max_tokens: int) -> tuple[Harness, list[str], list[str]]:
+    """A harness whose session holds *count* confirmed exchanges, then one
+    more question: returns it with each exchange's user and assistant text
+    as the requests carried them, oldest first."""
+
+    replies = [f"reply-{index:02d} " + "y" * HISTORY_PADDING for index in range(count + 1)]
+    harness = await activate_with(
+        *(FakeResponse(200, completion(reply)) for reply in replies),
+        settings_overrides={"budget": {"max_tokens": max_tokens}},
+    )
+    for index in range(count + 1):
+        await harness.send(
+            f"question-{index:02d} " + "x" * HISTORY_PADDING, message_id=f"m-{index:02d}"
+        )
+        await harness.completed(index + 1)
+    users = [harness.prompt(index)[-1]["content"] for index in range(count + 1)]
+    return harness, users[:count], replies[:count]
+
+
+def exchanges(users: list[str], replies: list[str]) -> list[str]:
+    """The chronological history messages of these exchanges."""
+
+    return [text for pair in zip(users, replies) for text in pair]
+
+
+def input_estimate(messages: list[dict[str, str]]) -> int:
+    return sum(_estimate_tokens(message["content"]) for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_history_beyond_the_token_budget_is_dropped() -> None:
+    """F27 (R9): retained history is dropped oldest first once it no longer
+    fits ``budget.max_tokens``. The 10 exchanges together weigh more than
+    the whole budget; the last request carries only the newest of them, at
+    least 1, and its input estimate plus its output cap is the budget.
+    Removing the history budget makes this fail."""
+
+    limit = 2000
+    harness, users, replies = await converse(10, limit)
+    try:
+        assert all(record.status == "success" for record in harness.records())
+        body = harness.requests()[-1]["json"]
+        messages = body["messages"]
+        mandatory = input_estimate([messages[0], messages[-1]])
+        assert mandatory + input_estimate(
+            [{"content": text} for text in exchanges(users, replies)]
+        ) > limit
+        history = [message["content"] for message in messages[1:-1]]
+        kept = len(history) // 2
+        assert 1 <= kept < 10
+        assert history == exchanges(users[-kept:], replies[-kept:])
+        assert body["max_tokens"] == limit - input_estimate(messages) > 0
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_history_leaves_half_the_token_budget_for_the_output() -> None:
+    """F27 (R9): history fills at most half of ``budget.max_tokens`` — the
+    50% output reservation. All 10 exchanges would fit the whole budget, yet
+    the last request keeps only as many as fit its half: its input estimate
+    is at most half the budget, the next older exchange would have crossed
+    that half, and the output cap it carries is at least half the budget.
+    Removing the reservation makes this fail."""
+
+    limit = 4000
+    half = limit // 2
+    harness, users, replies = await converse(10, limit)
+    try:
+        assert all(record.status == "success" for record in harness.records())
+        body = harness.requests()[-1]["json"]
+        messages = body["messages"]
+        mandatory = input_estimate([messages[0], messages[-1]])
+        assert mandatory + input_estimate(
+            [{"content": text} for text in exchanges(users, replies)]
+        ) < limit
+        history = [message["content"] for message in messages[1:-1]]
+        kept = len(history) // 2
+        assert 1 <= kept < 10
+        assert history == exchanges(users[-kept:], replies[-kept:])
+        used = input_estimate(messages)
+        older = _estimate_tokens(users[-kept - 1]) + _estimate_tokens(replies[-kept - 1])
+        assert used <= half < used + older
+        assert body["max_tokens"] == limit - used >= half
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_history_reaches_the_prompt_in_chronological_order() -> None:
+    """F27 (R9): retained exchanges sit between the instructions and the
+    new question oldest first, each viewer message before its reply.
+    Reversing the history order makes this fail."""
+
+    harness, users, replies = await converse(3, LIMITS["budget"]["max_tokens"])
+    try:
+        messages = harness.prompt()
+        assert [message["role"] for message in messages] == [
+            "system", "user", "assistant", "user", "assistant", "user", "assistant", "user"
+        ]
+        assert [message["content"] for message in messages[1:-1]] == exchanges(users, replies)
+        assert "question-03" in messages[-1]["content"]
+        assert harness.diagnostics == []
+    finally:
+        await harness.close()
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("outcome", "grant", "delivery", "code"),

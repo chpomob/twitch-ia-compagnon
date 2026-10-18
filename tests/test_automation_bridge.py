@@ -2026,9 +2026,6 @@ SCHEMA_N_INTEGER = {
     "properties": {"n": {"type": "integer"}},
     "additionalProperties": False,
 }
-#: Every run observation the P15 scenarios produced (AC16's suite-level
-#: assertion: none is a success).
-RUN_OBSERVATIONS: list[ActionObservation] = []
 
 
 class _Gate:
@@ -2096,7 +2093,6 @@ class _Runs(_Bridge):
         """Record a run outcome; no run outcome is ever a success (R4)."""
 
         assert observation is not None
-        RUN_OBSERVATIONS.append(observation)
         assert observation.status != "success"
         assert observation.error is not None and observation.error["retryable"] is False
         return observation
@@ -2303,12 +2299,42 @@ async def test_ac16_row_cancelled_before_the_frame_left(
         assert runs.frames() == []
 
 
-def test_ac16_no_run_observation_is_a_success() -> None:
-    """AC16's suite-level assertion over every outcome the scenarios above
-    recorded (each scenario also checks its own ``action.completed``
-    traces): no run of the action is ever reported a success."""
+async def test_ac16_no_run_observation_is_a_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC16: no run of the action is ever reported a success.
 
-    assert all(observation.status != "success" for observation in RUN_OBSERVATIONS)
+    Replaces the suite-level assertion over a module-level list the other
+    scenarios filled (F28, R9): that test passed vacuously when run alone,
+    or before them, with nothing recorded. This one builds its own fixture
+    runtime, drives runs of the action itself — an acknowledged one and one
+    the instance answers with an error — records each observation and each
+    ``action.completed`` trace of the run action, and asserts at least 1 was
+    recorded and none is a success, whatever the order or selection.
+    """
+
+    observations: list[ActionObservation] = []
+    for faults in ({}, {"reject_runs": True}):
+        async with _scenario(caplog, allowlist=[{"action": "A"}], faults=faults) as runs:
+            observation = await asyncio.wait_for(
+                runs.context.executor.invoke(runs.call("A")), FAKE_WAIT_SECONDS
+            )
+            assert observation is not None
+            observations.append(observation)
+            assert observation.status != "success", observation
+            assert len(runs.frames()) == 1
+            completed = [
+                trace["payload"]
+                for trace in runs.traces
+                if trace["type"] == TRACE_ACTION_COMPLETED
+                and trace["payload"].get("action") == RUN_ACTION
+            ]
+            assert len(completed) == 1
+            assert completed[0]["status"] == observation.status
+
+    assert len(observations) == 2
+    assert [observation.status for observation in observations] == ["external_unknown", "error"]
+    assert all(observation.status != "success" for observation in observations)
 
 
 # -- AC17: a late acknowledgement --------------------------------------------- #
