@@ -3813,15 +3813,27 @@ async def test_ac14_a_run_admitted_before_the_erasure_records_nothing_after_it(
         {},
     )
     await auditor.prepare()
+    audit_lines: list[str] = []
+
+    def audit_written(marker: str) -> bool:
+        # The audit writer runs in a worker thread: a line lands in wall
+        # time, so the wait is on the line itself, never on a turn count.
+        audit_lines.extend(capsys.readouterr().out.splitlines())
+        return auditor.pending == 0 and any(marker in line for line in audit_lines)
+
     try:
         await inject_chat(harness, VIEWER, ERASED_TEXT, "m-erased")
         await wait_until(session.entered.is_set)
-        await settle()
-        capsys.readouterr()
+        # Every record of the held run is written before the erasure's own
+        # capture starts, so a late one cannot be taken for the erasure's.
+        await wait_until(lambda: audit_written("m-erased"), seconds=10.0)
+        audit_lines.clear()
         before = len(harness.context.bus.list_events())
+        epoch_before = harness.brain.memory.epoch(memory_key())
 
         await inject_chat(harness, VIEWER, "!forgetme", "m-forget")
-        await settle()
+        await wait_until(lambda: harness.brain.memory.epoch(memory_key()) > epoch_before)
+        await wait_until(lambda: audit_written("m-forget"), seconds=10.0)
         erasure_events = [
             json.dumps(event, ensure_ascii=False, default=str)
             for event in harness.context.bus.list_events()[before:]
@@ -3830,9 +3842,10 @@ async def test_ac14_a_run_admitted_before_the_erasure_records_nothing_after_it(
         # produced the command's own events and nothing that names the text.
         assert any("m-forget" in text for text in erasure_events)
         assert not any(carries_erased_text(text) for text in erasure_events)
-        audit_lines = capsys.readouterr().out.splitlines()
         assert audit_lines and not any(carries_erased_text(line) for line in audit_lines)
 
+        # Released only once the erasure is observable: the held run's
+        # record is refused, never raced against it.
         session.release.set()
         await runs_completed(harness, 2)
         assert [send["text"] for send in harness.transport.sends] == [ERASED_REPLY]
