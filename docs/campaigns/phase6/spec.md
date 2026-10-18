@@ -203,9 +203,12 @@ defects have a recorded disposition.
   provider's invoke count stays 0, and the returned metadata has `delivery_status == "failed"` and a
   `delivery_outcome` equal to the executor's refusal status; the same publication with a matching
   rule emits exactly 1 POST and reports `sent`.
-- AC2 (R1): The compatibility publication produces exactly 1 `action.requested` and 1
+- AC2 (R1): The compatibility publication produces exactly 1 `action.started` and 1
   `action.completed` trace carrying the compatibility principal and the Twitch destination — the same
-  traces an executor call produces.
+  traces an executor call produces. (Amendment A1: this criterion said `action.requested`, a trace the
+  kernel does not define; the canonical executor start trace is `action.started`
+  (`core/contracts.py:149`), which is what its own closing clause already required. Recorded in
+  `scaffolding/plan-amendments.md`, no code change.)
 - AC3 (R1): After call `c1` by principal `brain` completes, an invocation reusing `c1` with a
   different principal, session, action, destination or arguments (5 parametrized cases) is refused,
   the provider count is unchanged, and the returned observation contains none of the original call's

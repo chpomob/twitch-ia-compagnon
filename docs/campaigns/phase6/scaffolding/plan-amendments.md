@@ -122,3 +122,26 @@ scheduler, three disjoint `chat.write` bindings, clip/poll unbound with 0 reques
   on top of the code resolution: on both guides `python -m core.main --config mon-compagnon.yaml`,
   `python -m core.config_ui --config mon-compagnon.yaml` and `python -m demo` must be printed, so a
   UI command altered to `--config wrong.yaml` fails the test on each guide.
+
+## A1 — AC2 named a trace the kernel does not define (`action.requested`)
+
+**What changed.** AC2 asked for "exactly 1 `action.requested` and 1 `action.completed` trace". The
+criterion now names `action.started`. No code and no test changed: the test
+`test_twitch.py::test_ac2_the_compatibility_send_is_traced_as_an_executor_call` already asserted the
+`started`/`completed` pair, and the executor has always emitted it.
+
+**Why the amendment, and not the event.** The kernel defines exactly one start trace for an action:
+`TRACE_ACTION_STARTED = "action.started"` (`core/contracts.py:149`), published by
+`ActionExecutor.invoke` (`core/actions.py:1361`). No `action.requested` exists anywhere in the product,
+and none did before this phase. The criterion's own closing clause — "the same traces an executor call
+produces" — settles which name was intended; only the literal token was wrong. Implementing an
+`action.requested` event to satisfy a typo would add a second, redundant start trace to the product's
+evidence trail, which is the opposite of what R8 asks for.
+
+**Why it surfaced only at the gate.** The first pass recorded it in its R1 row as an "AC2 literal
+discrepancy" without making it the reason for refusal; the second pass, with every product finding
+closed, refused to treat the two names as interchangeable on its own authority. It was right not to:
+an acceptance criterion is the operator's contract, and only a recorded amendment can change it.
+
+**What the gate must check in the third pass.** That AC2 now names `action.started`, that the named test
+asserts exactly that pair, and that no `action.requested` remains anywhere in the phase's documents.
