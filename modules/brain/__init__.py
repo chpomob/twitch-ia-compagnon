@@ -332,6 +332,14 @@ ticks — reaches the one scheduler whose run body is :meth:`BrainModule.run`.
 A scheduler shared through the context is its builder's, and is not
 published here."""
 
+ERASURE_SERVICE_KIND = "erasure"
+ERASURE_SERVICE_SCOPE = "conversation_memory"
+"""The service key ``(kind, scope)`` under which this module publishes the
+erasure of its conversation memory (phase 6 R4): a :class:`ConversationErasure`
+the ``viewer_memory`` erasure command calls with the erased key only. A
+direct call rather than a bus event, so bus history and the audit stream
+never carry an erasure signal, nor any of the erased viewer's text."""
+
 BRAIN_ERROR_RUN_LIMIT = "run_limit"
 """The code of a second call of the same model-proposable action in one run,
 refused to the model without an executor call (R5, decision 5)."""
@@ -1744,6 +1752,14 @@ class _SessionMemory:
     size: int = 0
 
 
+@dataclass(slots=True)
+class _Erasure:
+    """A key's erasure epoch and the memory-clock instant it was last bumped."""
+
+    epoch: int
+    at: float
+
+
 class ConversationMemory:
     """Bounded, session-keyed conversation memory (R3, R6, AC10, AC30).
 
@@ -1765,10 +1781,15 @@ class ConversationMemory:
 
     __slots__ = (
         "_clock",
+        "_erasure_horizon_seconds",
+        "_erasures",
         "_max_age_seconds",
         "_max_bytes",
         "_max_exchanges",
         "_max_sessions",
+        "_overflow",
+        "_refused_records",
+        "_sequence",
         "_sessions",
     )
 
@@ -1780,15 +1801,31 @@ class ConversationMemory:
         max_bytes: int,
         max_age_seconds: float,
         clock: Callable[[], float] = time.monotonic,
+        erasure_horizon_seconds: float | None = None,
     ) -> None:
         self._max_sessions = _memory_count(max_sessions, "max_sessions")
         self._max_exchanges = _memory_count(max_exchanges, "max_exchanges")
         self._max_bytes = _memory_count(max_bytes, "max_bytes")
         self._max_age_seconds = _memory_duration(max_age_seconds, "max_age_seconds")
+        self._erasure_horizon_seconds = (
+            None
+            if erasure_horizon_seconds is None
+            else _memory_duration(erasure_horizon_seconds, "erasure_horizon_seconds")
+        )
         if not callable(clock):
             raise BrainModuleError("brain memory: clock must be callable")
         self._clock = clock
         self._sessions: "OrderedDict[str, _SessionMemory]" = OrderedDict()
+        #: Erasure epochs (phase 6 R4) are numbered by one sequence across
+        #: keys, bumped by every :meth:`forget`; each key erased within the
+        #: horizon keeps its latest one, oldest erasure first, bounded by
+        #: ``max_sessions``.
+        self._sequence = 0
+        self._erasures: "OrderedDict[str, _Erasure]" = OrderedDict()
+        #: The newest erasure the count bound evicted: whatever key it was,
+        #: a run admitted before it cannot be told apart, so it is stale.
+        self._overflow: _Erasure | None = None
+        self._refused_records = 0
 
     @property
     def limits(self) -> Mapping[str, float]:
@@ -1821,18 +1858,71 @@ class ConversationMemory:
         self._sessions.move_to_end(session_id)
         return tuple(session.exchanges)
 
-    def remember(self, key: SessionKey, user: str, assistant: str) -> Exchange:
+    @property
+    def refused_records(self) -> int:
+        """How many exchanges were refused as recorded by a run admitted
+        before their key's erasure (phase 6 R4)."""
+
+        return self._refused_records
+
+    def epoch(self, key: SessionKey, *, admitted_at: float | None = None) -> int:
+        """The erasure epoch a run of *key* admitted at *admitted_at* has seen.
+
+        Without *admitted_at* it is the current epoch. With it, an erasure
+        of the key at or after that instant was not seen at admission, so
+        the epoch is the one just before it — an instant tie counts as
+        before the erasure, the side that refuses a record rather than
+        revive erased text. A run admitted at or before an erasure the
+        count bound no longer remembers is stale: ``-1``.
+        """
+
+        session_id = _session_id(key)
+        self._expire_erasures()
+        if admitted_at is None:
+            return self._sequence
+        if self._overflow is not None and admitted_at <= self._overflow.at:
+            return -1
+        erasure = self._erasures.get(session_id)
+        if erasure is not None and admitted_at <= erasure.at:
+            return erasure.epoch - 1
+        return self._sequence
+
+    def _erased_epoch(self, session_id: str) -> int:
+        """The epoch of the key's latest erasure a run must have seen.
+
+        A key the count bound evicted is not told apart from one never
+        erased, so the newest evicted epoch stands for it.
+        """
+
+        erasure = self._erasures.get(session_id)
+        if erasure is not None:
+            return erasure.epoch
+        return 0 if self._overflow is None else self._overflow.epoch
+
+    def remember(
+        self, key: SessionKey, user: str, assistant: str, *, epoch: int | None = None
+    ) -> Exchange | None:
         """Append one confirmed exchange to *key*, then enforce every bound.
 
         A new session evicts the least recently used sessions until the cap
         holds; the session itself then evicts its oldest exchanges until the
         count, byte and age bounds hold. An exchange that alone exceeds the
         byte bound is not retained — the bound wins over the memory.
+
+        *epoch* is the key's erasure epoch the recording run read at its
+        admission (:meth:`epoch`): older than the current one, the key was
+        erased since, so the exchange is dropped and counted in
+        :attr:`refused_records`, and ``None`` is returned (phase 6 R4).
         """
 
         session_id = _session_id(key)
         if not isinstance(user, str) or not isinstance(assistant, str):
             raise BrainModuleError("brain memory: an exchange holds two strings")
+        if epoch is not None:
+            self._expire_erasures()
+            if epoch < self._erased_epoch(session_id):
+                self._refused_records += 1
+                return None
         exchange = Exchange(
             timestamp=self._clock(),
             user=user,
@@ -1853,12 +1943,47 @@ class ConversationMemory:
         return exchange
 
     def forget(self, key: SessionKey) -> bool:
-        """Drop one session's memory; return whether one was retained."""
+        """Drop one session's memory and bump its erasure epoch (phase 6 R4).
 
-        return self._sessions.pop(_session_id(key), None) is not None
+        Returns whether an exchange was retained. The bump is what refuses
+        a later record of a run admitted before this call (:meth:`remember`).
+        The epochs are bounded like the sessions: at most ``max_sessions``
+        keys, each kept only within the erasure horizon when one is set —
+        no run admitted before the erasure outlives it. An erasure the count
+        bound evicts becomes the overflow instead, so no stale record slips
+        through for its key; the price is that a run older than it records
+        nothing for any key.
+        """
+
+        session_id = _session_id(key)
+        self._expire_erasures()
+        self._erasures.pop(session_id, None)
+        while len(self._erasures) >= self._max_sessions:
+            # Oldest first, so the evicted one is the newest evicted so far.
+            _evicted, self._overflow = self._erasures.popitem(last=False)
+        self._sequence += 1
+        self._erasures[session_id] = _Erasure(epoch=self._sequence, at=self._clock())
+        return self._sessions.pop(session_id, None) is not None
 
     def clear(self) -> None:
         self._sessions.clear()
+        self._erasures.clear()
+        self._overflow = None
+
+    def _expire_erasures(self) -> None:
+        """Drop the epochs no run admitted before them can still record against."""
+
+        horizon = self._erasure_horizon_seconds
+        if horizon is None:
+            return
+        limit = self._clock() - horizon
+        while self._erasures:
+            oldest = next(iter(self._erasures.values()))
+            if oldest.at >= limit:
+                break
+            self._erasures.popitem(last=False)
+        if self._overflow is not None and self._overflow.at < limit:
+            self._overflow = None
 
     def _evict(self, session_id: str, session: _SessionMemory) -> None:
         """Drop this session's oldest exchanges until every bound holds."""
@@ -1875,6 +2000,28 @@ class ConversationMemory:
             # An emptied session holds nothing to recall; keeping it would let
             # dead sessions occupy the session cap against live ones.
             self._sessions.pop(session_id, None)
+
+
+class ConversationErasure:
+    """The erasure service this module publishes (phase 6 R4).
+
+    ``forget(platform, channel_id, viewer_id)`` drops the conversation memory
+    of that one key and bumps its erasure epoch, so a run admitted before the
+    call records nothing for it afterwards. It takes the key and nothing
+    else; it returns whether an exchange was retained.
+    """
+
+    __slots__ = ("_memory",)
+
+    def __init__(self, memory: ConversationMemory) -> None:
+        self._memory = memory
+
+    def forget(self, platform: str, channel_id: str, viewer_id: str) -> bool:
+        try:
+            key = SessionKey(platform=platform, channel_id=channel_id, viewer_id=viewer_id)
+        except Exception:
+            raise BrainModuleError("brain memory: erasure key is invalid") from None
+        return self._memory.forget(key)
 
 
 def _session_id(key: Any) -> str:
@@ -2188,7 +2335,10 @@ class _RunState:
     (decision 4); ``proposed_writes`` names the model-proposable actions
     already executed in the run, each at most once (decision 5);
     ``deliveries`` are the entries of the run's terminal step — the final
-    response's or the fallback's — read by the memory record step (R4).
+    response's or the fallback's — read by the memory record step (R4);
+    ``memory_epoch`` is the session key's erasure epoch at the run's
+    admission (:meth:`ConversationMemory.epoch`), which the conversation
+    memory write-back carries so an erasure since refuses it (phase 6 R4).
     """
 
     principal: str
@@ -2205,6 +2355,7 @@ class _RunState:
     route_delivery: tuple[_DeliveryEntry, ...] | None = None
     proposed_writes: set[str] = field(default_factory=set)
     deliveries: tuple[_Delivery, ...] = ()
+    memory_epoch: int | None = None
 
     def correlation(self) -> dict[str, Any]:
         return {
@@ -2461,6 +2612,12 @@ class BrainModule:
         self._route_deliveries: dict[str, tuple[_DeliveryEntry, ...]] = {}
         self._memory = ConversationMemory(
             clock=runtime.clock,
+            # No run the owned scheduler admitted before an erasure outlives
+            # its total deadline; a shared scheduler's deadline is its own, so
+            # only the count bound applies to its runs' epochs.
+            erasure_horizon_seconds=(
+                settings.admission.total_run_seconds if runtime.scheduler is None else None
+            ),
             **{
                 field.name: getattr(settings.conversation_memory, field.name)
                 for field in fields(_MemoryLimits)
@@ -2815,6 +2972,7 @@ class BrainModule:
         state = _RunState(
             principal=run_principal(message.kind),
             route_delivery=None if route is None else self._route_deliveries.get(route.name),
+            memory_epoch=self._memory.epoch(key, admitted_at=_admitted_at(run)),
         )
         try:
             outcome = await self._loop(run, message, key, transcript, state)
@@ -3226,7 +3384,10 @@ class BrainModule:
         # ``external_unknown`` entry is never a confirmed send (AC7).
         delivered = bool(text_deliveries) and sends == len(text_deliveries)
         if delivered and not self._closed:
-            self._memory.remember(key, transcript.user, reply)
+            # A key erased since this run's admission refuses the exchange:
+            # the run's text predates the erasure and must not revive it.
+            if self._memory.remember(key, transcript.user, reply, epoch=state.memory_epoch) is None:
+                self._diagnose("brain memory: record refused after an erasure")
 
         status, failure = _run_status_of(summary)
         correlation: dict[str, Any] = {
@@ -4785,13 +4946,16 @@ async def activate(
         # Published only on a bound registry, and only the scheduler owned
         # here: a context built without one keeps activation as it was.
         services = getattr(context, "services", None)
-        if (
-            module.owns_scheduler
-            and services is not None
-            and getattr(services, "available", False) is True
-        ):
+        if services is not None and getattr(services, "available", False) is True:
+            if module.owns_scheduler:
+                services.publish(
+                    ADMISSION_SERVICE_KIND, ADMISSION_SERVICE_SCOPE, module.scheduler
+                )
+            # Whoever owns the scheduler, the memory is this module's (R4).
             services.publish(
-                ADMISSION_SERVICE_KIND, ADMISSION_SERVICE_SCOPE, module.scheduler
+                ERASURE_SERVICE_KIND,
+                ERASURE_SERVICE_SCOPE,
+                ConversationErasure(module.memory),
             )
         return module
     except BaseException:
@@ -4895,6 +5059,20 @@ def _attested_claims(author: Mapping[str, Any]) -> tuple[TrustedClaim, ...]:
     if not _is_text(provenance) or not isinstance(roles, (list, tuple)):
         return ()
     return tuple(TrustedClaim(role, provenance=provenance) for role in roles if _is_text(role))
+
+
+def _admitted_at(run: Any) -> float | None:
+    """The scheduler-clock instant *run* was admitted at, or ``None`` unread.
+
+    A run context carries its start and its wait, the admission being the
+    one before the other; a handle without both reads the epoch as current.
+    """
+
+    started_at = getattr(run, "started_at", None)
+    waited = getattr(run, "waited_seconds", None)
+    if not isinstance(started_at, (int, float)) or not isinstance(waited, (int, float)):
+        return None
+    return float(started_at) - float(waited)
 
 
 def _message_of_work(work: Any) -> _Message:
@@ -5096,6 +5274,8 @@ __all__ = [
     "CAPABILITY_VISION",
     "CHAT_SCOPE",
     "DELIVERY_NOT_ATTEMPTED",
+    "ERASURE_SERVICE_KIND",
+    "ERASURE_SERVICE_SCOPE",
     "FALLBACK_NONE",
     "KNOWN_CAPABILITIES",
     "MODULE_NAME",
@@ -5109,6 +5289,7 @@ __all__ = [
     "BrainModule",
     "BrainModuleError",
     "run_principal",
+    "ConversationErasure",
     "ConversationMemory",
     "Exchange",
     "activate",

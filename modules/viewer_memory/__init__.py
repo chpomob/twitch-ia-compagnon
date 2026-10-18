@@ -52,6 +52,15 @@ exactly ``forget_command`` (non-empty) and whose author is trusted — an
 attested ``author.id`` outside the reserved ``:`` namespace — deletes that
 author's file for the event's platform and channel (``erased``). The module
 consumes the event itself, so this happens whatever the trigger decides.
+The erasure then reaches the brain's in-process conversation memory for the
+same key (phase 6 R4) through the service the brain publishes under
+(:data:`ERASURE_SERVICE_KIND`, :data:`ERASURE_SERVICE_SCOPE`) — a direct
+call carrying the key only, so no erasure signal and none of the viewer's
+text enters bus history or the audit stream. It is made once the file
+erasure is done, and also when that erasure failed, so neither holder is
+left silently erased alone: a failed file deletion is reported as before, a
+conversation memory that could not be reached is a local diagnostic, and a
+profile without the brain makes that call a no-op recorded the same way.
 
 **Actions** (R4). ``memory.recall`` (read) and ``memory.record`` (write, not
 model-proposable, no delivery) are bound at ``prepare`` over the declared
@@ -138,6 +147,12 @@ ERROR_STORE_FAILED = "store_failed"
 _ERROR_PROVIDER_CLOSED = "provider_closed"
 
 #: The fact every removal pass publishes.
+ERASURE_SERVICE_KIND = "erasure"
+ERASURE_SERVICE_SCOPE = "conversation_memory"
+"""The service key ``(kind, scope)`` under which the brain publishes the
+erasure of its conversation memory: ``forget(platform, channel_id,
+viewer_id)``, resolved at each erasure, never required (phase 6 R4)."""
+
 FACT_MEMORY_REMOVED = "memory.removed"
 REASON_EVICTED = "evicted"
 REASON_EXPIRED = "expired"
@@ -1111,6 +1126,7 @@ class ViewerMemoryModule:
         self._provider = _MemoryActionProvider(self)
         self._supervision = getattr(context, "supervision", None)
         self._tasks = getattr(context, "tasks", None)
+        self._services = getattr(context, "services", None)
         self._settings = settings
         self._sleeper = sleeper
         self._store = MemoryStore(settings, wall_clock=wall_clock)
@@ -1273,15 +1289,47 @@ class ViewerMemoryModule:
 
         A file that could not be deleted is reported on ``module.degraded``
         and raises :class:`MemoryStoreError`: never taken for an absent file.
+        Either way the brain's conversation memory for the key is then
+        erased too (:meth:`_forget_conversation`, phase 6 R4).
         """
 
         try:
             count = self._store.forget(platform, channel_id, viewer_id)
         except MemoryStoreError:
             await self._report_degraded(REASON_DELETION_FAILED)
+            await self._forget_conversation(platform, channel_id, viewer_id)
             raise
+        await self._forget_conversation(platform, channel_id, viewer_id)
         await self._publish_removed({REASON_ERASED: count} if count else {})
         return count
+
+    async def _forget_conversation(self, platform: str, channel_id: str, viewer_id: str) -> None:
+        """Erase the brain's conversation memory of the key, through its service.
+
+        Only the key is handed over, never any text. An absent service (no
+        brain in the profile, no registry) is a no-op and a failing one is
+        not raised: both are recorded as a local diagnostic naming no viewer.
+        """
+
+        resolve = getattr(self._services, "resolve", None)
+        service = None
+        if callable(resolve):
+            try:
+                service = resolve(ERASURE_SERVICE_KIND, ERASURE_SERVICE_SCOPE)
+            except Exception:  # noqa: BLE001 - an unreadable registry reaches nothing
+                service = None
+        forget = getattr(service, "forget", None)
+        if not callable(forget):
+            self._diagnose("erasure: no conversation memory to reach")
+            return
+        try:
+            outcome = forget(platform, channel_id, viewer_id)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - reported, the file erasure stands
+            self._diagnose("erasure: the conversation memory could not be erased")
 
     # -- the actions (R4) ----------------------------------------------------- #
 
@@ -1706,6 +1754,8 @@ __all__ = [
     "DELIVERY_VALUES",
     "DIAGNOSTIC_MAX_CHARS",
     "DISPLAY_NAME_MAX_CHARS",
+    "ERASURE_SERVICE_KIND",
+    "ERASURE_SERVICE_SCOPE",
     "ERROR_NO_VIEWER",
     "EXCEEDED_FILES_NAMED",
     "FACT_MEMORY_DELETION_FAILED",

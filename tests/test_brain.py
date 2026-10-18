@@ -3452,6 +3452,7 @@ async def activate_memory_platform(
     *bodies: Any,
     memory: bool = True,
     brain_overrides: dict[str, Any] | None = None,
+    session: Any | None = None,
 ) -> MemoryPlatform:
     """The fake platform delivering ``chat.write``, the real ``viewer_memory``
     storing under *tmp_path* (left out with ``memory=False``, the twin) and
@@ -3486,7 +3487,8 @@ async def activate_memory_platform(
             rules=(TriggerRule(type="event_kind", parameters={"kinds": list(EVENT_KINDS)}),)
         ),
     )
-    session = ScriptedModel(*bodies)
+    if session is None:
+        session = ScriptedModel(*bodies)
     settings = merge_settings(brain_overrides)
     settings.update(
         {
@@ -3699,6 +3701,217 @@ async def test_ac22_memory_record_is_never_offered_over_a_granted_run(tmp_path: 
         assert len(bodies) == 2
         assert all(MEMORY_RECALL in json.dumps(body) for body in bodies)
         assert sum(json.dumps(body).count(MEMORY_RECORD) for body in bodies) == 0
+    finally:
+        await harness.close()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 R4: ``!forgetme`` reaches the brain's conversation memory (F6)
+# --------------------------------------------------------------------------- #
+
+ERASED_TEXT = "my secret words"
+ERASED_REPLY = "your secret reply"
+OTHER_VIEWER = "viewer-9"
+
+
+class FirstHeldModel(ScriptedModel):
+    """A scripted model holding its first scenario request until released."""
+
+    def __init__(self, *bodies: Any) -> None:
+        super().__init__(*bodies)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _answer(self, url: str, kwargs: dict[str, Any]) -> Any:
+        if not self.entered.is_set():
+            self.entered.set()
+            await self.release.wait()
+        return await super()._answer(url, kwargs)
+
+
+def memory_key(viewer: str = VIEWER) -> SessionKey:
+    return SessionKey(FAKE_PLATFORM, FAKE_CHANNEL, viewer)
+
+
+async def inject_chat(harness: MemoryPlatform, viewer: str, text: str, message_id: str) -> None:
+    published = await harness.platform.inject(
+        {
+            "channel_id": FAKE_CHANNEL,
+            "author": {"id": viewer},
+            "message_id": message_id,
+            "text": text,
+        }
+    )
+    assert published is not None
+
+
+async def runs_completed(harness: MemoryPlatform, count: int) -> None:
+    await wait_until(
+        lambda: len(events_of(harness.context.bus, TRACE_BRAIN_RUN_COMPLETED)) >= count
+    )
+
+
+def carries_erased_text(text: str) -> bool:
+    return ERASED_TEXT in text or ERASED_REPLY in text
+
+
+@pytest.mark.asyncio
+async def test_ac13_forgetme_empties_the_brain_memory_of_that_key_only(tmp_path: Path) -> None:
+    """AC13 (R4, F6): after an exchange is recorded for a key and
+    ``!forgetme`` completes for it, the brain's ``recall(key)`` is ``()``
+    and the next prompt built for that viewer carries none of the erased
+    text; another viewer's recall is unchanged."""
+
+    harness = await activate_memory_platform(
+        tmp_path,
+        final(ERASED_REPLY),
+        final("other reply"),
+        final(""),
+        final("fresh reply"),
+    )
+    try:
+        await inject_chat(harness, VIEWER, ERASED_TEXT, "m-erased")
+        await runs_completed(harness, 1)
+        await inject_chat(harness, OTHER_VIEWER, "other words", "m-other")
+        await runs_completed(harness, 2)
+        (remembered,) = harness.brain.memory.recall(memory_key())
+        assert ERASED_TEXT in remembered.user and remembered.assistant == ERASED_REPLY
+        other_before = harness.brain.memory.recall(memory_key(OTHER_VIEWER))
+        assert len(other_before) == 1
+
+        await inject_chat(harness, VIEWER, "!forgetme", "m-forget")
+        assert harness.brain.memory.recall(memory_key()) == ()
+        assert harness.brain.memory.recall(memory_key(OTHER_VIEWER)) == other_before
+        await runs_completed(harness, 3)
+
+        await inject_chat(harness, VIEWER, "hello again", "m-next")
+        await runs_completed(harness, 4)
+        next_prompt = json.dumps(harness.session.requests()[-1], ensure_ascii=False)
+        assert "hello again" in next_prompt
+        assert not carries_erased_text(next_prompt)
+        assert harness.brain.memory.recall(memory_key(OTHER_VIEWER)) == other_before
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_ac14_a_run_admitted_before_the_erasure_records_nothing_after_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC14 (R4, F6): a run admitted before ``!forgetme`` whose delivery and
+    record land after it leaves ``recall(key)`` empty, the refusal counted;
+    the bus history and the audit records the erasure produced carry none
+    of the erased text."""
+
+    from modules import audit
+
+    session = FirstHeldModel(final(ERASED_REPLY), final(""))
+    harness = await activate_memory_platform(tmp_path, session=session)
+    auditor = await audit.activate(
+        harness.context.for_module("audit"),
+        {"output": "stdout", "queue": {"max_records": 1000, "max_bytes": 4 * 1024 * 1024}},
+        {},
+    )
+    await auditor.prepare()
+    try:
+        await inject_chat(harness, VIEWER, ERASED_TEXT, "m-erased")
+        await wait_until(session.entered.is_set)
+        await settle()
+        capsys.readouterr()
+        before = len(harness.context.bus.list_events())
+
+        await inject_chat(harness, VIEWER, "!forgetme", "m-forget")
+        await settle()
+        erasure_events = [
+            json.dumps(event, ensure_ascii=False, default=str)
+            for event in harness.context.bus.list_events()[before:]
+        ]
+        # No file existed yet (the record waits on the held run): the erasure
+        # produced the command's own events and nothing that names the text.
+        assert any("m-forget" in text for text in erasure_events)
+        assert not any(carries_erased_text(text) for text in erasure_events)
+        audit_lines = capsys.readouterr().out.splitlines()
+        assert audit_lines and not any(carries_erased_text(line) for line in audit_lines)
+
+        session.release.set()
+        await runs_completed(harness, 2)
+        assert [send["text"] for send in harness.transport.sends] == [ERASED_REPLY]
+        assert harness.brain.memory.recall(memory_key()) == ()
+        assert harness.brain.memory.refused_records == 1
+    finally:
+        await auditor.close()
+        await harness.close()
+
+
+def test_r4_a_stale_epoch_is_refused_and_a_fresh_one_kept() -> None:
+    """R4: ``forget`` bumps the key's epoch; a record carrying the epoch read
+    at an admission at or before the erasure is dropped and counted, one
+    admitted after it is kept, and another key is untouched."""
+
+    clock = ManualClock(10.0)
+    memory = ConversationMemory(
+        max_sessions=4, max_exchanges=4, max_bytes=4096, max_age_seconds=600, clock=clock
+    )
+    key, other = memory_key(), memory_key(OTHER_VIEWER)
+    stale = memory.epoch(key, admitted_at=clock.now)
+    memory.remember(other, "o", "p", epoch=memory.epoch(other, admitted_at=clock.now))
+    assert memory.forget(key) is False
+    assert memory.epoch(key, admitted_at=clock.now) < memory.epoch(key)
+    assert memory.remember(key, ERASED_TEXT, ERASED_REPLY, epoch=stale) is None
+    assert memory.recall(key) == () and memory.refused_records == 1
+    clock.advance(1.0)
+    fresh = memory.epoch(key, admitted_at=clock.now)
+    assert memory.remember(key, "later", "kept", epoch=fresh) is not None
+    assert [item.user for item in memory.recall(key)] == ["later"]
+    assert [item.user for item in memory.recall(other)] == ["o"]
+
+
+def test_r4_the_erasure_epochs_are_bounded_without_letting_a_stale_record_in() -> None:
+    """R4 (bounded retention): at most ``max_sessions`` keys keep an epoch;
+    a key the bound evicted still refuses a run admitted before its erasure,
+    and the horizon drops every epoch once no such run can be alive."""
+
+    clock = ManualClock(0.0)
+    memory = ConversationMemory(
+        max_sessions=2,
+        max_exchanges=4,
+        max_bytes=4096,
+        max_age_seconds=600,
+        clock=clock,
+        erasure_horizon_seconds=30.0,
+    )
+    keys = [memory_key(f"viewer-{index}") for index in range(5)]
+    admitted = [memory.epoch(key, admitted_at=clock.now) for key in keys]
+    for key in keys:
+        memory.forget(key)
+    assert len(memory._erasures) == 2
+    for key, epoch in zip(keys, admitted, strict=True):
+        assert memory.remember(key, "late", "text", epoch=epoch) is None
+    assert memory.refused_records == len(keys)
+    clock.advance(31.0)
+    assert memory.epoch(keys[0], admitted_at=clock.now) == memory.epoch(keys[0])
+    assert len(memory._erasures) == 0 and memory._overflow is None
+
+
+@pytest.mark.asyncio
+async def test_r4_the_brain_publishes_its_erasure_service(tmp_path: Path) -> None:
+    """R4: the erasure reaches the brain through the service registry, never
+    the bus: one entry under ``(erasure, conversation_memory)`` published by
+    ``brain``, whose ``forget`` takes the key only and publishes nothing."""
+
+    harness = await activate_memory_platform(tmp_path, final("hello"))
+    try:
+        entries = harness.context.services.entries()
+        assert entries[("erasure", "conversation_memory")] == MODULE_NAME
+        service = harness.context.services.resolve("erasure", "conversation_memory")
+        harness.brain.memory.remember(memory_key(), "a", "b")
+        before = len(harness.context.bus.list_events())
+        assert service.forget(FAKE_PLATFORM, FAKE_CHANNEL, VIEWER) is True
+        assert harness.brain.memory.recall(memory_key()) == ()
+        assert len(harness.context.bus.list_events()) == before
+        # The loader's own copy of the module raises its own error class.
+        with pytest.raises(RuntimeError, match="erasure key is invalid"):
+            service.forget(FAKE_PLATFORM, FAKE_CHANNEL, "")
     finally:
         await harness.close()
 
