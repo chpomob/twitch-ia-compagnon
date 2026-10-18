@@ -864,7 +864,9 @@ def validate_schema(schema: Any, *, label: str) -> None:
             raise SchemaError(field, reason) from None
 
 
-def validate_against_schema(value: Any, schema: Any, *, label: str) -> None:
+def validate_against_schema(
+    value: Any, schema: Any, *, label: str, redact: Iterable[str] = ()
+) -> None:
     """Raise :class:`ContractError` unless *value* satisfies *schema*.
 
     *label* prefixes every diagnostic so arguments, results and trigger
@@ -872,13 +874,26 @@ def validate_against_schema(value: Any, schema: Any, *, label: str) -> None:
     so an unsupported keyword is reported instead of being silently ignored.
     Absent ``additionalProperties: false``, undeclared object keys are accepted,
     as in JSON Schema.
+
+    *redact* is the known-credential set of the caller (R3, F4): every key of
+    *value* a diagnostic path names passes through :func:`mask_known` first,
+    so a credential configured as a mapping key never reaches the field of
+    the error. Only the matching segment is masked; the path keeps its shape.
     """
 
     validate_schema(schema, label=label)
-    _apply_schema(value, schema, label=label)
+    _apply_schema(value, schema, label=label, redact=tuple(redact))
 
 
-def _apply_schema(value: Any, schema: Mapping[str, Any], *, label: str) -> None:
+def _key_label(label: str, key: str, redact: Sequence[str]) -> str:
+    """*label* extended by one mapping *key*, masked by :func:`mask_known` (R3)."""
+
+    return f"{label}.{mask_known(key, redact)}"
+
+
+def _apply_schema(
+    value: Any, schema: Mapping[str, Any], *, label: str, redact: Sequence[str] = ()
+) -> None:
     declared = schema.get("type")
     if declared is not None:
         _check_type(value, declared, label)
@@ -926,17 +941,23 @@ def _apply_schema(value: Any, schema: Mapping[str, Any], *, label: str) -> None:
             raise ContractError(
                 label, f"must be a mapping, got {type(value).__name__}"
             )
-        _apply_object_schema(value, schema, label=label)
+        _apply_object_schema(value, schema, label=label, redact=redact)
 
     if "items" in schema:
         if not _is_array(value):
             raise ContractError(label, f"must be a list, got {type(value).__name__}")
         for index, item in enumerate(value):
-            _apply_schema(item, schema["items"], label=f"{label}[{index}]")
+            _apply_schema(
+                item, schema["items"], label=f"{label}[{index}]", redact=redact
+            )
 
 
 def _apply_object_schema(
-    value: Mapping[Any, Any], schema: Mapping[str, Any], *, label: str
+    value: Mapping[Any, Any],
+    schema: Mapping[str, Any],
+    *,
+    label: str,
+    redact: Sequence[str] = (),
 ) -> None:
     for key in value:
         if not isinstance(key, str):
@@ -944,17 +965,24 @@ def _apply_object_schema(
 
     for name in schema.get("required", ()):
         if name not in value:
-            raise ContractError(f"{label}.{name}", "is required and missing")
+            raise ContractError(_key_label(label, name, redact), "is required and missing")
 
     properties: Mapping[str, Any] = schema.get("properties", {})
     for name, subschema in properties.items():
         if name in value:
-            _apply_schema(value[name], subschema, label=f"{label}.{name}")
+            _apply_schema(
+                value[name],
+                subschema,
+                label=_key_label(label, name, redact),
+                redact=redact,
+            )
 
     if schema.get("additionalProperties") is False:
         for name in value:
             if name not in properties:
-                raise ContractError(f"{label}.{name}", "is not an allowed property")
+                raise ContractError(
+                    _key_label(label, name, redact), "is not an allowed property"
+                )
 
 
 def _is_array(value: Any) -> bool:

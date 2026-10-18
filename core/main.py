@@ -113,6 +113,7 @@ from .loader import (
     _declaration,
     _entry_point,
     _redact_known,
+    _value_at,
     resolve_input_ownership,
 )
 from .overlay import (
@@ -381,8 +382,36 @@ def _load_documents(
     resolver = os.environ if environ is None else environ
     # Every resolution performed, by variable: the secrets block is served
     # from here rather than from the environment, so it can never cause a
-    # lookup of its own.
+    # lookup of its own — not even when a refusal is masked below.
     resolved: dict[str, str] = {}
+    try:
+        return _validated_documents(loaded, unresolved, path, resolver, resolved)
+    except ConfigurationError as exc:
+        # R3, F4: the one exit of every refusal the profile's keys can shape.
+        # A credential configured as a key of any block would otherwise ride
+        # out in the path the refusal names; it is masked here, the path's
+        # skeleton kept, before the text reaches stderr or the config UI.
+        raise ConfigurationError(
+            _redact_known(
+                str(exc), _configured_credentials(loaded, path, resolver, resolved)
+            )
+        ) from None
+
+
+def _validated_documents(
+    loaded: dict[str, Any],
+    unresolved: dict[str, Any],
+    path: Path,
+    resolver: Mapping[str, str],
+    resolved: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """:func:`_load_documents` past the read: resolve, then validate.
+
+    Every :class:`ConfigurationError` raised from here is masked of the
+    profile's credentials by the caller before it leaves (R3). *resolved*
+    is the caller's resolution cache, filled here, by variable.
+    """
+
     config = {
         key: (
             value
@@ -446,6 +475,84 @@ def _load_documents(
 
     config["modules_directory"] = _modules_directory(config["modules_directory"], path)
     return unresolved, config
+
+
+def _configured_credentials(
+    loaded: Mapping[str, Any],
+    path: Path,
+    environ: Mapping[str, str],
+    resolved: Mapping[str, str],
+) -> frozenset[str]:
+    """The credential set a refused profile's diagnostic is masked of (R3, F4).
+
+    Built only when a refusal is about to leave :func:`_load_documents`, from
+    the merged document as read: every value an enabled module's manifest
+    declares as a credential, as configured and — for a ``${NAME}``
+    reference — as the environment resolves it, and every value a reference
+    of the ``secrets`` block resolved to before the refusal (*resolved*, the
+    resolution cache) or that an enabled module references. A reference only
+    a disabled module makes is never looked up, so a disabled module's listed
+    credential stays unresolved (R7, AC25). The document is the thing being refused, so
+    no part of its shape is assumed; when the manifests cannot be read for
+    it, every string the named modules are configured with stands in for the
+    declared credentials — module names excepted — so the diagnostic is
+    over-redacted rather than reported unprotected. A reference is looked up
+    only for a module ``enabled_modules`` names; without a valid list the
+    modules' literals are still masked, but nothing is looked up.
+    """
+
+    def configured(value: Any, *, look_up: bool) -> set[str]:
+        if not isinstance(value, str) or not value:
+            return set()
+        match = _ENV_REFERENCE.fullmatch(value)
+        if match is None:
+            return {value}
+        if not look_up:
+            return set()
+        variable = match.group(1)
+        looked_up = environ[variable] if variable in environ else None
+        return {looked_up} if isinstance(looked_up, str) and looked_up else set()
+
+    values: set[str] = set()
+    modules = loaded.get(MODULES_KEY)
+    modules = modules if isinstance(modules, Mapping) else {}
+    enabled = loaded.get("enabled_modules")
+    look_up = isinstance(enabled, list)
+    names = [
+        name
+        for name in (enabled if look_up else modules)
+        if isinstance(name, str) and isinstance(modules.get(name), Mapping)
+    ]
+    # A listed secret an enabled module references would be resolved for it
+    # anyway; one only a disabled module references never is.
+    enabled_references = (
+        _referenced_variables([modules[name] for name in names]) if look_up else set()
+    )
+    secrets = loaded.get(SECRETS_KEY)
+    if isinstance(secrets, list):
+        for entry in secrets:
+            match = _ENV_REFERENCE.fullmatch(entry) if isinstance(entry, str) else None
+            if match is None:
+                continue
+            if resolved.get(match.group(1)):
+                values.add(resolved[match.group(1)])
+            elif match.group(1) in enabled_references:
+                values |= configured(entry, look_up=True)
+    try:
+        directory = _modules_directory(loaded["modules_directory"], path)
+        discovered = ModuleLoader(None, directory)._discover()
+        for name in names:
+            for credential in _declaration(discovered[name]).credentials:
+                values |= configured(_value_at(modules[name], credential), look_up=look_up)
+    except Exception:
+        for name in names:
+            for value in _configured_values(modules[name]):
+                values |= configured(value, look_up=look_up)
+        # A module's own name is a key of the document the refusal already
+        # names; masking a value equal to it would hide nothing and cut the
+        # module out of every path.
+        values -= {name for name in modules if isinstance(name, str)}
+    return frozenset(values)
 
 
 def _modules_directory(raw: Any, path: Path) -> str:
@@ -1046,7 +1153,11 @@ async def _validate_enabled(
     # The one global startup deadline every awaited hook is bounded by: the
     # attribute activate_enabled sets from its own argument (R4).
     loader._deadline_at = deadline_at
+    # The known-credential set every settings diagnostic is masked of, set
+    # where activate_enabled sets it (R3, F4).
+    loader.redacted_values = _credential_literals(enabled, declarations, settings)
     resolved = {name: loader._resolve_secrets(name, settings[name]) for name in enabled}
+    loader.redacted_values |= _credential_literals(enabled, declarations, resolved)
 
     refusals: list[str] = []
     for name in enabled:

@@ -2628,6 +2628,34 @@ class _RecordingEnviron(dict):
         return super().__getitem__(key)
 
 
+def test_a_refused_profile_never_looks_up_a_disabled_modules_listed_secret(
+    tmp_path: Path,
+) -> None:
+    """R3, R7/AC25: masking a refusal of the profile serves the ``secrets``
+    block from the resolution cache and the enabled modules' references, so
+    an unrelated invalid limit never causes a disabled module's listed
+    credential to be looked up."""
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    _make_phased_module(modules, "probe")
+    _make_phased_module(modules, "vault")
+    config = _phased_config("./modules", tmp_path / "lifecycle.log", ("probe", "vault"))
+    config["enabled_modules"] = ["probe"]
+    config["modules"]["vault"]["token"] = "${VAULT_TOKEN}"
+    config["secrets"] = ["${VAULT_TOKEN}"]
+    config["limits"]["history"] = {}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+    environ = _RecordingEnviron({"VAULT_TOKEN": _opaque("credential")})
+
+    with pytest.raises(application.ConfigurationError) as caught:
+        application.load_config(config_path, environ=environ)
+
+    assert "limits.history" in str(caught.value)
+    assert "VAULT_TOKEN" not in environ.queried
+
+
 @pytest.mark.asyncio
 async def test_configured_secrets_are_redacted_from_traces_and_loss_diagnostics_through_the_entry_point(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3647,3 +3675,241 @@ async def test_n2_overlapping_known_values_leave_no_credential_fragment(
     for fragment in (*_n1_fragments(_N1_SECRET), _N2_OTHER):
         assert fragment not in joined
     assert [lines for _, _, lines in outcomes] == [[expected], [expected]]
+
+
+# --------------------------------------------------------------------------- #
+# P5 — one redaction primitive for every configuration diagnostic (R3, F4)
+# --------------------------------------------------------------------------- #
+
+_AC10_SECRET = "review-secret-4521"
+
+
+def _ac10_profile(placement: str, key: str, password: str) -> dict[str, Any]:
+    """The streamerbot profile of AC10, *key* configured at *placement*.
+
+    *password* is the configured credential, a literal or a ``${NAME}``
+    reference; *key* is the mapping key a diagnostic will have to name.
+    """
+
+    settings: dict[str, Any] = {
+        "url": "ws://127.0.0.1:9/",
+        "companion_name": "Companion",
+        "password": password,
+    }
+    config: dict[str, Any] = {
+        "modules_directory": str(ROOT / "modules"),
+        "enabled_modules": ["streamerbot"],
+        "modules": {"streamerbot": settings},
+        "limits": _finite_limits(),
+    }
+    if placement == "settings":
+        settings[key] = "x"
+    elif placement == "settings.deadlines":
+        settings["deadlines"] = {key: 1}
+    elif placement == "settings.unresolved":
+        settings["deadlines"] = {key: "${AC10_NOT_SET}"}
+    elif placement == "limits":
+        config["limits"][key] = {}
+    elif placement == "limits.group":
+        config["limits"]["dedup"][key] = 1
+    elif placement == "actions":
+        config["actions"] = [{"rule_id": "r", key: 1}]
+    elif placement == "triggers":
+        config["triggers"] = {"streamerbot": {key: {}}}
+    else:  # pragma: no cover - a parametrisation mistake
+        raise AssertionError(placement)
+    return config
+
+
+_AC10_PLACEMENTS = (
+    "settings",
+    "settings.deadlines",
+    "settings.unresolved",
+    "limits",
+    "limits.group",
+    "actions",
+    "triggers",
+)
+
+
+@pytest.mark.parametrize("password", [_AC10_SECRET, "${AC10_PASSWORD}"])
+@pytest.mark.parametrize("placement", _AC10_PLACEMENTS)
+def test_ac10_check_config_never_echoes_a_credential_used_as_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    placement: str,
+    password: str,
+) -> None:
+    """AC10 (R3, F4): the streamerbot password, literal or resolved, also
+    configured as a key — under ``modules.streamerbot`` (top level, nested,
+    an unresolved reference's path) or under any core block — makes
+    ``--check-config`` exit non-zero, and neither stdout nor stderr carries
+    the credential or any long prefix of it."""
+
+    _forbid_the_watchdog(monkeypatch)
+    monkeypatch.setenv("AC10_PASSWORD", _AC10_SECRET)
+    monkeypatch.delenv("AC10_NOT_SET", raising=False)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, _ac10_profile(placement, _AC10_SECRET, password))
+
+    status = application.main(["--check-config", "--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert status == 2
+    assert output.startswith("error: ")
+    assert not any(
+        _AC10_SECRET[:end] in output for end in range(8, len(_AC10_SECRET) + 1)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("placement", "expected"),
+    [
+        (
+            "settings.deadlines",
+            "module 'streamerbot': field 'settings.deadlines.[REDACTED]': "
+            "is not an allowed property",
+        ),
+        (
+            "settings.unresolved",
+            "modules.streamerbot.deadlines.<redacted>: "
+            "environment reference is unresolved",
+        ),
+        ("limits", "limits.<redacted>: is not a known limit group"),
+        ("limits.group", "limits.dedup.<redacted>: is not a known limit"),
+        ("actions", "actions[0]: is not a known authorization rule key (<redacted>)"),
+        (
+            "triggers",
+            "module 'streamerbot': field 'triggers.streamerbot': "
+            "is not a known trigger configuration key (<redacted>)",
+        ),
+    ],
+)
+async def test_ac10_the_masked_key_keeps_the_path_skeleton(
+    tmp_path: Path, placement: str, expected: str
+) -> None:
+    """R3: only the segment matching the credential is masked; the path and
+    the reason stay readable, so the operator still learns where to look."""
+
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, _ac10_profile(placement, _AC10_SECRET, _AC10_SECRET))
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        config_path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+
+    assert (status, diagnostics) == (2, [expected])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("placement", "expected"),
+    [
+        (
+            "settings.deadlines",
+            "module 'streamerbot': field 'settings.deadlines.typo_seconds': "
+            "is not an allowed property",
+        ),
+        (
+            "settings.unresolved",
+            "modules.streamerbot.deadlines.typo_seconds: "
+            "environment reference is unresolved",
+        ),
+        ("limits", "limits.typo_seconds: is not a known limit group"),
+        ("limits.group", "limits.dedup.typo_seconds: is not a known limit"),
+        ("actions", "actions[0]: is not a known authorization rule key (typo_seconds)"),
+        (
+            "triggers",
+            "module 'streamerbot': field 'triggers.streamerbot': "
+            "is not a known trigger configuration key (typo_seconds)",
+        ),
+    ],
+)
+async def test_ac10_a_key_that_is_no_credential_is_reported_whole(
+    tmp_path: Path, placement: str, expected: str
+) -> None:
+    """R3's redaction is not over-broad: with the password configured, a key
+    that is not a credential is named in full, exactly as before."""
+
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, _ac10_profile(placement, "typo_seconds", _AC10_SECRET))
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        config_path, environ={}, diagnostic_reporter=diagnostics.append
+    )
+
+    assert (status, diagnostics) == (2, [expected])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", _AC10_PLACEMENTS)
+async def test_ac10_a_refused_startup_keeps_the_credential_out_of_supervision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, placement: str
+) -> None:
+    """AC10 (R3, F4): the same profile refused by ``run`` reports
+    diagnostics, supervision losses and bus records that never carry the
+    credential configured as a key."""
+
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, _ac10_profile(placement, _AC10_SECRET, _AC10_SECRET))
+    supervisions = _capture_supervision(monkeypatch)
+    diagnostics: list[str] = []
+    stop = asyncio.Event()
+    stop.set()
+
+    status = await application.run(
+        config_path,
+        stop,
+        environ={},
+        ready_reporter=lambda _message: None,
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status != 0
+    assert diagnostics
+    records = [
+        *diagnostics,
+        *(loss for supervision in supervisions for loss in supervision.losses),
+        *(
+            json.dumps(event, default=str)
+            for supervision in supervisions
+            for event in supervision._bus.list_events()
+        ),
+    ]
+    assert not any(_AC10_SECRET in record for record in records)
+
+
+def test_ac10_the_config_ui_check_never_echoes_a_credential_used_as_a_key(
+    tmp_path: Path,
+) -> None:
+    """AC10 (R3, F4): the config UI's Check of the same profile, through the
+    Check harness and the real settings phase, lists the refusal with the
+    key masked and carries the credential nowhere in its response."""
+
+    from core.config_ui import ConfigUI, UISettings
+    from test_config_ui import _listed, _post_check
+
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path, _ac10_profile("settings.deadlines", _AC10_SECRET, _AC10_SECRET)
+    )
+    ui = ConfigUI(
+        UISettings.from_argv(
+            ["--config", str(config_path), "--status-file", str(tmp_path / "status.json")]
+        ),
+        environ={},
+    )
+
+    for page in ("/", "/module/streamerbot"):
+        body = _post_check(ui, page)
+        assert _AC10_SECRET not in body
+        (listed,) = _listed(body)
+        assert listed.startswith("module 'streamerbot': field 'settings.deadlines.")
+        assert listed.endswith(": is not an allowed property")
+    assert ui.last_check is not None and not ui.last_check.passed
+    assert not any(_AC10_SECRET in line for line in ui.last_check.diagnostics)

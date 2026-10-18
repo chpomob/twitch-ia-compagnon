@@ -184,6 +184,7 @@ from core.contracts import (
     ContractError,
     Destination,
     SessionKey,
+    mask_known,
     validate_against_schema,
     validate_schema,
 )
@@ -292,10 +293,47 @@ def validate_settings(settings: Any, *, owned_inputs: Any = None) -> list[str]:
     *owned_inputs* is this module's read-only ownership view (D7), handed
     over by the loader; ``None`` — a call outside the loader — skips the
     ownership-dependent check.
+
+    A field path names configured keys, and a key may be the configured
+    password itself. Called outside the loader, every diagnostic leaves
+    through :func:`_redacted`, which masks the password out of its field and
+    reason (R3, F4). The loader's call — the one that hands *owned_inputs* —
+    gets the diagnostics unmasked: the loader holds every enabled module's
+    credentials and applies them together, refusing any field that carries
+    one. Masking the password first could cut an overlapping credential
+    down to a fragment the loader no longer recognises.
     """
 
     if not isinstance(settings, Mapping):
         return [_setting_diagnostic("settings", "must be a mapping")]
+    diagnostics = _settings_diagnostics(settings, owned_inputs)
+    if owned_inputs is not None:
+        return diagnostics
+    return _redacted(diagnostics, settings)
+
+
+def _redacted(diagnostics: list[str], settings: Mapping[str, Any]) -> list[str]:
+    """*diagnostics* with the configured password masked by :func:`mask_known`.
+
+    The module and the ``field`` label are this module's own text and stay
+    as they are; what follows them — the field path and the reason — is
+    masked, so the path keeps its skeleton (R3, F4).
+    """
+
+    password = settings.get(_SETTING_PASSWORD)
+    credentials = (password,) if isinstance(password, str) and password else ()
+    prefix = f"module {MODULE_NAME!r}: field "
+    return [
+        prefix + mask_known(entry[len(prefix) :], credentials)
+        if entry.startswith(prefix)
+        else mask_known(entry, credentials)
+        for entry in diagnostics
+    ]
+
+
+def _settings_diagnostics(settings: Mapping[str, Any], owned_inputs: Any) -> list[str]:
+    """Every diagnostic :func:`validate_settings` reports, before redaction."""
+
     diagnostics: list[str] = []
 
     for field_name in settings:

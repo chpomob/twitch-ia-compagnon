@@ -421,6 +421,11 @@ class ModuleLoader:
         #: (R2), before any secret, setting or module was touched. ``None``
         #: until one is resolved.
         self.input_ownership: InputOwnership | None = None
+        #: The known-credential set every configuration diagnostic this
+        #: loader raises is masked of (R3, F4): the literals the enabled
+        #: modules declare as credentials, then — once resolved — their
+        #: resolved values. Empty until :meth:`activate_enabled` sets it.
+        self.redacted_values: frozenset[str] = frozenset()
         self._v1_supervision: Supervision | None = None
 
     @property
@@ -508,9 +513,13 @@ class ModuleLoader:
         # Secrets belong to the enabled set only (R7, AC25). A disabled module's
         # ``${NAME}`` reference is never looked up, so an unresolvable one does
         # not stop an application that does not run that module.
+        self.redacted_values = _credential_literals(enabled, declarations, settings)
         resolved = {
             name: self._resolve_secrets(name, settings[name]) for name in enabled
         }
+        # R3, F4: from here on a configuration diagnostic is masked of every
+        # declared credential, literal or resolved, wherever it appears in it.
+        self.redacted_values |= _credential_literals(enabled, declarations, resolved)
 
         # Every enabled module validates its own settings, all of them before
         # any of them is activated, and every refusal is collected before the
@@ -1104,13 +1113,20 @@ class ModuleLoader:
                 return value, False
             variable = match.group(1)
             if variable not in self.environ:
-                raise _field_error(name, path, "environment reference is unresolved")
+                raise _field_error(
+                    name,
+                    path,
+                    "environment reference is unresolved",
+                    values=self.redacted_values,
+                )
             self.resolved_secrets += 1
             return self.environ[variable], True
 
         if isinstance(value, Mapping):
             if id(value) in active:
-                raise _field_error(name, path, "recursive value is invalid")
+                raise _field_error(
+                    name, path, "recursive value is invalid", values=self.redacted_values
+                )
             active.add(id(value))
             try:
                 mapping: dict[Any, Any] = {}
@@ -1175,14 +1191,27 @@ class ModuleLoader:
             been redacted.
         """
 
+        # R3, F4: every credential known to this loader, and this module's
+        # own declared ones, masked out of every path and reason below.
+        credentials = self.redacted_values | _credential_literals(
+            (name,), {name: declaration}, {name: settings}
+        )
         if declaration.settings_schema is not None:
             try:
                 validate_against_schema(
-                    settings, declaration.settings_schema, label="settings"
+                    settings,
+                    declaration.settings_schema,
+                    label="settings",
+                    redact=credentials,
                 )
             except ContractError as exc:
                 return [
-                    _field_diagnostic(name, exc.field, _value_free_reason(exc.reason))
+                    _field_diagnostic(
+                        name,
+                        exc.field,
+                        _value_free_reason(exc.reason),
+                        values=credentials,
+                    )
                 ]
 
         validator = entry_point.settings_validator
@@ -1229,7 +1258,13 @@ class ModuleLoader:
         except Exception:
             return [_field_diagnostic(name, hook_name, "settings were refused by the module")]
         if isinstance(outcome, (list, tuple)) and outcome:
-            values = _configured_values(settings)
+            values = tuple(
+                sorted(
+                    set(_configured_values(settings)) | credentials,
+                    key=len,
+                    reverse=True,
+                )
+            )
             return [
                 _module_diagnostic(name, entry, hook_name, values=values)
                 for entry in outcome
@@ -1362,13 +1397,18 @@ class ModuleLoader:
             )
         if not isinstance(configured, Mapping):
             raise _field_error("<config>", "triggers", "must be a mapping")
+        # R3, F4: an input name, a channel identifier and an unknown key are
+        # all configured keys; each diagnostic is masked of every credential.
+        values = self.redacted_values
         for input_name, entry in configured.items():
             if not isinstance(input_name, str) or not input_name.strip():
                 raise _field_error(
                     "<config>", "triggers", "must use non-empty input names"
                 )
             if not isinstance(entry, Mapping):
-                raise _field_error(input_name, "triggers", "must be a mapping")
+                raise _field_error(
+                    input_name, "triggers", "must be a mapping", values=values
+                )
             label = f"triggers.{input_name}"
             unknown = sorted(set(entry) - {"channels"})
             if unknown:
@@ -1376,24 +1416,33 @@ class ModuleLoader:
                     input_name,
                     label,
                     f"is not a known trigger configuration key ({', '.join(unknown)})",
+                    values=values,
                 )
             channels = entry.get("channels")
             if not isinstance(channels, Mapping):
-                raise _field_error(input_name, f"{label}.channels", "must be a mapping")
+                raise _field_error(
+                    input_name, f"{label}.channels", "must be a mapping", values=values
+                )
             for channel_id, channel_entry in channels.items():
                 if not isinstance(channel_id, str) or not channel_id.strip():
                     raise _field_error(
                         input_name,
                         f"{label}.channels",
                         "must use non-empty channel identifiers",
+                        values=values,
                     )
                 channel_label = f"{label}.channels.{channel_id}"
-                policy = _trigger_policy(input_name, channel_label, channel_entry)
+                policy = _trigger_policy(
+                    input_name, channel_label, channel_entry, values=values
+                )
                 try:
                     registry.configure(input_name, policy, channel_id=channel_id)
                 except Exception as exc:
                     raise _field_error(
-                        input_name, channel_label, _sanitised_reason(str(exc))
+                        input_name,
+                        channel_label,
+                        _sanitised_reason(str(exc)),
+                        values=values,
                     ) from None
 
     # -- discovery --------------------------------------------------------- #
@@ -2068,28 +2117,38 @@ def _manifest_triggers(name: str, manifest: Mapping[str, Any]) -> TriggerSpec | 
         ) from None
 
 
-def _trigger_policy(name: str, field_name: str, value: Any) -> TriggerPolicy:
+def _trigger_policy(
+    name: str, field_name: str, value: Any, *, values: Iterable[str] = ()
+) -> TriggerPolicy:
+    """A trigger policy from configuration or a manifest; *values* is redacted (R3)."""
+
     if not isinstance(value, Mapping):
-        raise _field_error(name, field_name, "must be a mapping")
+        raise _field_error(name, field_name, "must be a mapping", values=values)
     unknown = sorted(set(value) - _POLICY_KEYS)
     if unknown:
         raise _field_error(
-            name, field_name, f"declares unknown keys: {', '.join(unknown)}"
+            name,
+            field_name,
+            f"declares unknown keys: {', '.join(unknown)}",
+            values=values,
         )
     raw_rules = value.get("rules")
     if isinstance(raw_rules, (str, Mapping)) or not isinstance(
         raw_rules, (list, tuple)
     ):
-        raise _field_error(name, f"{field_name}.rules", "must be a list")
+        raise _field_error(name, f"{field_name}.rules", "must be a list", values=values)
     rules: list[TriggerRule] = []
     for index, entry in enumerate(raw_rules):
         location = f"{field_name}.rules[{index}]"
         if not isinstance(entry, Mapping):
-            raise _field_error(name, location, "must be a mapping")
+            raise _field_error(name, location, "must be a mapping", values=values)
         unknown = sorted(set(entry) - _RULE_KEYS)
         if unknown:
             raise _field_error(
-                name, location, f"declares unknown keys: {', '.join(unknown)}"
+                name,
+                location,
+                f"declares unknown keys: {', '.join(unknown)}",
+                values=values,
             )
         try:
             rules.append(
@@ -2099,13 +2158,17 @@ def _trigger_policy(name: str, field_name: str, value: Any) -> TriggerPolicy:
                 )
             )
         except (ContractError, TypeError, ValueError) as exc:
-            raise _field_error(name, location, _sanitised_reason(str(exc))) from None
+            raise _field_error(
+                name, location, _sanitised_reason(str(exc)), values=values
+            ) from None
     try:
         return TriggerPolicy(
             rules=tuple(rules), combination=value.get("combination", "all_of")
         )
     except (ContractError, TypeError, ValueError) as exc:
-        raise _field_error(name, field_name, _sanitised_reason(str(exc))) from None
+        raise _field_error(
+            name, field_name, _sanitised_reason(str(exc)), values=values
+        ) from None
 
 
 def _validate_event_pattern(pattern: Any) -> None:
@@ -2239,12 +2302,31 @@ def _hand_result(task: "asyncio.Task[Any]", release: Callable[[Any], None]) -> N
     release(task.result())
 
 
-def _field_diagnostic(module: str, field_name: str, reason: str) -> str:
-    return f"module {module!r}: field {field_name!r}: {reason}"
+def _field_diagnostic(
+    module: str, field_name: str, reason: str, *, values: Iterable[str] = ()
+) -> str:
+    """The one ``module 'x': field 'y': reason`` diagnostic (R7, R3).
+
+    Every slot — the module, the field path and the reason — passes through
+    :func:`core.contracts.mask_known` with the known-credential *values*
+    before it is composed: a credential configured as a mapping key would
+    otherwise ride out in the field path (F4). Only the matching text is
+    masked, so the path keeps its skeleton; with no values the diagnostic is
+    the text it always was.
+    """
+
+    values = tuple(values)
+    return (
+        f"module {_redact_values(module, values)!r}: "
+        f"field {_redact_values(field_name, values)!r}: "
+        f"{_redact_values(reason, values)}"
+    )
 
 
-def _field_error(module: str, field_name: str, reason: str) -> ModuleLoadError:
-    return ModuleLoadError(_field_diagnostic(module, field_name, reason))
+def _field_error(
+    module: str, field_name: str, reason: str, *, values: Iterable[str] = ()
+) -> ModuleLoadError:
+    return ModuleLoadError(_field_diagnostic(module, field_name, reason, values=values))
 
 
 _HOOK_DIAGNOSTIC = re.compile(r"module '(?P<module>[^']*)': field '(?P<field>[^']*)': (?P<reason>.*)\Z", re.DOTALL)

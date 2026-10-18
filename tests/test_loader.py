@@ -3411,3 +3411,241 @@ async def test_fixture_settings_hooks_refuse_by_field_without_values() -> None:
     assert "field 'scripts.audio.say'" in await refusal(
         "fakeeffects", {"scripts": {"audio.say": ["teleport"]}}
     )
+
+
+# --------------------------------------------------------------------------- #
+# P5 — one redaction primitive for every settings diagnostic (R3, F4, AC10)
+# --------------------------------------------------------------------------- #
+
+_AC10_SECRET = "review-secret-4521"
+
+_KEY_ECHOING_SOURCE = PLAIN_V2_SOURCE + '''
+
+def check_settings(settings):
+    return [
+        f"module 'echo': field 'extras.{key}': is not a known extra"
+        for key in settings.get("extras", {})
+    ]
+'''
+
+
+def _no_secret_fragment(text: str) -> bool:
+    return not any(
+        _AC10_SECRET[:end] in text for end in range(8, len(_AC10_SECRET) + 1)
+    )
+
+
+@pytest.mark.asyncio
+async def test_ac10_a_hook_diagnostic_never_names_another_modules_credential(
+    tmp_path: Path,
+) -> None:
+    """AC10 (R3, F4): a credential one module declares, configured as a key
+    of another module's settings, never reaches the field a hook names — the
+    hook guard masks with every known credential, not only the values of the
+    module whose hook spoke."""
+
+    make_module(
+        tmp_path,
+        "keyed",
+        manifest=v2_manifest("keyed", settings_schema=CREDENTIAL_SCHEMA, credentials=["token"]),
+        source=PLAIN_V2_SOURCE,
+    )
+    make_module(
+        tmp_path,
+        "echo",
+        manifest=v2_manifest("echo", settings_validator="check_settings"),
+        source=_KEY_ECHOING_SOURCE,
+    )
+    context = runtime_context()
+    keyed = {**v2_settings("keyed"), "token": _AC10_SECRET}
+    echo = {**v2_settings("echo"), "extras": {_AC10_SECRET: 1, "plain_key": 2}}
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["keyed", "echo"], "modules": {"keyed": keyed, "echo": echo}}
+        )
+
+    assert _no_secret_fragment(str(caught.value))
+    assert caught.value.diagnostics == (
+        "module 'echo': field 'check_settings': is not a known extra",
+        "module 'echo': field 'extras.plain_key': is not a known extra",
+    )
+    assert keyed["calls"] == echo["calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_ac10_a_schema_diagnostic_masks_a_credential_used_as_a_key(
+    tmp_path: Path,
+) -> None:
+    """AC10 (R3, F4): the declared schema's refusal of an undeclared key names
+    the path with only the credential's segment masked, whichever enabled
+    module declares the credential."""
+
+    strict_schema = {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string"},
+            "calls": {"type": "array"},
+            "closes": {"type": "array"},
+            "nested": {"type": "object", "additionalProperties": False},
+        },
+    }
+    make_module(
+        tmp_path,
+        "keyed",
+        manifest=v2_manifest("keyed", settings_schema=CREDENTIAL_SCHEMA, credentials=["token"]),
+        source=PLAIN_V2_SOURCE,
+    )
+    make_module(
+        tmp_path,
+        "strict",
+        manifest=v2_manifest("strict", settings_schema=strict_schema),
+        source=PLAIN_V2_SOURCE,
+    )
+    context = runtime_context()
+    keyed = {**v2_settings("keyed"), "token": _AC10_SECRET}
+    strict = {**v2_settings("strict"), "nested": {_AC10_SECRET: 1}}
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {
+                "enabled_modules": ["keyed", "strict"],
+                "modules": {"keyed": keyed, "strict": strict},
+            }
+        )
+
+    assert caught.value.diagnostics == (
+        "module 'strict': field 'settings.nested.[REDACTED]': is not an allowed property",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "placement",
+    ["top", "deadlines", "reconnect", "companion_identities", "allowlist"],
+)
+async def test_ac10_streamerbot_settings_never_echo_the_password_used_as_a_key(
+    tmp_path: Path, placement: str
+) -> None:
+    """AC10 (R3, F4): the shipped Streamer.bot module, its password also
+    configured as a key at any depth of its settings, is refused by the
+    loader with diagnostics that never carry the password, and its own
+    settings hook masks it from every diagnostic it returns."""
+
+    import modules.streamerbot as streamerbot
+
+    settings: dict[str, Any] = {
+        "url": "ws://127.0.0.1:9/",
+        "companion_name": "Companion",
+        "password": _AC10_SECRET,
+    }
+    if placement == "top":
+        settings[_AC10_SECRET] = "x"
+    elif placement == "allowlist":
+        settings["allowlist"] = [{"action": "a", _AC10_SECRET: "x"}]
+    else:
+        settings[placement] = {_AC10_SECRET: 1}
+    context = runtime_context()
+    loader = ModuleLoader(
+        context.bus, Path(streamerbot.__file__).resolve().parents[1], context=context
+    )
+
+    with pytest.raises(ModuleLoadError) as caught:
+        await loader.activate_enabled(
+            {"enabled_modules": ["streamerbot"], "modules": {"streamerbot": settings}}
+        )
+
+    assert caught.value.diagnostics
+    assert _no_secret_fragment(str(caught.value))
+    assert all(
+        line.startswith("module 'streamerbot': field '")
+        for line in caught.value.diagnostics
+    )
+    hook = streamerbot.validate_settings(settings)
+    assert hook and all(_no_secret_fragment(line) for line in hook)
+
+
+@pytest.mark.asyncio
+async def test_ac10_streamerbot_hook_leaves_overlapping_credentials_to_the_loader(
+    tmp_path: Path,
+) -> None:
+    """R3, F4: the loader's call of the Streamer.bot hook gets its
+    diagnostics unmasked, so another enabled module's credential that
+    overlaps the password is still whole when the loader masks the full
+    set together — the key carrying both is refused as a field, and no
+    fragment of either credential reaches the report."""
+
+    import modules.streamerbot as streamerbot
+    from core.loader import _declaration, _entry_point
+
+    other = "context-prefix-review-"
+    key = other + "secret-4521"
+    settings = {
+        "url": "ws://127.0.0.1:9/",
+        "companion_name": "Companion",
+        "password": _AC10_SECRET,
+        key: "x",
+    }
+    context = runtime_context()
+    loader = ModuleLoader(
+        context.bus, Path(streamerbot.__file__).resolve().parents[1], context=context
+    )
+    discovered = loader._discover()["streamerbot"]
+    loader.redacted_values = frozenset({other})
+
+    diagnostics = await loader._validate_settings(
+        "streamerbot",
+        _declaration(discovered),
+        _entry_point(loader._load_entry_point(discovered)),
+        settings,
+    )
+
+    assert diagnostics
+    rendered = "\n".join(diagnostics)
+    assert _no_secret_fragment(rendered)
+    assert "context-prefix" not in rendered
+    # Called outside the loader, the hook still masks the password itself.
+    assert all(
+        _AC10_SECRET not in line for line in streamerbot.validate_settings(settings)
+    )
+
+
+def test_ac10_streamerbot_hook_keeps_a_plain_key_whole() -> None:
+    """R3: the hook masks the password only; an unknown key that is not a
+    credential is named in full, so the redaction is not over-broad."""
+
+    import modules.streamerbot as streamerbot
+
+    settings = {
+        "url": "ws://127.0.0.1:9/",
+        "companion_name": "Companion",
+        "password": _AC10_SECRET,
+        "deadlines": {"typo_seconds": 1},
+        _AC10_SECRET: "x",
+    }
+
+    hook = streamerbot.validate_settings(settings)
+
+    assert "module 'streamerbot': field '[REDACTED]': is not a setting this module declares" in hook
+    assert any("deadlines.typo_seconds" in line for line in hook)
+
+
+def test_ac10_the_schema_validator_masks_only_the_matching_key_segment() -> None:
+    """R3: ``validate_against_schema`` routes every key it names through the
+    redaction primitive; without a redaction set the path is unchanged."""
+
+    from core.contracts import validate_against_schema
+
+    schema = {
+        "type": "object",
+        "properties": {"outer": {"type": "object", "additionalProperties": False}},
+    }
+    value = {"outer": {_AC10_SECRET: 1}}
+
+    with pytest.raises(ContractError) as masked:
+        validate_against_schema(value, schema, label="settings", redact=[_AC10_SECRET])
+    with pytest.raises(ContractError) as plain:
+        validate_against_schema(value, schema, label="settings")
+
+    assert masked.value.field == "settings.outer.[REDACTED]"
+    assert plain.value.field == f"settings.outer.{_AC10_SECRET}"
