@@ -254,6 +254,10 @@ def test_the_guide_prints_the_commands_the_code_still_has(document: Path) -> Non
     (R8). The commands the guides walk the reader through — the check, the
     run, the configuration UI and the demo — must still be among them, with
     the check flag on the guide's profile.
+
+    On each guide, the pre-fix test's exact assertions still hold on top of the
+    resolution: the run and the configuration UI carry the guide's profile
+    argument, so a UI command pointed at another file fails (N2, R10/AC38).
     """
 
     text = _text(document)
@@ -263,6 +267,9 @@ def test_the_guide_prints_the_commands_the_code_still_has(document: Path) -> Non
     assert {"core.main", "core.config_ui", "demo"} <= set(modules)
     if document in GUIDES:
         assert f"--config {PROFILE_NAME} --check-config" in text
+        assert f"python -m core.main --config {PROFILE_NAME}" in text
+        assert f"python -m core.config_ui --config {PROFILE_NAME}" in text
+        assert "python -m demo" in text
 
 
 def test_the_pre_fix_readme_line_does_not_resolve() -> None:

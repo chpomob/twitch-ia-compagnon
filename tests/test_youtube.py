@@ -1788,6 +1788,10 @@ async def test_ac39_three_platforms_on_one_runtime() -> None:
         )
         assert status == 200
         await settle(100)
+        # The pre-F11 count still holds here: one list, which is now the
+        # priming page, so only the kick session is live yet (R5, F11).
+        assert api.counts["list"] == 1
+        assert scheduler.live_sessions == 1
         # The youtube message follows the priming page, listed one poll
         # later (R5, F11): two lists where the first admitted it before.
         clock.advance(POLL_SECONDS)
