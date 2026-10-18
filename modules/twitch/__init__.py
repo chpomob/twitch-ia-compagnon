@@ -213,6 +213,28 @@ _CHAT_SEND_TIMEOUT_SECONDS = 10.0
 _STATUS_REFUSED = "refused"
 _NON_RETRYABLE_CLOSE_CODES = {4001, 4003}
 
+CHAT_MESSAGE_MAX_CHARACTERS = 500
+"""The platform's limit on one chat message, in Unicode code points (phase 6 R6).
+
+``chat.write`` refuses longer text before any request leaves (F24): Python's
+``len`` on ``str`` counts code points, as the platform does.
+"""
+
+KEEPALIVE_MARGIN_SECONDS = 5.0
+"""Slack added to the welcome's ``keepalive_timeout_seconds`` (phase 6 R5).
+
+A socket silent for longer than keepalive + this margin, measured on the
+module's clock, is treated as lost and recovered on a new socket (F10).
+"""
+
+_AUTHENTICATION_STATUSES = frozenset({401, 403})
+"""Chat subscription refusals that end recovery until a restart (phase 6 R5, F9).
+
+A refused credential does not heal by reconnecting, so recovery reports
+``module.degraded`` once and opens no further socket. A token that expires
+mid-stream is treated the same way: terminal, never refreshed here.
+"""
+
 DEFAULT_MAX_PENDING_SENT_TRACES = 64
 """How many ``channel.chat.sent`` publications may be outstanding at once (R6).
 
@@ -299,6 +321,7 @@ _ERROR_PLATFORM_REJECTED = "platform_rejected"
 _ERROR_TRANSPORT_FAILED = "transport_failed"
 _ERROR_TIMED_OUT = "timed_out"
 _ERROR_MALFORMED_RESPONSE = "malformed_response"
+_ERROR_TEXT_TOO_LONG = "text_too_long"
 
 _STATUS_SUCCESS = "success"
 _STATUS_ERROR = "error"
@@ -316,9 +339,22 @@ class _SubscriptionRefused(TwitchModuleError):
     refusal in a health report.
     """
 
-    def __init__(self, message: str, detail: str) -> None:
+    def __init__(self, message: str, detail: str, status: int | None = None) -> None:
         super().__init__(message)
         self.detail = detail
+        self.status = status
+
+
+class _RecoveryRefused(TwitchModuleError):
+    """The chat subscription was refused for authentication: recovery ends (F9)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("twitch recovery: authentication refused")
+        self.reason = reason
+
+
+class _KeepaliveExpired(Exception):
+    """No frame arrived within the welcome's keepalive plus the margin (F10)."""
 
 
 # The business settings this module owns (R7). ``companion_name`` is required
@@ -1047,6 +1083,12 @@ class TwitchModule:
         self._executor = runtime.executor
         clock = getattr(context, "clock", None)
         self._clock: Callable[[], float] = clock if callable(clock) else time.monotonic
+        # The module's clock waits through its own ``sleep`` when it has one
+        # (a manual clock does), so the keepalive bound runs on that clock.
+        sleeper = getattr(clock, "sleep", None)
+        self._sleep: Callable[[float], Awaitable[None]] = (
+            sleeper if callable(sleeper) else asyncio.sleep
+        )
         # ``call_id`` -> correlation of the ``channel.chat.send`` publications
         # being invoked right now: what lets the provider tell its own
         # compatibility calls from any other ``chat.write`` call (phase 6 R1).
@@ -1212,13 +1254,14 @@ class TwitchModule:
 
         websocket = await self._connect(EVENTSUB_URL)
         try:
-            session_id = await self._receive_welcome(websocket)
+            session_id, keepalive = await self._receive_welcome(websocket)
             await self._subscribe(session_id)
             self._websocket = websocket
             # Owned by the supervised registry: its failure is observed under
             # this module's name and shutdown never orphans it.
             self._receive_task = self._tasks.spawn(
-                self._receive_forever(websocket), name="twitch-eventsub-receiver"
+                self._receive_forever(websocket, keepalive),
+                name="twitch-eventsub-receiver",
             )
         except BaseException:
             self._websocket = None
@@ -1472,6 +1515,13 @@ class TwitchModule:
                 _STATUS_ERROR,
                 _ERROR_INVALID_ARGUMENTS,
                 "text and parent_message_id must be non-blank strings",
+            )
+        if len(text) > CHAT_MESSAGE_MAX_CHARACTERS:
+            self._diagnose("twitch chat send: text too long")
+            return failure(
+                _STATUS_REFUSED,
+                _ERROR_TEXT_TOO_LONG,
+                f"text exceeds {CHAT_MESSAGE_MAX_CHARACTERS} characters",
             )
         destination = call.destination
         if (
@@ -1899,7 +1949,13 @@ class TwitchModule:
             self._diagnose("twitch websocket: connection failed")
             raise TwitchModuleError("twitch websocket connection failed") from None
 
-    async def _receive_welcome(self, websocket: Any) -> str:
+    async def _receive_welcome(self, websocket: Any) -> tuple[str, float | None]:
+        """The session id and the keepalive the welcome announces.
+
+        The keepalive is ``None`` when the welcome carries no positive finite
+        ``keepalive_timeout_seconds``: that socket's receive stays unbounded.
+        """
+
         try:
             frame = await websocket.receive()
             envelope = _decode_text_frame(frame)
@@ -1913,7 +1969,15 @@ class TwitchModule:
                 or not session_id
             ):
                 raise ValueError
-            return session_id
+            keepalive = session.get("keepalive_timeout_seconds")
+            if (
+                isinstance(keepalive, bool)
+                or not isinstance(keepalive, (int, float))
+                or not math.isfinite(keepalive)
+                or keepalive <= 0
+            ):
+                return session_id, None
+            return session_id, float(keepalive)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1998,7 +2062,11 @@ class TwitchModule:
         ):
             detail = f"rejected (status {_safe_status(status)})"
             self._diagnose(f"{label}: {detail}")
-            raise _SubscriptionRefused("twitch subscription rejected", detail)
+            raise _SubscriptionRefused(
+                "twitch subscription rejected",
+                detail,
+                status if isinstance(status, int) else None,
+            )
 
     async def _report_degraded(self, reason: str, *capabilities: str) -> None:
         """Report *capabilities* degraded on the health surface; chat continues.
@@ -2020,13 +2088,16 @@ class TwitchModule:
         except Exception:
             self._diagnose(reason)
 
-    async def _receive_forever(self, initial_websocket: Any) -> None:
+    async def _receive_forever(
+        self, initial_websocket: Any, initial_keepalive: float | None = None
+    ) -> None:
         websocket = initial_websocket
+        keepalive = initial_keepalive
         retry_attempt = 0
         connected_at = asyncio.get_running_loop().time()
         try:
             while not self._closed and not self._stopping:
-                result = await self._consume(websocket)
+                result = await self._consume(websocket, keepalive=keepalive)
                 if self._closed or self._stopping:
                     return
                 socket_already_closed = False
@@ -2046,15 +2117,15 @@ class TwitchModule:
                     return
 
                 if result.action == "handoff" and result.reconnect_url is not None:
-                    drain_task = self._start_handoff_drain(websocket)
+                    drain_task = self._start_handoff_drain(websocket, keepalive)
                     if self._websocket is websocket:
                         self._websocket = None
                     replacement = await self._connect_for_recovery(
                         result.reconnect_url, subscribe=False
                     )
                     if replacement is not None:
-                        websocket = replacement
-                        self._websocket = replacement
+                        websocket, keepalive = replacement
+                        self._websocket = websocket
                         connected_at = asyncio.get_running_loop().time()
                         continue
                     await self._cancel_handoff_drain(drain_task)
@@ -2076,13 +2147,20 @@ class TwitchModule:
                     await _resolve(self._retry_delay(delay))
                     if self._closed or self._stopping:
                         return
-                    replacement = await self._connect_for_recovery(
-                        EVENTSUB_URL, subscribe=True
-                    )
+                    try:
+                        replacement = await self._connect_for_recovery(
+                            EVENTSUB_URL, subscribe=True
+                        )
+                    except _RecoveryRefused as refused:
+                        # Terminal until restart (F9): one degraded report,
+                        # no further socket and no further subscription.
+                        self._diagnose("twitch recovery: stopped, authentication refused")
+                        await self._report_degraded(refused.reason, _CHAT_FAMILY)
+                        return
                 if replacement is None:
                     return
-                websocket = replacement
-                self._websocket = replacement
+                websocket, keepalive = replacement
+                self._websocket = websocket
                 connected_at = asyncio.get_running_loop().time()
         except asyncio.CancelledError:
             raise
@@ -2090,9 +2168,11 @@ class TwitchModule:
             # No external exception text is copied into diagnostics.
             self._diagnose("twitch websocket receive: unexpected failure")
 
-    def _start_handoff_drain(self, websocket: Any) -> asyncio.Task[None]:
+    def _start_handoff_drain(
+        self, websocket: Any, keepalive: float | None
+    ) -> asyncio.Task[None]:
         task = asyncio.create_task(
-            self._drain_handoff_socket(websocket),
+            self._drain_handoff_socket(websocket, keepalive),
             name="twitch-eventsub-handoff-drain",
         )
         self._handoff_tasks.add(task)
@@ -2105,9 +2185,13 @@ class TwitchModule:
         with suppress(asyncio.CancelledError, Exception):
             await task
 
-    async def _drain_handoff_socket(self, websocket: Any) -> None:
+    async def _drain_handoff_socket(
+        self, websocket: Any, keepalive: float | None
+    ) -> None:
         try:
-            result = await self._consume(websocket, allow_handoff=False)
+            result = await self._consume(
+                websocket, allow_handoff=False, keepalive=keepalive
+            )
             if result.diagnostic == "twitch subscription: revoked":
                 self._diagnose(result.diagnostic)
         except asyncio.CancelledError:
@@ -2119,32 +2203,79 @@ class TwitchModule:
 
     async def _connect_for_recovery(
         self, url: str, *, subscribe: bool
-    ) -> Any | None:
+    ) -> tuple[Any, float | None] | None:
+        """A welcomed (and, with *subscribe*, subscribed) replacement socket.
+
+        ``None`` is a transient failure the caller retries. A chat
+        subscription refused 401 or 403 raises :class:`_RecoveryRefused`
+        instead: recovery cannot heal a refused credential (F9).
+        """
+
         try:
             websocket = await self._connect(url)
             try:
-                session_id = await self._receive_welcome(websocket)
+                session_id, keepalive = await self._receive_welcome(websocket)
                 if subscribe:
                     await self._subscribe(session_id)
             except BaseException:
                 await _close_websocket(websocket)
                 raise
-            return websocket
+            return websocket, keepalive
         except asyncio.CancelledError:
             raise
+        except _SubscriptionRefused as refused:
+            if refused.status in _AUTHENTICATION_STATUSES:
+                raise _RecoveryRefused(
+                    f"chat subscription {refused.detail}: authentication refused"
+                ) from None
+            return None
         except TwitchModuleError:
             return None
 
+    async def _receive_frame(self, websocket: Any, keepalive: float | None) -> Any:
+        """One ``receive``, bounded by *keepalive* + the margin on the module's clock.
+
+        Unbounded when the welcome announced no keepalive. Expiry raises
+        :class:`_KeepaliveExpired`; a frame that arrived first always wins.
+        """
+
+        if keepalive is None:
+            return await websocket.receive()
+        receive = asyncio.ensure_future(websocket.receive())
+        expiry = asyncio.ensure_future(self._sleep(keepalive + KEEPALIVE_MARGIN_SECONDS))
+        try:
+            await asyncio.wait({receive, expiry}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (receive, expiry):
+                if not pending.done():
+                    pending.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await pending
+        if receive.done() and not receive.cancelled():
+            return receive.result()
+        raise _KeepaliveExpired
+
     async def _consume(
-        self, websocket: Any, *, allow_handoff: bool = True
+        self,
+        websocket: Any,
+        *,
+        allow_handoff: bool = True,
+        keepalive: float | None = None,
     ) -> _ConsumeResult:
-        """Consume one socket until it needs handoff, retry, or shutdown."""
+        """Consume one socket until it needs handoff, retry, or shutdown.
+
+        Every receive is bounded by *keepalive* + :data:`KEEPALIVE_MARGIN_SECONDS`;
+        a silent socket is lost and recovered like any other loss (F10).
+        """
 
         while not self._closed and not self._stopping:
             try:
-                frame = await websocket.receive()
+                frame = await self._receive_frame(websocket, keepalive)
             except asyncio.CancelledError:
                 raise
+            except _KeepaliveExpired:
+                self._diagnose("twitch websocket receive: keepalive timeout")
+                return _ConsumeResult("retry")
             except Exception:
                 self._diagnose("twitch websocket receive: connection lost")
                 return _ConsumeResult("retry")

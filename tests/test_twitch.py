@@ -43,6 +43,7 @@ from conftest import (
     helix_refusal,
     helix_timeout_applied,
     runtime_context as build_context,
+    settle,
     trace_texts,
     wait_until,
 )
@@ -3532,5 +3533,250 @@ async def test_a_notification_owned_elsewhere_is_dropped_by_the_guard() -> None:
         await _ingest(handle, notification("m-1", "hello Companion"))
         assert chat_events(bus) == []
         assert rejections() == before + 1
+    finally:
+        await handle.close()
+
+
+# -- phase 6 P9: input recovery and output bounds (R5, R6) ------------------ #
+
+
+def keepalive_welcome(session_id: str, keepalive: Any) -> dict[str, Any]:
+    frame = welcome(session_id)
+    frame["payload"]["session"]["keepalive_timeout_seconds"] = keepalive
+    return frame
+
+
+def subscription_posts(session: FakeSession) -> list[dict[str, Any]]:
+    return [c for c in session.post_calls if c["url"] == EVENTSUB_SUBSCRIPTIONS_URL]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_ac16_an_authentication_refusal_of_the_chat_subscription_ends_recovery(
+    status: int,
+) -> None:
+    """AC16 (R5, F9): the socket is lost and recovery's chat subscription is
+    answered *status*: exactly 1 ``module.degraded`` with an authentication
+    reason, and over a simulated 60 s recovery opens exactly 1 socket and
+    makes exactly 1 subscription POST — the refused one — and no more."""
+
+    clock = ManualClock()
+    context = module_context(clock=clock)
+    first = FakeWebSocket(welcome("one"), close_frame(4005))
+    replacements = [FakeWebSocket(welcome(f"retry-{n}")) for n in range(40)]
+    session = FakeSession(
+        [first, *replacements],
+        subscriptions=[
+            FakeResponse(202, {"data": [{}]}),
+            *(
+                FakeResponse(status, {"message": SETTINGS["access_token"]})
+                for _ in range(40)
+            ),
+        ],
+    )
+    diagnostics: list[str] = []
+    settings = {
+        **SETTINGS,
+        "_session_factory": lambda: session,
+        "_retry_delay": clock.sleep,
+        "diagnostic_reporter": diagnostics.append,
+    }
+    handle = await start_module(settings, context=context)
+    try:
+        for _ in range(240):  # 60 s of simulated time
+            await settle()
+            clock.advance(0.25)
+        await settle()
+
+        assert session.ws_calls == [EVENTSUB_URL, EVENTSUB_URL]
+        assert len(subscription_posts(session)) == 2
+        (degraded,) = events_of(context.bus, TRACE_MODULE_DEGRADED)
+        assert degraded["payload"]["module"] == "twitch"
+        assert degraded["payload"]["capabilities"] == ["chat"]
+        assert "authentication" in degraded["payload"]["reason"]
+        assert f"status {status}" in degraded["payload"]["reason"]
+        assert replacements[0].close_calls == 1
+        assert f"twitch subscription: rejected (status {status})" in diagnostics
+        assert_sanitized(diagnostics)
+        assert SETTINGS["access_token"] not in str(context.bus.list_events())
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_transient_refusal_of_the_chat_subscription_still_recovers() -> None:
+    """R5, F9: only 401/403 end recovery; a 503 is retried and the next
+    subscription restores chat, with no degraded report."""
+
+    first = FakeWebSocket(welcome("one"), close_frame(4005))
+    second = FakeWebSocket(welcome("two"))
+    third = FakeWebSocket(welcome("three"), notification("message-3"))
+    session = FakeSession(
+        [first, second, third],
+        subscriptions=[
+            FakeResponse(202, {"data": [{}]}),
+            FakeResponse(503, {}),
+            FakeResponse(202, {"data": [{}]}),
+        ],
+    )
+    context = module_context()
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    try:
+        await wait_until(lambda: len(chat_events(bus)) == 1)
+        assert session.ws_calls == [EVENTSUB_URL] * 3
+        assert events_of(bus, TRACE_MODULE_DEGRADED) == []
+        assert diagnostics == ["twitch subscription: rejected (status 503)"]
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac17_a_socket_silent_past_its_keepalive_is_recovered() -> None:
+    """AC17 (R5, F10): a welcome announcing ``keepalive_timeout_seconds: 10``
+    then silence: no recovery before 10 s; a new socket and a diagnostic
+    within 10 s + the margin, on the module's manual clock."""
+
+    from modules.twitch import KEEPALIVE_MARGIN_SECONDS
+
+    clock = ManualClock()
+    context = module_context(clock=clock)
+    first = FakeWebSocket(keepalive_welcome("one", 10))
+    second = FakeWebSocket(welcome("two"), notification("after-recovery"))
+    session = FakeSession(
+        [first, second],
+        subscriptions=[
+            FakeResponse(202, {"data": [{}]}),
+            FakeResponse(202, {"data": [{}]}),
+        ],
+    )
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    try:
+        await settle()
+        clock.advance(9.99)
+        await settle()
+        assert session.ws_calls == [EVENTSUB_URL]
+        assert first.close_calls == 0
+        assert diagnostics == []
+
+        clock.advance(10.0 + KEEPALIVE_MARGIN_SECONDS - 9.99)
+        await wait_until(lambda: len(chat_events(bus)) == 1)
+        assert session.ws_calls == [EVENTSUB_URL, EVENTSUB_URL]
+        assert first.close_calls == 1
+        assert diagnostics == ["twitch websocket receive: keepalive timeout"]
+        assert [
+            c["json"]["transport"]["session_id"] for c in subscription_posts(session)
+        ] == ["one", "two"]
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_every_frame_restarts_the_keepalive_bound() -> None:
+    """R5, F10: the bound is per receive, so a keepalive frame arriving in
+    time keeps the socket; only silence after it counts."""
+
+    from modules.twitch import KEEPALIVE_MARGIN_SECONDS
+
+    clock = ManualClock()
+    context = module_context(clock=clock)
+    first = FakeWebSocket(keepalive_welcome("one", 10))
+    session = FakeSession([first, FakeWebSocket(welcome("two"))])
+    handle, _bus, diagnostics = await activate_with(session, context=context)
+    try:
+        await settle()
+        clock.advance(10.0)
+        first.feed({"metadata": {"message_type": "session_keepalive"}, "payload": {}})
+        await settle()
+        clock.advance(10.0 + KEEPALIVE_MARGIN_SECONDS - 0.01)
+        await settle()
+        assert session.ws_calls == [EVENTSUB_URL]
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_session_reconnect_handover_is_not_a_keepalive_recovery() -> None:
+    """R5, F10 (risk): a legitimate ``session_reconnect`` hands over to the
+    announced URL without resubscribing, and the replacement's own keepalive
+    then bounds it: no fresh session before that bound expires."""
+
+    from modules.twitch import KEEPALIVE_MARGIN_SECONDS
+
+    reconnect_url = "wss://eventsub.wss.twitch.tv/reconnect/session"
+    clock = ManualClock()
+    context = module_context(clock=clock)
+    first = FakeWebSocket(
+        keepalive_welcome("one", 10),
+        {
+            "metadata": {"message_type": "session_reconnect"},
+            "payload": {"session": {"reconnect_url": reconnect_url}},
+        },
+    )
+    second = FakeWebSocket(keepalive_welcome("one", 10))
+    session = FakeSession([first, second])
+    handle, _bus, diagnostics = await activate_with(session, context=context)
+    try:
+        await wait_until(lambda: len(session.ws_calls) == 2)
+        await settle()
+        clock.advance(10.0 + KEEPALIVE_MARGIN_SECONDS - 0.01)
+        await settle()
+        assert session.ws_calls == [EVENTSUB_URL, reconnect_url]
+        assert len(subscription_posts(session)) == 1
+        assert second.close_calls == 0
+        assert diagnostics == []
+    finally:
+        await handle.close()
+    # The replacement socket is the one shutdown closes, not a stale tuple.
+    assert second.close_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_ac23_chat_write_refuses_text_over_500_characters_before_any_request() -> None:
+    """AC23 (R6, F24): 501 characters is refused with 0 POSTs; exactly 500
+    code points — multi-byte ones included, as the platform counts — is 1
+    POST."""
+
+    context = module_context()
+    grant_chat_write(context)
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    executor = context.executor
+    try:
+        too_long = await executor.invoke(
+            chat_write_call("call-long", arguments={"text": "a" * 501})
+        )
+        assert too_long.status == "refused"
+        assert too_long.error["code"] == "text_too_long"
+        assert too_long.provenance["emission"] == "not_emitted"
+        assert helix_chat_posts(session) == []
+        assert handle.send_record.emitted == 0
+
+        at_limit = "é😀" * 250
+        assert len(at_limit) == 500 and len(at_limit.encode("utf-8")) > 500
+        sent = await executor.invoke(
+            chat_write_call("call-limit", arguments={"text": at_limit})
+        )
+        assert sent.status == "success"
+        (post,) = helix_chat_posts(session)
+        assert post["json"]["message"] == at_limit
+        assert diagnostics == ["twitch chat send: text too long"]
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac23_the_compatibility_route_reaches_the_500_character_check() -> None:
+    """AC23 (R6, F24) through P2's route: a 501-character
+    ``channel.chat.send`` is refused through ``chat.write`` with 0 POSTs."""
+
+    context = compatibility_context()
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, bus, _diagnostics = await activate_with(session, context=context)
+    try:
+        result = await bus.publish("channel.chat.send", {"text": "b" * 501}, {})
+        assert helix_chat_posts(session) == []
+        assert result["metadata"]["delivery_status"] == "failed"
+        assert result["metadata"]["delivery_outcome"] == "refused"
     finally:
         await handle.close()
