@@ -1,4 +1,6 @@
+import re
 from functools import partial
+from pathlib import Path
 
 import pytest
 
@@ -379,15 +381,73 @@ _VALID_LIMITS = {
 def test_absent_or_non_finite_limit_is_rejected_naming_the_setting(
     setting: str, invalid: object
 ) -> None:
-    """AC20 (R6): every bound is validated as finite and positive, by name."""
+    """AC20 (R6): every bound is validated as finite and positive, by name.
 
-    assert EventBus(**_VALID_LIMITS) is not None
+    F32 (R9): the valid-limits construction is checked against the bounds it
+    configures, not against a constructor result that can never be ``None``.
+    """
+
+    assert EventBus(**_VALID_LIMITS).history_limits == _VALID_LIMITS
 
     limits = dict(_VALID_LIMITS, **{setting: invalid})
     with pytest.raises((TypeError, ValueError)) as caught:
         EventBus(**limits)
 
     assert setting in str(caught.value)
+
+
+def test_no_constructor_result_is_asserted_merely_not_none() -> None:
+    """AC36 (R9, F32): no assertion here is ``<constructor>(...) is not None``."""
+
+    source = Path(__file__).read_text(encoding="utf-8")
+    tautology = re.compile(r"assert\s+[A-Z]\w*\(.*\)\s+is\s+not\s+None")
+    assert tautology.findall(source) == []
+
+
+class _Uncopyable:
+    """A payload value whose deep copy always fails."""
+
+    def __deepcopy__(self, memo: dict) -> object:
+        raise TypeError("cannot copy this value")
+
+
+@pytest.mark.asyncio
+async def test_retention_copy_failure_is_a_publication_error_with_history_record() -> (
+    None
+):
+    """AC28 (R7, F33): a payload the history cannot copy fails the publication.
+
+    The failure is a ``PublicationError`` naming the event type and chaining
+    the copy error, and the history keeps a payload-free record of it.
+    """
+
+    bus = EventBus()
+    before = await bus.publish("channel.chat.message", {"text": "kept"}, {})
+
+    with pytest.raises(PublicationError) as caught:
+        await bus.publish("channel.chat.uncopyable", {"value": _Uncopyable()}, {})
+
+    assert caught.value.event_type == "channel.chat.uncopyable"
+    assert "channel.chat.uncopyable" in str(caught.value)
+    assert isinstance(caught.value.cause, TypeError)
+    assert caught.value.__cause__ is caught.value.cause
+    assert caught.value.handler is None
+
+    history = bus.list_events()
+    assert history[0] == before
+    assert history[1:] == [
+        {
+            "type": "channel.chat.uncopyable",
+            "payload": {},
+            "metadata": {
+                "publication_failed": True,
+                "reason": "retention_copy_failed: TypeError",
+            },
+        }
+    ]
+
+    after = await bus.publish("channel.chat.message", {"text": "next"}, {})
+    assert bus.list_events()[-1] == after
 
 
 def test_non_callable_clock_is_rejected() -> None:

@@ -18,6 +18,10 @@ Event = dict[str, Any]
 Handler = Callable[[Event], Any]
 Clock = Callable[[], float]
 
+#: Metadata key marking a history record that stands for a publication whose
+#: event could not be retained (F33); the record carries no payload.
+PUBLICATION_FAILED_MARKER = "publication_failed"
+
 #: Retention defaults applied when a caller configures no explicit bound. They
 #: are finite by construction; ``core.main`` overrides them from configuration
 #: and a non-finite or absent configured value is rejected here (R6).
@@ -34,23 +38,35 @@ def matches_event_pattern(pattern: str, event_type: str) -> bool:
 
 
 class PublicationError(RuntimeError):
-    """Raised when a subscriber fails while handling a publication."""
+    """Raised when a publication fails in a subscriber or while being retained.
+
+    A subscriber failure names the handler. A retention failure (the history's
+    copy of the finalized event could not be made, F33) carries no handler:
+    ``handler`` and ``handler_identity`` are ``None``.
+    """
 
     def __init__(
         self,
         event_type: str,
-        handler: Handler,
-        handler_identity: str,
+        handler: Handler | None,
+        handler_identity: str | None,
         cause: Exception,
     ) -> None:
         self.event_type = event_type
         self.handler = handler
         self.handler_identity = handler_identity
         self.cause = cause
-        super().__init__(
-            f"Publication of {event_type!r} failed in handler "
-            f"{handler_identity!r}: {cause}"
-        )
+        if handler_identity is None:
+            message = (
+                f"Publication of {event_type!r} failed while retaining it in "
+                f"history: {cause}"
+            )
+        else:
+            message = (
+                f"Publication of {event_type!r} failed in handler "
+                f"{handler_identity!r}: {cause}"
+            )
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +128,16 @@ class EventBus:
         self._history_bytes = 0
         self._next_registration = 0
 
+    @property
+    def history_limits(self) -> dict[str, int | float]:
+        """Return the configured history bounds, keyed by their setting names."""
+
+        return {
+            "history_max_events": self._history_max_events,
+            "history_max_bytes": self._history_max_bytes,
+            "history_max_age_seconds": self._history_max_age_seconds,
+        }
+
     def subscribe(self, pattern: str, handler: Handler, order: int = 0) -> None:
         """Register *handler* for *pattern* at the requested chain order.
 
@@ -145,10 +171,14 @@ class EventBus:
         The matching chain is selected from the original event type. A mapping
         returned by a handler is a complete replacement; the literal ``False``
         stops the chain and records the event without invoking later handlers.
-        Failed publications are not added to history.
+        A publication failed by a handler is not added to history.
 
         Retention is applied only once the chain has returned, so a saturated
-        history evicts older records instead of failing this publication.
+        history evicts older records instead of failing this publication. If
+        the history's copy of the finalized event cannot be made, a minimal
+        failure record (type, failure marker, reason; no payload) is retained
+        instead and :class:`PublicationError` is raised naming the event type
+        (F33, R7).
         """
 
         event_segments = _validate_event_type(event_type)
@@ -189,7 +219,18 @@ class EventBus:
                     cause=exc,
                 ) from exc
 
-        self._retain(event)
+        try:
+            retained = deepcopy(event)
+        except Exception as exc:
+            self._retain(_retention_failure_record(event_type, exc))
+            raise PublicationError(
+                event_type=event_type,
+                handler=None,
+                handler_identity=None,
+                cause=exc,
+            ) from exc
+
+        self._retain(retained)
         return event
 
     def list_events(self) -> list[Event]:
@@ -202,16 +243,15 @@ class EventBus:
         self._evict()
         return [deepcopy(record.event) for record in self._history]
 
-    def _retain(self, event: Event) -> None:
-        """Append *event* to the history, then evict until every bound holds.
+    def _retain(self, retained: Event) -> None:
+        """Append the *retained* copy to the history, then evict to the bounds.
 
         Called strictly after the handler chain has run, so a saturated history
-        can never fail a publication (AC20). The byte size is measured once,
-        here, and cached on the record rather than recomputed on every
-        eviction pass.
+        can never fail a publication (AC20). The caller hands over a copy the
+        history owns. The byte size is measured once, here, and cached on the
+        record rather than recomputed on every eviction pass.
         """
 
-        retained = deepcopy(event)
         record = _HistoryRecord(
             event=retained,
             timestamp=self._clock(),
@@ -385,6 +425,24 @@ def _measure_event_bytes(event: Event) -> int:
         # traversal, which still measures the contents that stay retained.
         return opaque_bytes + _retained_size(event, seen)
     return opaque_bytes + len(serialized.encode("utf-8", "surrogatepass"))
+
+
+def _retention_failure_record(event_type: str, cause: Exception) -> Event:
+    """Build the copy-safe history record of a publication not retained.
+
+    Only strings are kept: the payload that failed to copy is never referenced,
+    and the reason names the cause's class rather than its message, which may
+    echo payload values.
+    """
+
+    return {
+        "type": event_type,
+        "payload": {},
+        "metadata": {
+            PUBLICATION_FAILED_MARKER: True,
+            "reason": f"retention_copy_failed: {type(cause).__name__}",
+        },
+    }
 
 
 def _validated_replacement(replacement: Mapping[str, Any]) -> Event:
