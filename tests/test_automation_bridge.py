@@ -1832,6 +1832,96 @@ async def test_ac25_a_failed_start_retries_and_a_success_reports_ready() -> None
             await bridge.stop()
 
 
+def _raising_reconcile_trace(bridge: _Bridge, *, times: int | None) -> list[str]:
+    """Make the bridge's reconcile trace raise *times* times (``None``: always).
+
+    Every other supervision call goes through; the returned list records each
+    raised trace.
+    """
+
+    supervision = bridge.handle._supervision
+    raised: list[str] = []
+
+    class Raising:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(supervision, name)
+
+        def emit(self, event_type: str, payload: Mapping[str, Any], **kwargs: Any) -> Any:
+            if event_type == streamerbot.TRACE_ALLOWLIST_RECONCILED and (
+                times is None or len(raised) < times
+            ):
+                raised.append(event_type)
+                raise RuntimeError("supervision unavailable")
+            return supervision.emit(event_type, payload, **kwargs)
+
+    bridge.handle._supervision = Raising()
+    return raised
+
+
+async def test_ac15_phase6_a_raising_reconcile_trace_leaves_the_owner_alive() -> None:
+    """Phase 6 AC15 (R5, F8): a supervision ``emit`` raising during the
+    reconcile trace does not end the owner task. The connection is closed and
+    cleared, the attempt is reported ``degraded``, and the next attempt under
+    the backoff (manual clock) connects again: connect count == 2."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.activate(url=fake.url, reconnect=RECONNECT)
+        raised = _raising_reconcile_trace(bridge, times=1)
+        assert bridge.coordinator is not None
+        report = await asyncio.wait_for(bridge.coordinator.start(), FAKE_WAIT_SECONDS)
+        try:
+            assert report.status == 0, report.diagnostics
+            assert raised == [streamerbot.TRACE_ALLOWLIST_RECONCILED]
+            owner = bridge.handle._owner
+            assert owner is not None and not owner.done()
+            await asyncio.wait_for(fake.wait_for_disconnections(1), FAKE_WAIT_SECONDS)
+            assert not bridge.handle.connected and not bridge.run_ready
+            assert bridge.handle._connection is None
+            assert bridge.state == "degraded"
+            assert bridge.health()[-1] == (TRACE_MODULE_DEGRADED, "unreachable")
+
+            await _until(lambda: bridge.clock.next_deadline() is not None)
+            assert bridge.delays == [RECONNECT["min_delay_seconds"]]
+            assert fake.connections == 1
+            bridge.clock.advance(RECONNECT["min_delay_seconds"])
+            await _until(lambda: bridge.state == "ready")
+            assert fake.connections == 2
+            assert bridge.run_ready and bridge.handle._owner is owner and not owner.done()
+        finally:
+            await bridge.stop()
+
+
+async def test_ac15_phase6_a_permanently_raising_trace_keeps_the_backoff() -> None:
+    """Phase 6 R5 (F8): a supervision that raises on every reconcile trace
+    makes no hot loop: each attempt connects once, is closed, and the next
+    waits the doubling, capped delay."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.activate(url=fake.url, reconnect=RECONNECT)
+        raised = _raising_reconcile_trace(bridge, times=None)
+        assert bridge.coordinator is not None
+        report = await asyncio.wait_for(bridge.coordinator.start(), FAKE_WAIT_SECONDS)
+        try:
+            assert report.status == 0, report.diagnostics
+            for attempt, expected in enumerate((1, 2, 4, 4), start=1):
+                await _until(lambda: bridge.clock.next_deadline() is not None)
+                assert bridge.delays[-1] == expected
+                assert fake.connections == attempt == len(raised)
+                await asyncio.wait_for(
+                    fake.wait_for_disconnections(attempt), FAKE_WAIT_SECONDS
+                )
+                bridge.clock.advance(expected)
+            await _until(lambda: len(bridge.delays) == 5)
+            assert bridge.delays == [1, 2, 4, 4, 4]
+            assert fake.connections == 5
+            assert not bridge.run_ready and bridge.state == "degraded"
+            assert bridge.handle._owner is not None and not bridge.handle._owner.done()
+        finally:
+            await bridge.stop()
+
+
 async def test_ac28_cancelling_the_owner_task_propagates_and_releases_the_connection(
 ) -> None:
     """AC28 (R6, connection half): cancelling the connection owner raises

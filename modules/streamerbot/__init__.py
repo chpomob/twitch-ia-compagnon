@@ -2244,11 +2244,12 @@ class AutomationBridge:
             return None
         return answer.result()
 
-    async def _reconcile(self, inventory: Inventory) -> None:
+    async def _reconcile(self, inventory: Inventory) -> bool:
         """Match the allowlist to *inventory*; one value-free trace (R5).
 
         An entry is unmatched when it reaches no action that exists exactly
-        once and is enabled; it is named by its configured name only.
+        once and is enabled; it is named by its configured name only. False
+        when the trace raised: the caller abandons the attempt (phase 6, R5).
         """
 
         reachable: set[str] = set()
@@ -2267,16 +2268,20 @@ class AutomationBridge:
                 reachable.update(found)
             else:
                 unmatched[entry.kind].append(entry.name)
-        await self._supervision.emit(
-            TRACE_ALLOWLIST_RECONCILED,
-            {
-                "module": MODULE_NAME,
-                "entries": len(self._allowlist),
-                "reachable": len(reachable),
-                "unmatched_actions": unmatched["action"],
-                "unmatched_groups": unmatched["group"],
-            },
-        )
+        try:
+            await self._supervision.emit(
+                TRACE_ALLOWLIST_RECONCILED,
+                {
+                    "module": MODULE_NAME,
+                    "entries": len(self._allowlist),
+                    "reachable": len(reachable),
+                    "unmatched_actions": unmatched["action"],
+                    "unmatched_groups": unmatched["group"],
+                },
+            )
+        except Exception:
+            return False
+        return True
 
     async def prepare(self) -> None:
         """Bind the run action and the owned viewer reads; the bridge is not
@@ -2423,7 +2428,13 @@ class AutomationBridge:
             self._connection = None
         self._actions.mark_not_ready()
         await connection.close()
-        await self._supervision.degraded(reason=REASON_UNREACHABLE)
+        try:
+            await self._supervision.degraded(reason=REASON_UNREACHABLE)
+        except Exception:
+            # A raising report must not end the owner (R5): the connection
+            # is already released, so the failure is dropped and the
+            # reconnect loop goes on under its backoff.
+            pass
 
     async def _attempt(self) -> bool:
         """One connection attempt; ready on success, degraded otherwise."""
@@ -2434,7 +2445,8 @@ class AutomationBridge:
             return await self._failed(failure.reason)
         self._inventory = inventory
         self._connection = connection
-        await self._reconcile(inventory)
+        if not await self._reconcile(inventory):
+            return await self._abandon(connection)
         try:
             await self._subscribe(connection)
         except _HandshakeFailure as failure:
@@ -2445,16 +2457,43 @@ class AutomationBridge:
         async with self._health:
             self._first_reported = True
             self._actions.mark_ready()
-            await self._supervision.ready(dropped_events=self._dropped_events)
+            try:
+                await self._supervision.ready(dropped_events=self._dropped_events)
+            except Exception:
+                supervised = False
+            else:
+                supervised = True
+        if not supervised:
+            return await self._abandon(connection)
         self._first_settled.set()
         return True
 
+    async def _abandon(self, connection: _Connection) -> bool:
+        """A supervision call raised during the attempt (R5): release the
+        connection, then report the attempt failed like any other.
+
+        Only ``Exception`` reaches here; a cancellation propagates.
+        """
+
+        if self._connection is connection:
+            self._connection = None
+        self._actions.mark_not_ready()
+        await connection.close()
+        return await self._failed(REASON_UNREACHABLE)
+
     async def _failed(self, reason: str) -> bool:
-        """One failed attempt: one degraded record with its *reason*."""
+        """One failed attempt: one degraded record with its *reason*.
+
+        A raising report is dropped (R5): no connection is held here, and
+        the owner goes on to its next attempt under the backoff.
+        """
 
         async with self._health:
             self._first_reported = True
-            await self._supervision.degraded(reason=reason)
+            try:
+                await self._supervision.degraded(reason=reason)
+            except Exception:
+                pass
         self._first_settled.set()
         return False
 
