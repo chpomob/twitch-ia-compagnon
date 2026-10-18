@@ -1,0 +1,41 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "R7: \"The scan reads, counts or deletes only two kinds of name: record files named exactly `<64 hex>.json`, and the store's own temporary files matching the write's `.viewer-memory-*.tmp` pattern (counted and removed, never read as records).\" This explicitly includes the temporary files required by AC26."
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "AC24: \"with `window_seconds: 600`, a delivery whose signed timestamp is 290 s ahead of the receiver clock is accepted, and the same delivery replayed 580 s later (signed timestamp then 290 s behind the clock, inside the 300 s tolerance at both deliveries) is deduplicated, while a delivery with a fresh message id and that same timestamp at that same instant is accepted (proving the signature check alone does not reject the replay).\""
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "AC33: \"In addition, the README's configuration-UI command, executed as a subprocess exactly as printed with its arguments replaced by `--help`, exits with status 0 within 30 s and prints usage text naming `--config`; the pre-fix README command exits non-zero under the same check.\""
+    },
+    {
+      "id": "S4",
+      "status": "RESOLVED",
+      "evidence": "AC29: \"With a fake player that exits 0.01 s after SIGTERM and a grace of 5 s, `audio_output.stop` returns no later than 0.1 s after the player's recorded exit time (measured from the exit, not from the SIGTERM).\""
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "N1",
+      "severity": "major",
+      "section": "Acceptance criteria — AC38 versus R10 and brief decision 3",
+      "summary": "AC38's docstring exception lets the acceptance check pass when a test is skipped, xfailed or loosened to conceal a failure, contrary to the binding prohibition.",
+      "evidence": "AC38 says: \"The diff of the phase adds no `skip`, `xfail`, or deleted/loosened assertion without a docstring citing a finding id and a requirement id\"; R10 says: \"no test is skipped, xfailed, deleted or broadened to turn red green\". A skipped failing regression accompanied by the specified docstring satisfies AC38's restriction and can leave the suite green while violating R10 and the brief's decision 3; the exception for replacing defective tests does not authorize skipping or xfail."
+    }
+  ],
+  "sound_enough_to_plan_from": false,
+  "summary": "All four challenged findings are resolved by the revised text. AC38 still allows its acceptance check to pass with documented suite weakening that R10 and the brief prohibit. This remaining acceptance gap prevents approval as a planning contract.",
+  "read_files": [
+    "docs/campaigns/phase6/spec.md",
+    "docs/campaigns/phase6/brief.md",
+    "docs/reviews/2026-10-16-full-adversarial-review.md"
+  ]
+}

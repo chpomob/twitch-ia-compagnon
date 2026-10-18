@@ -1,0 +1,46 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "R7: \"The scan reads, counts or deletes only two kinds of name: record files named exactly `<64 hex>.json`, and the store's own temporary files matching the write's `.viewer-memory-*.tmp` pattern (counted and removed, never read as records).\" Temporary files are explicitly permitted."
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "AC24: \"a delivery whose signed timestamp is 290 s ahead of the receiver clock is accepted, and the same delivery replayed 580 s later (signed timestamp then 290 s behind the clock, inside the 300 s tolerance at both deliveries) is deduplicated\". Both deliveries fall within the accepted signature window."
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "AC33: \"In addition, the README's configuration-UI command, executed as a subprocess exactly as printed with its arguments replaced by `--help`, exits with status 0 within 30 s and prints usage text naming `--config`; the pre-fix README command exits non-zero under the same check.\" This requires execution."
+    },
+    {
+      "id": "S4",
+      "status": "RESOLVED",
+      "evidence": "AC29: \"With a fake player that exits 0.01 s after SIGTERM and a grace of 5 s, `audio_output.stop` returns no later than 0.1 s after the player's recorded exit time (measured from the exit, not from the SIGTERM).\" This matches R7's latency bound."
+    },
+    {
+      "id": "N1",
+      "status": "RESOLVED",
+      "evidence": "AC38: \"A docstring never makes a skip, an xfail, a deletion or a loosening acceptable.\" R10 repeats this prohibition, removing the former docstring exception."
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "N2",
+      "severity": "major",
+      "section": "R9 / AC36 / AC38 / Test failure allowlist",
+      "summary": "The mandatory F32 assertion replacement is prohibited by AC38 because its existing test is absent from the replacement allowlist.",
+      "evidence": "R9 requires: \"The tautological `EventBus(...) is not None` assertion is replaced by an assertion that can fail.\" AC36 requires: \"`tests/test_bus.py` contains no `is not None` assertion on a constructor result.\" But AC38 permits replacement \"only for the tests named in the test failure allowlist\", whose eight entries contain no test from `tests/test_bus.py`; merely deleting the assertion is also forbidden. The file is correctly named in targets, but its required change remains disallowed."
+    }
+  ],
+  "sound_enough_to_plan_from": false,
+  "summary": "All five previous findings are resolved. The R/AC identifiers are contiguous, and all eight allowlisted tests are targeted with fixture-only adaptation distinguished from assertion replacement. Approval remains blocked because the required F32 assertion replacement conflicts with AC38's allowlist restriction.",
+  "read_files": [
+    "docs/campaigns/phase6/spec.md",
+    "docs/campaigns/phase6/brief.md",
+    "docs/reviews/2026-10-16-full-adversarial-review.md"
+  ]
+}
