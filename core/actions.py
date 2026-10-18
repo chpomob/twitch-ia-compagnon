@@ -222,6 +222,15 @@ dropped, so a provider can add to the trace but never rewrite it.
 
 _TRACE_FIELD_TYPES = (str, int, float, bool, type(None))
 
+CORRELATION_FIELDS = frozenset({"run_id", "conversation_id"})
+"""The call fields ``invoke(..., correlation=...)`` may replace in supervision.
+
+A call built from a peer's frame carries the peer's own ``run_id`` and
+``conversation_id``; its builder passes locally-defined values for them, and
+``action.started`` / ``action.completed`` publish those instead (phase 6 R2,
+F5). The call itself — what the provider sees — is unchanged.
+"""
+
 # --------------------------------------------------------------------------- #
 # Normalised error codes
 # --------------------------------------------------------------------------- #
@@ -1049,6 +1058,7 @@ class ActionExecutor:
         "_clock",
         "_counters",
         "_in_flight",
+        "_correlations",
         "_max_observation_bytes",
         "_max_outcomes",
         "_outcomes",
@@ -1136,6 +1146,9 @@ class ActionExecutor:
             OrderedDict()
         )
         self._in_flight: dict[str, _InFlight] = {}
+        # The supervision values of each call being invoked with a
+        # ``correlation``, by call object, with how many invocations hold it.
+        self._correlations: dict[int, list[Any]] = {}
         self._provider_invocations = 0
 
     # -- outcome store ------------------------------------------------------ #
@@ -1216,12 +1229,33 @@ class ActionExecutor:
 
     # -- the call ----------------------------------------------------------- #
 
-    async def invoke(self, call: ActionCall) -> ActionObservation:
-        """Run one call to its single terminal observation."""
+    async def invoke(
+        self, call: ActionCall, *, correlation: Mapping[str, str] | None = None
+    ) -> ActionObservation:
+        """Run one call to its single terminal observation.
+
+        ``correlation`` names, for a call built from a peer's frame, the
+        locally-defined values supervision publishes in place of the call's
+        own :data:`CORRELATION_FIELDS` (phase 6 R2, F5); without it the
+        traces carry the call's values.
+        """
 
         if not isinstance(call, ActionCall):
             raise ContractError("ActionExecutor.invoke", "expects an ActionCall")
+        if correlation is None:
+            return await self._invoke(call)
+        labels = _correlation(correlation)
+        key = id(call)
+        held = self._correlations.setdefault(key, [labels, 0])
+        held[1] += 1
+        try:
+            return await self._invoke(call)
+        finally:
+            held[1] -= 1
+            if held[1] == 0 and self._correlations.get(key) is held:
+                del self._correlations[key]
 
+    async def _invoke(self, call: ActionCall) -> ActionObservation:
         identity = _identity(call)
         retained = self._outcomes.get(call.call_id)
         running = self._in_flight.get(call.call_id)
@@ -1385,8 +1419,7 @@ class ActionExecutor:
             "action_version": call.action_version,
             "provider": binding.provider_name if binding is not None else None,
             "call_id": call.call_id,
-            "run_id": call.run_id,
-            "conversation_id": call.conversation_id,
+            **self._traced(call),
             "destination": str(call.destination),
             "nature": spec.nature if spec is not None else None,
             "principal": call.principal,
@@ -2081,8 +2114,7 @@ class ActionExecutor:
             "action_version": call.action_version,
             "provider": observation.provenance.get("provider"),
             "call_id": call.call_id,
-            "run_id": call.run_id,
-            "conversation_id": call.conversation_id,
+            **self._traced(call),
             "destination": str(call.destination),
             "status": observation.status,
             "duration_seconds": duration,
@@ -2098,6 +2130,15 @@ class ActionExecutor:
                 ):
                     payload[name] = value
         return payload
+
+    def _traced(self, call: ActionCall) -> dict[str, str]:
+        """The correlation fields supervision publishes for *call*."""
+
+        traced = {"run_id": call.run_id, "conversation_id": call.conversation_id}
+        held = self._correlations.get(id(call))
+        if held is not None:
+            traced.update(held[0])
+        return traced
 
     def _duration(self, started_at: float) -> float:
         return max(0.0, self._clock() - started_at)
@@ -2305,6 +2346,21 @@ def _detach(task: "asyncio.Future[Any]") -> None:
         return
     task.cancel()
     task.add_done_callback(_consume)
+
+
+def _correlation(value: Any) -> dict[str, str]:
+    """A valid ``invoke`` correlation: :data:`CORRELATION_FIELDS` to text."""
+
+    if not isinstance(value, Mapping):
+        raise ContractError("ActionExecutor.invoke.correlation", "must be a mapping")
+    labels: dict[str, str] = {}
+    for name, label in value.items():
+        if name not in CORRELATION_FIELDS:
+            raise ContractError(
+                "ActionExecutor.invoke.correlation", "names a field it cannot replace"
+            )
+        labels[name] = _require_text(label, "ActionExecutor.invoke.correlation")
+    return labels
 
 
 def _require_text(value: Any, field: str) -> str:

@@ -3954,9 +3954,9 @@ class RecordingExecutor:
         self.inner = inner
         self.calls: list[ActionCall] = []
 
-    async def invoke(self, call: ActionCall) -> ActionObservation:
+    async def invoke(self, call: ActionCall, **kwargs: Any) -> ActionObservation:
         self.calls.append(call)
-        return await self.inner.invoke(call)
+        return await self.inner.invoke(call, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
@@ -4085,6 +4085,109 @@ async def test_p6_ac8_peer_strings_never_enter_diagnostics_or_supervision_record
         assert all(peer_text not in line for line in host.diagnostics)
         assert sum(agent_link.LABEL_UNRECOGNIZED in line for line in host.diagnostics) == 2
         assert any(PROXY_ERROR_INVALID_FRAME in line for line in host.diagnostics)
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize(
+    "field", ["run_id", "conversation_id", "source_event_id", "message_id"]
+)
+@pytest.mark.parametrize("peer_text", [TOKEN, "x" * 4096], ids=["pairing-token", "4KiB"])
+async def test_p6_ac8_peer_call_fields_never_enter_supervision_records(
+    field: str, peer_text: str
+) -> None:
+    """AC8 (R2, F5), probe B: a valid call whose ``run_id`` — or, separately,
+    any other free-text field the agent forwards — is the pairing token or a
+    4 KiB string still executes and its result is returned, yet neither
+    ``action.started`` nor ``action.completed`` nor a diagnostic contains
+    that string. The provider still receives the call the frame named, and
+    the published correlation label is the same for the same peer value."""
+
+    host = AgentHost(heartbeat_seconds=100_000)
+    try:
+        await host.activate()
+        brain = host.connect()
+        await brain.pair_up()
+        for call_id, seq in (("gate-token", 2), ("gate-token-2", 3)):
+            frame = brain.call_frame(call_id, seq)
+            frame[field] = peer_text
+            await brain.send(frame)
+            observation = await brain.observation(call_id)
+            assert observation["status"] == "success", observation
+            assert observation["result"] == capture_result(4)
+        assert [getattr(call, field) for call in host.provider.calls] == [peer_text] * 2
+        assert host.executor.outcome("gate-token").status == "success"
+
+        started = events_of(host.bus, TRACE_ACTION_STARTED)
+        completed = events_of(host.bus, TRACE_ACTION_COMPLETED)
+        assert [e["payload"]["call_id"] for e in started] == ["gate-token", "gate-token-2"]
+        assert [e["payload"]["call_id"] for e in completed] == ["gate-token", "gate-token-2"]
+        assert all(e["payload"]["status"] == "success" for e in completed)
+        assert all(peer_text not in json.dumps(e, default=str) for e in host.bus.list_events())
+        assert all(peer_text not in line for line in host.diagnostics)
+        # The call's identity is published as received, validated, not free text.
+        payload = completed[0]["payload"]
+        assert payload["action"] == SCREEN_CAPTURE
+        assert payload["destination"] == str(CAPTURE_DESTINATION)
+        assert started[0]["payload"]["principal"] == PRINCIPAL
+        # A locally-defined label, stable for one peer value across its calls.
+        for name in ("run_id", "conversation_id"):
+            labels = {e["payload"][name] for e in started + completed}
+            assert len(labels) == 1 and labels.pop().startswith(f"peer-{name}-")
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize("field", ["run_id", "conversation_id"])
+async def test_p6_ac8_a_lone_surrogate_correlation_value_still_executes(field: str) -> None:
+    """AC8 (R2, F5): an escaped lone surrogate (``"\\ud800"``) is valid frame
+    JSON and a valid nonblank call field; labelling it for supervision must
+    not refuse the call — it executes, is traced, and gets a stable label."""
+
+    host = AgentHost(heartbeat_seconds=100_000)
+    try:
+        await host.activate()
+        brain = host.connect()
+        await brain.pair_up()
+        for call_id, seq in (("gate-surrogate", 2), ("gate-surrogate-2", 3)):
+            frame = brain.call_frame(call_id, seq)
+            frame[field] = "\ud800"
+            await brain.send(frame)
+            observation = await brain.observation(call_id)
+            assert observation["status"] == "success", observation
+        assert [getattr(call, field) for call in host.provider.calls] == ["\ud800"] * 2
+        started = events_of(host.bus, TRACE_ACTION_STARTED)
+        completed = events_of(host.bus, TRACE_ACTION_COMPLETED)
+        assert [e["payload"]["call_id"] for e in completed] == [
+            "gate-surrogate",
+            "gate-surrogate-2",
+        ]
+        labels = {e["payload"][field] for e in started + completed}
+        assert len(labels) == 1 and labels.pop().startswith(f"peer-{field}-")
+    finally:
+        await host.close()
+
+
+async def test_p6_ac8_a_locally_built_call_keeps_its_own_trace_fields() -> None:
+    """AC8 (R2, F5) control: the executor's own payloads for a locally-built
+    call — no ``correlation`` — still carry its ``run_id`` and
+    ``conversation_id`` verbatim; only a received call's are relabelled."""
+
+    host = AgentHost(heartbeat_seconds=100_000)
+    try:
+        await host.activate()
+        observation = await host.executor.invoke(
+            capture_call("local-1", deadline=host.clock() + 30)
+        )
+        assert observation.status == "success", observation.error
+        (started,) = events_of(host.bus, TRACE_ACTION_STARTED)
+        (completed,) = events_of(host.bus, TRACE_ACTION_COMPLETED)
+        for event in (started, completed):
+            assert event["payload"]["call_id"] == "local-1"
+            assert event["payload"]["run_id"] == RUN_ID
+            assert event["payload"]["conversation_id"] == "conversation-1"
+        assert started["payload"]["principal"] == PRINCIPAL
+        assert completed["payload"]["status"] == "success"
     finally:
         await host.close()
 

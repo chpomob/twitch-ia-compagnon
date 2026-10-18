@@ -105,10 +105,13 @@ in-memory path enforces.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import inspect
 import ipaddress
 import json
 import math
+import secrets
 import sys
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -118,6 +121,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from core.actions import (
+    CORRELATION_FIELDS,
     ERROR_CALL_ID_CONFLICT,
     ERROR_NOT_AUTHORIZED,
     ERROR_PROVIDER_FAILED,
@@ -693,6 +697,9 @@ class AgentLinkModule:
         self._pairings = 0
         self._execution_count = 0
         self._errors_received = 0
+        # Keys the local labels a received call's correlation fields are
+        # traced under (phase 6 R2, F5): stable per peer value, never it.
+        self._correlation_key = secrets.token_bytes(32)
         self._prepared = False
         self._stopping = False
         self._closed = False
@@ -1357,7 +1364,9 @@ class AgentLinkModule:
         observation: ActionObservation | None = None
         try:
             try:
-                observation = await self._executor.invoke(call)
+                observation = await self._executor.invoke(
+                    call, correlation=self._correlation(call)
+                )
             except Exception as exc:
                 observation = ActionObservation(
                     status="error",
@@ -1389,6 +1398,25 @@ class AgentLinkModule:
                 self._discard_images(observation.parts)
             self._retain(entry, None)
             raise
+
+    def _correlation(self, call: ActionCall) -> dict[str, str]:
+        """The local labels supervision publishes for a received call (R2, F5).
+
+        ``run_id`` and ``conversation_id`` are the peer's free text: the call
+        keeps them for the provider, but the executor's traces carry only a
+        keyed digest of each — the same label for the same peer value, and
+        nothing of the value itself. ``surrogatepass`` keeps a lone escaped
+        surrogate, which the frame's JSON accepts, from failing the call here.
+        """
+
+        return {
+            name: f"peer-{name}-" + hmac.new(
+                self._correlation_key,
+                f"{name}\0{getattr(call, name)}".encode("utf-8", "surrogatepass"),
+                hashlib.sha256,
+            ).hexdigest()[:16]
+            for name in sorted(CORRELATION_FIELDS)
+        }
 
     def _retain(self, entry: _CallEntry, text: str | None) -> None:
         if not entry.future.done():
