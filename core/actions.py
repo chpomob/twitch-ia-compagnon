@@ -73,10 +73,20 @@ into the per-call outcome store — the value :meth:`ActionExecutor.invoke`
 returns and the value the run reads — **before** ``action.completed`` is handed
 to supervision. A publication that fails therefore leaves the observation
 recorded and readable, is counted as a lost trace, and never re-invokes the
-provider, retries the call or downgrades the recorded status. Re-invoking a
-``call_id`` that already has a recorded outcome returns that outcome and reaches
-0 providers, so even a caller that retries after a failed trace cannot produce a
-second external effect.
+provider, retries the call or downgrades the recorded status.
+
+*Replay protection binds the whole call* (phase 6 R1). The store keeps, beside
+each observation, the call's logical identity: principal, session
+(``conversation_id``), action and version, destination and the canonical JSON
+form of the arguments. Re-invoking a ``call_id`` is authorized first, exactly
+like a fresh call; only an authorized reuse with the same identity reads the
+recorded outcome and reaches 0 providers, so a caller that retries after a
+failed trace cannot produce a second external effect. Any other reuse — a
+different identity, or one the policy now refuses — is refused with a new
+observation that copies nothing of the recorded one and never reaches a
+provider. A call still running is kept in an in-flight table: an identical
+concurrent invocation awaits the same terminal observation instead of entering
+the provider a second time.
 
 This module opens no transport and reads time only through an injected clock;
 the timeout race is driven by an injected sleeper, so a timeout can be provoked
@@ -89,6 +99,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -124,6 +135,7 @@ __all__ = [
     "EMISSION_EMITTED",
     "EMISSION_NOT_EMITTED",
     "EMISSION_UNKNOWN",
+    "ERROR_CALL_ID_CONFLICT",
     "ERROR_INVALID_ARGUMENTS",
     "ERROR_INVALID_OBSERVATION",
     "ERROR_INVALID_RESULT",
@@ -233,6 +245,8 @@ ERROR_PROVIDER_FAILED = "provider_failed"
 ERROR_TIMED_OUT = "timed_out"
 ERROR_CANCELLED = "cancelled"
 ERROR_EXTERNAL_UNKNOWN = "external_effect_unknown"
+ERROR_CALL_ID_CONFLICT = "call_id_conflict"
+"""A reused ``call_id`` naming a different logical call (phase 6 R1, F3/F7)."""
 
 REASON_NO_RULE = "no_applicable_rule"
 REASON_MISSING_PERMISSION = "missing_permission"
@@ -1034,6 +1048,7 @@ class ActionExecutor:
         "_cancel_grace",
         "_clock",
         "_counters",
+        "_in_flight",
         "_max_observation_bytes",
         "_max_outcomes",
         "_outcomes",
@@ -1083,6 +1098,10 @@ class ActionExecutor:
             cancel_grace_seconds, (int, float)
         ):
             raise ContractError("ActionExecutor.cancel_grace_seconds", "must be a number")
+        if not math.isfinite(cancel_grace_seconds):
+            raise ContractError(
+                "ActionExecutor.cancel_grace_seconds", "must be a finite number"
+            )
         if cancel_grace_seconds < 0:
             raise ContractError(
                 "ActionExecutor.cancel_grace_seconds", "must not be negative"
@@ -1113,7 +1132,10 @@ class ActionExecutor:
         self._cancel_grace = float(cancel_grace_seconds)
         self._attachments = attachments
         self._max_observation_bytes = max_observation_bytes
-        self._outcomes: "OrderedDict[str, ActionObservation]" = OrderedDict()
+        self._outcomes: "OrderedDict[str, tuple[_CallIdentity, ActionObservation]]" = (
+            OrderedDict()
+        )
+        self._in_flight: dict[str, _InFlight] = {}
         self._provider_invocations = 0
 
     # -- outcome store ------------------------------------------------------ #
@@ -1128,25 +1150,31 @@ class ActionExecutor:
         """The recorded terminal observation of *call_id*, if still retained."""
 
         _require_text(call_id, "ActionExecutor.outcome")
-        return self._outcomes.get(call_id)
+        retained = self._outcomes.get(call_id)
+        return retained[1] if retained is not None else None
 
     def outcomes(self) -> Mapping[str, ActionObservation]:
         """Every retained terminal observation, oldest first."""
 
-        return MappingProxyType(dict(self._outcomes))
+        return MappingProxyType(
+            {call_id: observation for call_id, (_identity, observation) in self._outcomes.items()}
+        )
 
-    def _record(self, call_id: str, observation: ActionObservation) -> None:
+    def _record(self, call: ActionCall, observation: ActionObservation) -> None:
         """Write the terminal state. Idempotent, and never a downgrade.
 
         ``record_and_emit`` calls this again as its ordering primitive, so the
         second write must be a no-op rather than a conflict; a *different*
         observation for a recorded ``call_id`` is a programming error and is
         refused, because silently overwriting a terminal state is exactly the
-        downgrade R8 forbids.
+        downgrade R8 forbids. The call's logical identity is kept beside the
+        observation, so a later reuse of the ``call_id`` can be judged (R1).
         """
 
-        stored = self._outcomes.get(call_id)
-        if stored is not None:
+        call_id = call.call_id
+        retained = self._outcomes.get(call_id)
+        if retained is not None:
+            stored = retained[1]
             if stored != observation:
                 raise ContractError(
                     "ActionExecutor._record",
@@ -1154,7 +1182,7 @@ class ActionExecutor:
                     f"refusing to overwrite it with {observation.status!r}",
                 )
             return
-        self._outcomes[call_id] = observation
+        self._outcomes[call_id] = (_identity(call), observation)
         while len(self._outcomes) > self._max_outcomes:
             self._outcomes.popitem(last=False)
 
@@ -1194,11 +1222,178 @@ class ActionExecutor:
         if not isinstance(call, ActionCall):
             raise ContractError("ActionExecutor.invoke", "expects an ActionCall")
 
-        recorded = self._outcomes.get(call.call_id)
-        if recorded is not None:
+        identity = _identity(call)
+        retained = self._outcomes.get(call.call_id)
+        running = self._in_flight.get(call.call_id)
+        if retained is not None or running is not None:
+            return await self._reuse(call, identity, retained, running)
+
+        # Registered before the first await, so an identical call arriving
+        # while this one runs joins it instead of reaching the provider (F7).
+        entry = _InFlight(identity, asyncio.get_running_loop().create_future())
+        self._in_flight[call.call_id] = entry
+        try:
+            observation = await self._invoke_fresh(call, entry)
+        except BaseException as exc:
+            if not entry.future.done():
+                self._settle_interrupted(call, entry, exc)
+            raise
+        else:
+            if not entry.future.done():
+                entry.future.set_result(observation)
+            return observation
+        finally:
+            if self._in_flight.get(call.call_id) is entry:
+                del self._in_flight[call.call_id]
+
+    async def _reuse(
+        self,
+        call: ActionCall,
+        identity: "_CallIdentity",
+        retained: "tuple[_CallIdentity, ActionObservation] | None",
+        running: "_InFlight | None",
+    ) -> ActionObservation:
+        """Judge a reused ``call_id`` (R1, F3/F7).
+
+        The new call is authorized exactly as a fresh one would be; only an
+        authorized call with the identity on record reads the recorded outcome
+        — or, while the first call runs, awaits its very terminal observation.
+        Anything else is a fresh refusal that names nothing of the recorded
+        call and is not recorded over it.
+        """
+
+        refusal = self._authorize_reuse(call)
+        if refusal is None:
+            assert retained is not None or running is not None
+            known = retained[0] if retained is not None else running.identity
+            if known != identity:
+                refusal = (
+                    ERROR_CALL_ID_CONFLICT,
+                    f"call_id {call.call_id!r} is already used by a different call",
+                    None,
+                )
+        if refusal is not None:
+            code, message, reason = refusal
+            return await self._refuse_reuse(call, code, message, reason)
+        if retained is not None:
             # A caller retrying a call that already terminated — after a lost
             # trace, say — reads the recorded outcome and reaches 0 providers.
-            return recorded
+            return retained[1]
+        assert running is not None
+        # Shielded: a waiter that is itself cancelled must not cancel the
+        # future the first caller and every other waiter settle on.
+        return await asyncio.shield(running.future)
+
+    def _authorize_reuse(self, call: ActionCall) -> tuple[str, str, str | None] | None:
+        """The refusal a reused call meets before any recorded state is read.
+
+        The same checks a fresh call passes before its authorization decision,
+        then the decision itself: default-deny, re-evaluated now.
+        """
+
+        spec = self._registry.discovered().get(call.action_name)
+        if (
+            spec is None
+            or call.action_version != spec.version
+            or not spec.supports(call.destination)
+        ):
+            return (
+                ERROR_CALL_ID_CONFLICT,
+                f"call_id {call.call_id!r} is reused by a call that cannot be authorized",
+                None,
+            )
+        decision = self._authorization.permits(
+            spec, principal=call.principal, destination=call.destination
+        )
+        if not decision.allowed:
+            return (
+                ERROR_NOT_AUTHORIZED,
+                f"principal {call.principal!r} is not authorized to run "
+                f"{call.action_name!r} at {call.destination} ({decision.reason})",
+                decision.reason,
+            )
+        return None
+
+    async def _refuse_reuse(
+        self, call: ActionCall, code: str, message: str, reason: str | None
+    ) -> ActionObservation:
+        """A refusal of a reused ``call_id``: traced, never recorded.
+
+        The recorded observation of the first call stays the terminal state of
+        that ``call_id``; this one is returned to the caller and traced only.
+        """
+
+        started_at = self._clock()
+        await self._emit(TRACE_ACTION_STARTED, self._started_payload(call, None, None))
+        provenance = self._provenance(
+            call, None, self._duration(started_at), EMISSION_NOT_EMITTED, invoked=False
+        )
+        if reason is not None:
+            provenance["authorization_reason"] = reason
+        observation = ActionObservation(
+            status="refused",
+            provenance=provenance,
+            error={"code": code, "message": message, "retryable": False},
+        )
+        await self._emit(TRACE_ACTION_COMPLETED, self._completed_payload(call, observation))
+        return observation
+
+    def _settle_interrupted(
+        self, call: ActionCall, entry: "_InFlight", exc: BaseException
+    ) -> None:
+        """Settle the waiters of a call whose first caller did not return.
+
+        A recorded outcome is what they get. A cancellation that came before
+        anything was recorded still ends in a terminal observation, recorded
+        so that :meth:`outcome` agrees with what the waiters read: a certain
+        ``cancelled`` when the provider was never entered, and the emission
+        rule's default — ``external_unknown`` for a write — when it was.
+        """
+
+        recorded = self.outcome(call.call_id)
+        if recorded is not None:
+            entry.future.set_result(recorded)
+            return
+        if not isinstance(exc, asyncio.CancelledError):
+            entry.future.set_exception(exc)
+            # Read here, so a future nobody awaited never logs its exception.
+            entry.future.exception()
+            return
+        spec = self._registry.discovered().get(call.action_name)
+        if entry.entered and spec is not None:
+            status, code = _uncertain_status(EMISSION_UNKNOWN, spec, "cancelled")
+            emission = EMISSION_UNKNOWN
+        else:
+            status, code, emission = "cancelled", ERROR_CANCELLED, EMISSION_NOT_EMITTED
+        observation = ActionObservation(
+            status=status,
+            provenance=self._provenance(call, None, 0.0, emission, invoked=entry.entered),
+            error={
+                "code": code,
+                "message": f"{call.action_name!r} was cancelled; reported as {status!r}",
+                "retryable": False,
+            },
+        )
+        self._record(call, observation)
+        entry.future.set_result(observation)
+
+    def _started_payload(
+        self, call: ActionCall, spec: ActionSpec | None, binding: ActionBinding | None
+    ) -> dict[str, Any]:
+        return {
+            "action": call.action_name,
+            "action_version": call.action_version,
+            "provider": binding.provider_name if binding is not None else None,
+            "call_id": call.call_id,
+            "run_id": call.run_id,
+            "conversation_id": call.conversation_id,
+            "destination": str(call.destination),
+            "nature": spec.nature if spec is not None else None,
+            "principal": call.principal,
+        }
+
+    async def _invoke_fresh(self, call: ActionCall, entry: "_InFlight") -> ActionObservation:
+        """The call of a ``call_id`` seen for the first time."""
 
         started_at = self._clock()
         spec = self._registry.discovered().get(call.action_name)
@@ -1243,20 +1438,7 @@ class ActionExecutor:
                         f"{call.action_name!r}",
                     )
 
-        await self._emit(
-            TRACE_ACTION_STARTED,
-            {
-                "action": call.action_name,
-                "action_version": call.action_version,
-                "provider": binding.provider_name if binding is not None else None,
-                "call_id": call.call_id,
-                "run_id": call.run_id,
-                "conversation_id": call.conversation_id,
-                "destination": str(call.destination),
-                "nature": spec.nature if spec is not None else None,
-                "principal": call.principal,
-            },
-        )
+        await self._emit(TRACE_ACTION_STARTED, self._started_payload(call, spec, binding))
 
         if spec is None:
             return await self._terminate(
@@ -1330,6 +1512,7 @@ class ActionExecutor:
                 message=f"deadline for {call.action_name!r} expired before invocation",
                 emission=EMISSION_NOT_EMITTED,
             )
+        entry.entered = True
         return await self._run_provider(
             call, spec, binding, started_at, expires_at - entered_at, expires_at
         )
@@ -1872,9 +2055,27 @@ class ActionExecutor:
             self._count(COUNTER_ACTION_TIMEOUTS)
 
         # The terminal state is durable here, before the trace exists at all.
-        self._record(call.call_id, observation)
+        self._record(call, observation)
 
-        duration = observation.provenance.get("duration_seconds", self._duration(started_at))
+        await self._record_and_emit(
+            lambda: self._record(call, observation),
+            TRACE_ACTION_COMPLETED,
+            self._completed_payload(call, observation, started_at),
+        )
+        # The value returned is the value recorded, whatever the trace did.
+        recorded = self.outcome(call.call_id)
+        return recorded if recorded is not None else observation
+
+    def _completed_payload(
+        self,
+        call: ActionCall,
+        observation: ActionObservation,
+        started_at: float | None = None,
+    ) -> dict[str, Any]:
+        duration = observation.provenance.get(
+            "duration_seconds",
+            self._duration(started_at) if started_at is not None else 0.0,
+        )
         payload: dict[str, Any] = {
             "action": call.action_name,
             "action_version": call.action_version,
@@ -1896,13 +2097,7 @@ class ActionExecutor:
                     and isinstance(value, _TRACE_FIELD_TYPES)
                 ):
                     payload[name] = value
-        await self._record_and_emit(
-            lambda: self._record(call.call_id, observation),
-            TRACE_ACTION_COMPLETED,
-            payload,
-        )
-        # The value returned is the value recorded, whatever the trace did.
-        return self._outcomes.get(call.call_id, observation)
+        return payload
 
     def _duration(self, started_at: float) -> float:
         return max(0.0, self._clock() - started_at)
@@ -1930,6 +2125,76 @@ class ActionExecutor:
             "emission": emission,
             "provider_entered": invoked,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Call identity (phase 6 R1)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class _CallIdentity:
+    """What makes two calls sharing a ``call_id`` the same logical call."""
+
+    principal: str
+    session: str
+    action: str
+    action_version: int
+    destination: tuple[str, str, str]
+    arguments: Any
+
+
+def _identity(call: ActionCall) -> _CallIdentity:
+    return _CallIdentity(
+        principal=call.principal,
+        session=call.conversation_id,
+        action=call.action_name,
+        action_version=call.action_version,
+        # The components, not ``str(destination)``: a component may hold a
+        # ``/``, so two different destinations can share one string form.
+        destination=(
+            call.destination.platform,
+            call.destination.channel_id,
+            call.destination.scope,
+        ),
+        arguments=_canonical_arguments(call.arguments),
+    )
+
+
+def _canonical_arguments(arguments: Mapping[str, Any]) -> Any:
+    """A type-tagged, order-independent form of a call's (frozen) arguments.
+
+    Two forms compare equal only when the arguments hold the same values of
+    the same types: every leaf carries its type, so ``b"x"`` never matches the
+    string ``"b'x'"`` and ``True`` never matches ``1``. A mapping is its items
+    sorted by key; a sequence keeps its order. A float is compared by its hex
+    form, so a NaN argument still identifies its own call.
+    """
+
+    return _tagged(arguments)
+
+
+def _tagged(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return ("map", tuple((key, _tagged(value[key])) for key in sorted(value)))
+    if isinstance(value, (list, tuple)):
+        return ("seq", tuple(_tagged(item) for item in value))
+    if type(value) is float:
+        return (float, value.hex())
+    return (type(value), value)
+
+
+class _InFlight:
+    """A call still running: its identity and the future its waiters await."""
+
+    __slots__ = ("entered", "future", "identity")
+
+    def __init__(
+        self, identity: _CallIdentity, future: "asyncio.Future[ActionObservation]"
+    ) -> None:
+        self.identity = identity
+        self.future = future
+        self.entered = False
 
 
 # --------------------------------------------------------------------------- #

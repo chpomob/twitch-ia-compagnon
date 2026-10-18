@@ -47,6 +47,7 @@ from core.actions import (
     AmbiguousBindingError,
     AuthorizationPolicy,
     AuthorizationRule,
+    _identity,
 )
 from core.attachments import AttachmentRef, AttachmentStore
 from core.contracts import (
@@ -2635,3 +2636,310 @@ async def test_a_shipped_confirmation_lost_cause_survives_a_take_over(path, shap
     assert observation.error["code"] == ERROR_EXTERNAL_UNKNOWN
     assert observation.error["cause"] == "confirmation_lost"
     assert "the call was cancelled" in observation.error["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 R1 — replay protection binds the whole call (F3, F7, F29)
+# --------------------------------------------------------------------------- #
+
+BRAIN = "brain"
+INTRUDER = "agent:peer"
+CALL_ID_CONFLICT = "call_id_conflict"
+
+
+def _grant_everyone(harness: Harness, *specs: ActionSpec) -> None:
+    """Rules for both principals on every spec, so only identity can refuse."""
+
+    for spec in specs:
+        harness.policy.grant(
+            AuthorizationRule(
+                rule_id=f"all-{spec.name}",
+                action_name=spec.name,
+                destination=CHAT_SCOPE,
+                principals=(BRAIN, INTRUDER),
+                natures=(spec.nature,),
+                granted_permissions=spec.required_permissions,
+            )
+        )
+
+
+def _brain_call(**changes) -> ActionCall:
+    return replace(make_call(WRITE_SPEC, call_id="c1", principal=BRAIN), **changes)
+
+
+_REUSES = {
+    "principal": lambda: _brain_call(principal=INTRUDER),
+    "session": lambda: _brain_call(conversation_id="conv-other"),
+    "action": lambda: make_call(
+        READ_SPEC, call_id="c1", principal=BRAIN, arguments={"text": "bonjour"}
+    ),
+    "destination": lambda: _brain_call(destination=Destination(PLATFORM, CHANNEL_B, "chat")),
+    "arguments": lambda: _brain_call(arguments={"text": "autre chose"}),
+}
+
+
+def _replay_harness() -> tuple[Harness, Provider, Provider]:
+    harness = Harness()
+    harness.declare(WRITE_SPEC, READ_SPEC)
+    sender = Provider("sender", write_success)
+    reader = Provider("reader", read_success)
+    harness.bind(WRITE_SPEC, sender)
+    harness.bind(READ_SPEC, reader)
+    harness.ready()
+    _grant_everyone(harness, WRITE_SPEC, READ_SPEC)
+    return harness, sender, reader
+
+
+def _discloses_nothing_of(observation: ActionObservation, original: ActionObservation) -> None:
+    assert observation.result is None
+    for key, value in original.result.items():
+        assert key not in repr(observation)
+        assert repr(value) not in repr(observation)
+
+
+@pytest.mark.parametrize("component", sorted(_REUSES))
+async def test_ac3_a_reused_call_id_naming_another_call_is_refused(component):
+    """AC3 (R1, F3): after ``c1`` by ``brain`` completed, a reuse of ``c1``
+    differing in one identity component is refused, reaches no provider and
+    discloses none of the recorded result."""
+
+    harness, sender, reader = _replay_harness()
+    first = await harness.executor.invoke(_brain_call())
+    assert first.status == "success" and first.result == {"message_id": "m-1"}
+    entered = harness.executor.provider_invocations
+
+    reused = await harness.executor.invoke(_REUSES[component]())
+
+    assert reused.status == "refused"
+    assert reused.error["code"] == CALL_ID_CONFLICT
+    assert harness.executor.provider_invocations == entered
+    assert len(sender.calls) == 1 and reader.calls == []
+    _discloses_nothing_of(reused, first)
+    # The terminal state of c1 is untouched by the refusal.
+    assert harness.executor.outcome("c1") is first
+
+
+async def test_ac3_a_reuse_whose_arguments_only_share_a_repr_is_refused():
+    """AC3 (R1): bytes and the string spelling their ``repr`` are different
+    arguments, so the reuse cannot read the record through the alias."""
+
+    harness, sender, _reader = _replay_harness()
+    first = await harness.executor.invoke(_brain_call(arguments={"text": "b'hello'"}))
+    assert first.status == "success"
+
+    reused = await harness.executor.invoke(_brain_call(arguments={"text": b"hello"}))
+
+    assert reused.status == "refused" and reused.error["code"] == CALL_ID_CONFLICT
+    assert len(sender.calls) == 1
+    _discloses_nothing_of(reused, first)
+
+
+def test_r1_identity_keeps_destination_components_and_argument_types():
+    """R1: destinations sharing one string form, and arguments equal only
+    after coercion, are different calls."""
+
+    base = _brain_call()
+    left = replace(base, destination=Destination(PLATFORM, "a/b", "chat"))
+    right = replace(base, destination=Destination(PLATFORM, "a", "b/chat"))
+    assert str(left.destination) == str(right.destination)
+    assert _identity(left) != _identity(right)
+
+    for one, other in (({"n": True}, {"n": 1}), ({"n": 1}, {"n": 1.0})):
+        assert _identity(replace(base, arguments=one)) != _identity(
+            replace(base, arguments=other)
+        )
+    nan = {"x": float("nan")}
+    assert _identity(replace(base, arguments=nan)) == _identity(
+        replace(base, arguments={"x": float("nan")})
+    )
+    assert _identity(replace(base, arguments={"a": 1, "b": [2]})) == _identity(
+        replace(base, arguments={"b": (2,), "a": 1})
+    )
+
+
+async def test_ac3_an_identical_reuse_the_policy_now_refuses_is_refused():
+    """AC3 (R1, F3): the reuse is authorized before the record is read, so a
+    revoked grant refuses even the very same call."""
+
+    harness, sender, _reader = _replay_harness()
+    first = await harness.executor.invoke(_brain_call())
+    assert first.status == "success"
+    harness.policy.revoke(f"all-{WRITE_SPEC.name}")
+
+    reused = await harness.executor.invoke(_brain_call())
+
+    assert reused.status == "refused"
+    assert reused.error["code"] == ERROR_NOT_AUTHORIZED
+    assert len(sender.calls) == 1
+    _discloses_nothing_of(reused, first)
+    assert harness.executor.outcome("c1") is first
+
+
+async def test_ac3_an_identical_authorized_reuse_still_reads_the_record():
+    """R1: the same logical call, still authorized, reads the record as before."""
+
+    harness, sender, _reader = _replay_harness()
+    first = await harness.executor.invoke(_brain_call())
+    again = await harness.executor.invoke(
+        _brain_call(arguments={"text": "bonjour"}, run_id="run-1")
+    )
+
+    assert again is first
+    assert len(sender.calls) == 1
+
+
+def _gated_writer():
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    runs: list[int] = []
+
+    async def gated(invocation) -> ActionObservation:
+        runs.append(1)
+        invocation.mark_emitted()
+        entered.set()
+        await gate.wait()
+        return ActionObservation(
+            status="success", provenance={"transport": "fake"}, result={"message_id": "m-1"}
+        )
+
+    return gate, entered, runs, gated
+
+
+async def _yield_to_others(rounds: int = 10) -> None:
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+async def test_ac4_concurrent_identical_calls_reach_the_provider_once():
+    """AC4 (R1, F7): two concurrent invocations of one logical call share one
+    provider run, and both callers read the same terminal observation."""
+
+    gate, entered, runs, gated = _gated_writer()
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    sender = Provider("sender", gated)
+    harness.bind(WRITE_SPEC, sender)
+    harness.ready()
+    _grant_everyone(harness, WRITE_SPEC)
+
+    together = asyncio.gather(
+        harness.executor.invoke(_brain_call()), harness.executor.invoke(_brain_call())
+    )
+    await entered.wait()
+    await _yield_to_others()
+    # Both are awaiting; neither has completed.
+    assert not together.done()
+    gate.set()
+    first, second = await together
+
+    assert harness.executor.provider_invocations == 1
+    assert len(sender.calls) == 1 and len(runs) == 1
+    assert first.status == second.status == "success"
+    assert first.result == second.result == {"message_id": "m-1"}
+
+
+async def test_ac4_a_concurrent_reuse_naming_another_call_is_refused():
+    """R1 (F7): a non-identical reuse while ``c1`` runs is refused at once."""
+
+    gate, entered, runs, gated = _gated_writer()
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    harness.bind(WRITE_SPEC, Provider("sender", gated))
+    harness.ready()
+    _grant_everyone(harness, WRITE_SPEC)
+
+    running = asyncio.ensure_future(harness.executor.invoke(_brain_call()))
+    await entered.wait()
+    reusing = asyncio.ensure_future(
+        harness.executor.invoke(_brain_call(principal=INTRUDER))
+    )
+    await _yield_to_others()
+    # Refused while c1 still runs: it never waits on c1's provider.
+    assert reusing.done()
+    gate.set()
+    reused = await reusing
+    first = await running
+
+    assert reused.status == "refused" and reused.error["code"] == CALL_ID_CONFLICT
+    assert first.status == "success"
+    assert len(runs) == 1
+
+
+async def test_ac4_a_cancelled_first_caller_still_settles_its_waiter():
+    """AC4 (R1, F7): cancelling the first caller while an identical one waits
+    leaves the waiter with the recorded terminal observation, provider once."""
+
+    entered = asyncio.Event()
+    runs: list[int] = []
+
+    async def emitted_then_hang(invocation) -> ActionObservation:
+        runs.append(1)
+        invocation.mark_emitted()
+        if len(runs) > 1:
+            return ActionObservation(
+                status="success", provenance={}, result={"message_id": "m-2"}
+            )
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    sender = Provider("sender", emitted_then_hang)
+    harness.bind(WRITE_SPEC, sender)
+    harness.ready()
+    _grant_everyone(harness, WRITE_SPEC)
+
+    first = asyncio.ensure_future(harness.executor.invoke(_brain_call()))
+    await entered.wait()
+    waiter = asyncio.ensure_future(harness.executor.invoke(_brain_call()))
+    await _yield_to_others()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    observation = await waiter
+
+    assert observation.status == "external_unknown"
+    assert observation is harness.executor.outcome("c1")
+    assert len(sender.calls) == 1 and len(runs) == 1
+
+
+async def test_ac4_a_waiter_cancelled_itself_leaves_the_first_caller_running():
+    """R1 (F7): the shared future is shielded from a waiter's own cancellation."""
+
+    gate, entered, runs, gated = _gated_writer()
+    harness = Harness()
+    harness.declare(WRITE_SPEC)
+    harness.bind(WRITE_SPEC, Provider("sender", gated))
+    harness.ready()
+    _grant_everyone(harness, WRITE_SPEC)
+
+    first = asyncio.ensure_future(harness.executor.invoke(_brain_call()))
+    await entered.wait()
+    waiter = asyncio.ensure_future(harness.executor.invoke(_brain_call()))
+    await _yield_to_others()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    gate.set()
+
+    assert (await first).status == "success"
+    assert len(runs) == 1
+
+
+@pytest.mark.parametrize("grace", [float("nan"), float("inf"), float("-inf")])
+def test_ac5_a_non_finite_cancel_grace_is_refused(grace):
+    """AC5 (R1, F29): the cancellation grace must be a finite number."""
+
+    policy = AuthorizationPolicy()
+    with pytest.raises(ContractError, match="cancel_grace_seconds.*finite") as raised:
+        ActionExecutor(ActionRegistry(authorization=policy), policy, cancel_grace_seconds=grace)
+    assert raised.value.field == "ActionExecutor.cancel_grace_seconds"
+
+
+@pytest.mark.parametrize("grace", [0, 0.5])
+def test_ac5_a_finite_non_negative_cancel_grace_is_accepted(grace):
+    """AC5 (R1): ``0`` and ``0.5`` remain valid graces."""
+
+    policy = AuthorizationPolicy()
+    ActionExecutor(ActionRegistry(authorization=policy), policy, cancel_grace_seconds=grace)
