@@ -644,8 +644,9 @@ class SubprocessPlayerRunner:
     to drain — a blocking pipe, so the count it returns is what the player
     accepted (or what sits in the pipe buffer); ``close_stdin`` closes the
     pipe and raises if it broke before the buffered tail was delivered, ``wait`` reaps the exit status. ``stop(process, grace_seconds)``
-    terminates the player's process group now and kills it once the grace
-    has passed on the injected sleeper, then reaps it. ``kill(process)``
+    terminates the player's process group now and returns as soon as the
+    player has exited; a player still running once the grace has passed on
+    the injected sleeper is killed, then reaped. ``kill(process)``
     kills the group at once, without awaiting anything — the last resort of
     an escalation cancelled before the exit was observed.
     """
@@ -691,7 +692,17 @@ class SubprocessPlayerRunner:
     async def stop(self, process: Any, grace_seconds: float) -> None:
         _signal_group(process, signal.SIGTERM)
         if process.returncode is None and grace_seconds > 0:
-            await self._sleeper(grace_seconds)
+            # The exit races the grace (F30): the call returns as soon as
+            # the player has exited, and only a player still running when
+            # the grace passes is killed.
+            exited = asyncio.ensure_future(process.wait())
+            grace = asyncio.ensure_future(self._sleeper(grace_seconds))
+            try:
+                await asyncio.wait((exited, grace), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (exited, grace):
+                    task.cancel()
+                    task.add_done_callback(_retrieve_outcome)
         if process.returncode is None:
             _signal_group(process, signal.SIGKILL)
         await process.wait()
@@ -699,6 +710,13 @@ class SubprocessPlayerRunner:
     def kill(self, process: Any) -> None:
         if process.returncode is None:
             _signal_group(process, signal.SIGKILL)
+
+
+def _retrieve_outcome(task: "asyncio.Future[Any]") -> None:
+    # The losing side of the exit/grace race is cancelled and never awaited;
+    # reading its outcome keeps a failure from being reported as unretrieved.
+    if not task.cancelled():
+        task.exception()
 
 
 def _signal_group(process: Any, signum: int) -> None:

@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
 import re
+import signal
 import struct
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -1145,6 +1148,99 @@ async def test_the_subprocess_runner_feeds_a_real_player_its_stdin() -> None:
     await runner.close_stdin(process)
     assert accepted == len(body)
     assert await runner.wait(process) == 0
+
+
+class _SignalledProcess:
+    """A fake player process: ``SIGTERM`` makes it exit ``exit_delay``
+    seconds later (never, when ``None``), ``SIGKILL`` at once. The exit time
+    is recorded on the monotonic clock."""
+
+    def __init__(self, exit_delay: float | None) -> None:
+        self.pid = 0
+        self.returncode: int | None = None
+        self.signals: list[int] = []
+        self.exited_at: float | None = None
+        self._exit_delay = exit_delay
+        self._exited = asyncio.Event()
+
+    def _exit(self, code: int) -> None:
+        if self.returncode is None:
+            self.returncode = code
+            self.exited_at = time.monotonic()
+            self._exited.set()
+
+    def send_signal(self, signum: int) -> None:
+        self.signals.append(signum)
+        if signum == signal.SIGKILL:
+            self._exit(-signal.SIGKILL)
+        elif signum == signal.SIGTERM and self._exit_delay is not None:
+            asyncio.get_running_loop().call_later(self._exit_delay, self._exit, 0)
+
+    async def wait(self) -> int:
+        await self._exited.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+
+async def test_stop_returns_as_soon_as_the_player_exits_within_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC29 (R7, F30): a player that exits 0.01 s after ``SIGTERM`` under a
+    5 s grace makes ``stop`` return no later than 0.1 s after the recorded
+    exit; it is never killed. The grace sleeper never ends on its own, so a
+    ``stop`` that waits the grace out fails the bound."""
+
+    from modules.audio_output import SubprocessPlayerRunner
+
+    monkeypatch.delattr(os, "killpg", raising=False)
+    graces: list[float] = []
+
+    async def endless_grace(seconds: float) -> None:
+        graces.append(seconds)
+        await asyncio.get_running_loop().create_future()
+
+    process = _SignalledProcess(exit_delay=0.01)
+    runner = SubprocessPlayerRunner(sleeper=endless_grace)
+    try:
+        await asyncio.wait_for(runner.stop(process, 5), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("stop waited out the grace after the player had exited")
+    returned_at = time.monotonic()
+    assert process.exited_at is not None
+    assert returned_at - process.exited_at <= 0.1
+    assert graces == [5]
+    assert process.signals == [signal.SIGTERM]
+    assert process.returncode == 0
+
+
+async def test_stop_still_kills_a_player_that_never_exits_at_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC29 (R7, F30): a player that ignores ``SIGTERM`` is killed once the
+    grace has passed — not before — and ``stop`` returns after reaping it."""
+
+    from modules.audio_output import SubprocessPlayerRunner
+
+    monkeypatch.delattr(os, "killpg", raising=False)
+    grace_passed = asyncio.Event()
+    graces: list[float] = []
+
+    async def controlled_grace(seconds: float) -> None:
+        graces.append(seconds)
+        await grace_passed.wait()
+
+    process = _SignalledProcess(exit_delay=None)
+    runner = SubprocessPlayerRunner(sleeper=controlled_grace)
+    stopping = asyncio.ensure_future(runner.stop(process, 5))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert graces == [5]
+    assert process.signals == [signal.SIGTERM]
+    assert not stopping.done()
+    grace_passed.set()
+    await asyncio.wait_for(stopping, timeout=2.0)
+    assert process.signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.returncode == -signal.SIGKILL
 
 
 async def test_the_loader_discovers_the_manifest_and_prepare_binds_the_declared_specs() -> None:
