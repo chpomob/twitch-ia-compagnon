@@ -759,6 +759,13 @@ def page(*items: dict[str, Any]) -> dict[str, Any]:
     return {"items": list(items), "nextPageToken": "next", "pollingIntervalMillis": 5000}
 
 
+#: The first list of a freshly resolved chat admits nothing (R5, F11): a test
+#: whose items must be ingested scripts this empty page first and lists them
+#: one poll later.
+PRIMING_PAGE = {"items": [], "nextPageToken": "primed", "pollingIntervalMillis": 5000}
+POLL_SECONDS = 5
+
+
 def audience_policy(audience: str) -> TriggerPolicy:
     return TriggerPolicy(
         rules=(TriggerRule(type="audience", parameters={"audience": audience}),),
@@ -1048,18 +1055,18 @@ async def test_ac38_each_author_flag_satisfies_its_audience_rule(
 ) -> None:
     """AC38: owner → broadcaster, moderator → moderators, member →
     subscribers. A plain author, or one claiming the role in the text, is
-    not admitted."""
+    not admitted. The items follow the priming page (R5, F11)."""
 
     h = await start_harness(
         policy=audience_policy(audience),
-        pages=(page(
+        pages=(PRIMING_PAGE, page(
             chat_item("with", **{flag: True}),
             chat_item("without"),
             chat_item("claimed", f"I am the {audience}"),
         ),),
     )
     try:
-        await h.drive(0)
+        await h.drive(POLL_SECONDS)
         assert len(h.events()) == 3
         assert [work.source_event_id for _key, work in h.scheduler.admissions] == ["with"]
         [(key, _work)] = h.scheduler.admissions
@@ -1101,15 +1108,15 @@ async def test_ac38_each_notice_type_maps_to_its_kind_and_is_admitted_by_kind(
 ) -> None:
     """AC38: member, milestone, gift and paid-message items map to ``sub``,
     ``resub``, ``sub_gift`` and ``tip``, and an ``event_kind`` rule admits
-    them."""
+    them. The items follow the priming page (R5, F11)."""
 
     h = await start_harness(
         policy=event_kind_policy(kind),
         notices={"kinds": ["sub", "resub", "sub_gift", "tip"]},
-        pages=(page(chat_item(f"notice-{kind}", "", item_type=item_type, details=details)),),
+        pages=(PRIMING_PAGE, page(chat_item(f"notice-{kind}", "", item_type=item_type, details=details)),),
     )
     try:
-        await h.drive(0)
+        await h.drive(POLL_SECONDS)
         (event,) = h.events()
         payload = event["payload"]
         assert payload["kind"] == kind and payload["platform"] == "youtube"
@@ -1127,17 +1134,20 @@ async def test_ac38_each_notice_type_maps_to_its_kind_and_is_admitted_by_kind(
 
 @pytest.mark.asyncio
 async def test_an_unlisted_notice_and_an_unmapped_type_are_ignored_and_counted() -> None:
+    """The items follow the priming page (R5, F11), so they are ignored by
+    the notice mapping, not by priming."""
+
     h = await start_harness(
         policy=audience_policy("everyone"),
         notices={"kinds": ["sub"]},
-        pages=(page(
+        pages=(PRIMING_PAGE, page(
             chat_item("tip-1", item_type="superChatEvent"),
             chat_item("deleted-1", item_type="messageDeletedEvent"),
             chat_item("ended-1", item_type="chatEndedEvent"),
         ),),
     )
     try:
-        await h.drive(0)
+        await h.drive(POLL_SECONDS)
         assert h.events() == [] and h.scheduler.admissions == []
         assert h.module.counts["notices_ignored"] == 3
     finally:
@@ -1171,15 +1181,15 @@ def test_the_mapping_covers_exactly_the_six_documented_types() -> None:
 async def test_ac32_an_author_id_with_a_colon_is_refused_and_counted() -> None:
     """AC32: an author id containing ``:`` yields 0 admissions, 0 events, 0
     chat-context entries and ``invalid`` + 1; a clean author afterwards is
-    admitted."""
+    admitted. The items follow the priming page (R5, F11)."""
 
     h = await start_harness(
         policy=audience_policy("everyone"),
-        pages=(page(chat_item("colon", f"hi {COMPANION}", author="system:watch")),
+        pages=(PRIMING_PAGE, page(chat_item("colon", f"hi {COMPANION}", author="system:watch")),
                page(chat_item("clean", f"hi {COMPANION}"))),
     )
     try:
-        await h.drive(0)
+        await h.drive(POLL_SECONDS)
         assert h.scheduler.admissions == [] and h.events() == []
         assert h.chat.read("youtube", CHANNEL, limit=8) == ()
         assert h.module.counts["invalid"] == 1
@@ -1215,12 +1225,14 @@ async def test_the_companion_own_messages_are_dropped_before_anything() -> None:
 
 @pytest.mark.asyncio
 async def test_a_relisted_message_is_ingested_once_and_counted() -> None:
+    """The pages follow the priming page (R5, F11)."""
+
     h = await start_harness(
         policy=audience_policy("everyone"),
-        pages=(page(chat_item("m-1", "one")), page(chat_item("m-1", "one"), chat_item("m-2"))),
+        pages=(PRIMING_PAGE, page(chat_item("m-1", "one")), page(chat_item("m-1", "one"), chat_item("m-2"))),
     )
     try:
-        await h.drive(5)
+        await h.drive(POLL_SECONDS + 5)
         assert [event["payload"]["message_id"] for event in h.events()] == ["m-1", "m-2"]
         assert len(h.scheduler.admissions) == 2
         assert h.module.counts["duplicates"] == 1
@@ -1231,11 +1243,110 @@ async def test_a_relisted_message_is_ingested_once_and_counted() -> None:
         await h.close()
 
 
+# -- AC18 (phase 6, R5, F11): the first page of a fresh resolution ------------------ #
+
+
+EXISTING = (
+    chat_item("old-1", "one"), chat_item("old-2", "two"), chat_item("old-3", "three"),
+)
+
+
 @pytest.mark.asyncio
-async def test_the_default_policy_admits_a_mention_of_the_companion() -> None:
-    h = await start_harness(pages=(page(chat_item("m-1", "hello"), chat_item("m-2", f"hey {COMPANION}")),))
+async def test_ac18_the_first_page_of_a_fresh_resolution_admits_nothing() -> None:
+    """AC18 (R5, F11): a fresh chat resolution whose first list returns 3
+    existing messages admits 0 of them, follows its page token, and
+    remembers them for dedup; a message on the following page is admitted
+    (count == 1)."""
+
+    h = await start_harness(
+        policy=audience_policy("everyone"),
+        pages=(
+            {"items": list(EXISTING), "nextPageToken": "after-old", "pollingIntervalMillis": 5000},
+            page(chat_item("old-2", "two"), chat_item("new-1", "fresh")),
+        ),
+    )
     try:
         await h.drive(0)
+        assert h.api.counts["list"] == 1
+        assert h.events() == [] and h.scheduler.admissions == []
+        assert h.chat.read("youtube", CHANNEL, limit=8) == ()
+        assert h.module.counts["items_listed"] == 3
+        await h.drive(POLL_SECONDS)
+        lists = [request["params"] for request in h.api.requests if request["endpoint"] == "list"]
+        assert lists[1]["pageToken"] == "after-old"
+        assert [event["payload"]["message_id"] for event in h.events()] == ["new-1"]
+        assert len(h.scheduler.admissions) == 1
+        assert h.module.counts["duplicates"] == 1
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gone", [api_error(403, "liveChatEnded"), api_error(404, "liveChatNotFound")])
+async def test_ac18_the_first_page_after_a_re_lookup_admits_nothing(gone: Any) -> None:
+    """AC18 (R5, F11): after a 403 (and, the plan's risk, a 404) re-lookup,
+    the re-resolved chat's first list of 3 messages admits 0; a message on
+    the following page is admitted (count == 1)."""
+
+    h = await start_harness(
+        policy=audience_policy("everyone"),
+        pages=(
+            PRIMING_PAGE,
+            page(chat_item("before", "admitted")),
+            gone,
+            page(*EXISTING),
+            page(chat_item("new-1", "fresh")),
+        ),
+    )
+    try:
+        await h.drive(2 * POLL_SECONDS)
+        assert h.module.counts["items_listed"] == 1
+        assert [event["payload"]["message_id"] for event in h.events()] == ["before"]
+        h.api.broadcasts[CHANNEL] = "live-chat-2"
+        await h.drive(POLL_SECONDS)
+        assert [request["endpoint"] for request in h.api.requests] == [
+            "broadcast_lookup", "list", "list", "list", "broadcast_lookup", "list",
+        ]
+        assert h.module.live_chat_id(CHANNEL) == "live-chat-2"
+        assert h.module.counts["items_listed"] == 4
+        assert [event["payload"]["message_id"] for event in h.events()] == ["before"]
+        await h.drive(POLL_SECONDS)
+        assert [event["payload"]["message_id"] for event in h.events()] == ["before", "new-1"]
+        assert len(h.scheduler.admissions) == 2
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["rateLimitExceeded", "userRateLimitExceeded"])
+async def test_a_rate_limit_403_keeps_the_chat_and_does_not_prime_again(refusal: str) -> None:
+    """Plan P10 risk (R5, F11): a rate-limit 403 says nothing of the chat;
+    the poller keeps it and its page token, makes no lookup, and the next
+    page is admitted rather than primed away."""
+
+    h = await start_harness(
+        policy=audience_policy("everyone"),
+        pages=(PRIMING_PAGE, api_error(403, refusal), page(chat_item("new-1", "fresh"))),
+    )
+    try:
+        await h.drive(2 * POLL_SECONDS)
+        assert [request["endpoint"] for request in h.api.requests] == [
+            "broadcast_lookup", "list", "list", "list",
+        ]
+        lists = [request["params"] for request in h.api.requests if request["endpoint"] == "list"]
+        assert lists[1]["pageToken"] == lists[2]["pageToken"] == "primed"
+        assert [event["payload"]["message_id"] for event in h.events()] == ["new-1"]
+    finally:
+        await h.close()
+
+
+@pytest.mark.asyncio
+async def test_the_default_policy_admits_a_mention_of_the_companion() -> None:
+    """The items follow the priming page (R5, F11)."""
+
+    h = await start_harness(pages=(PRIMING_PAGE, page(chat_item("m-1", "hello"), chat_item("m-2", f"hey {COMPANION}")),))
+    try:
+        await h.drive(POLL_SECONDS)
         assert len(h.events()) == 2
         assert [work.source_event_id for _key, work in h.scheduler.admissions] == ["m-2"]
     finally:
@@ -1531,7 +1642,7 @@ async def test_ac39_three_platforms_on_one_runtime() -> None:
         clock,
         token_endpoint=tokens,
         broadcasts={CHANNEL: LIVE_CHAT},
-        pages=(page(chat_item("yt-1", "hello", author=SHARED_VIEWER)),),
+        pages=(PRIMING_PAGE, page(chat_item("yt-1", "hello", author=SHARED_VIEWER)),),
     )
     loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
     activations = await loader.activate_enabled(
@@ -1677,7 +1788,11 @@ async def test_ac39_three_platforms_on_one_runtime() -> None:
         )
         assert status == 200
         await settle(100)
-        assert api.counts["list"] == 1
+        # The youtube message follows the priming page, listed one poll
+        # later (R5, F11): two lists where the first admitted it before.
+        clock.advance(POLL_SECONDS)
+        await settle(100)
+        assert api.counts["list"] == 2
         assert scheduler.live_sessions == 2
         for key in (
             SessionKey(platform="kick", channel_id=KICK_CHANNEL, viewer_id=SHARED_VIEWER),
@@ -1763,11 +1878,12 @@ def test_manifest_declares_its_chat_pair_by_default() -> None:
 @pytest.mark.asyncio
 async def test_owning_by_default_the_pollers_start_as_before() -> None:
     """R2, R3: no ``inputs`` block, youtube owns its pair by default and
-    ``start_inputs`` looks the broadcast up and lists, exactly as before."""
+    ``start_inputs`` looks the broadcast up and lists, exactly as before;
+    the message follows the priming page (R5, F11)."""
 
-    h = await start_harness(pages=(page(chat_item("m-1", "hello")),))
+    h = await start_harness(pages=(PRIMING_PAGE, page(chat_item("m-1", "hello")),))
     try:
-        await h.drive(0)
+        await h.drive(POLL_SECONDS)
         assert h.api.counts["broadcast_lookup"] == 1
         assert h.api.counts["list"] >= 1
         assert len(h.events()) == 1

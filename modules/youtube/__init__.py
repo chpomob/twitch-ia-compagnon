@@ -1081,6 +1081,10 @@ class _Poller:
     channel_id: str
     live_chat_id: str | None = None
     page_token: str | None = None
+    #: The live chat id was freshly resolved and not listed yet: its first
+    #: page holds messages sent before this poller looked, which are
+    #: remembered for dedup and never admitted (R5, F11).
+    priming: bool = False
     task: Any = None
 
 
@@ -1357,6 +1361,7 @@ class YouTubeModule:
             return status, body, LOOKUP_RETRY_SECONDS
         poller.live_chat_id = live_chat_id
         poller.page_token = None
+        poller.priming = True
         return status, body, 0.0
 
     async def _list(self, poller: _Poller) -> float:
@@ -1377,6 +1382,10 @@ class YouTubeModule:
             self._tokens.invalidate()
             return minimum
         self._check_quota_refusal(status, body)
+        if status == 403 and _error_reason(body) in RATE_LIMIT_REASONS | QUOTA_REASONS:
+            # A rate or quota refusal says nothing of the chat: keep it, its
+            # page token and its priming state (R5, F11).
+            return minimum
         if status in (403, 404):
             # The chat ended or is gone: look the broadcast up again.
             poller.live_chat_id = None
@@ -1385,9 +1394,16 @@ class YouTubeModule:
         if status != 200 or not isinstance(body, Mapping):
             return minimum
         items = body.get("items")
+        priming, poller.priming = poller.priming, False
         if isinstance(items, list):
             self._counts[COUNT_ITEMS_LISTED] += len(items)
             for item in items:
+                if priming:
+                    # Already in the chat when it was resolved: remembered so
+                    # a later page repeating it is a duplicate, never admitted.
+                    if isinstance(item, Mapping) and isinstance(item.get("id"), str):
+                        _remember(self._seen, item["id"])
+                    continue
                 await self._ingest(poller.channel_id, item)
         next_token = body.get("nextPageToken")
         if isinstance(next_token, str) and next_token:
