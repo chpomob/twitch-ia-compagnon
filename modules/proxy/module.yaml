@@ -139,6 +139,22 @@ settings_schema:
         How long a terminal call identity is remembered so a late
         `observation` for it is recognised as late rather than unknown; both
         are ignored and counted. Default 60.
+    max_unpaired_connections:
+      title: Max unpaired connections
+      default: 16
+      type: integer
+      minimum: 1
+      description: >-
+        How many accepted connections may be waiting for pairing at once; one
+        more is refused `agent_limit` and closed 4409. Default 16.
+    hello_deadline_seconds:
+      title: Hello deadline seconds
+      default: 30
+      type: number
+      minimum: 0
+      description: >-
+        How long an accepted connection has to send a valid `hello` before it
+        is closed 4400. Default 30.
     limits:
       title: Limits
       type: object

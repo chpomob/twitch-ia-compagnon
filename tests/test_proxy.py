@@ -5704,3 +5704,181 @@ def test_ac20_the_frame_table_limits_and_codes_are_the_phase_1_ones(protocol_doc
     assert set(PROXY_CLOSE_CODES) == {4400, 4401, 4409, 4413}
     assert _MAX_FRAME == DEFAULT_BINARY_BOUND
     assert "twelve frame types" in protocol_doc
+
+
+# =========================================================================== #
+# Phase 6 P4 — unpaired connections are capped and must say hello in time
+# (R6; F13, F19; AC20)
+# =========================================================================== #
+
+
+async def test_p6_ac20_a_third_unpaired_connection_beyond_the_cap_of_2_is_refused() -> None:
+    """AC20 (R6, F13): with ``max_unpaired_connections: 2``, two silent
+    connections are held and a third is refused ``agent_limit`` 4409 before
+    anything is read, with a local diagnostic; the counter never passes the
+    cap, frees a slot on pairing and on close, and returns to 0."""
+
+    brain = Brain(max_unpaired_connections=2)
+    try:
+        module = await brain.activate()
+        first, second = brain.connect(), brain.connect()
+        await settle()
+        assert module.unpaired_connections == 2
+        assert not first.handler.done() and not second.handler.done()
+
+        third = brain.connect()
+        await settle()
+        assert third.handler.done(), "the third unpaired connection was accepted"
+        frame = await third.expect_refusal(PROXY_ERROR_AGENT_LIMIT, PROXY_CLOSE_AGENT_LIMIT)
+        assert frame["id"] is None and frame["retryable"] is True
+        assert module.unpaired_connections == 2
+        assert any("max_unpaired_connections" in line for line in brain.diagnostics)
+        assert all(TOKEN not in line for line in brain.diagnostics)
+
+        # Pairing frees a slot: a new connection is accepted, not refused.
+        await first.pair_up()
+        assert module.paired and module.unpaired_connections == 1
+        fourth = brain.connect()
+        await settle()
+        assert module.unpaired_connections == 2 and not fourth.handler.done()
+
+        # Closing frees the slots: no leak.
+        await second.ws.close()
+        await wait_until(second.handler.done)
+        await fourth.ws.close()
+        await wait_until(fourth.handler.done)
+        assert module.unpaired_connections == 0
+        await first.ws.close()
+        await wait_until(first.handler.done)
+        assert module.unpaired_connections == 0 and not module.paired
+    finally:
+        await brain.close()
+
+
+async def test_p6_ac20_a_silent_connection_is_closed_at_the_hello_deadline_and_not_one_tick_before() -> None:
+    """AC20 (R6, F19): a connection that sends nothing is closed
+    ``unknown_session`` 4400 once ``hello_deadline_seconds`` elapses on the
+    manual clock, is still open one tick before, and leaves the counter at
+    0; a frame other than ``hello`` does not extend the deadline."""
+
+    brain = Brain(hello_deadline_seconds=5)
+    try:
+        module = await brain.activate()
+        agent = brain.connect()
+        await settle()
+        await agent.send({"type": FRAME_PING, "id": "x"})
+        await agent.expect_error(PROXY_ERROR_UNKNOWN_SESSION)
+
+        brain.clock.advance(4)
+        await settle()
+        assert not agent.handler.done() and not agent.ws.closed
+        assert module.unpaired_connections == 1
+
+        brain.clock.advance(1)
+        await settle()
+        assert agent.handler.done(), "the silent connection outlived the hello deadline"
+        frame = await agent.expect_refusal(PROXY_ERROR_UNKNOWN_SESSION, PROXY_CLOSE_BAD_REQUEST)
+        assert frame["id"] is None
+        assert module.unpaired_connections == 0
+        assert not module.paired
+        assert any("hello_deadline_seconds" in line for line in brain.diagnostics)
+        assert brain.clock.next_deadline() is None
+    finally:
+        await brain.close()
+
+
+async def test_p6_ac20_a_peer_that_stops_reading_cannot_hold_its_slot_past_the_hello_deadline() -> None:
+    """R6 (F19): a peer that sends a malformed frame and never reads parks
+    the handler in a write under the send lock. At the deadline the slot is
+    freed at once — a new connection is accepted under a cap of 1 — and once
+    the close grace elapses on the manual clock the blocked handler is
+    cancelled rather than left open."""
+
+    brain = Brain(max_unpaired_connections=1, hello_deadline_seconds=30)
+    try:
+        module = await brain.activate()
+        reached = asyncio.Event()
+
+        class NeverDrains:
+            """The server end of a peer that does not read: every write parks."""
+
+            def __init__(self, ws: Any) -> None:
+                self._ws = ws
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._ws, name)
+
+            async def send_str(self, text: str) -> None:
+                reached.set()
+                await asyncio.Event().wait()
+
+        pair = MemoryWebSocketPair()
+        handler = asyncio.create_task(module.connection_handler(NeverDrains(pair.server)))
+        brain.handlers.append(handler)
+        stuck = Agent(brain, pair, handler)
+        await stuck.send_raw("not json")
+        await wait_until(reached.is_set)
+        await settle()
+        assert module.unpaired_connections == 1
+
+        brain.clock.advance(30)
+        await settle()
+        assert module.unpaired_connections == 0, "the deadline did not free the slot"
+        assert not handler.done()
+        newcomer = brain.connect()
+        await settle()
+        assert module.unpaired_connections == 1 and not newcomer.handler.done()
+
+        brain.clock.advance(proxy_module._HELLO_CLOSE_GRACE_SECONDS)
+        await wait_until(handler.done)
+        assert handler.cancelled()
+        assert any("did not complete" in line for line in brain.diagnostics)
+        # The newcomer's own deadline is the only one left on the clock.
+        assert not newcomer.handler.done()
+        assert brain.clock.next_deadline() == brain.clock() + 30 - proxy_module._HELLO_CLOSE_GRACE_SECONDS
+    finally:
+        await brain.close()
+
+
+async def test_p6_ac20_a_paired_connection_outlives_the_hello_deadline() -> None:
+    """R6 (F19): the deadline bounds only the wait for ``hello``; an agent
+    that paired in time is not closed when it elapses, and its watch is
+    gone from the clock."""
+
+    brain = Brain(hello_deadline_seconds=5, heartbeat_seconds=60, heartbeat_timeout_seconds=30)
+    try:
+        module = await brain.activate()
+        agent = brain.connect()
+        await agent.pair_up()
+        assert module.unpaired_connections == 0
+        # Only the heartbeat is parked on the clock: the hello watch is cancelled.
+        assert brain.clock.next_deadline() == brain.clock() + 60
+        brain.clock.advance(10)
+        await settle()
+        assert module.paired and not agent.ws.closed and not agent.handler.done()
+    finally:
+        await brain.close()
+
+
+def test_p6_validate_settings_bounds_the_unpaired_cap_and_the_hello_deadline() -> None:
+    """R6: both settings are optional, declared in the manifest with finite
+    positive defaults, and refused when not finite and positive."""
+
+    base = {**BASE_SETTINGS, "actions": [SCREEN_CAPTURE]}
+    assert validate_settings(base) == []
+    assert validate_settings(
+        {**base, "max_unpaired_connections": 2, "hello_deadline_seconds": 0.5}
+    ) == []
+    for value in (0, -1, 1.5, True, "2"):
+        (line,) = validate_settings({**base, "max_unpaired_connections": value})
+        assert "max_unpaired_connections" in line
+    for value in (0, -1, float("inf"), float("nan"), True):
+        (line,) = validate_settings({**base, "hello_deadline_seconds": value})
+        assert "hello_deadline_seconds" in line
+
+    manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+    properties = manifest["settings_schema"]["properties"]
+    assert properties["max_unpaired_connections"]["default"] == proxy_module.DEFAULT_MAX_UNPAIRED_CONNECTIONS
+    assert properties["hello_deadline_seconds"]["default"] == proxy_module.DEFAULT_HELLO_DEADLINE_SECONDS
+    assert "max_unpaired_connections" not in manifest["settings_schema"]["required"]
+    assert "hello_deadline_seconds" not in manifest["settings_schema"]["required"]

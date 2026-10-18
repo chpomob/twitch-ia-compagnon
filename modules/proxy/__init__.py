@@ -45,7 +45,15 @@ close 4401; a second authenticated agent while one is paired — or while a
 first staying connected; a text frame
 above ``max_frame_bytes`` — measured on the UTF-8 encoded frame — is
 ``frame_too_large`` and close 4413; an unknown ``type`` is ``unknown_frame``
-with the connection kept. ``welcome`` echoes the ``hello`` nonce as ``id``,
+with the connection kept. Unpaired connections are bounded (R6, F13, F19):
+at most ``max_unpaired_connections`` accepted connections may be waiting for
+pairing at once — one more is ``agent_limit`` and close 4409 before anything
+is read, with a local diagnostic — and a connection that has not sent a valid
+``hello`` within ``hello_deadline_seconds``, measured on the module's clock,
+is ``unknown_session`` and close 4400. The deadline frees the slot at once,
+and its error and close get ``_HELLO_CLOSE_GRACE_SECONDS`` on the module's
+sleeper: a peer that does not read, holding a write open, has its handler
+cancelled instead. A connection stops counting when it pairs, closes or fails. ``welcome`` echoes the ``hello`` nonce as ``id``,
 issues a ``session_id`` drawn from the injected random source and unique per
 brain process, lists the accepted action names and the brain's limits.
 
@@ -198,6 +206,8 @@ DEFAULT_MAX_ATTACHMENT_BYTES = 5_242_880
 DEFAULT_HEARTBEAT_SECONDS = 15.0
 DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 10.0
 DEFAULT_LATE_RESULT_SECONDS = 60.0
+DEFAULT_MAX_UNPAIRED_CONNECTIONS = 16
+DEFAULT_HELLO_DEADLINE_SECONDS = 30.0
 
 MAX_TERMINAL_CALLS = 1024
 """How many terminal call identities are remembered for late observations."""
@@ -247,6 +257,11 @@ _SETTING_MAX_ATTACHMENT_BYTES = "max_attachment_bytes"
 _SETTING_HEARTBEAT_SECONDS = "heartbeat_seconds"
 _SETTING_HEARTBEAT_TIMEOUT_SECONDS = "heartbeat_timeout_seconds"
 _SETTING_LATE_RESULT_SECONDS = "late_result_seconds"
+_SETTING_MAX_UNPAIRED_CONNECTIONS = "max_unpaired_connections"
+_SETTING_HELLO_DEADLINE_SECONDS = "hello_deadline_seconds"
+#: How long the ``hello`` deadline's error and close may take before the
+#: handler is cancelled: a peer that stops reading cannot hold a slot (R6).
+_HELLO_CLOSE_GRACE_SECONDS = 5.0
 _SETTINGS = frozenset(
     {
         _SETTING_LISTEN,
@@ -258,6 +273,8 @@ _SETTINGS = frozenset(
         _SETTING_HEARTBEAT_SECONDS,
         _SETTING_HEARTBEAT_TIMEOUT_SECONDS,
         _SETTING_LATE_RESULT_SECONDS,
+        _SETTING_MAX_UNPAIRED_CONNECTIONS,
+        _SETTING_HELLO_DEADLINE_SECONDS,
     }
 )
 
@@ -394,13 +411,18 @@ def validate_settings(settings: Any) -> list[str]:
             else:
                 seen.add(entry)
 
-    for name in (_SETTING_MAX_FRAME_BYTES, _SETTING_MAX_ATTACHMENT_BYTES):
+    for name in (
+        _SETTING_MAX_FRAME_BYTES,
+        _SETTING_MAX_ATTACHMENT_BYTES,
+        _SETTING_MAX_UNPAIRED_CONNECTIONS,
+    ):
         if name in settings and not _is_positive_int(settings[name]):
             diagnostics.append(_setting_diagnostic(name, "must be a positive integer"))
     for name in (
         _SETTING_HEARTBEAT_SECONDS,
         _SETTING_HEARTBEAT_TIMEOUT_SECONDS,
         _SETTING_LATE_RESULT_SECONDS,
+        _SETTING_HELLO_DEADLINE_SECONDS,
     ):
         if name in settings and not _is_positive_number(settings[name]):
             diagnostics.append(_setting_diagnostic(name, "must be a finite positive number"))
@@ -465,6 +487,10 @@ class _Settings:
     heartbeat_seconds: float
     heartbeat_timeout_seconds: float
     late_result_seconds: float
+    #: How many accepted connections may be waiting for pairing at once (R6).
+    max_unpaired_connections: int
+    #: How long an accepted connection has to send a valid ``hello`` (R6).
+    hello_deadline_seconds: float
     #: The store's own per-object bound when the entry point handed the
     #: accepted ``limits`` block over; tightens the binary bound (§6).
     store_max_object_bytes: int | None
@@ -504,6 +530,12 @@ class _Settings:
             ),
             late_result_seconds=float(
                 settings.get(_SETTING_LATE_RESULT_SECONDS, DEFAULT_LATE_RESULT_SECONDS)
+            ),
+            max_unpaired_connections=int(
+                settings.get(_SETTING_MAX_UNPAIRED_CONNECTIONS, DEFAULT_MAX_UNPAIRED_CONNECTIONS)
+            ),
+            hello_deadline_seconds=float(
+                settings.get(_SETTING_HELLO_DEADLINE_SECONDS, DEFAULT_HELLO_DEADLINE_SECONDS)
             ),
             store_max_object_bytes=store_bound,
         )
@@ -639,6 +671,12 @@ class _Connection:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     closed: bool = False
     session: "_Session | None" = None
+    #: Counted in :attr:`ProxyModule.unpaired_connections` until it pairs or ends.
+    unpaired: bool = False
+    #: The ``hello`` deadline watching it while it is unpaired.
+    deadline_task: "asyncio.Task[None] | None" = None
+    #: The task running :meth:`ProxyModule.connection_handler` for it.
+    handler_task: "asyncio.Task[Any] | None" = None
 
 
 @dataclass(slots=True, eq=False)
@@ -728,6 +766,9 @@ class ProxyModule:
         # in flight is ``agent_limit`` rather than a second pairing.
         self._pairing: _Connection | None = None
         self._connections: set[_Connection] = set()
+        # Accepted connections not paired yet, bounded by
+        # ``max_unpaired_connections`` (R6, F13).
+        self._unpaired = 0
         self._pairings = 0
         self._late_observations = 0
         self._dropped_events = 0
@@ -770,6 +811,12 @@ class ProxyModule:
         """Accepted uploads currently held in translation for the paired agent."""
 
         return len(self._session.acknowledged) if self._session is not None else 0
+
+    @property
+    def unpaired_connections(self) -> int:
+        """Accepted connections that have not completed pairing (R6)."""
+
+        return self._unpaired
 
     @property
     def paired(self) -> bool:
@@ -978,8 +1025,23 @@ class ProxyModule:
         is hand each accepted WebSocket to this coroutine.
         """
 
-        connection = _Connection(ws=ws)
+        connection = _Connection(ws=ws, handler_task=asyncio.current_task())
+        if self._unpaired >= self._settings.max_unpaired_connections:
+            # Refused before anything is read: the cap bounds what an
+            # unauthenticated peer can hold open (R6, F13).
+            self._diagnose(
+                f"{MODULE_NAME}: connection refused: max_unpaired_connections "
+                f"({self._settings.max_unpaired_connections}) reached"
+            )
+            await self._refuse(
+                connection, None, PROXY_ERROR_AGENT_LIMIT,
+                "too many connections awaiting pairing", PROXY_CLOSE_AGENT_LIMIT, retryable=True,
+            )
+            return
+        self._unpaired += 1
+        connection.unpaired = True
         self._connections.add(connection)
+        connection.deadline_task = asyncio.create_task(self._hello_deadline(connection))
         try:
             while not connection.closed:
                 message = await ws.receive()
@@ -999,11 +1061,65 @@ class ProxyModule:
                     await self._on_binary(connection, message.data)
                 # Transport-level ping/pong are answered by the transport.
         finally:
+            self._release_unpaired(connection)
             self._connections.discard(connection)
             connection.closed = True
             session = connection.session
             if session is not None:
                 await self._teardown_session(session, "connection closed")
+
+    def _release_unpaired(self, connection: _Connection) -> None:
+        """Stop counting *connection* as unpaired: on pairing, close or error."""
+
+        if connection.unpaired:
+            connection.unpaired = False
+            self._unpaired -= 1
+        task, connection.deadline_task = connection.deadline_task, None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    async def _hello_deadline(self, connection: _Connection) -> None:
+        """Close *connection* if no valid ``hello`` came within the deadline (R6, F19).
+
+        Measured on the module's clock and slept on the injected sleeper, so
+        a manual clock decides it. A ``hello`` whose checks passed and is
+        still being answered holds the pairing slot and is left alone.
+
+        The slot is freed before anything is written, and the error and close
+        are bounded: the handler may be parked in a write under the send lock
+        (a peer that does not read), so if they have not finished within
+        ``_HELLO_CLOSE_GRACE_SECONDS`` the handler is cancelled.
+        """
+
+        deadline = self._clock() + self._settings.hello_deadline_seconds
+        while (remaining := deadline - self._clock()) > 0:
+            await self._sleeper(remaining)
+        if connection.closed or not connection.unpaired or self._pairing is connection:
+            return
+        self._diagnose(
+            f"{MODULE_NAME}: connection closed: no valid hello within hello_deadline_seconds "
+            f"({self._settings.hello_deadline_seconds:g})"
+        )
+        self._release_unpaired(connection)
+        refusal = asyncio.ensure_future(self._refuse(
+            connection, None, PROXY_ERROR_UNKNOWN_SESSION,
+            "no hello before the deadline", PROXY_CLOSE_BAD_REQUEST,
+        ))
+        grace = asyncio.ensure_future(self._sleeper(_HELLO_CLOSE_GRACE_SECONDS))
+        try:
+            await asyncio.wait((refusal, grace), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            grace.cancel()
+            if not refusal.done():
+                refusal.cancel()
+                connection.closed = True
+                handler = connection.handler_task
+                if handler is not None and not handler.done():
+                    self._diagnose(
+                        f"{MODULE_NAME}: connection dropped: the hello-deadline close did not "
+                        f"complete within {_HELLO_CLOSE_GRACE_SECONDS:g}s"
+                    )
+                    handler.cancel()
 
     async def _on_text(self, connection: _Connection, data: Any) -> None:
         text = data if isinstance(data, str) else bytes(data).decode("utf-8", "replace")
@@ -1154,6 +1270,7 @@ class ProxyModule:
             )
             connection.session = session
             self._session = session
+            self._release_unpaired(connection)
         finally:
             if self._pairing is connection:
                 self._pairing = None
@@ -2204,7 +2321,9 @@ __all__ = [
     "CLOSE_GOING_AWAY",
     "DEFAULT_HEARTBEAT_SECONDS",
     "DEFAULT_HEARTBEAT_TIMEOUT_SECONDS",
+    "DEFAULT_HELLO_DEADLINE_SECONDS",
     "DEFAULT_LATE_RESULT_SECONDS",
+    "DEFAULT_MAX_UNPAIRED_CONNECTIONS",
     "DEFAULT_MAX_ATTACHMENT_BYTES",
     "EVENT_ALLOWLIST",
     "MANIFEST_PATH",
