@@ -100,6 +100,7 @@ from modules.brain import (
     PRINCIPAL,
     WATCH_PRINCIPAL,
     BrainModuleError,
+    ConversationErasure,
     ConversationMemory,
     _estimate_tokens,
     _estimate_tool_tokens,
@@ -3975,8 +3976,88 @@ async def test_ac14_a_run_admitted_before_the_erasure_records_nothing_after_it(
         assert [send["text"] for send in harness.transport.sends] == [ERASED_REPLY]
         assert harness.brain.memory.recall(memory_key()) == ()
         assert harness.brain.memory.refused_records == 1
+        # Probe E (F6): the persistent store refuses the held run's record
+        # too, so the erased text is not recreated on disk.
+        assert_store_erased(harness)
     finally:
         await auditor.close()
+        await harness.close()
+
+
+def memory_files_text(harness: MemoryPlatform) -> list[str]:
+    """The text of every file under the viewer memory store's directory."""
+
+    assert harness.memory is not None
+    directory = harness.memory.store.directory
+    return [
+        path.read_bytes().decode("utf-8", "replace")
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    ]
+
+
+def assert_store_erased(harness: MemoryPlatform) -> None:
+    """No record for ``VIEWER`` and none of the erased text on disk, each
+    refusal of the store counted and traced ``refused`` (F6, probe E)."""
+
+    assert harness.memory is not None
+    assert harness.stored() is None
+    assert not any(carries_erased_text(text) for text in memory_files_text(harness))
+    records = [
+        event["payload"].get("memory_record")
+        for event in events_of(harness.context.bus, TRACE_BRAIN_RUN_COMPLETED)
+    ]
+    # The held run and the ``!forgetme`` run, admitted at the erasure's
+    # instant — a tie counts as before it — are both refused by the store.
+    assert records.count("refused") == harness.memory.refused_records == 2
+    assert "success" not in records
+
+
+@pytest.mark.asyncio
+async def test_f6_the_store_refuses_a_stale_record_and_keeps_later_and_other_keys(
+    tmp_path: Path,
+) -> None:
+    """F6 (probe E, R4): a run admitted before ``!forgetme`` whose record
+    lands after it writes nothing to the persistent store — no record for
+    the key, none of the erased text in any file under its directory, the
+    refusal counted — exactly as the brain's own memory refuses it. A record
+    for another key at the erasure's instant, and one for the same key
+    admitted after the erasure, are written."""
+
+    session = FirstHeldModel(
+        final(ERASED_REPLY), final(""), final("other reply"), final("fresh reply")
+    )
+    harness = await activate_memory_platform(tmp_path, session=session)
+    try:
+        await inject_chat(harness, VIEWER, ERASED_TEXT, "m-erased")
+        await wait_until(session.entered.is_set)
+        epoch_before = harness.brain.memory.epoch(memory_key())
+        await inject_chat(harness, VIEWER, "!forgetme", "m-forget")
+        await wait_until(lambda: harness.brain.memory.epoch(memory_key()) > epoch_before)
+        session.release.set()
+        await runs_completed(harness, 2)
+        assert harness.brain.memory.recall(memory_key()) == ()
+        assert harness.brain.memory.refused_records == 1
+        assert_store_erased(harness)
+
+        await inject_chat(harness, OTHER_VIEWER, "other words", "m-other")
+        await runs_completed(harness, 3)
+        assert harness.memory is not None
+        other = harness.memory.store.read(FAKE_PLATFORM, FAKE_CHANNEL, OTHER_VIEWER)
+        assert other is not None
+        assert [note["viewer_text"] for note in other["notes"]] == ["other words"]
+
+        harness.clock.advance(1.0)
+        await inject_chat(harness, VIEWER, "fresh words", "m-fresh")
+        await runs_completed(harness, 4)
+        stored = harness.stored()
+        assert stored is not None
+        assert [note["viewer_text"] for note in stored["notes"]] == ["fresh words"]
+        assert stored["notes"][0]["reply_text"] == "fresh reply"
+        assert not any(carries_erased_text(text) for text in memory_files_text(harness))
+        assert harness.memory.refused_records == 2
+        assert harness.brain.memory.refused_records == 1
+    finally:
         await harness.close()
 
 
@@ -4001,6 +4082,36 @@ def test_r4_a_stale_epoch_is_refused_and_a_fresh_one_kept() -> None:
     assert memory.remember(key, "later", "kept", epoch=fresh) is not None
     assert [item.user for item in memory.recall(key)] == ["later"]
     assert [item.user for item in memory.recall(other)] == ["o"]
+
+
+def test_f6_the_erasure_service_admits_a_record_by_the_run_s_admission_epoch() -> None:
+    """F6 (probe E, R4): ``admits`` reads the persistent record's run from
+    the epochs the brain keeps — a run admitted before the key's erasure is
+    not admitted, one admitted after it is, another key is untouched, and a
+    run not in progress (or of another key) is not admitted. It counts
+    nothing: the brain's own refusals stay its own."""
+
+    clock = ManualClock(10.0)
+    memory = ConversationMemory(
+        max_sessions=4, max_exchanges=4, max_bytes=4096, max_age_seconds=600, clock=clock
+    )
+    key, other = memory_key(), memory_key(OTHER_VIEWER)
+    runs = {
+        "stale": (key, memory.epoch(key, admitted_at=clock.now)),
+        "other": (other, memory.epoch(other, admitted_at=clock.now)),
+    }
+    service = ConversationErasure(memory, runs.get)
+    names = (FAKE_PLATFORM, FAKE_CHANNEL)
+    assert service.admits(*names, VIEWER, "stale") is True
+    assert service.forget(*names, VIEWER) is False
+    assert service.admits(*names, VIEWER, "stale") is False
+    assert service.admits(*names, OTHER_VIEWER, "other") is True
+    clock.advance(1.0)
+    runs["fresh"] = (key, memory.epoch(key, admitted_at=clock.now))
+    assert service.admits(*names, VIEWER, "fresh") is True
+    assert service.admits(*names, VIEWER, "finished") is False
+    assert service.admits(*names, VIEWER, "other") is False
+    assert memory.refused_records == 0
 
 
 def test_r4_the_erasure_epochs_are_bounded_without_letting_a_stale_record_in() -> None:

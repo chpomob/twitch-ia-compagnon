@@ -1931,6 +1931,16 @@ class ConversationMemory:
             return erasure.epoch
         return 0 if self._overflow is None else self._overflow.epoch
 
+    def admits(self, key: SessionKey, epoch: int) -> bool:
+        """Whether a record of *key* by a run that read *epoch* at its
+        admission (:meth:`epoch`) may be written: not when the key was
+        erased since (phase 6 R4). Counts nothing — the holder refusing
+        the record counts its own refusals."""
+
+        session_id = _session_id(key)
+        self._expire_erasures()
+        return epoch >= self._erased_epoch(session_id)
+
     def remember(
         self, key: SessionKey, user: str, assistant: str, *, epoch: int | None = None
     ) -> Exchange | None:
@@ -1950,11 +1960,9 @@ class ConversationMemory:
         session_id = _session_id(key)
         if not isinstance(user, str) or not isinstance(assistant, str):
             raise BrainModuleError("brain memory: an exchange holds two strings")
-        if epoch is not None:
-            self._expire_erasures()
-            if epoch < self._erased_epoch(session_id):
-                self._refused_records += 1
-                return None
+        if epoch is not None and not self.admits(key, epoch):
+            self._refused_records += 1
+            return None
         exchange = Exchange(
             timestamp=self._clock(),
             user=user,
@@ -2041,19 +2049,42 @@ class ConversationErasure:
     of that one key and bumps its erasure epoch, so a run admitted before the
     call records nothing for it afterwards. It takes the key and nothing
     else; it returns whether an exchange was retained.
+
+    ``admits(platform, channel_id, viewer_id, run_id)`` extends the erasure
+    to the persistent store: it is whether a record of that key made by the
+    run *run_id* may be written, read from the same epochs
+    (:meth:`ConversationMemory.admits`) with the epoch the run read at its
+    admission. A run this module is not running — finished, or another
+    key's — is not admitted: no epoch of its admission is left to vouch
+    for it.
     """
 
-    __slots__ = ("_memory",)
+    __slots__ = ("_memory", "_runs")
 
-    def __init__(self, memory: ConversationMemory) -> None:
+    def __init__(
+        self,
+        memory: ConversationMemory,
+        runs: Callable[[str], tuple[SessionKey, int] | None],
+    ) -> None:
         self._memory = memory
+        self._runs = runs
 
     def forget(self, platform: str, channel_id: str, viewer_id: str) -> bool:
-        try:
-            key = SessionKey(platform=platform, channel_id=channel_id, viewer_id=viewer_id)
-        except Exception:
-            raise BrainModuleError("brain memory: erasure key is invalid") from None
-        return self._memory.forget(key)
+        return self._memory.forget(_erasure_key(platform, channel_id, viewer_id))
+
+    def admits(self, platform: str, channel_id: str, viewer_id: str, run_id: str) -> bool:
+        key = _erasure_key(platform, channel_id, viewer_id)
+        admitted = self._runs(run_id) if isinstance(run_id, str) else None
+        if admitted is None or admitted[0] != key:
+            return False
+        return self._memory.admits(key, admitted[1])
+
+
+def _erasure_key(platform: str, channel_id: str, viewer_id: str) -> SessionKey:
+    try:
+        return SessionKey(platform=platform, channel_id=channel_id, viewer_id=viewer_id)
+    except Exception:
+        raise BrainModuleError("brain memory: erasure key is invalid") from None
 
 
 def _session_id(key: Any) -> str:
@@ -2655,6 +2686,10 @@ class BrainModule:
                 for field in fields(_MemoryLimits)
             },
         )
+        #: The session key and admission epoch of every run in progress, by
+        #: run id: what :class:`ConversationErasure` checks a persistent
+        #: record against (phase 6 R4). Bounded by the runs in flight.
+        self._run_epochs: dict[str, tuple[SessionKey, int]] = {}
         self._owns_scheduler = runtime.scheduler is None
         if self._owns_scheduler:
             limits = settings.admission
@@ -2697,6 +2732,12 @@ class BrainModule:
         """The conversation memory this module owns; see :class:`ConversationMemory`."""
 
         return self._memory
+
+    def run_epoch(self, run_id: str) -> tuple[SessionKey, int] | None:
+        """The session key and erasure epoch run *run_id* read at its
+        admission while it is in progress, else ``None`` (phase 6 R4)."""
+
+        return self._run_epochs.get(run_id)
 
     @property
     def scheduler(self) -> Any:
@@ -3006,12 +3047,17 @@ class BrainModule:
             route_delivery=None if route is None else self._route_deliveries.get(route.name),
             memory_epoch=self._memory.epoch(key, admitted_at=_admitted_at(run)),
         )
+        # Only while it runs: a record its let-go call makes later is refused.
+        run_id = getattr(run, "run_id", None)
+        if isinstance(run_id, str) and state.memory_epoch is not None:
+            self._run_epochs[run_id] = (key, state.memory_epoch)
         try:
             outcome = await self._loop(run, message, key, transcript, state)
             if state.fallback_reason is not None:
                 outcome = await self._fallback_outcome(run, message, state, outcome)
             return await self._record_memory(run, message, key, state, outcome)
         finally:
+            self._run_epochs.pop(run_id, None)
             self._discard_images(transcript.attachment_parts())
 
     async def _loop(
@@ -5067,7 +5113,7 @@ async def activate(
             services.publish(
                 ERASURE_SERVICE_KIND,
                 ERASURE_SERVICE_SCOPE,
-                ConversationErasure(module.memory),
+                ConversationErasure(module.memory, module.run_epoch),
             )
         return module
     except BaseException:

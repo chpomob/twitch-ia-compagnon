@@ -104,6 +104,16 @@ record is a use (``use_count`` + 1, ``last_used`` now). A record creates or
 updates the file through :meth:`MemoryStore.record`, with its bounds and
 eviction.
 
+A record is first checked against the erasure (phase 6 R4): when the
+brain's erasure service answers ``admits(platform, channel_id, viewer_id,
+run_id)`` — the epoch the call's run read at its admission against the
+key's latest erasure, the brain's epochs being the one reference — and it
+does not admit the call's run, nothing is written: the call ends ``refused
+erased``, counted in :attr:`ViewerMemoryModule.refused_records` with a
+value-free diagnostic, so a run admitted before ``!forgetme`` cannot
+recreate the erased file. A service that cannot answer refuses too; a
+profile without one has no erasure epoch to compare and writes as before.
+
 **Facts.** Every eviction pass, expiry pass, corrupt pass and erasure
 publishes one ``memory.removed`` fact carrying ``reason`` and ``count`` only —
 no viewer identifier, no file name. A deletion the prepare scan could not
@@ -163,6 +173,8 @@ ERROR_NO_VIEWER = "no_viewer"
 ERROR_INVALID_ARGUMENTS = "invalid_arguments"
 ERROR_STORE_FAILED = "store_failed"
 _ERROR_PROVIDER_CLOSED = "provider_closed"
+#: A record of a run admitted before its key's erasure (phase 6 R4).
+ERROR_ERASED = "erased"
 
 #: The fact every removal pass publishes.
 ERASURE_SERVICE_KIND = "erasure"
@@ -1260,6 +1272,7 @@ class ViewerMemoryModule:
         self._prepared = False
         self._stopping = False
         self._closed = False
+        self._refused_records = 0
         # Value-free diagnostics of what could not be done (a failed deletion
         # pass, a lost fact); bounded to the newest few.
         self._diagnostics: list[str] = []
@@ -1275,6 +1288,13 @@ class ViewerMemoryModule:
     @property
     def diagnostics(self) -> tuple[str, ...]:
         return tuple(self._diagnostics)
+
+    @property
+    def refused_records(self) -> int:
+        """How many ``memory.record`` calls were refused because their run
+        was admitted before the key's erasure (phase 6 R4)."""
+
+        return self._refused_records
 
     # -- lifecycle hooks ---------------------------------------------------- #
 
@@ -1437,14 +1457,7 @@ class ViewerMemoryModule:
         not raised: both are recorded as a local diagnostic naming no viewer.
         """
 
-        resolve = getattr(self._services, "resolve", None)
-        service = None
-        if callable(resolve):
-            try:
-                service = resolve(ERASURE_SERVICE_KIND, ERASURE_SERVICE_SCOPE)
-            except Exception:  # noqa: BLE001 - an unreadable registry reaches nothing
-                service = None
-        forget = getattr(service, "forget", None)
+        forget = getattr(self._erasure_service(), "forget", None)
         if not callable(forget):
             self._diagnose("erasure: no conversation memory to reach")
             return
@@ -1456,6 +1469,37 @@ class ViewerMemoryModule:
             raise
         except Exception:  # noqa: BLE001 - reported, the file erasure stands
             self._diagnose("erasure: the conversation memory could not be erased")
+
+    def _erasure_service(self) -> Any:
+        """The brain's erasure service, resolved now; ``None`` when absent."""
+
+        resolve = getattr(self._services, "resolve", None)
+        if not callable(resolve):
+            return None
+        try:
+            return resolve(ERASURE_SERVICE_KIND, ERASURE_SERVICE_SCOPE)
+        except Exception:  # noqa: BLE001 - an unreadable registry reaches nothing
+            return None
+
+    async def _admitted(self, key: MemoryKey, run_id: str) -> bool:
+        """Whether run *run_id* may record for *key*: not when the brain's
+        erasure epochs say the key was erased since its admission (phase 6
+        R4). No service answering ``admits`` leaves no epoch to compare, so
+        the record is admitted; a service that fails to answer refuses it."""
+
+        admits = getattr(self._erasure_service(), "admits", None)
+        if not callable(admits):
+            return True
+        try:
+            outcome = admits(*key, run_id)
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - an unanswered check fails closed
+            self._diagnose("record: the erasure could not be checked")
+            return False
+        return outcome is True
 
     # -- the actions (R4) ----------------------------------------------------- #
 
@@ -1484,7 +1528,7 @@ class ViewerMemoryModule:
             )
         if action_name == RECALL_ACTION:
             return await self._recall(key, provenance)
-        return await self._record(key, call.arguments, provenance)
+        return await self._record(key, call.arguments, provenance, call.run_id)
 
     async def _recall(self, key: MemoryKey, provenance: Mapping[str, Any]) -> ActionObservation:
         try:
@@ -1515,7 +1559,11 @@ class ViewerMemoryModule:
         )
 
     async def _record(
-        self, key: MemoryKey, arguments: Mapping[str, Any], provenance: Mapping[str, Any]
+        self,
+        key: MemoryKey,
+        arguments: Mapping[str, Any],
+        provenance: Mapping[str, Any],
+        run_id: str,
     ) -> ActionObservation:
         # The schema subset has no length keyword: the text bounds are here.
         for field_name in ("viewer_text", "reply_text"):
@@ -1531,6 +1579,20 @@ class ViewerMemoryModule:
             for name in ("viewer_text", "reply_text", "delivery")
             if name in arguments
         }
+        # Checked last before the write, with no suspension between them
+        # once answered: an erasure cannot land between the check and it.
+        if not await self._admitted(key, run_id):
+            self._refused_records += 1
+            self._diagnose("record: refused after an erasure")
+            return ActionObservation(
+                status="refused",
+                provenance=provenance,
+                error={
+                    "code": ERROR_ERASED,
+                    "message": "the viewer's memory was erased after this run was admitted",
+                    "retryable": False,
+                },
+            )
         try:
             record = await self.record(
                 *key, display_name=arguments.get("display_name"), note=note
@@ -1882,6 +1944,7 @@ __all__ = [
     "DISPLAY_NAME_MAX_CHARS",
     "ERASURE_SERVICE_KIND",
     "ERASURE_SERVICE_SCOPE",
+    "ERROR_ERASED",
     "ERROR_NO_VIEWER",
     "EXCEEDED_FILES_NAMED",
     "FACT_MEMORY_DELETION_FAILED",

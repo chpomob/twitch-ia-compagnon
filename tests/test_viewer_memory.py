@@ -1557,6 +1557,87 @@ async def test_ac22_record_accepts_the_exchange_data(tmp_path: Path) -> None:
         await h.handle.close()
 
 
+class ErasureEpochs:
+    """A stand-in for the brain's erasure service: ``admits`` answers from
+    a fixed set of refused ``(key, run_id)`` pairs and records each query."""
+
+    def __init__(self, refused: set[tuple[tuple[str, str, str], str]], *, fail: bool = False):
+        self.refused = refused
+        self.fail = fail
+        self.queries: list[tuple[tuple[str, str, str], str]] = []
+
+    def forget(self, platform: str, channel_id: str, viewer_id: str) -> bool:
+        return False
+
+    def admits(self, platform: str, channel_id: str, viewer_id: str, run_id: str) -> bool:
+        key = (platform, channel_id, viewer_id)
+        self.queries.append((key, run_id))
+        if self.fail:
+            raise RuntimeError("unanswerable")
+        return (key, run_id) not in self.refused
+
+
+@pytest.mark.asyncio
+async def test_f6_a_record_the_erasure_does_not_admit_writes_nothing(tmp_path: Path) -> None:
+    """F6 (probe E, R4): a ``memory.record`` whose run the brain's erasure
+    epochs do not admit ends ``refused erased``, writes no file and leaves
+    none of its text under the directory, and is counted; another key's
+    record and the same key's record by an admitted run are written; a
+    service that fails to answer refuses, and none at all admits."""
+
+    h = await memory_harness(tmp_path)
+    key = ("fake", MEMORY_CHANNEL, VIEWER)
+    epochs = ErasureEpochs({(key, "run-1")})
+    h.runtime.for_module("brain").services.publish(
+        viewer_memory.ERASURE_SERVICE_KIND, viewer_memory.ERASURE_SERVICE_SCOPE, epochs
+    )
+    directory = h.handle.store.directory
+    try:
+        refused = await h.record(
+            "my secret words", reply_text="secret reply", delivery="confirmed"
+        )
+        assert refused.status == "refused", refused
+        assert refused.error["code"] == viewer_memory.ERROR_ERASED == "erased"
+        assert epochs.queries == [(key, "run-1")]
+        assert h.handle.refused_records == 1
+        assert "viewer_memory record: refused after an erasure" in h.handle.diagnostics
+        assert h.handle.store.read(*key) is None
+        assert not any(
+            b"secret" in path.read_bytes() for path in directory.rglob("*") if path.is_file()
+        )
+
+        other = await h.invoke(
+            RECORD_ACTION,
+            {"viewer_text": "other words", "delivery": "none"},
+            conversation_id=SessionKey("fake", MEMORY_CHANNEL, "v2").serialize(),
+        )
+        assert other.status == "success", other
+        assert h.handle.store.read("fake", MEMORY_CHANNEL, "v2") is not None
+
+        epochs.refused.clear()
+        fresh = await h.record("fresh words")
+        assert fresh.status == "success", fresh
+        assert [note["viewer_text"] for note in h.stored()["notes"]] == ["fresh words"]
+        assert h.handle.refused_records == 1
+
+        epochs.fail = True
+        failed = await h.record("unchecked words")
+        assert failed.status == "refused" and failed.error["code"] == "erased"
+        assert h.handle.refused_records == 2
+        assert "viewer_memory record: the erasure could not be checked" in h.handle.diagnostics
+        assert [note["viewer_text"] for note in h.stored()["notes"]] == ["fresh words"]
+    finally:
+        await h.handle.close()
+
+    # No brain in the profile: no epoch to compare, the record is written.
+    bare = await memory_harness(tmp_path / "bare")
+    try:
+        assert (await bare.record("no brain")).status == "success"
+        assert bare.handle.refused_records == 0
+    finally:
+        await bare.handle.close()
+
+
 @pytest.mark.asyncio
 async def test_ac22_twelve_notes_fit_1024_bytes_newest_first(tmp_path: Path) -> None:
     """AC22: 12 notes of 200 characters at ``max_recall_bytes: 1024`` give a
