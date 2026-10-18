@@ -11,7 +11,15 @@ exercised here, by the same rules:
   reader to export — so the block is validated by the code path the reader runs;
 * every ``${...}`` reference in that block is one of the eight documented exports
   (an undocumented reference is precisely the first error a reader would hit);
-* the commands, the flags and the file name the guide prints still exist;
+* every ``python -m X`` and console-script command both guides and the README
+  print resolves against the code — ``X`` importable with a callable entry point,
+  or a ``[project.scripts]`` name — and the README's configuration-UI command,
+  run exactly as printed with ``--help`` for its arguments, exits 0 (R8, F16, F18);
+* the ``MODEL_ENDPOINT`` values the guides give are complete Chat Completions URLs,
+  and a fake-backed startup of the guide's profile posts to exactly that URL
+  (R8, F15);
+* the overlay file the documents name is the one ``core/overlay.py`` derives for
+  their profile (R8, F17);
 * the two documents name each other and print the same profile, which is what makes
   the pair a translation rather than two documents that happen to share a subject.
 
@@ -21,21 +29,48 @@ the guide's eight values, not on whatever the developer happens to have exported
 
 from __future__ import annotations
 
+import asyncio
+import importlib
+import importlib.util
+import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised on the 3.10 floor only
+    import tomli as tomllib
 
 import pytest
 import yaml
+
+import core.main as application
+from conftest import FakeResponse, FakeSession
+from core.overlay import implicit_overlay_path
+from modules.twitch import EVENTSUB_SUBSCRIPTIONS_URL
 
 ROOT = Path(__file__).parents[1]
 GUIDES = (ROOT / "docs" / "installation.md", ROOT / "docs" / "installation.fr.md")
 """The English guide and its French counterpart, in that order."""
 
+README = ROOT / "README.md"
+DOCUMENTS = (*GUIDES, README)
+"""Every document that prints a command a newcomer copies."""
+
 PROFILE_NAME = "mon-compagnon.yaml"
 """The file name both guides tell the reader to save the profile under."""
+
+README_PROFILE_NAME = "my-config.yaml"
+"""The profile name the README's quick start passes to ``--config``."""
+
+PRE_FIX_README_COMMAND = "python -m twitch-ia-compagnon-config-ui --config my-config.yaml"
+"""The README's configuration-UI line before F16: a console-script name given to ``-m``."""
 
 VALUES = {
     "TWITCH_CLIENT_ID": "guide-client-id",
@@ -43,7 +78,7 @@ VALUES = {
     "TWITCH_ACCESS_TOKEN": "guide-access-token",
     "TWITCH_BROADCASTER_ID": "123456789",
     "TWITCH_BOT_USER_ID": "987654321",
-    "MODEL_ENDPOINT": "https://api.example.com/v1",
+    "MODEL_ENDPOINT": "https://api.example.com/v1/chat/completions",
     "MODEL_NAME": "guide-model",
     "MODEL_API_KEY": "guide-api-key",
 }
@@ -113,15 +148,350 @@ def test_every_reference_in_the_profile_is_an_export_the_guide_gives(guide: Path
     assert referenced <= documented, sorted(referenced - documented)
 
 
-@pytest.mark.parametrize("guide", GUIDES, ids=lambda path: path.name)
-def test_the_guide_prints_the_commands_the_code_still_has(guide: Path) -> None:
-    """The three commands, and the check flag, are the ones the entry points expose."""
+_MODULE_COMMAND = re.compile(r"(?<![\w.-])(?:python3?|py(?: -3)?) -m (?P<module>[^\s`|]+)")
+_INLINE = re.compile(r"`([^`\n]+)`")
+_CONSOLE_PREFIX = "twitch-ia-compagnon"
+_BOOTSTRAPPED = {"pip": "ensurepip"}
+"""Tools a fresh virtual environment may not carry yet, by their stdlib bootstrapper.
 
-    text = _text(guide)
-    assert f"--config {PROFILE_NAME} --check-config" in text
-    assert f"python -m core.main --config {PROFILE_NAME}" in text
-    assert f"python -m core.config_ui --config {PROFILE_NAME}" in text
-    assert "python -m demo" in text
+``python -m pip`` is printed for a reader whose environment ``venv`` created —
+which installs pip through ``ensurepip``. An environment created otherwise (this
+suite's may be) can lack pip itself, so pip resolves when it is importable or when
+the bootstrapper that provides it is.
+"""
+
+
+def _project_scripts() -> frozenset[str]:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return frozenset(project["project"]["scripts"])
+
+
+def _command_lines(text: str) -> list[str]:
+    """Every line a reader copies: fenced-block lines and inline code spans."""
+
+    lines = [
+        line.strip()
+        for match in _BLOCK.finditer(text)
+        if match.group("language") != "yaml"
+        for line in match.group("body").splitlines()
+    ]
+    lines.extend(span.strip() for span in _INLINE.findall(text))
+    return [line for line in lines if line]
+
+
+def _modules(text: str) -> list[str]:
+    """The ``X`` of every ``python -m X`` the text prints, in order."""
+
+    return [
+        match.group("module")
+        for line in _command_lines(text)
+        for match in _MODULE_COMMAND.finditer(line)
+    ]
+
+
+def _console_scripts(text: str) -> list[str]:
+    """Every command line that starts with the project's console-script prefix."""
+
+    return [
+        line.split()[0]
+        for line in _command_lines(text)
+        if line.split()[0].startswith(_CONSOLE_PREFIX)
+    ]
+
+
+def _module_unresolved(module: str) -> str | None:
+    """Why ``python -m module`` would not run, or ``None`` when it resolves.
+
+    It resolves when the module is importable, is runnable by ``-m`` (a
+    package needs its ``__main__``) and exposes a callable ``main`` — the
+    entry point a command runs. The ``__main__`` is located, never imported:
+    importing it would run the command.
+    """
+
+    if module in _BOOTSTRAPPED and importlib.util.find_spec(module) is None:
+        module = _BOOTSTRAPPED[module]
+    try:
+        spec = importlib.util.find_spec(module)
+    except (ImportError, ValueError):
+        spec = None
+    if spec is None:
+        return f"{module}: no such module"
+    if spec.submodule_search_locations is not None:
+        if importlib.util.find_spec(f"{module}.__main__") is None:
+            return f"{module}: a package without __main__"
+    entry = getattr(importlib.import_module(module), "main", None)
+    if entry is None and module in _BOOTSTRAPPED.values():
+        entry = getattr(importlib.import_module(module), "_main", None)
+    if not callable(entry):
+        return f"{module}: no callable entry point"
+    return None
+
+
+def _unresolved_commands(text: str) -> list[str]:
+    scripts = _project_scripts()
+    failures = [
+        reason
+        for reason in (_module_unresolved(module) for module in _modules(text))
+        if reason is not None
+    ]
+    failures.extend(
+        f"{name}: not a [project.scripts] entry"
+        for name in _console_scripts(text)
+        if name not in scripts
+    )
+    return failures
+
+
+@pytest.mark.parametrize("document", DOCUMENTS, ids=lambda path: path.name)
+def test_the_guide_prints_the_commands_the_code_still_has(document: Path) -> None:
+    """Every printed command resolves against the code, not against a grep (F18, R8).
+
+    Replaces a grep of the guide text for command names, which passed for a
+    command the code no longer has and never looked at the README (F18). Each
+    ``python -m X`` printed in both guides and the README must name an
+    importable, ``-m``-runnable module exposing a callable entry point, and each
+    console-script command a ``[project.scripts]`` name of ``pyproject.toml``
+    (R8). The commands the guides walk the reader through — the check, the
+    run, the configuration UI and the demo — must still be among them, with
+    the check flag on the guide's profile.
+    """
+
+    text = _text(document)
+    modules = _modules(text)
+    assert modules, f"{document.name}: no command found"
+    assert _unresolved_commands(text) == []
+    assert {"core.main", "core.config_ui", "demo"} <= set(modules)
+    if document in GUIDES:
+        assert f"--config {PROFILE_NAME} --check-config" in text
+
+
+def test_the_pre_fix_readme_line_does_not_resolve() -> None:
+    """The resolution rejects the README line F16 found (F18, R8).
+
+    ``twitch-ia-compagnon-config-ui`` is a console script, not a module: the
+    grep this resolution replaces could not tell the two apart.
+    """
+
+    assert _unresolved_commands(f"```bash\n{PRE_FIX_README_COMMAND}\n```\n") == [
+        "twitch-ia-compagnon-config-ui: no such module"
+    ]
+
+
+def _readme_config_ui_command() -> str:
+    """The README quick start's configuration-UI line, as printed."""
+
+    for match in _BLOCK.finditer(_text(README)):
+        lines = match.group("body").splitlines()
+        for comment, command in zip(lines, lines[1:]):
+            if comment.startswith("#") and "configuration UI" in comment:
+                return command.split("#", 1)[0].strip()
+    raise AssertionError("README: no configuration-UI command")
+
+
+def _run_with_help(command: str) -> subprocess.CompletedProcess[str]:
+    """Run *command* as printed, its arguments replaced by ``--help``.
+
+    The command is everything before its first option; ``python`` is the
+    interpreter running this suite, which is the reader's activated one.
+    """
+
+    words = shlex.split(command)
+    first_option = next(
+        (index for index, word in enumerate(words) if word.startswith("--")), len(words)
+    )
+    program = words[:first_option]
+    if program[0] in ("python", "python3"):
+        program[0] = sys.executable
+    return subprocess.run(
+        [*program, "--help"],
+        cwd=ROOT,
+        env={**os.environ, "NO_COLOR": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_the_readme_config_ui_command_runs() -> None:
+    """The README's configuration-UI command runs, as printed (F16, R8).
+
+    Executed exactly as printed with its arguments replaced by ``--help``: it
+    exits 0 within 30 s and prints the usage naming ``--config``. The pre-fix
+    line, under the same check, exits non-zero.
+    """
+
+    command = _readme_config_ui_command()
+    assert command.endswith(f"--config {README_PROFILE_NAME}")
+    completed = _run_with_help(command)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "usage:" in completed.stdout
+    assert "--config" in completed.stdout
+
+    assert _run_with_help(PRE_FIX_README_COMMAND).returncode != 0
+
+
+# --------------------------------------------------------------------------- #
+# F15: the endpoint the guide gives is the URL the brain posts to
+# --------------------------------------------------------------------------- #
+
+
+def _endpoint_values(guide: Path) -> list[str]:
+    """The example ``MODEL_ENDPOINT`` URLs of the guide's table of values."""
+
+    rows = [
+        line for line in _text(guide).splitlines() if line.startswith("| `MODEL_ENDPOINT` |")
+    ]
+    assert len(rows) == 1, f"{guide.name}: one MODEL_ENDPOINT row"
+    examples = rows[0].split("|")[3]
+    return [span for span in _INLINE.findall(examples) if span.startswith("http")]
+
+
+class _FakeEventSocket:
+    """A platform socket that welcomes the session, then stays silent."""
+
+    def __init__(self) -> None:
+        self._frames: asyncio.Queue[Any] = asyncio.Queue()
+        self._frames.put_nowait(
+            {
+                "metadata": {"message_type": "session_welcome"},
+                "payload": {"session": {"id": "guide-session"}},
+            }
+        )
+
+    async def receive(self) -> Any:
+        return await self._frames.get()
+
+    async def close(self) -> None:
+        return None
+
+
+class _FakePlatformSession:
+    """The platform edge of the guide's profile: validation and subscription."""
+
+    def __init__(self) -> None:
+        self._socket = _FakeEventSocket()
+
+    async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        return FakeResponse(
+            200,
+            {"client_id": VALUES["TWITCH_CLIENT_ID"], "user_id": VALUES["TWITCH_BOT_USER_ID"]},
+        )
+
+    async def post(self, url: str, **kwargs: Any) -> FakeResponse:
+        assert url == EVENTSUB_SUBSCRIPTIONS_URL, url
+        return FakeResponse(202, {"data": [{"id": "guide-subscription"}]})
+
+    async def ws_connect(self, url: str) -> _FakeEventSocket:
+        return self._socket
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("guide", GUIDES, ids=lambda path: path.name)
+def test_the_guides_endpoint_values_are_complete_chat_completions_urls(guide: Path) -> None:
+    """Each example ``MODEL_ENDPOINT`` is a full request URL (F15, R8).
+
+    The adapter posts to the endpoint as given; a base URL ending in ``/v1``
+    is a 404 the reader cannot diagnose.
+    """
+
+    values = _endpoint_values(guide)
+    assert len(values) >= 2, values
+    assert all(value.endswith("/chat/completions") for value in values), values
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guide", GUIDES, ids=lambda path: path.name)
+async def test_the_guides_profile_posts_to_the_guides_endpoint(
+    guide: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fake-backed startup of the guide's profile posts to the guide's value (F15, R8).
+
+    The printed profile is run through :func:`core.main.run` with each example
+    ``MODEL_ENDPOINT`` the guide gives; only the platform session, the model
+    transport and the audit writer are fakes. The brain's prepare-time probe
+    is the request it makes, and its URL is exactly the guide's value — a
+    complete Chat Completions URL, since the adapter adds no path of its own.
+    """
+
+    config = tmp_path / PROFILE_NAME
+    config.write_text(_profile(guide), encoding="utf-8")
+    real_load_config = application.load_config
+
+    endpoints = _endpoint_values(guide)
+    assert endpoints and all(value.endswith("/chat/completions") for value in endpoints)
+    for endpoint in endpoints:
+        model = FakeSession()
+        diagnostics: list[str] = []
+
+        def load_with_fakes(
+            path: str | Path,
+            *,
+            environ: Mapping[str, str] | None = None,
+            _model: FakeSession = model,
+            _diagnostics: list[str] = diagnostics,
+        ) -> dict[str, Any]:
+            loaded = real_load_config(path, environ=environ)
+            platform = _FakePlatformSession()
+            loaded["modules"]["twitch"]["_session_factory"] = lambda: platform
+            loaded["modules"]["brain"].update(
+                {"_session_factory": lambda: _model, "diagnostic_reporter": _diagnostics.append}
+            )
+            loaded["modules"]["audit"]["_writer"] = lambda line: json.loads(line)
+            return loaded
+
+        monkeypatch.setattr(application, "load_config", load_with_fakes)
+        stop = asyncio.Event()
+        ready = asyncio.Event()
+        task = asyncio.create_task(
+            application.run(
+                config,
+                stop,
+                environ={**VALUES, "MODEL_ENDPOINT": endpoint},
+                ready_reporter=lambda message: ready.set(),
+                diagnostic_reporter=diagnostics.append,
+            )
+        )
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=5)
+        finally:
+            stop.set()
+        assert await asyncio.wait_for(task, timeout=5) == 0, diagnostics
+        assert diagnostics == []
+
+        posted = [call["url"] for call in model.probe_calls + model.post_calls]
+        assert posted, f"{endpoint}: the brain posted nothing"
+        assert set(posted) == {endpoint}
+
+
+# --------------------------------------------------------------------------- #
+# F17: the overlay the documents name is the one the code writes
+# --------------------------------------------------------------------------- #
+
+_OVERLAY_NAME = re.compile(r"(?<![\w.-])[\w.-]+\.local\.ya?ml(?![\w.-])")
+
+
+@pytest.mark.parametrize(
+    ("document", "profile"),
+    [(GUIDES[0], PROFILE_NAME), (GUIDES[1], PROFILE_NAME), (README, README_PROFILE_NAME)],
+    ids=lambda value: value.name if isinstance(value, Path) else value,
+)
+def test_the_documents_name_the_overlay_the_code_derives(document: Path, profile: str) -> None:
+    """The overlay named is the one ``core/overlay.py`` derives for the profile (F17, R8).
+
+    The name is computed by the overlay code, not written here as a literal:
+    ``mon-compagnon.yaml`` gives ``mon-compagnon.local.yaml``. Every overlay
+    file name the document prints must be that one.
+    """
+
+    text = _text(document)
+    assert f"--config {profile}" in text, f"{document.name} does not use {profile}"
+    derived = implicit_overlay_path(profile)
+    assert derived is not None
+    named = set(_OVERLAY_NAME.findall(text))
+    assert named == {derived.name}, sorted(named)
 
 
 def test_the_two_guides_are_a_translation_pair() -> None:

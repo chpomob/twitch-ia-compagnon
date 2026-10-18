@@ -127,7 +127,7 @@ python -m core.main --config presence.yaml.example --check-config
 python -m core.main --config my-config.yaml
 
 # 4. Serve the local configuration UI (loopback only, prints a one-time access URL).
-python -m twitch-ia-compagnon-config-ui --config my-config.yaml
+python -m core.config_ui --config my-config.yaml
 
 # 5. The test suite.
 python -m pytest tests/ -q
@@ -137,8 +137,9 @@ python -m pytest tests/ -q
 
 - **Secrets are never literals.** A profile refers to `${NAME}` environment references; the runtime
   resolves them and redacts them everywhere. The UI shows whether a reference is set — never its value.
-- **The UI writes to an overlay** (`config.local.yaml` next to the base file), merged over the base, so
-  the commented example stays intact. Removing an override restores the base value.
+- **The UI writes to an overlay** (`my-config.local.yaml` next to `my-config.yaml`: the base name with
+  `.local.yaml` in place of `.yaml`), merged over the base, so the commented example stays intact.
+  Removing an override restores the base value.
 - **Applying a change is a supervised restart** — there is no hot reload in this version.
 - `secrets` and the authorization rules (`actions`) are **read-only in the UI**: a single mis-click must
   not be able to widen what the companion is allowed to do.

@@ -115,7 +115,7 @@ fastidieuse, et une faute de frappe ici est la première cause d'échec.
 | `TWITCH_ACCESS_TOKEN` | le mot de passe du bot | le générateur de jetons (droits `chat:read` + `chat:edit`) |
 | `TWITCH_BROADCASTER_ID` | l'identifiant **numérique** de votre chaîne (pas votre pseudo) | le générateur de jetons l'affiche ; sinon un outil « Twitch user id lookup » |
 | `TWITCH_BOT_USER_ID` | l'identifiant numérique du compte qui parle (le bot) | même méthode, avec le compte bot |
-| `MODEL_ENDPOINT` | l'adresse du service de modèle | OpenAI : `https://api.openai.com/v1` · Ollama local : `http://localhost:11434/v1` · sinon l'adresse donnée par votre fournisseur |
+| `MODEL_ENDPOINT` | l'adresse Chat Completions complète du service de modèle, terminée par `/chat/completions` | OpenAI : `https://api.openai.com/v1/chat/completions` · Ollama local : `http://localhost:11434/v1/chat/completions` · sinon l'adresse donnée par votre fournisseur, complétée par `/chat/completions` si elle s'arrête à `/v1` |
 | `MODEL_NAME` | le nom exact du modèle | chez votre fournisseur (ex. `gpt-4o-mini`, `llama-3.3-70b-versatile`) |
 | `MODEL_API_KEY` | votre clé de modèle | la page « API keys » de votre fournisseur (Ollama local : n'importe quoi, `ollama` par exemple) |
 
@@ -361,7 +361,7 @@ chaque lancement.
 
 Trois choses à savoir sur cette interface :
 
-- elle écrit vos modifications dans un **fichier séparé** (`config.local.yaml`) posé par-dessus
+- elle écrit vos modifications dans un **fichier séparé** (`mon-compagnon.local.yaml`, juste à côté) posé par-dessus
   votre profil : votre `mon-compagnon.yaml` reste intact, et supprimer une ligne de l'interface
   restaure la valeur d'origine ;
 - les **secrets** et les **règles d'autorisation** (le bloc `actions`) y sont en lecture seule,

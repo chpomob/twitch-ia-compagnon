@@ -109,7 +109,7 @@ a typo here is the first cause of failure.
 | `TWITCH_ACCESS_TOKEN` | the bot's password | the token generator (`chat:read` + `chat:edit` scopes) |
 | `TWITCH_BROADCASTER_ID` | the **numeric** identifier of your channel (not your username) | the token generator shows it; otherwise a "Twitch user id lookup" tool |
 | `TWITCH_BOT_USER_ID` | the numeric identifier of the account that speaks (the bot) | same method, with the bot account |
-| `MODEL_ENDPOINT` | the model service's address | OpenAI: `https://api.openai.com/v1` · local Ollama: `http://localhost:11434/v1` · otherwise the address your provider gives you |
+| `MODEL_ENDPOINT` | the complete Chat Completions address of the model service, ending in `/chat/completions` | OpenAI: `https://api.openai.com/v1/chat/completions` · local Ollama: `http://localhost:11434/v1/chat/completions` · otherwise the address your provider gives you, with `/chat/completions` added if it stops at `/v1` |
 | `MODEL_NAME` | the model's exact name | from your provider (e.g. `gpt-4o-mini`, `llama-3.3-70b-versatile`) |
 | `MODEL_API_KEY` | your model key | your provider's "API keys" page (local Ollama: anything, `ollama` for instance) |
 
@@ -350,7 +350,7 @@ own machine (it is not exposed on the internet) and the token changes on every l
 
 Three things to know about this interface:
 
-- it writes your changes into a **separate file** (`config.local.yaml`) laid over your profile: your
+- it writes your changes into a **separate file** (`mon-compagnon.local.yaml`, next to it) laid over your profile: your
   `mon-compagnon.yaml` stays intact, and removing a line in the interface restores the original value;
 - **secrets** and the **authorization rules** (the `actions` block) are read-only there, on purpose: a
   stray click must not be able to widen what the companion is allowed to do;
