@@ -220,3 +220,49 @@ Sibling paths the steps reported instead of widening their scope:
 - P14: the offline CLI (`modules/viewer_memory/__main__.py`) does not reclaim `.viewer-memory-*.tmp`.
 - P9: a 401/403 at startup still fails `start_inputs` (pinned by a non-allowlisted test); AC16 is
   enforced on the recovery path.
+
+## Fix round and closing gate (added after the fourth pass)
+
+The ledger above is P20's, written before the closing gate ran. The gate then refused **three times**,
+each time on a narrower ground, and its fourth pass approved.
+
+**First pass — `docs/campaigns/phase6/full-branch-review.md`.** 29 findings closed; **F2, F3, F4, F5 and
+F6 open**, each with an executed probe, plus three defects in the phase's own evidence (N1–N3). Five fix
+steps answered them:
+
+| Step | Commit | What it closed |
+|---|---|---|
+| P20F1 | `67906ce` | **F2, F3** — the agent's retained call cache checks the call identity (action, principal, destination, arguments) *before* serving a retained observation; an altered retry is refused, an exact retry still returns it. Probe A: `refused/unknown_action`, `refused/not_authorized`, `refused/call_id_conflict`, `executor_calls=1`; exact retry `success, retained_equal=true`. |
+| P20F2 | `6f72939` | **F4, N1** — one redacting constructor for hook diagnostics, and the structural test now proves the invariant: all four probe-D fixtures (raw f-string, `.format`, concatenation, raw f-string behind an unrelated redactor call) fail, the positive control passes; the offline `viewer_memory.__main__` consumer prints nothing unredacted (probe C: `exit=2`, empty stdout). |
+| P20F3 | `63958be` | **F5** — no peer-supplied string reaches the executor's supervision payloads; probe B: `leaking_records=0`, `leaking_diagnostics=0`, the call still executes and returns its result, the local fields stay in the trace. |
+| P20F4 | `6addd6d` | **F6** — the persistent store refuses a record admitted before its viewer's erasure; probe E: `viewer_memory_record_exists=false`, `erased_text_in_any_store_file=false`, `store_refusals=2`, a later and an other-key write still succeed. |
+| P20F5 | `8f0bd26` | **N2, N3** — the F18 replacement asserts the guide's `--config mon-compagnon.yaml` again (changing it to `wrong.yaml` now fails), and `scaffolding/plan-amendments.md` records the five out-of-allowlist tests as explicit extensions, one entry each. |
+
+**Second pass — `full-branch-review-2.md`.** All 34 in-scope findings and N1–N3 **closed**; probes A–E
+pass; the assertion-AST comparison over 2,184 pre-existing test functions finds no deletion and no
+loosening. One item remained: **literal AC2 named an `action.requested` trace the kernel does not
+define**.
+
+**Amendment A1 — `scaffolding/plan-amendments.md`.** AC2 now names `action.started`
+(`core/contracts.py:149`), the single start trace the executor publishes. No code and no test changed:
+the criterion's own closing clause ("the same traces an executor call produces") already settled it, and
+adding a second event to satisfy a typo would add a redundant trace to the evidence trail R8 exists to
+protect.
+
+**Third pass — `full-branch-review-3.md`.** Everything stayed closed and the amended AC2 behaviour passed;
+it refused on a documentary point: two **prescriptive** clauses (the plan's AC2 line and the P2 step
+spec) still named the old token. Both are aligned in `12f7329`, and A1's absence check now scopes itself
+to prescriptive text, because the amendment record and the gate reports must quote the old name to
+document the change.
+
+**Fourth pass — `full-branch-review-4.md`: APPROVE.** A1 PASS, F1–F33 and F35 CLOSED, N1–N3 CLOSED,
+F34 and `claude:F8` OUT-OF-SCOPE, probes A–E pass, R1–R10 pass within the stated verification limits.
+
+**Corrections to the "known limits" above, where the fix round changed them.** The offline
+`modules/viewer_memory/__main__` consumer no longer prints an unredacted hook diagnostic (P20F2), and the
+persistent store no longer recreates an erased viewer's record (P20F4). The other limits stand as
+written.
+
+**Final state.** `main` at the addendum's commit, suite **3,901 passed, 26 skipped**, closing report
+`docs/campaigns/phase6/full-branch-review-4.md`. The bridge remains **NOT delivered**: no real-instance
+trial record exists, and this document does not create one.

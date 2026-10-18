@@ -329,6 +329,18 @@ def main():
             if "429" in out or "usage limit" in low or "rate limit" in low:
                 log(f"{step}: DEV rate-limited — waiting for a window, then retrying")
                 continue
+            # A re-login mid-campaign (or an operator freeing a hung TUI) kills the DEV with a signal:
+            # the loop reports `DEV exited -15` / `-9`. That is not a code rejection and must not halt
+            # the campaign -- phase 6 lost an hour at P14 exactly here, and the fix is to retry.
+            if any(f"DEV exited {sig}" in out for sig in ("-15", "-9", "143", "137")):
+                log(f"{step}: DEV was terminated (signal) — retrying the step")
+                continue
+            # A dead access token surfaces as an auth line in the DEV's own output, not as a quota
+            # wall. Refresh and retry; the operator's login is what makes the next probe pass.
+            if "401" in out or "OAuth access token" in out or "Please run /login" in out:
+                log(f"{step}: DEV authentication expired — refreshing the token, then retrying")
+                sh(f"python3 {REFRESH}", timeout=240)
+                continue
             if "DEV exited 3" in out or "timed out" in low:
                 log(f"{step}: DEV inactivity timeout — refreshing the token and retrying")
                 sh(f"python3 {REFRESH}", timeout=240)
