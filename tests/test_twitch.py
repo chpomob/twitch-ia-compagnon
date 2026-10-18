@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
-from core.actions import AuthorizationPolicy, AuthorizationRule
+from core.actions import ActionExecutor, AuthorizationPolicy, AuthorizationRule
 from core.bus import EventBus
 from core.context import ChatContext
 from core.contracts import (
@@ -28,7 +28,7 @@ from core.contracts import (
 )
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
-from core.runtime import ModuleContext, RuntimeContext, ServiceRegistryError
+from core.runtime import ModuleContext, RuntimeContext, ServiceRegistryError, Supervision
 from core.triggers import TriggerContext, TriggerRegistry
 from conftest import (
     FakeResponse,
@@ -50,6 +50,7 @@ from modules.brain import _message_of_work
 from modules.twitch import (
     CHAT_WRITE_ACTION,
     CHAT_WRITE_PROVIDER,
+    COMPATIBILITY_PRINCIPAL,
     EVENTSUB_SUBSCRIPTIONS_URL,
     EVENTSUB_URL,
     HELIX_CHAT_URL,
@@ -295,6 +296,50 @@ async def activate_with(
     }
     handle = await start_module(settings, target_bus, context)
     return handle, target_bus, target_diagnostics
+
+
+def compatibility_grant() -> AuthorizationRule:
+    """The rule a profile writes to deliver legacy ``channel.chat.send``
+    publications: ``chat.write`` granted to the compatibility principal, on
+    the configured channel only (phase 6 R1)."""
+
+    return AuthorizationRule(
+        rule_id="grant-compatibility-chat-write",
+        action_name=CHAT_WRITE_ACTION,
+        destination=Destination("twitch", SETTINGS["broadcaster_id"], "chat"),
+        principals=(COMPATIBILITY_PRINCIPAL,),
+        granted_permissions=("chat.write",),
+    )
+
+
+def compatibility_context(
+    bus: EventBus | None = None, *, audit_bus: EventBus | None = None
+) -> ModuleContext:
+    """A module context whose policy grants ``chat.write`` to
+    :data:`COMPATIBILITY_PRINCIPAL` (F1, R1): the compatibility route is an
+    executor invocation under default-deny, so a test that expects it to send
+    configures the grant, as a profile would.
+
+    ``audit_bus``, when given, receives the executor's own ``action.*``
+    traces instead of *bus*, so a test asserting the route's complete bus
+    history — the published event, the module's ``channel.chat.sent`` — reads
+    exactly the events it was written for; the executor's traces of the same
+    call are asserted on their own by AC2's test.
+    """
+
+    policy = AuthorizationPolicy([compatibility_grant()])
+    runtime = runtime_context(bus, authorization=policy)
+    if audit_bus is not None:
+        runtime = dataclasses.replace(
+            runtime,
+            executor=ActionExecutor(
+                runtime.actions,
+                policy,
+                supervision=Supervision(audit_bus),
+                clock=runtime.clock,
+            ),
+        )
+    return runtime.for_module("twitch")
 
 
 def assert_sanitized(diagnostics: list[str]) -> None:
@@ -593,6 +638,10 @@ async def test_activation_refuses_a_context_without_the_runtime_surfaces() -> No
 
 @pytest.mark.asyncio
 async def test_notification_mapping_dedup_and_retry_reconnect() -> None:
+    """F1/R1: the send after reconnect goes through the compatibility route,
+    which is an executor invocation of ``chat.write`` under default-deny; the
+    fixture grants it to the compatibility principal, assertions unchanged."""
+
     first = FakeWebSocket(
         welcome("session-1"),
         notification("message-1", "first"),
@@ -621,7 +670,9 @@ async def test_notification_mapping_dedup_and_retry_reconnect() -> None:
             ),
         ],
     )
-    handle, bus, diagnostics = await activate_with(session)
+    handle, bus, diagnostics = await activate_with(
+        session, context=compatibility_context()
+    )
     try:
         await wait_until(lambda: len(chat_events(bus)) == 2)
 
@@ -1042,6 +1093,10 @@ async def sent_traces_settled(handle: TwitchModule) -> None:
 
 @pytest.mark.asyncio
 async def test_chat_send_uses_configured_identity_and_preserves_event() -> None:
+    """F1/R1: the compatibility route reaches Helix only as an executor
+    invocation of ``chat.write``; the fixture grants it to the compatibility
+    principal, assertions unchanged."""
+
     class RecordingBus(EventBus):
         def __init__(self) -> None:
             super().__init__()
@@ -1053,7 +1108,9 @@ async def test_chat_send_uses_configured_identity_and_preserves_event() -> None:
 
     response = sent_response()
     session = FakeSession([FakeWebSocket(welcome("one"))], sends=[response])
-    handle, bus, diagnostics = await activate_with(session, RecordingBus())
+    handle, bus, diagnostics = await activate_with(
+        session, context=compatibility_context(RecordingBus())
+    )
     payload = {"text": " Hello! ", "parent_message_id": "parent"}
     metadata = {"source": "test", "delivery_status": "failed"}
     try:
@@ -1114,8 +1171,14 @@ async def test_chat_send_uses_configured_identity_and_preserves_event() -> None:
 async def test_invalid_send_is_a_failed_attempt_without_request(
     payload: dict[str, Any],
 ) -> None:
+    """F1/R1: the valid send that follows goes through the executor under
+    default-deny; the fixture grants ``chat.write`` to the compatibility
+    principal, assertions unchanged."""
+
     session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
-    handle, bus, diagnostics = await activate_with(session)
+    handle, bus, diagnostics = await activate_with(
+        session, context=compatibility_context()
+    )
     try:
         result = await bus.publish("channel.chat.send", payload, {})
         assert result["metadata"]["delivery_status"] == "failed"
@@ -1153,11 +1216,17 @@ async def test_send_failure_continues_chain_and_next_send_succeeds(
     """R5/R8: an unconfirmed send is ``error`` or ``external_unknown``, never
     ``success``, and emits no ``channel.chat.sent``; the next confirmed send
     emits exactly one. The former ``[first, second]`` history equality is
-    superseded by R8's confirmed-send trace, retained on the same bus."""
+    superseded by R8's confirmed-send trace, retained on the same bus.
+
+    F1/R1: both sends are executor invocations of ``chat.write`` under
+    default-deny; the fixture grants it to the compatibility principal and
+    audits the executor's traces on their own bus, assertions unchanged."""
 
     success = sent_response()
     session = FakeSession([FakeWebSocket(welcome("one"))], sends=[response, success])
-    handle, bus, diagnostics = await activate_with(session)
+    handle, bus, diagnostics = await activate_with(
+        session, context=compatibility_context(audit_bus=EventBus())
+    )
     observed = []
     bus.subscribe("**", lambda event: observed.append(event), order=90)
     try:
@@ -1198,6 +1267,11 @@ async def test_send_failure_continues_chain_and_next_send_succeeds(
 async def test_pending_send_releases_response_on_timeout_cancellation_and_close(
     action: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """F1/R1: the pending send is an executor invocation of ``chat.write``
+    under default-deny, and its timeout, cancellation and close still release
+    the response; the fixture grants it to the compatibility principal and
+    audits the executor's traces on their own bus, assertions unchanged."""
+
     import modules.twitch as twitch
 
     started = asyncio.Event()
@@ -1210,7 +1284,9 @@ async def test_pending_send_releases_response_on_timeout_cancellation_and_close(
     pending = PendingResponse(200, None)
     websocket = FakeWebSocket(welcome("one"))
     session = FakeSession([websocket], sends=[pending, sent_response()])
-    handle, bus, diagnostics = await activate_with(session)
+    handle, bus, diagnostics = await activate_with(
+        session, context=compatibility_context(audit_bus=EventBus())
+    )
     if action == "timeout":
         monkeypatch.setattr(twitch, "_CHAT_SEND_TIMEOUT_SECONDS", 0.01)
     publication = asyncio.create_task(
@@ -1797,7 +1873,12 @@ async def test_chat_write_refuses_without_a_rule_blank_text_and_other_channels()
 async def test_lost_sent_trace_neither_retries_nor_repeats_the_send(route: str) -> None:
     """R8/AC28: with ``channel.chat.sent`` publication always raising, the send
     record still shows exactly 1 confirmed send, the transport is invoked
-    exactly 1 time, the loss is counted, and the route still reports success."""
+    exactly 1 time, the loss is counted, and the route still reports success.
+
+    F1/R1: the compatibility parametrization is an executor invocation of
+    ``chat.write`` under default-deny; the ``grant_chat_write`` rule this test
+    configures applies to every principal, the compatibility one included,
+    assertions unchanged."""
 
     runtime = runtime_context()
     context = runtime.for_module("twitch")
@@ -1843,7 +1924,12 @@ async def test_confirmed_outcome_never_waits_for_the_sent_trace(route: str) -> N
     budget is not spent on the trace, so the confirmed send is never turned
     into ``external_unknown``, and the compatibility caller is not held. The
     record is already written when the outcome is returned; ``close`` then
-    waits for the trace, which lands exactly once."""
+    waits for the trace, which lands exactly once.
+
+    F1/R1: the compatibility parametrization is an executor invocation of
+    ``chat.write`` under default-deny; the ``grant_chat_write`` rule this test
+    configures applies to every principal, the compatibility one included,
+    assertions unchanged."""
 
     context = module_context()
     grant_chat_write(context)
@@ -1897,6 +1983,134 @@ async def test_confirmed_outcome_never_waits_for_the_sent_trace(route: str) -> N
         assert diagnostics == []
     finally:
         release.set()
+        await handle.close()
+
+
+def helix_chat_posts(session: FakeSession) -> list[dict[str, Any]]:
+    return [call for call in session.post_calls if call["url"] == HELIX_CHAT_URL]
+
+
+@pytest.mark.asyncio
+async def test_ac1_an_ungranted_compatibility_send_is_refused_by_the_executor() -> None:
+    """AC1 (R1, F1): with an executor and no rule granting ``chat.write`` to
+    the compatibility principal, ``channel.chat.send {"text": "hi"}`` emits 0
+    Helix POSTs, invokes the provider 0 times and reports ``failed`` with the
+    executor's own refusal status; with the matching rule the same
+    publication emits exactly 1 POST and reports ``sent``."""
+
+    context = module_context()
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    executor = context.executor
+    try:
+        result = await bus.publish("channel.chat.send", {"text": "hi"}, {})
+        assert helix_chat_posts(session) == []
+        assert executor.provider_invocations == 0
+        assert handle.send_record.emitted == 0
+        # The status a direct, equally ungranted executor call ends in.
+        direct = await executor.invoke(
+            chat_write_call("direct-0", principal=COMPATIBILITY_PRINCIPAL)
+        )
+        assert direct.status == "refused"
+        assert result["metadata"]["delivery_status"] == "failed"
+        assert result["metadata"]["delivery_outcome"] == direct.status
+        assert executor.provider_invocations == 0
+        assert events_of(bus, "channel.chat.sent") == []
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+    granted = compatibility_context()
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, bus, diagnostics = await activate_with(session, context=granted)
+    try:
+        result = await bus.publish("channel.chat.send", {"text": "hi"}, {})
+        (post,) = helix_chat_posts(session)
+        assert post["json"]["message"] == "hi"
+        assert granted.executor.provider_invocations == 1
+        assert result["metadata"]["delivery_status"] == "sent"
+        assert result["metadata"]["delivery_outcome"] == "success"
+        assert diagnostics == []
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac1_without_an_executor_the_compatibility_route_refuses() -> None:
+    """R1, F1: a runtime without an executor has no authorization, so the
+    compatibility route refuses — it never falls back onto the transport."""
+
+    runtime = dataclasses.replace(
+        runtime_context(authorization=AuthorizationPolicy([compatibility_grant()])),
+        executor=None,
+    )
+    session = FakeSession([FakeWebSocket(welcome("one"))], sends=[sent_response()])
+    handle, bus, diagnostics = await activate_with(
+        session, context=runtime.for_module("twitch")
+    )
+    try:
+        result = await bus.publish("channel.chat.send", {"text": "hi"}, {})
+        assert helix_chat_posts(session) == []
+        assert handle.send_record.emitted == 0
+        assert result["metadata"]["delivery_status"] == "failed"
+        assert result["metadata"]["delivery_outcome"] == "refused"
+        assert diagnostics == ["twitch chat send: refused, the runtime has no executor"]
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac2_the_compatibility_send_is_traced_as_an_executor_call() -> None:
+    """AC2 (R1, F1): one compatibility publication produces exactly 1
+    ``action.started`` (the executor's request trace) and 1
+    ``action.completed``, carrying the compatibility principal and the
+    Twitch destination of the configured channel — the same traces, field
+    for field in shape, that a direct executor call produces."""
+
+    context = compatibility_context()
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))], sends=[sent_response(), sent_response()]
+    )
+    handle, bus, diagnostics = await activate_with(session, context=context)
+    destination = str(Destination("twitch", SETTINGS["broadcaster_id"], "chat"))
+    try:
+        result = await bus.publish("channel.chat.send", {"text": "hi"}, {})
+        assert result["metadata"]["delivery_status"] == "sent"
+        await sent_traces_settled(handle)
+        (started,) = events_of(bus, "action.started")
+        (completed,) = events_of(bus, "action.completed")
+        assert started["payload"]["principal"] == COMPATIBILITY_PRINCIPAL
+        assert started["payload"]["action"] == CHAT_WRITE_ACTION
+        assert started["payload"]["destination"] == destination
+        assert started["payload"]["provider"] == CHAT_WRITE_PROVIDER
+        assert completed["payload"]["action"] == CHAT_WRITE_ACTION
+        assert completed["payload"]["destination"] == destination
+        assert completed["payload"]["status"] == "success"
+        assert completed["payload"]["call_id"] == started["payload"]["call_id"]
+        # AC27's order holds on this route too.
+        types = [event["type"] for event in bus.list_events()]
+        assert (
+            types.index("action.started")
+            < types.index("action.completed")
+            < types.index("channel.chat.sent")
+        )
+
+        direct = await context.executor.invoke(
+            chat_write_call("direct-1", principal=COMPATIBILITY_PRINCIPAL)
+        )
+        assert direct.status == "success"
+        direct_started = events_of(bus, "action.started")[-1]
+        direct_completed = events_of(bus, "action.completed")[-1]
+        assert direct_started["payload"]["call_id"] == "direct-1"
+        for ours, theirs in ((started, direct_started), (completed, direct_completed)):
+            assert ours.keys() == theirs.keys()
+            assert ours["payload"].keys() == theirs["payload"].keys()
+            assert ours["metadata"].keys() == theirs["metadata"].keys()
+        assert started["payload"]["call_id"] != direct_started["payload"]["call_id"]
+        assert len(events_of(bus, "action.started")) == 2
+        assert len(events_of(bus, "action.completed")) == 2
+        assert diagnostics == []
+    finally:
         await handle.close()
 
 

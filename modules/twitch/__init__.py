@@ -46,8 +46,16 @@ refused can reach a model through the bus (R1, AC4).
 **Delivery** (R5, R8). One send service serves two routes: the ``chat.write``
 action, bound at preparation to the configured channel and invoked by the
 executor, and the compatibility ``channel.chat.send`` bus route. Exactly one
-route is used per invocation. The service reports ``success`` only on the
-platform's own confirmation and ``external_unknown`` when the request left and
+route is used per invocation. The compatibility route never reaches the
+transport on its own (phase 6 R1, F1): each publication becomes one executor
+invocation of ``chat.write`` under :data:`COMPATIBILITY_PRINCIPAL`, for the
+configured channel, with a fresh ``call_id``, so default-deny applies to it
+exactly as to any other caller — with no rule granting ``chat.write`` to that
+principal it is refused, no request is emitted and the legacy metadata reads
+``delivery_status: failed`` with the executor's terminal status as
+``delivery_outcome``. A runtime without an executor refuses it the same way;
+there is no fallback onto the transport. The service reports ``success`` only
+on the platform's own confirmation and ``external_unknown`` when the request left and
 the outcome is not known; ``channel.chat.sent`` is emitted only for a confirmed
 send, through ``record_and_emit``, so the confirmed-send fact is written into
 :class:`SendRecord` before the trace is published and a failed publication
@@ -55,7 +63,7 @@ neither retries nor repeats the send (AC28). The trace is handed to the loop
 rather than awaited by the send: a confirmed outcome is returned as soon as it
 is recorded, on either route, and never depends on how long a trace subscriber
 takes — it cannot spend the executor's budget and turn a confirmed send into
-``external_unknown``, nor hold the compatibility route's caller. On the action
+``external_unknown``, nor hold the compatibility route's caller. On either
 route the hand-over runs through the invocation's completion hook, once the
 executor has published its own ``action.completed``, so one run's audit reads
 ``action.started``, ``action.completed``, ``channel.chat.sent`` and then
@@ -107,6 +115,8 @@ import inspect
 import json
 import math
 import sys
+import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
@@ -124,6 +134,7 @@ from core.contracts import (
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
     EVENT_KIND_DEFAULT,
+    ActionCall,
     ActionObservation,
     ActionSpec,
     Destination,
@@ -180,6 +191,15 @@ MANIFEST_PATH = Path(__file__).with_name("module.yaml")
 CHAT_WRITE_PROVIDER = "twitch-helix-chat"
 """Provider name in bindings and traces; what an ambiguity diagnostic prints."""
 
+COMPATIBILITY_PRINCIPAL = "channel.chat.send"
+"""The principal every ``channel.chat.send`` publication is invoked under (phase 6 R1).
+
+The compatibility route carries no identity of its own, so it is given this
+explicit one: a profile that wants legacy publications delivered grants
+``chat.write`` to it in an authorization rule, and without that rule every
+publication is refused by the executor before any request leaves (F1).
+"""
+
 _CHAT_EVENT = "channel.chat.message"
 _NOTIFICATION_EVENT = "channel.chat.notification"
 _FOLLOW_EVENT = "channel.follow"
@@ -190,6 +210,7 @@ _CHAT_FAMILY = "chat"
 _ROUTE_ACTION = CHAT_WRITE_ACTION
 _ROUTE_COMPATIBILITY = _CHAT_SEND_EVENT
 _CHAT_SEND_TIMEOUT_SECONDS = 10.0
+_STATUS_REFUSED = "refused"
 _NON_RETRYABLE_CLOSE_CODES = {4001, 4003}
 
 DEFAULT_MAX_PENDING_SENT_TRACES = 64
@@ -1023,6 +1044,13 @@ class TwitchModule:
         self._chat = runtime.chat
         self._scheduler = runtime.scheduler
         self._inputs = runtime.inputs
+        self._executor = runtime.executor
+        clock = getattr(context, "clock", None)
+        self._clock: Callable[[], float] = clock if callable(clock) else time.monotonic
+        # ``call_id`` -> correlation of the ``channel.chat.send`` publications
+        # being invoked right now: what lets the provider tell its own
+        # compatibility calls from any other ``chat.write`` call (phase 6 R1).
+        self._compatibility_calls: dict[str, dict[str, Any]] = {}
         # Set once ``start_inputs`` found (``chat``, twitch) owned elsewhere:
         # a repeated call opens nothing and reports nothing again.
         self._ingestion_elsewhere = False
@@ -1036,6 +1064,10 @@ class TwitchModule:
         self._moderation_service = _TwitchModerationService(self)
         self._send_record = SendRecord()
         self._bound = False
+        # The declared ``chat.write`` version and timeout, read from the
+        # manifest at binding: what a compatibility call is built with.
+        self._chat_write_version = 1
+        self._chat_write_timeout = float(_CHAT_SEND_TIMEOUT_SECONDS)
         # Covers normalisation and the dedup decision only (R2): it is released
         # before the publication, the trace and the admission.
         self._publish_lock = asyncio.Lock()
@@ -1150,6 +1182,8 @@ class TwitchModule:
             # from the settings beyond the channel identifier.
             self._diagnose(f"twitch prepare: {exc}")
             raise TwitchModuleError("twitch prepare: action binding failed") from None
+        self._chat_write_version = spec.version
+        self._chat_write_timeout = float(spec.timeout_seconds)
         self._bound = True
 
     async def start_inputs(self) -> None:
@@ -1397,15 +1431,26 @@ class TwitchModule:
         signalled on the invocation before the request leaves, so an
         interruption after that point is classified ``external_unknown`` by
         the executor and never as a certain timeout (AC33).
+
+        A call :meth:`handle_chat_send` is invoking right now — its
+        ``call_id`` on record here, under :data:`COMPATIBILITY_PRINCIPAL` —
+        is served on the compatibility route: its trace is correlated as the
+        legacy route always was. Any other call is the action route.
         """
 
         invocation.mark_not_emitted()
         call = invocation.call
+        compatibility = (
+            self._compatibility_calls.get(call.call_id)
+            if call.principal == COMPATIBILITY_PRINCIPAL
+            else None
+        )
+        route = _ROUTE_ACTION if compatibility is None else _ROUTE_COMPATIBILITY
         provenance = {
             "provider": CHAT_WRITE_PROVIDER,
             "platform": PLATFORM,
             "channel_id": self._settings.broadcaster_id,
-            "route": _ROUTE_ACTION,
+            "route": route,
         }
 
         def failure(status: str, code: str, message: str) -> ActionObservation:
@@ -1439,18 +1484,21 @@ class TwitchModule:
                 "destination is outside the configured channel",
             )
 
-        correlation: dict[str, Any] = {
-            "run_id": call.run_id,
-            "call_id": call.call_id,
-            "conversation_id": call.conversation_id,
-            "source_event_id": call.source_event_id,
-        }
-        if call.message_id is not None:
-            correlation["source_message_id"] = call.message_id
+        if compatibility is not None:
+            correlation: dict[str, Any] = dict(compatibility)
+        else:
+            correlation = {
+                "run_id": call.run_id,
+                "call_id": call.call_id,
+                "conversation_id": call.conversation_id,
+                "source_event_id": call.source_event_id,
+            }
+            if call.message_id is not None:
+                correlation["source_message_id"] = call.message_id
         outcome = await self._send(
             text,
             parent,
-            route=_ROUTE_ACTION,
+            route=route,
             correlation=correlation,
             on_emit=invocation.mark_emitted,
             after_completion=invocation.after_completion,
@@ -1474,16 +1522,24 @@ class TwitchModule:
         )
 
     async def handle_chat_send(self, event: Mapping[str, Any]) -> dict[str, Any]:
-        """The compatibility ``channel.chat.send`` route onto the send service.
+        """The compatibility ``channel.chat.send`` route, through the executor.
+
+        The publication never reaches the transport directly (phase 6 R1,
+        F1): it becomes one ``chat.write`` call for the configured channel
+        under :data:`COMPATIBILITY_PRINCIPAL`, with a fresh ``call_id``, and
+        the runtime's executor decides it — default-deny, the argument
+        schema, the spec's timeout. A runtime without an executor refuses it;
+        nothing falls back onto the transport.
 
         Legacy readers keep ``metadata.delivery_status`` as ``sent`` or
-        ``failed``; ``metadata.delivery_outcome`` carries the terminal status
-        of the same send, so an emitted request whose outcome is unknown is
-        never read as a plain failure that is safe to repeat. Operational
-        failures continue the bus chain so audit sees the attempt. Only the
-        platform's own acknowledgement means sent. Cancellation propagates
-        without a record. No response body or external exception text enters
-        diagnostics or metadata.
+        ``failed``; ``metadata.delivery_outcome`` carries the executor's
+        terminal status of the same call — ``refused`` when no rule grants it
+        — so an emitted request whose outcome is unknown is never read as a
+        plain failure that is safe to repeat. Operational failures continue
+        the bus chain so audit sees the attempt. Only the platform's own
+        acknowledgement means sent. Cancellation — of the publication or by
+        :meth:`close` — propagates without a record. No response body or
+        external exception text enters diagnostics or metadata.
         """
 
         def outcome(status: str, terminal: str) -> dict[str, Any]:
@@ -1512,18 +1568,62 @@ class TwitchModule:
             self._diagnose("twitch chat send: invalid input")
             return outcome("failed", _STATUS_ERROR)
 
+        executor = self._executor
+        if executor is None:
+            # Default-deny: no executor, no authorization, no send.
+            self._diagnose("twitch chat send: refused, the runtime has no executor")
+            return outcome("failed", _STATUS_REFUSED)
+
         metadata = event.get("metadata")
         correlation: dict[str, Any] = {}
+        source_message_id: str | None = None
         if isinstance(metadata, Mapping):
-            source_message_id = metadata.get("source_message_id")
-            if isinstance(source_message_id, str) and source_message_id:
-                correlation["source_message_id"] = source_message_id
-        result = await self._send(
-            text, parent, route=_ROUTE_COMPATIBILITY, correlation=correlation
+            candidate = metadata.get("source_message_id")
+            if isinstance(candidate, str) and candidate.strip():
+                source_message_id = candidate
+                correlation["source_message_id"] = candidate
+        arguments: dict[str, Any] = {"text": text}
+        if parent is not None:
+            arguments["parent_message_id"] = parent
+        run_id = f"{_CHAT_SEND_EVENT}/{uuid.uuid4().hex}"
+        call = ActionCall(
+            action_name=CHAT_WRITE_ACTION,
+            action_version=self._chat_write_version,
+            arguments=arguments,
+            conversation_id=f"{PLATFORM}:{self._settings.broadcaster_id}",
+            run_id=run_id,
+            call_id=f"{run_id}/call-1",
+            source_event_id=source_message_id or run_id,
+            destination=Destination(
+                platform=PLATFORM,
+                channel_id=self._settings.broadcaster_id,
+                scope=_CHAT_SCOPE,
+            ),
+            principal=COMPATIBILITY_PRINCIPAL,
+            deadline=self._clock() + self._chat_write_timeout,
+            message_id=source_message_id,
         )
-        return outcome(
-            "sent" if result.status == _STATUS_SUCCESS else "failed", result.status
-        )
+
+        # The publication itself is an active send: ``close`` cancels it as
+        # it cancelled the direct route, and the executor records the
+        # interruption before the cancellation propagates.
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_send_tasks.add(task)
+        self._compatibility_calls[call.call_id] = correlation
+        try:
+            observation = await executor.invoke(call)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._diagnose("twitch chat send: the executor failed")
+            return outcome("failed", _STATUS_ERROR)
+        finally:
+            self._compatibility_calls.pop(call.call_id, None)
+            if task is not None:
+                self._active_send_tasks.discard(task)
+        status = getattr(observation, "status", _STATUS_ERROR)
+        return outcome("sent" if status == _STATUS_SUCCESS else "failed", status)
 
     async def _send(
         self,
@@ -1543,10 +1643,10 @@ class TwitchModule:
         have — with no readable answer. *on_emit* is called right before the
         request leaves, so the executor's invocation carries the emission
         signal from that instant on. *after_completion* is the invocation's
-        completion hook on the action route: the confirmed-send trace is
-        handed to the loop through it, once the executor has published its
-        own ``action.completed`` (AC27); without it — the compatibility
-        route — the trace is handed over as soon as the send is recorded.
+        completion hook: the confirmed-send trace is handed to the loop
+        through it, once the executor has published its own
+        ``action.completed`` (AC27); without it the trace is handed over as
+        soon as the send is recorded.
         """
 
         if self._closed:
@@ -1660,13 +1760,14 @@ class TwitchModule:
         — a false uncertainty about an effect that is known — and would hold
         the compatibility route's caller without any bound at all.
 
-        On the action route the hand-over itself waits for the executor:
-        *after_completion* runs it once the executor has recorded the call's
-        observation and published ``action.completed``, so the audit reads
-        the executor's completion before this module's fact — AC27's order —
-        and reads the fact only after the transport confirmed, since the
-        record is already written when the hook is registered. The
-        compatibility route has no executor and hands the trace over at once.
+        The hand-over itself waits for the executor: *after_completion* runs
+        it once the executor has recorded the call's observation and
+        published ``action.completed``, so the audit reads the executor's
+        completion before this module's fact — AC27's order — and reads the
+        fact only after the transport confirmed, since the record is already
+        written when the hook is registered. Both routes reach here through
+        the executor (phase 6 R1); without a hook the trace is handed over at
+        once.
 
         ``record_and_emit`` still runs the record first, as R8's ordering
         primitive; that second write is a no-op, as the scheduler's is. A
@@ -2433,6 +2534,7 @@ class _RuntimeSurfaces:
     chat: Any | None
     scheduler: Any | None
     inputs: Any
+    executor: Any | None
 
 
 _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -2455,6 +2557,9 @@ _OPTIONAL_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # context without the field is read the same way, so an absent table
     # means "own everything I declare".
     ("inputs", ("owns",)),
+    # The one path from the compatibility route to the transport (phase 6
+    # R1). Absent, every ``channel.chat.send`` is refused: default-deny.
+    ("executor", ("invoke",)),
 )
 
 

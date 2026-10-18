@@ -13,6 +13,13 @@ runtime_api: 2
 
 produces:
   - channel.chat.message
+# The compatibility `channel.chat.send` route (phase 6 R1). Each publication
+# becomes one executor invocation of `chat.write` below, for the configured
+# channel, under the explicit principal `channel.chat.send`
+# (`COMPATIBILITY_PRINCIPAL`). Default-deny applies: without an authorization
+# rule granting `chat.write` to that principal the publication is refused, no
+# request is sent and its metadata reads `delivery_status: failed` with the
+# executor's terminal status. Without an executor it is refused the same way.
 consumes:
   - channel.chat.send
 middleware: false
