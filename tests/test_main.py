@@ -2741,7 +2741,15 @@ async def test_declared_credentials_are_redacted_without_a_secrets_entry_through
         source=LEAKING_PROBE_SOURCE,
         settings_schema={
             "type": "object",
-            "properties": {"token": {"type": "string"}, "other": {"type": "string"}},
+            "properties": {
+                "token": {"type": "string"},
+                "other": {"type": "string"},
+                # The phased fixture's own keys: the closed profile boundary
+                # refuses an undeclared one (R3, F26).
+                "label": {"type": "string"},
+                "lifecycle_log": {"type": "string"},
+                "log": {"type": "string"},
+            },
             "required": ["token"],
         },
         credentials=["token"],
@@ -3913,3 +3921,169 @@ def test_ac10_the_config_ui_check_never_echoes_a_credential_used_as_a_key(
         assert listed.endswith(": is not an allowed property")
     assert ui.last_check is not None and not ui.last_check.passed
     assert not any(_AC10_SECRET in line for line in ui.last_check.diagnostics)
+
+
+# --------------------------------------------------------------------------- #
+# P6 — unknown settings refused at top level and in module settings (R3, F26)
+# --------------------------------------------------------------------------- #
+
+
+def _example_variant(tmp_path: Path, change: Callable[[dict[str, Any]], None]) -> Path:
+    """The shipped PC example with *change* applied, its modules found by path."""
+
+    config = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    config["modules_directory"] = str(ROOT / "modules")
+    change(config)
+    path = tmp_path / "config.yaml"
+    _write_config(path, config)
+    return path
+
+
+def _misspell_broadcaster(config: dict[str, Any]) -> None:
+    # Beside the real one, which is required: only the misspelling is wrong.
+    config["modules"]["twitch"]["brodcaster_id"] = "${TWITCH_BROADCASTER_ID}"
+
+
+def _unknown_top_level(config: dict[str, Any]) -> None:
+    config["trigers"] = {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            _misspell_broadcaster,
+            "module 'twitch': field 'settings.brodcaster_id': "
+            "is not an allowed property",
+        ),
+        (_unknown_top_level, "trigers: is not a known configuration block"),
+    ],
+    ids=["module-setting", "top-level"],
+)
+async def test_ac12_check_config_refuses_an_unknown_key_naming_its_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: Callable[[dict[str, Any]], None],
+    expected: str,
+) -> None:
+    """AC12 (R3, F26): a misspelt ``brodcaster_id`` under
+    ``modules.twitch.settings`` and, separately, an unknown top-level key each
+    make ``--check-config`` exit non-zero with one diagnostic naming that
+    key's path — never silently accepted — and 0 modules activated."""
+
+    _loaded, activated = _spy_entry_points(monkeypatch)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        _example_variant(tmp_path, change),
+        environ=_environment(),
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert (status, diagnostics, activated) == (2, [expected], [])
+
+
+def _underscore_broadcaster(config: dict[str, Any]) -> None:
+    config["modules"]["twitch"]["_brodcaster_id"] = "123"
+
+
+def _binary_broadcaster(config: dict[str, Any]) -> None:
+    # Dumped as ``!!binary``, which the YAML loader reads back as bytes.
+    config["modules"]["twitch"]["brodcaster_id"] = b"123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            _underscore_broadcaster,
+            "modules.twitch._brodcaster_id: is reserved for code-injected settings",
+        ),
+        (
+            _binary_broadcaster,
+            "modules.twitch.brodcaster_id: is not a supported setting value",
+        ),
+    ],
+    ids=["underscore-key", "binary-value"],
+)
+async def test_ac12_a_profile_cannot_ride_the_code_injection_exemption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: Callable[[dict[str, Any]], None],
+    expected: str,
+) -> None:
+    """R3, F26: the loader leaves ``_``-prefixed seams and non-data values
+    undeclared because only code hands them over. Written in a profile —
+    an ``_``-prefixed key, or a ``!!binary`` value — they are refused by
+    their path, not exempted from the closed schema."""
+
+    _loaded, activated = _spy_entry_points(monkeypatch)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        _example_variant(tmp_path, change),
+        environ=_environment(),
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert (status, diagnostics, activated) == (2, [expected], [])
+
+
+@pytest.mark.parametrize(
+    ("change", "path"),
+    [(_misspell_broadcaster, "settings.brodcaster_id"), (_unknown_top_level, "trigers:")],
+    ids=["module-setting", "top-level"],
+)
+def test_ac12_main_check_config_exits_non_zero_on_an_unknown_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change: Callable[[dict[str, Any]], None],
+    path: str,
+) -> None:
+    """AC12 through the command line: the same profiles return status 2 and
+    stderr names the path."""
+
+    profile = _example_variant(tmp_path, change)
+    for name, value in _environment().items():
+        monkeypatch.setenv(name, value)
+
+    assert application.main(["--config", str(profile), "--check-config"]) == 2
+    assert path in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["top-level", "module-setting"])
+async def test_ac12_a_credential_used_as_an_unknown_key_is_redacted(
+    tmp_path: Path, placement: str
+) -> None:
+    """AC12 joins AC10 (R3, F4, F26): a configured credential used as the
+    unknown key — top level or in a module's settings — is refused with the
+    path's skeleton kept and the credential's segment masked."""
+
+    def change(config: dict[str, Any]) -> None:
+        if placement == "top-level":
+            config[_F4_SECRET] = {}
+        else:
+            config["modules"]["twitch"][_F4_SECRET] = "x"
+
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        _example_variant(tmp_path, change),
+        environ={**_environment(), "TWITCH_ACCESS_TOKEN": _F4_SECRET},
+        diagnostic_reporter=diagnostics.append,
+    )
+
+    assert status == 2
+    assert len(diagnostics) == 1
+    assert not any(
+        _F4_SECRET[:end] in diagnostics[0] for end in range(8, len(_F4_SECRET) + 1)
+    )
+    if placement == "top-level":
+        assert diagnostics[0].endswith(": is not a known configuration block")
+    else:
+        assert diagnostics[0] == (
+            "module 'twitch': field 'settings.[REDACTED]': is not an allowed property"
+        )

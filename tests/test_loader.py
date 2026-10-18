@@ -1278,6 +1278,16 @@ def runtime_context(**overrides: object) -> RuntimeContext:
     return RuntimeContext(**fields)
 
 
+#: The fixture's own spy keys, which every fixture settings mapping carries:
+#: a fixture schema declaring ``properties`` declares them too, since the
+#: profile boundary refuses an undeclared key (R3, F26).
+_SPY_SETTING_PROPERTIES = {
+    "label": {"type": "string"},
+    "calls": {"type": "array"},
+    "closes": {"type": "array"},
+}
+
+
 def v2_settings(label: str = "v2") -> dict:
     return {"label": label, "calls": [], "closes": []}
 
@@ -1606,7 +1616,7 @@ async def test_settings_schema_and_declared_hook_run_before_any_activation(
 
     schema = {
         "type": "object",
-        "properties": {"channel": {"type": "string", "enum": ["general", "vip"]}},
+        "properties": {**_SPY_SETTING_PROPERTIES, "channel": {"type": "string", "enum": ["general", "vip"]}},
         "required": ["channel"],
     }
     make_module(
@@ -1668,6 +1678,7 @@ async def test_settings_schema_and_declared_hook_run_before_any_activation(
 CREDENTIAL_SCHEMA = {
     "type": "object",
     "properties": {
+        **_SPY_SETTING_PROPERTIES,
         "token": {"type": "string"},
         "backend": {
             "type": "object",
@@ -1941,7 +1952,7 @@ async def test_settings_hook_cannot_echo_the_rejected_credential(
 #: only name a field its module declares or was handed (R7).
 CHAT_SETTINGS_SCHEMA = {
     "type": "object",
-    "properties": {"api_key": {"type": "string"}, "channel": {"type": "string"}},
+    "properties": {**_SPY_SETTING_PROPERTIES, "api_key": {"type": "string"}, "channel": {"type": "string"}},
 }
 
 
@@ -2088,7 +2099,7 @@ async def test_every_enabled_module_is_validated_and_every_refusal_is_reported(
             "other",
             settings_schema={
                 "type": "object",
-                "properties": {"token": {"type": "string"}},
+                "properties": {**_SPY_SETTING_PROPERTIES, "token": {"type": "string"}},
                 "required": ["token"],
             },
         ),
@@ -2126,7 +2137,7 @@ async def test_schema_diagnostic_drops_a_value_that_contains_the_separator(
             "chat",
             settings_schema={
                 "type": "object",
-                "properties": {"channel": {"type": "string", "enum": ["general"]}},
+                "properties": {**_SPY_SETTING_PROPERTIES, "channel": {"type": "string", "enum": ["general"]}},
                 "required": ["channel"],
             },
         ),
@@ -3649,3 +3660,127 @@ def test_ac10_the_schema_validator_masks_only_the_matching_key_segment() -> None
 
     assert masked.value.field == "settings.outer.[REDACTED]"
     assert plain.value.field == f"settings.outer.{_AC10_SECRET}"
+
+
+# --------------------------------------------------------------------------- #
+# P6 — unknown settings refused in every enabled module's settings (R3, F26)
+# --------------------------------------------------------------------------- #
+
+_IMPLICIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {"type": "string"},
+        "calls": {"type": "array"},
+        "closes": {"type": "array"},
+        "token": {"type": "string"},
+        "nested": {"type": "object", "properties": {"port": {"type": "integer"}}},
+        "listed": {
+            "type": "array",
+            "items": {"type": "object", "properties": {"id": {"type": "string"}}},
+        },
+        "open": {
+            "type": "object",
+            "properties": {"known": {"type": "string"}},
+            "additionalProperties": True,
+        },
+        "free": {"type": "object"},
+    },
+}
+
+
+async def _implicit_check(tmp_path: Path, **extra: Any) -> ModuleLoadError | None:
+    make_module(
+        tmp_path,
+        "implicit",
+        manifest=v2_manifest(
+            "implicit", settings_schema=_IMPLICIT_SCHEMA, credentials=["token"]
+        ),
+        source=PLAIN_V2_SOURCE,
+    )
+    context = runtime_context()
+    settings = {**v2_settings("implicit"), **extra}
+    try:
+        await ModuleLoader(context.bus, tmp_path, context=context).activate_enabled(
+            {"enabled_modules": ["implicit"], "modules": {"implicit": settings}}
+        )
+    except ModuleLoadError as exc:
+        return exc
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "field"),
+    [
+        ({"lable": "typo"}, "settings.lable"),
+        ({"nested": {"prot": 1}}, "settings.nested.prot"),
+        ({"listed": [{"id": "a"}, {"idd": "b"}]}, "settings.listed[1].idd"),
+    ],
+)
+async def test_f26_an_undeclared_setting_is_refused_by_its_path_at_every_depth(
+    tmp_path: Path, extra: dict, field: str
+) -> None:
+    """AC12 (R3, F26): a schema that leaves ``additionalProperties`` implicit
+    is closed at the profile boundary, top level and nested alike — the
+    misspelt key is refused naming its path, not silently ignored."""
+
+    caught = await _implicit_check(tmp_path, **extra)
+
+    assert caught is not None
+    assert caught.diagnostics == (
+        f"module 'implicit': field '{field}': is not an allowed property",
+    )
+
+
+@pytest.mark.asyncio
+async def test_f26_explicitly_open_maps_seams_and_the_limits_slot_stay_accepted(
+    tmp_path: Path,
+) -> None:
+    """R3, F26: closure is only the implicit default — a node saying
+    ``additionalProperties: true``, a free-form map declaring no properties,
+    the reserved ``limits`` slot and a ``_``-prefixed injection seam are
+    accepted as before."""
+
+    caught = await _implicit_check(
+        tmp_path,
+        open={"known": "x", "anything": 1},
+        free={"a": 1, "b": {"c": 2}},
+        limits={"admission": {"workers": 1}},
+        _seam_factory=object(),
+    )
+
+    assert caught is None
+
+
+@pytest.mark.asyncio
+async def test_f26_a_credential_used_as_an_unknown_key_is_masked(
+    tmp_path: Path,
+) -> None:
+    """AC12 joins AC10 (R3, F4, F26): the refusal of an unknown key that is a
+    configured credential names the path with that segment masked."""
+
+    caught = await _implicit_check(
+        tmp_path, token=_AC10_SECRET, nested={_AC10_SECRET: 1}
+    )
+
+    assert caught is not None
+    assert _no_secret_fragment(str(caught))
+    assert caught.diagnostics == (
+        "module 'implicit': field 'settings.nested.[REDACTED]': "
+        "is not an allowed property",
+    )
+
+
+def test_f26_the_schema_validator_closes_only_when_asked() -> None:
+    """R3, F26: ``validate_against_schema`` keeps JSON Schema's open default
+    for its other callers; ``closed=True`` is the profile boundary's reading."""
+
+    from core.contracts import validate_against_schema
+
+    schema = {"type": "object", "properties": {"known": {"type": "string"}}}
+
+    validate_against_schema({"other": 1}, schema, label="settings")
+    with pytest.raises(ContractError) as caught:
+        validate_against_schema({"other": 1}, schema, label="settings", closed=True)
+
+    assert caught.value.field == "settings.other"

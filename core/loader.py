@@ -73,6 +73,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Any
@@ -1200,9 +1201,12 @@ class ModuleLoader:
             try:
                 validate_against_schema(
                     settings,
-                    declaration.settings_schema,
+                    _profile_settings_schema(declaration.settings_schema, settings),
                     label="settings",
                     redact=credentials,
+                    # R3, F26: a key the schema does not declare is refused
+                    # by its path, at every depth, not silently ignored.
+                    closed=True,
                 )
             except ContractError as exc:
                 return [
@@ -1808,6 +1812,61 @@ def _manifest_settings_schema(
     except SchemaError as exc:
         raise _field_error(name, exc.field, exc.reason) from None
     return schema
+
+
+_RESERVED_LIMITS_SETTING = "limits"
+"""The setting the entry point hands every enabled module the accepted limits in."""
+
+
+def _profile_settings_schema(
+    schema: Mapping[str, Any], settings: Any
+) -> Mapping[str, Any]:
+    """*schema* as the profile boundary closes it (R3, F26).
+
+    Some top-level slots are not the profile's to declare. The entry point
+    hands every enabled module the accepted ``limits`` block under
+    :data:`_RESERVED_LIMITS_SETTING`; a setting whose name starts with ``_``
+    is a module's private injection seam (a factory, a clock), read by its
+    code and never documented as a setting; and a value that is not profile
+    data (:func:`_is_profile_data`) — a callable, a transport, a service
+    object — can only have been handed over by code. Neither shape is
+    trusted on its own word: the profile boundary
+    (``core.main._validate_config``) refuses a module setting the profile
+    writes under ``limits``, under an ``_``-prefixed name or with a value
+    that is not profile data (a ``!!binary`` bytes value, a ``!!set``), so
+    by the time settings reach here those slots can only hold code
+    injections. A schema that leaves ``additionalProperties`` implicit never
+    had to declare them, so they are declared here, unconstrained, before
+    the closed validation runs; a schema explicit about
+    ``additionalProperties`` keeps its own word.
+    """
+
+    properties = schema.get("properties")
+    if "additionalProperties" in schema or not isinstance(properties, Mapping):
+        return schema
+    present = settings if isinstance(settings, Mapping) else {}
+    implicit = {
+        key: {}
+        for key in present
+        if isinstance(key, str)
+        and key not in properties
+        and (
+            key == _RESERVED_LIMITS_SETTING
+            or key.startswith("_")
+            or not _is_profile_data(present[key])
+        )
+    }
+    if not implicit:
+        return schema
+    return {**schema, "properties": {**properties, **implicit}}
+
+
+def _is_profile_data(value: Any) -> bool:
+    """Whether *value* has a shape a YAML profile can write (R3, F26)."""
+
+    return value is None or isinstance(
+        value, (str, int, float, bool, list, tuple, Mapping, date)
+    )
 
 
 def _manifest_credentials(

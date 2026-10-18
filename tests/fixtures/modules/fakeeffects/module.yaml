@@ -22,10 +22,14 @@ lifecycle:
   roles: []
 
 # No business setting: `{}` is accepted. The `scripts` seam a test may pass is
-# not configuration and is not declared here.
+# not configuration; it is declared only because the profile boundary refuses
+# an undeclared key (phase 6 R3, F26), and the hook checks its shape.
 settings_schema:
   type: object
-  properties: {}
+  properties:
+    scripts:
+      type: object
+      description: Test seam — scripted outcomes by action name.
 settings_validator: validate_settings
 
 credentials: []

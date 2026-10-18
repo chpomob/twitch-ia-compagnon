@@ -865,7 +865,12 @@ def validate_schema(schema: Any, *, label: str) -> None:
 
 
 def validate_against_schema(
-    value: Any, schema: Any, *, label: str, redact: Iterable[str] = ()
+    value: Any,
+    schema: Any,
+    *,
+    label: str,
+    redact: Iterable[str] = (),
+    closed: bool = False,
 ) -> None:
     """Raise :class:`ContractError` unless *value* satisfies *schema*.
 
@@ -879,10 +884,16 @@ def validate_against_schema(
     *value* a diagnostic path names passes through :func:`mask_known` first,
     so a credential configured as a mapping key never reaches the field of
     the error. Only the matching segment is masked; the path keeps its shape.
+
+    *closed* is the profile boundary's reading (R3, F26): a node declaring
+    ``properties`` without an explicit ``additionalProperties`` is closed, at
+    every depth, so a misspelt setting is refused by its path instead of
+    silently doing nothing. A node that says ``additionalProperties: true``,
+    or declares no ``properties`` at all (a free-form map), stays open.
     """
 
     validate_schema(schema, label=label)
-    _apply_schema(value, schema, label=label, redact=tuple(redact))
+    _apply_schema(value, schema, label=label, redact=tuple(redact), closed=closed)
 
 
 def _key_label(label: str, key: str, redact: Sequence[str]) -> str:
@@ -892,7 +903,12 @@ def _key_label(label: str, key: str, redact: Sequence[str]) -> str:
 
 
 def _apply_schema(
-    value: Any, schema: Mapping[str, Any], *, label: str, redact: Sequence[str] = ()
+    value: Any,
+    schema: Mapping[str, Any],
+    *,
+    label: str,
+    redact: Sequence[str] = (),
+    closed: bool = False,
 ) -> None:
     declared = schema.get("type")
     if declared is not None:
@@ -941,14 +957,20 @@ def _apply_schema(
             raise ContractError(
                 label, f"must be a mapping, got {type(value).__name__}"
             )
-        _apply_object_schema(value, schema, label=label, redact=redact)
+        _apply_object_schema(
+            value, schema, label=label, redact=redact, closed=closed
+        )
 
     if "items" in schema:
         if not _is_array(value):
             raise ContractError(label, f"must be a list, got {type(value).__name__}")
         for index, item in enumerate(value):
             _apply_schema(
-                item, schema["items"], label=f"{label}[{index}]", redact=redact
+                item,
+                schema["items"],
+                label=f"{label}[{index}]",
+                redact=redact,
+                closed=closed,
             )
 
 
@@ -958,6 +980,7 @@ def _apply_object_schema(
     *,
     label: str,
     redact: Sequence[str] = (),
+    closed: bool = False,
 ) -> None:
     for key in value:
         if not isinstance(key, str):
@@ -975,9 +998,13 @@ def _apply_object_schema(
                 subschema,
                 label=_key_label(label, name, redact),
                 redact=redact,
+                closed=closed,
             )
 
-    if schema.get("additionalProperties") is False:
+    additional = schema.get("additionalProperties")
+    if additional is None and closed and "properties" in schema:
+        additional = False
+    if additional is False:
         for name in value:
             if name not in properties:
                 raise ContractError(

@@ -1658,3 +1658,49 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
         assert started.diagnostics == [] and started.reported == []
     finally:
         await started.stop()
+
+
+# --------------------------------------------------------------------------- #
+# P6 — every shipped profile passes the closed settings boundary (R3, F26)
+# --------------------------------------------------------------------------- #
+
+#: Every ``*.example`` profile the repository ships, found rather than listed,
+#: so a profile added later is held to the closed boundary too.
+SHIPPED_EXAMPLES = tuple(sorted(path.name for path in ROOT.glob("*.example")))
+
+
+def test_ac12_the_shipped_example_set_is_the_known_one() -> None:
+    """AC12's parametrization covers every shipped profile, presence included."""
+
+    assert SHIPPED_EXAMPLES == (
+        "agent.yaml.example",
+        "config.server.yaml.example",
+        "config.yaml.example",
+        "presence.yaml.example",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", SHIPPED_EXAMPLES)
+async def test_ac12_every_shipped_example_passes_check_config(
+    name: str, tmp_path: Path
+) -> None:
+    """AC12 (R3, F26): with unknown keys refused at the top level and in every
+    enabled module's settings, each shipped ``*.example`` profile still
+    passes ``--check-config`` with status 0 and no diagnostic."""
+
+    path = ROOT / name
+    if name == "presence.yaml.example":
+        # Imported here: the presence suite imports this module.
+        from test_presence_pack import presence_environ
+
+        environ = presence_environ(tmp_path)
+    else:
+        environ = _sample_environ(path)
+    diagnostics: list[str] = []
+
+    status = await application.check_config(
+        path, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+
+    assert (status, diagnostics) == (0, [])

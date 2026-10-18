@@ -4617,7 +4617,13 @@ def _publisher_base(root: Path, environ: dict[str, str]) -> Path:
             "consumes": [],
             "middleware": False,
             "lifecycle": {"roles": []},
-            "settings_schema": {"type": "object", "properties": {"api_key": {"type": "string"}}},
+            # Explicitly open: the canary references are free-form keys, and
+            # an implicit schema is closed at the profile boundary (R3, F26).
+            "settings_schema": {
+                "type": "object",
+                "properties": {"api_key": {"type": "string"}},
+                "additionalProperties": True,
+            },
             "credentials": ["api_key"],
         }
         (directory / "module.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")

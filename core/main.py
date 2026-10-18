@@ -112,6 +112,7 @@ from .loader import (
     _credential_literals,
     _declaration,
     _entry_point,
+    _is_profile_data,
     _redact_known,
     _value_at,
     resolve_input_ownership,
@@ -1653,13 +1654,38 @@ def _resolve_environment(
     return value
 
 
+_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
+    {
+        "modules_directory",
+        "enabled_modules",
+        MODULES_KEY,
+        LIMITS_KEY,
+        SECRETS_KEY,
+        INPUTS_KEY,
+        ACTIONS_KEY,
+        "triggers",
+    }
+)
+"""Every top-level block a profile may carry; any other key is refused (R3)."""
+
+
 def _validate_config(config: Mapping[str, Any]) -> None:
     """Validate what the core owns: structure, paths and limits (R6, R7).
 
     A module's business settings are not inspected here. They belong to the
     module, which validates them through its declared hook before any module
-    is activated.
+    is activated. A top-level key outside :data:`_TOP_LEVEL_KEYS` is refused
+    by its path (R3, F26): a misspelt block would otherwise do nothing.
     """
+
+    for key in config:
+        if key not in _TOP_LEVEL_KEYS:
+            # Masked of the profile's credentials at the one exit of every
+            # refusal, :func:`_load_documents`, before the path leaves (R3).
+            raise ConfigurationError(
+                f"{_display_path(_mapping_path('configuration', key))}: "
+                "is not a known configuration block"
+            )
 
     modules_directory = config.get("modules_directory")
     if not isinstance(modules_directory, str) or not modules_directory.strip():
@@ -1699,6 +1725,21 @@ def _validate_config(config: Mapping[str, Any]) -> None:
                 f"{MODULES_KEY}.{name}.{LIMITS_KEY}: is reserved for the accepted "
                 f"{LIMITS_KEY} block"
             )
+        for key, value in settings.items():
+            # R3, F26: the loader leaves ``_``-prefixed seams and values no
+            # profile can write undeclared, because only code hands them
+            # over. A profile that writes either is refused here, by its
+            # path, so it can never ride that exemption past the schema.
+            if isinstance(key, str) and key.startswith("_"):
+                raise ConfigurationError(
+                    f"{_mapping_path(f'{MODULES_KEY}.{name}', key)}: "
+                    "is reserved for code-injected settings"
+                )
+            if not _is_profile_data(value):
+                raise ConfigurationError(
+                    f"{_mapping_path(f'{MODULES_KEY}.{name}', key)}: "
+                    "is not a supported setting value"
+                )
 
     for name in enabled:
         if name not in modules:
