@@ -786,16 +786,64 @@ async def test_a_delivery_for_an_unconfigured_channel_is_ignored_and_counted() -
 
 
 async def test_the_dedup_window_is_bounded_by_its_settings() -> None:
-    harness = await start_harness(dedup={"max_entries": 2, "window_seconds": 300})
+    """The smallest window is now 600 s, twice the timestamp tolerance (R6,
+    F25, AC24): the window and the advance past it moved from 300/301 to
+    600/601; every assertion is unchanged."""
+
+    harness = await start_harness(dedup={"max_entries": 2, "window_seconds": 600})
     try:
         for index in range(3):
             assert await harness.post(
                 CHAT, chat_body("x", message_id=f"c-{index}"), message_id=f"d-{index}"
             ) == 200
         assert harness.module.dedup_size == 2
-        harness.clock.advance(301)
+        harness.clock.advance(601)
         assert await harness.post(CHAT, chat_body("y", message_id="c-9"), message_id="d-9") == 200
         assert harness.module.dedup_size == 1
+    finally:
+        await harness.close()
+
+
+def test_ac24_the_dedup_window_is_never_shorter_than_twice_the_tolerance() -> None:
+    """R6, F25: a window under the whole accepted signature span is refused,
+    by the validator and by the manifest schema alike."""
+
+    span = int(2 * kick_module.TIMESTAMP_TOLERANCE_SECONDS)
+    assert span == 600
+    assert kick_module.DEFAULT_DEDUP_WINDOW_SECONDS >= span
+    refused = validate_settings({**BASE_SETTINGS, "dedup": {"window_seconds": 300}})
+    assert len(refused) == 1 and "field 'dedup.window_seconds'" in refused[0]
+    assert validate_settings({**BASE_SETTINGS, "dedup": {"window_seconds": span - 1}}) != []
+    assert validate_settings({**BASE_SETTINGS, "dedup": {"window_seconds": 600}}) == []
+    manifest = yaml.safe_load((ROOT / "modules" / "kick" / "module.yaml").read_text("utf-8"))
+    window = manifest["settings_schema"]["properties"]["dedup"]["properties"]["window_seconds"]
+    assert window["minimum"] == span
+    assert window["default"] == kick_module.DEFAULT_DEDUP_WINDOW_SECONDS
+
+
+async def test_ac24_a_replay_across_the_whole_tolerance_span_is_deduplicated() -> None:
+    """R6, F25: a delivery signed 290 s ahead, replayed 580 s later (then
+    290 s behind), passes the timestamp check both times and is refused as a
+    duplicate; a fresh id with the same timestamp at that instant is accepted,
+    so the signature check alone is not what refuses the replay."""
+
+    harness = await start_harness(dedup={"window_seconds": 600})
+    try:
+        stamp = harness.sender.timestamp(NOW + 290)
+        body = chat_body(f"hi {COMPANION}", message_id="chat-replayed")
+        assert await harness.post(CHAT, body, message_id="replayed", timestamp=stamp) == 200
+        assert len(harness.events()) == 1
+
+        harness.clock.advance(580)
+        assert await harness.post(CHAT, body, message_id="replayed", timestamp=stamp) == 409
+        assert harness.module.counts["duplicate"] == 1
+        assert harness.module.counts["stale_timestamp"] == 0
+        assert len(harness.events()) == 1
+
+        fresh = chat_body(f"hi {COMPANION}", message_id="chat-fresh")
+        assert await harness.post(CHAT, fresh, message_id="fresh", timestamp=stamp) == 200
+        assert len(harness.events()) == 2
+        assert harness.module.counts["stale_timestamp"] == 0
     finally:
         await harness.close()
 

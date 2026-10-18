@@ -225,7 +225,10 @@ TIMESTAMP_TOLERANCE_SECONDS = 300.0
 DEFAULT_DEDUP_MAX_ENTRIES = 4096
 DEFAULT_DEDUP_WINDOW_SECONDS = 600
 _DEDUP_MAX_ENTRIES_BOUNDS = (1, 100_000)
-_DEDUP_WINDOW_BOUNDS = (int(TIMESTAMP_TOLERANCE_SECONDS), 86_400)
+# A replay is accepted by the timestamp check anywhere in a span of twice the
+# tolerance (signed ahead of the clock, then replayed behind it), so the dedup
+# window never retains an identifier for less than that span (R6, F25).
+_DEDUP_WINDOW_BOUNDS = (int(2 * TIMESTAMP_TOLERANCE_SECONDS), 86_400)
 
 PUBLIC_KEY_FETCH_TIMEOUT_SECONDS = 10.0
 """Budget of the one public-key request ``prepare`` may make."""

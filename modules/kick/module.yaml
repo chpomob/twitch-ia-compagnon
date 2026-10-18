@@ -144,11 +144,12 @@ settings_schema:
           title: Window seconds
           default: 600
           type: integer
-          minimum: 300
+          minimum: 600
           maximum: 86400
           description: >-
-            How long an identifier is retained, never shorter than the 300 s
-            timestamp tolerance. Default 600.
+            How long an identifier is retained, never shorter than twice the
+            300 s timestamp tolerance -- the whole span in which a signed
+            delivery can be replayed. Default 600.
       additionalProperties: false
   required:
     - client_secret
