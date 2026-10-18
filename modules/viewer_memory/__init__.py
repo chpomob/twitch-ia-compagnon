@@ -33,13 +33,31 @@ file can have), ``fsync``, then ``os.replace``: a reader sees the old file or
 the new one, never a part. A failure before the replace removes the
 temporary file and leaves the old file intact.
 
+**Write first, evict after** (phase 6 R7). The temporary file is written and
+synced *before* any eviction the write needs, so a write that fails for space
+(any ``OSError``) has deleted nothing; the evictions then run, and only once
+they hold the bounds is the file renamed into place. Until then the staged
+file is on disk beside the files it will make room for: the directory can
+exceed ``max_total_bytes`` by at most that one record, transiently, within a
+single synchronous store call. A rename that fails after evictions ran is a
+:class:`MemoryStoreError` carrying them, so each is still published as
+``memory.removed``. A temporary file whose removal fails is counted toward
+``max_total_bytes`` and retried by every later sweep and eviction pass.
+
 **Retention.** A record whose ``last_seen`` is older than ``retention_days``
 (on the injected wall clock) is never returned by :meth:`MemoryStore.read`,
 and is deleted at prepare and at every sweep (``expired``).
 
 **Prepare scan** (before readiness). Only names matching
-:data:`MEMORY_FILE_PATTERN` are read; anything else is neither read, counted
-nor deleted. A memory-named file that is oversized, unreadable, malformed or
+:data:`MEMORY_FILE_PATTERN` in full are read. Names matching
+:data:`TEMPORARY_FILE_PATTERN` in full — the store's own temporary files,
+left by an interrupted write — are counted toward ``max_total_bytes``, never
+read, and removed (no fact; one that cannot be removed stays counted, is
+reported like any failed scan deletion and is retried). Anything else,
+``<64 hex>.json`` followed by a newline included, is foreign: neither read,
+counted nor deleted. Scans and writes never interleave: every store
+operation is synchronous, so no scan can see a write's in-flight temporary
+file. A memory-named file that is oversized, unreadable, malformed or
 stored under a name that is not its key's is deleted (``corrupt``); expired
 files are deleted; then, if the retained files still exceed a bound, the
 eviction runs with no target. From ``start_inputs`` (the module declares the
@@ -173,7 +191,9 @@ EXCEEDED_FILES_NAMED = 2
 DIAGNOSTIC_MAX_CHARS = 1024
 
 MEMORY_FORMAT = 1
-MEMORY_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
+#: A memory file's name; always applied with ``fullmatch`` (phase 6 R7):
+#: ``$`` alone would also accept the name followed by a newline.
+MEMORY_FILE_PATTERN = re.compile(r"[0-9a-f]{64}\.json")
 #: The pinned UTC format: fixed width, so the strings order as the instants.
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 _TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
@@ -201,6 +221,12 @@ MAX_RECALL_BYTES_BOUNDS = (512, 8192)
 _SECONDS_PER_DAY = 86400
 _TEMPORARY_PREFIX = ".viewer-memory-"
 _TEMPORARY_SUFFIX = ".tmp"
+#: The name of a temporary file the atomic write creates (``mkstemp`` with
+#: :data:`_TEMPORARY_PREFIX` and :data:`_TEMPORARY_SUFFIX`); always applied
+#: with ``fullmatch``.
+TEMPORARY_FILE_PATTERN = re.compile(
+    re.escape(_TEMPORARY_PREFIX) + r"[A-Za-z0-9_]+" + re.escape(_TEMPORARY_SUFFIX)
+)
 #: The outcomes of one file deletion.
 _DELETED = "deleted"
 _ABSENT = "absent"
@@ -282,6 +308,10 @@ REASON_DELETION_FAILED = "a memory file could not be deleted"
 #: ``max_file_bytes`` (read as corrupt). Never a ``memory.removed`` reason: a
 #: removed oversized file is counted as ``corrupt``.
 REASON_OVERSIZED = "oversized"
+#: The reason a :class:`DeletionFailure` names for a temporary file left by an
+#: interrupted write. Never a ``memory.removed`` reason: a reclaimed temporary
+#: file is not a viewer's record, so its removal publishes no fact.
+REASON_TEMPORARY = "temporary"
 
 
 class DeletionFailure(NamedTuple):
@@ -590,6 +620,9 @@ class MemoryStore:
         # file whose deletion failed: still on disk, so it counts toward both
         # bounds, and every later eviction pass or sweep retries it.
         self._stranded: dict[str, tuple[str, int]] = {}
+        # ``file name → bytes`` of every temporary file of the store whose
+        # removal failed: counted toward ``max_total_bytes`` until reclaimed.
+        self._temporaries: dict[str, int] = {}
         # Deletions that failed since the store was built (value-free).
         self._failed_deletions = 0
         # ``file name → reason`` of every deletion the last prepare scan tried
@@ -606,10 +639,21 @@ class MemoryStore:
 
     def stats(self) -> tuple[int, int]:
         """``(file count, total bytes)`` of the memory files on disk: the
-        indexed ones and those whose deletion failed."""
+        indexed ones and those whose deletion failed. The bytes also count
+        the store's temporary files whose removal failed (not files: they
+        hold no record)."""
 
         stranded_bytes = sum(size for _reason, size in self._stranded.values())
-        return len(self._index) + len(self._stranded), self._total_bytes + stranded_bytes
+        temporary_bytes = sum(self._temporaries.values())
+        return (
+            len(self._index) + len(self._stranded),
+            self._total_bytes + stranded_bytes + temporary_bytes,
+        )
+
+    def temporaries(self) -> tuple[str, ...]:
+        """The store's temporary files whose removal failed, sorted."""
+
+        return tuple(sorted(self._temporaries))
 
     @property
     def failed_deletions(self) -> int:
@@ -631,7 +675,10 @@ class MemoryStore:
         limit = self._settings.max_file_bytes
         failures = []
         for name in sorted(self._scan_attempts):
-            if name in self._stranded:
+            if name in self._temporaries:
+                size = self._temporaries[name]
+                reason = REASON_TEMPORARY
+            elif name in self._stranded:
                 size = self._stranded[name][1]
                 reason = REASON_OVERSIZED if size > limit else self._scan_attempts[name]
             elif name in self._index:
@@ -678,11 +725,22 @@ class MemoryStore:
         self._index.clear()
         self._total_bytes = 0
         self._stranded.clear()
+        self._temporaries.clear()
         self._scan_attempts.clear()
         removed = {REASON_CORRUPT: 0, REASON_EXPIRED: 0, REASON_EVICTED: 0}
         horizon = self._horizon()
         with os.scandir(self._directory) as entries:
-            candidates = [entry for entry in entries if MEMORY_FILE_PATTERN.match(entry.name)]
+            candidates = []
+            temporaries = []
+            for entry in entries:
+                if MEMORY_FILE_PATTERN.fullmatch(entry.name):
+                    candidates.append(entry)
+                elif TEMPORARY_FILE_PATTERN.fullmatch(entry.name):
+                    temporaries.append(entry)
+        for entry in sorted(temporaries, key=lambda item: item.name):
+            if entry.is_dir(follow_symlinks=False):
+                continue
+            self._reclaim(entry)
         for entry in sorted(candidates, key=lambda item: item.name):
             if entry.is_dir(follow_symlinks=False):
                 continue
@@ -751,6 +809,17 @@ class MemoryStore:
             self._stranded[entry.name] = (reason, int(size))
             self._scan_attempts[entry.name] = reason
 
+    def _reclaim(self, entry: Any) -> None:
+        """Remove a scanned temporary file; keep it counted on failure."""
+
+        try:
+            size = entry.stat(follow_symlinks=False).st_size
+        except OSError:
+            size = 0
+        if self._unlink(entry.name) == _FAILED:
+            self._temporaries[entry.name] = int(size)
+            self._scan_attempts[entry.name] = REASON_TEMPORARY
+
     def sweep(self) -> dict[str, int]:
         """Retry the stranded files, then delete every indexed record past
         retention. A record whose deletion fails stays indexed (and
@@ -763,8 +832,15 @@ class MemoryStore:
         return _merge_removed(removed, {REASON_EXPIRED: count})
 
     def _retry_stranded(self) -> dict[str, int]:
-        """Try once more to delete every stranded file; ``{reason: count}``."""
+        """Try once more to delete every stranded file; ``{reason: count}``.
 
+        The temporary files whose removal failed are retried too; their
+        removal is counted nowhere, as they hold no record.
+        """
+
+        for name in sorted(self._temporaries):
+            if self._unlink(name) != _FAILED:
+                del self._temporaries[name]
         removed: dict[str, int] = {}
         for name in sorted(self._stranded):
             reason = self._stranded[name][0]
@@ -942,8 +1018,29 @@ class MemoryStore:
         return raw
 
     def _write(self, name: str, record: Mapping[str, Any], raw: bytes) -> dict[str, int]:
-        removed = self._evict(target=name, new_size=len(raw))
-        self._atomic_write(name, raw)
+        """Stage *raw*, evict for it, then rename it into place (phase 6 R7).
+
+        A staging failure (``ENOSPC`` included) deletes nothing. An eviction
+        pass that cannot hold the bounds discards the staged file. A rename
+        that fails after evictions ran raises :class:`MemoryStoreError`
+        carrying them, so they are still published.
+        """
+
+        temporary = self._stage(raw)
+        try:
+            removed = self._evict(target=name, new_size=len(raw))
+        except BaseException:
+            self._discard_temporary(temporary, len(raw))
+            raise
+        try:
+            self._commit(temporary, name, len(raw))
+        except OSError:
+            if not removed:
+                raise
+            raise MemoryStoreError(
+                f"{MODULE_NAME} record: the memory file could not be written",
+                removed=removed,
+            ) from None
         # The replacement overwrote any stranded file of the same name: it is
         # now valid, so no later retry may delete it as corrupt or expired.
         self._stranded.pop(name, None)
@@ -1010,29 +1107,58 @@ class MemoryStore:
             )
         return removed
 
-    def _atomic_write(self, name: str, raw: bytes) -> None:
-        """Temporary file in the same directory, ``fsync``, ``os.replace``."""
+    def _stage(self, raw: bytes) -> str:
+        """Write *raw* to a new temporary file and ``fsync`` it; its path.
+
+        On any failure the temporary file is removed (or, when that fails,
+        kept counted at the size it reached) and the error propagates.
+        """
 
         descriptor, temporary = tempfile.mkstemp(
             prefix=_TEMPORARY_PREFIX, suffix=_TEMPORARY_SUFFIX, dir=self._directory
         )
+        staged = 0
         try:
             try:
                 view = memoryview(raw)
                 while view:
                     written = os.write(descriptor, view)
+                    staged += written
                     view = view[written:]
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+        except BaseException:
+            self._discard_temporary(temporary, staged)
+            raise
+        return temporary
+
+    def _commit(self, temporary: str, name: str, size: int) -> None:
+        """``os.replace`` the staged *temporary* onto *name*; on failure the
+        temporary file is discarded and the error propagates."""
+
+        try:
             os.replace(temporary, self._directory / name)
         except BaseException:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
+            self._discard_temporary(temporary, size)
             raise
         self._sync_directory()
+
+    def _discard_temporary(self, temporary: str, size: int) -> None:
+        """Remove a staged file; one that stays is counted until reclaimed.
+
+        A file that stays is counted at its size on disk — a write cut short
+        leaves fewer bytes than the record — and at *size* only when it
+        cannot be measured.
+        """
+
+        name = Path(temporary).name
+        if self._unlink(name) == _FAILED:
+            try:
+                size = os.stat(self._directory / name).st_size
+            except OSError:
+                pass
+            self._temporaries[name] = size
 
     def _sync_directory(self) -> None:
         """Persist the rename where the platform allows opening a directory."""
@@ -1776,6 +1902,8 @@ __all__ = [
     "REASON_EVICTED",
     "REASON_EXPIRED",
     "REASON_OVERSIZED",
+    "REASON_TEMPORARY",
+    "TEMPORARY_FILE_PATTERN",
     "TIMESTAMP_FORMAT",
     "DeletionFailure",
     "MemorySettings",

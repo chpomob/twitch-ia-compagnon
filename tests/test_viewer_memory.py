@@ -14,8 +14,10 @@ positive-duration sleep.
 from __future__ import annotations
 
 import asyncio
+import errno
 import gc
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -1882,3 +1884,248 @@ def test_ac19_cli_the_module_entry_runs_without_a_network_client(tmp_path: Path)
     imported = {line.rsplit("|", 1)[-1].strip() for line in completed.stderr.splitlines()}
     assert not {name for name in imported if name.split(".")[0] == "aiohttp"}
     assert "yaml" in imported
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 R7 — consistency across failures (AC25, AC26, AC27)
+# --------------------------------------------------------------------------- #
+
+
+def no_space(*_args: Any, **_kwargs: Any) -> Any:
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def store_files(directory: Path) -> list[str]:
+    """Every name in *directory*, foreign and temporary ones included."""
+
+    return sorted(os.listdir(directory))
+
+
+@pytest.mark.asyncio
+async def test_ac25_a_write_failing_for_space_evicts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 6 R7 / F21, AC25: with ``max_files: 2`` and two files, a write
+    for a third viewer needs one eviction; its atomic write raises
+    ``OSError(ENOSPC)``. Both files are still on disk, still counted, no
+    ``memory.removed`` is published and no temporary file is left behind:
+    the write is staged before any eviction runs."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, _ = memory_directory(tmp_path)
+    old = write_memory(directory, ("fake", "chan-a", "old"), last_used=1.0)
+    recent = write_memory(directory, ("fake", "chan-a", "recent"), last_used=2.0)
+    before = store_files(directory)
+    handle = await module_for(runtime, clock, directory, max_files=2)
+    await handle.prepare()
+    try:
+        assert handle.store.eviction_order()[0] == old.name
+        real_write = os.write
+        monkeypatch.setattr(viewer_memory.os, "write", no_space)
+        with pytest.raises(OSError) as raised:
+            await handle.record("fake", "chan-a", "new")
+        assert raised.value.errno == errno.ENOSPC
+        assert store_files(directory) == before == sorted([old.name, recent.name])
+        assert handle.store.stats() == (2, old.stat().st_size + recent.stat().st_size)
+        assert removed_facts(runtime) == []
+
+        monkeypatch.setattr(viewer_memory.os, "write", real_write)
+        await handle.record("fake", "chan-a", "new")
+        assert store_files(directory) == sorted(
+            [recent.name, memory_file_name("fake", "chan-a", "new")]
+        )
+        assert removed_facts(runtime) == [{"reason": "evicted", "count": 1}]
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac25_a_rename_failing_after_evictions_publishes_their_exact_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 6 R7 / F21, AC25 (second branch): when the rename that ends
+    the atomic write raises ``OSError(ENOSPC)`` after the evictions ran,
+    the write is refused and exactly one ``memory.removed`` is published,
+    its ``count`` the number of files actually deleted (2 here)."""
+
+    clock = ManualClock(START)
+    runtime = runtime_context(clock=clock)
+    directory, _ = memory_directory(tmp_path)
+    first = write_memory(directory, ("fake", "chan-a", "a"), last_used=1.0)
+    second = write_memory(directory, ("fake", "chan-a", "b"), last_used=2.0)
+    third = write_memory(directory, ("fake", "chan-a", "c"), last_used=3.0)
+    handle = await module_for(runtime, clock, directory, max_files=3)
+    await handle.prepare()
+    try:
+        # Shrink the bound under the store: the write now needs two evictions.
+        handle.store._settings = MemorySettings(directory=directory, max_files=2)
+        monkeypatch.setattr(viewer_memory.os, "replace", no_space)
+        with pytest.raises(MemoryStoreError):
+            await handle.record("fake", "chan-a", "new")
+        remaining = store_files(directory)
+        assert remaining == [third.name]
+        deleted = len({first.name, second.name, third.name} - set(remaining))
+        assert removed_facts(runtime) == [{"reason": "evicted", "count": deleted}]
+        assert deleted == 2
+        assert handle.store.stats() == (1, third.stat().st_size)
+    finally:
+        await handle.close()
+
+
+def test_ac25_a_use_whose_rename_fails_carries_its_evictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 6 R7 / F21, AC25 on the recall's use path: a use whose rename
+    raises ``OSError(ENOSPC)`` after an eviction raises
+    :class:`MemoryStoreError` carrying that eviction (the module publishes
+    it), and the used file is left as it was."""
+
+    directory, _ = memory_directory(tmp_path)
+    wall = Wall(WALL_EPOCH + 100.0)
+    old = write_memory(directory, ("twitch", "c1", "old"), last_used=1.0)
+    viewer = write_memory(directory, ("twitch", "c1", "viewer"), last_used=2.0)
+    content = viewer.read_bytes()
+    store = store_for(directory, wall, max_files=2)
+    # Shrink the bound under the store: the use now needs the old file gone.
+    store._settings = MemorySettings(directory=directory, max_files=1)
+    monkeypatch.setattr(viewer_memory.os, "replace", no_space)
+    with pytest.raises(MemoryStoreError) as raised:
+        store.use("twitch", "c1", "viewer")
+    assert raised.value.removed == {"evicted": 1}
+    assert not old.exists()
+    assert store_files(directory) == [viewer.name]
+    assert viewer.read_bytes() == content
+
+
+def test_ac26_a_leftover_temporary_file_is_counted_then_reclaimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 6 R7 / F22, AC26: a 1,000-byte ``.viewer-memory-x.tmp`` left by
+    an interrupted write counts toward ``max_total_bytes`` while it stays —
+    a write that fits only without it evicts — and is never read as a
+    record; the next scan that can delete it removes it."""
+
+    directory, _ = memory_directory(tmp_path)
+    temporary = directory / ".viewer-memory-x.tmp"
+    temporary.write_bytes(b"x" * 1000)
+    # The exact size of the record the write below creates.
+    probe_directory, _ = memory_directory(tmp_path, "probe")
+    wall = Wall(WALL_EPOCH + 100.0)
+    store_for(probe_directory, wall).record("twitch", "c1", "new")
+    new_size = (probe_directory / memory_file_name("twitch", "c1", "new")).stat().st_size
+    old = write_memory(directory, ("twitch", "c1", "old"), last_used=1.0)
+    old_size = old.stat().st_size
+
+    refused = refusing_unlink(monkeypatch, {temporary.name})
+    read: list[str] = []
+    real_open = open
+
+    def watching_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+        read.append(Path(path).name)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(viewer_memory, "open", watching_open, raising=False)
+    store = store_for(
+        directory, wall, max_file_bytes=512, max_total_bytes=1000 + old_size + new_size - 1
+    )
+    assert refused == [temporary.name]
+    assert temporary.name not in read
+    assert store.stats() == (1, old_size + 1000)
+    _, removed = store.record("twitch", "c1", "new")
+    # Without the temporary file both records would fit.
+    assert removed == {"evicted": 1}
+    assert not old.exists()
+    assert store_files(directory) == sorted([temporary.name, memory_file_name("twitch", "c1", "new")])
+
+    monkeypatch.setattr(viewer_memory.os, "unlink", REAL_UNLINK)
+    assert store.scan() == {}
+    assert not temporary.exists()
+    assert temporary.name not in read
+    assert store.stats() == (1, new_size)
+
+
+def test_ac26_a_write_cut_short_counts_its_kept_temporary_at_its_real_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 6 R7 / F22, AC26 (P14 fix round 2): a write that stages 10
+    bytes, then fails for space, and whose temporary file cannot be removed
+    counts that file at the 10 bytes it holds — not at the record's full
+    size — so later evictions are not driven by bytes that were never
+    written."""
+
+    directory, _ = memory_directory(tmp_path)
+    wall = Wall(WALL_EPOCH + 100.0)
+    old = write_memory(directory, ("twitch", "c1", "old"), last_used=1.0)
+    store = store_for(directory, wall)
+    real_write = os.write
+    calls: list[int] = []
+
+    def short_then_full(descriptor: int, data: Any) -> int:
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(descriptor, bytes(data[:10]))
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(viewer_memory.os, "write", short_then_full)
+    refusing_unlink(monkeypatch)
+    with pytest.raises(OSError) as raised:
+        store.record("twitch", "c1", "new")
+    assert raised.value.errno == errno.ENOSPC
+    assert calls[0] > 10
+    (kept,) = store.temporaries()
+    assert (directory / kept).stat().st_size == 10
+    assert store.stats() == (1, old.stat().st_size + 10)
+
+
+def test_ac26_a_scan_reclaims_a_temporary_file_and_never_reads_it(tmp_path: Path) -> None:
+    """Phase 6 R7 / F22, AC26: the store's own temporary file — a name
+    ``mkstemp`` can give the write — is removed by the scan; a name merely
+    resembling it is foreign and stays."""
+
+    directory, _ = memory_directory(tmp_path)
+    temporary = directory / ".viewer-memory-x.tmp"
+    temporary.write_bytes(b"x" * 1000)
+    foreign = directory / ".viewer-memory-x.tmp\n"
+    foreign.write_bytes(b"y" * 10)
+    store = store_for(directory, Wall())
+    assert store_files(directory) == [foreign.name]
+    assert store.stats() == (0, 0)
+
+
+def test_ac27_a_memory_name_with_a_trailing_newline_is_foreign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 6 R7 / F31, AC27: ``<64 hex>.json\\n`` is not a memory file:
+    a scan neither reads, counts nor deletes it, even when it is malformed
+    (which a memory file would be deleted for) and the bounds are tight."""
+
+    directory, _ = memory_directory(tmp_path)
+    foreign = directory / ("a" * 64 + ".json\n")
+    foreign.write_bytes(b"{not json" + b" " * 2000)
+    read: list[str] = []
+    real_open = open
+
+    def watching_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+        read.append(Path(path).name)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(viewer_memory, "open", watching_open, raising=False)
+    store = store_for(directory, Wall(), max_files=1, max_file_bytes=512, max_total_bytes=512)
+    assert read == []
+    assert store.stats() == (0, 0)
+    assert store.indexed() == ()
+    assert store_files(directory) == [foreign.name]
+    store.record("twitch", "c1", "v1")
+    assert store.sweep() == {}
+    assert store.scan() == {}
+    assert foreign.name not in read
+    assert store_files(directory) == sorted([foreign.name, memory_file_name("twitch", "c1", "v1")])
+
+
+def test_r7_scans_and_writes_are_serialized_by_being_synchronous() -> None:
+    """Phase 6 R7 risk: a scan never sees a write's in-flight temporary file
+    because no store operation awaits — on one loop none interleave."""
+
+    for operation in ("scan", "sweep", "record", "use", "forget", "read"):
+        assert not inspect.iscoroutinefunction(getattr(MemoryStore, operation)), operation
