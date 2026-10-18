@@ -89,6 +89,7 @@ from core.main import (
     MODULES_DIRECTORY_BUILTIN,
     MODULES_KEY,
     SECRETS_KEY,
+    _STARTUP_DEADLINE_SECONDS,
     _builtin_modules_directory,
     check_config,
 )
@@ -4397,13 +4398,19 @@ def _default_checker(
     environ: Mapping[str, str],
     overlay_path: Path | None,
     draft: Mapping[str, Any],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
 ) -> tuple[bool, list[str]]:
     """The settings phase through ``core.main.check_config`` (R5, D7, D8).
 
     It runs the check on its own socket-free loop, never ``asyncio.run``
     (whose self-pipe is a socketpair), and refuses to run on a thread that
     already runs a loop: in production it is reached on a ``config-ui``
-    worker through :func:`_dispatch`.
+    worker through :func:`_dispatch`. The loop is released by
+    :data:`CHECK_RELEASE_SECONDS` after the Check starts on *clock*, its
+    cleanup included; a Check that did not finish by then fails with
+    :data:`CHECK_TIMEOUT_DIAGNOSTIC` (R7, F35).
     """
 
     try:
@@ -4413,15 +4420,20 @@ def _default_checker(
     else:
         raise RuntimeError("Check must not run on a running event loop")
     collected: list[str] = []
-    status = _run_socket_free(
+    released, status = _run_check_bounded(
         check_config(
             base_path,
             environ=environ,
             overlay=overlay_path,
             overlay_document=draft,
             diagnostic_reporter=collected.append,
-        )
+        ),
+        clock=clock,
+        sleep=sleep,
     )
+    if not released:
+        collected.append(CHECK_TIMEOUT_DIAGNOSTIC)
+        return False, collected
     return status == 0, collected
 
 
@@ -5322,6 +5334,103 @@ def _run_socket_free(coro: Coroutine[Any, Any, _T]) -> _T:
             loop.run_until_complete(loop.shutdown_default_executor())
         finally:
             loop.close()
+
+
+#: The one release deadline of a Check's loop, from the moment it starts: the
+#: loader's validator deadline plus one second of cleanup (R7, F35).
+CHECK_RELEASE_SECONDS = _STARTUP_DEADLINE_SECONDS + 1.0
+CHECK_TIMEOUT_DIAGNOSTIC = (
+    "configuration check: timed out; the check was abandoned "
+    f"after {CHECK_RELEASE_SECONDS:g} s"
+)
+
+
+def _drive_until(
+    loop: asyncio.AbstractEventLoop,
+    finished: Callable[[], bool],
+    deadline: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], Awaitable[Any]],
+    watched: "asyncio.Future[Any] | None" = None,
+) -> bool:
+    """Run *loop* until *finished* or *deadline* on *clock*; return which.
+
+    Each turn waits at most what remains until the shared *deadline*, never
+    a budget of its own, and ends early when *watched* completes.
+    """
+
+    while not finished():
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        pause = loop.create_task(sleep(min(remaining, _POLL_SECONDS)))  # type: ignore[arg-type]
+        awaited = {pause} if watched is None else {pause, watched}
+        loop.run_until_complete(asyncio.wait(awaited, return_when=asyncio.FIRST_COMPLETED))
+        if not pause.done():
+            pause.cancel()
+            loop.run_until_complete(asyncio.wait({pause}))
+    return True
+
+
+def _run_check_bounded(
+    coro: Coroutine[Any, Any, _T],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+) -> tuple[bool, _T | None]:
+    """Run a Check's *coro* on a socket-free loop released by one deadline.
+
+    The deadline is :data:`CHECK_RELEASE_SECONDS` after the call on *clock*.
+    Validation, then the cancellation of the remaining tasks, the shutdown
+    of async generators and the shutdown of the loop's executor each wait
+    only for what remains of it (R7, F35). Once it has passed, the stages
+    not yet run are skipped, what is still pending is abandoned unawaited
+    and the loop is closed; the executor is then shut down without waiting
+    for a job that never returns. Returns ``(True, result)`` when every
+    stage finished, ``(False, None)`` otherwise; an exception the coroutine
+    raised propagates once the loop is closed.
+    """
+
+    deadline = clock() + CHECK_RELEASE_SECONDS
+    loop = _SocketFreeEventLoop()
+    # The loop's executor is created here so its shutdown can be bounded;
+    # ``shutdown_default_executor`` would join its thread unconditionally.
+    executor = ThreadPoolExecutor()
+    loop.set_default_executor(executor)
+    released = False
+    try:
+        main = loop.create_task(coro)
+        if not _drive_until(loop, main.done, deadline, clock, sleep, main):
+            main.cancel()
+            return False, None
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            gathered = asyncio.gather(*pending, return_exceptions=True)
+            if not _drive_until(loop, gathered.done, deadline, clock, sleep, gathered):
+                return False, None
+        closing = loop.create_task(loop.shutdown_asyncgens())
+        if not _drive_until(loop, closing.done, deadline, clock, sleep, closing):
+            closing.cancel()
+            return False, None
+        stopper = threading.Thread(
+            target=executor.shutdown, kwargs={"wait": True}, daemon=True
+        )
+        stopper.start()
+        if not _drive_until(
+            loop, lambda: not stopper.is_alive(), deadline, clock, sleep
+        ):
+            return False, None
+        released = True
+        return True, main.result()
+    finally:
+        if not released:
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+        loop.close()
+        if not released:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------

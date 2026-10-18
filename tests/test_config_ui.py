@@ -8055,3 +8055,199 @@ def test_p5_ac10_check_keeps_its_draft_semantics_for_an_inputs_edit(tmp_path: Pa
     assert checked.passed and checked.diagnostics == ()
     assert ui.save(edit, fingerprint=_fingerprint(tmp_path / "config.local.yaml")).outcome == "refused"
     assert _snapshot(tmp_path) == before
+
+
+# ---------------------------------------------------------------------------
+# P17: a Check releases its loop by the validator deadline (R7, F35, AC30)
+# ---------------------------------------------------------------------------
+
+
+class _CheckClock:
+    """A manual clock whose ``sleep`` advances it instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        await asyncio.sleep(0)
+
+
+def _hung_validator_ui(tmp_path: Path, clock: _CheckClock) -> ConfigUI:
+    _write_manifest(
+        tmp_path / "mods",
+        "p17hang",
+        "settings_schema: {type: object, properties: {}}\nsettings_validator: validate\n",
+    )
+    (tmp_path / "mods" / "p17hang" / "__init__.py").write_text(
+        CHECK_ENTRY_POINT
+        + "\n\nasync def validate(settings):\n"
+        "    import asyncio\n"
+        "    await asyncio.get_running_loop().create_future()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.yaml").write_text(
+        "modules_directory: ./mods\nenabled_modules: [p17hang]\nmodules: {p17hang: {}}\n",
+        encoding="utf-8",
+    )
+
+    def checker(*args: Any) -> tuple[bool, list[str]]:
+        return config_ui._default_checker(*args, clock=clock, sleep=clock.sleep)
+
+    return ConfigUI(
+        UISettings.from_argv(
+            ["--config", str(tmp_path / "config.yaml"), "--status-file", str(tmp_path / "status.json")]
+        ),
+        environ={},
+        checker=checker,
+    )
+
+
+def test_p17_ac30_a_validator_that_never_returns_releases_the_check_by_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """AC30 (R7, F35): the loop is released within the loader's validator
+    deadline + 1 s of the Check's start on the injected clock, and the Check
+    reports the timeout — on the response page too."""
+
+    clock = _CheckClock()
+    ui = _hung_validator_ui(tmp_path, clock)
+    assert config_ui.CHECK_RELEASE_SECONDS == config_ui._STARTUP_DEADLINE_SECONDS + 1.0
+    start = clock()
+    result = ui.check()
+    assert clock() - start <= config_ui.CHECK_RELEASE_SECONDS
+    assert not result.passed
+    assert config_ui.CHECK_TIMEOUT_DIAGNOSTIC in result.diagnostics
+
+    start = clock()
+    page = _post_check(ui, config_ui.CORE_PAGE)
+    assert clock() - start <= config_ui.CHECK_RELEASE_SECONDS
+    assert not _verdict(page)
+    assert config_ui.CHECK_TIMEOUT_DIAGNOSTIC in _listed(page)
+
+
+def test_p17_ac30_stalled_cleanup_after_a_validator_timeout_gets_only_the_residual(
+    tmp_path: Path,
+) -> None:
+    """AC30 (a): validation ends at the loader's deadline, leaving a task that
+    ignores cancellation, an async generator whose ``aclose`` stalls and an
+    executor job that never finishes. The cleanup shares the one deadline,
+    so the loop is released at deadline + 1 s, not + 3 s (a fresh budget per
+    stage would reach it)."""
+
+    clock = _CheckClock()
+    release = threading.Event()
+    held: list[Any] = []
+    start = clock()
+
+    async def stubborn() -> None:
+        while True:
+            try:
+                await asyncio.get_running_loop().create_future()
+            except asyncio.CancelledError:
+                continue
+
+    async def stalled_generator() -> Any:
+        try:
+            yield 1
+        finally:
+            await asyncio.get_running_loop().create_future()
+
+    async def validation() -> str:
+        loop = asyncio.get_running_loop()
+        held.append(loop.create_task(stubborn()))
+        generator = stalled_generator()
+        held.append(generator)
+        await generator.__anext__()
+        held.append(loop.run_in_executor(None, release.wait))
+        while clock() < start + config_ui._STARTUP_DEADLINE_SECONDS:
+            await asyncio.sleep(0)
+        return "timed out"
+
+    try:
+        outcome = config_ui._run_check_bounded(validation(), clock=clock, sleep=clock.sleep)
+        assert clock() - start <= config_ui.CHECK_RELEASE_SECONDS
+        assert outcome == (False, None)
+    finally:
+        release.set()
+
+
+def test_p17_ac30_cleanup_stages_after_an_early_validation_share_the_remaining_budget() -> None:
+    """AC30 (b): validation finishes at once; an async generator's ``aclose``
+    stalls for 100 s and an executor job never finishes. The executor stage
+    gets only what the generator stage left: release at deadline + 1 s."""
+
+    clock = _CheckClock()
+    release = threading.Event()
+    held: list[Any] = []
+    start = clock()
+
+    async def slow_generator() -> Any:
+        try:
+            yield 1
+        finally:
+            while clock() < start + 100.0:
+                await asyncio.sleep(0)
+            held.append("closed")
+
+    async def validation() -> int:
+        loop = asyncio.get_running_loop()
+        generator = slow_generator()
+        held.append(generator)
+        await generator.__anext__()
+        held.append(loop.run_in_executor(None, release.wait))
+        return 0
+
+    try:
+        outcome = config_ui._run_check_bounded(validation(), clock=clock, sleep=clock.sleep)
+        assert "closed" in held
+        assert clock() - start <= config_ui.CHECK_RELEASE_SECONDS
+        assert outcome == (False, None)
+    finally:
+        release.set()
+
+
+def test_p17_ac30_a_normal_check_completes_every_stage_without_a_timeout(tmp_path: Path) -> None:
+    """AC30 (c): every stage finishes — the remaining task is cancelled, the
+    generator closed, the executor job joined — and no timeout is reported."""
+
+    clock = _CheckClock()
+    held: list[Any] = []
+    start = clock()
+
+    async def pending() -> None:
+        try:
+            await asyncio.get_running_loop().create_future()
+        except asyncio.CancelledError:
+            held.append("cancelled")
+            raise
+
+    async def generator() -> Any:
+        try:
+            yield 1
+        finally:
+            held.append("closed")
+
+    async def validation() -> int:
+        loop = asyncio.get_running_loop()
+        held.append(loop.create_task(pending()))
+        opened = generator()
+        held.append(opened)
+        await opened.__anext__()
+        assert await loop.run_in_executor(None, lambda: "joined") == "joined"
+        return 7
+
+    assert config_ui._run_check_bounded(validation(), clock=clock, sleep=clock.sleep) == (True, 7)
+    assert "cancelled" in held and "closed" in held
+    assert clock() - start < config_ui.CHECK_RELEASE_SECONDS
+
+    def checker(*args: Any) -> tuple[bool, list[str]]:
+        return config_ui._default_checker(*args, clock=clock, sleep=clock.sleep)
+
+    ui = _check_fixture(tmp_path, VALID_MODULES, checker=checker)
+    result = ui.check()
+    assert result.passed, result.diagnostics
+    assert config_ui.CHECK_TIMEOUT_DIAGNOSTIC not in result.diagnostics
