@@ -41,6 +41,13 @@ observation. ``seq ≤ last_seq`` with a ``call_id`` not retained is refused
 ``error duplicate_call_unknown`` (``retryable: false``), 0 executions. A
 missing or non-positive ``seq``, or a ``call_id`` retained under another
 ``seq``, is ``error invalid_frame``. Both are reset on every ``welcome``.
+A repeat is served only once it passed the checks a new call passes — a
+valid call, the negotiated set, the pairing principal — and only when it
+is the same logical call: its identity, computed from the call by the
+executor's rule (principal, conversation, action and version, destination
+components, type-tagged arguments), equals the retained one. Any other
+reuse is ``refused call_id_conflict``, not retained, 0 executions, and
+discloses nothing of the retained observation.
 
 **A peer is not an identity (phase 6 R2).** The paired brain is bounded by
 the pairing, not by what it sends. A ``call`` naming an action outside the
@@ -110,7 +117,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from core.actions import ERROR_NOT_AUTHORIZED, ERROR_PROVIDER_FAILED, ERROR_UNKNOWN_ACTION
+from core.actions import (
+    ERROR_CALL_ID_CONFLICT,
+    ERROR_NOT_AUTHORIZED,
+    ERROR_PROVIDER_FAILED,
+    ERROR_UNKNOWN_ACTION,
+    _CallIdentity,
+    _identity,
+)
 from core.contracts import (
     ATTACHMENT_ACK_CODES,
     ATTACHMENT_ACK_TOO_LARGE,
@@ -567,6 +581,21 @@ def _encode(frame: Mapping[str, Any]) -> str:
     return json.dumps({"v": PROXY_PROTOCOL_VERSION, **frame}, separators=(",", ":"))
 
 
+def _refusal_frame(call_id: str, code: str, message: str, retryable: bool) -> str:
+    """The encoded terminal ``refused`` observation the agent answers itself."""
+
+    return _encode(
+        {
+            "type": FRAME_OBSERVATION,
+            "id": call_id,
+            "status": "refused",
+            "provenance": {"provider": MODULE_NAME},
+            "error": {"code": code, "message": message, "retryable": retryable},
+            "parts": [],
+        }
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Connection and session state
 # --------------------------------------------------------------------------- #
@@ -579,6 +608,9 @@ class _CallEntry:
     call_id: str
     seq: int
     accepted_at: float
+    #: What the accepted call was — the executor's identity rule (R1): a
+    #: repeat is served only when its own call has the same identity.
+    identity: _CallIdentity
     #: The encoded ``observation`` frame once terminal; a repeat re-sends it.
     future: "asyncio.Future[str | None]"
 
@@ -1146,6 +1178,27 @@ class AgentLinkModule:
                     "call_id is retained under a different seq",
                 )
                 return
+            # A repeat passes the checks a new call passes before anything
+            # retained is exposed (phase 6 R1/R2): its own call, the
+            # negotiated set, the pairing principal, then the same identity.
+            call = self._action_call(frame, call_id, now)
+            if call is None:
+                await self._error(
+                    session.connection, call_id, PROXY_ERROR_INVALID_FRAME,
+                    "call does not carry a valid ActionCall",
+                )
+                return
+            refusal = self._pairing_refusal(session, frame, call)
+            if refusal is None and _identity(call) != entry.identity:
+                refusal = (
+                    ERROR_CALL_ID_CONFLICT,
+                    "the call_id is retained for another call",
+                    False,
+                )
+            if refusal is not None:
+                # Not retained: the entry still answers the call it was.
+                await self._send_retained(session, _refusal_frame(call_id, *refusal))
+                return
             # A repeat: the retained observation, once it exists; 0 executions.
             if entry.future.done():
                 await self._send_retained(session, entry.future.result())
@@ -1181,6 +1234,7 @@ class AgentLinkModule:
             call_id=call_id,
             seq=seq,
             accepted_at=now,
+            identity=_identity(call),
             future=asyncio.get_running_loop().create_future(),
         )
         session.table[call_id] = entry
@@ -1189,29 +1243,11 @@ class AgentLinkModule:
 
         # The pairing bounds the peer (phase 6 R2): each refusal below is a
         # terminal observation, retained like any other, 0 executor entries.
-        refusal: tuple[str, str, bool] | None = None
-        if call.action_name not in session.accepted:
-            refusal = (
-                ERROR_UNKNOWN_ACTION, "the action is not in this session's negotiated set", False
-            )
-        elif frame.get("principal") != self._settings.principal:
-            refusal = (
-                ERROR_NOT_AUTHORIZED, "the principal is not the one this pairing fixes", False
-            )
-        elif self.running_calls >= self._settings.max_running_calls:
+        refusal = self._pairing_refusal(session, frame, call)
+        if refusal is None and self.running_calls >= self._settings.max_running_calls:
             refusal = (ERROR_BUSY, "the agent runs as many calls as it admits", True)
         if refusal is not None:
-            code, message, retryable = refusal
-            text = _encode(
-                {
-                    "type": FRAME_OBSERVATION,
-                    "id": call_id,
-                    "status": "refused",
-                    "provenance": {"provider": MODULE_NAME},
-                    "error": {"code": code, "message": message, "retryable": retryable},
-                    "parts": [],
-                }
-            )
+            text = _refusal_frame(call_id, *refusal)
             self._retain(entry, text)
             await self._send_retained(session, text)
             return
@@ -1233,6 +1269,21 @@ class AgentLinkModule:
                 del session.running[call_id]
 
         task.add_done_callback(_forget)
+
+    def _pairing_refusal(
+        self, session: _Session, frame: Mapping[str, Any], call: ActionCall
+    ) -> tuple[str, str, bool] | None:
+        """Why the pairing refuses this call, if it does (phase 6 R2)."""
+
+        if call.action_name not in session.accepted:
+            return (
+                ERROR_UNKNOWN_ACTION, "the action is not in this session's negotiated set", False
+            )
+        if frame.get("principal") != self._settings.principal:
+            return (
+                ERROR_NOT_AUTHORIZED, "the principal is not the one this pairing fixes", False
+            )
+        return None
 
     def _expire(self, session: _Session, now: float) -> None:
         ttl = self._settings.call_table.ttl_seconds

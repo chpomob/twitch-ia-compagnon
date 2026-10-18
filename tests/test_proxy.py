@@ -3075,6 +3075,7 @@ import shutil
 import subprocess
 
 from core.actions import (
+    ERROR_CALL_ID_CONFLICT,
     ERROR_CANCELLED,
     ERROR_NOT_AUTHORIZED,
     ERROR_UNKNOWN_ACTION,
@@ -4145,6 +4146,103 @@ async def test_p6_ac9_running_executions_and_duplicate_waiters_are_bounded() -> 
         await brain.call("call-4", 4)
         assert (await brain.observation("call-4"))["status"] == "success"
         assert len(recorder.calls) == 3
+    finally:
+        await host.close()
+
+
+async def test_p6_f2_f3_a_reused_call_id_naming_another_call_reads_nothing_retained() -> None:
+    """F2/F3 (R1, R2), the gate's replay probe A: the first call is granted
+    and in-set; the same ``(id, seq)`` with an out-of-set action, another
+    principal and changed arguments — each alone, then all together — is
+    refused, the executor sees exactly one invocation, and no answer is the
+    retained observation. The retained entry still serves the exact retry."""
+
+    host, brain, recorder = await recorded_host()
+    try:
+        await brain.call("gate-replay", 1)
+        original = await brain.observation("gate-replay")
+        assert original["status"] == "success" and len(recorder.calls) == 1
+
+        for altered, code in (
+            ({"action": FAKE_WRITE}, ERROR_UNKNOWN_ACTION),
+            ({"principal": "ungranted-attacker"}, ERROR_NOT_AUTHORIZED),
+            ({"arguments": {"source": "changed"}}, ERROR_CALL_ID_CONFLICT),
+            (
+                {
+                    "principal": "ungranted-attacker",
+                    "action": FAKE_WRITE,
+                    "arguments": {"text": "changed"},
+                },
+                ERROR_UNKNOWN_ACTION,
+            ),
+        ):
+            await brain.call("gate-replay", 1, **altered)
+            forged = await brain.observation("gate-replay")
+            assert forged != original, altered
+            assert forged["status"] == "refused", altered
+            assert forged["error"]["code"] == code, altered
+            assert forged["error"]["retryable"] is False
+            assert "result" not in forged and forged["parts"] == []
+            assert len(recorder.calls) == 1 and host.module.executions == 1
+
+        # The exact retry still reads the retained observation, 0 executions.
+        await brain.call("gate-replay", 1)
+        assert await brain.observation("gate-replay") == original
+        assert len(recorder.calls) == 1 and host.executor.provider_invocations == 1
+        assert host.module.retained_calls == ("gate-replay",) and host.module.last_seq == 1
+    finally:
+        await host.close()
+
+
+async def test_p6_f3_a_reuse_whose_arguments_only_share_a_rendering_is_refused() -> None:
+    """F3 (R1): an in-set retry under the pairing principal whose arguments
+    differ from the retained call's only where a rendering collides — a
+    list and its printed form, a mapping (in either key order) and its
+    printed form, a number and its digits — is another call: refused
+    ``call_id_conflict``, never the retained observation, never executed.
+    A retry still in flight is held to the same rule."""
+
+    host, brain, recorder = await recorded_host()
+    try:
+        cases = (
+            ("['screen', 'window']", ["screen", "window"]),
+            ("{'a': 1, 'b': 2}", {"a": 1, "b": 2}),
+            ("{'a': 1, 'b': 2}", {"b": 2, "a": 1}),
+            ("1", 1),
+            ("True", True),
+        )
+        for seq, (spelled, value) in enumerate(cases, start=1):
+            call_id = f"rendered-{seq}"
+            await brain.call(call_id, seq, arguments={"source": spelled})
+            original = await brain.observation(call_id)
+            assert original["status"] == "success"
+
+            await brain.call(call_id, seq, arguments={"source": value})
+            reused = await brain.observation(call_id)
+            assert reused != original, value
+            assert reused["status"] == "refused"
+            assert reused["error"]["code"] == ERROR_CALL_ID_CONFLICT
+            assert len(recorder.calls) == seq
+
+            await brain.call(call_id, seq, arguments={"source": spelled})
+            assert await brain.observation(call_id) == original
+            assert len(recorder.calls) == seq
+
+        # While the first execution runs, an altered repeat attaches to nothing.
+        host.provider.hold = asyncio.get_running_loop().create_future()
+        await brain.call("running", 9, arguments={"source": "1"})
+        await host.provider.entered.wait()
+        await brain.call("running", 9, arguments={"source": 1})
+        reused = await brain.observation("running")
+        assert reused["status"] == "refused"
+        assert reused["error"]["code"] == ERROR_CALL_ID_CONFLICT
+        assert host.module.duplicate_waiters == 0
+        host.provider.hold.set_result(None)
+        served = await brain.observation("running")
+        assert served["status"] == "success"
+        await settle()
+        assert brain.received_frames(FRAME_OBSERVATION)[-2:] == [reused, served]
+        assert len(recorder.calls) == len(cases) + 1
     finally:
         await host.close()
 
