@@ -222,10 +222,13 @@ def run_step(step, dev_cmd, loop_timeout):
         f'--test-cmd "{TEST_CMD}" --timeout {loop_timeout} --max-loops 3 --no-arbiter '
         f"--out {CAMPAIGN}/loop-out"
     )
-    LOGS.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(cmd, shell=True, cwd=REPO, capture_output=True, text=True,
                        timeout=14400, env=fresh_env())
     out = (r.stdout or "") + (r.stderr or "")
+    # mkdir HERE, not before the subprocess: the loop runs `git clean`/stash housekeeping in the
+    # repository, and an untracked `logs/` can be removed while the step is running (phase 6, P1:
+    # the harness had no .gitignore, and the runner died writing this very line).
+    LOGS.mkdir(parents=True, exist_ok=True)
     (LOGS / f"{step}.log").write_text(out, encoding="utf-8")
     return r.returncode, out
 
