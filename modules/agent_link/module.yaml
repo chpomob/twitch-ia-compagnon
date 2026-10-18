@@ -7,9 +7,10 @@
 # resolves every name of its `actions` list from the agent's own discovered
 # catalog — the specs the colocated modules (`capture` in phase 1) declared —
 # and at pairing it sends them to the brain in `hello`. Every `call` the brain
-# forwards is executed through the agent's own default-deny executor with the
-# forwarded principal: only an explicit agent-side authorization rule ever
-# lets a forwarded call reach a provider (R5, R6).
+# forwards is executed through the agent's own default-deny executor under the
+# pairing principal this agent configures, never one the frame names: only an
+# explicit agent-side authorization rule ever lets a forwarded call reach a
+# provider (R5, R6; phase 6 R2).
 
 name: agent_link
 manifest_version: 2
@@ -148,6 +149,31 @@ settings_schema:
         The agent's own bound on one forwarded call; the executed deadline
         is `min(remaining_ms, action_seconds)` on the agent's monotonic
         clock, never `deadline_utc`. Default 10.
+    principal:
+      title: Principal
+      default: brain
+      type: string
+      description: >-
+        The pairing principal every forwarded call executes under, whatever
+        the frame names; a call naming another principal is refused
+        `not_authorized` without reaching the executor. Default `brain`.
+    max_running_calls:
+      title: Max running calls
+      default: 16
+      type: integer
+      minimum: 1
+      description: >-
+        How many forwarded calls may execute at once; one beyond it is
+        refused `busy`, never queued. Default 16.
+    max_duplicate_waiters:
+      title: Max duplicate waiters
+      default: 16
+      type: integer
+      minimum: 1
+      description: >-
+        How many repeats of a still-running call may wait for its
+        observation; one beyond it is answered `error busy`, never queued.
+        Default 16.
     limits:
       title: Limits
       type: object

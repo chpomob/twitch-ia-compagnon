@@ -3074,7 +3074,12 @@ def test_the_proxy_package_names_no_platform() -> None:
 import shutil
 import subprocess
 
-from core.actions import ERROR_CANCELLED, ERROR_NOT_AUTHORIZED, AuthorizationRule
+from core.actions import (
+    ERROR_CANCELLED,
+    ERROR_NOT_AUTHORIZED,
+    ERROR_UNKNOWN_ACTION,
+    AuthorizationRule,
+)
 from core.contracts import (
     PROXY_ERROR_DUPLICATE_CALL_UNKNOWN,
     TRACE_ACTION_COMPLETED,
@@ -3504,6 +3509,9 @@ def test_agent_link_manifest_declares_the_input_role_no_event_and_no_action() ->
     assert set(schema["properties"]) == {
         "brain_url", "pairing_token", "agent_id", "actions", "reconnect", "heartbeat_seconds",
         "heartbeat_timeout_seconds", "call_table", "max_frame_bytes", "action_seconds", "limits",
+        # Phase 6 R2: the pairing principal and the two execution bounds,
+        # optional so no shipped profile gains a required setting.
+        "principal", "max_running_calls", "max_duplicate_waiters",
     }
     assert set(schema["properties"]["reconnect"]["properties"]) == {
         "initial_seconds", "multiplier", "max_seconds",
@@ -3526,6 +3534,9 @@ def test_agent_link_validate_settings_accepts_loopback_ws_and_wss_anywhere() -> 
         "call_table": {"max_entries": 1024, "ttl_seconds": 300},
         "max_frame_bytes": 1_048_576,
         "action_seconds": 10,
+        "principal": PRINCIPAL,
+        "max_running_calls": 16,
+        "max_duplicate_waiters": 16,
         "limits": {"attachments": dict(STORE_LIMITS)},
     }
     assert agent_link.validate_settings(full) == []
@@ -3535,6 +3546,10 @@ def test_agent_link_validate_settings_accepts_loopback_ws_and_wss_anywhere() -> 
     assert (parsed.call_table.max_entries, parsed.call_table.ttl_seconds) == (1024, 300.0)
     assert parsed.max_frame_bytes == PROXY_DEFAULT_MAX_FRAME_BYTES
     assert parsed.action_seconds == 10.0
+    assert parsed.principal == PRINCIPAL == agent_link.DEFAULT_PRINCIPAL
+    assert (parsed.max_running_calls, parsed.max_duplicate_waiters) == (
+        agent_link.DEFAULT_MAX_RUNNING_CALLS, agent_link.DEFAULT_MAX_DUPLICATE_WAITERS,
+    )
 
 
 @pytest.mark.parametrize(
@@ -3568,6 +3583,9 @@ def test_agent_link_validate_settings_refuses_bad_entries_and_non_finite_bounds(
             "call_table": {"max_entries": 0, "ttl_seconds": float("inf"), "extra": 1},
             "max_frame_bytes": True,
             "action_seconds": "10",
+            "principal": "",
+            "max_running_calls": float("inf"),
+            "max_duplicate_waiters": 0,
             "unknown": 1,
             "_connector": "not callable",
         }
@@ -3579,6 +3597,7 @@ def test_agent_link_validate_settings_refuses_bad_entries_and_non_finite_bounds(
         "'reconnect.other'", "'heartbeat_seconds'", "'heartbeat_timeout_seconds'",
         "'call_table.max_entries'", "'call_table.ttl_seconds'", "'call_table.extra'",
         "'max_frame_bytes'", "'action_seconds'", "'unknown'", "'_connector'",
+        "'principal'", "'max_running_calls'", "'max_duplicate_waiters'",
     }
     assert all(d.startswith(f"module {AGENT_MODULE!r}: field ") for d in diagnostics)
     assert agent_link.validate_settings("nope") == [
@@ -3913,6 +3932,219 @@ async def test_a_malformed_call_frame_is_invalid_frame_and_touches_no_state() ->
         await brain.call("call-1", 1)
         assert (await brain.observation("call-1"))["status"] == "success"
         assert host.module.last_seq == 1
+    finally:
+        await host.close()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 R2 — a paired peer is bounded by the pairing, not by what it sends
+# --------------------------------------------------------------------------- #
+
+
+class RecordingExecutor:
+    """The agent's executor seen from the link: every ``invoke`` is recorded.
+
+    Wraps the real default-deny executor, so what reaches it is executed
+    exactly as before; ``calls`` is each :class:`ActionCall` it received —
+    the executor-invocation count the R2 criteria are stated on.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.calls: list[ActionCall] = []
+
+    async def invoke(self, call: ActionCall) -> ActionObservation:
+        self.calls.append(call)
+        return await self.inner.invoke(call)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+async def recorded_host(**kwargs: Any) -> tuple[AgentHost, BrainEnd, RecordingExecutor]:
+    host, brain = await paired_host(heartbeat_seconds=100_000, **kwargs)
+    recorder = RecordingExecutor(host.module._executor)
+    host.module._executor = recorder
+    return host, brain, recorder
+
+
+async def test_p6_ac6_a_call_outside_the_negotiated_set_never_reaches_the_executor() -> None:
+    """AC6 (R2, F2): the agent is configured to lend two actions, the brain's
+    ``welcome`` accepts one; a call naming the other — declared locally, so
+    only the negotiated set can stop it — is refused with a terminal
+    observation and 0 executor invocations; the accepted action executes
+    once."""
+
+    host = AgentHost(actions=(SCREEN_CAPTURE, FAKE_WRITE), heartbeat_seconds=100_000)
+    try:
+        await host.activate()
+        brain = host.connect()
+        await brain.pair_up(actions=[SCREEN_CAPTURE])
+        recorder = RecordingExecutor(host.module._executor)
+        host.module._executor = recorder
+        assert host.module.accepted_actions == frozenset({SCREEN_CAPTURE})
+
+        await brain.call("call-1", 1, action=FAKE_WRITE, arguments={"text": "hi"})
+        refused = await brain.observation("call-1")
+        assert refused["status"] == "refused"
+        assert refused["error"]["code"] == ERROR_UNKNOWN_ACTION
+        assert recorder.calls == [] and host.module.executions == 0
+        # Terminal and retained: the repeat re-sends it, still 0 invocations.
+        await brain.call("call-1", 1, action=FAKE_WRITE, arguments={"text": "hi"})
+        assert await brain.observation("call-1") == refused
+        assert recorder.calls == []
+
+        await brain.call("call-2", 2)
+        served = await brain.observation("call-2")
+        assert served["status"] == "success"
+        assert [call.action_name for call in recorder.calls] == [SCREEN_CAPTURE]
+        assert host.executor.provider_invocations == 1
+    finally:
+        await host.close()
+
+
+async def test_p6_ac7_the_frame_principal_is_compared_never_executed_under() -> None:
+    """AC7 (R2, F2): the pairing principal is the agent's own ``principal``
+    setting. A frame naming another principal — one the agent's policy
+    would even grant — is refused with 0 executor invocations; a frame
+    naming the paired one executes, and the ``ActionCall`` the executor
+    receives carries the locally configured principal."""
+
+    local = "pairing-principal"
+    host, brain, recorder = await recorded_host(
+        principal=local, policy=agent_policy(local, PRINCIPAL)
+    )
+    try:
+        await brain.call("call-1", 1, principal=PRINCIPAL)
+        refused = await brain.observation("call-1")
+        assert refused["status"] == "refused"
+        assert refused["error"]["code"] == ERROR_NOT_AUTHORIZED
+        assert recorder.calls == [] and host.provider.calls == []
+        assert host.module.executions == 0
+
+        await brain.call("call-2", 2, principal=local)
+        served = await brain.observation("call-2")
+        assert served["status"] == "success"
+        assert len(recorder.calls) == 1 and recorder.calls[0].principal == local
+        assert host.provider.calls[-1].principal == local
+    finally:
+        await host.close()
+
+
+async def test_p6_ac7_the_default_pairing_principal_is_brain() -> None:
+    """AC7 (R2): with no ``principal`` setting the pairing principal is
+    ``brain`` — the one the shipped agent profile's rules grant — so a
+    shipped profile behaves as before for the brain's own calls; a frame
+    naming another principal is refused even when a local rule grants it."""
+
+    host, brain, recorder = await recorded_host(policy=agent_policy(PRINCIPAL, "viewer"))
+    try:
+        await brain.call("call-1", 1, principal="viewer")
+        refused = await brain.observation("call-1")
+        assert refused["status"] == "refused"
+        assert refused["error"]["code"] == ERROR_NOT_AUTHORIZED
+        assert recorder.calls == [] and host.provider.calls == []
+
+        await brain.call("call-2", 2)
+        assert (await brain.observation("call-2"))["status"] == "success"
+        assert [call.principal for call in recorder.calls] == [PRINCIPAL]
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize("peer_text", [TOKEN, "x" * 4096], ids=["pairing-token", "4KiB"])
+async def test_p6_ac8_peer_strings_never_enter_diagnostics_or_supervision_records(
+    peer_text: str,
+) -> None:
+    """AC8 (R2, F5): an ``error`` frame whose code (and message) is the
+    pairing token, or a 4 KiB string, and a ``welcome`` whose session id is
+    that string: neither occurs in a diagnostic or a supervision record. The
+    known code still reaches the operator by its local label."""
+
+    host = AgentHost(heartbeat_seconds=100_000)
+    try:
+        await host.activate()
+        brain = host.connect()
+        await brain.expect_hello()
+        # Before pairing, then after: both ``error`` paths are labelled.
+        await brain.send({"type": FRAME_ERROR, "id": None, "code": peer_text,
+                          "message": peer_text, "retryable": False})
+        await settle()
+        await brain.welcome(session_id=peer_text)
+        await brain.send({"type": FRAME_ERROR, "id": peer_text, "code": peer_text,
+                          "message": peer_text, "retryable": False})
+        await brain.send({"type": FRAME_ERROR, "id": peer_text,
+                          "code": PROXY_ERROR_INVALID_FRAME, "message": peer_text,
+                          "retryable": False})
+        await settle()
+        assert host.module.errors_received == 3
+        records = json.dumps(host.bus.list_events())
+        assert events_of(host.bus, TRACE_MODULE_READY)
+        assert peer_text not in records
+        assert all(peer_text not in line for line in host.diagnostics)
+        assert sum(agent_link.LABEL_UNRECOGNIZED in line for line in host.diagnostics) == 2
+        assert any(PROXY_ERROR_INVALID_FRAME in line for line in host.diagnostics)
+    finally:
+        await host.close()
+
+
+async def test_p6_ac9_running_executions_and_duplicate_waiters_are_bounded() -> None:
+    """AC9 (R2, F14): with ``max_running_calls`` 2 and a gated provider, a
+    third concurrent call is refused ``busy`` with a terminal observation and
+    the executor sees exactly 2 invocations; with ``max_duplicate_waiters``
+    2 a third repeat of a running call is answered ``error busy`` rather
+    than queued. A sampled count of live execution and waiter tasks never
+    exceeds its bound."""
+
+    samples: list[tuple[int, int, int]] = []
+
+    def sample() -> None:
+        # Every task the link spawned for a call — executions and waiters —
+        # still alive, next to the two counts the bounds are applied to.
+        live = sum(1 for task in host.module._executions if not task.done())
+        samples.append((host.module.running_calls, host.module.duplicate_waiters, live))
+
+    host, brain, recorder = await recorded_host(max_running_calls=2, max_duplicate_waiters=2)
+    try:
+        host.provider.hold = asyncio.get_running_loop().create_future()
+        await brain.call("call-1", 1)
+        await brain.call("call-2", 2)
+        await settle()
+        sample()
+        assert len(host.provider.calls) == 2
+
+        await brain.call("call-3", 3)
+        busy = await brain.observation("call-3")
+        sample()
+        assert busy["status"] == "refused"
+        assert busy["error"]["code"] == agent_link.ERROR_BUSY
+        assert len(recorder.calls) == 2
+
+        for _ in range(2):
+            await brain.call("call-1", 1)
+            await settle()
+            sample()
+        await brain.call("call-1", 1)
+        refused = await brain.expect_error(agent_link.ERROR_BUSY)
+        assert refused["id"] == "call-1"
+        sample()
+        assert len(recorder.calls) == 2
+
+        host.provider.hold.set_result(None)
+        frames = [await brain.observation() for _ in range(4)]
+        assert sorted(frame["id"] for frame in frames) == ["call-1", "call-1", "call-1", "call-2"]
+        assert all(frame["status"] == "success" for frame in frames)
+        await settle()
+        sample()
+        assert len(recorder.calls) == 2 and host.executor.provider_invocations == 2
+        assert samples[0] == (2, 0, 2) and max(s[1] for s in samples) == 2
+        assert all(s[0] <= 2 and s[1] <= 2 and s[2] <= 2 + 2 for s in samples), samples
+        assert samples[-1] == (0, 0, 0)
+
+        # Capacity is back: the next call executes.
+        await brain.call("call-4", 4)
+        assert (await brain.observation("call-4"))["status"] == "success"
+        assert len(recorder.calls) == 3
     finally:
         await host.close()
 

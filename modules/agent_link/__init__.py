@@ -3,10 +3,11 @@
 The PC agent holds a capability the brain needs — ``screen.capture`` in
 phase 1 — and this module is how it lends it: it dials ``brain_url``, pairs
 with the brain-side ``modules/proxy`` and executes every ``call`` it receives
-**through the agent's own default-deny executor** with the principal the
-brain forwarded. Peer authentication grants nothing: a call the agent's
-authorization rules do not permit is ``refused not_authorized`` locally, 0
-providers entered, exactly as it would be for a local caller. Nothing else
+**through the agent's own default-deny executor** under the principal this
+agent's own ``principal`` setting fixes for the pairing. Peer authentication
+grants nothing: a call the agent's authorization rules do not permit is
+``refused not_authorized`` locally, 0 providers entered, exactly as it would
+be for a local caller. Nothing else
 crosses the wire: no bus subscription, no trace and no run state
 (``docs/proxy-protocol.md`` is the normative description of the frames; the
 codes are the ``core.contracts`` constants).
@@ -40,6 +41,22 @@ observation. ``seq ≤ last_seq`` with a ``call_id`` not retained is refused
 ``error duplicate_call_unknown`` (``retryable: false``), 0 executions. A
 missing or non-positive ``seq``, or a ``call_id`` retained under another
 ``seq``, is ``error invalid_frame``. Both are reset on every ``welcome``.
+
+**A peer is not an identity (phase 6 R2).** The paired brain is bounded by
+the pairing, not by what it sends. A ``call`` naming an action outside the
+session's negotiated set — computed once at ``welcome``: what the brain
+accepted of what this agent is configured to lend — is answered with a
+``refused unknown_action`` observation, 0 executor invocations. The frame's
+``principal`` is never the executing identity: one that differs from the
+configured pairing principal is answered ``refused not_authorized``, 0
+invocations; an equal one executes under the local principal. At most
+``max_running_calls`` received executions run at once and at most
+``max_duplicate_waiters`` repeats wait for a running execution's
+observation; a call beyond the first bound is answered ``refused busy``, a
+repeat beyond the second ``error busy``: nothing is queued without limit.
+No string the peer sent — an error or ack code, a session id, an action
+name — enters a diagnostic or a supervision record: a known code is
+rendered by its local label, anything else as ``unrecognized``.
 
 **Deadlines (AC34).** The local :class:`~core.contracts.ActionCall` carries
 ``deadline = now + min(remaining_ms / 1000, action_seconds)`` on the agent's
@@ -93,8 +110,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from core.actions import ERROR_PROVIDER_FAILED
+from core.actions import ERROR_NOT_AUTHORIZED, ERROR_PROVIDER_FAILED, ERROR_UNKNOWN_ACTION
 from core.contracts import (
+    ATTACHMENT_ACK_CODES,
     ATTACHMENT_ACK_TOO_LARGE,
     BRAIN_ERROR_ATTACHMENT_REFUSED,
     FRAME_ATTACHMENT,
@@ -113,6 +131,7 @@ from core.contracts import (
     PROXY_CLOSE_BAD_REQUEST,
     PROXY_CLOSE_FRAME_TOO_LARGE,
     PROXY_DEFAULT_MAX_FRAME_BYTES,
+    PROXY_ERROR_CODES,
     PROXY_ERROR_DUPLICATE_CALL_UNKNOWN,
     PROXY_ERROR_FRAME_TOO_LARGE,
     PROXY_ERROR_INVALID_FRAME,
@@ -151,6 +170,21 @@ DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 10.0
 DEFAULT_CALL_TABLE_MAX_ENTRIES = 1024
 DEFAULT_CALL_TABLE_TTL_SECONDS = 300.0
 DEFAULT_ACTION_SECONDS = 10.0
+DEFAULT_PRINCIPAL = "brain"
+"""The pairing principal every received call executes under, unless configured."""
+DEFAULT_MAX_RUNNING_CALLS = 16
+DEFAULT_MAX_DUPLICATE_WAITERS = 16
+
+ERROR_BUSY = "busy"
+"""The code of a received call refused because a bound is reached (phase 6 R2)."""
+
+LABEL_UNRECOGNIZED = "unrecognized"
+"""How a peer-supplied code outside the known set is rendered in diagnostics."""
+
+#: The closed mapping of the codes a brain may send to their local labels:
+#: a diagnostic names the label, never the string the peer sent (phase 6 R2).
+_PEER_ERROR_LABELS: Mapping[str, str] = {code: code for code in PROXY_ERROR_CODES}
+_ACK_LABELS: Mapping[str, str] = {code: code for code in ATTACHMENT_ACK_CODES}
 
 CLOSE_GOING_AWAY = 1001
 """The close code the agent sends when it drops a session itself."""
@@ -186,6 +220,9 @@ _SETTING_HEARTBEAT_TIMEOUT_SECONDS = "heartbeat_timeout_seconds"
 _SETTING_CALL_TABLE = "call_table"
 _SETTING_MAX_FRAME_BYTES = "max_frame_bytes"
 _SETTING_ACTION_SECONDS = "action_seconds"
+_SETTING_PRINCIPAL = "principal"
+_SETTING_MAX_RUNNING_CALLS = "max_running_calls"
+_SETTING_MAX_DUPLICATE_WAITERS = "max_duplicate_waiters"
 _SETTINGS = frozenset(
     {
         _SETTING_BRAIN_URL,
@@ -198,6 +235,9 @@ _SETTINGS = frozenset(
         _SETTING_CALL_TABLE,
         _SETTING_MAX_FRAME_BYTES,
         _SETTING_ACTION_SECONDS,
+        _SETTING_PRINCIPAL,
+        _SETTING_MAX_RUNNING_CALLS,
+        _SETTING_MAX_DUPLICATE_WAITERS,
     }
 )
 _RECONNECT_FIELDS = ("initial_seconds", "multiplier", "max_seconds")
@@ -233,7 +273,8 @@ def validate_settings(settings: Any) -> list[str]:
     diagnostic names the module and the field and nothing else — no URL, no
     token is echoed. ``brain_url`` must use ``ws`` or ``wss``; a
     non-loopback host must use ``wss`` (R6); every ``actions`` entry is a
-    non-empty, unique action name; every bound is a finite positive number.
+    non-empty, unique action name; ``principal`` is a non-empty name; every
+    bound is a finite positive number, the counts positive integers.
     """
 
     if not isinstance(settings, Mapping):
@@ -323,12 +364,15 @@ def validate_settings(settings: Any) -> list[str]:
                         _setting_diagnostic(label, "must be a finite positive number")
                     )
 
-    if _SETTING_MAX_FRAME_BYTES in settings and not _is_positive_int(
-        settings[_SETTING_MAX_FRAME_BYTES]
+    for name in (
+        _SETTING_MAX_FRAME_BYTES,
+        _SETTING_MAX_RUNNING_CALLS,
+        _SETTING_MAX_DUPLICATE_WAITERS,
     ):
-        diagnostics.append(
-            _setting_diagnostic(_SETTING_MAX_FRAME_BYTES, "must be a positive integer")
-        )
+        if name in settings and not _is_positive_int(settings[name]):
+            diagnostics.append(_setting_diagnostic(name, "must be a positive integer"))
+    if _SETTING_PRINCIPAL in settings and not _is_text(settings[_SETTING_PRINCIPAL]):
+        diagnostics.append(_setting_diagnostic(_SETTING_PRINCIPAL, "must be a non-empty string"))
     for name in (
         _SETTING_HEARTBEAT_SECONDS,
         _SETTING_HEARTBEAT_TIMEOUT_SECONDS,
@@ -424,6 +468,9 @@ class _Settings:
     call_table: _CallTable
     max_frame_bytes: int
     action_seconds: float
+    principal: str
+    max_running_calls: int
+    max_duplicate_waiters: int
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
@@ -459,6 +506,13 @@ class _Settings:
                 settings.get(_SETTING_MAX_FRAME_BYTES, PROXY_DEFAULT_MAX_FRAME_BYTES)
             ),
             action_seconds=float(settings.get(_SETTING_ACTION_SECONDS, DEFAULT_ACTION_SECONDS)),
+            principal=str(settings.get(_SETTING_PRINCIPAL, DEFAULT_PRINCIPAL)).strip(),
+            max_running_calls=int(
+                settings.get(_SETTING_MAX_RUNNING_CALLS, DEFAULT_MAX_RUNNING_CALLS)
+            ),
+            max_duplicate_waiters=int(
+                settings.get(_SETTING_MAX_DUPLICATE_WAITERS, DEFAULT_MAX_DUPLICATE_WAITERS)
+            ),
         )
 
 
@@ -547,6 +601,8 @@ class _Session:
 
     connection: _Connection
     session_id: str
+    #: The negotiated set: what ``welcome`` accepted of the configured
+    #: actions, fixed at pairing. A call outside it never reaches the executor.
     accepted: frozenset[str]
     limits: Mapping[str, Any]
     last_seq: int = 0
@@ -596,6 +652,10 @@ class AgentLinkModule:
         self._session: _Session | None = None
         self._dial_task: "asyncio.Task[None] | None" = None
         self._executions: set["asyncio.Task[None]"] = set()
+        #: The received executions still running, every session included.
+        self._running_calls: set["asyncio.Task[None]"] = set()
+        #: The repeats waiting for a running execution's observation.
+        self._waiters: set["asyncio.Task[None]"] = set()
         self._attempts = 0
         self._failures = 0
         self._pairings = 0
@@ -648,6 +708,18 @@ class AgentLinkModule:
         if self._session is None:
             return ()
         return tuple(call_id for call_id, task in self._session.running.items() if not task.done())
+
+    @property
+    def running_calls(self) -> int:
+        """How many received executions run now, bounded by ``max_running_calls``."""
+
+        return sum(1 for task in self._running_calls if not task.done())
+
+    @property
+    def duplicate_waiters(self) -> int:
+        """How many repeats wait now, bounded by ``max_duplicate_waiters``."""
+
+        return sum(1 for task in self._waiters if not task.done())
 
     @property
     def attempts(self) -> int:
@@ -983,14 +1055,18 @@ class AgentLinkModule:
         await self._report_ready(session)
 
     def _on_error_frame(self, frame: Mapping[str, Any]) -> None:
-        """An ``error`` from the brain: logged by code, never by payload."""
+        """An ``error`` from the brain: logged by the local label of its code.
+
+        The peer's string is never interpolated: a known code is rendered by
+        its label, anything else as ``unrecognized`` (phase 6 R2).
+        """
 
         self._errors_received += 1
         code = frame.get("code")
-        self._diagnose(
-            f"{MODULE_NAME} connection: the brain answered error "
-            f"{code if _is_text(code) else 'unknown'!r}"
+        label = _PEER_ERROR_LABELS.get(code, LABEL_UNRECOGNIZED) if isinstance(code, str) else (
+            LABEL_UNRECOGNIZED
         )
+        self._diagnose(f"{MODULE_NAME} connection: the brain answered error {label!r}")
 
     # -- heartbeat (§12) ----------------------------------------------------- #
 
@@ -1071,7 +1147,19 @@ class AgentLinkModule:
                 )
                 return
             # A repeat: the retained observation, once it exists; 0 executions.
-            self._spawn_execution(self._resend(session, entry), name="agent-link-resend")
+            if entry.future.done():
+                await self._send_retained(session, entry.future.result())
+                return
+            if self.duplicate_waiters >= self._settings.max_duplicate_waiters:
+                await self._error(
+                    session.connection, call_id, ERROR_BUSY,
+                    "too many repeats are waiting for a running call", retryable=True,
+                )
+                return
+            waiter = self._spawn_execution(self._resend(session, entry), name="agent-link-resend")
+            if waiter is not None:
+                self._waiters.add(waiter)
+                waiter.add_done_callback(self._waiters.discard)
             return
         if seq <= session.last_seq:
             await self._error(
@@ -1098,6 +1186,35 @@ class AgentLinkModule:
         session.table[call_id] = entry
         while len(session.table) > self._settings.call_table.max_entries:
             session.table.popitem(last=False)
+
+        # The pairing bounds the peer (phase 6 R2): each refusal below is a
+        # terminal observation, retained like any other, 0 executor entries.
+        refusal: tuple[str, str, bool] | None = None
+        if call.action_name not in session.accepted:
+            refusal = (
+                ERROR_UNKNOWN_ACTION, "the action is not in this session's negotiated set", False
+            )
+        elif frame.get("principal") != self._settings.principal:
+            refusal = (
+                ERROR_NOT_AUTHORIZED, "the principal is not the one this pairing fixes", False
+            )
+        elif self.running_calls >= self._settings.max_running_calls:
+            refusal = (ERROR_BUSY, "the agent runs as many calls as it admits", True)
+        if refusal is not None:
+            code, message, retryable = refusal
+            text = _encode(
+                {
+                    "type": FRAME_OBSERVATION,
+                    "id": call_id,
+                    "status": "refused",
+                    "provenance": {"provider": MODULE_NAME},
+                    "error": {"code": code, "message": message, "retryable": retryable},
+                    "parts": [],
+                }
+            )
+            self._retain(entry, text)
+            await self._send_retained(session, text)
+            return
         max_attachment = frame.get("max_attachment_bytes")
         if not _is_positive_int(max_attachment):
             max_attachment = session.limits.get("max_attachment_bytes")
@@ -1108,6 +1225,8 @@ class AgentLinkModule:
         if task is None:
             return
         session.running[call_id] = task
+        self._running_calls.add(task)
+        task.add_done_callback(self._running_calls.discard)
 
         def _forget(done: "asyncio.Task[None]", *, call_id: str = call_id) -> None:
             if session.running.get(call_id) is done:
@@ -1134,6 +1253,9 @@ class AgentLinkModule:
             not _is_non_negative_int(remaining_ms)
             or not isinstance(destination, Mapping)
             or not isinstance(arguments, Mapping)
+            # A frame still names a principal (§5.4); it is compared with the
+            # pairing's, never executed under.
+            or not _is_text(frame.get("principal"))
         ):
             return None
         budget = min(remaining_ms / 1000.0, self._settings.action_seconds)
@@ -1151,7 +1273,8 @@ class AgentLinkModule:
                     channel_id=destination.get("channel_id"),
                     scope=destination.get("scope"),
                 ),
-                principal=frame.get("principal"),
+                # The pairing fixes the executing identity, never the frame.
+                principal=self._settings.principal,
                 deadline=now + budget,
                 message_id=frame.get("message_id"),
                 **(
@@ -1387,8 +1510,12 @@ class AgentLinkModule:
         if frame.get("accepted") is True:
             pending[1].set_result(None)
         else:
+            # The local label of the ack code, never the peer's string.
             code = frame.get("code")
-            pending[1].set_result(code if _is_text(code) else "refused")
+            label = _ACK_LABELS.get(code, LABEL_UNRECOGNIZED) if isinstance(code, str) else (
+                "refused"
+            )
+            pending[1].set_result(label)
 
     # -- sending ------------------------------------------------------------- #
 
@@ -1437,7 +1564,9 @@ class AgentLinkModule:
         if not callable(ready):
             return
         try:
-            outcome = ready(capabilities=sorted(session.accepted), session_id=session.session_id)
+            # The local pairing ordinal, not the brain's session id: no peer
+            # string enters a supervision record (phase 6 R2).
+            outcome = ready(capabilities=sorted(session.accepted), pairing=self._pairings)
             if inspect.isawaitable(outcome):
                 await outcome
         except asyncio.CancelledError:
@@ -1595,10 +1724,15 @@ __all__ = [
     "DEFAULT_CALL_TABLE_TTL_SECONDS",
     "DEFAULT_HEARTBEAT_SECONDS",
     "DEFAULT_HEARTBEAT_TIMEOUT_SECONDS",
+    "DEFAULT_MAX_DUPLICATE_WAITERS",
+    "DEFAULT_MAX_RUNNING_CALLS",
+    "DEFAULT_PRINCIPAL",
     "DEFAULT_RECONNECT_INITIAL_SECONDS",
     "DEFAULT_RECONNECT_MAX_SECONDS",
     "DEFAULT_RECONNECT_MULTIPLIER",
     "ERROR_ATTACHMENT_REFUSED",
+    "ERROR_BUSY",
+    "LABEL_UNRECOGNIZED",
     "MANIFEST_PATH",
     "MODULE_NAME",
     "STATE_PAIRED",
