@@ -102,7 +102,7 @@ def fresh_env():
 
 def sh(cmd, cwd=None, timeout=None):
     return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True,
-                          timeout=timeout, env=fresh_env())
+                          errors="replace", timeout=timeout, env=fresh_env())
 
 
 def _reset_epoch(m):

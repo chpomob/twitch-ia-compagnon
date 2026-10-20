@@ -401,3 +401,15 @@ exist; the adaptation updates the expected constants and counts and loosens noth
   shipped modules; R1 makes it 19.
 - `tests/test_docs_bilingual.py::test_the_discovered_pairs_are_exactly_the_declared_guides` — the
   declared guide set lacks `web-knowledge`; R9 adds that pair.
+
+### Amendment A1 (2026-10-20) — the seventh allowlisted node
+
+The closing gate's first pass found that `tests/test_examples.py::test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario`
+also changed: the global manifest catalog count 14→16, and the expected action set gains both web
+actions. That change is the same mechanical consequence as the six nodes above — the catalog lists every
+shipped action, and two were added — its assertions stay exact, and the no-web variant it also covers is
+untouched. Its omission from the allowlist above was an enumeration error, not a design choice.
+
+A1 therefore adds it as a **seventh allowlisted node**, on identical terms: update the expected
+constants, loosen nothing, delete no assertion. R1–R10 and AC1–AC26 are unchanged; this amendment touches
+the allowlist only. Any further node remains unauthorized.
