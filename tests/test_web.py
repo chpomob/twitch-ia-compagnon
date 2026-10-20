@@ -5,7 +5,9 @@ contracts (R1, AC1 manifest half), the settings schema, its validator and
 the ``--check-config`` answers (R5, AC3 check half, AC14), and activation
 and readiness that open nothing (AC4). Plan step P2 adds the network guard
 (R4): URL, host and address checks and the checked resolution, over every
-AC9 address, the AC10 refusals and the AC12 host matching.
+AC9 address, the AC10 refusals and the AC12 host matching. Plan step P3 adds the
+in-module HTML-to-text extractor and charset decoding (R3): the AC7 pages
+and the text half of AC8, over the fixtures in ``tests/fixtures/web``.
 
 **No test here opens a real socket.** The autouse :func:`socket_guard`
 replaces ``socket.socket.connect``/``connect_ex``, ``socket.create_connection``,
@@ -60,11 +62,14 @@ from modules.web import (
     GuardRefusal,
     Target,
     WebModule,
+    Extracted,
     WebModuleError,
     _Settings,
     activate,
     address_refusal,
     advisory_marker,
+    cut_utf8,
+    extract_text,
     host_allowed,
     literal_address,
     normalize_host_name,
@@ -76,6 +81,7 @@ from modules.web import (
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG = ROOT / "config.yaml.example"
+FIXTURES = ROOT / "tests" / "fixtures" / "web"
 
 #: The marker sentence the plan fixes, written here once to check the manifest.
 MARKER = (
@@ -1288,3 +1294,219 @@ def test_ac12_idna_hosts_match_both_ways_and_an_empty_list_allows_any() -> None:
     assert host_allowed("anything.example", [])
     assert host_allowed("anything.example", ())
     assert not host_allowed("*.example.org", ["example.org", "*.example.org"])
+
+
+# --------------------------------------------------------------------------- #
+# The extractor and charset decoding (R3: AC7, AC8 text half)
+# --------------------------------------------------------------------------- #
+
+LATIN1_META = b'<meta charset="iso-8859-1">\n'
+
+
+def fixture_bytes(name: str) -> bytes:
+    return (FIXTURES / name).read_bytes()
+
+
+def test_ac7_the_basic_page_keeps_three_paragraphs_and_no_skipped_byte() -> None:
+    """AC7: the three ``<p>`` on 3 lines, references decoded, the title
+    apart, and 0 bytes from the script, the style or the comment."""
+
+    body = fixture_bytes("page_basic.html")
+    script = body[body.index(b"<script>") : body.index(b"</script>")]
+    assert len(script) >= 5 * 1024
+    assert b"<style>" in body and b"<!--" in body
+    assert b"&eacute;" in body and b"&#x263A;" in body
+
+    extracted = extract_text(body, "text/html; charset=utf-8")
+
+    assert isinstance(extracted, Extracted)
+    assert extracted.title == "A basic page"
+    assert extracted.text.split("\n") == [
+        "The café opens at nine.",
+        "A smile: ☺ for the regulars.",
+        "The third paragraph ends here.",
+    ]
+    for sentinel in ("SENTINEL", "sentinelScript", "font-family", "var ", "<", "&"):
+        assert sentinel not in extracted.text
+    assert "A basic page" not in extracted.text
+
+
+def test_ac7_the_header_charset_decodes_latin1() -> None:
+    body = fixture_bytes("page_latin1.html").replace(LATIN1_META, b"")
+    assert b"\xe9" in body and b"charset" not in body
+
+    extracted = extract_text(body, "text/html; charset=iso-8859-1")
+
+    assert extracted.title == "Café page"
+    assert extracted.text == "Un café crème."
+
+
+def test_ac7_the_meta_charset_decodes_latin1_when_the_header_names_none() -> None:
+    body = fixture_bytes("page_latin1.html")
+    assert LATIN1_META in body
+
+    assert extract_text(body, "text/html").text == "Un café crème."
+    assert extract_text(body, None).text == "Un café crème."
+    http_equiv = body.replace(
+        LATIN1_META,
+        b'<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">',
+    )
+    assert extract_text(http_equiv, "application/xhtml+xml").text == "Un café crème."
+
+
+def test_r3_the_header_charset_wins_over_the_meta_one() -> None:
+    body = fixture_bytes("page_latin1.html")
+
+    assert extract_text(body, 'text/html; charset="utf-8"').text == "Un caf\ufffd cr\ufffdme."
+
+
+def test_r3_with_no_declaration_the_body_is_utf8_with_replacement() -> None:
+    body = fixture_bytes("page_latin1.html").replace(LATIN1_META, b"")
+
+    assert extract_text(body, "text/html").text == "Un caf\ufffd cr\ufffdme."
+
+
+def test_r3_a_meta_declaration_past_1024_bytes_is_not_read() -> None:
+    body = fixture_bytes("page_latin1.html")
+    late = body.replace(LATIN1_META, b"<!--" + b"x" * 1024 + b"-->" + LATIN1_META)
+
+    assert extract_text(late, "text/html").text == "Un caf\ufffd cr\ufffdme."
+
+
+@pytest.mark.parametrize("label", ["no-such-codec", "rot13", "base64", "x\u00e9", ""])
+def test_r3_an_unknown_or_non_text_codec_falls_back_to_utf8(label: str) -> None:
+    body = "<p>caf\u00e9</p>".encode() + b"<p>\xff</p>"
+
+    extracted = extract_text(body, f"text/html; charset={label}")
+
+    assert extracted.text == "café\n\ufffd"
+
+
+def test_r3_a_utf8_byte_order_mark_is_not_text() -> None:
+    assert extract_text(b"\xef\xbb\xbf<p>a</p>", "text/html").text == "a"
+    assert extract_text(b"\xef\xbb\xbfa", "text/plain").text == "a"
+
+
+def test_r3_text_plain_is_decoded_and_collapsed_per_line_not_parsed() -> None:
+    body = "  one\t  two  \n\n\n<p>three &amp;</p>\r\n caf\u00e9 ".encode("latin-1")
+
+    extracted = extract_text(body, "text/plain; charset=ISO-8859-1")
+
+    assert extracted == Extracted(title=None, text="one two\n<p>three &amp;</p>\ncafé")
+
+
+@pytest.mark.parametrize("tag", ["script", "style", "noscript", "template"])
+def test_ac7_an_unclosed_skipped_element_at_eof_leaks_nothing(tag: str) -> None:
+    body = f"<p>kept</p><{tag}>LEAK <p>LEAK</p> <!-- x --> LEAK".encode()
+
+    assert extract_text(body, "text/html").text == "kept"
+
+
+def test_ac7_noscript_and_template_content_is_absent_however_nested() -> None:
+    body = (
+        b"<p>one</p>"
+        b"<noscript><p>LEAK noscript</p><img alt=x></noscript>"
+        b"<template><div>LEAK <template>LEAK inner</template> LEAK after</div></template>"
+        b"<noscript>LEAK <template></template> LEAK </template> still LEAK</noscript>"
+        b"<p>two</p>"
+        b"</script></noscript><p>three</p>"
+    )
+
+    assert extract_text(body, "text/html").text == "one\ntwo\nthree"
+
+
+def test_r3_comments_declarations_and_processing_instructions_are_dropped() -> None:
+    body = (
+        b"<?xml version='1.0'?><!DOCTYPE html><![CDATA[LEAK]]>"
+        b"<p>a<!-- LEAK --><?php LEAK ?>b</p><!-- LEAK unclosed"
+    )
+
+    assert extract_text(body, "application/xhtml+xml").text == "ab"
+
+
+def test_r3_block_elements_break_lines_and_inline_ones_do_not() -> None:
+    body = (
+        b"<h1>Head</h1><div>a<span> b </span><b>c</b></div>line<br>next<hr>"
+        b"<ul><li>one</li><li>two</li></ul><table><tr><td>x</td></tr><tr><td>y</td></tr></table>"
+        b"<section>s</section><article>t</article><header>h</header><footer>f</footer>"
+        b"<pre>p   q\n  r</pre><blockquote>q</blockquote><ol><li>z</li></ol>"
+        b"<h6>six</h6>\n\n\n   \n<p> &nbsp; \xc2\xa0 </p>"
+    )
+
+    assert extract_text(body, "text/html").text.split("\n") == [
+        "Head", "a b c", "line", "next", "one", "two", "x", "y",
+        "s", "t", "h", "f", "p q", "r", "q", "z", "six",
+    ]  # fmt: skip
+
+
+def test_r3_the_first_title_is_the_title_and_no_title_is_text() -> None:
+    body = b"<title> First \n  one </title><title>Second</title><p>body</p>"
+
+    assert extract_text(body, "text/html") == Extracted(title="First one", text="body")
+    assert extract_text(b"<p>body</p>", "text/html").title is None
+    assert extract_text(b"<title> </title><p>b</p>", "text/html").title is None
+
+
+def test_r3_character_references_decode_and_surrogates_are_replaced() -> None:
+    body = b"<p>&lt;b&gt; &amp; &quot;q&quot; &#233; &#x1F600; &#xD800; &nbsp;x</p>"
+
+    text = extract_text(body, "text/html").text
+
+    assert text == '<b> & "q" é \U0001F600 \ufffd x'
+    text.encode("utf-8")
+
+
+def test_r3_pathological_input_stays_bounded_in_output() -> None:
+    """A 1 MiB unclosed comment and deep nesting: nothing leaks, text stays."""
+
+    comment = b"<p>kept</p><!--" + b"LEAK " * (1 << 18)
+    nested = b"<div>" * 20_000 + b"deep" + b"</div>" * 20_000
+
+    assert extract_text(comment, "text/html").text == "kept"
+    assert extract_text(nested, "text/html").text == "deep"
+
+
+def twenty_thousand_byte_page(fill: str) -> str:
+    """The text of a page whose extracted text is exactly 20 000 bytes."""
+
+    paragraph_bytes = 2000 - 1  # each line plus its newline is 2000 bytes
+    unit = len(fill.encode())
+    head = "x" * ((paragraph_bytes - 1) % unit + 1)
+    line = head + fill * ((paragraph_bytes - len(head)) // unit)
+    assert len(line.encode()) == paragraph_bytes
+    body = "".join(f"<p>{line}</p>" for _ in range(10)) + "<p>x</p>"
+    text = extract_text(body.encode(), "text/html; charset=utf-8").text
+    text = text[: -len("\nx")] + "\n"
+    assert len(text.encode()) == 20_000
+    return text
+
+
+@pytest.mark.parametrize("fill", ["a", "\u00e9", "\u263a", "\U0001F600"])
+def test_ac8_a_20000_byte_text_is_cut_to_8192_valid_utf8_bytes(fill: str) -> None:
+    """AC8 text half: at most 8192 bytes, valid UTF-8, the cut reported —
+    including when byte 8192 falls inside a multi-byte character."""
+
+    text = twenty_thousand_byte_page(fill)
+    encoded = text.encode()
+    if fill != "a":
+        # The byte at index 8192 continues a character the cut splits.
+        assert encoded[8192] & 0xC0 == 0x80
+
+    cut, was_cut = cut_utf8(text, 8192)
+
+    assert was_cut is True
+    cut_bytes = cut.encode()
+    assert len(cut_bytes) <= 8192
+    assert cut_bytes.decode("utf-8") == cut
+    assert text.startswith(cut)
+    assert len(cut_bytes) > 8192 - len(fill.encode())
+
+
+def test_ac8_a_1000_byte_text_is_unchanged_and_not_cut() -> None:
+    text = extract_text(b"<p>" + "\u00e9".encode() * 500 + b"</p>", "text/html").text
+    assert len(text.encode()) == 1000
+
+    assert cut_utf8(text, 8192) == (text, False)
+    assert cut_utf8(text, 1000) == (text, False)
+    assert cut_utf8(text, 999) == ("\u00e9" * 499, True)
+    assert cut_utf8(text, 0) == ("", True)

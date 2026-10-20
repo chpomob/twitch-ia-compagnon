@@ -69,6 +69,17 @@ compatible forms, so these two are left to ``is_global``. ``is_global``
 treats both as global, so ``64:ff9b::7f00:1`` is not refused as loopback.
 This gap is recorded here and was not checked in another way.
 
+**The extractor (R3).** :func:`extract_text` turns a body into a title
+and text with no dependency: the charset is the header's ``charset=``, else
+a ``<meta>`` declaration in the first 1024 bytes, else UTF-8, and decoding
+always replaces, never fails. HTML goes through an ``html.parser``
+subclass that decodes character references, drops comments, declarations,
+processing instructions and the content of ``script``, ``style``,
+``noscript`` and ``template`` — each counted on its own, so nesting or an
+unclosed tag cannot leak — and breaks lines at block elements. Nothing runs
+and nothing is rendered. :func:`cut_utf8` is the one byte bound on text: it
+cuts on a character boundary and says whether it cut.
+
 **Seams, for the tests.** ``_transport`` replaces the HTTP transport,
 ``_resolver`` the name resolution and ``_sleeper`` the sleep a bound is
 raced against. They are read from *settings*, never from a configuration
@@ -81,6 +92,7 @@ Lifecycle: the manifest declares no role, so the handle takes part in
 from __future__ import annotations
 
 import asyncio
+import codecs
 import functools
 import inspect
 import ipaddress
@@ -89,6 +101,7 @@ import socket
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -627,6 +640,191 @@ def _answer_address(answer: Any) -> Address | None:
         return ipaddress.ip_address(answer)
     except ValueError:
         return None
+
+
+# --------------------------------------------------------------------------- #
+# The HTML-to-text extractor and charset decoding (R3)
+# --------------------------------------------------------------------------- #
+
+#: The media type read as plain text; every other readable one is markup.
+_PLAIN_TEXT = "text/plain"
+
+#: How far into a document a ``<meta>`` charset declaration is looked for.
+_META_SCAN_BYTES = 1024
+
+#: A ``<meta charset>`` or ``<meta http-equiv content="…; charset=…">``.
+_META_CHARSET = re.compile(
+    rb"<meta\b[^>]*?\bcharset\s*=\s*[\"']?\s*([A-Za-z0-9_.:+-]+)", re.IGNORECASE
+)
+
+#: Elements whose content never reaches the text, however they are nested.
+_SKIPPED_ELEMENTS = frozenset({"script", "style", "noscript", "template"})
+
+#: Elements whose start and end separate lines.
+_BLOCK_ELEMENTS = frozenset(
+    {
+        "address", "article", "aside", "blockquote", "body", "br", "caption",
+        "dd", "details", "dialog", "div", "dl", "dt", "fieldset", "figcaption",
+        "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head",
+        "header", "hr", "html", "li", "main", "nav", "ol", "p", "pre",
+        "section", "summary", "table", "tbody", "td", "tfoot", "th", "thead",
+        "title", "tr", "ul",
+    }
+)  # fmt: skip
+
+_INLINE_WHITESPACE = re.compile(r"[^\S\n]+")
+_WHITESPACE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True, slots=True)
+class Extracted:
+    """A page's text: its first ``<title>``, if any, and its body text."""
+
+    title: str | None
+    text: str
+
+
+def extract_text(body: bytes, content_type_header: str | None) -> Extracted:
+    """The title and text of *body*, decoded and stripped of markup (R3).
+
+    The charset is the header's ``charset=`` parameter, else — for markup —
+    a ``<meta>`` declaration in the first 1024 bytes, else UTF-8; a label no
+    codec answers to is UTF-8 too, and decoding always replaces what it
+    cannot read, so a wrong label mis-decodes but never fails. ``text/plain``
+    is only normalised; anything else is parsed as HTML, the content of
+    ``script``, ``style``, ``noscript`` and ``template`` and every comment
+    dropped. Nothing is executed and nothing is rendered.
+    """
+
+    media_type, header_charset = _content_type(content_type_header)
+    plain = media_type == _PLAIN_TEXT
+    charset = header_charset
+    if charset is None and not plain:
+        charset = _meta_charset(body)
+    text = _decode(body, charset)
+    if plain:
+        return Extracted(title=None, text=_normalise(text))
+    parser = _TextParser()
+    parser.feed(text)
+    parser.close()
+    return Extracted(title=parser.title(), text=_normalise("".join(parser.parts)))
+
+
+def cut_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
+    """*text* cut to at most *max_bytes* UTF-8 bytes on a character boundary.
+
+    Returns the text and whether anything was cut. A cut that falls inside a
+    multi-byte character drops that whole character.
+    """
+
+    encoded = text.encode("utf-8", errors="replace")
+    limit = max(0, max_bytes)
+    if len(encoded) <= limit:
+        return text, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
+
+
+def _content_type(header: str | None) -> tuple[str, str | None]:
+    """The lower-case media type of *header* and its ``charset``, if named."""
+
+    if not isinstance(header, str):
+        return "", None
+    media_type, *parameters = header.split(";")
+    charset = None
+    for parameter in parameters:
+        name, _, value = parameter.partition("=")
+        if name.strip().lower() == "charset":
+            charset = value.strip().strip("\"'").strip() or None
+            break
+    return media_type.strip().lower(), charset
+
+
+def _meta_charset(body: bytes) -> str | None:
+    """The charset a ``<meta>`` in the first 1024 bytes of *body* declares.
+
+    As the WHATWG prescan does, a UTF-16 label found this way means UTF-8:
+    a document whose bytes the prescan could read is not UTF-16.
+    """
+
+    match = _META_CHARSET.search(body[:_META_SCAN_BYTES])
+    if match is None:
+        return None
+    label = match.group(1).decode("ascii")
+    if label.lower().replace("_", "-").startswith("utf-16"):
+        return "utf-8"
+    return label
+
+
+def _decode(body: bytes, charset: str | None) -> str:
+    """*body* decoded by *charset*, UTF-8 when the label names no text codec."""
+
+    try:
+        codec = codecs.lookup(charset or "utf-8").name
+        if codec == "utf-8":
+            codec = "utf-8-sig"
+        return body.decode(codec, errors="replace")
+    except LookupError:  # an unknown label, or a codec that is not text
+        return body.decode("utf-8-sig", errors="replace")
+
+
+def _normalise(text: str) -> str:
+    """Whitespace runs collapsed in each line, empty lines dropped, stripped."""
+
+    lines = (_INLINE_WHITESPACE.sub(" ", line).strip() for line in text.splitlines())
+    return "\n".join(line for line in lines if line)
+
+
+class _TextParser(HTMLParser):
+    """Collects the text of a document, outside every skipped element.
+
+    Each skipped element keeps its own open count, so an end tag of one
+    cannot close another and an element left unclosed skips to the end of
+    the document. A source line break is whitespace, except inside
+    ``<pre>``: lines break at block elements. Every ``<title>`` is kept out
+    of the text; the first one is the title.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skipped = dict.fromkeys(_SKIPPED_ELEMENTS, 0)
+        self._preformatted = 0
+        self._title_parts: list[str] = []
+        self._in_title = False
+        self._title_done = False
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag in self._skipped:
+            self._skipped[tag] += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag == "pre":
+            self._preformatted += 1
+        if tag in _BLOCK_ELEMENTS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._skipped:
+            self._skipped[tag] = max(0, self._skipped[tag] - 1)
+        elif tag == "title" and self._in_title:
+            self._in_title = False
+            self._title_done = True
+        elif tag == "pre":
+            self._preformatted = max(0, self._preformatted - 1)
+        if tag in _BLOCK_ELEMENTS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if any(self._skipped.values()):
+            return
+        if self._in_title:
+            if not self._title_done:
+                self._title_parts.append(data)
+            return
+        self.parts.append(data if self._preformatted else _WHITESPACE.sub(" ", data))
+
+    def title(self) -> str | None:
+        return " ".join("".join(self._title_parts).split()) or None
 
 
 def _setting_diagnostic(field_name: str, reason: str) -> str:
