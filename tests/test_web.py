@@ -77,6 +77,8 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
+import time
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -1510,6 +1512,169 @@ def test_r3_an_unknown_or_non_text_codec_falls_back_to_utf8(label: str) -> None:
     assert extracted.text == "café\n\ufffd"
 
 
+@pytest.mark.parametrize("label", ["idna", "base64", "rot13"])
+def test_p3f1_a_codec_that_cannot_decode_with_replacement_falls_back_to_utf8(
+    label: str,
+) -> None:
+    """F1: ``idna`` exists but rejects ``errors="replace"``; ``base64`` and
+    ``rot13`` exist but are not text. Each is UTF-8, and nothing raises."""
+
+    assert extract_text(b"<p>body</p>", f"text/html; charset={label}").text == "body"
+    assert extract_text(b"body", f"text/plain; charset={label}").text == "body"
+    meta = f'<meta charset="{label}"><p>caf\u00e9</p>'.encode()
+    assert extract_text(meta, "text/html").text == "café"
+
+
+@pytest.mark.parametrize(
+    ("body", "title", "text"),
+    [
+        (b"<noscript><title>hidden</title></noscript><title>real</title><p>body</p>",
+         "real", "body"),
+        (b"<noscript><title>hidden</noscript><p>visible</p>", None, "visible"),
+        (b"<p>a<noscript><pre>hidden</pre></noscript>b</p>", None, "ab"),
+    ],
+)  # fmt: skip
+def test_p3f1_a_skipped_subtree_changes_neither_title_nor_preformatting_nor_lines(
+    body: bytes, title: str | None, text: str
+) -> None:
+    """F2: inside a skipped element, descendants mutate nothing visible."""
+
+    assert extract_text(body, "text/html") == Extracted(title=title, text=text)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        b'<!-- <meta charset="iso-8859-1"> -->',
+        b'<meta name="description" content="charset=iso-8859-1">',
+    ],
+)
+def test_p3f1_only_a_meta_element_declares_the_charset(declaration: bytes) -> None:
+    """F3: a comment and an unrelated attribute value are not declarations,
+    so the UTF-8 bytes stay ``café``; a genuine ``<meta charset>`` after
+    them, inside the 1024 bytes, still wins."""
+
+    body = declaration + b"<p>caf\xc3\xa9</p>"
+    assert extract_text(body, "text/html").text == "café"
+    assert extract_text(body, None).text == "café"
+
+    genuine = declaration + LATIN1_META + b"<p>caf\xe9</p>"
+    assert extract_text(genuine, "text/html").text == "café"
+
+
+def _utf8_corpus() -> list[tuple[bytes, str | None]]:
+    bodies = [fixture_bytes(path.name) for path in sorted(FIXTURES.glob("*.html"))]
+    bodies += [
+        b"\\ud800",
+        b"<p>\\udfff&#xD800;</p>",
+        b"<title>\\ud800t</title><p>a\\ud800b</p>",
+        b"<noscript><title>hidden</noscript><p>visible</p>",
+        b'<!-- <meta charset="iso-8859-1"> --><p>caf\xc3\xa9</p>',
+        b"\xff\xfe\x00\xd8",
+    ]
+    content_types = [
+        None,
+        "text/html",
+        "text/plain; charset=unicode_escape",
+        "text/html; charset=unicode_escape",
+        "text/plain; charset=utf-16-le",
+        "text/html; charset=raw_unicode_escape",
+        "text/html; charset=idna",
+    ]
+    return [(body, content_type) for body in bodies for content_type in content_types]
+
+
+def test_p3f1_the_extracted_text_and_every_cut_of_it_are_utf8_encodable() -> None:
+    """F4: ``text/plain; charset=unicode_escape`` on the six bytes ``\\ud800``
+    decodes to a lone surrogate. The text, the title and every cut of the
+    text — at each bound from 0 to its length — encode strictly as UTF-8."""
+
+    lone = extract_text(b"\\ud800", "text/plain; charset=unicode_escape")
+    assert lone.text == "\ufffd"
+    assert cut_utf8("a\ud800b", 99) == ("a\ufffdb", False)
+
+    texts = set()
+    for body, content_type in _utf8_corpus():
+        extracted = extract_text(body, content_type)
+        extracted.text.encode("utf-8")
+        (extracted.title or "").encode("utf-8")
+        texts.add(extracted.text)
+    for text in texts:  # a text several content types share is cut once
+        for bound in range(len(text) + 1):
+            cut, _ = cut_utf8(text, bound)
+            cut.encode("utf-8")
+    for bound in range(len("x\ud800y\udfff") + 1):
+        cut_utf8("x\ud800y\udfff", bound)[0].encode("utf-8")
+
+
+@pytest.mark.parametrize("offset", [0, 1, 20, 30, 34, 40, 43, 44, 45])
+def test_p3f1_a_character_reference_across_a_feed_boundary_decodes_whole(
+    offset: int,
+) -> None:
+    """Fix round: a numeric reference longer than the parser's 34-character
+    look-back, crossing the 65 536-character feed boundary, decodes as one
+    — ``A``, as a single feed decodes it — never U+FFFD and a literal
+    tail. So do a named one and a hexadecimal one."""
+
+    import modules.web as web
+
+    for reference, decoded in [
+        (b"&#" + b"0" * 40 + b"65;", "A"),
+        (b"&#x" + b"0" * 40 + b"41;", "A"),
+        (b"&amp;", "&"),
+    ]:
+        body = b"a" * (web._FEED_CHARS - offset) + reference + b"b"
+        assert extract_text(body, "text/html").text == "a" * (web._FEED_CHARS - offset) + (
+            decoded + "b"
+        ), (offset, reference)
+
+
+def test_p3f1_a_start_tag_longer_than_a_feed_is_read_by_its_name() -> None:
+    """Fix round: a start tag longer than a feed — whose attributes the
+    standard parser would walk one by one before any deadline check — is
+    taken by its name alone, with the same text as a short one."""
+
+    attributes = b" a" * 40_000 + b' b=">"'
+    for body, title, text in [
+        (b"<p" + attributes + b">x</p>y", None, "x\ny"),
+        (b"<script" + attributes + b">hidden</script>after", None, "after"),
+        (b"<title" + attributes + b">t &amp; u</title><p>b</p>", "t & u", "b"),
+        (b"a<br" + attributes + b"/>b", None, "a\nb"),
+    ]:
+        assert extract_text(body, "text/html") == Extracted(title=title, text=text), body[:8]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<p" + b" a" * 4_000_000 + b">x</p>",
+        b"<p" + b' a=">"' * 1_000_000 + b">x</p>",
+    ],
+    ids=["unquoted-attributes", "quoted-attributes"],
+)
+def test_p3f1_one_huge_construct_still_reaches_the_deadline(body: bytes) -> None:
+    """Fix round: one 8 MB start tag of millions of attributes is a single
+    construct the parser buffers across feeds. The
+    walk still stops soon after its deadline expires — not after parsing
+    every attribute — and without it the whole page takes a few seconds,
+    not the quadratic re-reads of one growing buffer."""
+
+    import modules.web as web
+
+    start = time.monotonic()
+    assert extract_text(body, "text/html").text == "x"
+    assert time.monotonic() - start < 6
+
+    deadline = time.monotonic() + 0.2
+    token = web._EXTRACTION_EXPIRED.set(lambda: time.monotonic() >= deadline)
+    try:
+        with pytest.raises(web.ExtractionAbandoned):
+            extract_text(body, "text/html")
+    finally:
+        web._EXTRACTION_EXPIRED.reset(token)
+    assert time.monotonic() - deadline < 0.8
+
+
 def test_r3_a_utf8_byte_order_mark_is_not_text() -> None:
     assert extract_text(b"\xef\xbb\xbf<p>a</p>", "text/html").text == "a"
     assert extract_text(b"\xef\xbb\xbfa", "text/plain").text == "a"
@@ -2790,6 +2955,146 @@ async def test_ac13_a_stalled_body_is_timeout_timed_out_before_the_deadline() ->
     assert trace["status"] == "timeout"
     assert trace["error_code"] == ERROR_TIMED_OUT
     assert trace["outcome"] == ERROR_TIMED_OUT
+
+
+async def test_p3f1_the_deadline_bounds_extraction_on_the_real_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate F1: an 8 MiB page of ``<p>`` tags under ``request_timeout_seconds:
+    1`` used to succeed after ~4 s, the parse outside every timer. On a real
+    asyncio timer the call is now ``timeout timed_out`` at about 1 s, and
+    the parser on its worker thread stops at the same deadline."""
+
+    import modules.web as web
+
+    walked: list[str] = []
+    stopped = threading.Event()
+    extract = web.extract_text
+
+    def watched(body: bytes, header: str | None) -> Extracted:
+        try:
+            return extract(body, header)
+        except web.ExtractionAbandoned:
+            walked.append("abandoned")
+            raise
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(web, "extract_text", watched)
+    rig = await read_rig(
+        max_response_bytes=8388608, request_timeout_seconds=1, cache_ttl_seconds=0
+    )
+    rig.handle._sleeper = None
+    rig.transport.script("example.org", html_page(b"<p>" * (8388608 // 3)))
+
+    start = time.monotonic()
+    observation = await rig.read("https://example.org/")
+    elapsed = time.monotonic() - start
+
+    assert_read_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert 0.9 <= elapsed < 1.4, elapsed
+    assert rig.handle._in_flight == 0
+    assert await asyncio.to_thread(stopped.wait, 2.0)
+    assert walked == ["abandoned"]
+
+
+async def test_p3f1_a_never_answering_body_still_times_out_at_1s_on_the_real_clock() -> None:
+    """The control: headers and never a body, ``request_timeout_seconds: 1``,
+    the real asyncio timer — ``timeout timed_out`` at about 1 s."""
+
+    rig = await read_rig(request_timeout_seconds=1, cache_ttl_seconds=0)
+    rig.handle._sleeper = None
+    stalled = FakeResponse.body(
+        b"<p>never</p>", stalled=asyncio.Event(), headers={"Content-Type": "text/html"}
+    )
+    rig.transport.script("example.org", stalled)
+
+    start = time.monotonic()
+    observation = await rig.read("https://example.org/")
+    elapsed = time.monotonic() - start
+
+    assert_read_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert 0.9 <= elapsed < 1.4, elapsed
+    assert stalled.closed >= 1
+
+
+async def test_p3f1_an_extraction_the_deadline_overtakes_is_timeout_on_the_injected_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline that bounds the fetch also bounds the extraction: an
+    extraction still running when it elapses ends the call ``timeout
+    timed_out`` — not a success — and its late answer is discarded."""
+
+    import modules.web as web
+
+    release = threading.Event()
+
+    def slow(_body: bytes, _header: str | None) -> Extracted:
+        release.wait(5)
+        return Extracted(title=None, text="late")
+
+    monkeypatch.setattr(web, "extract_text", slow)
+    rig = await read_rig()
+    rig.transport.script("example.org", html_page(b"<p>x</p>"))
+    start = rig.clock.now
+
+    call = asyncio.ensure_future(rig.read("https://example.org/"))
+    await spin()
+    assert not call.done()
+    rig.clock.advance(10)
+    await spin()
+    release.set()
+
+    assert_read_outcome(await call, "timeout", ERROR_TIMED_OUT)
+    assert rig.clock.now - start == 10
+    assert rig.handle._in_flight == 0
+    assert rig.clock.next_deadline() is None
+
+
+async def test_p3f1_the_deadline_bounds_the_cache_record_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix round: the serialisation the cache sizes a read's success by runs
+    on the worker thread under the call's deadline, not on the event loop
+    after it. A serialisation the deadline overtakes ends the call
+    ``timeout timed_out`` and stores nothing; one that finishes is stored
+    at exactly the size the cache would have measured itself."""
+
+    import modules.web as web
+
+    measured_on: list[threading.Thread] = []
+    release = threading.Event()
+    record_size = web._ObservationCache.record_size
+
+    def slow(observation: ActionObservation) -> int:
+        measured_on.append(threading.current_thread())
+        release.wait(5)
+        return record_size(observation)
+
+    monkeypatch.setattr(web._ObservationCache, "record_size", staticmethod(slow))
+    rig = await read_rig()
+    rig.transport.script(
+        "example.org", html_page(b"<title>t</title><p>x</p>"), html_page(b"<p>y</p>")
+    )
+    start = rig.clock.now
+
+    call = asyncio.ensure_future(rig.read("https://example.org/"))
+    await spin()
+    assert not call.done()
+    rig.clock.advance(10)
+    await spin()
+    release.set()
+
+    assert_read_outcome(await call, "timeout", ERROR_TIMED_OUT)
+    assert rig.clock.now - start == 10
+    assert rig.handle._cache.stats() == (0, 0)
+    assert measured_on and threading.main_thread() not in measured_on
+
+    measured_on.clear()
+    assert read_success(await rig.read("https://example.org/2"))["text"] == "y"
+    assert measured_on and threading.main_thread() not in measured_on
+    assert rig.handle._cache.stats().entries == 1
+    assert rig.handle._cache.stats().stored_bytes == stored_content(rig)
 
 
 async def test_ac17_a_call_beyond_the_concurrency_bound_is_resource_busy() -> None:

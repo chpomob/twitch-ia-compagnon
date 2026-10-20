@@ -157,9 +157,17 @@ always replaces, never fails. HTML goes through an ``html.parser``
 subclass that decodes character references, drops comments, declarations,
 processing instructions and the content of ``script``, ``style``,
 ``noscript`` and ``template`` — each counted on its own, so nesting or an
-unclosed tag cannot leak — and breaks lines at block elements. Nothing runs
-and nothing is rendered. :func:`cut_utf8` is the one byte bound on text: it
-cuts on a character boundary and says whether it cut.
+unclosed tag cannot leak, and a skipped subtree changes neither the title,
+nor preformatting, nor a line break — and breaks lines at block elements.
+Nothing runs and nothing is rendered. The ``<meta>`` prescan reads elements,
+not text: a comment or another attribute naming a charset decides nothing.
+A label is used only if it names a text codec that decodes with
+replacement. The text, and every cut of it, is always UTF-8 encodable.
+:func:`cut_utf8` is the one byte bound on text: it cuts on a character
+boundary and says whether it cut. A ``web.read`` extracts on a worker thread
+under what is left of the call's one deadline, and the parser checks that
+deadline as it walks, so a page too big to parse in time is ``timeout
+timed_out``, never a late success.
 
 **Seams, for the tests.** ``_transport`` replaces the HTTP transport,
 ``_resolver`` the name resolution and ``_sleeper`` the sleep a bound is
@@ -174,6 +182,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import contextvars
 import functools
 import importlib.metadata
 import inspect
@@ -182,6 +191,7 @@ import json
 import logging
 import re
 import socket
+import threading
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
@@ -741,10 +751,27 @@ _PLAIN_TEXT = "text/plain"
 #: How far into a document a ``<meta>`` charset declaration is looked for.
 _META_SCAN_BYTES = 1024
 
-#: A ``<meta charset>`` or ``<meta http-equiv content="…; charset=…">``.
-_META_CHARSET = re.compile(
-    rb"<meta\b[^>]*?\bcharset\s*=\s*[\"']?\s*([A-Za-z0-9_.:+-]+)", re.IGNORECASE
-)
+#: A charset label, as the prescan accepts one.
+_CHARSET_LABEL = re.compile(r"[A-Za-z0-9_.:+-]+")
+
+#: The ``charset=`` parameter in a ``<meta http-equiv>``'s ``content``.
+_CONTENT_CHARSET = re.compile(r"charset\s*=\s*[\"']?\s*([A-Za-z0-9_.:+-]+)", re.IGNORECASE)
+
+#: A lone surrogate: decodable by some codecs, encodable by none in UTF-8.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+#: How many parser events pass between two looks at the deadline.
+_DEADLINE_CHECK_EVENTS = 256
+
+#: How much decoded markup one ``feed`` gets, at most, so a run of text with
+#: no tag still reaches a deadline check. It is also how many characters of
+#: start tags the parser reads between two looks at the deadline, and the
+#: longest start tag whose attributes it parses.
+_FEED_CHARS = 65_536
+
+#: The characters that end a character reference, wherever it began: a cut
+#: after one of them never splits a reference (html.unescape's grammar).
+_CHARREF_ENDS = frozenset("\t\n\f <&;")
 
 #: Elements whose content never reaches the text, however they are nested.
 _SKIPPED_ELEMENTS = frozenset({"script", "style", "noscript", "template"})
@@ -761,6 +788,9 @@ _BLOCK_ELEMENTS = frozenset(
     }
 )  # fmt: skip
 
+#: A start tag's name, as the standard parser reads it after the ``<``.
+_TAG_NAME = re.compile(r"([a-zA-Z][^\t\n\r\f />]*)")
+
 _INLINE_WHITESPACE = re.compile(r"[^\S\n]+")
 _WHITESPACE = re.compile(r"\s+")
 
@@ -773,6 +803,23 @@ class Extracted:
     text: str
 
 
+class ExtractionAbandoned(Exception):
+    """The deadline the extraction ran under expired before it finished."""
+
+
+#: The deadline the current extraction checks as it walks: a callable that
+#: answers ``True`` once the call has run out of time, or ``None``.
+_EXTRACTION_EXPIRED: contextvars.ContextVar[Callable[[], bool] | None] = (
+    contextvars.ContextVar("web_extraction_expired", default=None)
+)
+
+
+def _check_deadline() -> None:
+    expired = _EXTRACTION_EXPIRED.get()
+    if expired is not None and expired():
+        raise ExtractionAbandoned
+
+
 def extract_text(body: bytes, content_type_header: str | None) -> Extracted:
     """The title and text of *body*, decoded and stripped of markup (R3).
 
@@ -782,7 +829,11 @@ def extract_text(body: bytes, content_type_header: str | None) -> Extracted:
     cannot read, so a wrong label mis-decodes but never fails. ``text/plain``
     is only normalised; anything else is parsed as HTML, the content of
     ``script``, ``style``, ``noscript`` and ``template`` and every comment
-    dropped. Nothing is executed and nothing is rendered.
+    dropped. Nothing is executed and nothing is rendered. The text and the
+    title are always UTF-8 encodable.
+
+    Run under a deadline (:data:`_EXTRACTION_EXPIRED`), the walk checks it
+    as it goes and raises :class:`ExtractionAbandoned` once it has expired.
     """
 
     media_type, header_charset = _content_type(content_type_header)
@@ -791,26 +842,65 @@ def extract_text(body: bytes, content_type_header: str | None) -> Extracted:
     if charset is None and not plain:
         charset = _meta_charset(body)
     text = _decode(body, charset)
+    _check_deadline()
     if plain:
         return Extracted(title=None, text=_normalise(text))
     parser = _TextParser()
-    parser.feed(text)
+    start, size = 0, _FEED_CHARS
+    while start < len(text):
+        _check_deadline()
+        end = _feed_end(text, start, size)
+        parser.feed(text[start:end])
+        start = end
+        # The parser reads a construct still open — a tag, a comment, a
+        # script — again from its start at every feed: while one is, each
+        # feed doubles, so those re-reads stay linear in the page.
+        size = size * 2 if len(parser.rawdata) > _FEED_CHARS else _FEED_CHARS
     parser.close()
+    _check_deadline()
     return Extracted(title=parser.title(), text=_normalise("".join(parser.parts)))
+
+
+def _feed_end(text: str, start: int, size: int) -> int:
+    """Where the feed of *text* that begins at *start* ends.
+
+    At most *size* characters on, and never inside a character reference:
+    the parser decodes a reference it was fed only in part as if it had
+    ended, so a feed whose last ``&`` is still open ends before that ``&``
+    instead — the next feed then holds the whole reference, and the text
+    is the one a single feed would give. Only a reference longer than a
+    whole feed is still cut.
+    """
+
+    end = min(len(text), start + size)
+    if end == len(text):
+        return end
+    amp = text.rfind("&", start, end)
+    if amp <= start or not _CHARREF_ENDS.isdisjoint(text[amp + 1 : end]):
+        return end
+    return amp
 
 
 def cut_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
     """*text* cut to at most *max_bytes* UTF-8 bytes on a character boundary.
 
     Returns the text and whether anything was cut. A cut that falls inside a
-    multi-byte character drops that whole character.
+    multi-byte character drops that whole character. Either way the text is
+    UTF-8 encodable: a lone surrogate is U+FFFD whatever the bound.
     """
 
-    encoded = text.encode("utf-8", errors="replace")
+    text = _utf8_safe(text)
+    encoded = text.encode("utf-8")
     limit = max(0, max_bytes)
     if len(encoded) <= limit:
         return text, False
-    return encoded[:limit].decode("utf-8", errors="ignore"), True
+    return _utf8_safe(encoded[:limit].decode("utf-8", errors="ignore")), True
+
+
+def _utf8_safe(text: str) -> str:
+    """*text* with every lone surrogate replaced, so UTF-8 encodes it strictly."""
+
+    return _SURROGATE.sub("\ufffd", text)
 
 
 def _content_type(header: str | None) -> tuple[str, str | None]:
@@ -831,29 +921,80 @@ def _content_type(header: str | None) -> tuple[str, str | None]:
 def _meta_charset(body: bytes) -> str | None:
     """The charset a ``<meta>`` in the first 1024 bytes of *body* declares.
 
-    As the WHATWG prescan does, a UTF-16 label found this way means UTF-8:
-    a document whose bytes the prescan could read is not UTF-16.
+    Only an element decides: a ``<meta charset>``, or a ``<meta
+    http-equiv="content-type">`` whose ``content`` carries ``charset=``.
+    Comments, text and every other attribute are read past. As the WHATWG
+    prescan does, a UTF-16 label found this way means UTF-8: a document
+    whose bytes the prescan could read is not UTF-16.
     """
 
-    match = _META_CHARSET.search(body[:_META_SCAN_BYTES])
-    if match is None:
+    prescan = _MetaPrescan()
+    # Latin-1 maps each byte to one character, so ASCII markup reads as is.
+    prescan.feed(body[:_META_SCAN_BYTES].decode("latin-1"))
+    label = prescan.label
+    if label is None:
         return None
-    label = match.group(1).decode("ascii")
     if label.lower().replace("_", "-").startswith("utf-16"):
         return "utf-8"
     return label
 
 
-def _decode(body: bytes, charset: str | None) -> str:
-    """*body* decoded by *charset*, UTF-8 when the label names no text codec."""
+class _MetaPrescan(HTMLParser):
+    """The first charset a ``<meta>`` element declares, and nothing else."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.label: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag != "meta" or self.label is not None:
+            return
+        values: dict[str, str] = {}
+        for name, value in attrs:
+            values.setdefault(name, value or "")
+        if "charset" in values:
+            match = _CHARSET_LABEL.match(values["charset"].strip())
+        elif values.get("http-equiv", "").strip().lower() == "content-type":
+            match = _CONTENT_CHARSET.search(values.get("content", ""))
+            match = _CHARSET_LABEL.match(match.group(1)) if match else None
+        else:
+            return
+        if match is not None:
+            self.label = match.group(0)
+
+    handle_startendtag = handle_starttag
+
+
+def _text_codec(charset: str | None) -> str:
+    """The codec *charset* names, if it is text and decodes with replacement.
+
+    Anything else — an unknown label, a bytes or str transform such as
+    ``base64`` or ``rot13``, a codec that rejects the replacement handler
+    such as ``idna`` — is UTF-8.
+    """
 
     try:
-        codec = codecs.lookup(charset or "utf-8").name
-        if codec == "utf-8":
-            codec = "utf-8-sig"
-        return body.decode(codec, errors="replace")
-    except LookupError:  # an unknown label, or a codec that is not text
-        return body.decode("utf-8-sig", errors="replace")
+        info = codecs.lookup(charset or "utf-8")
+        if not getattr(info, "_is_text_encoding", True):
+            return "utf-8-sig"
+        b"\xff\x00probe".decode(info.name, errors="replace")
+    except (LookupError, ValueError, TypeError):  # UnicodeError is a ValueError
+        return "utf-8-sig"
+    return "utf-8-sig" if info.name == "utf-8" else info.name
+
+
+def _decode(body: bytes, charset: str | None) -> str:
+    """*body* decoded by *charset*, UTF-8 when the label names no usable codec.
+
+    Never raises, and the text has no lone surrogate.
+    """
+
+    codec = _text_codec(charset)
+    try:
+        text = body.decode(codec, errors="replace")
+    except (LookupError, ValueError, TypeError):  # a codec the probe did not catch
+        text = body.decode("utf-8-sig", errors="replace")
+    return _utf8_safe(text)
 
 
 def _normalise(text: str) -> str:
@@ -870,7 +1011,17 @@ class _TextParser(HTMLParser):
     cannot close another and an element left unclosed skips to the end of
     the document. A source line break is whitespace, except inside
     ``<pre>``: lines break at block elements. Every ``<title>`` is kept out
-    of the text; the first one is the title.
+    of the text; the first one is the title. Inside a skipped element
+    nothing but the skip counts changes: a hidden ``<title>`` neither takes
+    the title nor reads as one, a hidden ``<pre>`` or block element breaks
+    no line.
+
+    A start tag's attributes are never read, so a tag longer than
+    :data:`_FEED_CHARS` is taken by its name alone: the standard parser
+    would walk every attribute of it before any handler — and so any look
+    at the deadline — runs. Start tags are counted by their length too, so
+    the deadline is looked at at least once every :data:`_FEED_CHARS`
+    characters of them.
     """
 
     def __init__(self) -> None:
@@ -881,11 +1032,56 @@ class _TextParser(HTMLParser):
         self._title_parts: list[str] = []
         self._in_title = False
         self._title_done = False
+        self._events = 0
+        self._tag_chars = 0
+
+    def _hidden(self) -> bool:
+        return any(self._skipped.values())
+
+    def _walked(self) -> None:
+        self._events += 1
+        if self._events % _DEADLINE_CHECK_EVENTS == 0:
+            _check_deadline()
+
+    def parse_starttag(self, i: int) -> int:
+        end = self.check_for_whole_start_tag(i)
+        if end < 0:
+            return end
+        self._tag_chars += end - i
+        if self._tag_chars >= _FEED_CHARS:
+            self._tag_chars = 0
+            _check_deadline()
+        if end - i <= _FEED_CHARS:
+            return super().parse_starttag(i)
+        name = _TAG_NAME.match(self.rawdata, i + 1)
+        if name is None:  # unreachable: the caller matched ``<`` + letter
+            return super().parse_starttag(i)
+        self.lasttag = tag = name.group(1).lower()
+        if self.rawdata.endswith("/>", i, end):
+            self.handle_startendtag(tag, [])
+            return end
+        self.handle_starttag(tag, [])
+        if tag in self.CDATA_CONTENT_ELEMENTS:
+            self.set_cdata_mode(tag)
+        elif tag in self.RCDATA_CONTENT_ELEMENTS:
+            self.set_cdata_mode(tag, escapable=True)
+        return end
+
+    def set_cdata_mode(self, elem: str, **kwargs: Any) -> None:
+        # A hidden ``<title>`` or ``<textarea>`` is no element at all, so its
+        # content must not swallow the markup after it as escapable text.
+        if kwargs.get("escapable") and self._hidden():
+            return
+        super().set_cdata_mode(elem, **kwargs)
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
+        self._walked()
         if tag in self._skipped:
             self._skipped[tag] += 1
-        elif tag == "title":
+            return
+        if self._hidden():
+            return
+        if tag == "title":
             self._in_title = True
         elif tag == "pre":
             self._preformatted += 1
@@ -893,9 +1089,13 @@ class _TextParser(HTMLParser):
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
+        self._walked()
         if tag in self._skipped:
             self._skipped[tag] = max(0, self._skipped[tag] - 1)
-        elif tag == "title" and self._in_title:
+            return
+        if self._hidden():
+            return
+        if tag == "title" and self._in_title:
             self._in_title = False
             self._title_done = True
         elif tag == "pre":
@@ -904,7 +1104,8 @@ class _TextParser(HTMLParser):
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if any(self._skipped.values()):
+        self._walked()
+        if self._hidden():
             return
         if self._in_title:
             if not self._title_done:
@@ -1719,7 +1920,9 @@ class _ObservationCache:
     An entry is the complete observation a provider returned; its size — the
     UTF-8 bytes of its key plus those of :func:`_observation_record` as
     compact sorted-key JSON — is computed once at :meth:`put` and kept next
-    to it. :meth:`get` never serves an entry older than the TTL on the
+    to it — or, when the caller measured the record already (a read does so
+    on its worker thread, under its deadline), taken from the caller, so
+    the event loop never serialises a page. :meth:`get` never serves an entry older than the TTL on the
     runtime clock (nor one stamped in the future), and :meth:`put` evicts the
     least recently used entries until both ``max_entries`` and ``max_bytes``
     hold; an entry larger than ``max_bytes`` alone is not stored. A TTL of 0
@@ -1749,9 +1952,13 @@ class _ObservationCache:
 
     @staticmethod
     def entry_size(key: str, observation: ActionObservation) -> int:
-        return len(key.encode("utf-8")) + len(
-            _compact_json(_observation_record(observation)).encode("utf-8")
-        )
+        return len(key.encode("utf-8")) + _ObservationCache.record_size(observation)
+
+    @staticmethod
+    def record_size(observation: ActionObservation) -> int:
+        """The UTF-8 bytes of *observation*'s record, its key not counted."""
+
+        return len(_compact_json(_observation_record(observation)).encode("utf-8"))
 
     def get(self, key: str) -> ActionObservation | None:
         """The fresh stored observation under *key*, now the most recently used."""
@@ -1768,12 +1975,21 @@ class _ObservationCache:
         self._entries[key] = self._entries.pop(key)
         return entry.observation
 
-    def put(self, key: str, observation: ActionObservation) -> None:
-        """Store a success under *key*, then evict until every bound holds."""
+    def put(
+        self, key: str, observation: ActionObservation, record_bytes: int | None = None
+    ) -> None:
+        """Store a success under *key*, then evict until every bound holds.
+
+        *record_bytes* is :meth:`record_size` of *observation* when the
+        caller measured it already; ``None`` measures it here.
+        """
 
         if not self.enabled or observation.status != "success":
             return
-        size = self.entry_size(key, observation)
+        if record_bytes is None:
+            size = self.entry_size(key, observation)
+        else:
+            size = len(key.encode("utf-8")) + record_bytes
         if key in self._entries:
             self._drop(key)
         if size > self._max_bytes:
@@ -1813,9 +2029,15 @@ def _served_from_cache(observation: ActionObservation) -> ActionObservation:
 
 @dataclass(slots=True)
 class _Lengths:
-    """The byte counts a call's diagnostic may add beyond its trace (R7)."""
+    """The byte counts a call measures beyond its trace.
+
+    ``response_bytes`` is for the diagnostic (R7); ``record_bytes`` is the
+    cache's size of the call's success, when the call measured it under its
+    deadline.
+    """
 
     response_bytes: int = 0
+    record_bytes: int | None = None
 
 
 @dataclass(slots=True)
@@ -1940,6 +2162,7 @@ class WebModule:
                 observation = await self._cached(
                     cache_key(WEB_READ_ACTION, PROVIDER_HTTP, invocation.call.arguments),
                     lambda: self._read(url, trace, lengths),
+                    lengths,
                 )
             finally:
                 self._in_flight -= 1
@@ -1955,10 +2178,43 @@ class WebModule:
     async def _read(
         self, url: Any, trace: dict[str, Any], lengths: _Lengths
     ) -> ActionObservation:
-        """Fetch, judge the content type unread, extract, bound (R3)."""
+        """Fetch, judge the content type unread, extract, bound (R3, R5).
+
+        One sleep of ``request_timeout_seconds`` bounds the whole call: the
+        fetch races it, and so does the work after it — the extraction, the
+        result and the serialisation the cache accounts it by — so all that
+        is left once it is cancelled is the cache's constant-time store.
+        """
+
+        sleeper = self._sleeper or asyncio.sleep
+        deadline = asyncio.ensure_future(sleeper(self._settings.request_timeout_seconds))
+        try:
+            return await self._read_within(url, trace, lengths, deadline)
+        finally:
+            deadline.cancel()
+            await asyncio.gather(deadline, return_exceptions=True)
+
+    async def _read_within(
+        self,
+        url: Any,
+        trace: dict[str, Any],
+        lengths: _Lengths,
+        deadline: "asyncio.Future[Any]",
+    ) -> ActionObservation:
+        """:meth:`_read` under *deadline*, which ends the call when it is done.
+
+        Extraction, the result and its measured cache record are built on a
+        worker thread, so the event loop keeps the deadline while a large
+        page is parsed and serialised; once it expires the thread's answer
+        is discarded and its parser, which checks the same deadline as it
+        walks, stops. A call that ran out of time is ``timeout timed_out``,
+        never a success with less text.
+        """
 
         settings = self._settings
-        fetched = await self.fetch(url, apply_allowlist=True, accept_body=_readable_answer)
+        fetched = await self.fetch(
+            url, apply_allowlist=True, accept_body=_readable_answer, deadline=deadline
+        )
         trace["redirects"] = fetched.redirects
         if isinstance(fetched, FetchFailure):
             return _read_failure(trace, fetched)
@@ -1967,26 +2223,35 @@ class WebModule:
             return _read_failure(trace, fetched.status)
         if fetched.body is None:
             return _read_failure(trace, REFUSAL_UNSUPPORTED_CONTENT_TYPE)
-        try:
-            extracted = extract_text(fetched.body, _header(fetched.headers, "Content-Type"))
-        except Exception:  # noqa: BLE001 - the parser's text would quote the page
-            return _read_failure(trace, ERROR_MALFORMED_RESPONSE)
-        text, text_cut = cut_utf8(extracted.text, settings.max_text_bytes)
-        trace["text_bytes"] = len(text.encode("utf-8"))
-        result: dict[str, Any] = {
-            "advisory": advisory_marker(),
-            "final_url": fetched.final_url,
-            "text": text,
-            "truncated": fetched.truncated or text_cut,
-        }
-        if extracted.title is not None:
-            result["title"] = extracted.title
-        return ActionObservation(
-            status="success",
-            provenance=_read_provenance(trace),
-            result=result,
-            parts=(),
+        expired = threading.Event()
+        work = asyncio.ensure_future(
+            asyncio.to_thread(
+                _read_success,
+                fetched,
+                _header(fetched.headers, "Content-Type"),
+                settings.max_text_bytes,
+                dict(trace),
+                expired.is_set,
+            )
         )
+        try:
+            await asyncio.wait({work, deadline}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            expired.set()
+            work.cancel()
+            raise
+        if deadline.done():
+            expired.set()
+            work.cancel()
+            return _read_failure(
+                trace, FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT, fetched.redirects)
+            )
+        answered = work.result()
+        if answered is None:  # the parser's text would quote the page
+            return _read_failure(trace, ERROR_MALFORMED_RESPONSE)
+        observation, lengths.record_bytes = answered
+        trace["text_bytes"] = observation.provenance["trace_fields"]["text_bytes"]
+        return observation
 
     # -- web.search (R1, R2, R4 provider endpoints, R6, R7) ------------------ #
 
@@ -2020,6 +2285,7 @@ class WebModule:
                 observation = await self._cached(
                     cache_key(WEB_SEARCH_ACTION, backend.name, invocation.call.arguments),
                     lambda: self._search(backend, query, trace, lengths),
+                    lengths,
                 )
             finally:
                 self._in_flight -= 1
@@ -2049,19 +2315,21 @@ class WebModule:
         _LOG.warning(line)
 
     async def _cached(
-        self, key: str, call: Callable[[], Any]
+        self, key: str, call: Callable[[], Any], lengths: _Lengths
     ) -> ActionObservation:
         """Serve *key* from the cache, or run *call* and offer its answer.
 
         Looked up after admission, so a hit still took a slot, which its
         caller releases at once; a hit resolves and connects nothing (R5).
+        An answer whose record *call* measured (``lengths.record_bytes``) is
+        stored without being serialised again.
         """
 
         stored = self._cache.get(key)
         if stored is not None:
             return _served_from_cache(stored)
         observation = await call()
-        self._cache.put(key, observation)
+        self._cache.put(key, observation, lengths.record_bytes)
         return observation
 
     async def _search(
@@ -2130,6 +2398,7 @@ class WebModule:
         apply_allowlist: bool,
         accept_body: Callable[[Any], bool] | None = None,
         headers: Mapping[str, str] | None = None,
+        deadline: "asyncio.Future[Any] | None" = None,
     ) -> Fetched | FetchFailure:
         """Fetch *url* through the guard, every hop, within one deadline (R4, R6).
 
@@ -2139,7 +2408,8 @@ class WebModule:
         and the call is ``timeout timed_out``. *accept_body* sees the final
         response before any body byte is read and may decline it; by default
         the body is read, bounded. A cancellation of the caller cancels the
-        work and is re-raised.
+        work and is re-raised. A caller that bounds more than the fetch
+        passes its own *deadline*, which the fetch races and leaves running.
         """
 
         sleeper = self._sleeper or asyncio.sleep
@@ -2153,20 +2423,27 @@ class WebModule:
                 progress=progress,
             )
         )
-        timer = asyncio.ensure_future(sleeper(self._settings.request_timeout_seconds))
+        timer = (
+            asyncio.ensure_future(sleeper(self._settings.request_timeout_seconds))
+            if deadline is None
+            else deadline
+        )
+        owned = [timer] if deadline is None else []
         try:
             await asyncio.wait({work, timer}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             work.cancel()
-            timer.cancel()
-            await asyncio.gather(work, timer, return_exceptions=True)
+            for pending in owned:
+                pending.cancel()
+            await asyncio.gather(work, *owned, return_exceptions=True)
             raise
         if not work.done():
             work.cancel()
             await asyncio.gather(work, return_exceptions=True)
             return FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT, progress.redirects)
-        timer.cancel()
-        await asyncio.gather(timer, return_exceptions=True)
+        for pending in owned:
+            pending.cancel()
+        await asyncio.gather(*owned, return_exceptions=True)
         if work.cancelled() or work.exception() is not None:
             return FetchFailure(FETCH_ERROR, REFUSAL_TRANSPORT_FAILED, progress.redirects)
         return work.result()
@@ -2240,6 +2517,47 @@ class WebModule:
             finally:
                 if response is not None:
                     await _close_response(response)
+
+
+def _read_success(
+    fetched: Fetched,
+    content_type: str | None,
+    max_text_bytes: int,
+    trace: dict[str, Any],
+    expired: Callable[[], bool],
+) -> tuple[ActionObservation, int] | None:
+    """A read's success observation and its cache record size, in bytes.
+
+    The text is cut to *max_text_bytes*. *trace* is the thread's own copy:
+    the caller's is never touched here. Run on a worker thread under the
+    call's deadline: *expired* is what the parser checks as it walks, and
+    the record is measured here, not on the event loop. ``None`` is a body
+    the extractor could not parse, or one it gave up on because the
+    deadline expired — the caller already knows which.
+    """
+
+    _EXTRACTION_EXPIRED.set(expired)
+    try:
+        extracted = extract_text(fetched.body or b"", content_type)
+        text, text_cut = cut_utf8(extracted.text, max_text_bytes)
+    except Exception:  # noqa: BLE001 - the parser's text would quote the page
+        return None
+    trace["text_bytes"] = len(text.encode("utf-8"))
+    result: dict[str, Any] = {
+        "advisory": advisory_marker(),
+        "final_url": fetched.final_url,
+        "text": text,
+        "truncated": fetched.truncated or text_cut,
+    }
+    if extracted.title is not None:
+        result["title"] = extracted.title
+    observation = ActionObservation(
+        status="success",
+        provenance=_read_provenance(trace),
+        result=result,
+        parts=(),
+    )
+    return observation, _ObservationCache.record_size(observation)
 
 
 def _readable_answer(response: Any) -> bool:
