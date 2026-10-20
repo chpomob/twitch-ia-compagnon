@@ -3698,6 +3698,161 @@ async def test_r2_a_mediawiki_item_with_no_title_is_dropped() -> None:
     assert trace["dropped_count"] == 2
 
 
+async def test_r2_a_wikipedia_lone_surrogate_item_is_dropped_its_sibling_kept() -> None:
+    """P12F2: the title whose URL encoding raises is dropped and counted;
+    the valid sibling is the answer."""
+
+    rig = await search_rig()
+    wiki = {"query": {"search": [
+        {"title": "Valid", "snippet": "good"},
+        {"title": "\ud800", "snippet": "bad"},
+    ]}}
+    rig.transport.script(WIKIPEDIA_EN, json_answer(json.dumps(wiki).encode()))
+
+    observation = await rig.search("q")
+    results = search_success(observation, PROVIDER_WIKIPEDIA)
+
+    assert observation.status == "success"
+    assert results == [
+        {"title": "Valid", "url": "https://en.wikipedia.org/wiki/Valid", "excerpt": "good"}
+    ]
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["dropped_count"]) == (1, 1)
+    assert observation.provenance["trace_fields"]["dropped_count"] == 1
+
+
+async def test_r2_a_brave_lone_surrogate_item_is_dropped_its_sibling_kept() -> None:
+    """P12F2: the title whose UTF-8 conversion raises is dropped and
+    counted; the valid sibling is the answer."""
+
+    rig = await search_rig(**brave_settings(fake_key()))
+    brave = {"web": {"results": [
+        {"title": "Valid", "url": "https://example.org", "description": "good"},
+        {"title": "\ud800", "url": "https://example.org/bad", "description": "bad"},
+    ]}}
+    rig.transport.script(BRAVE_HOST, json_answer(json.dumps(brave).encode()))
+
+    observation = await rig.search("q")
+    results = search_success(observation, PROVIDER_BRAVE)
+
+    assert observation.status == "success"
+    assert results == [{"title": "Valid", "url": "https://example.org", "excerpt": "good"}]
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["dropped_count"]) == (1, 1)
+    assert observation.provenance["trace_fields"]["dropped_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        pytest.param({"title": "t", "url": "https://example.org/\ud800"}, id="surrogate-url"),
+        pytest.param(
+            {"title": "t", "url": "https://example.org/a", "description": "\udfff"},
+            id="surrogate-description",
+        ),
+    ],
+)
+async def test_r2_a_brave_item_with_unencodable_url_or_excerpt_is_dropped(item: Any) -> None:
+    rig = await search_rig(**brave_settings(fake_key()))
+    good = {"title": "kept", "url": "https://example.org/kept"}
+    body = json.dumps({"web": {"results": [item, good]}}).encode()
+    rig.transport.script(BRAVE_HOST, json_answer(body))
+
+    results = search_success(await rig.search("q"), PROVIDER_BRAVE)
+
+    assert results == [{"title": "kept", "url": "https://example.org/kept", "excerpt": ""}]
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["dropped_count"]) == (1, 1)
+
+
+@pytest.mark.parametrize("provider", [PROVIDER_WIKIPEDIA, PROVIDER_BRAVE])
+async def test_r2_an_answer_whose_every_item_is_malformed_is_malformed(provider: str) -> None:
+    """P12F2: dropping never becomes a success with nothing, and the
+    failure still counts every dropped item."""
+
+    if provider == PROVIDER_WIKIPEDIA:
+        rig = await search_rig()
+        host = WIKIPEDIA_EN
+        body = {"query": {"search": [{"title": "\ud800"}, {"snippet": "x"}, 7]}}
+    else:
+        rig = await search_rig(**brave_settings(fake_key()))
+        host = BRAVE_HOST
+        body = {"web": {"results": [
+            {"title": "\ud800", "url": "https://example.org/a"},
+            {"title": "t", "url": "ftp://example.org/b"},
+            "not-an-object",
+        ]}}
+    rig.transport.script(host, json_answer(json.dumps(body).encode()))
+
+    observation = await rig.search("q")
+
+    assert_search_outcome(observation, "error", ERROR_MALFORMED_RESPONSE)
+    assert observation.result is None
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["outcome"]) == (0, ERROR_MALFORMED_RESPONSE)
+    assert trace["dropped_count"] == 3
+    assert observation.provenance["trace_fields"]["dropped_count"] == 3
+
+
+@pytest.mark.parametrize(
+    ("provider", "body"),
+    [
+        pytest.param(PROVIDER_WIKIPEDIA, {"query": {}}, id="wikipedia-absent"),
+        pytest.param(PROVIDER_WIKIPEDIA, {"query": {"search": "x"}}, id="wikipedia-string"),
+        pytest.param(PROVIDER_WIKIPEDIA, {"query": {"search": {"a": 1}}}, id="wikipedia-object"),
+        pytest.param(PROVIDER_BRAVE, {"web": {}}, id="brave-absent"),
+        pytest.param(PROVIDER_BRAVE, {"web": {"results": 3}}, id="brave-number"),
+        pytest.param(PROVIDER_BRAVE, {"web": {"results": "x"}}, id="brave-string"),
+    ],
+)
+async def test_r2_a_results_array_absent_or_of_the_wrong_type_is_malformed(
+    provider: str, body: Any
+) -> None:
+    if provider == PROVIDER_WIKIPEDIA:
+        rig, host = await search_rig(), WIKIPEDIA_EN
+    else:
+        rig, host = await search_rig(**brave_settings(fake_key())), BRAVE_HOST
+    rig.transport.script(host, json_answer(json.dumps(body).encode()))
+
+    observation = await rig.search("q")
+
+    assert_search_outcome(observation, "error", ERROR_MALFORMED_RESPONSE)
+    assert observation.result is None
+
+
+@pytest.mark.parametrize("provider", [PROVIDER_WIKIPEDIA, PROVIDER_BRAVE])
+async def test_r2_ten_items_three_malformed_keep_seven_and_count_three(provider: str) -> None:
+    bad = {2, 5, 9}
+    if provider == PROVIDER_WIKIPEDIA:
+        rig, host = await search_rig(max_results=10), WIKIPEDIA_EN
+        items = [
+            {"title": "\ud800" if index in bad else f"T{index}", "snippet": "s"}
+            for index in range(10)
+        ]
+        body = {"query": {"search": items}}
+    else:
+        rig = await search_rig(max_results=10, **brave_settings(fake_key()))
+        host = BRAVE_HOST
+        items = [
+            {
+                "title": "\ud800" if index in bad else f"T{index}",
+                "url": f"https://example.org/{index}",
+                "description": "s",
+            }
+            for index in range(10)
+        ]
+        body = {"web": {"results": items}}
+    rig.transport.script(host, json_answer(json.dumps(body).encode()))
+
+    results = search_success(await rig.search("q"), provider)
+
+    assert [result["title"] for result in results] == [
+        f"T{index}" for index in range(10) if index not in bad
+    ]
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["dropped_count"]) == (7, 3)
+
+
 async def test_r2_an_answer_cut_by_the_byte_bound_is_malformed_not_partial() -> None:
     """A 2xx body over ``max_response_bytes`` is read only to the bound plus
     one byte and is never parsed as a partial answer."""

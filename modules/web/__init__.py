@@ -73,7 +73,10 @@ or :data:`MALFORMED`: a third provider adds a class and an enum value, not a
 contract field. The endpoint is fetched through the same guard and pinning
 as a read but never against ``allowed_hosts``; only a 2xx body is read,
 bounded, and must parse as the documented JSON shape. A result with no title
-or no ``http(s)`` URL is dropped and counted; every excerpt goes through the
+or no ``http(s)`` URL, or that cannot be used at all (text that is not valid
+UTF-8), is dropped and counted in the trace's ``dropped_count`` while its
+siblings are kept; an answer whose every item is dropped is still
+``malformed_response``, its trace still counting them. Every excerpt goes through the
 extractor and :func:`cut_utf8`; the results keep the provider's order, at
 most ``max_results``. Admission is shared with reads. The trace names the
 backend and adds only the query's byte length, the result and dropped
@@ -1650,12 +1653,20 @@ def _product_version() -> str:
 
 
 class Malformed:
-    """A provider answer that is not the documented shape (R2): no result."""
+    """A provider answer that is not the documented shape (R2): no result.
 
-    __slots__ = ()
+    *dropped* counts the items that were dropped on the way — every one, when
+    an answer has items of which none is usable — so the trace still reports
+    them; it is ``0`` when the answer's shape itself is wrong.
+    """
+
+    __slots__ = ("dropped",)
+
+    def __init__(self, dropped: int = 0) -> None:
+        self.dropped = dropped
 
     def __repr__(self) -> str:
-        return "Malformed()"
+        return f"Malformed(dropped={self.dropped})"
 
 
 MALFORMED = Malformed()
@@ -1682,10 +1693,21 @@ def _is_web_url(value: Any) -> bool:
     return parts.scheme.lower() in _SCHEME_PORTS and bool(parts.hostname)
 
 
+def _encodable(text: str) -> bool:
+    """Whether *text* is valid UTF-8 text: no lone surrogate."""
+
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _search_result(
     title: Any, url: Any, excerpt: Any, max_excerpt_bytes: int
 ) -> dict[str, str] | None:
-    """One result, or ``None`` when it has no title or no ``http(s)`` URL (R2).
+    """One result, or ``None`` when it has no title or no ``http(s)`` URL, or
+    either is not valid UTF-8 text (R2).
 
     The excerpt goes through the extractor — markup removed, references
     decoded — and is cut to *max_excerpt_bytes* on a character boundary; a
@@ -1694,9 +1716,40 @@ def _search_result(
 
     if not isinstance(title, str) or not title.strip() or not _is_web_url(url):
         return None
+    if not (_encodable(title) and _encodable(url)):
+        return None
     plain = _plain(excerpt) if isinstance(excerpt, str) else ""
     cut, _ = cut_utf8(plain, max_excerpt_bytes)
     return {"title": title, "url": url, "excerpt": cut}
+
+
+def _parsed_items(
+    items: list[Any], result_of: Callable[[Any], dict[str, str] | None]
+) -> ParsedSearch | Malformed:
+    """The kept results of *items* and the dropped count, or :data:`MALFORMED`.
+
+    The item boundary is where the guard lives (R2): an item *result_of*
+    cannot use — ``None``, or any exception, such as a lone surrogate the
+    URL encoding or the extractor refuses — is dropped and counted, and its
+    siblings are kept. An answer with items of which none is usable is
+    :class:`Malformed` carrying that dropped count, never a success with
+    nothing; an empty list is an answer with no hits.
+    """
+
+    results: list[dict[str, str]] = []
+    dropped = 0
+    for item in items:
+        try:
+            result = result_of(item)
+        except Exception:  # noqa: BLE001 - the error's text would quote the item
+            result = None
+        if result is None:
+            dropped += 1
+        else:
+            results.append(result)
+    if items and not results:
+        return Malformed(dropped)
+    return results, dropped
 
 
 def _json_answer(body: bytes) -> Any:
@@ -1759,20 +1812,15 @@ class WikipediaBackend:
         items = query.get("search") if isinstance(query, dict) else None
         if not isinstance(items, list):
             return MALFORMED
-        results: list[dict[str, str]] = []
-        dropped = 0
-        for item in items:
-            title = item.get("title") if isinstance(item, dict) else None
-            result = None
-            if isinstance(title, str) and title.strip():
-                result = _search_result(
-                    title, self.article_url(title), item.get("snippet"), self._max_excerpt_bytes
-                )
-            if result is None:
-                dropped += 1
-            else:
-                results.append(result)
-        return results, dropped
+        return _parsed_items(items, self._result)
+
+    def _result(self, item: Any) -> dict[str, str] | None:
+        title = item.get("title") if isinstance(item, dict) else None
+        if not isinstance(title, str) or not title.strip():
+            return None
+        return _search_result(
+            title, self.article_url(title), item.get("snippet"), self._max_excerpt_bytes
+        )
 
 
 class BraveBackend:
@@ -1806,23 +1854,18 @@ class BraveBackend:
         items = web.get("results") if isinstance(web, dict) else None
         if not isinstance(items, list):
             return MALFORMED
-        results: list[dict[str, str]] = []
-        dropped = 0
-        for item in items:
-            result = None
-            if isinstance(item, dict):
-                title = item.get("title")
-                result = _search_result(
-                    _plain(title) if isinstance(title, str) else None,
-                    item.get("url"),
-                    item.get("description"),
-                    self._max_excerpt_bytes,
-                )
-            if result is None:
-                dropped += 1
-            else:
-                results.append(result)
-        return results, dropped
+        return _parsed_items(items, self._result)
+
+    def _result(self, item: Any) -> dict[str, str] | None:
+        if not isinstance(item, dict):
+            return None
+        title = item.get("title")
+        return _search_result(
+            _plain(title) if isinstance(title, str) else None,
+            item.get("url"),
+            item.get("description"),
+            self._max_excerpt_bytes,
+        )
 
 
 #: The backend class of each ``provider`` value: a third provider adds a
@@ -2362,6 +2405,7 @@ class WebModule:
         except Exception:  # noqa: BLE001 - the parser's text would quote the answer
             parsed = MALFORMED
         if isinstance(parsed, Malformed):
+            trace["dropped_count"] = parsed.dropped
             return _search_failure(backend.name, trace, ERROR_MALFORMED_RESPONSE)
         results, dropped = parsed
         results = results[: settings.max_results]
