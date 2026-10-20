@@ -1,9 +1,9 @@
 # Phase 7 campaign summary
 
-- steps approved: 3 — P3F1, P12F2, P12F3
+- steps approved: 1 — P12F4
 - halted: no
-- full-branch gate: unparsed
-- main HEAD: d31bf17 feat(phase7): P12F3 — The three test-treatment findings of the closing gate
-- final test run: green — 4378 passed, 26 skipped in 316.12s (0:05:16)
+- full-branch gate: REQUEST_CHANGES
+- main HEAD: 07f6bd6 feat(phase7): P12F4 — The whole-call deadline covers every path, and the summary tells the truth
+- final test run: green — 4397 passed, 26 skipped in 312.43s (0:05:12)
 - NOT delivered: the real-instance trial record does not exist yet, so the bridge stays 'not delivered' whatever this summary says.
 - log: /media/chpo/HDD-papa/twitch-ia-compagnon/docs/campaigns/phase7/scaffolding/campaign.log
