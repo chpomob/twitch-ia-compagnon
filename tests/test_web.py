@@ -36,6 +36,16 @@ loader-started ``web`` collected by emitter — traces, audit lines, log
 records, stderr, observation messages, the status record and the reprs —
 and none carries the query, the path, the key or page text; the
 ``debug_lengths`` diagnostics add byte lengths only.
+Plan step P10 checks the operator guide as executable (R9, R10): the guide's
+grant fragment, applied to a copy of ``config.yaml.example``, passes
+``--check-config`` with exactly the two ``web`` rules, and deleting them
+leaves the brain offering no ``web.*`` tool (AC23); the Brave fragment
+passes only with ``BRAVE_API_KEY`` exported; both guides' settings tables
+equal the manifest and the validator's constants, the README links the
+guide, the dependencies are exactly two and the shipped profiles unchanged
+(AC24); both guides document the operator trial and its record file, and an
+AST scan shows every ``activate(`` here passes the ``_transport`` seam but
+the one no-call test and no other test file imports ``modules.web`` (AC25).
 
 **No test here opens a real socket.** The autouse :func:`socket_guard`
 replaces ``socket.socket.connect``/``connect_ex``, ``socket.create_connection``,
@@ -54,15 +64,19 @@ environment the example's other ``${...}`` references need.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import asyncio.base_events
+import copy
 import dataclasses
 import functools
 import ipaddress
 import json
 import logging
 import re
+import shutil
 import socket
+import subprocess
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -146,6 +160,9 @@ from modules.web import (
     read_bounded,
     MANIFEST_PATH,
     MAX_ALLOWED_HOSTS,
+    MAX_USER_AGENT_CONTACT,
+    _LANGUAGE,
+    _MAX_HOST_LENGTH,
     MODULE_NAME,
     REFUSAL_BLOCKED_ADDRESS,
     REFUSAL_TRANSPORT_FAILED,
@@ -4973,3 +4990,473 @@ def test_r7_the_settings_repr_holds_no_configured_value() -> None:
     assert not leaks(rendered, key)
     assert "brave_api_key" not in rendered
     assert "SECRETCONTACT" not in rendered and "secrethost" not in rendered
+
+
+# --------------------------------------------------------------------------- #
+# P10: the operator guide, checked as executable (R9, R10; AC23, AC24, AC25)
+# --------------------------------------------------------------------------- #
+
+GUIDE = ROOT / "docs" / "web-knowledge.md"
+GUIDE_FR = ROOT / "docs" / "web-knowledge.fr.md"
+README = ROOT / "README.md"
+TRIAL_RECORD = "docs/campaigns/phase7/web-trial-record.md"
+#: The tree before phase 7: the shipped profiles must not differ from it.
+PHASE_BASE = "7c29434"
+SHIPPED_PROFILES = (
+    "config.yaml.example",
+    "config.server.yaml.example",
+    "agent.yaml.example",
+    "presence.yaml.example",
+)
+GRANT_FRAGMENT = "grant-fragment"
+BRAVE_FRAGMENT = "brave-fragment"
+#: The guide's spelling of a setting that has no default.
+NO_DEFAULT = "—"
+#: The one test that activates with no seam at all, on purpose (P4, AC25).
+NO_SEAM_TEST = "test_ac25_activate_and_prepare_with_no_seams_open_nothing"
+
+
+def guide_fragment(name: str, path: Path = GUIDE) -> str:
+    """The fenced YAML right after ``<!-- web-knowledge:<name> -->``, exactly once."""
+
+    pattern = re.compile(
+        rf"^<!-- web-knowledge:{re.escape(name)} -->\n```yaml\n(?P<body>.*?)^```$",
+        re.MULTILINE | re.DOTALL,
+    )
+    (body,) = [match.group("body") for match in pattern.finditer(path.read_text(encoding="utf-8"))]
+    return body
+
+
+def insert_fragment(profile: Mapping[str, Any], fragment: Mapping[str, Any]) -> dict[str, Any]:
+    """The guide's insertion rule: a mapping merges key by key, a list extends
+    the profile's list of the same key, any other value replaces it."""
+
+    merged = copy.deepcopy(dict(profile))
+    for key, value in fragment.items():
+        current = merged.get(key)
+        if isinstance(value, Mapping) and isinstance(current, Mapping):
+            merged[key] = insert_fragment(current, value)
+        elif isinstance(value, list) and isinstance(current, list):
+            merged[key] = current + copy.deepcopy(value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def guide_profile(directory: Path, *fragments: str) -> dict[str, Any]:
+    """``config.yaml.example`` with the named guide fragments inserted in order."""
+
+    profile = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    for name in fragments:
+        profile = insert_fragment(profile, yaml.safe_load(guide_fragment(name)))
+    profile["modules_directory"] = str(ROOT / "modules")
+    return profile
+
+
+def write_profile(directory: Path, profile: Mapping[str, Any]) -> Path:
+    path = directory / f"guide-{uuid4().hex}.yaml"
+    path.write_text(yaml.safe_dump(dict(profile), sort_keys=False), encoding="utf-8")
+    return path
+
+
+def guide_environ(**extra: str) -> dict[str, str]:
+    """The example's dummy environment, its broadcaster the brain rig's channel."""
+
+    return {**_environment(), "TWITCH_BROADCASTER_ID": BRAIN_CHANNEL, **extra}
+
+
+async def check_profile(path: Path, environ: Mapping[str, str]) -> tuple[int, list[str]]:
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        path, environ=environ, diagnostic_reporter=diagnostics.append
+    )
+    return status, diagnostics
+
+
+def web_rules(config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [
+        rule
+        for rule in config.get("actions") or ()
+        if str(rule.get("action_name", "")).startswith("web.")
+    ]
+
+
+async def offered_on_the_served_channel(config: Mapping[str, Any]) -> list[str]:
+    """The tools the shipped brain offers on its first turn for a chat
+    message on the served channel, under exactly *config*'s rules, with the
+    shipped ``web`` module prepared over the fakes."""
+
+    clock = ManualClock()
+    policy = AuthorizationPolicy(application._authorization_rules(config))
+    registry = ActionRegistry(authorization=policy)
+    registry.register(CHAT_WRITE_SPEC, SendProvider(), module="sender")
+    registry.mark_ready("sender")
+    context = runtime_context(clock=clock, authorization=policy, actions=registry)
+    transport = FakeTransport()
+    web = await activate(
+        context.for_module(MODULE_NAME),
+        {"_transport": transport, "_resolver": FakeResolver(), "_sleeper": clock.sleep},
+        {},
+    )
+    await web.prepare()
+    model = ScriptedModel(final("Nothing to look up."))
+    settings = merge_settings(None)
+    settings.update({"_session_factory": lambda: model, "_sleeper": clock.sleep})
+    brain = await brain_module.activate(context.for_module(brain_module.MODULE_NAME), settings, {})
+    await brain.prepare()
+    rig = BrainReadRig(context, brain, web, model, transport, CountingSceneProvider())
+    try:
+        await rig.ask()
+        assert transport.connections == []
+        return rig.offered(0)
+    finally:
+        await rig.close()
+
+
+async def test_ac23_the_grant_fragment_checks_with_exactly_two_web_rules(
+    tmp_path: Path,
+) -> None:
+    """AC23 (R9): the guide's grant fragment, read by its anchor and applied
+    to a copy of ``config.yaml.example``, passes ``--check-config`` with
+    exit 0, and the profile holds exactly 2 ``web`` rules — ``web.search``
+    and ``web.read`` for principal ``brain`` on the served channel's ``web``
+    scope — the shipped profile holding none."""
+
+    shipped = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert web_rules(shipped) == []
+    profile = guide_profile(tmp_path, GRANT_FRAGMENT)
+    assert MODULE_NAME in profile["enabled_modules"]
+    assert profile["modules"][MODULE_NAME] == {}
+    environ = guide_environ()
+    path = write_profile(tmp_path, profile)
+
+    assert await check_profile(path, environ) == (0, [])
+    config = application.load_config(path, environ=environ)
+    rules = web_rules(config)
+    assert len(rules) == 2
+    assert len(config["actions"]) == len(shipped["actions"]) + 2
+    assert sorted(rule["action_name"] for rule in rules) == sorted(
+        [WEB_SEARCH_ACTION, WEB_READ_ACTION]
+    )
+    for rule in rules:
+        assert rule["principals"] == [PRINCIPAL]
+        assert rule["natures"] == ["read"]
+        assert rule["granted_permissions"] == [rule["action_name"]]
+        assert rule["destination"] == {
+            "platform": "twitch",
+            "channel_id": BRAIN_CHANNEL,
+            "scope": "web",
+        }
+
+
+async def test_ac23_deleting_the_two_rules_leaves_the_brain_no_web_tool(
+    tmp_path: Path,
+) -> None:
+    """AC23 (R9): with the fragment's rules the brain offers both ``web``
+    actions on the served channel; with those 2 rules deleted — and the
+    module still enabled — it offers 0 ``web.*`` actions: revocation is
+    configuration only."""
+
+    environ = guide_environ()
+    granted = application.load_config(
+        write_profile(tmp_path, guide_profile(tmp_path, GRANT_FRAGMENT)), environ=environ
+    )
+    offered = await offered_on_the_served_channel(granted)
+    assert sorted(name for name in offered if name.startswith("web.")) == sorted(
+        [WEB_SEARCH_ACTION, WEB_READ_ACTION]
+    )
+
+    profile = guide_profile(tmp_path, GRANT_FRAGMENT)
+    fragment = yaml.safe_load(guide_fragment(GRANT_FRAGMENT))
+    fragment_ids = {rule["rule_id"] for rule in fragment["actions"]}
+    assert len(fragment_ids) == 2
+    profile["actions"] = [rule for rule in profile["actions"] if rule["rule_id"] not in fragment_ids]
+    assert MODULE_NAME in profile["enabled_modules"]
+    path = write_profile(tmp_path, profile)
+    assert await check_profile(path, environ) == (0, [])
+    revoked = application.load_config(path, environ=environ)
+    assert web_rules(revoked) == []
+    offered = await offered_on_the_served_channel(revoked)
+    assert [name for name in offered if name.startswith("web.")] == []
+
+
+async def test_ac23_the_brave_fragment_checks_only_with_the_key_exported(
+    tmp_path: Path,
+) -> None:
+    """AC23 (R9): the guide's Brave fragment, applied the same way after the
+    grant fragment, sets ``provider: brave`` and ``brave_api_key:
+    ${BRAVE_API_KEY}``; ``--check-config`` exits 0 with ``BRAVE_API_KEY``
+    exported and non-zero, naming ``brave_api_key``, without it — and the
+    key never reaches a diagnostic."""
+
+    assert yaml.safe_load(guide_fragment(BRAVE_FRAGMENT)) == {
+        "modules": {
+            MODULE_NAME: {"provider": PROVIDER_BRAVE, "brave_api_key": "${BRAVE_API_KEY}"}
+        }
+    }
+    path = write_profile(tmp_path, guide_profile(tmp_path, GRANT_FRAGMENT, BRAVE_FRAGMENT))
+    key = fake_key()
+
+    assert await check_profile(path, guide_environ(BRAVE_API_KEY=key)) == (0, [])
+    status, diagnostics = await check_profile(path, guide_environ())
+    assert status != 0
+    assert any("brave_api_key" in diagnostic for diagnostic in diagnostics), diagnostics
+    assert not leaks("\n".join(diagnostics), key)
+
+
+def test_ac23_the_french_guide_carries_the_same_fragments() -> None:
+    """A profile is copied from either guide: the fragments are byte-equal."""
+
+    for name in (GRANT_FRAGMENT, BRAVE_FRAGMENT):
+        assert guide_fragment(name, GUIDE_FR) == guide_fragment(name, GUIDE)
+    assert "delete these two rules" in guide_fragment(GRANT_FRAGMENT)
+
+
+def test_ac24_the_english_guide_is_normative_and_the_french_one_defers() -> None:
+    """AC24 (R9): both files exist; the English one marks itself normative and
+    the French one says the English text wins, linking it."""
+
+    english = GUIDE.read_text(encoding="utf-8")
+    french = GUIDE_FR.read_text(encoding="utf-8")
+    assert "**Status: normative.**" in english
+    assert "this English text wins" in english
+    assert re.search(r"\*\*le texte\s*(?:>\s*)?anglais fait foi\*\*", french)
+    assert "](web-knowledge.md)" in french
+
+
+def settings_table(path: Path) -> dict[str, tuple[Any, str]]:
+    """The guide's settings table: each setting's default and range cells."""
+
+    text = path.read_text(encoding="utf-8")
+    section = text.split("<!-- web-knowledge:settings-table -->\n", 1)[1]
+    lines = []
+    for line in section.splitlines():
+        if not line.startswith("|"):
+            break
+        lines.append(line)
+    assert set(lines[1].replace("|", "")) == {"-"}
+    rows: dict[str, tuple[Any, str]] = {}
+    for line in lines[2:]:
+        name, default, value_range, _meaning = (cell.strip() for cell in line.strip("|").split("|"))
+        assert name.startswith("`") and name.endswith("`"), line
+        assert value_range.startswith("`") and value_range.endswith("`"), line
+        if default != NO_DEFAULT:
+            assert default.startswith("`") and default.endswith("`"), line
+            default = yaml.safe_load(default.strip("`"))
+        assert name.strip("`") not in rows, name
+        rows[name.strip("`")] = (default, value_range.strip("`"))
+    return rows
+
+
+def manifest_settings_rows() -> dict[str, tuple[Any, str]]:
+    """Each setting's default and range, as the guide spells them, from the
+    manifest — and, for the ranges the validator holds, from its constants."""
+
+    properties = _manifest()["settings_schema"]["properties"]
+    rows: dict[str, tuple[Any, str]] = {}
+    for name, (default, minimum, maximum) in INTEGER_SETTINGS.items():
+        node = properties[name]
+        assert (node["default"], node["minimum"], node["maximum"]) == (default, minimum, maximum)
+        rows[name] = (default, f"{minimum}–{maximum}")
+    provider = properties["provider"]
+    rows["provider"] = (provider["default"], ", ".join(provider["enum"]))
+    key = properties["brave_api_key"]
+    assert "default" not in key
+    rows["brave_api_key"] = (NO_DEFAULT, f"length ≤ {key['maxLength']}")
+    hosts = properties["allowed_hosts"]["items"]
+    assert hosts["maxLength"] == _MAX_HOST_LENGTH
+    rows["allowed_hosts"] = (
+        properties["allowed_hosts"]["default"],
+        f"≤ {MAX_ALLOWED_HOSTS} entries, each length {hosts['minLength']}–{hosts['maxLength']}",
+    )
+    language = properties["wikipedia_language"]
+    rows["wikipedia_language"] = (
+        language["default"],
+        f"{_LANGUAGE.pattern}, length {language['minLength']}–{language['maxLength']}",
+    )
+    contact = properties["user_agent_contact"]
+    assert contact["maxLength"] == MAX_USER_AGENT_CONTACT
+    rows["user_agent_contact"] = (contact["default"], f"length ≤ {MAX_USER_AGENT_CONTACT}")
+    rows["debug_lengths"] = (properties["debug_lengths"]["default"], "true, false")
+    assert set(rows) == set(properties) - {"limits"}
+    return rows
+
+
+@pytest.mark.parametrize("path", [GUIDE, GUIDE_FR], ids=["en", "fr"])
+def test_ac24_the_settings_table_equals_the_manifest(path: Path) -> None:
+    """AC24 (R9): each guide's settings table names exactly the 16 settings —
+    ``provider``, ``brave_api_key``, the 13 of R5 and ``debug_lengths`` —
+    each with the manifest's default and range; the ranges the validator
+    holds (64 hosts, the host length, the language shape, the contact
+    length) equal its constants."""
+
+    expected = manifest_settings_rows()
+    assert len(expected) == 16
+    table = settings_table(path)
+    assert table == expected
+    for name, (default, _range) in table.items():
+        if default is not NO_DEFAULT:
+            assert type(default) is type(expected[name][0]), name
+
+
+def test_ac24_the_readme_lists_the_capability_and_links_the_guide() -> None:
+    """AC24 (R9): the README links the guide and says the providers are
+    proven against fakes only."""
+
+    text = README.read_text(encoding="utf-8")
+    assert "](docs/web-knowledge.md)" in text
+    assert "](docs/web-knowledge.fr.md)" in text
+    assert "proven against fakes only" in text
+    assert "| `modules/web/` |" in text
+
+
+def test_ac24_pyproject_declares_exactly_two_runtime_dependencies() -> None:
+    """AC24 (R9): ``aiohttp`` and ``PyYAML`` only, and the ``modules.web``
+    package-data line."""
+
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+        import tomli as tomllib
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    names = [
+        re.split(r"[\s<>=!~;\[]", spec, maxsplit=1)[0]
+        for spec in project["project"]["dependencies"]
+    ]
+    assert names == ["aiohttp", "PyYAML"]
+    assert project["tool"]["setuptools"]["package-data"]["modules.web"] == ["module.yaml"]
+
+
+def _git(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(ROOT), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base() -> None:
+    """AC24 (R9): ``git diff 7c29434 -- '*.example'`` — the working tree
+    against the tree before phase 7 — has 0 changed lines in the 4 shipped
+    profiles."""
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not available: the phase-base diff cannot be taken")
+    if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
+        pytest.skip("not a git work tree: the phase-base diff cannot be taken")
+    if _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode != 0:
+        pytest.skip(f"the phase base {PHASE_BASE} is not in this clone (shallow?)")
+
+    numstat = _git("diff", "--numstat", PHASE_BASE, "--", "*.example")
+    assert numstat.returncode == 0, numstat.stderr
+    assert numstat.stdout.strip() == ""
+    for name in SHIPPED_PROFILES:
+        assert _git("cat-file", "-e", f"{PHASE_BASE}:{name}").returncode == 0, name
+        assert (ROOT / name).is_file(), name
+
+
+@pytest.mark.parametrize(
+    ("path", "heading", "wiki"),
+    [(GUIDE, "## Operator trial", "Wikipedia"), (GUIDE_FR, "## Essai opérateur", "Wikipédia")],
+    ids=["en", "fr"],
+)
+def test_ac25_both_guides_document_the_operator_trial_and_its_record(
+    path: Path, heading: str, wiki: str
+) -> None:
+    """AC25 docs half (R10): each guide has the manual operator-trial section
+    — Wikipedia, and Brave when a key exists — naming its record file."""
+
+    text = path.read_text(encoding="utf-8")
+    section = text.split(f"\n{heading}\n", 1)[1].split("\n## ", 1)[0]
+    assert TRIAL_RECORD in section
+    assert wiki in section
+    assert "Brave" in section and "BRAVE_API_KEY" in section
+    assert "blocked_address" in section
+
+
+def _activate_calls(tree: ast.Module) -> list[tuple[str, ast.Call, bool]]:
+    """Every ``activate(...)`` call of this file: its test, the call, and
+    whether it sits inside a ``pytest.raises`` block."""
+
+    found: list[tuple[str, ast.Call, bool]] = []
+
+    def visit(node: ast.AST, function: str, raising: bool) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function = node.name
+        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+            isinstance(item.context_expr, ast.Call)
+            and ast.unparse(item.context_expr.func) == "pytest.raises"
+            for item in node.items
+        ):
+            raising = True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "activate"
+        ):
+            found.append((function, node, raising))
+        for child in ast.iter_child_nodes(node):
+            visit(child, function, raising)
+
+    visit(tree, "<module>", False)
+    return found
+
+
+def _passes_the_transport(call: ast.Call) -> bool:
+    settings = call.args[1] if len(call.args) > 1 else None
+    return isinstance(settings, ast.Dict) and any(
+        isinstance(key, ast.Constant) and key.value == "_transport" for key in settings.keys
+    )
+
+
+def test_ac25_every_activation_here_passes_the_transport_seam() -> None:
+    """AC25 structural half (R10): an AST scan of this file — every
+    ``activate(`` call passes the ``_transport`` seam, except calls refused
+    inside ``pytest.raises`` (no handle exists) and the single P4 no-call
+    test, which activates with no seam and makes no call."""
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    calls = _activate_calls(tree)
+    assert len(calls) >= 6
+    seamless = {
+        function
+        for function, call, raising in calls
+        if not raising and not _passes_the_transport(call)
+    }
+    assert seamless == {NO_SEAM_TEST}
+    # The scan can fail: a seamless call outside the allowed test is found.
+    probe = ast.parse("async def test_x():\n    await activate(context, {}, {})\n")
+    flagged = {
+        function
+        for function, call, _raising in _activate_calls(probe)
+        if not _passes_the_transport(call)
+    }
+    assert flagged == {"test_x"}
+
+
+def test_ac25_no_other_test_file_imports_the_web_module() -> None:
+    """AC25 structural half (R10): ``tests/test_web.py`` is the one test file
+    that imports ``modules.web``, so no other test can reach its transport."""
+
+    importing = []
+    for path in sorted((ROOT / "tests").rglob("*.py")):
+        if path.resolve() == Path(__file__).resolve():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(
+                alias.name == "modules.web" or alias.name.startswith("modules.web.")
+                for alias in node.names
+            ):
+                importing.append(path.name)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None and (
+                node.module == "modules.web"
+                or node.module.startswith("modules.web.")
+                or (node.module == "modules" and any(alias.name == "web" for alias in node.names))
+            ):
+                importing.append(path.name)
+        if re.search(r"""import_module\(\s*["']modules\.web""", path.read_text(encoding="utf-8")):
+            importing.append(path.name)
+    assert importing == []

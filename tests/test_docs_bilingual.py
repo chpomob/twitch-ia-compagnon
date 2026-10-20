@@ -45,7 +45,14 @@ _TOKEN = re.compile(r"^(?:--[a-z][a-z-]*|python -m [\w.]+|twitch-ia-compagnon[\w
 
 PAIRS = _pairs()
 
-GUIDES = ("installation", "config-ui", "proxy-protocol", "design-v2", "automation-bridge")
+GUIDES = (
+    "installation",
+    "config-ui",
+    "proxy-protocol",
+    "design-v2",
+    "automation-bridge",
+    "web-knowledge",
+)
 """The guides that must exist in both languages.
 
 The rule is a repository rule, not an aspiration: a guide ships in English and in
