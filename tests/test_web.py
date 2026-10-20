@@ -4186,6 +4186,406 @@ def stored_content(rig: ReadRig) -> int:
     return sum(entry_bytes(key, observation) for key, observation in rig.handle._cache._snapshot())
 
 
+#: Gate P12F4 F1a: one 8 MiB start tag that never closes, of bare
+#: attributes and of quoted ones holding a ``>``.
+UNFINISHED_TAGS = [
+    pytest.param(b"<p" + b" a" * ((8388608 - 2) // 2), id="bare-attributes"),
+    pytest.param(b"<p" + b' a=">"' * ((8388608 - 2) // 6), id="quoted-attributes"),
+]
+
+
+@pytest.mark.parametrize("body", UNFINISHED_TAGS)
+async def test_p12f4_an_unfinished_8_mib_tag_honours_the_1s_bound_on_the_real_clock(
+    body: bytes,
+) -> None:
+    """Gate P12F4 F1a: an 8 MiB tag that never closes, under
+    ``request_timeout_seconds: 1``, used to end ``timeout timed_out`` at
+    2.36 s: each feed re-read the growing tag in one match that held the
+    interpreter for up to 0.9 s, so neither the walk nor the event loop
+    could look at the deadline. The tag's end is now looked for in bounded
+    steps, and the call ends within the bound — ``timeout timed_out`` if
+    the walk is still running at 1 s, else the dropped tag's empty text."""
+
+    rig = await read_rig(
+        max_response_bytes=8388608, request_timeout_seconds=1, cache_ttl_seconds=0
+    )
+    rig.handle._sleeper = None
+    rig.transport.script("example.org", html_page(body))
+
+    start = time.monotonic()
+    observation = await rig.read("https://example.org/")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.25, elapsed
+    if observation.status == "success":
+        assert read_success(observation)["text"] == ""
+    else:
+        assert_read_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert rig.handle._in_flight == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        *UNFINISHED_TAGS,
+        pytest.param(b"</p" + b' a=">"' * ((8388608 - 3) // 6), id="end-tag"),
+    ],
+)
+def test_p12f4_the_search_for_a_tag_end_stops_soon_after_its_deadline(body: bytes) -> None:
+    """Gate P12F4 F1a: the parser holding the whole 8 MiB unfinished tag
+    looks for its end in steps the deadline sits between — not in one
+    match that holds the interpreter for most of a second."""
+
+    import modules.web as web
+
+    parser = web._TextParser()
+    parser.rawdata = body.decode("ascii")
+    deadline = time.monotonic() + 0.05
+    token = web._EXTRACTION_EXPIRED.set(lambda: time.monotonic() >= deadline)
+    try:
+        with pytest.raises(web.ExtractionAbandoned):
+            if body.startswith(b"</"):
+                parser.parse_endtag(0)
+            else:
+                parser.check_for_whole_start_tag(0)
+    finally:
+        web._EXTRACTION_EXPIRED.reset(token)
+    assert time.monotonic() - deadline < 0.05
+
+
+def test_p12f4_the_stepped_tag_end_matches_the_standard_parser() -> None:
+    """The stepped search for a tag's end finds the end the standard
+    parser's one match finds, on tags of every shape, steps of one
+    attribute included."""
+
+    import html.parser
+    import random
+
+    import modules.web as web
+
+    assert web._STEPPED_TAG_END
+    pieces = ["a", "b", "=", '"', "'", " ", "\t", "/", ">", "x", "\n", "==", " = "]
+    generator = random.Random(1204)
+    single = re.compile(
+        web._TAG_ATTRIBUTES.pattern.replace("{0,%d}" % web._ATTRIBUTES_PER_STEP, "{0,1}"),
+        re.VERBOSE,
+    )
+    for pattern in (web._TAG_ATTRIBUTES, single):
+        for _ in range(20_000):
+            tag = "<p" + "".join(generator.choice(pieces) for _ in range(generator.randint(0, 30)))
+            match = html.parser.locatetagend.match(tag, 1)
+            expected = match.end() if tag[match.end() - 1] == ">" else -1
+            parser = web._TextParser()
+            parser.rawdata = tag
+            saved, web._TAG_ATTRIBUTES = web._TAG_ATTRIBUTES, pattern
+            try:
+                assert parser._tag_end(1) == expected, tag
+            finally:
+                web._TAG_ATTRIBUTES = saved
+
+
+async def test_p12f4_a_1_mib_page_of_ordinary_tags_still_reads_within_1s() -> None:
+    """Gate P12F4 F1a control: a legitimate 1 MiB page of ordinary markup
+    is parsed whole under ``request_timeout_seconds: 1`` and its text cut
+    to ``max_text_bytes``, as before."""
+
+    paragraph = b'<div class="c"><p id="p">Kelp grove <b>arches</b> &amp; more.</p></div>\n'
+    page = b"<title>Long</title>" + paragraph * (1_048_576 // len(paragraph))
+    assert len(page) > 1_000_000
+    rig = await read_rig(
+        max_response_bytes=8388608,
+        max_text_bytes=65536,
+        request_timeout_seconds=1,
+        cache_ttl_seconds=0,
+    )
+    rig.handle._sleeper = None
+    rig.transport.script("example.org", html_page(page))
+
+    start = time.monotonic()
+    result = read_success(await rig.read("https://example.org/"))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1, elapsed
+    assert result["title"] == "Long"
+    lines = result["text"].split("\n")
+    assert set(lines[:-1]) == {"Kelp grove arches & more."}
+    assert len(lines) == 65536 // len("Kelp grove arches & more.\n") + 1
+    assert result["truncated"] is True
+
+
+async def test_p12f4_a_store_that_outlives_the_deadline_is_timed_out_with_no_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate P12F4 F1b: the cache store used to run after the deadline was
+    cancelled, so a store held up 1.2 s past a 1 s bound still returned
+    ``success`` and kept its entry. The store is now under the deadline:
+    the call is ``timeout timed_out`` and the cache holds nothing."""
+
+    import modules.web as web
+
+    put = web._ObservationCache.put
+
+    def slow(self: Any, *arguments: Any) -> None:
+        threading.Event().wait(1.2)
+        put(self, *arguments)
+
+    monkeypatch.setattr(web._ObservationCache, "put", slow)
+    rig = await read_rig(request_timeout_seconds=1)
+    rig.handle._sleeper = None
+    rig.transport.script("example.org", html_page(b"<p>x</p>"))
+
+    observation = await rig.read("https://example.org/")
+
+    assert_read_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert rig.handle._cache.stats() == (0, 0)
+    (trace,) = rig.completed()
+    assert trace["outcome"] == ERROR_TIMED_OUT
+    assert trace["text_bytes"] == 0
+
+
+async def test_p12f4_a_search_stored_past_its_deadline_is_timed_out_on_the_injected_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate P12F4 F1b for both actions: a search whose store the deadline
+    overtakes is ``timeout timed_out`` with no entry; once the store is
+    quick again, the same search succeeds and is stored."""
+
+    import modules.web as web
+
+    rig = await search_rig()
+    put = web._ObservationCache.put
+    held = [True]
+
+    def slow(self: Any, *arguments: Any) -> None:
+        if held[0]:
+            rig.clock.advance(10)
+        put(self, *arguments)
+
+    monkeypatch.setattr(web._ObservationCache, "put", slow)
+    rig.transport.script(
+        WIKIPEDIA_EN,
+        fixture_answer("mediawiki_search_8.json"),
+        fixture_answer("mediawiki_search_8.json"),
+    )
+
+    assert_search_outcome(await rig.search("zebra"), "timeout", ERROR_TIMED_OUT)
+    assert rig.handle._cache.stats() == (0, 0)
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["dropped_count"]) == (0, 0)
+
+    held[0] = False
+    assert search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+    assert rig.handle._cache.stats().entries == 1
+
+
+async def test_p12f4_a_6_mb_search_answer_times_out_at_1s_on_the_real_clock() -> None:
+    """Gate P12F4 N1: a correctly shaped 6,000,058-byte answer whose one
+    snippet is two million ``<p>`` used to succeed after 3.57 s, parsed on
+    the event loop after the fetch's timer was cancelled. The JSON, each
+    result and the counts are now built on a worker thread under the
+    call's deadline: ``timeout timed_out`` at about 1 s, nothing counted,
+    nothing stored, and the walk stops at the same deadline."""
+
+    import modules.web as web
+
+    stopped = threading.Event()
+    walked: list[str] = []
+    plain = web._plain
+
+    def watched(text: str) -> str:
+        try:
+            return plain(text)
+        except web.ExtractionAbandoned:
+            walked.append("abandoned")
+            raise
+        finally:
+            stopped.set()
+
+    rig = await search_rig(max_response_bytes=8388608, request_timeout_seconds=1)
+    rig.handle._sleeper = None
+    answer = json.dumps(
+        {"query": {"search": [{"title": "Valid", "snippet": "<p>" * 2_000_000}]}}
+    ).encode("utf-8")
+    assert len(answer) == 6_000_058
+    rig.transport.script(WIKIPEDIA_EN, json_answer(answer))
+
+    original = web._plain
+    web._plain = watched
+    try:
+        start = time.monotonic()
+        observation = await rig.search("zebra")
+        elapsed = time.monotonic() - start
+        assert await asyncio.to_thread(stopped.wait, 2.0)
+    finally:
+        web._plain = original
+
+    assert_search_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert 0.9 <= elapsed < 1.25, elapsed
+    assert walked == ["abandoned"]
+    assert rig.handle._cache.stats() == (0, 0)
+    assert rig.handle._in_flight == 0
+    (trace,) = rig.searched()
+    assert trace["outcome"] == ERROR_TIMED_OUT
+    assert (trace["result_count"], trace["dropped_count"]) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param("[" + ",".join(["0"] * 4_000_000) + "]", id="numbers"),
+        pytest.param("[" + ",".join(["true", "null"] * 1_000_000) + "]", id="literals"),
+        pytest.param('{"a":' + ",".join(["1"] * 3_000_000).join("[]") + "}", id="member"),
+        pytest.param('"' + "\\u0041" * 1_200_000 + '"', id="escapes"),
+        pytest.param('["' + "\\n" * 3_000_000 + '"]', id="escapes-in-array"),
+    ],
+)
+def test_p12f4_the_json_walk_stops_soon_after_its_deadline_inside_one_value(
+    document: str,
+) -> None:
+    """Gate P12F4 review A1: the deadline is looked at before each scalar
+    of an array or object and each chunk of a string, not only as an
+    array, object or string begins — so the loop over a million numbers
+    or escapes ends soon after the deadline, not when the value does."""
+
+    import modules.web as web
+
+    deadline = time.monotonic() + 0.05
+    token = web._EXTRACTION_EXPIRED.set(lambda: time.monotonic() >= deadline)
+    try:
+        with pytest.raises(web.ExtractionAbandoned):
+            web._json_answer(document.encode("utf-8"))
+    finally:
+        web._EXTRACTION_EXPIRED.reset(token)
+    assert time.monotonic() - deadline < 0.05
+
+
+def test_p12f4_the_stepped_json_decoder_matches_the_standard_one() -> None:
+    """The stepped decoder reads what ``json.loads`` reads, and refuses
+    what it refuses, on documents of every shape — escapes, surrogate
+    pairs, control characters and malformed tails included."""
+
+    import random
+
+    import modules.web as web
+
+    pieces = [
+        "[", "]", "{", "}", ",", ":", " ", '"', '"a"', '"\\u00e9"', '"\\ud83d\\ude00"',
+        '"\\ud83d"', '"\\n\\t\\/"', '"\\x"', '"\\u12"', '"\x01"', "\\",
+        "0", "-1.5e3", "true", "false", "null", "NaN", "-Infinity", "tru",
+    ]
+    generator = random.Random(1204)
+    documents = [
+        json.dumps({"a": [1, 2.5, None, True, "x\u00e9\U0001f600\n"], "b": {"c": []}}),
+        *("".join(generator.choice(pieces) for _ in range(generator.randint(1, 12)))
+          for _ in range(20_000)),
+    ]
+    for document in documents:
+        try:
+            expected = json.loads(document)
+        except ValueError:
+            assert web._json_answer(document.encode("utf-8", "surrogatepass")) is web.MALFORMED
+            continue
+        answer = web._json_answer(document.encode("utf-8", "surrogatepass"))
+        assert json.dumps(answer) == json.dumps(expected), document
+
+
+async def test_p12f4_a_timed_out_scalar_answer_leaves_no_walk_running() -> None:
+    """Gate P12F4 review A1: an 8,000,001-byte answer of four million
+    numbers parses for longer than the 1 s bound. The call times out at
+    about 1 s, and the walk on its worker thread stops soon after — it
+    does not run on through the array, holding a thread the in-flight
+    count no longer covers."""
+
+    rig = await search_rig(max_response_bytes=8388608, request_timeout_seconds=1)
+    rig.handle._sleeper = None
+    answer = ('{"query":{"search":' + ",".join(["0"] * 4_000_000).join("[]") + "}}").encode()
+    assert len(answer) <= 8388608
+    rig.transport.script(WIKIPEDIA_EN, json_answer(answer))
+
+    start = time.monotonic()
+    observation = await rig.search("zebra")
+    elapsed = time.monotonic() - start
+
+    def walking() -> bool:
+        return any(thread.name == "web-deadline-walk" for thread in threading.enumerate())
+
+    await wait_until(lambda: not walking(), seconds=0.25)
+    assert_search_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert 0.9 <= elapsed < 1.25, elapsed
+    assert not walking()
+    assert rig.handle._cache.stats() == (0, 0)
+    assert rig.handle._in_flight == 0
+
+
+async def test_p12f4_a_search_within_the_budget_returns_its_results_on_the_real_clock() -> None:
+    """Gate P12F4 N1 controls on the real clock under a 1 s bound: the
+    ordinary answer returns its results, and an answer whose parse is
+    real work but fits the budget — a 60,000-byte snippet — is unaffected
+    and stored."""
+
+    rig = await search_rig(max_response_bytes=8388608, request_timeout_seconds=1)
+    rig.handle._sleeper = None
+    heavy = json.dumps(
+        {"query": {"search": [{"title": "Heavy", "snippet": "<p>" * 20_000 + "kelp"}]}}
+    ).encode("utf-8")
+    rig.transport.script(
+        WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"), json_answer(heavy)
+    )
+
+    start = time.monotonic()
+    results = search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+    heavy_results = search_success(await rig.search("kelp"), PROVIDER_WIKIPEDIA)
+    elapsed = time.monotonic() - start
+
+    assert len(results) == rig.handle.settings.max_results
+    assert heavy_results == [
+        {"title": "Heavy", "url": "https://en.wikipedia.org/wiki/Heavy", "excerpt": "kelp"}
+    ]
+    assert elapsed < 1, elapsed
+    assert rig.handle._cache.stats().entries == 2
+    assert [trace["status"] for trace in rig.searched()] == ["success", "success"]
+
+
+async def test_p12f4_a_search_parse_the_deadline_overtakes_is_timeout_on_the_injected_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate P12F4 N1: the deadline that bounds the search's fetch bounds
+    its parse too — off the event loop. A parse still running when it
+    elapses ends the call ``timeout timed_out`` and its late answer is
+    discarded, never counted nor stored."""
+
+    import modules.web as web
+
+    release = threading.Event()
+    parsed_on: list[threading.Thread] = []
+
+    def slow(_self: Any, _body: bytes) -> Any:
+        parsed_on.append(threading.current_thread())
+        release.wait(5)
+        return [{"title": "Late", "url": "https://late.example/", "excerpt": ""}], 3
+
+    monkeypatch.setattr(web.WikipediaBackend, "parse", slow)
+    rig = await search_rig()
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"))
+    start = rig.clock.now
+
+    call = asyncio.ensure_future(rig.search("zebra"))
+    await wait_until(lambda: bool(parsed_on), seconds=5)
+    assert not call.done()
+    rig.clock.advance(10)
+    await spin()
+    release.set()
+
+    assert_search_outcome(await call, "timeout", ERROR_TIMED_OUT)
+    assert rig.clock.now - start == 10
+    assert threading.main_thread() not in parsed_on
+    assert rig.handle._cache.stats() == (0, 0)
+    assert rig.handle._in_flight == 0
+    assert rig.clock.next_deadline() is None
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["dropped_count"]) == (0, 0)
+
+
 def brave_answer(*results: tuple[str, str]) -> FakeResponse:
     items = [
         {"title": title, "url": url, "description": "An excerpt."} for title, url in results

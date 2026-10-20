@@ -167,10 +167,13 @@ not text: a comment or another attribute naming a charset decides nothing.
 A label is used only if it names a text codec that decodes with
 replacement. The text, and every cut of it, is always UTF-8 encodable.
 :func:`cut_utf8` is the one byte bound on text: it cuts on a character
-boundary and says whether it cut. A ``web.read`` extracts on a worker thread
-under what is left of the call's one deadline, and the parser checks that
-deadline as it walks, so a page too big to parse in time is ``timeout
-timed_out``, never a late success.
+boundary and says whether it cut. A ``web.read`` extracts — and a
+``web.search`` decodes its JSON and builds each result — on a worker thread
+under what is left of the call's one deadline, and the walk checks that
+deadline as it goes, in steps no single match outlasts (a tag's end, a JSON
+value), so an answer too big to parse in time is ``timeout timed_out``,
+never a late success. The cache store is under the same deadline: a success
+ready only once it expired is not stored.
 
 **Seams, for the tests.** ``_transport`` replaces the HTTP transport,
 ``_resolver`` the name resolution and ``_sleeper`` the sleep a bound is
@@ -191,6 +194,8 @@ import importlib.metadata
 import inspect
 import ipaddress
 import json
+import json.decoder
+import json.scanner
 import logging
 import re
 import socket
@@ -199,6 +204,11 @@ import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass
+# The codec every decode falls back to, imported now: the first decode runs
+# on a worker thread, where the import's file reads would each have to win
+# the interpreter back from a busy event loop.
+import encodings.utf_8_sig  # noqa: F401
+import html.parser
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -794,6 +804,36 @@ _BLOCK_ELEMENTS = frozenset(
 #: A start tag's name, as the standard parser reads it after the ``<``.
 _TAG_NAME = re.compile(r"([a-zA-Z][^\t\n\r\f />]*)")
 
+#: Whether this ``html.parser`` finds a tag's end with ``locatetagend``, the
+#: grammar :data:`_TAG_HEAD` and :data:`_TAG_ATTRIBUTES` restate in steps.
+_STEPPED_TAG_END = hasattr(html.parser, "locatetagend")
+
+#: How many attributes one step of the tag-end scan reads, at most.
+_ATTRIBUTES_PER_STEP = 1024
+
+#: ``locatetagend`` up to its attributes: the name and the space after it.
+_TAG_HEAD = re.compile(r"[a-zA-Z][^\t\n\r\f />]*[\t\n\r\f /]*")
+
+#: At most :data:`_ATTRIBUTES_PER_STEP` of ``locatetagend``'s attributes.
+#: Nothing after them can fail, so the greedy repetition never gives one
+#: back: steps that start where the last one stopped end where the single
+#: match would, and each is one bounded call the deadline can sit between.
+_TAG_ATTRIBUTES = re.compile(
+    r"""
+  (?:(?<=['"\t\n\r\f /])[^\t\n\r\f />][^\t\n\r\f /=>]*  # attribute name
+    (?:[\t\n\r\f ]*=[\t\n\r\f ]*    # value indicator
+      (?:'[^']*'                    # LITA-enclosed value
+        |"[^"]*"                    # LIT-enclosed value
+        |(?!['"])[^>\t\n\r\f ]*     # bare value
+       )
+     )?
+    [\t\n\r\f /]*                   # possibly followed by a space
+   ){0,%d}
+"""
+    % _ATTRIBUTES_PER_STEP,
+    re.VERBOSE,
+)
+
 _INLINE_WHITESPACE = re.compile(r"[^\S\n]+")
 _WHITESPACE = re.compile(r"\s+")
 
@@ -1024,7 +1064,9 @@ class _TextParser(HTMLParser):
     would walk every attribute of it before any handler — and so any look
     at the deadline — runs. Start tags are counted by their length too, so
     the deadline is looked at at least once every :data:`_FEED_CHARS`
-    characters of them.
+    characters of them. The end of a start or end tag is found in bounded
+    steps (:meth:`_tag_end`), the deadline looked at between them, so a tag
+    still open across feeds is never re-read in one long match.
     """
 
     def __init__(self) -> None:
@@ -1037,6 +1079,7 @@ class _TextParser(HTMLParser):
         self._title_done = False
         self._events = 0
         self._tag_chars = 0
+        self._known_end: tuple[int, int] | None = None
 
     def _hidden(self) -> bool:
         return any(self._skipped.values())
@@ -1047,6 +1090,7 @@ class _TextParser(HTMLParser):
             _check_deadline()
 
     def parse_starttag(self, i: int) -> int:
+        _check_deadline()
         end = self.check_for_whole_start_tag(i)
         if end < 0:
             return end
@@ -1055,7 +1099,12 @@ class _TextParser(HTMLParser):
             self._tag_chars = 0
             _check_deadline()
         if end - i <= _FEED_CHARS:
-            return super().parse_starttag(i)
+            # The standard parser asks for the end again: it is known.
+            self._known_end = (i, end)
+            try:
+                return super().parse_starttag(i)
+            finally:
+                self._known_end = None
         name = _TAG_NAME.match(self.rawdata, i + 1)
         if name is None:  # unreachable: the caller matched ``<`` + letter
             return super().parse_starttag(i)
@@ -1069,6 +1118,56 @@ class _TextParser(HTMLParser):
         elif tag in self.RCDATA_CONTENT_ELEMENTS:
             self.set_cdata_mode(tag, escapable=True)
         return end
+
+    def check_for_whole_start_tag(self, i: int) -> int:
+        known = self._known_end
+        if known is not None and known[0] == i:
+            return known[1]
+        if not _STEPPED_TAG_END:
+            return super().check_for_whole_start_tag(i)
+        return self._tag_end(i + 1)
+
+    def parse_endtag(self, i: int) -> int:
+        rawdata = self.rawdata
+        if (
+            not _STEPPED_TAG_END
+            or rawdata.find(">", i + 2) < 0
+            or not html.parser.endtagopen.match(rawdata, i)
+        ):
+            return super().parse_endtag(i)
+        end = self._tag_end(i + 2)
+        if end < 0:
+            return -1
+        name = html.parser.tagfind_tolerant.match(rawdata, i + 2)
+        if name is None:  # unreachable: the end tag opens with a letter
+            return super().parse_endtag(i)
+        self.handle_endtag(name.group(1).lower())
+        self.clear_cdata_mode()
+        return end
+
+    def _tag_end(self, name_at: int) -> int:
+        """Where the tag whose name starts at *name_at* ends, or ``-1``.
+
+        The standard parser's ``locatetagend`` in bounded steps, the deadline
+        looked at between them: one match over a tag of millions of
+        attributes holds the interpreter until it returns, so the event
+        loop could not end the call on time however often the walk checked
+        between matches. No step reads more than
+        :data:`_ATTRIBUTES_PER_STEP` attributes.
+        """
+
+        rawdata = self.rawdata
+        head = _TAG_HEAD.match(rawdata, name_at)
+        if head is None:  # unreachable: the caller matched a letter
+            return -1
+        position = head.end()
+        while True:
+            end = _TAG_ATTRIBUTES.match(rawdata, position).end()
+            if end == position:
+                break
+            position = end
+            _check_deadline()
+        return position + 1 if rawdata.startswith(">", position) else -1
 
     def set_cdata_mode(self, elem: str, **kwargs: Any) -> None:
         # A hidden ``<title>`` or ``<textarea>`` is no element at all, so its
@@ -1733,14 +1832,19 @@ def _parsed_items(
     URL encoding or the extractor refuses — is dropped and counted, and its
     siblings are kept. An answer with items of which none is usable is
     :class:`Malformed` carrying that dropped count, never a success with
-    nothing; an empty list is an answer with no hits.
+    nothing; an empty list is an answer with no hits. The deadline the
+    walk runs under is looked at before each item, and its expiry is
+    :class:`ExtractionAbandoned`, never a dropped item.
     """
 
     results: list[dict[str, str]] = []
     dropped = 0
     for item in items:
+        _check_deadline()
         try:
             result = result_of(item)
+        except ExtractionAbandoned:
+            raise
         except Exception:  # noqa: BLE001 - the error's text would quote the item
             result = None
         if result is None:
@@ -1752,11 +1856,110 @@ def _parsed_items(
     return results, dropped
 
 
+def _checked_scan(scan_once: Callable[..., Any]) -> Callable[..., Any]:
+    """*scan_once*, the deadline looked at before each value it reads."""
+
+    def checked(string: str, index: int) -> Any:
+        _check_deadline()
+        return scan_once(string, index)
+
+    return checked
+
+
+def _stepped_array(s_and_end: tuple[str, int], scan_once: Callable[..., Any]) -> Any:
+    """``JSONArray`` with the deadline looked at before each element — a
+    number, a literal and a string value alike."""
+
+    _check_deadline()
+    return json.decoder.JSONArray(s_and_end, _checked_scan(scan_once))
+
+
+def _stepped_object(
+    s_and_end: tuple[str, int], strict: bool, scan_once: Callable[..., Any], *hooks: Any
+) -> Any:
+    """``JSONObject`` with the deadline looked at before each member's value."""
+
+    _check_deadline()
+    return json.decoder.JSONObject(s_and_end, strict, _checked_scan(scan_once), *hooks)
+
+
+def _stepped_string(string: str, end: int, strict: bool = True) -> tuple[str, int]:
+    """``py_scanstring`` with the deadline looked at before each chunk: the
+    run up to the next escape, and the escape it ends on.
+
+    The standard Python step reads every escape of one string in a loop no
+    deadline sits in; a multi-megabyte string of escapes held its thread
+    for as long, past the call's end.
+    """
+
+    chunks: list[str] = []
+    begin = end - 1
+    while True:
+        _check_deadline()
+        chunk = json.decoder.STRINGCHUNK.match(string, end)
+        if chunk is None:
+            raise json.JSONDecodeError("Unterminated string starting at", string, begin)
+        end = chunk.end()
+        content, terminator = chunk.groups()
+        if content:
+            chunks.append(content)
+        if terminator == '"':
+            return "".join(chunks), end
+        if terminator != "\\":
+            if strict:
+                raise json.JSONDecodeError("Invalid control character", string, end - 1)
+            chunks.append(terminator)
+            continue
+        escape = string[end : end + 1]
+        if escape != "u":
+            try:
+                chunks.append(json.decoder.BACKSLASH[escape])
+            except KeyError:
+                raise json.JSONDecodeError("Invalid \\escape", string, end) from None
+            end += 1
+            continue
+        code = json.decoder._decode_uXXXX(string, end)
+        end += 5
+        if 0xD800 <= code <= 0xDBFF and string[end : end + 2] == "\\u":
+            low = json.decoder._decode_uXXXX(string, end + 1)
+            if 0xDC00 <= low <= 0xDFFF:
+                code = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00))
+                end += 6
+        chunks.append(chr(code))
+
+
+class _SteppedDecoder(json.JSONDecoder):
+    """``json`` decoding in Python steps: the deadline is looked at before
+    each value — of an array, of an object, at the top — and before each
+    chunk of a string.
+
+    The C scanner reads a whole document in one call that holds the
+    interpreter — half a second for some 7 MB answers — so the event loop
+    could not end the call on time while it ran. Looking only as an object,
+    array or string begins was not enough either: an array of a million
+    numbers, or a string of a million escapes, is one long loop after that
+    look, and a walk the deadline had abandoned ran on through it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parse_object = _stepped_object
+        self.parse_array = _stepped_array
+        self.parse_string = _stepped_string
+        self.scan_once = _checked_scan(json.scanner.py_make_scanner(self))
+
+
 def _json_answer(body: bytes) -> Any:
-    """*body* as JSON, or :data:`MALFORMED`; the decoder's text is never read."""
+    """*body* as JSON, or :data:`MALFORMED`; the decoder's text is never read.
+
+    Decoded in steps (:class:`_SteppedDecoder`), so a deadline the walk runs
+    under ends it with :class:`ExtractionAbandoned`.
+    """
 
     try:
-        return json.loads(body)
+        return _SteppedDecoder().decode(body.decode(json.detect_encoding(body), "surrogatepass"))
+    except ExtractionAbandoned:
+        raise
     except Exception:  # noqa: BLE001 - the decoder's text would quote the body
         return MALFORMED
 
@@ -1963,8 +2166,8 @@ class _ObservationCache:
     An entry is the complete observation a provider returned; its size — the
     UTF-8 bytes of its key plus those of :func:`_observation_record` as
     compact sorted-key JSON — is computed once at :meth:`put` and kept next
-    to it — or, when the caller measured the record already (a read does so
-    on its worker thread, under its deadline), taken from the caller, so
+    to it — or, when the caller measured the record already (either action
+    does so on its worker thread, under its deadline), taken from the caller, so
     the event loop never serialises a page. :meth:`get` never serves an entry older than the TTL on the
     runtime clock (nor one stamped in the future), and :meth:`put` evicts the
     least recently used entries until both ``max_entries`` and ``max_bytes``
@@ -2042,6 +2245,12 @@ class _ObservationCache:
         while len(self._entries) > self._max_entries or self._stored_bytes > self._max_bytes:
             self._drop(next(iter(self._entries)))
 
+    def discard(self, key: str) -> None:
+        """Forget the entry under *key*, if there is one."""
+
+        if key in self._entries:
+            self._drop(key)
+
     def stats(self) -> CacheStats:
         return CacheStats(len(self._entries), self._stored_bytes)
 
@@ -2088,6 +2297,97 @@ class _Progress:
     """How far one fetch got, readable after its task is cancelled."""
 
     redirects: int = 0
+
+
+class _Deadline:
+    """One call's whole deadline: ``request_timeout_seconds`` from its start.
+
+    :attr:`future` is the sleep the fetch races. :meth:`expired` also reads
+    the clock that sleep runs on — the event loop's for the default sleeper,
+    the runtime clock for an injected one — so work that held the loop past
+    the deadline is seen late at once, before the sleep's own wake-up runs.
+    :meth:`run` runs a function on a worker thread under it.
+    """
+
+    __slots__ = ("future", "_now", "_expires_at")
+
+    def __init__(self, sleeper: Any, clock: Callable[[], float], seconds: float) -> None:
+        if sleeper is None:
+            sleeper = asyncio.sleep
+            self._now: Callable[[], float] = asyncio.get_running_loop().time
+        else:
+            self._now = clock
+        self._expires_at = self._now() + seconds
+        self.future: "asyncio.Future[Any]" = asyncio.ensure_future(sleeper(seconds))
+
+    def __repr__(self) -> str:
+        return f"_Deadline(expired={self.expired()})"
+
+    def passed(self) -> bool:
+        """Whether the clock reads the deadline: safe from any thread."""
+
+        return self._now() >= self._expires_at
+
+    def expired(self) -> bool:
+        return self.future.done() or self.passed()
+
+    async def run(self, function: Callable[..., Any], *arguments: Any) -> tuple[bool, Any]:
+        """``(True, function(*arguments, expired))`` on a worker thread, or
+        ``(False, None)`` once the deadline expired first.
+
+        *expired* is what the thread's walk checks: it turns true when the
+        deadline passes or the caller is cancelled. An answer the thread
+        returns after the deadline is discarded, never a late success.
+
+        The thread is a new one, not a pool's: starting it hands it the
+        interpreter at once, where a pooled thread woken from its queue can
+        wait behind a busy event loop for as long as the loop keeps it.
+        """
+
+        stop = threading.Event()
+
+        def expired() -> bool:
+            return stop.is_set() or self.passed()
+
+        loop = asyncio.get_running_loop()
+        work: "asyncio.Future[Any]" = loop.create_future()
+        context = contextvars.copy_context()
+
+        def settle(outcome: Any, error: BaseException | None) -> None:
+            if work.done():
+                return
+            if error is None:
+                work.set_result(outcome)
+            else:
+                work.set_exception(error)
+
+        def walk() -> None:
+            outcome, error = None, None
+            try:
+                outcome = context.run(function, *arguments, expired)
+            except BaseException as caught:  # noqa: BLE001 - handed to the caller
+                error = caught
+            try:
+                loop.call_soon_threadsafe(settle, outcome, error)
+            except RuntimeError:  # the loop closed: nobody waits for the answer
+                return
+
+        threading.Thread(target=walk, name="web-deadline-walk", daemon=True).start()
+        try:
+            await asyncio.wait({work, self.future}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            stop.set()
+            work.cancel()
+            raise
+        if self.expired():
+            stop.set()
+            work.cancel()
+            return False, None
+        return True, work.result()
+
+    async def cancel(self) -> None:
+        self.future.cancel()
+        await asyncio.gather(self.future, return_exceptions=True)
 
 
 class WebModule:
@@ -2204,8 +2504,9 @@ class WebModule:
             try:
                 observation = await self._cached(
                     cache_key(WEB_READ_ACTION, PROVIDER_HTTP, invocation.call.arguments),
-                    lambda: self._read(url, trace, lengths),
+                    lambda deadline: self._read(url, trace, lengths, deadline),
                     lengths,
+                    lambda: _read_timed_out(trace),
                 )
             finally:
                 self._in_flight -= 1
@@ -2219,44 +2520,23 @@ class WebModule:
         return observation
 
     async def _read(
-        self, url: Any, trace: dict[str, Any], lengths: _Lengths
+        self, url: Any, trace: dict[str, Any], lengths: _Lengths, deadline: _Deadline
     ) -> ActionObservation:
         """Fetch, judge the content type unread, extract, bound (R3, R5).
 
-        One sleep of ``request_timeout_seconds`` bounds the whole call: the
-        fetch races it, and so does the work after it — the extraction, the
-        result and the serialisation the cache accounts it by — so all that
-        is left once it is cancelled is the cache's constant-time store.
-        """
-
-        sleeper = self._sleeper or asyncio.sleep
-        deadline = asyncio.ensure_future(sleeper(self._settings.request_timeout_seconds))
-        try:
-            return await self._read_within(url, trace, lengths, deadline)
-        finally:
-            deadline.cancel()
-            await asyncio.gather(deadline, return_exceptions=True)
-
-    async def _read_within(
-        self,
-        url: Any,
-        trace: dict[str, Any],
-        lengths: _Lengths,
-        deadline: "asyncio.Future[Any]",
-    ) -> ActionObservation:
-        """:meth:`_read` under *deadline*, which ends the call when it is done.
-
-        Extraction, the result and its measured cache record are built on a
-        worker thread, so the event loop keeps the deadline while a large
-        page is parsed and serialised; once it expires the thread's answer
-        is discarded and its parser, which checks the same deadline as it
-        walks, stops. A call that ran out of time is ``timeout timed_out``,
-        never a success with less text.
+        *deadline* bounds the whole call: the fetch races it, and so does
+        the work after it — the extraction, the result and the serialisation
+        the cache accounts it by — which runs on a worker thread, so the
+        event loop keeps the deadline while a large page is parsed and
+        serialised. Once it expires the thread's answer is discarded and its
+        parser, which checks the same deadline as it walks, stops. A call
+        that ran out of time is ``timeout timed_out``, never a success with
+        less text.
         """
 
         settings = self._settings
         fetched = await self.fetch(
-            url, apply_allowlist=True, accept_body=_readable_answer, deadline=deadline
+            url, apply_allowlist=True, accept_body=_readable_answer, deadline=deadline.future
         )
         trace["redirects"] = fetched.redirects
         if isinstance(fetched, FetchFailure):
@@ -2266,30 +2546,16 @@ class WebModule:
             return _read_failure(trace, fetched.status)
         if fetched.body is None:
             return _read_failure(trace, REFUSAL_UNSUPPORTED_CONTENT_TYPE)
-        expired = threading.Event()
-        work = asyncio.ensure_future(
-            asyncio.to_thread(
-                _read_success,
-                fetched,
-                _header(fetched.headers, "Content-Type"),
-                settings.max_text_bytes,
-                dict(trace),
-                expired.is_set,
-            )
+        finished, answered = await deadline.run(
+            _read_success,
+            fetched,
+            _header(fetched.headers, "Content-Type"),
+            settings.max_text_bytes,
+            dict(trace),
+            advisory_marker(),
         )
-        try:
-            await asyncio.wait({work, deadline}, return_when=asyncio.FIRST_COMPLETED)
-        except asyncio.CancelledError:
-            expired.set()
-            work.cancel()
-            raise
-        if deadline.done():
-            expired.set()
-            work.cancel()
-            return _read_failure(
-                trace, FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT, fetched.redirects)
-            )
-        answered = work.result()
+        if not finished:
+            return _read_timed_out(trace)
         if answered is None:  # the parser's text would quote the page
             return _read_failure(trace, ERROR_MALFORMED_RESPONSE)
         observation, lengths.record_bytes = answered
@@ -2327,8 +2593,9 @@ class WebModule:
             try:
                 observation = await self._cached(
                     cache_key(WEB_SEARCH_ACTION, backend.name, invocation.call.arguments),
-                    lambda: self._search(backend, query, trace, lengths),
+                    lambda deadline: self._search(backend, query, trace, lengths, deadline),
                     lengths,
+                    lambda: _search_timed_out(backend.name, trace),
                 )
             finally:
                 self._in_flight -= 1
@@ -2358,25 +2625,48 @@ class WebModule:
         _LOG.warning(line)
 
     async def _cached(
-        self, key: str, call: Callable[[], Any], lengths: _Lengths
+        self,
+        key: str,
+        call: Callable[[_Deadline], Any],
+        lengths: _Lengths,
+        timed_out: Callable[[], ActionObservation],
     ) -> ActionObservation:
         """Serve *key* from the cache, or run *call* and offer its answer.
 
         Looked up after admission, so a hit still took a slot, which its
         caller releases at once; a hit resolves and connects nothing (R5).
-        An answer whose record *call* measured (``lengths.record_bytes``) is
-        stored without being serialised again.
+        A miss starts the call's one deadline of ``request_timeout_seconds``
+        and hands it to *call*. The store is under that deadline too: an
+        answer that is only ready once it expired — or whose store outlived
+        it — leaves no entry and is *timed_out*'s observation, never a late
+        success. An answer whose record *call* measured
+        (``lengths.record_bytes``) is stored without being serialised again.
         """
 
         stored = self._cache.get(key)
         if stored is not None:
             return _served_from_cache(stored)
-        observation = await call()
-        self._cache.put(key, observation, lengths.record_bytes)
-        return observation
+        deadline = _Deadline(self._sleeper, self._clock, self._settings.request_timeout_seconds)
+        try:
+            observation = await call(deadline)
+            if observation.status != "success":
+                return observation
+            if not deadline.expired():
+                self._cache.put(key, observation, lengths.record_bytes)
+                if not deadline.expired():
+                    return observation
+                self._cache.discard(key)
+            return timed_out()
+        finally:
+            await deadline.cancel()
 
     async def _search(
-        self, backend: Any, query: Any, trace: dict[str, Any], lengths: _Lengths
+        self,
+        backend: Any,
+        query: Any,
+        trace: dict[str, Any],
+        lengths: _Lengths,
+        deadline: _Deadline,
     ) -> ActionObservation:
         """Ask *backend* through the guard, never the allowlist; parse, bound (R2).
 
@@ -2384,13 +2674,21 @@ class WebModule:
         and pinning as a read, but ``allowed_hosts`` does not apply to it
         (R4). Only a 2xx body is read, bounded by ``max_response_bytes``; one
         that was cut, or that is not the documented JSON shape, is
-        ``error malformed_response``.
+        ``error malformed_response``. As for a read, *deadline* bounds the
+        whole call: the JSON, every result's extraction, the dropped count
+        and the record the cache accounts the success by are built on a
+        worker thread that checks it as it walks, and a search that ran out
+        of time is ``timeout timed_out``.
         """
 
         settings = self._settings
         url, headers = backend.build_request(query, settings.max_results)
         fetched = await self.fetch(
-            url, apply_allowlist=False, accept_body=_successful_answer, headers=headers
+            url,
+            apply_allowlist=False,
+            accept_body=_successful_answer,
+            headers=headers,
+            deadline=deadline.future,
         )
         trace["redirects"] = fetched.redirects
         if isinstance(fetched, FetchFailure):
@@ -2400,27 +2698,24 @@ class WebModule:
             return _search_failure(backend.name, trace, fetched.status)
         if fetched.body is None or fetched.truncated:
             return _search_failure(backend.name, trace, ERROR_MALFORMED_RESPONSE)
-        try:
-            parsed = backend.parse(fetched.body)
-        except Exception:  # noqa: BLE001 - the parser's text would quote the answer
-            parsed = MALFORMED
-        if isinstance(parsed, Malformed):
-            trace["dropped_count"] = parsed.dropped
-            return _search_failure(backend.name, trace, ERROR_MALFORMED_RESPONSE)
-        results, dropped = parsed
-        results = results[: settings.max_results]
-        trace["result_count"] = len(results)
-        trace["dropped_count"] = dropped
-        return ActionObservation(
-            status="success",
-            provenance=_search_provenance(backend.name, trace),
-            result={
-                "advisory": advisory_marker(),
-                "provider": backend.name,
-                "results": results,
-            },
-            parts=(),
+        finished, answered = await deadline.run(
+            _search_success,
+            backend,
+            fetched.body,
+            settings.max_results,
+            dict(trace),
+            advisory_marker(),
         )
+        if not finished:
+            return _search_timed_out(backend.name, trace)
+        if isinstance(answered, Malformed):
+            trace["dropped_count"] = answered.dropped
+            return _search_failure(backend.name, trace, ERROR_MALFORMED_RESPONSE)
+        observation, lengths.record_bytes = answered
+        fields = observation.provenance["trace_fields"]
+        trace["result_count"] = fields["result_count"]
+        trace["dropped_count"] = fields["dropped_count"]
+        return observation
 
     # -- the guarded fetch (R4, R6) ----------------------------------------- #
 
@@ -2568,12 +2863,14 @@ def _read_success(
     content_type: str | None,
     max_text_bytes: int,
     trace: dict[str, Any],
+    marker: str,
     expired: Callable[[], bool],
 ) -> tuple[ActionObservation, int] | None:
     """A read's success observation and its cache record size, in bytes.
 
     The text is cut to *max_text_bytes*. *trace* is the thread's own copy:
-    the caller's is never touched here. Run on a worker thread under the
+    the caller's is never touched here; *marker* is :func:`advisory_marker`,
+    read by the caller. Run on a worker thread under the
     call's deadline: *expired* is what the parser checks as it walks, and
     the record is measured here, not on the event loop. ``None`` is a body
     the extractor could not parse, or one it gave up on because the
@@ -2588,7 +2885,7 @@ def _read_success(
         return None
     trace["text_bytes"] = len(text.encode("utf-8"))
     result: dict[str, Any] = {
-        "advisory": advisory_marker(),
+        "advisory": marker,
         "final_url": fetched.final_url,
         "text": text,
         "truncated": fetched.truncated or text_cut,
@@ -2599,6 +2896,48 @@ def _read_success(
         status="success",
         provenance=_read_provenance(trace),
         result=result,
+        parts=(),
+    )
+    return observation, _ObservationCache.record_size(observation)
+
+
+def _search_success(
+    backend: Any,
+    body: bytes,
+    max_results: int,
+    trace: dict[str, Any],
+    marker: str,
+    expired: Callable[[], bool],
+) -> tuple[ActionObservation, int] | Malformed:
+    """A search's success observation and its cache record size, in bytes.
+
+    At most *max_results* results. *trace* is the thread's own copy, its
+    counts filled here; *marker* is :func:`advisory_marker`, read by the
+    caller. Run on a worker thread under the call's deadline:
+    *expired* is what the JSON's walk and every result's extraction check.
+    :class:`Malformed` is an answer that is not the documented shape, or
+    one whose walk the deadline ended — the caller already knows which.
+    """
+
+    _EXTRACTION_EXPIRED.set(expired)
+    try:
+        parsed = backend.parse(body)
+    except Exception:  # noqa: BLE001 - the parser's text would quote the answer
+        return MALFORMED
+    if isinstance(parsed, Malformed):
+        return parsed
+    results, dropped = parsed
+    results = results[:max_results]
+    trace["result_count"] = len(results)
+    trace["dropped_count"] = dropped
+    observation = ActionObservation(
+        status="success",
+        provenance=_search_provenance(backend.name, trace),
+        result={
+            "advisory": marker,
+            "provider": backend.name,
+            "results": results,
+        },
         parts=(),
     )
     return observation, _ObservationCache.record_size(observation)
@@ -2652,6 +2991,16 @@ def _search_failure(
     )
 
 
+def _search_timed_out(provider: str, trace: dict[str, Any]) -> ActionObservation:
+    """A search the deadline ended after its fetch: counted nothing it kept."""
+
+    trace["result_count"] = 0
+    trace["dropped_count"] = 0
+    return _search_failure(
+        provider, trace, FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT, trace["redirects"])
+    )
+
+
 def _read_provenance(trace: Mapping[str, Any]) -> dict[str, Any]:
     """A read's provenance: the ``http`` provider and its count-only trace fields."""
 
@@ -2673,6 +3022,15 @@ def _read_failure(trace: dict[str, Any], outcome: FetchFailure | int | str) -> A
             "message": _failure_message(WEB_READ_ACTION, status, code),
             "retryable": False,
         },
+    )
+
+
+def _read_timed_out(trace: dict[str, Any]) -> ActionObservation:
+    """A read the deadline ended after its fetch: it kept no text."""
+
+    trace["text_bytes"] = 0
+    return _read_failure(
+        trace, FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT, trace["redirects"])
     )
 
 

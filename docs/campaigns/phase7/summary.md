@@ -5,9 +5,10 @@ Authority: `docs/campaigns/phase7/spec.md` (R1–R10, AC1–AC26), `docs/campaig
 and its binding decisions, `docs/design-v2.md`.
 
 - Pre-phase tree: `7c29434` (`docs(phase7): the approved specification, …`).
-- Evidence head: `174ab51` (P10, the last code commit on `main` before this summary). Every commit
-  hash below is a `main` commit. A gate fix round (P12) that adds a closing commit updates this
-  ledger before the final gate pass.
+- Evidence head: the P12F4 commit — the third gate fix round, which also refreshes this summary —
+  on top of `d31bf17` (P12F3). The summary was first written at `174ab51` (P10); the closing gate's
+  two passes and their fix rounds since are in [Gate fix rounds](#gate-fix-rounds). Every commit
+  hash below is a `main` commit (a commit cannot cite its own hash, so P12F4 is named, not hashed).
 - The gate half of AC26 (the full-branch review ending `APPROVE`, with an executed and failing
   counterexample for R4, R7 and R8) is P12's, not this document's.
 
@@ -18,10 +19,12 @@ key, Brave as an option) and `web.read` (one public page as bounded plain text).
 R1–R9 is carried by at least one commit on `main` and named tests in `tests/test_web.py` that pass
 at the evidence head; the scripted check below confirms that every cited test id is collected and
 every cited commit exists. The full suite is green (see [Suite count](#suite-count)). The allowlist
-audit finds **no added `skip`/`xfail` marker and no loosened assertion** in an existing test; it
-also finds **two existing tests outside the allowlist** whose assertions changed (both in P1, neither
-loosened), plus three environment-conditional `pytest.skip` calls inside one new test — recorded in
-[the audit](#allowlist-audit-git-diff-7c29434----tests) for the gate, not hidden.
+audit finds **no `skip`/`xfail`/`importorskip` call or marker anywhere in `tests/test_web.py`** (an
+AST scan finds zero: P12F3 removed the three skip paths P10 had added) and **no loosened or deleted
+assertion** in an existing test. The seven existing tests whose expectations changed are exactly
+the specification's allowlist as Amendment A1 extends it (A1 adds the AC30 node); the one further
+changed test, `test_a2`, was changed at the gate's request and is now stricter, not narrower — see
+[the audit](#allowlist-audit-git-diff-7c29434----tests).
 
 ## Requirement ledger (R1–R9)
 
@@ -44,6 +47,10 @@ function name covers every parametrization.
 | R8 fetched text is untrusted data, grants nothing | `a518ab2`, `05938f9` | `tests/test_web.py::test_ac1_the_result_schemas_are_provider_neutral_and_require_the_marker` (`a518ab2`); `tests/test_web.py::test_r8_every_result_key_of_both_schemas_sorts_after_advisory`, `tests/test_web.py::test_ac21_ac22_an_injection_page_is_framed_data_and_grants_nothing`, `tests/test_web.py::test_ac21_the_framing_check_fails_on_page_text_in_a_text_part` (`05938f9`) | AC21, AC22 |
 | R9 on and off by configuration; documented | `a518ab2`, `174ab51` | `tests/test_web.py::test_r9_pyproject_ships_the_web_manifest` (`a518ab2`); `tests/test_web.py::test_ac23_the_grant_fragment_checks_with_exactly_two_web_rules`, `tests/test_web.py::test_ac23_deleting_the_two_rules_leaves_the_brain_no_web_tool`, `tests/test_web.py::test_ac23_the_brave_fragment_checks_only_with_the_key_exported`, `tests/test_web.py::test_ac23_the_french_guide_carries_the_same_fragments`, `tests/test_web.py::test_ac24_the_english_guide_is_normative_and_the_french_one_defers`, `tests/test_web.py::test_ac24_the_settings_table_equals_the_manifest`, `tests/test_web.py::test_ac24_the_readme_lists_the_capability_and_links_the_guide`, `tests/test_web.py::test_ac24_pyproject_declares_exactly_two_runtime_dependencies`, `tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base` (`174ab51`) | AC23, AC24 |
 
+The gate's fix rounds add evidence to R2 (F2) and to R3–R6 (F1, N1: the whole-call deadline of
+both actions, their cache store included); those commits and tests are in
+[Gate fix rounds](#gate-fix-rounds).
+
 R10 (for completeness; not part of AC26's R1–R9 mapping): the socket guard
 `tests/test_web.py::test_the_socket_guard_refuses_and_records_every_non_loopback_surface` (`a518ab2`),
 `tests/test_web.py::test_ac25_activate_and_prepare_with_no_seams_open_nothing` (`6356326`),
@@ -51,6 +58,36 @@ R10 (for completeness; not part of AC26's R1–R9 mapping): the socket guard
 `tests/test_web.py::test_ac25_every_activation_here_passes_the_transport_seam`,
 `tests/test_web.py::test_ac25_no_other_test_file_imports_the_web_module` (`174ab51`); this summary
 (P11) and the full-branch review (P12).
+
+## Gate fix rounds
+
+The closing gate (P12) ran twice before this refresh: the first pass (`b218724`, report
+`full-branch-review.md`) found F1–F5; the second (`8be265d`, report `full-branch-review-2.md`)
+settled F2–F5, found F1 partial and added N1 and N2. Each row is the finding, the step that closed
+it, and the tests that fail on the tree before that step and pass after it.
+
+| Finding | Step / commit | What changed | Test id(s) (`tests/…::…`) |
+|---|---|---|---|
+| F1 (HIGH) — extraction outside the whole-call deadline | P3F1 `38e14c5` | the read's extraction, result and cache record are built on a worker thread raced against the call's one deadline; the parser checks it as it walks | `tests/test_web.py::test_p3f1_the_deadline_bounds_extraction_on_the_real_clock`, `tests/test_web.py::test_p3f1_a_never_answering_body_still_times_out_at_1s_on_the_real_clock`, `tests/test_web.py::test_p3f1_an_extraction_the_deadline_overtakes_is_timeout_on_the_injected_clock`, `tests/test_web.py::test_p3f1_the_deadline_bounds_the_cache_record_too`, `tests/test_web.py::test_p3f1_one_huge_construct_still_reaches_the_deadline`, `tests/test_web.py::test_p3f1_a_start_tag_longer_than_a_feed_is_read_by_its_name` |
+| F1 (partial in pass 2) — an unfinished 8 MiB tag ran 2.36 s; the cache store ran after the deadline | P12F4 | a tag's end is found in bounded steps (at most 1,024 attributes per match), the deadline looked at between them, end tags included, and JSON is decoded in steps too; the cache store is under the deadline and a success stored late is dropped and `timeout timed_out` | `tests/test_web.py::test_p12f4_an_unfinished_8_mib_tag_honours_the_1s_bound_on_the_real_clock`, `tests/test_web.py::test_p12f4_the_search_for_a_tag_end_stops_soon_after_its_deadline`, `tests/test_web.py::test_p12f4_the_stepped_tag_end_matches_the_standard_parser`, `tests/test_web.py::test_p12f4_a_1_mib_page_of_ordinary_tags_still_reads_within_1s`, `tests/test_web.py::test_p12f4_a_store_that_outlives_the_deadline_is_timed_out_with_no_entry`, `tests/test_web.py::test_p12f4_a_search_stored_past_its_deadline_is_timed_out_on_the_injected_clock` |
+| F2 (MEDIUM) — one malformed result discarded its valid sibling | P12F2 `d18da61` | the item boundary is where the guard lives: an unusable item is dropped and counted, its siblings kept; an answer of only unusable items is `malformed_response` | `tests/test_web.py::test_r2_a_wikipedia_lone_surrogate_item_is_dropped_its_sibling_kept`, `tests/test_web.py::test_r2_a_brave_lone_surrogate_item_is_dropped_its_sibling_kept`, `tests/test_web.py::test_r2_a_brave_item_with_unencodable_url_or_excerpt_is_dropped`, `tests/test_web.py::test_r2_an_answer_whose_every_item_is_malformed_is_malformed`, `tests/test_web.py::test_r2_a_results_array_absent_or_of_the_wrong_type_is_malformed`, `tests/test_web.py::test_r2_ten_items_three_malformed_keep_seven_and_count_three` |
+| F3 (MEDIUM) — two expectation changes beyond the six-node allowlist | Amendment A1 (spec) and P12F3 `d31bf17` | A1 adds AC30 as the seventh allowlisted node; `test_a2`'s rule now flags any bare `web` in a comment or string and every module form, sparing only aiohttp's `web` binding | `tests/test_config_ui.py::test_a2_the_ui_source_names_no_module`, `tests/test_config_ui.py::test_a2_the_web_rule_flags_the_module_and_spares_aiohttp` |
+| F4 (MEDIUM) — three skip paths in the AC24 test | P12F3 `d31bf17` | a missing git, work tree or base commit is a hard failure; CI checks out full history | `tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base` |
+| F5 (MEDIUM) — the guard self-test built a kernel socket | P12F3 `d31bf17` | the self-test calls the patched methods on a stand-in object | `tests/test_web.py::test_the_socket_guard_refuses_and_records_every_non_loopback_surface` |
+| N1 (HIGH) — `web.search` parsed after its deadline (3.57 s success) | P12F4 | the JSON, every result's extraction, the dropped count and the cache record are built on a worker thread under the same deadline as a read; a search that runs out of time is `timeout timed_out` with nothing counted or stored | `tests/test_web.py::test_p12f4_a_6_mb_search_answer_times_out_at_1s_on_the_real_clock`, `tests/test_web.py::test_p12f4_a_search_within_the_budget_returns_its_results_on_the_real_clock`, `tests/test_web.py::test_p12f4_a_search_parse_the_deadline_overtakes_is_timeout_on_the_injected_clock` |
+| N2 (LOW) — this summary described the tree before the fixes | P12F4 | this section, the evidence head, the result paragraph, the suite count, the evidence check and the allowlist audit | the [evidence check](#evidence-check-scripted) below |
+
+The three gate reproductions, re-run at P12F4 (`request_timeout_seconds: 1`, the real asyncio timer,
+fake public transport, the real executor):
+
+| Reproduction | Before | At P12F4 |
+|---|---|---|
+| `b'<p' + b' a' * ((8388608 - 2) // 2)` read | `timeout timed_out` at 2.358819 s | `success`, text `""`, at 0.73 s — the whole tag is now scanned within the bound, so it ends before the deadline; the stdlib drops a tag still open at the end of the document |
+| `web.read` with the cache store delayed 1.2 s | `success` at 1.201056 s, 1 entry stored | `timeout timed_out` at 1.20 s, 0 entries |
+| 6,000,058-byte Wikipedia answer, one `'<p>' * 2000000` snippet | `success` at 3.568903 s, `result_count=1` | `timeout timed_out` at 1.00 s, `result_count=0`, 0 entries |
+
+(The delayed store blocks the event loop itself, so no timer can end the call before it returns;
+what P12F4 guarantees is the outcome — the late success is not returned and not kept.)
 
 ## What the companion can now do
 
@@ -133,10 +170,11 @@ which extracts the fragment by that anchor from the guides, has exactly one sour
 
 ## Suite count
 
-`.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` at the evidence head plus this summary:
+`.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` at P12F4 (at `174ab51` the count was
+4324 passed, 26 skipped):
 
 ```
-4324 passed, 26 skipped in 302.84s (0:05:02)
+4390 passed, 26 skipped in 325.84s (0:05:25)
 ```
 
 The step's floor is 3,124 passed / 18 skipped (the count recorded at the start of the phase); the
@@ -147,7 +185,7 @@ re-run with `-rs`, they are 6 `test_phase2_trials.py`, 6 `test_phase3_trials.py`
 so `test_installed_distribution_discovers_the_shipped_manifests_and_answers_help`, one of the
 allowlisted tests, skips here). The same 26 reasons skip on the `7c29434` tree run with the same
 virtualenv (that run, from a `git archive` extraction, adds only 2 skips and 3 failures of tests
-that need a git work tree). `tests/test_web.py` alone: 416 passed, 0 skipped. Phase 7 adds no skip
+that need a git work tree). `tests/test_web.py` alone: 467 passed, 0 skipped (416 at `174ab51`). Phase 7 adds no skip
 that fires here.
 
 ## Evidence check (scripted)
@@ -177,36 +215,37 @@ sys.exit(1 if missing or bad else 0)
 EOF
 ```
 
-Output at the evidence head:
+Output at P12F4 (at `174ab51` it was 109 ids and 11 commits; the gate fix rounds add the rest):
 
 ```
-test ids cited: 109, not collected: 0 []
-commits cited: 11, missing: 0 []
+test ids cited: 131, not collected: 0 []
+commits cited: 16, missing: 0 []
 ```
 
 ## Allowlist audit (`git diff 7c29434 -- tests`)
 
-15 files, +6,062 / −15 lines: `tests/test_web.py` (new, +5,462), 9 new fixture files under
-`tests/fixtures/web/` (each with its source in `PROVENANCE.md`), and 5 existing test files.
-Method: every `+` line searched for `skip`, `xfail`, `importorskip`; every `-` line read (all 15
-shown by `git diff -U0 7c29434 -- tests`, none in `tests/test_web.py`, which is new), and each
-touched existing test compared before/after.
+At P12F4: 15 files, +6,917 / −15 lines: `tests/test_web.py` (new, +6,246), 9 new fixture files
+under `tests/fixtures/web/` (each with its source in `PROVENANCE.md`), and 5 existing test files.
+Method: an AST scan of `tests/test_web.py` for every `pytest.skip`, `pytest.xfail`,
+`pytest.importorskip` and skip/xfail marker; every `+` line of the existing files searched for
+`skip`, `xfail`, `importorskip`; every `-` line read (all 15 shown by `git diff -U0 7c29434 -- tests`,
+none in `tests/test_web.py`, which is new); each touched existing test compared before/after.
 
-**No `skip`/`xfail` marker added, no existing test skipped.** The `+` lines matching `skip` are
-test names and docstrings (`…_skipped_byte`, `…_skipped_element_…`), `# fmt: skip` formatter
-comments, a JSON-scanner helper named `skip`, and — the one real hit — three
-environment-conditional `pytest.skip(...)` calls inside the new
+**No skip or xfail anywhere, no existing test skipped.** The AST scan of `tests/test_web.py` finds
+zero skip/xfail/importorskip calls or markers. The three environment-conditional `pytest.skip`
+calls P10 had put in
 `tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base`
-(P10), taken only when `git` is missing, the tree is not a work tree, or `7c29434` is absent from
-the clone. None fires here (the test passes; `tests/test_web.py` has 0 skips). Recorded
-for the gate: it is a new test, not a loosened one, but it is a skip path a shallow clone would take.
+were removed in P12F3 (`d31bf17`): a missing git, work tree or phase-base commit now fails the test.
+The remaining `+` lines that match `skip` are test names and docstrings (`…_skipped_byte`,
+`…_skipped_element_…`), `# fmt: skip` formatter comments and a JSON-scanner helper named `skip`.
 
 **No deleted assertion, no loosened assertion.** The 15 removed lines are 8 count equalities
 replaced by the same equality with the new count (18 → 19 manifests, 14 → 16 actions), 5
-docstring/comment lines extended, the `GUIDES` tuple (extended by `web-knowledge`), and the module-name regex of
-`test_a2` (below).
+docstring/comment lines extended, the `GUIDES` tuple (extended by `web-knowledge`), and the
+module-name regex of `test_a2` (below).
 
-**Allowlisted tests (6 in the specification), each changed and citing phase 7 R1/R9:**
+**Allowlisted tests (7: the specification's 6 and Amendment A1's seventh), each changed and citing
+phase 7 R1/R9:**
 
 | Test | Change |
 |---|---|
@@ -216,15 +255,19 @@ docstring/comment lines extended, the `GUIDES` tuple (extended by `web-knowledge
 | `tests/test_profiles.py::test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency` | 18 → 19 manifests and package-data lines; the dependency assertion unchanged |
 | `tests/test_config_ui.py::test_ac15_the_base_page_lists_every_module_and_the_origin` | 18 → 19 |
 | `tests/test_docs_bilingual.py::test_the_discovered_pairs_are_exactly_the_declared_guides` | `GUIDES` gains `web-knowledge` (P10) |
+| `tests/test_examples.py::test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario` (A1) | catalog size 14 → 16 and the exact catalog set gains `web.search`, `web.read`; the ready/discovered sets, multiplicity and scenario assertions unchanged — still exact |
 
-**Outside the allowlist — recorded for the gate (P12), not hidden.** Two existing tests changed in
-P1 that the specification's allowlist does not name. Neither is loosened in its count or set
-equalities; both carry a comment or docstring citing phase 7 R1/R9 (plan P1):
+**The one further changed test, at the gate's request.**
+`tests/test_config_ui.py::test_a2_the_ui_source_names_no_module` keeps its eighteen-module word
+check unchanged and adds `_web_mentions` for `web`, whose bare word is also the UI's aiohttp
+binding. After P12F3 (`d31bf17`) that rule flags every module form (`"web"`, `'web'`,
+`modules.web`, `modules/web`, `web.search`, `web.read`, `/module/web`) in any token, and **any bare
+`web` in a comment or string** — `# Enable web when the operator grants its actions` is caught —
+sparing only `from aiohttp import web` and attribute uses of that binding.
+`tests/test_config_ui.py::test_a2_the_web_rule_flags_the_module_and_spares_aiohttp` pins both
+directions. No assertion was removed, and for `web` the check is now stricter than P1's, not
+narrower: the gate's second pass accepted it under F3. The UI's only change is a docstring phrase,
+`web page` → `HTML page`.
 
-| Test | Step | Change | Loosened? |
-|---|---|---|---|
-| `tests/test_examples.py::test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario` | P1 | catalog size 14 → 16 and the exact catalog set gains `web.search`, `web.read` — it fails for the same reason as the allowlisted count tests (a 19th manifest declaring two actions) | no — still exact |
-| `tests/test_config_ui.py::test_a2_the_ui_source_names_no_module` | P1 | the bare-word module-name match now excludes `web` (the word is also aiohttp's `web` package and "web page"), and a new pattern `WEB_MODULE_FORMS` checks every form that would name the module (`"web"`, `'web'`, `modules.web`, `modules/web`, `web.search`, `web.read`, `/module/web`) in every string token and the whole source | no assertion removed; for `web` alone the check is narrower than a bare `\bweb\b` would be (a bare word `web` in a comment is no longer caught) — for the gate to judge |
-
-Either the gate accepts these as consequences of the 19th manifest, or the allowlist in `spec.md` is
-amended to name them; P11 cannot do either (its only file is this summary).
+No other existing test file changed. Since the first gate pass, test edits are confined to
+`tests/test_web.py` and `tests/test_config_ui.py`.
