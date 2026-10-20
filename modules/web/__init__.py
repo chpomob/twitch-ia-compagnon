@@ -2174,9 +2174,19 @@ class _ObservationCache:
     hold; an entry larger than ``max_bytes`` alone is not stored. A TTL of 0
     disables the cache. Keys and entries never leave the object: its repr
     and :meth:`stats` are counts.
+
+    Every method holds one lock, because :meth:`put` runs on a worker
+    thread under its call's deadline: the store reads its caller's
+    revocation flag inside the lock, before it changes anything, so a store
+    the call gave up on never lands. The event loop takes that lock too, so
+    :meth:`put` holds it only for dict and counter updates: its size and
+    its clock stamp are read before it, and it calls nothing it was handed
+    but the flag — a store that stalls stalls outside the lock.
     """
 
-    __slots__ = ("_clock", "_ttl", "_max_entries", "_max_bytes", "_entries", "_stored_bytes")
+    __slots__ = (
+        "_clock", "_ttl", "_max_entries", "_max_bytes", "_entries", "_stored_bytes", "_lock",
+    )
 
     def __init__(
         self, clock: Callable[[], float], ttl: float, max_entries: int, max_bytes: int
@@ -2188,6 +2198,7 @@ class _ObservationCache:
         #: Least recently used first.
         self._entries: dict[str, _CacheEntry] = {}
         self._stored_bytes = 0
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:
         return f"_ObservationCache(entries={len(self._entries)}, stored_bytes={self._stored_bytes})"
@@ -2211,53 +2222,72 @@ class _ObservationCache:
 
         if not self.enabled:
             return None
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        age = self._clock() - entry.stored_at
-        if not 0 <= age <= self._ttl:
-            self._drop(key)
-            return None
-        self._entries[key] = self._entries.pop(key)
-        return entry.observation
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            age = self._clock() - entry.stored_at
+            if not 0 <= age <= self._ttl:
+                self._drop(key)
+                return None
+            self._entries[key] = self._entries.pop(key)
+            return entry.observation
 
     def put(
-        self, key: str, observation: ActionObservation, record_bytes: int | None = None
-    ) -> None:
+        self,
+        key: str,
+        observation: ActionObservation,
+        record_bytes: int | None = None,
+        revoked: Callable[[], bool] | None = None,
+    ) -> bool:
         """Store a success under *key*, then evict until every bound holds.
 
         *record_bytes* is :meth:`record_size` of *observation* when the
-        caller measured it already; ``None`` measures it here.
+        caller measured it already; ``None`` measures it here. *revoked* is
+        the caller's flag that it gave up on the store — a read that never
+        blocks, such as :meth:`threading.Event.is_set` — checked inside the
+        lock before anything changes, so once it is true the cache is left
+        as it was. The answer is whether the entry was stored.
         """
 
         if not self.enabled or observation.status != "success":
-            return
+            return False
         if record_bytes is None:
             size = self.entry_size(key, observation)
         else:
             size = len(key.encode("utf-8")) + record_bytes
-        if key in self._entries:
-            self._drop(key)
-        if size > self._max_bytes:
-            return
-        self._entries[key] = _CacheEntry(observation, self._clock(), size)
-        self._stored_bytes += size
-        while len(self._entries) > self._max_entries or self._stored_bytes > self._max_bytes:
-            self._drop(next(iter(self._entries)))
+        stored_at = self._clock()
+        with self._lock:
+            if revoked is not None and revoked():
+                return False
+            if key in self._entries:
+                self._drop(key)
+            if size > self._max_bytes:
+                return False
+            self._entries[key] = _CacheEntry(observation, stored_at, size)
+            self._stored_bytes += size
+            while len(self._entries) > self._max_entries or self._stored_bytes > self._max_bytes:
+                self._drop(next(iter(self._entries)))
+            return key in self._entries
 
-    def discard(self, key: str) -> None:
-        """Forget the entry under *key*, if there is one."""
+    def discard(self, key: str, observation: ActionObservation | None = None) -> None:
+        """Forget the entry under *key*, if there is one — only if it holds
+        *observation*, when that is given."""
 
-        if key in self._entries:
-            self._drop(key)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and (observation is None or entry.observation is observation):
+                self._drop(key)
 
     def stats(self) -> CacheStats:
-        return CacheStats(len(self._entries), self._stored_bytes)
+        with self._lock:
+            return CacheStats(len(self._entries), self._stored_bytes)
 
     def _snapshot(self) -> list[tuple[str, ActionObservation]]:
         """The raw entries, least recently used first: for tests only."""
 
-        return [(key, entry.observation) for key, entry in self._entries.items()]
+        with self._lock:
+            return [(key, entry.observation) for key, entry in self._entries.items()]
 
     def _drop(self, key: str) -> None:
         self._stored_bytes -= self._entries.pop(key).size
@@ -2636,28 +2666,44 @@ class WebModule:
         Looked up after admission, so a hit still took a slot, which its
         caller releases at once; a hit resolves and connects nothing (R5).
         A miss starts the call's one deadline of ``request_timeout_seconds``
-        and hands it to *call*. The store is under that deadline too: an
-        answer that is only ready once it expired — or whose store outlived
-        it — leaves no entry and is *timed_out*'s observation, never a late
-        success. An answer whose record *call* measured
-        (``lengths.record_bytes``) is stored without being serialised again.
+        and hands it to *call*. The store is under that deadline too: it
+        runs on a worker thread the call stops waiting for once the deadline
+        expires, and the call then revokes it, so the cache refuses it from
+        then on; the event loop only ever waits for the cache's lock behind
+        dict updates, never behind a stalled store. An answer that is
+        only ready once it expired — or whose store outlived it — leaves no
+        entry and is *timed_out*'s observation, never a late success. An
+        answer whose record *call* measured (``lengths.record_bytes``) is
+        stored without being serialised again.
         """
 
         stored = self._cache.get(key)
         if stored is not None:
             return _served_from_cache(stored)
         deadline = _Deadline(self._sleeper, self._clock, self._settings.request_timeout_seconds)
+        abandoned = threading.Event()
+
+        def store(expired: Callable[[], bool]) -> bool:
+            if expired():
+                return False
+            return self._cache.put(key, observation, lengths.record_bytes, abandoned.is_set)
+
         try:
             observation = await call(deadline)
             if observation.status != "success":
                 return observation
-            if not deadline.expired():
-                self._cache.put(key, observation, lengths.record_bytes)
-                if not deadline.expired():
-                    return observation
-                self._cache.discard(key)
+            if deadline.expired():
+                return timed_out()
+            if not self._cache.enabled:
+                return observation
+            finished, _ = await deadline.run(store)
+            if finished and not deadline.expired():
+                return observation
+            abandoned.set()
+            self._cache.discard(key, observation)
             return timed_out()
         finally:
+            abandoned.set()
             await deadline.cancel()
 
     async def _search(

@@ -4334,13 +4334,119 @@ async def test_p12f4_a_store_that_outlives_the_deadline_is_timed_out_with_no_ent
     rig.handle._sleeper = None
     rig.transport.script("example.org", html_page(b"<p>x</p>"))
 
+    start = time.monotonic()
     observation = await rig.read("https://example.org/")
+    elapsed = time.monotonic() - start
 
+    assert 1 <= elapsed < 1.1, elapsed
     assert_read_outcome(observation, "timeout", ERROR_TIMED_OUT)
     assert rig.handle._cache.stats() == (0, 0)
     (trace,) = rig.completed()
     assert trace["outcome"] == ERROR_TIMED_OUT
     assert trace["text_bytes"] == 0
+    await asyncio.to_thread(threading.Event().wait, 0.5)
+    assert rig.handle._cache.stats() == (0, 0)
+
+
+async def test_p12f5_a_held_store_does_not_hold_the_answer_and_never_lands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate P12F4 F1b, third pass: the store ran on the event loop, so a
+    store held 1.2 s returned ``timed_out`` only at 1.2 s, and the loop's
+    own timers fired late with it. The store now runs on a worker thread
+    under the call's deadline: a read and a search each answer
+    ``timeout timed_out`` at about 1 s with the loop free, the abandoned
+    store is refused by the cache once it does run, and an undelayed store
+    still stores and answers."""
+
+    import modules.web as web
+
+    put = web._ObservationCache.put
+    held = [True]
+
+    def slow(self: Any, *arguments: Any, **keywords: Any) -> bool:
+        if held[0]:
+            threading.Event().wait(1.2)
+        return put(self, *arguments, **keywords)
+
+    monkeypatch.setattr(web._ObservationCache, "put", slow)
+    rig = await search_rig(request_timeout_seconds=1)
+    rig.handle._sleeper = None
+    rig.transport.script("example.org", html_page(b"<p>x</p>"), html_page(b"<p>x</p>"))
+    rig.transport.script(
+        WIKIPEDIA_EN,
+        fixture_answer("mediawiki_search_8.json"),
+        fixture_answer("mediawiki_search_8.json"),
+    )
+    loop = asyncio.get_running_loop()
+
+    for probe in (lambda: rig.read("https://example.org/"), lambda: rig.search("zebra")):
+        beats: list[float] = []
+        start = time.monotonic()
+        loop.call_later(0.5, lambda: beats.append(time.monotonic() - start))
+        observation = await probe()
+        elapsed = time.monotonic() - start
+
+        assert 1 <= elapsed < 1.1, elapsed
+        assert len(beats) == 1 and beats[0] < 0.6, beats
+        assert observation.status == "timeout"
+        assert observation.error["code"] == ERROR_TIMED_OUT
+        assert rig.handle._cache.stats() == (0, 0)
+        await asyncio.to_thread(threading.Event().wait, 0.5)
+        assert rig.handle._cache.stats() == (0, 0)
+
+    held[0] = False
+    start = time.monotonic()
+    assert read_success(await rig.read("https://example.org/"))["text"] == "x"
+    assert search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+    assert time.monotonic() - start < 1
+    assert rig.handle._cache.stats().entries == 2
+
+
+async def test_p12f5_a_store_stalled_in_the_cache_clock_never_holds_the_lock() -> None:
+    """Gate P12F5 A1: the worker's store read the cache clock while it held
+    the cache lock, so a clock that stalled there kept every lookup and the
+    timeout's own discard waiting on the event loop. The store now stamps
+    before it takes the lock: a lookup, the stats and a discard made while
+    it is stalled return at once, the call still answers ``timeout
+    timed_out`` at about 1 s, and the stalled store, revoked, never lands."""
+
+    rig = await read_rig(request_timeout_seconds=1)
+    rig.handle._sleeper = None
+    rig.transport.script("example.org", html_page(b"<p>x</p>"))
+    cache = rig.handle._cache
+    clock = cache._clock
+    main = threading.get_ident()
+
+    def stalling() -> float:
+        if threading.get_ident() != main:
+            threading.Event().wait(1.2)
+        return clock()
+
+    cache._clock = stalling
+    loop = asyncio.get_running_loop()
+    probes: list[tuple[float, float]] = []
+    start = time.monotonic()
+
+    def probe() -> None:
+        began = time.monotonic()
+        assert cache.get("absent") is None
+        assert cache.stats() == (0, 0)
+        cache.discard("absent")
+        probes.append((began - start, time.monotonic() - began))
+
+    loop.call_later(0.5, probe)
+    observation = await rig.read("https://example.org/")
+    elapsed = time.monotonic() - start
+
+    assert 1 <= elapsed < 1.1, elapsed
+    assert len(probes) == 1, probes
+    ((at, took),) = probes
+    assert at < 0.6 and took < 0.05, probes
+    assert_read_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert cache.stats() == (0, 0)
+    await asyncio.to_thread(threading.Event().wait, 0.5)
+    assert cache.stats() == (0, 0)
 
 
 async def test_p12f4_a_search_stored_past_its_deadline_is_timed_out_on_the_injected_clock(

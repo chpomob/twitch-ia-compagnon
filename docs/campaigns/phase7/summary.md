@@ -174,7 +174,7 @@ which extracts the fragment by that anchor from the guides, has exactly one sour
 4324 passed, 26 skipped):
 
 ```
-4390 passed, 26 skipped in 325.84s (0:05:25)
+4399 passed, 26 skipped in 322.56s (0:05:22)
 ```
 
 The step's floor is 3,124 passed / 18 skipped (the count recorded at the start of the phase); the
@@ -185,7 +185,7 @@ re-run with `-rs`, they are 6 `test_phase2_trials.py`, 6 `test_phase3_trials.py`
 so `test_installed_distribution_discovers_the_shipped_manifests_and_answers_help`, one of the
 allowlisted tests, skips here). The same 26 reasons skip on the `7c29434` tree run with the same
 virtualenv (that run, from a `git archive` extraction, adds only 2 skips and 3 failures of tests
-that need a git work tree). `tests/test_web.py` alone: 467 passed, 0 skipped (416 at `174ab51`). Phase 7 adds no skip
+that need a git work tree). `tests/test_web.py` alone: 476 passed, 0 skipped (416 at `174ab51`). Phase 7 adds no skip
 that fires here.
 
 ## Evidence check (scripted)
@@ -224,7 +224,7 @@ commits cited: 16, missing: 0 []
 
 ## Allowlist audit (`git diff 7c29434 -- tests`)
 
-At P12F4: 15 files, +6,917 / −15 lines: `tests/test_web.py` (new, +6,246), 9 new fixture files
+At P12F5: 15 files, +7,111 / −15 lines: `tests/test_web.py` (new, +6,440), 9 new fixture files
 under `tests/fixtures/web/` (each with its source in `PROVENANCE.md`), and 5 existing test files.
 Method: an AST scan of `tests/test_web.py` for every `pytest.skip`, `pytest.xfail`,
 `pytest.importorskip` and skip/xfail marker; every `+` line of the existing files searched for
