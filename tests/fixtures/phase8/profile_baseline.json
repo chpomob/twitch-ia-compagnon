@@ -1,0 +1,631 @@
+{
+  "agent.yaml.example": {
+    "draws": 2,
+    "enabled": [
+      "agent_link",
+      "audio_input",
+      "audio_output",
+      "capture",
+      "stream_control"
+    ],
+    "start_status": 0,
+    "steps": [
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "chat:plain"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "chat:keyword"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "chat:mention"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "chat:command"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "chat:broadcaster_watch"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:sub"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:resub"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:sub_gift"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:community_sub_gift"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:raid"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:follow"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:tip"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:cue"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "clock:watch_tick"
+      }
+    ],
+    "subscriptions": []
+  },
+  "config.server.yaml.example": {
+    "draws": 0,
+    "enabled": [
+      "audit",
+      "brain",
+      "chat_context",
+      "proxy",
+      "stream_control",
+      "twitch",
+      "users"
+    ],
+    "start_status": 0,
+    "steps": [
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-1",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:plain"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-chat-2",
+            "chat.message",
+            "6:twitch|28:sample-twitch_broadcaster_id|8:viewer-3",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-chat-2",
+            "twitch",
+            "accepted:keyword_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:keyword"
+      },
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-3",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:mention"
+      },
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-4",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:command"
+      },
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-5",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:broadcaster_watch"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:sub"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:resub"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:sub_gift"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:community_sub_gift"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:raid"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:follow"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:tip"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:cue"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "clock:watch_tick"
+      }
+    ],
+    "subscriptions": [
+      {
+        "condition": {
+          "broadcaster_user_id": "sample-twitch_broadcaster_id",
+          "user_id": "sample-twitch_bot_user_id"
+        },
+        "type": "channel.chat.message",
+        "version": "1"
+      }
+    ]
+  },
+  "config.yaml.example": {
+    "draws": 0,
+    "enabled": [
+      "audio_input",
+      "audio_output",
+      "audit",
+      "brain",
+      "capture",
+      "chat_context",
+      "stream_control",
+      "twitch",
+      "users"
+    ],
+    "start_status": 0,
+    "steps": [
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-1",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:plain"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-chat-2",
+            "chat.message",
+            "6:twitch|28:sample-twitch_broadcaster_id|8:viewer-3",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-chat-2",
+            "twitch",
+            "accepted:keyword_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:keyword"
+      },
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-3",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:mention"
+      },
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-4",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:command"
+      },
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-5",
+            "twitch",
+            "rejected:keyword_no_match",
+            "26e3fa925e67c187"
+          ]
+        ],
+        "step": "chat:broadcaster_watch"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:sub"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:resub"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:sub_gift"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:community_sub_gift"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:raid"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "notice:follow"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:tip"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:cue"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "clock:watch_tick"
+      }
+    ],
+    "subscriptions": [
+      {
+        "condition": {
+          "broadcaster_user_id": "sample-twitch_broadcaster_id",
+          "user_id": "sample-twitch_bot_user_id"
+        },
+        "type": "channel.chat.message",
+        "version": "1"
+      }
+    ]
+  },
+  "presence.yaml.example": {
+    "draws": 0,
+    "enabled": [
+      "audio_output",
+      "brain",
+      "capture",
+      "chat_context",
+      "clips",
+      "moderation",
+      "stream_control",
+      "twitch",
+      "users",
+      "viewer_memory",
+      "watch"
+    ],
+    "start_status": 0,
+    "steps": [
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-1",
+            "twitch",
+            "rejected:no_rule_matched",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "chat:plain"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-chat-2",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|8:viewer-3",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-chat-2",
+            "twitch",
+            "accepted:keyword_match",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "chat:keyword"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-chat-3",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|8:viewer-3",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-chat-3",
+            "twitch",
+            "accepted:keyword_match",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "chat:mention"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-chat-4",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|8:viewer-3",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-chat-4",
+            "twitch",
+            "accepted:keyword_match",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "chat:command"
+      },
+      {
+        "admissions": [],
+        "decisions": [
+          [
+            "baseline-chat-5",
+            "twitch",
+            "rejected:no_rule_matched",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "chat:broadcaster_watch"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-sub",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|8:viewer-7",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-sub",
+            "twitch",
+            "accepted:event_kind_sub",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "notice:sub"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-resub",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|8:viewer-7",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-resub",
+            "twitch",
+            "accepted:event_kind_resub",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "notice:resub"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-sub-gift",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|8:viewer-7",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-sub-gift",
+            "twitch",
+            "accepted:event_kind_sub_gift",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "notice:sub_gift"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-community-gift",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|8:viewer-7",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-community-gift",
+            "twitch",
+            "accepted:event_kind_community_sub_gift",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "notice:community_sub_gift"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-raid",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|2:42",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-raid",
+            "twitch",
+            "accepted:event_kind_raid",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "notice:raid"
+      },
+      {
+        "admissions": [
+          [
+            "baseline-follow",
+            "chat.message",
+            "6:twitch|13:broadcaster-1|2:55",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "baseline-follow",
+            "twitch",
+            "accepted:event_kind_follow",
+            "c91b040407b79e3b"
+          ]
+        ],
+        "step": "notice:follow"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:tip"
+      },
+      {
+        "admissions": [],
+        "decisions": [],
+        "step": "bus:cue"
+      },
+      {
+        "admissions": [
+          [
+            "watch-1",
+            "watch.tick",
+            "6:twitch|13:broadcaster-1|12:system:watch",
+            "admitted"
+          ]
+        ],
+        "decisions": [
+          [
+            "watch-1",
+            "watch",
+            "accepted:event_kind_watch_tick",
+            "4bad096c6496a920"
+          ]
+        ],
+        "step": "clock:watch_tick"
+      }
+    ],
+    "subscriptions": [
+      {
+        "condition": {
+          "broadcaster_user_id": "broadcaster-1",
+          "moderator_user_id": "bot-9"
+        },
+        "type": "channel.follow",
+        "version": "2"
+      },
+      {
+        "condition": {
+          "broadcaster_user_id": "broadcaster-1",
+          "user_id": "bot-9"
+        },
+        "type": "channel.chat.message",
+        "version": "1"
+      },
+      {
+        "condition": {
+          "broadcaster_user_id": "broadcaster-1",
+          "user_id": "bot-9"
+        },
+        "type": "channel.chat.notification",
+        "version": "1"
+      }
+    ]
+  }
+}
