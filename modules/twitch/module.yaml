@@ -188,6 +188,10 @@ triggers:
                 - tip
                 - watch_tick
                 - cue
+                - reward
+                - manual
+                - speech
+                - timer
         required:
           - kinds
         additionalProperties: false

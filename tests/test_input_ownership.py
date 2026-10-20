@@ -46,7 +46,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_cue_is_the_tenth_kind_and_not_a_platform_notice() -> None:
-    assert EVENT_KINDS[-1] == CUE_KIND == "cue"
+    """Phase 8 R4 supersedes ``cue`` being last: it stays the tenth kind
+    (index 9) and the four appended kinds end with ``timer``."""
+
+    assert EVENT_KINDS[9] == CUE_KIND == "cue"
+    assert EVENT_KINDS[-1] == "timer"
     assert "cue" in EVENT_KIND_SET
     assert "cue" not in PLATFORM_NOTICE_KINDS
     assert len(PLATFORM_NOTICE_KINDS) == 7

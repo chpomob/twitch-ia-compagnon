@@ -496,9 +496,13 @@ def test_delivery_text_argument_value_must_be_a_name() -> None:
 
 def test_event_kind_vocabulary_is_the_nine_names_in_order() -> None:
     """Superseded by phase 5 R7 (A5): ``cue`` is appended as the tenth kind,
-    last, so the nine earlier names keep their order and indices."""
+    last, so the nine earlier names keep their order and indices.
 
-    assert EVENT_KINDS == (
+    Superseded again by phase 8 R4: ``reward``, ``manual``, ``speech`` and
+    ``timer`` are appended after ``cue`` (14 kinds); the first ten keep their
+    order and indices."""
+
+    assert EVENT_KINDS[:10] == (
         "message",
         "sub",
         "resub",
@@ -510,7 +514,8 @@ def test_event_kind_vocabulary_is_the_nine_names_in_order() -> None:
         "watch_tick",
         "cue",
     )
-    assert len(EVENT_KINDS) == 10 and EVENT_KINDS[-1] == "cue"
+    assert EVENT_KINDS[10:] == ("reward", "manual", "speech", "timer")
+    assert len(EVENT_KINDS) == 14 and EVENT_KINDS[9] == "cue" and EVENT_KINDS[-1] == "timer"
     assert EVENT_KIND_SET == frozenset(EVENT_KINDS)
     assert EVENT_KIND_DEFAULT == "message"
 
@@ -518,10 +523,15 @@ def test_event_kind_vocabulary_is_the_nine_names_in_order() -> None:
 def test_platform_notice_kinds_exclude_message_and_watch_tick() -> None:
     """R1 route safety: a notice kind is never an ordinary message or a tick.
 
-    Phase 5 A5: nor a routed ``cue``, and the seven members are unchanged."""
+    Phase 5 A5: nor a routed ``cue``, and the seven members are unchanged.
+
+    Phase 8 R4 (A1) supersedes "every other kind is a notice": the four
+    appended kinds belong to no input family, so the notices are the phase-7
+    ten minus the same three, and none of the appended four."""
 
     assert len(PLATFORM_NOTICE_KINDS) == 7
-    assert set(PLATFORM_NOTICE_KINDS) == EVENT_KIND_SET - {"message", "watch_tick", "cue"}
+    assert set(PLATFORM_NOTICE_KINDS) == set(EVENT_KINDS[:10]) - {"message", "watch_tick", "cue"}
+    assert not set(PLATFORM_NOTICE_KINDS) & set(EVENT_KINDS[10:])
     assert "cue" not in PLATFORM_NOTICE_KINDS
     assert PLATFORM_NOTICE_KINDS == (
         "sub",

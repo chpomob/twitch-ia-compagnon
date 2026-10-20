@@ -1,5 +1,8 @@
 """Declared trigger types (phase 8).
 
+P2 holds AC15 and the route half of AC16 (R4): the four kinds appended to
+the vocabulary, and a brain route naming one of them.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -41,11 +44,16 @@ import pytest
 
 import core.main as application
 from core.contracts import (
+    CHAT_FAMILY_KINDS,
+    EVENT_KINDS,
+    PLATFORM_NOTICE_KINDS,
     TRACE_BRAIN_ADMISSION_ACCEPTED,
     TRACE_BRAIN_ADMISSION_REJECTED,
     TRACE_BRAIN_RUN_COMPLETED,
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
+    input_family_of_event,
+    validate_event_kind,
 )
 from conftest import (
     FakeCaptureSource,
@@ -489,3 +497,89 @@ def test_ac16_runtime_dependencies_are_exactly_aiohttp_and_pyyaml() -> None:
         for requirement in project["dependencies"]
     )
     assert names == ["PyYAML", "aiohttp"]
+
+
+# --------------------------------------------------------------------------- #
+# AC15 (R4): the vocabulary grows by appending
+# --------------------------------------------------------------------------- #
+
+#: The phase-7 vocabulary, written out: the order the appended kinds must keep.
+PHASE7_EVENT_KINDS = (
+    "message",
+    "sub",
+    "resub",
+    "sub_gift",
+    "community_sub_gift",
+    "raid",
+    "follow",
+    "tip",
+    "watch_tick",
+    "cue",
+)
+PHASE8_EVENT_KINDS = ("reward", "manual", "speech", "timer")
+
+
+def test_ac15_the_four_kinds_are_appended_after_the_phase7_ten() -> None:
+    """AC15 (R4): the first ten kinds are the phase-7 tuple, the last four
+    are ``reward``, ``manual``, ``speech``, ``timer``, and the seven notice
+    kinds are unchanged."""
+
+    assert EVENT_KINDS[:10] == PHASE7_EVENT_KINDS
+    assert EVENT_KINDS[10:] == PHASE8_EVENT_KINDS
+    assert len(EVENT_KINDS) == 14
+    assert len(PLATFORM_NOTICE_KINDS) == 7
+    assert not set(PHASE8_EVENT_KINDS) & set(PLATFORM_NOTICE_KINDS)
+    assert not set(PHASE8_EVENT_KINDS) & set(CHAT_FAMILY_KINDS)
+
+
+@pytest.mark.parametrize("kind", PHASE8_EVENT_KINDS)
+def test_ac15_an_appended_kind_belongs_to_no_input_family(kind: str) -> None:
+    """AC15 (R4, A1): a ``channel.chat.message`` of each new kind belongs to
+    no family, while the same event as a ``message`` is ``chat``."""
+
+    payload = {"platform": "twitch", "kind": kind, "text": "hello"}
+    event = {"type": "channel.chat.message", "payload": payload}
+    assert validate_event_kind(kind, "payload.kind") == kind
+    assert input_family_of_event(event) is None
+    assert input_family_of_event({**event, "payload": {**payload, "kind": "message"}}) == (
+        "chat",
+        "twitch",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# AC16 (R4): the route half
+# --------------------------------------------------------------------------- #
+
+
+async def test_ac16_a_brain_route_matching_manual_validates_at_startup(tmp_path: Path) -> None:
+    """AC16 (R4): the presence profile with a brain route
+    ``match.kinds: [manual]`` passes the startup check — the manifest schema
+    and the brain's settings hook both accept the new kind — and the same
+    route naming an unknown kind is still refused by its field."""
+
+    path = ROOT / PRESENCE
+    environ = presence_environ(tmp_path)
+
+    def overlay(kinds: list[str]) -> dict[str, Any]:
+        route = {"name": "manual", "match": {"kinds": kinds}}
+        return {"modules": {"brain": {"routes": [route]}}}
+
+    accepted: list[str] = []
+    status = await application.check_config(
+        path,
+        environ=environ,
+        diagnostic_reporter=accepted.append,
+        overlay_document=overlay(["manual"]),
+    )
+    assert (status, accepted) == (0, [])
+
+    refused: list[str] = []
+    status = await application.check_config(
+        path,
+        environ=environ,
+        diagnostic_reporter=refused.append,
+        overlay_document=overlay(["hug"]),
+    )
+    assert status == 2
+    assert len(refused) == 1 and "routes[0].match.kinds" in refused[0], refused

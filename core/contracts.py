@@ -59,13 +59,18 @@ EVENT_KINDS = (
     "tip",
     "watch_tick",
     "cue",
+    "reward",
+    "manual",
+    "speech",
+    "timer",
 )
 """The closed, ordered vocabulary of an input event's ``payload.kind``
 (R1, R6). It names what happened, never which source produced it.
 
 ``cue`` (phase 5, A5) is appended last so the earlier indices keep their
 order: an operator automation deliberately routed this event to the
-companion."""
+companion. Phase 8 (R4) appends ``reward``, ``manual``, ``speech`` and
+``timer`` after it the same way; they belong to no input family (A1)."""
 
 EVENT_KIND_SET = frozenset(EVENT_KINDS)
 """Membership view of :data:`EVENT_KINDS`."""
@@ -74,10 +79,11 @@ EVENT_KIND_DEFAULT = "message"
 """The kind of an event that carries none (every phase-2 event)."""
 
 PLATFORM_NOTICE_KINDS = tuple(
-    kind for kind in EVENT_KINDS if kind not in ("message", "watch_tick", "cue")
+    kind for kind in EVENT_KINDS[:10] if kind not in ("message", "watch_tick", "cue")
 )
-"""The community-notice kinds: every kind except an ordinary message, the
-continuous-capture tick and a routed cue (R1 route safety, A5)."""
+"""The community-notice kinds: every phase-7 kind except an ordinary message,
+the continuous-capture tick and a routed cue (R1 route safety, A5). The kinds
+phase 8 appends are no notice (R4, A1), so the seven members are unchanged."""
 
 # --------------------------------------------------------------------------- #
 # Input families (phase 5, A4, R2, R3)

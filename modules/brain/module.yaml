@@ -333,6 +333,10 @@ settings_schema:
                     - tip
                     - watch_tick
                     - cue
+                    - reward
+                    - manual
+                    - speech
+                    - timer
                 description: Non-empty list of event kinds the route matches.
               command:
                 title: Command
