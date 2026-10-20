@@ -25,6 +25,16 @@ before ``final_url``, ``provider``, ``results``, ``text``, ``title`` and
 module therefore emits no ``text`` part. Reading content changes no
 authorization: default-deny is untouched and nothing here can grant.
 
+The framing, as the guide restates it: the tool message's first line is one
+JSON object, and nothing follows it; ``result.advisory`` is the marker and
+sorts before every external field, nested search items included; every
+external string — ``final_url``, ``title``, ``text``, and each result's
+``title``, ``url`` and ``excerpt`` — is a JSON string value under
+``result``, recovered byte-for-byte by ``json.loads`` of that first line.
+A page that carries the marker's text or a closing delimiter such as
+``"}`` or ``"]}`` only adds bytes inside one such value. The text is
+returned unfiltered: no content-based rewriting or scoring.
+
 **What is recorded, and what never is (R7).** Traces and diagnostics carry
 the provider, byte lengths, counts, the cache-hit flag and the outcome —
 never a query, a URL's path or query string, page or excerpt text, or the
