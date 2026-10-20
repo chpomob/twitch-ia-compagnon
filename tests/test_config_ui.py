@@ -958,7 +958,8 @@ def test_ac15_the_base_page_lists_every_module_and_the_origin(
     page = response.body.decode("utf-8")
 
     listed = dict(re.findall(r'<tr data-module="([^"]+)" data-enabled="(true|false)">', page))
-    assert len(SHIPPED_MODULES) == 18  # phase 5 P12 adds streamerbot
+    # Phase 5 P12 adds streamerbot (18); phase 7 R1, R9 (plan P1) adds web (19).
+    assert len(SHIPPED_MODULES) == 19
     assert sorted(listed) == list(SHIPPED_MODULES)
     enabled = set(read_base(REPO / profile)["enabled_modules"])
     assert {name for name, state in listed.items() if state == "true"} == enabled
@@ -1132,13 +1133,24 @@ def test_ac3_the_real_pages_need_a_session_and_name_no_module(path: str, tmp_pat
 # -- A2: the UI source names no module ----------------------------------------
 
 
+#: Phase 7 R1, R9 (plan P1): ``web`` is also aiohttp's ``web`` package and the
+#: word in "web page", so a bare word match cannot tell the module from them;
+#: the UI source is checked instead for every form that would name the module.
+WEB_MODULE_FORMS = re.compile(
+    r"[\"']web[\"']|\bmodules[./]web\b|\bweb\.(search|read)\b|/module/web\b"
+)
+
+
 def test_a2_the_ui_source_names_no_module() -> None:
     source = Path(config_ui.__file__).read_text(encoding="utf-8")
-    pattern = re.compile(r"\b(" + "|".join(re.escape(name) for name in SHIPPED_MODULES) + r")\b")
+    names = [name for name in SHIPPED_MODULES if name != "web"]
+    pattern = re.compile(r"\b(" + "|".join(re.escape(name) for name in names) + r")\b")
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type == tokenize.STRING:
             assert pattern.search(token.string) is None, token.string
+            assert WEB_MODULE_FORMS.search(token.string) is None, token.string
     assert pattern.search(source) is None
+    assert WEB_MODULE_FORMS.search(source) is None
 
 
 # -- The configuration model ---------------------------------------------------

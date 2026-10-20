@@ -112,6 +112,8 @@ MODULE_NAMES = (
     "youtube",
     # Phase 5 R10 (plan P12): the automation bridge, the 18th manifest.
     "streamerbot",
+    # Phase 7 R1, R9 (plan P1): web knowledge, the 19th manifest.
+    "web",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -400,6 +402,17 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": ["input"]},
         "settings_validator": "validate_settings",
     },
+    # Phase 7 R1 (plan P1): two read actions, no event, no lifecycle role.
+    "web": {
+        "name": "web",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": [],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": []},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
 # R8): only the chat input — and, from phase 3's R6, the watch input —
@@ -440,6 +453,8 @@ DECLARATION_KEYS = {
     # Phase 5 R4, R6, R7 (plan P12): the bridge declares its triggers, its
     # run action, its password and its three families.
     "streamerbot": {"triggers", "actions", "credentials", "input_families"},
+    # Phase 7 R1 (plan P1): its two read actions and its optional Brave key.
+    "web": {"actions", "credentials"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -461,6 +476,8 @@ DECLARED_ACTIONS = {
     # Phase 5 R4 (plan P12): the bridge's one write; `users.read` is declared
     # at prepare from the `users` manifest, not in the bridge's own.
     "streamerbot": {"automation.action.run"},
+    # Phase 7 R1 (plan P1): the two web reads, declared by `web` alone.
+    "web": {"web.search", "web.read"},
 }
 
 #: The credentials each manifest declares, by dotted setting path (R8).
@@ -476,6 +493,8 @@ SECRET_SETTINGS = {
     "youtube": ("client_secret", "refresh_token"),
     # Phase 5 R6 (plan P12): the bridge's instance password.
     "streamerbot": ("password",),
+    # Phase 7 R1 (plan P1): the optional Brave key, required by `provider: brave`.
+    "web": ("brave_api_key",),
 }
 #: The optional credentials shipped unconfigured — empty, never a literal —
 #: with the speech and transcription endpoints they go with (AC43).
@@ -615,6 +634,9 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     the 18th manifest, and R4 adds its ``automation.action.run`` — 14
     action names, the new one declared by the bridge alone; R6 declares its
     ``password`` credential.
+    Phase 7 R1, R9 (plan step P1, allowlisted) ships ``web`` as the 19th
+    manifest with ``web.search`` and ``web.read`` — 16 action names, both
+    declared by ``web`` alone — and its optional ``brave_api_key`` credential.
 
     Every shipped manifest — the eight R8 names and phase 2's
     ``audio_output``, ``audio_input`` and ``stream_control`` — is v2: it
@@ -632,7 +654,7 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 18
+    assert len(names) == 19
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():
@@ -701,8 +723,11 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
         "moderation.request",
         # Phase 5 R4 (plan P12): shipped, enabled by no shipped profile (R1).
         "automation.action.run",
+        # Phase 7 R1 (plan P1): shipped, enabled by no shipped profile.
+        "web.search",
+        "web.read",
     }
-    assert len(declared) == 14
+    assert len(declared) == 16
     # Phase 3 R7 (plan P19, decision 11), superseding "declared once each, by
     # one manifest": each action name has exactly one declaring manifest,
     # except `chat.write`, declared by exactly twitch, kick and youtube
@@ -1622,7 +1647,11 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
     Superseded in part by phase 5's R4 and R10 (plan step P12): the 18th
     shipped manifest declares ``automation.action.run``, so the catalog
     declares 14 names, the new one once; the chat-only profile does not
-    enable the bridge (R1), so its registered-ready view is unchanged."""
+    enable the bridge (R1), so its registered-ready view is unchanged.
+    Superseded in part by phase 7's R1 and R9 (plan step P1): the 19th
+    manifest, ``web``, declares ``web.search`` and ``web.read``, so the
+    catalog declares 16 names, each new one once; the chat-only profile does
+    not enable ``web``, so its registered-ready view is unchanged."""
 
     path = _chat_only_profile(tmp_path)
     environ = _phase1_environ(path)
@@ -1641,7 +1670,8 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
         assert set(started.registry.registered_ready()) == PHASE1_ACTIONS
         assert set(started.registry.discovered()) == PHASE1_ACTIONS
         catalog = started.catalog_actions()
-        assert len(set(catalog)) == 14
+        # Phase 7 R1, R9 (plan P1): `web` declares web.search and web.read (16).
+        assert len(set(catalog)) == 16
         assert catalog.count("chat.write") == 3
         assert all(catalog.count(name) == 1 for name in set(catalog) - {"chat.write"})
         assert set(catalog) == PHASE1_ACTIONS | PHASE2_ACTIONS | {
@@ -1650,6 +1680,8 @@ async def test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario(
             "memory.record",
             "moderation.request",
             "automation.action.run",
+            "web.search",
+            "web.read",
         }
 
         completed = await started.chat_scenario()

@@ -153,6 +153,8 @@ PRESENTED = (
     "users",
     "viewer_memory",
     "watch",
+    # Phase 7 R1, R9 (plan P1): web knowledge.
+    "web",
     "youtube",
 )
 
@@ -240,10 +242,11 @@ def _shipped_manifests() -> set[str]:
 def test_presented_covers_every_shipped_manifest() -> None:
     """AC12: the title and default checks run over all shipped manifests —
     18 since phase 5 R10 (plan P12, AC23) ships the automation bridge
-    (allowlisted: 17 → 18)."""
+    (allowlisted: 17 → 18), and 19 since phase 7 R1, R9 (plan P1) ships
+    ``web`` (allowlisted: 18 → 19)."""
 
     shipped = _shipped_manifests()
-    assert len(shipped) == 18
+    assert len(shipped) == 19
     assert len(PRESENTED) == len(set(PRESENTED))
     assert set(PRESENTED) == shipped
 
