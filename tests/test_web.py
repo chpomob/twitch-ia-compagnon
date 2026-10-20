@@ -29,6 +29,13 @@ proves the untrusted marker through the shipped brain's own rendering
 framed — the marker once outside external strings and before them, the
 page text recovered byte-for-byte (AC21) — and the read gains no tool and
 no grant (AC22); a negative control shows the framing check can fail.
+Plan step P9 proves R7 end to end (AC19, AC20): a viewer's chat message
+becomes the brain's search and the brain reads a URL with a secret path and
+query string, under each outcome and both providers, with audit and the
+loader-started ``web`` collected by emitter — traces, audit lines, log
+records, stderr, observation messages, the status record and the reprs —
+and none carries the query, the path, the key or page text; the
+``debug_lengths`` diagnostics add byte lengths only.
 
 **No test here opens a real socket.** The autouse :func:`socket_guard`
 replaces ``socket.socket.connect``/``connect_ex``, ``socket.create_connection``,
@@ -53,6 +60,8 @@ import dataclasses
 import functools
 import ipaddress
 import json
+import logging
+import re
 import socket
 import urllib.parse
 from collections.abc import Mapping, Sequence
@@ -125,6 +134,7 @@ from modules.web import (
     FETCH_REFUSED,
     FETCH_TIMEOUT,
     INTEGER_SETTINGS,
+    LOGGER_NAME,
     READ_BINDING_PROVIDER,
     REFUSAL_HOST_NOT_ALLOWED,
     REFUSAL_TOO_MANY_REDIRECTS,
@@ -4310,3 +4320,656 @@ def test_ac21_the_framing_check_fails_on_page_text_in_a_text_part() -> None:
     assert expected.text in content
     with pytest.raises(AssertionError):
         assert_framed(content)
+
+
+# --------------------------------------------------------------------------- #
+# P9: nothing this module emits or records carries the query, a URL path or
+# query string, the key or page text (R7; AC19, AC20)
+# --------------------------------------------------------------------------- #
+
+AC19_QUERY = "SECRETQ zebra 42 ?x=1"
+AC19_URL = "https://example.org/p/SECRETPATH?token=SECRETQS#frag"
+#: Never in anything ``web`` emits or records, whatever the outcome (AC19).
+AC19_FORBIDDEN = ("SECRETQ", "zebra", "SECRETPATH", "SECRETQS", "token=")
+AC19_OUTCOMES = ("success", "refused", "error", "timeout", "debug")
+WEB_ACTIONS = (WEB_SEARCH_ACTION, WEB_READ_ACTION)
+FAKE_INPUT = "fake-input"
+
+#: The fake page and excerpts: text that must never leave as a record. It is
+#: chosen to share no 8-byte run with the fixed vocabulary (asserted below).
+LEAK_PAGE_TITLE = "Quiet Lanterns of Vyrmoor"
+LEAK_PAGE_PARAGRAPHS = (
+    "Glowmoss drifts above Vyrmoor fjords at dusk.",
+    "Ferrymen hum quaint ballads under copper skies.",
+)
+LEAK_RESULTS = (
+    ("Kelp Grove Arches", "https://kelp.example/grove", "Basalt arches cradle luminous kelp."),
+    ("Ferret Juggling Lore", "https://ferret.example/lore", "Owlish ferrets juggle plum pits."),
+)
+LEAK_TEXTS = (
+    LEAK_PAGE_TITLE,
+    *LEAK_PAGE_PARAGRAPHS,
+    *(title for title, _url, _excerpt in LEAK_RESULTS),
+    *(excerpt for _title, _url, excerpt in LEAK_RESULTS),
+)
+
+_LENGTH_FIELD = re.compile(r"\b[a-z]+_bytes=")
+
+
+def leak_page() -> FakeResponse:
+    paragraphs = "".join(f"<p>{text}</p>" for text in LEAK_PAGE_PARAGRAPHS)
+    return html_page(
+        f"<html><head><title>{LEAK_PAGE_TITLE}</title></head><body>{paragraphs}</body></html>"
+        .encode("utf-8")
+    )
+
+
+def leak_search_answer(provider: str) -> FakeResponse:
+    if provider == PROVIDER_BRAVE:
+        items = [
+            {"title": title, "url": url, "description": excerpt}
+            for title, url, excerpt in LEAK_RESULTS
+        ]
+        return json_answer(json.dumps({"web": {"results": items}}).encode("utf-8"))
+    items = [{"title": title, "snippet": excerpt} for title, _url, excerpt in LEAK_RESULTS]
+    return json_answer(json.dumps({"query": {"search": items}}).encode("utf-8"))
+
+
+def fixed_vocabulary() -> str:
+    """Every fixed value ``web`` may record: the manifest (field names, the
+    marker, descriptions), the codes, the statuses and the trace names."""
+
+    from modules.web import _STATUS_OF_CODE
+
+    names = [
+        *_STATUS_OF_CODE,
+        *_STATUS_OF_CODE.values(),
+        OUTCOME_OK,
+        "success",
+        PROVIDER_HTTP,
+        *WEB_ACTIONS,
+        "query_bytes url_bytes response_bytes text_bytes result_count dropped_count",
+        "redirects cache_hit outcome provider module state ready degraded stopped",
+    ]
+    return MANIFEST_PATH.read_text(encoding="utf-8") + "\n".join(names)
+
+
+def test_ac19_the_fake_texts_share_no_8_byte_run_with_the_fixed_vocabulary() -> None:
+    """AC19 setup: the 8-byte scan over page and excerpt text cannot
+    false-positive on fixed vocabulary, nor on the forbidden words or the URL
+    host a trace might legitimately name."""
+
+    vocabulary = fixed_vocabulary() + " ".join((*AC19_FORBIDDEN, "example.org", FAKE_INPUT))
+    for text in LEAK_TEXTS:
+        assert len(text.encode("utf-8")) >= 8
+        assert not leaks(vocabulary, text), text
+    assert len(AC19_QUERY.encode("utf-8")) == 21
+
+
+class Recording:
+    """A delegating proxy that records every call of the *methods* it names."""
+
+    def __init__(self, inner: Any, sink: list[str], methods: frozenset[str]) -> None:
+        self._inner = inner
+        self._sink = sink
+        self._methods = methods
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._inner, name)
+        if name not in self._methods:
+            return attribute
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            self._sink.append(repr((name, args, kwargs)))
+            return attribute(*args, **kwargs)
+
+        return call
+
+
+class RecordingContext:
+    """``web``'s scoped context, with its bus and supervision recorded by emitter."""
+
+    def __init__(self, inner: Any, published: list[str], emitted: list[str]) -> None:
+        self._inner = inner
+        self.bus = Recording(inner.bus, published, frozenset({"publish"}))
+        self.supervision = Recording(
+            inner.supervision, emitted, frozenset({"emit", "record_and_emit"})
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+@dataclass
+class LeakRig:
+    """The shipped brain, audit and ``web`` — loaded and started by the core —
+    over fake model, transport and resolver, with every surface ``web`` can
+    reach collected by emitter."""
+
+    clock: ManualClock
+    context: Any
+    coordinator: Any
+    brain: Any
+    audit: Any
+    web: Any
+    model: Any
+    transport: FakeTransport
+    status: Any
+    stalled: list[FakeResponse]
+    diagnostics: list[str] = field(default_factory=list)
+    observations: list[ActionObservation] = field(default_factory=list)
+    raised: list[str] = field(default_factory=list)
+    published: list[str] = field(default_factory=list)
+    emitted: list[str] = field(default_factory=list)
+    status_records: list[str] = field(default_factory=list)
+
+    async def ask(self, text: str) -> None:
+        """The fake input delivers *text* as a viewer's chat message; the run ends."""
+
+        await self.context.bus.publish(
+            "channel.chat.message",
+            chat_payload(
+                text,
+                message_id="message-19",
+                viewer_id=BRAIN_VIEWER,
+                channel_id=BRAIN_CHANNEL,
+                platform=BRAIN_PLATFORM,
+            ),
+            {"source": FAKE_INPUT, "schema_version": 2},
+        )
+        for response in self.stalled:
+            await wait_until(lambda response=response: bool(response.requested))
+            self.clock.advance(1)
+        await wait_until(lambda: len(events_of(self.context.bus, TRACE_BRAIN_RUN_COMPLETED)) >= 1)
+        self.status.publish()
+
+    def web_events(self) -> list[Mapping[str, Any]]:
+        """Every ``action.*`` trace of a web call and every ``module.*`` trace of web."""
+
+        return [
+            event
+            for event in self.context.bus.list_events()
+            if (event["type"].startswith("action.") and event["payload"].get("action") in WEB_ACTIONS)
+            or (event["type"].startswith("module.") and event["payload"].get("module") == MODULE_NAME)
+        ]
+
+    def completed(self, action: str) -> Mapping[str, Any]:
+        (payload,) = [
+            event["payload"]
+            for event in events_of(self.context.bus, TRACE_ACTION_COMPLETED)
+            if event["payload"]["action"] == action
+        ]
+        return payload
+
+    async def stop(self) -> None:
+        await self.brain.close()
+        await self.coordinator.stop()
+        await self.audit.flush(5)
+        await self.audit.close()
+
+
+async def leak_rig(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str,
+    outcome: str,
+    *,
+    query: str = AC19_QUERY,
+    debug_lengths: bool | None = None,
+    key: str = "",
+) -> LeakRig:
+    """Start audit, ``web`` (through the loader and the coordinator) and the
+    brain; script the model to search *query* and read :data:`AC19_URL`,
+    and the transport to answer both as *outcome* says."""
+
+    import modules.audit as audit_module
+
+    clock = ManualClock()
+    destination = Destination(platform=BRAIN_PLATFORM, channel_id=BRAIN_CHANNEL, scope="web")
+    policy = AuthorizationPolicy(
+        [
+            *(
+                AuthorizationRule(
+                    rule_id=f"grant-brain-{action}",
+                    action_name=action,
+                    destination=destination,
+                    principals=(PRINCIPAL,),
+                    granted_permissions=(action,),
+                )
+                for action in WEB_ACTIONS
+            ),
+            AuthorizationRule(
+                rule_id="grant-brain-delivery",
+                action_name=CHAT_WRITE_SPEC.name,
+                destination=Destination("*", "*", "chat"),
+                principals=(PRINCIPAL,),
+                granted_permissions=(CHAT_WRITE_SPEC.name,),
+            ),
+        ]
+    )
+    registry = ActionRegistry(authorization=policy)
+    registry.register(CHAT_WRITE_SPEC, SendProvider(), module="sender")
+    registry.mark_ready("sender")
+    context = runtime_context(clock=clock, authorization=policy, actions=registry)
+
+    # The shipped audit module, wired as tests/test_audit.py wires it.
+    audit = await audit_module.activate(
+        context.for_module("audit"),
+        {"output": "stdout", "queue": {"max_records": 1000, "max_bytes": 4 * 1024 * 1024}},
+        {},
+    )
+    await audit.prepare()
+
+    search_host = BRAVE_HOST if provider == PROVIDER_BRAVE else WIKIPEDIA_EN
+    transport = FakeTransport()
+    stalled: list[FakeResponse] = []
+    settings: dict[str, Any] = {"provider": provider}
+    if provider == PROVIDER_BRAVE:
+        settings["brave_api_key"] = key
+    if outcome in ("success", "debug"):
+        transport.script(search_host, leak_search_answer(provider))
+        transport.script("example.org", leak_page())
+    elif outcome == "refused":
+        transport.script(search_host, json_answer(b'{"error": "SECRETQ"}', status=429))
+        settings["allowed_hosts"] = ["allowed.example"]
+    elif outcome == "error":
+        transport.script(search_host, json_answer(b"{}", status=500))
+        transport.script("example.org", FakeResponse(status=500))
+    else:
+        settings["request_timeout_seconds"] = 1
+        for host, content_type in ((search_host, "application/json"), ("example.org", "text/html")):
+            response = FakeResponse.body(
+                b"{}", stalled=asyncio.Event(), headers={"Content-Type": content_type}
+            )
+            transport.script(host, response)
+            stalled.append(response)
+    if debug_lengths is not None:
+        settings["debug_lengths"] = debug_lengths
+    elif outcome == "debug":
+        settings["debug_lengths"] = True
+    resolver = FakeResolver(
+        {WIKIPEDIA_EN: [PUBLIC_WIKI], BRAVE_HOST: [PUBLIC_BRAVE], "example.org": [PUBLIC_A]}
+    )
+
+    rig_sinks: dict[str, list[Any]] = {"published": [], "emitted": [], "obs": [], "raised": []}
+    scoped = ModuleLoader._scoped_context
+
+    def recording_scoped(self: Any, name: str, declaration: Any) -> Any:
+        inner = scoped(self, name, declaration)
+        if name != MODULE_NAME:
+            return inner
+        return RecordingContext(inner, rig_sinks["published"], rig_sinks["emitted"])
+
+    monkeypatch.setattr(ModuleLoader, "_scoped_context", recording_scoped)
+    loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
+    activations = await loader.activate_enabled(
+        {
+            "enabled_modules": [MODULE_NAME],
+            "modules": {
+                MODULE_NAME: {
+                    **settings,
+                    "_transport": transport,
+                    "_resolver": resolver,
+                    "_sleeper": clock.sleep,
+                    "limits": {},
+                }
+            },
+        }
+    )
+    (activation,) = activations
+    # The loader imports the module from its directory: spy on that class.
+    handle_class = type(activation.handle)
+    for method in ("_invoke_search", "_invoke_read"):
+        original = getattr(handle_class, method)
+
+        async def spy(self: Any, invocation: Any, original: Any = original) -> Any:
+            try:
+                observation = await original(self, invocation)
+            except BaseException as exc:
+                rig_sinks["raised"].append(f"{type(exc).__name__}: {exc}")
+                raise
+            rig_sinks["obs"].append(observation)
+            return observation
+
+        monkeypatch.setattr(handle_class, method, spy)
+
+    diagnostics: list[str] = []
+    coordinator = PhaseCoordinator(
+        activations,
+        tasks=context.tasks,
+        reporter=diagnostics.append,
+        observer=context.health.observe_phase,
+    )
+    assert (await coordinator.start()).status == 0
+
+    model = ScriptedModel(
+        tool_call(WEB_SEARCH_ACTION, {"query": query}),
+        tool_call(WEB_READ_ACTION, {"url": AC19_URL}),
+        final("Done."),
+    )
+    brain_settings = merge_settings(None)
+    brain_settings.update({"_session_factory": lambda: model, "_sleeper": clock.sleep})
+    brain = await brain_module.activate(
+        context.for_module(brain_module.MODULE_NAME), brain_settings, {}
+    )
+    await brain.prepare()
+
+    status_records: list[str] = []
+    status = application._StatusPublisher(
+        tmp_path / "status.json",
+        started_at="2026-10-20T00:00:00Z",
+        digest="0" * 64,
+        modules=(MODULE_NAME,),
+        health=context.health,
+        writer=lambda _path, text: status_records.append(text),
+    )
+    status.publish()
+    rig = LeakRig(
+        clock, context, coordinator, brain, audit, activation.handle, model, transport, status,
+        stalled, diagnostics=diagnostics, status_records=status_records,
+    )
+    rig.observations = rig_sinks["obs"]
+    rig.raised = rig_sinks["raised"]
+    rig.published = rig_sinks["published"]
+    rig.emitted = rig_sinks["emitted"]
+    return rig
+
+
+def web_log_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == LOGGER_NAME]
+
+
+def collected_surfaces(
+    rig: LeakRig, caplog: pytest.LogCaptureFixture, captured: Any
+) -> dict[str, list[str]]:
+    """Every output of ``web`` for the calls, selected by emitter (AC19).
+
+    The fake input's own chat event, and the brain's records, are not
+    ``web``'s; nothing of ``web`` is left out.
+    """
+
+    def dump(value: Any) -> str:
+        return json.dumps(_plain_json(value), ensure_ascii=False, sort_keys=True, default=repr)
+
+    audit_lines = []
+    for line in captured.out.splitlines():
+        record = json.loads(line)
+        payload = record.get("payload") or {}
+        if (record["type"].startswith("action.") and payload.get("action") in WEB_ACTIONS) or (
+            record["type"].startswith("module.") and payload.get("module") == MODULE_NAME
+        ):
+            audit_lines.append(line)
+    return {
+        "trace": [dump(event) for event in rig.web_events()],
+        "audit": audit_lines,
+        "published": list(rig.published),
+        "emitted": list(rig.emitted),
+        "log": [
+            f"{record.name} {record.levelname} {record.getMessage()}" for record in caplog.records
+        ],
+        "stderr": [captured.err],
+        "raised": list(rig.raised),
+        "coordinator": list(rig.diagnostics),
+        "error.message": [
+            str((observation.error or {}).get("message")) for observation in rig.observations
+        ],
+        "provenance": [dump(observation.provenance) for observation in rig.observations],
+        "status": [
+            dump(json.loads(record)["modules"].get(MODULE_NAME)) for record in rig.status_records
+        ],
+        "repr": [repr(rig.web.settings), repr(rig.web._backend), repr(rig.web._cache)]
+        + [repr(entry) for entry in rig.web._cache._entries.values()],
+    }
+
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+def scan(surfaces: Mapping[str, Sequence[str]], key: str) -> list[str]:
+    """Every forbidden occurrence in *surfaces*: ``"<surface>: <what>"``."""
+
+    hits: list[str] = []
+    for name, items in surfaces.items():
+        for item in items:
+            hits.extend(f"{name}: {word}" for word in AC19_FORBIDDEN if word in item)
+            if key and leaks(item, key):
+                hits.append(f"{name}: the key")
+            hits.extend(f"{name}: page text {text!r}" for text in LEAK_TEXTS if leaks(item, text))
+    return hits
+
+
+#: Each AC19 outcome: (search status, search code, read status, read code).
+AC19_EXPECTED = {
+    "success": ("success", None, "success", None),
+    "debug": ("success", None, "success", None),
+    "refused": ("refused", REFUSAL_RATE_LIMITED, "refused", REFUSAL_HOST_NOT_ALLOWED),
+    "error": ("error", ERROR_UPSTREAM_STATUS, "error", ERROR_UPSTREAM_STATUS),
+    "timeout": ("timeout", ERROR_TIMED_OUT, "timeout", ERROR_TIMED_OUT),
+}
+
+
+def assert_ac19_outcome(rig: LeakRig, provider: str, outcome: str) -> None:
+    search_status, search_code, read_status, read_code = AC19_EXPECTED[outcome]
+    search, read = rig.observations
+    assert (search.status, (search.error or {}).get("code")) == (search_status, search_code)
+    assert (read.status, (read.error or {}).get("code")) == (read_status, read_code)
+    search_trace = rig.completed(WEB_SEARCH_ACTION)
+    assert search_trace["status"] == search_status
+    assert search_trace["provider"] == provider
+    assert search_trace["query_bytes"] == 21
+    read_trace = rig.completed(WEB_READ_ACTION)
+    assert read_trace["status"] == read_status
+    assert read_trace["url_bytes"] == len(AC19_URL.encode("utf-8"))
+    if outcome in ("success", "debug"):
+        assert search_trace["result_count"] == len(LEAK_RESULTS)
+        assert read_trace["text_bytes"] > 0
+
+
+@pytest.mark.parametrize("outcome", AC19_OUTCOMES)
+@pytest.mark.parametrize("provider", [PROVIDER_BRAVE, PROVIDER_WIKIPEDIA])
+async def test_ac19_nothing_web_emits_or_records_carries_the_query_url_key_or_text(
+    provider: str,
+    outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC19 (R7): a viewer's chat message ``SECRETQ zebra 42 ?x=1``, delivered
+    by the fake input, becomes the brain's ``web.search``; the brain then
+    reads ``https://example.org/p/SECRETPATH?token=SECRETQS#frag``. Run as a
+    success, ``refused`` (429 / ``host_not_allowed``), ``error`` (500),
+    ``timeout`` (stalled) and a success with ``debug_lengths: true``, under
+    Brave with a fake key and under Wikipedia. Collected by emitter — every
+    ``action.*`` trace and audit stdout line of the two calls, every
+    ``module.*`` trace of ``web``, every event ``web`` published (none), every
+    log record and stderr, raised exception text, observation
+    ``error.message`` and provenance, the status-record entries for ``web``
+    and the reprs of the settings, the backend, the cache and its entries —
+    holds 0 occurrences of a forbidden word, the key, or any 8-byte run of
+    the page text or excerpts. The search's ``action.completed`` carries
+    ``query_bytes: 21``."""
+
+    caplog.set_level(logging.DEBUG)
+    key = fake_key() if provider == PROVIDER_BRAVE else ""
+    rig = await leak_rig(monkeypatch, tmp_path, provider, outcome, key=key)
+    try:
+        await rig.ask(AC19_QUERY)
+    finally:
+        await rig.stop()
+    captured = capsys.readouterr()
+
+    assert_ac19_outcome(rig, provider, outcome)
+    assert rig.published == []
+    assert rig.raised == []
+    assert rig.diagnostics == []
+    surfaces = collected_surfaces(rig, caplog, captured)
+    assert surfaces["audit"], "the audit module recorded the calls"
+    assert any('"module.ready"' in line for line in surfaces["audit"])
+    assert len(surfaces["status"]) >= 1
+    assert scan(surfaces, key) == []
+    # The input's own chat event did carry the query: it is excluded by emitter.
+    assert AC19_QUERY in captured.out
+
+    lines = web_log_lines(caplog)
+    if outcome in ("success", "debug"):
+        assert lines == []
+    else:
+        search_status, search_code, read_status, read_code = AC19_EXPECTED[outcome]
+        assert lines == [
+            f"{WEB_SEARCH_ACTION} {search_status}: {search_code} provider={provider}",
+            f"{WEB_READ_ACTION} {read_status}: {read_code} provider={PROVIDER_HTTP}",
+        ]
+
+
+async def test_ac19_a_search_for_wikipedia_records_the_query_only_as_fixed_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC19 (R7): a search for ``wikipedia`` under the Wikipedia provider
+    succeeds with ``provider: wikipedia`` and ``query_bytes: 9``; the only
+    recorded value equal to or containing the query is the fixed provider
+    name, under the ``provider`` field."""
+
+    caplog.set_level(logging.DEBUG)
+    rig = await leak_rig(monkeypatch, tmp_path, PROVIDER_WIKIPEDIA, "success", query="wikipedia")
+    try:
+        await rig.ask("wikipedia")
+    finally:
+        await rig.stop()
+    captured = capsys.readouterr()
+
+    trace = rig.completed(WEB_SEARCH_ACTION)
+    assert (trace["status"], trace["provider"], trace["query_bytes"]) == (
+        "success",
+        PROVIDER_WIKIPEDIA,
+        9,
+    )
+
+    found: list[tuple[str, str]] = []
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for name, item in value.items():
+                assert "wikipedia" not in str(name)
+                walk(item, str(name))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, key)
+        elif isinstance(value, str) and "wikipedia" in value:
+            found.append((key, value))
+
+    surfaces = collected_surfaces(rig, caplog, captured)
+    for event in rig.web_events():
+        walk(event)
+    for line in surfaces["audit"]:
+        walk(json.loads(line))
+    for observation in rig.observations:
+        walk(observation.provenance)
+        walk(observation.error)
+    for name in ("log", "stderr", "raised", "error.message", "status", "published", "emitted"):
+        assert not [item for item in surfaces[name] if "wikipedia" in item], name
+    assert found and set(found) == {("provider", PROVIDER_WIKIPEDIA)}
+
+
+async def test_ac19_the_scan_fails_on_a_query_injected_into_a_log_line(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC19 negative control: the same run with the query written into one
+    ``modules.web`` log line fails the scan on ``SECRETQ`` — so the scan
+    reads the module's diagnostics and can fail."""
+
+    caplog.set_level(logging.DEBUG)
+    rig = await leak_rig(monkeypatch, tmp_path, PROVIDER_WIKIPEDIA, "refused")
+    original = type(rig.web)._diagnose
+
+    def leaky(self: Any, action: str, observation: Any, **lengths: int) -> None:
+        original(self, action, observation, **lengths)
+        if action == WEB_SEARCH_ACTION:
+            logging.getLogger(LOGGER_NAME).warning("web.search query=%s", AC19_QUERY)
+
+    monkeypatch.setattr(type(rig.web), "_diagnose", leaky)
+    try:
+        await rig.ask(AC19_QUERY)
+    finally:
+        await rig.stop()
+    surfaces = collected_surfaces(rig, caplog, capsys.readouterr())
+
+    hits = scan(surfaces, "")
+    assert "log: SECRETQ" in hits and "log: zebra" in hits
+    assert {hit.split(":", 1)[0] for hit in hits} <= {"log", "stderr"}
+
+
+@pytest.mark.parametrize("debug_lengths", [False, True], ids=["debug-off", "debug-on"])
+@pytest.mark.parametrize("outcome", ["refused", "error", "timeout"])
+@pytest.mark.parametrize("provider", [PROVIDER_BRAVE, PROVIDER_WIKIPEDIA])
+async def test_ac20_debug_lengths_adds_byte_lengths_and_nothing_else(
+    provider: str,
+    outcome: str,
+    debug_lengths: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC20 (R7): over the AC19 calls that do not succeed, ``modules.web``
+    logs one line per call. With ``debug_lengths: false`` it holds 0 length
+    fields; with ``true`` it adds exactly ``query_bytes=21`` and
+    ``response_bytes=`` to the search line, and ``url_bytes=52``,
+    ``response_bytes=`` and ``text_bytes=`` to the read line — and nothing
+    from AC19's forbidden list, the key or the page text."""
+
+    caplog.set_level(logging.DEBUG)
+    key = fake_key() if provider == PROVIDER_BRAVE else ""
+    rig = await leak_rig(
+        monkeypatch, tmp_path, provider, outcome, key=key, debug_lengths=debug_lengths
+    )
+    try:
+        await rig.ask(AC19_QUERY)
+    finally:
+        await rig.stop()
+    surfaces = collected_surfaces(rig, caplog, capsys.readouterr())
+
+    search_status, search_code, read_status, read_code = AC19_EXPECTED[outcome]
+    search_line = f"{WEB_SEARCH_ACTION} {search_status}: {search_code} provider={provider}"
+    read_line = f"{WEB_READ_ACTION} {read_status}: {read_code} provider={PROVIDER_HTTP}"
+    lines = web_log_lines(caplog)
+    if debug_lengths:
+        url_bytes = len(AC19_URL.encode("utf-8"))
+        assert lines == [
+            f"{search_line} query_bytes=21 response_bytes=0",
+            f"{read_line} url_bytes={url_bytes} response_bytes=0 text_bytes=0",
+        ]
+    else:
+        assert lines == [search_line, read_line]
+        assert not [line for line in lines if _LENGTH_FIELD.search(line)]
+    assert scan(surfaces, key) == []
+
+
+def test_r7_the_settings_repr_holds_no_configured_value() -> None:
+    """R7: the settings object's repr omits ``brave_api_key`` — name and
+    value — and every other configured string."""
+
+    key = fake_key()
+    settings = _Settings.from_mapping(
+        {
+            "provider": PROVIDER_BRAVE,
+            "brave_api_key": key,
+            "user_agent_contact": "SECRETCONTACT",
+            "allowed_hosts": ["secrethost.example"],
+        }
+    )
+    rendered = repr(settings)
+    assert not leaks(rendered, key)
+    assert "brave_api_key" not in rendered
+    assert "SECRETCONTACT" not in rendered and "secrethost" not in rendered

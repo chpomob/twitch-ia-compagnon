@@ -40,7 +40,15 @@ the provider, byte lengths, counts, the cache-hit flag and the outcome —
 never a query, a URL's path or query string, page or excerpt text, or the
 Brave key's value. Every diagnostic this module produces is a fixed string
 or a format of fixed vocabulary and counts; no exception text from the
-transport, the codecs or the address parser is ever rendered.
+transport, the codecs or the address parser is ever rendered. The module
+logs on ``modules.web`` one line per call that does not succeed — the
+action, the status, the code and the provider, e.g. ``web.search refused:
+rate_limited provider=brave`` — and nothing on a success. Only with
+``debug_lengths: true`` does that line add byte lengths: ``query_bytes=``
+and ``response_bytes=`` for a search, ``url_bytes=``, ``response_bytes=``
+and ``text_bytes=`` for a read, and nothing else. The settings, the
+backends, the cache and its entries, a fetched answer and a target each
+have a repr that holds no key, query, path or text.
 
 **Bounds (R5).** Every bound is a setting with a validated inclusive range,
 checked by the core schema subset at startup and by ``--check-config``, and
@@ -171,6 +179,7 @@ import importlib.metadata
 import inspect
 import ipaddress
 import json
+import logging
 import re
 import socket
 import urllib.parse
@@ -187,6 +196,10 @@ from core.contracts import ActionObservation, ActionSpec, Destination, mask_know
 
 
 MODULE_NAME = "web"
+
+#: The one logger this module writes its value-free diagnostics to (R7).
+LOGGER_NAME = "modules.web"
+_LOG = logging.getLogger(LOGGER_NAME)
 
 WEB_SEARCH_ACTION = "web.search"
 WEB_READ_ACTION = "web.read"
@@ -1799,6 +1812,13 @@ def _served_from_cache(observation: ActionObservation) -> ActionObservation:
 
 
 @dataclass(slots=True)
+class _Lengths:
+    """The byte counts a call's diagnostic may add beyond its trace (R7)."""
+
+    response_bytes: int = 0
+
+
+@dataclass(slots=True)
 class _Progress:
     """How far one fetch got, readable after its task is cancelled."""
 
@@ -1911,18 +1931,30 @@ class WebModule:
             "cache_hit": False,
             "outcome": OUTCOME_OK,
         }
+        lengths = _Lengths()
         if self._in_flight >= self._settings.max_concurrent_requests:
-            return _read_failure(trace, REFUSAL_RESOURCE_BUSY)
-        self._in_flight += 1
-        try:
-            return await self._cached(
-                cache_key(WEB_READ_ACTION, PROVIDER_HTTP, invocation.call.arguments),
-                lambda: self._read(url, trace),
-            )
-        finally:
-            self._in_flight -= 1
+            observation = _read_failure(trace, REFUSAL_RESOURCE_BUSY)
+        else:
+            self._in_flight += 1
+            try:
+                observation = await self._cached(
+                    cache_key(WEB_READ_ACTION, PROVIDER_HTTP, invocation.call.arguments),
+                    lambda: self._read(url, trace, lengths),
+                )
+            finally:
+                self._in_flight -= 1
+        self._diagnose(
+            WEB_READ_ACTION,
+            observation,
+            url_bytes=trace["url_bytes"],
+            response_bytes=lengths.response_bytes,
+            text_bytes=trace["text_bytes"],
+        )
+        return observation
 
-    async def _read(self, url: Any, trace: dict[str, Any]) -> ActionObservation:
+    async def _read(
+        self, url: Any, trace: dict[str, Any], lengths: _Lengths
+    ) -> ActionObservation:
         """Fetch, judge the content type unread, extract, bound (R3)."""
 
         settings = self._settings
@@ -1930,6 +1962,7 @@ class WebModule:
         trace["redirects"] = fetched.redirects
         if isinstance(fetched, FetchFailure):
             return _read_failure(trace, fetched)
+        lengths.response_bytes = len(fetched.body or b"")
         if _classify(WEB_READ_ACTION, fetched.status)[0] != "success":
             return _read_failure(trace, fetched.status)
         if fetched.body is None:
@@ -1978,16 +2011,42 @@ class WebModule:
             "outcome": OUTCOME_OK,
         }
         backend = self._backend
+        lengths = _Lengths()
         if self._in_flight >= self._settings.max_concurrent_requests:
-            return _search_failure(backend.name, trace, REFUSAL_RESOURCE_BUSY)
-        self._in_flight += 1
-        try:
-            return await self._cached(
-                cache_key(WEB_SEARCH_ACTION, backend.name, invocation.call.arguments),
-                lambda: self._search(backend, query, trace),
-            )
-        finally:
-            self._in_flight -= 1
+            observation = _search_failure(backend.name, trace, REFUSAL_RESOURCE_BUSY)
+        else:
+            self._in_flight += 1
+            try:
+                observation = await self._cached(
+                    cache_key(WEB_SEARCH_ACTION, backend.name, invocation.call.arguments),
+                    lambda: self._search(backend, query, trace, lengths),
+                )
+            finally:
+                self._in_flight -= 1
+        self._diagnose(
+            WEB_SEARCH_ACTION,
+            observation,
+            query_bytes=trace["query_bytes"],
+            response_bytes=lengths.response_bytes,
+        )
+        return observation
+
+    def _diagnose(self, action: str, observation: ActionObservation, **lengths: int) -> None:
+        """Log one value-free line for a call that did not succeed (R7).
+
+        The line is the action, the status, the code and the provider — all
+        fixed vocabulary — and, only with ``debug_lengths``, the byte
+        lengths named by *lengths*, each an integer. A success logs nothing.
+        """
+
+        if observation.status == "success":
+            return
+        error = observation.error or {}
+        line = _failure_message(action, observation.status, error.get("code"))
+        line = f"{line} provider={observation.provenance.get('provider')}"
+        if self._settings.debug_lengths:
+            line += "".join(f" {name}={int(value)}" for name, value in lengths.items())
+        _LOG.warning(line)
 
     async def _cached(
         self, key: str, call: Callable[[], Any]
@@ -2006,7 +2065,7 @@ class WebModule:
         return observation
 
     async def _search(
-        self, backend: Any, query: Any, trace: dict[str, Any]
+        self, backend: Any, query: Any, trace: dict[str, Any], lengths: _Lengths
     ) -> ActionObservation:
         """Ask *backend* through the guard, never the allowlist; parse, bound (R2).
 
@@ -2025,6 +2084,7 @@ class WebModule:
         trace["redirects"] = fetched.redirects
         if isinstance(fetched, FetchFailure):
             return _search_failure(backend.name, trace, fetched)
+        lengths.response_bytes = len(fetched.body or b"")
         if _classify(WEB_SEARCH_ACTION, fetched.status)[0] != "success":
             return _search_failure(backend.name, trace, fetched.status)
         if fetched.body is None or fetched.truncated:
@@ -2353,6 +2413,7 @@ __all__ = [
     "DEFAULT_WIKIPEDIA_LANGUAGE",
     "GuardRefusal",
     "INTEGER_SETTINGS",
+    "LOGGER_NAME",
     "MANIFEST_PATH",
     "MAX_ALLOWED_HOSTS",
     "MAX_USER_AGENT_CONTACT",
