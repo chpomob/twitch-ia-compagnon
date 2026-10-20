@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -525,6 +526,7 @@ __all__ = [
     "CAPABILITY_AUDIO",
     "CAPABILITY_STRUCTURED_OUTPUT",
     "CAPABILITY_VISION",
+    "CANONICAL_TRIGGER_FIELDS",
     "CHAT_FAMILY_KINDS",
     "COMBINATION_OPERATORS",
     "CONTRACT_VERSION",
@@ -538,6 +540,8 @@ __all__ = [
     "COUNTER_STALE_DROP",
     "COUNTER_TRIGGER_REJECTIONS",
     "CUE_KIND",
+    "DECLARED_TRIGGER_FIELD_TYPES",
+    "DECLARED_TYPE_NAME_MAX_LENGTH",
     "DELIVERY_REASON_EMPTY",
     "DELIVERY_REASON_NOT_A_DELIVERY",
     "DELIVERY_REASON_TEXT_MAPPING_AMBIGUOUS",
@@ -559,6 +563,8 @@ __all__ = [
     "FRAME_PING",
     "FRAME_PONG",
     "FRAME_WELCOME",
+    "GENERIC_TRIGGER_TYPE_NAMES",
+    "HOOK_TIMEOUT_MAX_SECONDS",
     "IDEMPOTENCY_POLICIES",
     "IMAGE_CONTENT_TYPES",
     "IMAGE_REF_FIELDS",
@@ -567,6 +573,11 @@ __all__ = [
     "INPUT_FAMILY_SET",
     "INPUT_OWNER_NONE",
     "INTERNAL_TRACE_TYPES",
+    "MATCH_LIST_MAX_ITEMS",
+    "MATCH_MAX_DEPTH",
+    "MATCH_MAX_NODES",
+    "MATCH_OPERATORS",
+    "MATCH_PATTERN_MAX_LENGTH",
     "PART_TYPES",
     "PLATFORM_NOTICE_KINDS",
     "PART_TYPE_AUDIO_REF",
@@ -1910,6 +1921,167 @@ def trace_size(payload: Any) -> int:
 # --------------------------------------------------------------------------- #
 
 
+GENERIC_TRIGGER_TYPE_NAMES = frozenset({"probability", "audience", "keyword", "event_kind"})
+"""The four generic trigger types any input may use (R1).
+
+They mirror the ``TRIGGER_TYPE_*`` names of :mod:`core.triggers`, which
+imports this module; a declared type may not take one of them."""
+
+DECLARED_TYPE_NAME_MAX_LENGTH = 32
+"""The longest name a declared trigger type may carry (R1)."""
+
+MATCH_OPERATORS = ("all", "any", "not", "equals", "in", "gte", "lte", "matches")
+"""The closed node set of a declared type's ``match`` tree (R1)."""
+
+_MATCH_LOGICAL = frozenset({"all", "any"})
+_MATCH_COMPARISONS = frozenset({"equals", "in", "gte", "lte", "matches"})
+
+MATCH_MAX_DEPTH = 8
+MATCH_MAX_NODES = 64
+MATCH_LIST_MAX_ITEMS = 64
+MATCH_PATTERN_MAX_LENGTH = 128
+"""Bounds of a ``match`` tree: its depth and node count, the scalars of one
+literal list, and the characters of one ``matches`` literal pattern (R1, A2)."""
+
+HOOK_TIMEOUT_MAX_SECONDS = 10.0
+"""The upper bound of a hooked type's ``hook_timeout_seconds``, in (0, 10] (R3)."""
+
+CANONICAL_TRIGGER_FIELDS = (
+    "kind",
+    "text",
+    "platform",
+    "channel_id",
+    "message_id",
+    "author.id",
+    "author.display_name",
+)
+"""The normalized payload fields every input emits, which any declared type's
+``field`` operand may name without the input declaring them (R1, A4)."""
+
+DECLARED_TRIGGER_FIELD_TYPES = frozenset({"string", "integer", "number", "boolean"})
+"""The scalar types an input may give a field of its ``triggers.fields`` (A4)."""
+
+_DECLARED_TYPE_NAME = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _is_match_scalar(value: Any) -> bool:
+    if isinstance(value, (str, bool)):
+        return True
+    return _is_number(value) and math.isfinite(float(value))
+
+
+def _is_payload_path(value: Any) -> bool:
+    """Whether *value* is a dotted key path with non-empty segments."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    return all(segment.strip() == segment and segment for segment in value.split("."))
+
+
+def _walk_match(tree: Any, label: str) -> list[tuple[str, str, str, bool]]:
+    """Check a ``match`` tree's structure and return its reference operands.
+
+    Each returned entry is ``(location, "field" | "param", path, under_not)``.
+    The walk is iterative and stops as soon as a bound is exceeded, so a
+    hostile tree — deep, wide or self-referencing — costs at most
+    :data:`MATCH_MAX_NODES` visits. No diagnostic echoes a configured value:
+    an unknown operator is reported by its location, not by its name.
+    """
+
+    references: list[tuple[str, str, str, bool]] = []
+    stack: list[tuple[Any, str, int, bool]] = [(tree, label, 1, False)]
+    nodes = 0
+    allowed = ", ".join(MATCH_OPERATORS)
+    while stack:
+        node, location, depth, under_not = stack.pop()
+        if depth > MATCH_MAX_DEPTH:
+            raise ContractError(location, f"exceeds the maximum depth of {MATCH_MAX_DEPTH}")
+        nodes += 1
+        if nodes > MATCH_MAX_NODES:
+            raise ContractError(label, f"must hold at most {MATCH_MAX_NODES} nodes")
+        if not isinstance(node, Mapping) or len(node) != 1:
+            raise ContractError(location, "must be a node with exactly one operator")
+        ((operator, operands),) = node.items()
+        if not isinstance(operator, str) or operator not in MATCH_OPERATORS:
+            raise ContractError(location, f"operator must be one of {allowed}")
+        here = f"{location}.{operator}"
+        if operator == "not":
+            stack.append((operands, here, depth + 1, True))
+            continue
+        if not isinstance(operands, (list, tuple)):
+            raise ContractError(here, "must be a list")
+        if operator in _MATCH_LOGICAL:
+            if not operands:
+                raise ContractError(here, "must hold at least one node")
+            if nodes + len(operands) > MATCH_MAX_NODES:
+                raise ContractError(label, f"must hold at most {MATCH_MAX_NODES} nodes")
+            for index in range(len(operands) - 1, -1, -1):
+                stack.append((operands[index], f"{here}[{index}]", depth + 1, under_not))
+            continue
+        if len(operands) != 2:
+            raise ContractError(here, "must hold exactly two operands")
+        for index, operand in enumerate(operands):
+            at = f"{here}[{index}]"
+            if isinstance(operand, Mapping):
+                if len(operand) != 1 or next(iter(operand)) not in ("field", "param"):
+                    raise ContractError(at, "must be {field}, {param} or a literal")
+                ((kind, path),) = operand.items()
+                if not _is_payload_path(path):
+                    raise ContractError(f"{at}.{kind}", "must be a dotted key path")
+                references.append((f"{at}.{kind}", kind, path, under_not))
+            elif isinstance(operand, (list, tuple)):
+                if operator != "in" or index != 1:
+                    raise ContractError(at, "a list is only the right operand of 'in'")
+                if len(operand) > MATCH_LIST_MAX_ITEMS:
+                    raise ContractError(
+                        at, f"must hold at most {MATCH_LIST_MAX_ITEMS} scalars"
+                    )
+                for item_index, item in enumerate(operand):
+                    if not _is_match_scalar(item):
+                        raise ContractError(
+                            f"{at}[{item_index}]",
+                            "must be a string, a finite number or a boolean",
+                        )
+            elif not _is_match_scalar(operand):
+                raise ContractError(
+                    at, "must be a string, a finite number, a boolean or {field}/{param}"
+                )
+            elif operator == "in" and index == 1:
+                raise ContractError(at, "must be a list or {param}")
+            elif operator == "matches" and index == 1:
+                if not isinstance(operand, str):
+                    raise ContractError(at, "pattern must be a string")
+                if len(operand) > MATCH_PATTERN_MAX_LENGTH:
+                    raise ContractError(
+                        at,
+                        f"pattern must be at most {MATCH_PATTERN_MAX_LENGTH} characters",
+                    )
+    return references
+
+
+def _resolve_parameter(schema: Mapping[str, Any], path: str) -> tuple[bool, bool]:
+    """Return ``(resolves, required)`` for a ``param`` path through *schema*.
+
+    Every segment must be a declared property, and every segment but the last
+    must have an object schema. ``required`` is true only when every segment
+    is required by the object that declares it.
+    """
+
+    node: Mapping[str, Any] = schema
+    required = True
+    segments = path.split(".")
+    for position, segment in enumerate(segments):
+        properties = node.get("properties")
+        if not isinstance(properties, Mapping) or segment not in properties:
+            return False, False
+        if segment not in tuple(node.get("required", ())):
+            required = False
+        node = properties[segment]
+        if position < len(segments) - 1 and node.get("type") != "object":
+            return False, False
+    return True, required
+
+
 @dataclass(frozen=True, slots=True)
 class TriggerTypeDeclaration:
     """One trigger type a module supports, with the schema of its parameters.
@@ -1917,19 +2089,163 @@ class TriggerTypeDeclaration:
     A module declares these in its manifest; configuration may only select a
     declared type and may only pass parameters this schema accepts, both
     checked at startup before any transport is opened (R1, AC2).
+
+    A *generic* declaration names one of :data:`GENERIC_TRIGGER_TYPE_NAMES` and
+    carries only a schema. A *declared* type (phase 8, R1) also carries the
+    event ``kinds`` it applies to and exactly one of a ``match`` tree or
+    ``hook: true`` with its ``hook_timeout_seconds``; it may name one required
+    parameter as its ``probability_parameter`` (A3). Every refusal of a
+    declared type names the sub-path (``kinds[0]``, ``match.all[1].in[0].field``)
+    and echoes no configured value. Whether a ``field`` operand is one the
+    input emits is checked by :class:`TriggerSpec`, which knows its fields.
     """
 
     name: str
     parameter_schema: Mapping[str, Any]
+    kinds: tuple[str, ...] = ()
+    match: Mapping[str, Any] | None = None
+    probability_parameter: str | None = None
+    hook: bool = False
+    hook_timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
-        _validate_dotted_name(
-            self.name, "TriggerTypeDeclaration.name", minimum_segments=1
-        )
-        label = "TriggerTypeDeclaration.parameter_schema"
+        prefix = "TriggerTypeDeclaration"
+        label = f"{prefix}.parameter_schema"
+        if not isinstance(self.hook, bool):
+            raise ContractError(f"{prefix}.hook", "must be a boolean")
+        if not self.declared:
+            _validate_dotted_name(self.name, f"{prefix}.name", minimum_segments=1)
+            for extra in ("probability_parameter", "hook_timeout_seconds"):
+                if getattr(self, extra) is not None:
+                    raise ContractError(
+                        f"{prefix}.{extra}", "applies only to a declared trigger type"
+                    )
+            validate_schema(self.parameter_schema, label=label)
+            object.__setattr__(
+                self, "parameter_schema", _frozen_mapping(self.parameter_schema, label)
+            )
+            return
+
+        self._validate_declared_name(prefix)
         validate_schema(self.parameter_schema, label=label)
         object.__setattr__(
             self, "parameter_schema", _frozen_mapping(self.parameter_schema, label)
+        )
+        object.__setattr__(self, "kinds", self._validated_kinds(prefix))
+
+        if self.match is not None and self.hook:
+            raise ContractError(f"{prefix}.hook", "must not be combined with match")
+        if self.match is None and not self.hook:
+            raise ContractError(f"{prefix}.name", "declares neither match nor hook")
+        self._validate_hook_timeout(prefix)
+        if self.match is not None:
+            for location, kind, path, under_not in _walk_match(
+                self.match, f"{prefix}.match"
+            ):
+                if kind != "param":
+                    continue
+                resolves, required = _resolve_parameter(self.parameter_schema, path)
+                if not resolves:
+                    raise ContractError(
+                        location, "does not resolve through the declared parameter schema"
+                    )
+                if under_not and not required:
+                    raise ContractError(
+                        location, "names a parameter that is not required under 'not'"
+                    )
+            object.__setattr__(
+                self, "match", _frozen_mapping(self.match, f"{prefix}.match")
+            )
+        self._validate_probability_parameter(prefix)
+
+    @property
+    def declared(self) -> bool:
+        """Whether this is a declared type, not one of the generic four.
+
+        Computed from the three discriminating fields only, so a default can
+        never turn a generic declaration into a declared one.
+        """
+
+        return bool(self.kinds) or self.match is not None or self.hook is True
+
+    def _validate_declared_name(self, prefix: str) -> None:
+        location = f"{prefix}.name"
+        if not isinstance(self.name, str):
+            raise ContractError(location, "must be a string")
+        if len(self.name) > DECLARED_TYPE_NAME_MAX_LENGTH:
+            raise ContractError(
+                location, f"must be at most {DECLARED_TYPE_NAME_MAX_LENGTH} characters"
+            )
+        if not _DECLARED_TYPE_NAME.fullmatch(self.name):
+            raise ContractError(location, "must match [a-z][a-z0-9_]*")
+        if self.name in GENERIC_TRIGGER_TYPE_NAMES:
+            raise ContractError(location, "must not be a generic trigger type name")
+
+    def _validated_kinds(self, prefix: str) -> tuple[str, ...]:
+        location = f"{prefix}.kinds"
+        kinds = self.kinds
+        if isinstance(kinds, str) or not isinstance(kinds, Sequence):
+            raise ContractError(location, "must be a list of event kinds")
+        kinds = tuple(kinds)
+        if not kinds:
+            raise ContractError(location, "must name at least one event kind")
+        for index, kind in enumerate(kinds):
+            if not isinstance(kind, str) or kind not in EVENT_KIND_SET:
+                raise ContractError(f"{location}[{index}]", "is not a known event kind")
+            if kind in kinds[:index]:
+                raise ContractError(f"{location}[{index}]", "duplicates an earlier kind")
+        return kinds
+
+    def _validate_hook_timeout(self, prefix: str) -> None:
+        location = f"{prefix}.hook_timeout_seconds"
+        timeout = self.hook_timeout_seconds
+        if not self.hook:
+            if timeout is not None:
+                raise ContractError(location, "applies only to a hooked type")
+            return
+        if timeout is None:
+            raise ContractError(location, "is required for a hooked type")
+        if not _is_number(timeout) or not math.isfinite(float(timeout)):
+            raise ContractError(location, "must be a finite number")
+        if not 0 < timeout <= HOOK_TIMEOUT_MAX_SECONDS:
+            raise ContractError(
+                location, f"must be in (0, {HOOK_TIMEOUT_MAX_SECONDS:g}] seconds"
+            )
+
+    def _validate_probability_parameter(self, prefix: str) -> None:
+        location = f"{prefix}.probability_parameter"
+        name = self.probability_parameter
+        if name is None:
+            return
+        if not isinstance(name, str):
+            raise ContractError(location, "must be a string")
+        properties = self.parameter_schema.get("properties")
+        if not isinstance(properties, Mapping) or name not in properties:
+            raise ContractError(location, "is not a top-level declared parameter")
+        if name not in tuple(self.parameter_schema.get("required", ())):
+            raise ContractError(location, "must name a required parameter")
+        schema = properties[name]
+        minimum, maximum = schema.get("minimum"), schema.get("maximum")
+        if (
+            schema.get("type") != "number"
+            or minimum is None
+            or maximum is None
+            or minimum < 0
+            or maximum > 1
+        ):
+            raise ContractError(location, "must be a number bounded within [0, 1]")
+
+    def field_references(self) -> tuple[tuple[str, str], ...]:
+        """Return ``(location, path)`` for every ``field`` operand of the tree."""
+
+        if self.match is None:
+            return ()
+        return tuple(
+            (location, path)
+            for location, kind, path, _ in _walk_match(
+                self.match, "TriggerTypeDeclaration.match"
+            )
+            if kind == "field"
         )
 
     def validate_parameters(self, parameters: Any, *, label: str = "parameters") -> None:
@@ -2026,11 +2342,18 @@ class TriggerSpec:
     operators it supports, and exactly one default policy for its input type.
     A module may declare nothing, in which case it has no default policy and no
     policy can be configured for it at all (AC2).
+
+    ``fields`` is the catalog of payload fields the input emits beyond the
+    :data:`CANONICAL_TRIGGER_FIELDS` (A4): a dotted payload path mapped to its
+    scalar type. A declared type may only name, in a ``field`` operand, a
+    canonical field or one of these, so it cannot assert a field its input
+    does not produce.
     """
 
     types: tuple[TriggerTypeDeclaration, ...]
     combinations: tuple[str, ...] = ()
     default_policy: TriggerPolicy | None = None
+    fields: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         declarations = self.types
@@ -2050,6 +2373,16 @@ class TriggerSpec:
                 raise ContractError(location, f"duplicates type {declaration.name!r}")
             seen.add(declaration.name)
         object.__setattr__(self, "types", declarations)
+
+        catalog = self._validated_fields()
+        for index, declaration in enumerate(declarations):
+            for location, path in declaration.field_references():
+                if path not in catalog:
+                    raise ContractError(
+                        f"TriggerSpec.types[{index}]."
+                        + location.removeprefix("TriggerTypeDeclaration."),
+                        "is neither a canonical normalized field nor a declared field",
+                    )
 
         combinations = _unique_texts(self.combinations, "TriggerSpec.combinations")
         for index, operator in enumerate(combinations):
@@ -2082,6 +2415,32 @@ class TriggerSpec:
         if not isinstance(self.default_policy, TriggerPolicy):
             raise ContractError("TriggerSpec.default_policy", "must be a TriggerPolicy")
         self.validate_policy(self.default_policy, label="TriggerSpec.default_policy")
+
+    def _validated_fields(self) -> frozenset[str]:
+        """Freeze ``fields`` and return every path a ``field`` operand may name.
+
+        A diagnostic names a field by its position, never by its path.
+        """
+
+        location = "TriggerSpec.fields"
+        # Each entry is checked before anything is copied: a recursive freeze
+        # would name a malformed value by its path, and a cyclic one would
+        # never return. A valid value is a type name, so a shallow copy is
+        # already immutable.
+        raw = _require_mapping(self.fields, location)
+        for index, (path, kind) in enumerate(raw.items()):
+            if not _is_payload_path(path):
+                raise ContractError(f"{location}[{index}]", "must be a dotted payload path")
+            if path in CANONICAL_TRIGGER_FIELDS:
+                raise ContractError(
+                    f"{location}[{index}]", "must not redeclare a canonical normalized field"
+                )
+            if not isinstance(kind, str) or kind not in DECLARED_TRIGGER_FIELD_TYPES:
+                allowed = ", ".join(sorted(DECLARED_TRIGGER_FIELD_TYPES))
+                raise ContractError(f"{location}[{index}]", f"type must be one of {allowed}")
+        fields = MappingProxyType(dict(raw))
+        object.__setattr__(self, "fields", fields)
+        return frozenset(CANONICAL_TRIGGER_FIELDS) | frozenset(fields)
 
     def declares(self, type_name: str) -> bool:
         """Whether *type_name* is one of the declared trigger types."""

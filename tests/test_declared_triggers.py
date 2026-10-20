@@ -3,6 +3,10 @@
 P2 holds AC15 and the route half of AC16 (R4): the four kinds appended to
 the vocabulary, and a brain route naming one of them.
 
+P3 holds the construction-level half of AC2 and AC8's pattern length (R1):
+the shapes of a declared trigger type and their structural validation, each
+refusal naming its sub-path and echoing no configured value.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -46,12 +50,18 @@ import core.main as application
 from core.contracts import (
     CHAT_FAMILY_KINDS,
     EVENT_KINDS,
+    GENERIC_TRIGGER_TYPE_NAMES,
     PLATFORM_NOTICE_KINDS,
     TRACE_BRAIN_ADMISSION_ACCEPTED,
     TRACE_BRAIN_ADMISSION_REJECTED,
     TRACE_BRAIN_RUN_COMPLETED,
     TRACE_INPUT_TRIGGER_ACCEPTED,
     TRACE_INPUT_TRIGGER_REJECTED,
+    ContractError,
+    TriggerPolicy,
+    TriggerRule,
+    TriggerSpec,
+    TriggerTypeDeclaration,
     input_family_of_event,
     validate_event_kind,
 )
@@ -65,6 +75,7 @@ from conftest import (
     final,
     settle,
 )
+from core.triggers import BUILTIN_TRIGGER_TYPE_NAMES, BUILTIN_TRIGGER_TYPES
 from modules.twitch import EVENTSUB_SUBSCRIPTIONS_URL
 from test_examples import ROOT, DeviceEdges, _activate_example, _sample_environ
 from test_presence_pack import PresenceTwitchSession, presence_environ
@@ -583,3 +594,456 @@ async def test_ac16_a_brain_route_matching_manual_validates_at_startup(tmp_path:
     )
     assert status == 2
     assert len(refused) == 1 and "routes[0].match.kinds" in refused[0], refused
+
+
+# --------------------------------------------------------------------------- #
+# P3 (R1): declared-type contract shapes; AC2 structural rows, AC8 length
+# --------------------------------------------------------------------------- #
+
+BADGE_SCHEMA = {
+    "type": "object",
+    "properties": {"tiers": {"type": "array", "items": {"type": "string"}}},
+    "required": ["tiers"],
+    "additionalProperties": False,
+}
+BADGE_MATCH = {"in": [{"field": "badge.tier"}, {"param": "tiers"}]}
+
+INTERVAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "every_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+        "probability": {"type": "number", "minimum": 0, "maximum": 1},
+        "window": {
+            "type": "object",
+            "properties": {
+                "start_minute": {"type": "integer", "minimum": 0, "maximum": 1439},
+                "end_minute": {"type": "integer", "minimum": 0, "maximum": 1439},
+            },
+            "required": ["start_minute", "end_minute"],
+        },
+    },
+    "required": ["every_minutes", "probability"],
+}
+
+
+def _interval_match(end_path: str = "window.end_minute") -> dict[str, Any]:
+    return {
+        "all": [
+            {"gte": [{"field": "timer.minute_of_day"}, {"param": "window.start_minute"}]},
+            {"lte": [{"field": "timer.minute_of_day"}, {"param": end_path}]},
+        ]
+    }
+
+
+def _badge(**overrides: Any) -> TriggerTypeDeclaration:
+    arguments: dict[str, Any] = {
+        "name": "badge_tier",
+        "parameter_schema": BADGE_SCHEMA,
+        "kinds": ("message",),
+        "match": BADGE_MATCH,
+    }
+    arguments.update(overrides)
+    return TriggerTypeDeclaration(**arguments)
+
+
+def _badge_spec(
+    declaration: TriggerTypeDeclaration, fields: Mapping[str, str] | None = None
+) -> TriggerSpec:
+    return TriggerSpec(
+        types=(declaration,),
+        combinations=("all_of",),
+        default_policy=TriggerPolicy(
+            rules=(TriggerRule(declaration.name, {"tiers": ["gold"]}),)
+        ),
+        fields={"badge.tier": "string"} if fields is None else fields,
+    )
+
+
+def _refused(build: Any, field: str, *configured: str) -> ContractError:
+    """Build, expect a refusal at exactly *field*, and check that no
+    *configured* string reaches the diagnostic."""
+
+    with pytest.raises(ContractError) as caught:
+        build()
+    assert caught.value.field == field, caught.value
+    for value in configured:
+        assert value not in str(caught.value), (value, str(caught.value))
+    return caught.value
+
+
+def _nested_not(depth: int) -> dict[str, Any]:
+    tree: dict[str, Any] = {"equals": [{"field": "text"}, "deep_sentinel"]}
+    for _ in range(depth - 1):
+        tree = {"not": tree}
+    return tree
+
+
+def test_p3_the_ac1_badge_tier_declaration_constructs_and_its_spec_validates() -> None:
+    """AC1 (R1), construction level: the ``badge_tier`` declaration with a
+    ``kinds``, a schema with required ``tiers`` and an ``in`` rule over the
+    declared field ``badge.tier`` constructs, and its policy validates."""
+
+    declaration = _badge()
+    assert declaration.declared
+    assert declaration.kinds == ("message",)
+    spec = _badge_spec(declaration)
+    spec.validate_policy(
+        TriggerPolicy(rules=(TriggerRule("badge_tier", {"tiers": ["gold"]}),))
+    )
+    assert dict(spec.fields) == {"badge.tier": "string"}
+
+
+def test_p3_generic_declarations_construct_unchanged_and_are_not_declared() -> None:
+    """R1: the four built-in types keep their shape and none counts as
+    declared; the contract's generic names are exactly the engine's."""
+
+    assert set(BUILTIN_TRIGGER_TYPE_NAMES) == GENERIC_TRIGGER_TYPE_NAMES
+    for declaration in BUILTIN_TRIGGER_TYPES:
+        assert not declaration.declared
+        assert declaration.kinds == ()
+        assert declaration.match is None
+        assert declaration.probability_parameter is None
+        assert declaration.hook is False
+        assert declaration.hook_timeout_seconds is None
+    plain = TriggerTypeDeclaration(name="keyword", parameter_schema={"type": "object"})
+    assert not plain.declared
+
+
+def test_p3_a_hooked_declaration_counts_as_declared() -> None:
+    """R1, R3: ``hook: true`` with a bound in (0, 10] is a declared type."""
+
+    hooked = _badge(match=None, hook=True, hook_timeout_seconds=0.5)
+    assert hooked.declared and hooked.match is None
+    assert _badge(match=None, hook=True, hook_timeout_seconds=10).declared
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field", "configured"),
+    [
+        pytest.param({"name": "keyword"}, "name", (), id="generic-name"),
+        pytest.param({"name": "b" * 33}, "name", ("b" * 33,), id="33-characters"),
+        pytest.param({"name": "Badge-Tier"}, "name", ("Badge-Tier",), id="pattern"),
+        pytest.param({"kinds": ()}, "kinds", (), id="empty-kinds"),
+        pytest.param({"kinds": ("banana",)}, "kinds[0]", ("banana",), id="unknown-kind"),
+        pytest.param(
+            {"hook": True, "hook_timeout_seconds": 1}, "hook", (), id="match-and-hook"
+        ),
+        pytest.param(
+            {
+                "match": {
+                    "all": [
+                        {"equals": [{"field": "text"}, "hello_sentinel"]},
+                        {"regex": [{"field": "text"}, "re_sentinel"]},
+                    ]
+                }
+            },
+            "match.all[1]",
+            ("regex", "re_sentinel", "hello_sentinel"),
+            id="operator-regex",
+        ),
+        pytest.param(
+            {"match": {"in": [{"field": "badge.tier"}, {"param": "ranks_sentinel"}]}},
+            "match.in[1].param",
+            ("ranks_sentinel",),
+            id="unknown-param",
+        ),
+        pytest.param({"match": _nested_not(9)}, "match" + ".not" * 8, ("deep_sentinel",), id="depth-9"),
+    ],
+)
+def test_p3_ac2_structural_rows_are_refused_by_sub_path(
+    overrides: dict[str, Any], field: str, configured: tuple[str, ...]
+) -> None:
+    """AC2 (R1), construction level: eight of the nine fixture rows are
+    refused by the declaration itself, the error naming the sub-path and
+    echoing no configured string (the ninth, a ``field`` path the input does
+    not emit, is the spec's — see the next test)."""
+
+    _refused(lambda: _badge(**overrides), f"TriggerTypeDeclaration.{field}", *configured)
+
+
+def test_p3_ac2_a_field_absent_from_canonical_and_declared_fields_is_refused() -> None:
+    """AC2 (R1), A4: ``secret.token`` is neither canonical nor declared in
+    ``fields``, so the spec refuses it at the operand's sub-path; the same
+    tree over a declared field is accepted."""
+
+    tree = {
+        "all": [
+            {"equals": [{"field": "text"}, "hello"]},
+            {"in": [{"field": "secret.token"}, {"param": "tiers"}]},
+        ]
+    }
+    declaration = _badge(match=tree)
+    _refused(
+        lambda: _badge_spec(declaration),
+        "TriggerSpec.types[0].match.all[1].in[0].field",
+        "secret.token",
+    )
+    assert _badge_spec(declaration, {"secret.token": "string"}).declares("badge_tier")
+    # A canonical field needs no declaration.
+    _badge_spec(_badge(match={"equals": [{"field": "author.display_name"}, "x"]}), {})
+
+
+def test_p3_ac2_depth_8_constructs_and_depth_9_is_refused() -> None:
+    """AC2 (R1): the depth bound is 8, inclusive."""
+
+    assert _badge(match=_nested_not(8)).declared
+    _refused(lambda: _badge(match=_nested_not(9)), "TriggerTypeDeclaration.match" + ".not" * 8)
+
+
+def test_p3_a_literal_list_holds_at_most_64_scalars() -> None:
+    """R1: 64 literal scalars construct, 65 are refused at the operand."""
+
+    items = [f"tier_{index}" for index in range(65)]
+    assert _badge(match={"in": [{"field": "badge.tier"}, items[:64]]}).declared
+    _refused(
+        lambda: _badge(match={"in": [{"field": "badge.tier"}, items]}),
+        "TriggerTypeDeclaration.match.in[1]",
+        "tier_64",
+        "tier_0",
+    )
+
+
+def test_p3_a_tree_holds_at_most_64_nodes() -> None:
+    """R1: ``any`` over 63 comparisons is 64 nodes and constructs; over 64
+    it is 65 and is refused, at the tree, before visiting the children."""
+
+    def tree(width: int) -> dict[str, Any]:
+        return {"any": [{"equals": [{"field": "text"}, "node_sentinel"]}] * width}
+
+    assert _badge(match=tree(63)).declared
+    _refused(lambda: _badge(match=tree(64)), "TriggerTypeDeclaration.match", "node_sentinel")
+    # A tree far past the bound is refused the same way, without walking it.
+    _refused(lambda: _badge(match=tree(1_000_000)), "TriggerTypeDeclaration.match")
+
+
+def test_p3_a_self_referencing_tree_is_refused_by_its_bounds() -> None:
+    """R1 risk: a cyclic tree (a YAML anchor loop) ends the bounded walk."""
+
+    children: list[Any] = []
+    cyclic = {"all": children}
+    children.append(cyclic)
+    with pytest.raises(ContractError) as caught:
+        _badge(match=cyclic)
+    assert caught.value.field.startswith("TriggerTypeDeclaration.match")
+
+
+def test_p3_ac8_a_matches_pattern_holds_at_most_128_characters() -> None:
+    """AC8 (R2, A2), load half: a 128-character pattern constructs, a
+    141-character one is refused at the pattern without echoing it."""
+
+    assert _badge(match={"matches": [{"field": "text"}, "*" * 128]}).declared
+    pattern = "hi*bot?" * 20 + "x"
+    assert len(pattern) == 141
+    _refused(
+        lambda: _badge(match={"matches": [{"field": "text"}, pattern]}),
+        "TriggerTypeDeclaration.match.matches[1]",
+        pattern,
+        "hi*bot?",
+    )
+
+
+def test_p3_ac30_a_param_path_resolves_through_object_properties_only() -> None:
+    """AC30 (R8)'s load refusal at construction level: the ``interval``
+    shape over ``window.start_minute``/``window.end_minute`` constructs, and a
+    ``{param: window.nope}`` operand is refused naming its path."""
+
+    interval = TriggerTypeDeclaration(
+        name="interval",
+        parameter_schema=INTERVAL_SCHEMA,
+        kinds=("timer",),
+        match=_interval_match(),
+        probability_parameter="probability",
+    )
+    assert interval.declared and interval.probability_parameter == "probability"
+    TriggerSpec(
+        types=(interval,),
+        combinations=("all_of",),
+        default_policy=TriggerPolicy(
+            rules=(TriggerRule("interval", {"every_minutes": 30, "probability": 0.25}),)
+        ),
+        fields={"timer.minute_of_day": "integer"},
+    )
+    _refused(
+        lambda: TriggerTypeDeclaration(
+            name="interval",
+            parameter_schema=INTERVAL_SCHEMA,
+            kinds=("timer",),
+            match=_interval_match("window.nope"),
+        ),
+        "TriggerTypeDeclaration.match.all[1].lte[1].param",
+        "nope",
+    )
+    # A path through a non-object property does not resolve either.
+    _refused(
+        lambda: TriggerTypeDeclaration(
+            name="interval",
+            parameter_schema=INTERVAL_SCHEMA,
+            kinds=("timer",),
+            match={"gte": [{"field": "timer.minute_of_day"}, {"param": "probability.x"}]},
+        ),
+        "TriggerTypeDeclaration.match.gte[1].param",
+    )
+
+
+def test_p3_a_non_required_parameter_is_refused_under_not() -> None:
+    """R1: a parameter under a non-required object may not appear under
+    ``not``; a required one may, and the same optional one outside ``not``
+    is accepted."""
+
+    def build(tree: dict[str, Any]) -> TriggerTypeDeclaration:
+        return TriggerTypeDeclaration(
+            name="interval", parameter_schema=INTERVAL_SCHEMA, kinds=("timer",), match=tree
+        )
+
+    optional = {"gte": [{"field": "timer.minute_of_day"}, {"param": "window.start_minute"}]}
+    required = {"gte": [{"field": "timer.minute_of_day"}, {"param": "every_minutes"}]}
+    assert build(optional).declared
+    assert build({"not": required}).declared
+    _refused(
+        lambda: build({"any": [required, {"not": optional}]}),
+        "TriggerTypeDeclaration.match.any[1].not.gte[1].param",
+        "start_minute",
+    )
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        pytest.param({**INTERVAL_SCHEMA, "required": ["every_minutes"]}, id="not-required"),
+        pytest.param(
+            {
+                **INTERVAL_SCHEMA,
+                "properties": {
+                    **INTERVAL_SCHEMA["properties"],
+                    "probability": {"type": "number", "minimum": 0, "maximum": 2},
+                },
+            },
+            id="unbounded",
+        ),
+    ],
+)
+def test_p3_the_probability_parameter_is_required_and_bounded(schema: dict[str, Any]) -> None:
+    """AC3 (R1, A3), construction level: a probability parameter the schema
+    does not list as required, or whose number is not bounded within [0, 1],
+    is refused at ``probability_parameter`` without echoing its name."""
+
+    _refused(
+        lambda: TriggerTypeDeclaration(
+            name="interval",
+            parameter_schema=schema,
+            kinds=("timer",),
+            match=_interval_match(),
+            probability_parameter="probability",
+        ),
+        "TriggerTypeDeclaration.probability_parameter",
+        "'probability'",
+    )
+
+
+@pytest.mark.parametrize("timeout", [0, 10.5, -1, float("nan"), True, None])
+def test_p3_ac12_a_hook_bound_outside_0_to_10_is_refused(timeout: Any) -> None:
+    """AC12 (R3), construction level: ``hook_timeout_seconds`` must be a
+    number in (0, 10] for a hooked type; 0 and 10.5 are refused."""
+
+    _refused(
+        lambda: _badge(match=None, hook=True, hook_timeout_seconds=timeout),
+        "TriggerTypeDeclaration.hook_timeout_seconds",
+    )
+
+
+def test_p3_a_hook_bound_without_a_hook_is_refused() -> None:
+    """R3: the bound is declared iff ``hook`` is true."""
+
+    _refused(
+        lambda: _badge(hook_timeout_seconds=1), "TriggerTypeDeclaration.hook_timeout_seconds"
+    )
+
+
+def test_p3_ac3_neither_match_nor_hook_is_refused_at_name() -> None:
+    """AC3 (R1), construction level: kinds without a match or a hook."""
+
+    _refused(lambda: _badge(match=None), "TriggerTypeDeclaration.name")
+
+
+def test_p3_a_generic_declaration_cannot_carry_declared_only_keys() -> None:
+    """R1 risk: a generic name with extra declared keys is refused, so it can
+    never reach a declared evaluator."""
+
+    _refused(
+        lambda: TriggerTypeDeclaration(
+            name="probability",
+            parameter_schema={"type": "object"},
+            probability_parameter="probability",
+        ),
+        "TriggerTypeDeclaration.probability_parameter",
+    )
+    _refused(lambda: _badge(name="probability"), "TriggerTypeDeclaration.name")
+
+
+def test_p3_the_match_tree_and_fields_are_frozen() -> None:
+    """R1: the match tree and the field catalog cannot change after load."""
+
+    tree = {"in": [{"field": "badge.tier"}, ["gold"]]}
+    declaration = _badge(match=tree)
+    tree["in"][1].append("silver")
+    assert declaration.match["in"][1] == ("gold",)
+    with pytest.raises(TypeError):
+        declaration.match["all"] = []  # type: ignore[index]
+    fields = {"badge.tier": "string"}
+    spec = _badge_spec(declaration, fields)
+    fields["badge.tier"] = "integer"
+    assert spec.fields["badge.tier"] == "string"
+    with pytest.raises(TypeError):
+        spec.fields["x"] = "string"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("fields", "configured"),
+    [
+        pytest.param({"badge.tier": "object"}, "badge.tier", id="non-scalar-type"),
+        pytest.param({"badge..tier": "string"}, "badge..tier", id="empty-segment"),
+        pytest.param({"text": "integer"}, "text", id="canonical-redeclared"),
+        pytest.param({"secret.token": {"x"}}, "secret.token", id="set-value"),
+        pytest.param({"secret.token": {"k": "v"}}, "secret.token", id="mapping-value"),
+        pytest.param({"secret.token": ["string"]}, "secret.token", id="list-value"),
+    ],
+)
+def test_p3_a_field_catalog_entry_is_a_dotted_path_and_a_scalar_type(
+    fields: dict[str, str], configured: str
+) -> None:
+    """A4: each ``fields`` entry is refused by its position, not its path."""
+
+    error = _refused(lambda: _badge_spec(_badge(), fields), "TriggerSpec.fields[0]")
+    assert repr(configured) not in str(error)
+
+
+def test_p3_a_cyclic_field_catalog_value_is_refused_by_position() -> None:
+    """A4: a self-containing value is refused, not recursed into."""
+
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    error = _refused(
+        lambda: _badge_spec(_badge(), {"secret.token": cyclic}), "TriggerSpec.fields[0]"
+    )
+    assert "secret.token" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("tree", "field"),
+    [
+        pytest.param({"in": [{"field": "badge.tier"}, "gold"]}, "match.in[1]", id="in-scalar"),
+        pytest.param({"equals": [{"field": "text"}, ["a"]]}, "match.equals[1]", id="list"),
+        pytest.param({"equals": [{"field": "text"}]}, "match.equals", id="arity"),
+        pytest.param({"all": []}, "match.all", id="empty-all"),
+        pytest.param({"equals": [{"value": "x"}, "y"]}, "match.equals[0]", id="operand"),
+        pytest.param({"equals": [{"field": "text"}, None]}, "match.equals[1]", id="null"),
+        pytest.param({"matches": [{"field": "text"}, 3]}, "match.matches[1]", id="pattern"),
+        pytest.param({"equals": [{"field": "text"}, "x"], "any": []}, "match", id="two-ops"),
+    ],
+)
+def test_p3_malformed_nodes_and_operands_are_refused_by_sub_path(
+    tree: dict[str, Any], field: str
+) -> None:
+    """R1: the closed node set and its operand shapes."""
+
+    _refused(lambda: _badge(match=tree), f"TriggerTypeDeclaration.{field}")
