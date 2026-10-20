@@ -77,6 +77,19 @@ code has one fixed message. The provenance names the provider ``http`` and
 adds to the ``action.completed`` trace only counts, lengths, the cache-hit
 flag and the outcome code (R7).
 
+**The cache (R5).** One :class:`_ObservationCache` in process memory
+serves both actions. It is keyed by :func:`cache_key` — the compact
+sorted-key JSON of the action, the provider (``http`` for a read) and the
+canonical arguments — and holds only successes, each as the complete
+observation the provider returned. It is consulted after admission, so a hit
+takes and at once releases a slot, resolves and connects nothing, and comes
+back as a copy whose ``cache_hit`` trace field is true. An entry older than
+``cache_ttl_seconds`` on the runtime clock is never served; least recently
+used entries are evicted until at most ``cache_max_entries`` entries and
+``cache_max_bytes`` bytes are held, an entry's size being the UTF-8 bytes
+of its key plus those of the whole observation as compact sorted-key JSON;
+``cache_ttl_seconds: 0`` disables it. A key or an entry never leaves it.
+
 **The network guard (R4).** Every request goes through the same guard,
 at every hop. :func:`parse_target` accepts only ``http``/``https`` URLs that
 have a host and no userinfo, and normalises the host: no brackets, lower
@@ -152,10 +165,11 @@ import re
 import socket
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
+import dataclasses
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -1610,6 +1624,166 @@ class _SearchProvider:
 
 
 # --------------------------------------------------------------------------- #
+# The shared bounded TTL cache (R5)
+# --------------------------------------------------------------------------- #
+
+
+def _json_value(value: Any) -> Any:
+    """*value* as plain JSON types: a mapping a ``dict``, a tuple a ``list``.
+
+    The frozen observation holds ``MappingProxyType`` and tuples; anything
+    else is left as is, so a non-JSON value fails ``json.dumps`` — a bug to
+    surface, never a value to stringify.
+    """
+
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _compact_json(value: Any) -> str:
+    """The R5 serialisation: compact, keys sorted, non-ASCII kept as is."""
+
+    return json.dumps(
+        _json_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _observation_record(observation: ActionObservation) -> dict[str, Any]:
+    """The complete observation as the cache accounts it: all five fields."""
+
+    return {
+        "status": observation.status,
+        "result": observation.result,
+        "error": observation.error,
+        "parts": list(observation.parts),
+        "provenance": observation.provenance,
+    }
+
+
+def cache_key(action: str, provider: str, arguments: Mapping[str, Any]) -> str:
+    """The in-memory key of one call: action, provider and canonical arguments.
+
+    It lives only inside :class:`_ObservationCache` and is never persisted,
+    logged or emitted (R5, R7).
+    """
+
+    return _compact_json({"action": action, "provider": provider, "arguments": arguments})
+
+
+class CacheStats(NamedTuple):
+    """What the cache may say about itself: counts only."""
+
+    entries: int
+    stored_bytes: int
+
+
+@dataclass(slots=True)
+class _CacheEntry:
+    observation: ActionObservation
+    stored_at: float
+    size: int
+
+    def __repr__(self) -> str:
+        return f"_CacheEntry(size={self.size})"
+
+
+class _ObservationCache:
+    """One in-process cache of successful observations, bounded three ways (R5).
+
+    An entry is the complete observation a provider returned; its size — the
+    UTF-8 bytes of its key plus those of :func:`_observation_record` as
+    compact sorted-key JSON — is computed once at :meth:`put` and kept next
+    to it. :meth:`get` never serves an entry older than the TTL on the
+    runtime clock (nor one stamped in the future), and :meth:`put` evicts the
+    least recently used entries until both ``max_entries`` and ``max_bytes``
+    hold; an entry larger than ``max_bytes`` alone is not stored. A TTL of 0
+    disables the cache. Keys and entries never leave the object: its repr
+    and :meth:`stats` are counts.
+    """
+
+    __slots__ = ("_clock", "_ttl", "_max_entries", "_max_bytes", "_entries", "_stored_bytes")
+
+    def __init__(
+        self, clock: Callable[[], float], ttl: float, max_entries: int, max_bytes: int
+    ) -> None:
+        self._clock = clock
+        self._ttl = ttl
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        #: Least recently used first.
+        self._entries: dict[str, _CacheEntry] = {}
+        self._stored_bytes = 0
+
+    def __repr__(self) -> str:
+        return f"_ObservationCache(entries={len(self._entries)}, stored_bytes={self._stored_bytes})"
+
+    @property
+    def enabled(self) -> bool:
+        return self._ttl > 0
+
+    @staticmethod
+    def entry_size(key: str, observation: ActionObservation) -> int:
+        return len(key.encode("utf-8")) + len(
+            _compact_json(_observation_record(observation)).encode("utf-8")
+        )
+
+    def get(self, key: str) -> ActionObservation | None:
+        """The fresh stored observation under *key*, now the most recently used."""
+
+        if not self.enabled:
+            return None
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        age = self._clock() - entry.stored_at
+        if not 0 <= age <= self._ttl:
+            self._drop(key)
+            return None
+        self._entries[key] = self._entries.pop(key)
+        return entry.observation
+
+    def put(self, key: str, observation: ActionObservation) -> None:
+        """Store a success under *key*, then evict until every bound holds."""
+
+        if not self.enabled or observation.status != "success":
+            return
+        size = self.entry_size(key, observation)
+        if key in self._entries:
+            self._drop(key)
+        if size > self._max_bytes:
+            return
+        self._entries[key] = _CacheEntry(observation, self._clock(), size)
+        self._stored_bytes += size
+        while len(self._entries) > self._max_entries or self._stored_bytes > self._max_bytes:
+            self._drop(next(iter(self._entries)))
+
+    def stats(self) -> CacheStats:
+        return CacheStats(len(self._entries), self._stored_bytes)
+
+    def _snapshot(self) -> list[tuple[str, ActionObservation]]:
+        """The raw entries, least recently used first: for tests only."""
+
+        return [(key, entry.observation) for key, entry in self._entries.items()]
+
+    def _drop(self, key: str) -> None:
+        self._stored_bytes -= self._entries.pop(key).size
+
+
+def _served_from_cache(observation: ActionObservation) -> ActionObservation:
+    """A new observation equal to the stored one but flagged ``cache_hit``.
+
+    The stored entry is left untouched, and so is its accounted size.
+    """
+
+    provenance = dict(observation.provenance)
+    provenance["trace_fields"] = {**provenance.get("trace_fields", {}), "cache_hit": True}
+    return dataclasses.replace(observation, provenance=provenance)
+
+
+# --------------------------------------------------------------------------- #
 # The handle
 # --------------------------------------------------------------------------- #
 
@@ -1650,6 +1824,13 @@ class WebModule:
         self._search_provider = _SearchProvider(self)
         #: The configured search backend: built here, it opens nothing.
         self._backend = SEARCH_BACKENDS[settings.provider](settings)
+        #: The one cache both actions share, in this process's memory only (R5).
+        self._cache = _ObservationCache(
+            context.clock,
+            settings.cache_ttl_seconds,
+            settings.cache_max_entries,
+            settings.cache_max_bytes,
+        )
         self._prepared = False
         self._closed = False
 
@@ -1724,7 +1905,10 @@ class WebModule:
             return _read_failure(trace, REFUSAL_RESOURCE_BUSY)
         self._in_flight += 1
         try:
-            return await self._read(url, trace)
+            return await self._cached(
+                cache_key(WEB_READ_ACTION, PROVIDER_HTTP, invocation.call.arguments),
+                lambda: self._read(url, trace),
+            )
         finally:
             self._in_flight -= 1
 
@@ -1788,9 +1972,28 @@ class WebModule:
             return _search_failure(backend.name, trace, REFUSAL_RESOURCE_BUSY)
         self._in_flight += 1
         try:
-            return await self._search(backend, query, trace)
+            return await self._cached(
+                cache_key(WEB_SEARCH_ACTION, backend.name, invocation.call.arguments),
+                lambda: self._search(backend, query, trace),
+            )
         finally:
             self._in_flight -= 1
+
+    async def _cached(
+        self, key: str, call: Callable[[], Any]
+    ) -> ActionObservation:
+        """Serve *key* from the cache, or run *call* and offer its answer.
+
+        Looked up after admission, so a hit still took a slot, which its
+        caller releases at once; a hit resolves and connects nothing (R5).
+        """
+
+        stored = self._cache.get(key)
+        if stored is not None:
+            return _served_from_cache(stored)
+        observation = await call()
+        self._cache.put(key, observation)
+        return observation
 
     async def _search(
         self, backend: Any, query: Any, trace: dict[str, Any]
@@ -2106,6 +2309,7 @@ __all__ = [
     "AiohttpTransport",
     "BRAVE_SEARCH_ENDPOINT",
     "BraveBackend",
+    "CacheStats",
     "MALFORMED",
     "Malformed",
     "SEARCH_BACKENDS",
@@ -2159,6 +2363,7 @@ __all__ = [
     "activate",
     "address_refusal",
     "advisory_marker",
+    "cache_key",
     "host_allowed",
     "literal_address",
     "normalize_host_name",

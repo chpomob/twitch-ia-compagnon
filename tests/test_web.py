@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import asyncio.base_events
+import dataclasses
 import functools
 import ipaddress
 import json
@@ -64,7 +65,13 @@ from core.actions import (
     AuthorizationRule,
 )
 from core.bus import EventBus
-from core.contracts import TRACE_ACTION_COMPLETED, TRACE_MODULE_READY, ActionCall, Destination
+from core.contracts import (
+    TRACE_ACTION_COMPLETED,
+    TRACE_MODULE_READY,
+    ActionCall,
+    ActionObservation,
+    Destination,
+)
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from conftest import ManualClock, events_of, runtime_context
@@ -122,6 +129,7 @@ from modules.web import (
     activate,
     address_refusal,
     advisory_marker,
+    cache_key,
     cut_utf8,
     extract_text,
     host_allowed,
@@ -2897,10 +2905,14 @@ async def test_r7_the_read_trace_carries_counts_and_lengths_only() -> None:
     """R7 trace shape: the ``action.completed`` trace of a read names the
     ``http`` provider and adds only ``url_bytes``, ``text_bytes``,
     ``redirects``, ``cache_hit`` and ``outcome`` to the executor's own
-    fields — no path, query string or page text."""
+    fields — no path, query string or page text.
+
+    The same URL is read twice, the second answering 404; since R5's cache
+    (P7) would serve the second from the first success, this rig disables it
+    with ``cache_ttl_seconds: 0`` so both reads reach the network."""
 
     url = "https://example.org/p/SECRETPATH?token=SECRETQS#frag"
-    rig = await read_rig()
+    rig = await read_rig(cache_ttl_seconds=0)
     rig.transport.script(
         "example.org", redirect("/q/SECRETPATH2?token=SECRETQS"), html_page(b"<p>PAGETEXT</p>")
     )
@@ -3600,3 +3612,316 @@ async def test_ac18_the_twelve_rows_walked_once_only_the_last_is_a_success() -> 
 
     assert [outcome == "success" for outcome in outcomes] == [False] * 11 + [True]
     assert list(observation.result["results"]) == []
+
+
+# --------------------------------------------------------------------------- #
+# P7: the shared bounded TTL cache (R5; AC15, AC16)
+# --------------------------------------------------------------------------- #
+
+
+def whole_observation_json(observation: ActionObservation) -> str:
+    """The test's own R5 serialisation of *observation*, every dataclass field.
+
+    Independent of the module's record helper: it walks
+    ``dataclasses.fields(ActionObservation)``, so a field the cache forgot is
+    still counted here, and it refuses any value that is not plain JSON.
+    """
+
+    def plain(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            assert all(isinstance(key, str) for key in value), value
+            return {key: plain(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [plain(item) for item in value]
+        assert value is None or isinstance(value, (str, int, float, bool)), type(value)
+        return value
+
+    record = {
+        item.name: plain(getattr(observation, item.name))
+        for item in dataclasses.fields(ActionObservation)
+    }
+    assert set(record) == {"status", "provenance", "result", "error", "parts"}
+    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def compact(value: Any) -> str:
+    def plain(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {key: plain(inner) for key, inner in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [plain(inner) for inner in item]
+        return item
+
+    return json.dumps(plain(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def entry_bytes(key: str, observation: ActionObservation) -> int:
+    return len(key.encode("utf-8")) + len(whole_observation_json(observation).encode("utf-8"))
+
+
+def stored_content(rig: ReadRig) -> int:
+    """The cache's stored content recomputed from its raw entries (R5)."""
+
+    return sum(entry_bytes(key, observation) for key, observation in rig.handle._cache._snapshot())
+
+
+def brave_answer(*results: tuple[str, str]) -> FakeResponse:
+    items = [
+        {"title": title, "url": url, "description": "An excerpt."} for title, url in results
+    ]
+    return json_answer(json.dumps({"web": {"results": items}}).encode("utf-8"))
+
+
+def eight_kib_page(index: int) -> FakeResponse:
+    return html_page(b"<p>" + (b"%02d" % index) * 4096 + b"</p>")
+
+
+async def test_ac15_an_identical_search_within_the_ttl_is_served_from_the_cache() -> None:
+    """AC15: two identical searches within the TTL send exactly 1 request;
+    the second trace has ``cache_hit: true`` and the hit resolves nothing,
+    yet returns the same result; the stored entry keeps ``cache_hit: false``."""
+
+    rig = await search_rig()
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"))
+
+    first = await rig.search("zebra")
+    resolutions = len(rig.resolver.calls)
+    rig.clock.advance(3600)
+    second = await rig.search("zebra")
+
+    assert len(rig.transport.connections) == 1
+    assert len(rig.resolver.calls) == resolutions
+    assert search_success(second, PROVIDER_WIKIPEDIA) == search_success(first, PROVIDER_WIKIPEDIA)
+    assert [trace["cache_hit"] for trace in rig.searched()] == [False, True]
+    assert second.provenance["trace_fields"]["cache_hit"] is True
+    assert dict(second.provenance["trace_fields"]) == {
+        **first.provenance["trace_fields"], "cache_hit": True
+    }
+    ((_key, stored),) = rig.handle._cache._snapshot()
+    assert stored.provenance["trace_fields"]["cache_hit"] is False
+    assert rig.handle._in_flight == 0
+
+
+async def test_ac15_an_entry_older_than_the_ttl_is_never_served() -> None:
+    """AC15: the same search after ``cache_ttl_seconds`` + 1 s on the
+    injected clock sends a 2nd request, not a hit."""
+
+    rig = await search_rig(cache_ttl_seconds=60)
+    rig.transport.script(
+        WIKIPEDIA_EN,
+        fixture_answer("mediawiki_search_8.json"),
+        fixture_answer("mediawiki_search_8.json"),
+    )
+
+    search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+    rig.clock.advance(60 + 1)
+    search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+
+    assert len(rig.transport.connections) == 2
+    assert [trace["cache_hit"] for trace in rig.searched()] == [False, False]
+    assert rig.handle._cache.stats().entries == 1
+
+
+async def test_ac15_a_ttl_of_zero_disables_the_cache() -> None:
+    """AC15: with ``cache_ttl_seconds: 0``, 2 identical searches send 2
+    requests and nothing is stored."""
+
+    rig = await search_rig(cache_ttl_seconds=0)
+    rig.transport.script(
+        WIKIPEDIA_EN,
+        fixture_answer("mediawiki_search_8.json"),
+        fixture_answer("mediawiki_search_8.json"),
+    )
+
+    for _ in range(2):
+        search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+
+    assert len(rig.transport.connections) == 2
+    assert [trace["cache_hit"] for trace in rig.searched()] == [False, False]
+    assert rig.handle._cache.stats() == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("http_status", "status", "code"),
+    [
+        pytest.param(429, "refused", REFUSAL_RATE_LIMITED, id="refused-429"),
+        pytest.param(500, "error", ERROR_UPSTREAM_STATUS, id="error-500"),
+    ],
+)
+async def test_ac15_a_failure_is_never_served_from_the_cache(
+    http_status: int, status: str, code: str
+) -> None:
+    """AC15: a ``refused`` (429) or ``error`` (500) search is not cached: the
+    retry sends a new request, and only its success is then served."""
+
+    rig = await search_rig(**brave_settings(fake_key()))
+    rig.transport.script(
+        BRAVE_HOST,
+        json_answer(b"{}", status=http_status),
+        brave_answer(("Zebra", "https://example.org/zebra")),
+    )
+
+    assert_search_outcome(await rig.search("zebra"), status, code)
+    assert rig.handle._cache.stats() == (0, 0)
+    search_success(await rig.search("zebra"), PROVIDER_BRAVE)
+    search_success(await rig.search("zebra"), PROVIDER_BRAVE)
+
+    assert len(rig.transport.connections) == 2
+    assert [trace["cache_hit"] for trace in rig.searched()] == [False, False, True]
+
+
+async def test_ac15_a_failed_read_is_never_served_from_the_cache() -> None:
+    """AC15 read half: a ``refused`` (404) read retried sends a new request."""
+
+    rig = await read_rig()
+    rig.transport.script("example.org", FakeResponse(status=404), html_page(b"<p>x</p>"))
+
+    assert_read_outcome(await rig.read("https://example.org/x"), "refused", REFUSAL_NOT_FOUND)
+    read_success(await rig.read("https://example.org/x"))
+    read_success(await rig.read("https://example.org/x"))
+
+    assert len(rig.transport.connections) == 2
+    assert [trace["cache_hit"] for trace in rig.completed()] == [False, False, True]
+
+
+async def test_ac16_the_cache_holds_at_most_max_entries_least_recent_evicted() -> None:
+    """AC16: with ``cache_max_entries: 3``, 5 distinct successful calls leave
+    3 entries; the least recently used go first, and a hit refreshes."""
+
+    rig = await read_rig(cache_max_entries=3, transport=FakeTransport(html_page(b"<p>x</p>")))
+    rig.transport.default = html_page(b"<p>x</p>")
+
+    for index in range(3):
+        read_success(await rig.read(f"https://example.org/{index}"))
+    read_success(await rig.read("https://example.org/0"))  # a hit: 0 is now the most recent
+    for index in (3, 4):
+        read_success(await rig.read(f"https://example.org/{index}"))
+
+    assert rig.handle._cache.stats().entries == 3
+    assert len(rig.transport.connections) == 5
+    for index in (0, 3, 4):
+        read_success(await rig.read(f"https://example.org/{index}"))
+    assert len(rig.transport.connections) == 5
+    read_success(await rig.read("https://example.org/1"))  # evicted: a new request
+    assert len(rig.transport.connections) == 6
+    assert rig.handle._cache.stats().entries == 3
+
+
+async def test_ac16_stored_content_stays_within_max_bytes_over_20_reads() -> None:
+    """AC16: with ``cache_max_bytes: 65536`` and 20 distinct 8 KiB reads,
+    after each read the stored content recomputed from the raw entries over
+    the whole observation is > 0, ≤ 65536 and equal to ``stats()``."""
+
+    rig = await read_rig(cache_max_bytes=65_536)
+    for index in range(20):
+        rig.transport.script("example.org", eight_kib_page(index))
+        result = read_success(await rig.read(f"https://example.org/r{index}"))
+        assert len(result["text"].encode("utf-8")) == 8192
+
+        measured = stored_content(rig)
+        assert 0 < measured <= 65_536
+        assert measured == rig.handle._cache.stats().stored_bytes
+    entries = rig.handle._cache.stats().entries
+    assert 1 < entries < 20
+    assert len(rig.transport.connections) == 20
+
+
+async def test_r5_an_entry_larger_than_max_bytes_alone_is_not_stored() -> None:
+    """R5: a 65536-byte text under ``cache_max_bytes: 65536`` cannot fit with
+    its key and record, so it is not stored and evicts nothing."""
+
+    rig = await read_rig(cache_max_bytes=65_536, max_text_bytes=65_536)
+    rig.transport.script("example.org", html_page(b"<p>small</p>"))
+    read_success(await rig.read("https://example.org/small"))
+    before = rig.handle._cache.stats()
+    rig.transport.script("example.org", html_page(b"<p>" + b"y" * 65_536 + b"</p>"))
+
+    read_success(await rig.read("https://example.org/big"))
+
+    assert rig.handle._cache.stats() == before
+    assert [key for key, _ in rig.handle._cache._snapshot()] == [
+        cache_key(WEB_READ_ACTION, PROVIDER_HTTP, {"url": "https://example.org/small"})
+    ]
+
+
+async def test_ac16_an_entry_is_accounted_as_the_whole_observation() -> None:
+    """AC16 per entry: a cached read's and a cached search's accounted size
+    equals the test's whole-observation size, and exceeds key + result alone
+    by at least the compact length of the provenance mapping."""
+
+    read = await read_rig()
+    read.transport.script("example.org", eight_kib_page(1))
+    read_success(await read.read("https://example.org/x"))
+    search = await search_rig()
+    search.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"))
+    search_success(await search.search("zebra"), PROVIDER_WIKIPEDIA)
+
+    for rig in (read, search):
+        ((key, observation),) = rig.handle._cache._snapshot()
+        accounted = rig.handle._cache.stats().stored_bytes
+        assert accounted == entry_bytes(key, observation)
+        result_only = len(key.encode("utf-8")) + len(compact(observation.result).encode("utf-8"))
+        assert accounted - result_only >= len(compact(observation.provenance).encode("utf-8"))
+        assert accounted > result_only
+
+
+async def test_ac16_every_byte_of_the_observation_changes_its_accounted_size() -> None:
+    """AC16 sensitivity: two reads identical but for a ``final_url`` 100
+    bytes longer, and two searches differing only in one result ``title``,
+    differ in accounted size by exactly that byte difference."""
+
+    async def read_size(final_path: str, request_path: str) -> int:
+        rig = await read_rig()
+        rig.transport.script("example.org", redirect(final_path), html_page(b"<p>same</p>"))
+        result = read_success(await rig.read(f"https://example.org/{request_path}"))
+        assert result["final_url"] == f"https://example.org{final_path}"
+        return rig.handle._cache.stats().stored_bytes
+
+    async def search_size(title: str, query: str) -> int:
+        rig = await search_rig(**brave_settings(fake_key()))
+        rig.transport.script(
+            BRAVE_HOST,
+            brave_answer((title, "https://example.org/a"), ("Other", "https://example.org/b")),
+        )
+        results = search_success(await rig.search(query), PROVIDER_BRAVE)
+        assert results[0]["title"] == title
+        return rig.handle._cache.stats().stored_bytes
+
+    assert await read_size("/f" + "u" * 100, "b") - await read_size("/f", "a") == 100
+    longer, shorter = "Zebra stripes, explained", "Zebra"
+    difference = len(longer.encode("utf-8")) - len(shorter.encode("utf-8"))
+    assert await search_size(longer, "zebrb") - await search_size(shorter, "zebra") == difference
+
+
+async def test_ac16_a_read_and_a_search_of_the_same_string_are_distinct_entries() -> None:
+    """AC16: a read of ``https://example.org/x`` and a search for the same
+    string are 2 entries, each served only to its own action."""
+
+    rig = await search_rig()
+    text = "https://example.org/x"
+    rig.transport.script("example.org", html_page(b"<p>page</p>"))
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"))
+
+    read_success(await rig.read(text))
+    search_success(await rig.search(text), PROVIDER_WIKIPEDIA)
+    read_success(await rig.read(text))
+    search_success(await rig.search(text), PROVIDER_WIKIPEDIA)
+
+    assert rig.handle._cache.stats().entries == 2
+    assert len(rig.transport.connections) == 2
+    assert [trace["cache_hit"] for trace in rig.completed()] == [False, True]
+    assert [trace["cache_hit"] for trace in rig.searched()] == [False, True]
+
+
+async def test_r7_the_cache_never_renders_a_key_or_an_entry() -> None:
+    """R5/R7: the cache's repr, its stats and its entries' reprs are counts
+    only; the key, URL and page text stay inside the object."""
+
+    rig = await read_rig()
+    rig.transport.script("example.org", html_page(b"<p>PAGETEXT</p>"))
+    read_success(await rig.read("https://example.org/SECRETPATH?q=SECRETQS"))
+
+    cache = rig.handle._cache
+    rendered = repr(cache) + repr(cache.stats()) + repr(list(cache._entries.values()))
+    for secret in ("SECRETPATH", "SECRETQS", "PAGETEXT", "example.org", WEB_READ_ACTION):
+        assert secret not in rendered
