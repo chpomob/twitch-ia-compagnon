@@ -45,6 +45,30 @@ providers are bound, the executor refuses both actions
 ``provider_not_ready`` — the kernel's own answer. ``close`` withdraws
 readiness and closes a transport a call opened.
 
+**The network guard (R4).** Every request goes through the same guard,
+at every hop. :func:`parse_target` accepts only ``http``/``https`` URLs that
+have a host and no userinfo, and normalises the host: no brackets, lower
+case, no trailing dot, IDNA-encoded. :func:`literal_address` classifies
+every spelling the platform resolver would read as an address, the legacy
+IPv4 forms included (``2130706433``, ``0x7f.1``, ``017700000001``,
+``1.2.3``), so a literal is checked as an address and never sent to the
+resolver as a name. :func:`address_refusal` unwraps IPv4-mapped and
+IPv4-compatible IPv6 to the embedded IPv4, then refuses every address in an
+explicit table of non-public ranges, and any other address whose
+``is_global`` is false. The table is explicit because ``ipaddress``
+classifies some ranges differently across the supported Python versions.
+:func:`resolve_checked` resolves a name once and refuses the call if *any*
+answer is refused. The addresses it returns are the only ones a
+connection may use. :func:`host_allowed` is the ``allowed_hosts`` exact
+match, which applies to reads only. A refusal is a :class:`GuardRefusal`
+that holds only its code, never the URL or the host.
+
+*Not covered:* NAT64 (``64:ff9b::/96``) and 6to4 (``2002::/16``) also embed
+an IPv4 address, but the specification names only the mapped and
+compatible forms, so these two are left to ``is_global``. ``is_global``
+treats both as global, so ``64:ff9b::7f00:1`` is not refused as loopback.
+This gap is recorded here and was not checked in another way.
+
 **Seams, for the tests.** ``_transport`` replaces the HTTP transport,
 ``_resolver`` the name resolution and ``_sleeper`` the sleep a bound is
 raced against. They are read from *settings*, never from a configuration
@@ -56,9 +80,13 @@ Lifecycle: the manifest declares no role, so the handle takes part in
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
+import ipaddress
 import re
+import socket
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -339,6 +367,268 @@ def normalize_host_name(value: Any) -> str | None:
     return encoded
 
 
+# --------------------------------------------------------------------------- #
+# The network guard (R4)
+# --------------------------------------------------------------------------- #
+
+#: The guard's refusal codes, a fixed vocabulary (R7).
+REFUSAL_BLOCKED_ADDRESS = "blocked_address"
+REFUSAL_HOST_NOT_ALLOWED = "host_not_allowed"
+REFUSAL_UNSUPPORTED_SCHEME = "unsupported_scheme"
+REFUSAL_UNSUPPORTED_URL = "unsupported_url"
+REFUSAL_TRANSPORT_FAILED = "transport_failed"
+
+_SCHEME_PORTS: Mapping[str, int] = {"http": 80, "https": 443}
+
+#: Characters a legacy IPv4 spelling is made of; only these reach ``inet_aton``,
+#: whose platform version may ignore anything after whitespace.
+_LEGACY_IPV4 = re.compile(r"[0-9a-fx.]+")
+
+#: Non-public IPv4 ranges, refused whatever ``is_global`` says on this Python.
+_BLOCKED_IPV4 = tuple(
+    ipaddress.IPv4Network(network)
+    for network in (
+        "0.0.0.0/8",  # "this network", unspecified
+        "10.0.0.0/8",  # private
+        "100.64.0.0/10",  # shared (CGNAT)
+        "127.0.0.0/8",  # loopback
+        "169.254.0.0/16",  # link-local
+        "172.16.0.0/12",  # private
+        "192.0.0.0/24",  # IETF protocol assignments
+        "192.0.2.0/24",  # documentation
+        "192.168.0.0/16",  # private
+        "198.18.0.0/15",  # benchmarking
+        "198.51.100.0/24",  # documentation
+        "203.0.113.0/24",  # documentation
+        "224.0.0.0/4",  # multicast
+        "240.0.0.0/4",  # reserved, and the broadcast 255.255.255.255
+    )
+)
+
+#: Non-public IPv6 ranges; mapped and compatible IPv4 are unwrapped first.
+_BLOCKED_IPV6 = tuple(
+    ipaddress.IPv6Network(network)
+    for network in (
+        "::/128",  # unspecified
+        "::1/128",  # loopback
+        "::ffff:0:0/96",  # IPv4-mapped, if ever reached un-unwrapped
+        "100::/64",  # discard-only
+        "2001:db8::/32",  # documentation
+        "3fff::/20",  # documentation (RFC 9637), global on older Pythons
+        "fc00::/7",  # unique local
+        "fe80::/10",  # link-local
+        "fec0::/10",  # site-local
+        "ff00::/8",  # multicast
+    )
+)
+
+Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+@dataclass(frozen=True, slots=True)
+class GuardRefusal:
+    """A refused request: only its code, never the URL, host or address."""
+
+    code: str
+
+
+@dataclass(frozen=True, slots=True)
+class Target:
+    """One parsed request target, its host normalised (R4).
+
+    ``host`` is lower case, IDNA-encoded, with no brackets and no trailing
+    dot; ``port`` is the effective port; ``address`` is the literal address
+    when the host is one, else ``None``. ``path`` is the path and query
+    string to request (the fragment is dropped). The repr omits it, because
+    a URL's path is never recorded (R7).
+    """
+
+    scheme: str
+    host: str
+    port: int
+    path: str
+    address: Address | None = None
+
+    def __repr__(self) -> str:
+        return f"Target(scheme={self.scheme!r}, host={self.host!r}, port={self.port!r})"
+
+
+def parse_target(url: Any) -> Target | GuardRefusal:
+    """*url* as a :class:`Target`, or the refusal the guard answers.
+
+    A scheme other than ``http`` or ``https`` is ``unsupported_scheme``.
+    Userinfo, a missing host, a port that does not parse, a host that is
+    neither an address nor a host name, or an IDNA failure is
+    ``unsupported_url``. The parser's error text is never read.
+    """
+
+    if not isinstance(url, str):
+        return GuardRefusal(REFUSAL_UNSUPPORTED_URL)
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        if scheme not in _SCHEME_PORTS:
+            return GuardRefusal(REFUSAL_UNSUPPORTED_SCHEME)
+        if "@" in parts.netloc:
+            return GuardRefusal(REFUSAL_UNSUPPORTED_URL)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return GuardRefusal(REFUSAL_UNSUPPORTED_URL)
+    if not hostname:
+        return GuardRefusal(REFUSAL_UNSUPPORTED_URL)
+    effective_port = _SCHEME_PORTS[scheme] if port is None else port
+    path = parts.path or "/"
+    if parts.query:
+        path = f"{path}?{parts.query}"
+
+    if parts.netloc.startswith("["):
+        try:
+            address = ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return GuardRefusal(REFUSAL_UNSUPPORTED_URL)
+        return Target(scheme, str(address), effective_port, path, address)
+
+    host = hostname[:-1] if hostname.endswith(".") else hostname
+    address = literal_address(host)
+    if isinstance(address, ipaddress.IPv4Address):
+        return Target(scheme, str(address), effective_port, path, address)
+    if address is not None:  # an unbracketed IPv6 literal is not a URL host
+        return GuardRefusal(REFUSAL_UNSUPPORTED_URL)
+    name = normalize_host_name(host)
+    if name is None:
+        return GuardRefusal(REFUSAL_UNSUPPORTED_URL)
+    return Target(scheme, name, effective_port, path, None)
+
+
+def literal_address(host: Any) -> Address | None:
+    """*host* as an address when the platform resolver would read it as one.
+
+    Canonical forms come from ``ipaddress``. Every legacy IPv4 spelling
+    ``inet_aton`` accepts (decimal, hexadecimal, octal, short forms) is an
+    address too. That is the safe side: a literal is checked as an address
+    and never resolved as a name.
+    """
+
+    if not isinstance(host, str) or not host:
+        return None
+    candidate = host.strip("[]").lower()
+    try:
+        return ipaddress.ip_address(candidate)
+    except ValueError:
+        pass
+    if _LEGACY_IPV4.fullmatch(candidate) is None:
+        return None
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(candidate))
+    except (OSError, ValueError):
+        return None
+
+
+def address_refusal(address: Any) -> str | None:
+    """``"blocked_address"`` unless *address* is globally reachable (R4).
+
+    IPv4-mapped (``::ffff:a.b.c.d``) and IPv4-compatible (``::a.b.c.d``)
+    IPv6 are judged by their embedded IPv4. ``::`` and ``::1`` are not
+    unwrapped and are refused as unspecified and loopback.
+    """
+
+    if not isinstance(address, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return REFUSAL_BLOCKED_ADDRESS
+    if isinstance(address, ipaddress.IPv6Address):
+        value = int(address)
+        address = ipaddress.IPv6Address(value)  # drop any scope id
+        if address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        elif value >> 32 == 0 and value > 1:
+            address = ipaddress.IPv4Address(value)
+    table = _BLOCKED_IPV4 if isinstance(address, ipaddress.IPv4Address) else _BLOCKED_IPV6
+    if any(address in network for network in table):
+        return REFUSAL_BLOCKED_ADDRESS
+    if (
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_reserved
+        or getattr(address, "is_site_local", False)
+        or not address.is_global
+    ):
+        return REFUSAL_BLOCKED_ADDRESS
+    return None
+
+
+def host_allowed(host: Any, allowed_hosts: Any) -> bool:
+    """Whether a read may go to *host* under ``allowed_hosts`` (R4).
+
+    An empty list allows any host. Otherwise *host* must equal one entry
+    exactly once both are normalised (case-insensitive, IDNA). A suffix or
+    a wildcard never matches. This never applies to the fixed provider
+    endpoints.
+    """
+
+    entries = tuple(allowed_hosts or ())
+    if not entries:
+        return True
+    name = normalize_host_name(host)
+    if name is None:
+        return False
+    return any(normalize_host_name(entry) == name for entry in entries)
+
+
+async def resolve_checked(target: Target, resolver: Any = None) -> list[Address] | GuardRefusal:
+    """The addresses *target* may be connected to, or the refusal.
+
+    A literal is checked directly and never resolved. A name is resolved
+    once through *resolver* (by default the running loop's ``getaddrinfo``
+    for a stream socket). The call is refused ``blocked_address`` if *any*
+    answer is refused, and ``transport_failed`` if resolution fails or
+    returns nothing. The list returned is the pinned set: a connection is
+    made only to one of these addresses.
+    """
+
+    if target.address is not None:
+        if address_refusal(target.address) is not None:
+            return GuardRefusal(REFUSAL_BLOCKED_ADDRESS)
+        return [target.address]
+    if resolver is None:
+        resolver = asyncio.get_running_loop().getaddrinfo
+    try:
+        answers = await resolver(target.host, target.port, type=socket.SOCK_STREAM)
+        answers = list(answers or ())
+    except Exception:  # noqa: BLE001 - the resolver's text names the host
+        return GuardRefusal(REFUSAL_TRANSPORT_FAILED)
+    if not answers:
+        return GuardRefusal(REFUSAL_TRANSPORT_FAILED)
+    addresses: list[Address] = []
+    for answer in answers:
+        address = _answer_address(answer)
+        if address is None or address_refusal(address) is not None:
+            return GuardRefusal(REFUSAL_BLOCKED_ADDRESS)
+        if address not in addresses:
+            addresses.append(address)
+    return addresses
+
+
+def _answer_address(answer: Any) -> Address | None:
+    """One resolver answer as an address: a ``getaddrinfo`` tuple or a string."""
+
+    if isinstance(answer, tuple):
+        try:
+            answer = answer[4][0]
+        except (IndexError, TypeError):
+            return None
+    if isinstance(answer, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return answer
+    if not isinstance(answer, str):
+        return None
+    try:
+        return ipaddress.ip_address(answer)
+    except ValueError:
+        return None
+
+
 def _setting_diagnostic(field_name: str, reason: str) -> str:
     return f"module {MODULE_NAME!r}: field {field_name!r}: {reason}"
 
@@ -555,10 +845,12 @@ def _require_runtime_surfaces(context: Any) -> None:
 
 
 __all__ = [
+    "Address",
     "DEFAULT_DEBUG_LENGTHS",
     "DEFAULT_PROVIDER",
     "DEFAULT_USER_AGENT_CONTACT",
     "DEFAULT_WIKIPEDIA_LANGUAGE",
+    "GuardRefusal",
     "INTEGER_SETTINGS",
     "MANIFEST_PATH",
     "MAX_ALLOWED_HOSTS",
@@ -567,12 +859,23 @@ __all__ = [
     "PROVIDERS",
     "PROVIDER_BRAVE",
     "PROVIDER_WIKIPEDIA",
+    "REFUSAL_BLOCKED_ADDRESS",
+    "REFUSAL_HOST_NOT_ALLOWED",
+    "REFUSAL_TRANSPORT_FAILED",
+    "REFUSAL_UNSUPPORTED_SCHEME",
+    "REFUSAL_UNSUPPORTED_URL",
+    "Target",
     "WEB_READ_ACTION",
     "WEB_SEARCH_ACTION",
     "WebModule",
     "WebModuleError",
     "activate",
+    "address_refusal",
     "advisory_marker",
+    "host_allowed",
+    "literal_address",
     "normalize_host_name",
+    "parse_target",
+    "resolve_checked",
     "validate_settings",
 ]

@@ -3,7 +3,9 @@
 Plan step P1 lays the module boundary: the manifest and its two read
 contracts (R1, AC1 manifest half), the settings schema, its validator and
 the ``--check-config`` answers (R5, AC3 check half, AC14), and activation
-and readiness that open nothing (AC4).
+and readiness that open nothing (AC4). Plan step P2 adds the network guard
+(R4): URL, host and address checks and the checked resolution, over every
+AC9 address, the AC10 refusals and the AC12 host matching.
 
 **No test here opens a real socket.** The autouse :func:`socket_guard`
 replaces ``socket.socket.connect``/``connect_ex``, ``socket.create_connection``,
@@ -49,14 +51,25 @@ from modules.web import (
     MANIFEST_PATH,
     MAX_ALLOWED_HOSTS,
     MODULE_NAME,
+    REFUSAL_BLOCKED_ADDRESS,
+    REFUSAL_TRANSPORT_FAILED,
+    REFUSAL_UNSUPPORTED_SCHEME,
+    REFUSAL_UNSUPPORTED_URL,
     WEB_READ_ACTION,
     WEB_SEARCH_ACTION,
+    GuardRefusal,
+    Target,
     WebModule,
     WebModuleError,
     _Settings,
     activate,
+    address_refusal,
     advisory_marker,
+    host_allowed,
+    literal_address,
     normalize_host_name,
+    parse_target,
+    resolve_checked,
     validate_settings,
 )
 
@@ -993,3 +1006,285 @@ async def test_prepare_and_close_mark_and_withdraw_readiness_idempotently() -> N
     assert transport.closed == 1
     await handle.prepare()
     assert not context.actions.is_ready()
+
+
+# --------------------------------------------------------------------------- #
+# P2: the network guard (R4; AC9, AC10 refusal half, AC12 matching)
+# --------------------------------------------------------------------------- #
+
+#: AC9's first-hop URLs, each a literal address the guard must refuse.
+AC9_LITERAL_URLS = [
+    "http://127.0.0.1/",
+    "http://[::1]/",
+    "http://10.0.0.1/",
+    "http://172.16.0.1/",
+    "http://192.168.1.1/",
+    "http://169.254.169.254/",
+    "http://[fe80::1]/",
+    "http://[fc00::1]/",
+    "http://100.64.0.1/",
+    "http://0.0.0.0/",
+    "http://224.0.0.1/",
+    "http://255.255.255.255/",
+    "http://192.0.2.1/",
+    "http://198.18.0.1/",
+    "http://240.0.0.1/",
+    "http://[::ffff:127.0.0.1]/",
+    "http://[::127.0.0.1]/",
+    "http://2130706433/",
+    "http://0x7f.1/",
+    "http://017700000001/",
+]
+
+
+def assert_code_only(refusal: Any, code: str, *secrets: str) -> None:
+    """*refusal* is a :class:`GuardRefusal` of *code* holding nothing else."""
+
+    assert isinstance(refusal, GuardRefusal)
+    assert refusal.code == code
+    assert GuardRefusal.__slots__ == ("code",)
+    assert not hasattr(refusal, "__dict__")
+    rendered = f"{refusal!r} {refusal!s}"
+    for secret in secrets:
+        assert secret not in rendered
+
+
+@pytest.mark.parametrize("url", AC9_LITERAL_URLS)
+async def test_ac9_every_literal_is_refused_blocked_address_with_no_resolution(
+    url: str,
+) -> None:
+    """Each AC9 literal parses to an address, never a name, and is refused
+    ``blocked_address`` without one resolver call."""
+
+    resolver = FakeResolver()
+    target = parse_target(url)
+    assert isinstance(target, Target)
+    assert target.address is not None
+    assert address_refusal(target.address) == REFUSAL_BLOCKED_ADDRESS
+    refusal = await resolve_checked(target, resolver)
+    assert_code_only(refusal, REFUSAL_BLOCKED_ADDRESS, url, target.host)
+    assert resolver.calls == []
+
+
+@pytest.mark.parametrize(
+    ("spelling", "address"),
+    [
+        ("2130706433", "127.0.0.1"),
+        ("0x7f.1", "127.0.0.1"),
+        ("017700000001", "127.0.0.1"),
+        ("0x7f000001", "127.0.0.1"),
+        ("127.1", "127.0.0.1"),
+        ("1.2.3", "1.2.0.3"),
+        ("10.0.0.1", "10.0.0.1"),
+        ("::ffff:127.0.0.1", "::ffff:7f00:1"),
+        ("[::1]", "::1"),
+    ],
+)
+def test_ac9_literal_address_reads_every_platform_spelling(
+    spelling: str, address: str
+) -> None:
+    """Both paths: ``ipaddress`` for canonical forms, ``inet_aton`` for the
+    legacy IPv4 spellings ``ipaddress`` rejects."""
+
+    assert literal_address(spelling) == ipaddress.ip_address(address)
+
+
+@pytest.mark.parametrize(
+    "host", ["example.org", "cafe.be", "1.2.3.4 x", "999.1.1.1", "", "localhost"]
+)
+def test_literal_address_leaves_names_to_the_resolver(host: str) -> None:
+    """A host name (even one written in hex digits), or a spelling with
+    trailing text, is not classified as an address."""
+
+    assert literal_address(host) is None
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "::ffff:10.0.0.1",
+        "::10.0.0.1",
+        "::ffff:192.168.0.1",
+        "::",
+        "::1",
+        "2001:db8::1",
+        "3fff::1",
+        "3fff:fff:ffff::1",
+        "fec0::1",
+        "ff02::1",
+        "198.51.100.7",
+        "203.0.113.9",
+        "192.0.0.8",
+        "0.1.2.3",
+        "fe80::1%2",
+    ],
+)
+def test_r4_the_explicit_table_refuses_embedded_and_reserved_addresses(
+    address: str,
+) -> None:
+    """Mapped and compatible IPv6 are judged by their embedded IPv4;
+    documentation, site-local, multicast and other reserved ranges are
+    refused by the explicit table (``::127.0.0.1`` alone is ``is_global``
+    on some supported Pythons)."""
+
+    assert address_refusal(ipaddress.ip_address(address)) == REFUSAL_BLOCKED_ADDRESS
+
+
+async def test_ac9_a_name_with_one_private_answer_is_refused() -> None:
+    """AC9 last row: a name resolving to one public and one ``10.0.0.5``
+    address is refused ``blocked_address``, after exactly one lookup."""
+
+    resolver = FakeResolver({"mixed.example": ["93.184.216.34", "10.0.0.5"]})
+    target = parse_target("https://mixed.example/page")
+    assert isinstance(target, Target) and target.address is None
+    refusal = await resolve_checked(target, resolver)
+    assert_code_only(refusal, REFUSAL_BLOCKED_ADDRESS, "mixed.example", "page")
+    assert resolver.calls == [("mixed.example", 443)]
+
+
+@pytest.mark.parametrize(
+    ("url", "address"),
+    [
+        ("http://93.184.216.34/", "93.184.216.34"),
+        ("https://[2606:4700::1111]/", "2606:4700::1111"),
+    ],
+)
+async def test_r4_a_public_literal_passes_unresolved(url: str, address: str) -> None:
+    resolver = FakeResolver()
+    target = parse_target(url)
+    assert isinstance(target, Target)
+    assert address_refusal(target.address) is None
+    assert await resolve_checked(target, resolver) == [ipaddress.ip_address(address)]
+    assert resolver.calls == []
+
+
+async def test_r4_a_public_name_returns_its_pinned_addresses() -> None:
+    """The returned list is what a connection may use: every answer, once,
+    in order, from the one lookup; ``getaddrinfo`` tuples are read too."""
+
+    resolver = FakeResolver({"example.org": ["93.184.216.34", "93.184.216.34", "2606:4700::1111"]})
+    target = parse_target("http://Example.ORG.:8080/a?b=c#frag")
+    assert isinstance(target, Target)
+    assert (target.scheme, target.host, target.port, target.path) == (
+        "http",
+        "example.org",
+        8080,
+        "/a?b=c",
+    )
+    assert "/a" not in repr(target)
+    assert await resolve_checked(target, resolver) == [
+        ipaddress.ip_address("93.184.216.34"),
+        ipaddress.ip_address("2606:4700::1111"),
+    ]
+    assert resolver.calls == [("example.org", 8080)]
+
+    async def getaddrinfo(host: str, port: Any, **kwargs: Any) -> list[Any]:
+        assert kwargs == {"type": socket.SOCK_STREAM}
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    assert await resolve_checked(target, getaddrinfo) == [
+        ipaddress.ip_address("93.184.216.34")
+    ]
+
+
+@pytest.mark.parametrize(
+    "answers", [[], ["not-an-address"]], ids=["empty", "unparsable"]
+)
+async def test_r4_an_empty_or_unreadable_answer_is_never_connected(
+    answers: list[str],
+) -> None:
+    resolver = FakeResolver({"example.org": answers} if answers else {})
+    target = parse_target("https://example.org/")
+    assert isinstance(target, Target)
+    refusal = await resolve_checked(target, resolver)
+    expected = REFUSAL_TRANSPORT_FAILED if not answers else REFUSAL_BLOCKED_ADDRESS
+    assert_code_only(refusal, expected, "example.org")
+
+
+async def test_r4_a_failed_resolution_is_transport_failed_value_free() -> None:
+    """An unresolvable name (the fake raises ``gaierror``) is
+    ``transport_failed``, and the resolver's error text is not kept."""
+
+    resolver = FakeResolver()
+    target = parse_target("https://nowhere.example/")
+    assert isinstance(target, Target)
+    refusal = await resolve_checked(target, resolver)
+    assert_code_only(refusal, REFUSAL_TRANSPORT_FAILED, "nowhere.example", "unresolved")
+    assert resolver.calls == [("nowhere.example", 443)]
+
+
+@pytest.mark.parametrize(
+    ("url", "code"),
+    [
+        ("ftp://example.org/", REFUSAL_UNSUPPORTED_SCHEME),
+        ("file:///etc/passwd", REFUSAL_UNSUPPORTED_SCHEME),
+        ("gopher://example.org/", REFUSAL_UNSUPPORTED_SCHEME),
+        ("javascript:alert(1)", REFUSAL_UNSUPPORTED_SCHEME),
+        ("example.org/a", REFUSAL_UNSUPPORTED_SCHEME),
+        ("http://user:pw@example.org/", REFUSAL_UNSUPPORTED_URL),
+        ("http://user@example.org/", REFUSAL_UNSUPPORTED_URL),
+        ("http:///path", REFUSAL_UNSUPPORTED_URL),
+        ("https://:443/", REFUSAL_UNSUPPORTED_URL),
+        ("http://example.org:99999/", REFUSAL_UNSUPPORTED_URL),
+        ("http://example.org:port/", REFUSAL_UNSUPPORTED_URL),
+        ("http://[127.0.0.1]/", REFUSAL_UNSUPPORTED_URL),
+        ("http://[not-v6]/", REFUSAL_UNSUPPORTED_URL),
+        ("http://%31%32%37.0.0.1/", REFUSAL_UNSUPPORTED_URL),
+        ("http://*.example.org/", REFUSAL_UNSUPPORTED_URL),
+        ("http://exa_mple.org/", REFUSAL_UNSUPPORTED_URL),
+    ],
+)
+async def test_ac10_unsupported_schemes_and_urls_are_refused_before_any_lookup(
+    url: str, code: str
+) -> None:
+    """AC10 refusal half: three schemes are ``unsupported_scheme``; userinfo,
+    a missing host, a bad port or a host that is neither an address nor a
+    host name is ``unsupported_url``. The refusal holds only its code."""
+
+    refusal = parse_target(url)
+    assert_code_only(refusal, code, url, "example.org", "passwd", "pw")
+
+
+def test_parse_target_normalises_the_host() -> None:
+    """Brackets stripped, lower-cased, trailing dot removed, IDNA-encoded;
+    the default port follows the scheme."""
+
+    cases = {
+        "HTTPS://BÜCHER.Example./x": ("https", "xn--bcher-kva.example", 443),
+        "http://[2606:4700:0:0::1111]:81/": ("http", "2606:4700::1111", 81),
+        "http://127.0.0.1./": ("http", "127.0.0.1", 80),
+    }
+    for url, expected in cases.items():
+        target = parse_target(url)
+        assert isinstance(target, Target)
+        assert (target.scheme, target.host, target.port) == expected
+
+
+@pytest.mark.parametrize(
+    ("host", "allowed"),
+    [
+        ("EXAMPLE.org", True),
+        ("example.org.", True),
+        ("sub.example.org", False),
+        ("example.com", False),
+        ("org", False),
+        ("notexample.org", False),
+    ],
+)
+def test_ac12_allowed_hosts_is_an_exact_case_insensitive_match(
+    host: str, allowed: bool
+) -> None:
+    """AC12 matching: equality after normalisation, never a suffix match."""
+
+    assert host_allowed(host, ["example.org"]) is allowed
+
+
+def test_ac12_idna_hosts_match_both_ways_and_an_empty_list_allows_any() -> None:
+    unicode_host = "bücher.example"
+    assert host_allowed(unicode_host, ["xn--bcher-kva.example"])
+    assert host_allowed("xn--bcher-kva.example", [unicode_host])
+    assert host_allowed("BÜCHER.example", [unicode_host])
+    assert not host_allowed("buecher.example", [unicode_host])
+    assert host_allowed("anything.example", [])
+    assert host_allowed("anything.example", ())
+    assert not host_allowed("*.example.org", ["example.org", "*.example.org"])
