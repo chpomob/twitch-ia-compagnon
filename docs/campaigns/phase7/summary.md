@@ -79,7 +79,10 @@ R10 (for completeness; not part of AC26's R1–R9 mapping): the socket guard
 - **No summarisation by the module.** It returns bounded extracted text and excerpts as they are;
   any summary is the model's, from that text. No content is filtered, rewritten or scored.
 - **The real providers are proven against fakes only.** Wikipedia and Brave are exercised by the
-  suite against fake transports and recorded-shape fixtures; no test contacts a real network.
+  suite against fake transports and recorded-shape fixtures; no test contacts a real provider.
+- **No socket added.** This phase adds no socket of any kind; the suite's only connections are the
+  pre-existing loopback ones in `test_kick.py`. The socket guard's own self-test exercises the
+  patched `connect`/`connect_ex` on a stand-in object, never a kernel socket.
 - **NAT64 and 6to4 are not specially handled.** `64:ff9b::/96` and `2002::/16` addresses are not
   unwrapped to the IPv4 they embed; they are judged by the platform's `is_global` (so
   `64:ff9b::7f00:1` is not refused as loopback). The guide states this limit.

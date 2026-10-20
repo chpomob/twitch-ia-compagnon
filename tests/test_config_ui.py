@@ -1133,12 +1133,84 @@ def test_ac3_the_real_pages_need_a_session_and_name_no_module(path: str, tmp_pat
 # -- A2: the UI source names no module ----------------------------------------
 
 
-#: Phase 7 R1, R9 (plan P1): ``web`` is also aiohttp's ``web`` package and the
-#: word in "web page", so a bare word match cannot tell the module from them;
-#: the UI source is checked instead for every form that would name the module.
+#: Phase 7 R1, R9 (plan P1): ``web`` is also the name the UI binds aiohttp's
+#: ``web`` package to, so the rule is precise rather than a bare word match:
+#: these forms name the module in any token, ...
 WEB_MODULE_FORMS = re.compile(
     r"[\"']web[\"']|\bmodules[./]web\b|\bweb\.(search|read)\b|/module/web\b"
 )
+WEB_WORD = re.compile(r"\bweb\b")
+#: Prose tokens: a comment, a string, and an f-string's literal parts.
+TEXT_TOKENS = frozenset(
+    {tokenize.COMMENT, tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", tokenize.STRING)}
+)
+
+
+def _web_mentions(source: str) -> list[str]:
+    """... and, beyond them, every bare ``web`` is flagged unless it is the
+    aiohttp name: its ``from aiohttp import web`` binding, or an attribute
+    access ``web.<name>`` of that binding where ``<name>`` is in
+    ``aiohttp.web``. A comment or a string can never be aiohttp usage, so any
+    ``web`` word in one is flagged."""
+
+    from aiohttp import web as aiohttp_web
+
+    tokens = [
+        token
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT)
+    ]
+    bound = any(
+        [t.string for t in tokens[i : i + 4]] == ["from", "aiohttp", "import", "web"]
+        for i in range(len(tokens))
+    )
+    found: list[str] = []
+    for index, token in enumerate(tokens):
+        if WEB_MODULE_FORMS.search(token.string):
+            found.append(token.string)
+        elif token.type in TEXT_TOKENS:
+            if WEB_WORD.search(token.string):
+                found.append(token.string)
+        elif token.type == tokenize.NAME and token.string == "web":
+            before = [t.string for t in tokens[max(index - 3, 0) : index]]
+            after = [t.string for t in tokens[index + 1 : index + 3]]
+            if before == ["from", "aiohttp", "import"]:
+                continue
+            if (
+                bound
+                and (index == 0 or tokens[index - 1].string != ".")
+                and len(after) == 2
+                and after[0] == "."
+                and after[1] in dir(aiohttp_web)
+            ):
+                continue
+            found.append(token.line.strip())
+    return found
+
+
+@pytest.mark.parametrize(
+    ("source", "flagged"),
+    [
+        # The closing gate's counterexample: a comment naming the module.
+        ("# Enable web when the operator grants its actions\nx = 1\n", True),
+        ("from aiohttp import web\nresponse = web.Response(text='ok')\n", False),
+        ("from aiohttp import web\nweb.run_app(web.Application())\n", False),
+        ("x = 1  # the web module\n", True),
+        ("NAME = 'web'\n", True),
+        ("PATH = '/module/web'\n", True),
+        ('"""Serves the web module\'s settings."""\n', True),
+        ("from aiohttp import web\nweb.search(query)\n", True),
+        ("web = load('module')\n", True),
+        ("web.Response()\n", True),
+        ("label = f'the web module {name}'\n", True),
+        ("import modules.web\n", True),
+        ("from modules import web\n", True),
+        ("from aiohttp import web\nthing.web.Response()\n", True),
+        ("from aiohttp import web\nwebsite = web.Request\n", False),
+    ],
+)
+def test_a2_the_web_rule_flags_the_module_and_spares_aiohttp(source: str, flagged: bool) -> None:
+    assert bool(_web_mentions(source)) is flagged, _web_mentions(source)
 
 
 def test_a2_the_ui_source_names_no_module() -> None:
@@ -1148,9 +1220,8 @@ def test_a2_the_ui_source_names_no_module() -> None:
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type == tokenize.STRING:
             assert pattern.search(token.string) is None, token.string
-            assert WEB_MODULE_FORMS.search(token.string) is None, token.string
     assert pattern.search(source) is None
-    assert WEB_MODULE_FORMS.search(source) is None
+    assert _web_mentions(source) == []
 
 
 # -- The configuration model ---------------------------------------------------

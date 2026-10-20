@@ -1,6 +1,6 @@
 """Local configuration UI, run as its own process (R1, D2, D3).
 
-``python -m core.config_ui --config PATH`` serves a local-only web page that
+``python -m core.config_ui --config PATH`` serves a local-only HTML page that
 edits the managed overlay file merged over the untouched base configuration
 (R2, R6). It is never a remote administration channel: it binds a loopback
 address unless ``--allow-non-loopback`` is given, every request must carry an

@@ -598,6 +598,17 @@ def _all_keys(node: Any) -> set[str]:
 # --------------------------------------------------------------------------- #
 
 
+class _UnopenedSocket:
+    """Resolves ``connect``/``connect_ex`` through ``socket.socket`` — the
+    guard's patched methods — without ever being a kernel socket."""
+
+    def connect(self, address: Any) -> Any:
+        return socket.socket.connect(self, address)  # type: ignore[arg-type]
+
+    def connect_ex(self, address: Any) -> Any:
+        return socket.socket.connect_ex(self, address)  # type: ignore[arg-type]
+
+
 async def test_the_socket_guard_refuses_and_records_every_non_loopback_surface(
     socket_guard: SocketGuard,
 ) -> None:
@@ -614,14 +625,14 @@ async def test_the_socket_guard_refuses_and_records_every_non_loopback_surface(
         await loop.getaddrinfo("example.org", 443)
     with pytest.raises(GuardViolation):
         await loop.create_connection(asyncio.Protocol, "198.51.100.7", 80)
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        with pytest.raises(GuardViolation):
-            probe.connect(("192.0.2.1", 80))
-        with pytest.raises(GuardViolation):
-            probe.connect_ex(("192.0.2.1", 80))
-    finally:
-        probe.close()
+    # A stand-in, not a socket: the patched methods are looked up on
+    # ``socket.socket`` at call time and refuse before any OS call, so the
+    # check creates no kernel socket (the phase adds none of any kind).
+    probe = _UnopenedSocket()
+    with pytest.raises(GuardViolation):
+        probe.connect(("192.0.2.1", 80))
+    with pytest.raises(GuardViolation):
+        probe.connect_ex(("192.0.2.1", 80))
     assert [surface for surface, _ in socket_guard.attempts] == [
         "socket.create_connection",
         "socket.getaddrinfo",
@@ -5802,12 +5813,13 @@ def test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base(
     against the tree before phase 7 — has 0 changed lines in the 4 shipped
     profiles."""
 
-    if shutil.which("git") is None:
-        pytest.skip("git is not available: the phase-base diff cannot be taken")
-    if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
-        pytest.skip("not a git work tree: the phase-base diff cannot be taken")
-    if _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode != 0:
-        pytest.skip(f"the phase base {PHASE_BASE} is not in this clone (shallow?)")
+    # A missing git, work tree or base commit is a broken checkout of this
+    # repository, never a reason to pass: each is a hard failure.
+    assert shutil.which("git") is not None, "git is not available: the phase-base diff cannot be taken"
+    assert _git("rev-parse", "--is-inside-work-tree").returncode == 0, "not a git work tree"
+    assert _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode == 0, (
+        f"the phase base {PHASE_BASE} is not in this clone: a broken checkout"
+    )
 
     numstat = _git("diff", "--numstat", PHASE_BASE, "--", "*.example")
     assert numstat.returncode == 0, numstat.stderr

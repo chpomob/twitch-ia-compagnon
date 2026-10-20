@@ -28,6 +28,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The full history: the AC24 test diffs the shipped profiles against
+          # the phase-7 base commit, and treats a missing base as a hard failure.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
