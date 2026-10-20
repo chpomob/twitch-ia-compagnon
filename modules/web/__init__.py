@@ -39,12 +39,29 @@ what the subset cannot say: at most 64 ``allowed_hosts``, each a host name;
 the ``wikipedia_language`` shape; and a non-empty ``brave_api_key`` under
 ``provider: brave``.
 
-**Readiness.** ``prepare`` binds the ``web.read`` provider, its spec built
-from the colocated manifest, and marks the module ready, opening nothing: no
-resolution and no connection happen before a call (R1, AC4). Until its
-provider is bound, the executor refuses ``web.search``
-``provider_not_ready`` — the kernel's own answer. ``close`` withdraws
-readiness and closes a transport a call opened.
+**Readiness.** ``prepare`` binds the ``web.search`` and ``web.read``
+providers, each spec built from the colocated manifest, and marks the module
+ready, opening nothing: no resolution and no connection happen before a call
+(R1, AC4). ``close`` withdraws readiness and closes a transport a call
+opened.
+
+**``web.search`` (R1, R2, R6).** The provider delegates to the configured
+backend — :class:`WikipediaBackend` (MediaWiki ``list=search`` on the
+``wikipedia_language`` wiki, no credential) or :class:`BraveBackend` (the
+Brave web-search endpoint, the key in its subscription header and nowhere
+else, not even its repr). A backend is a ``name``, a ``build_request(query,
+limit)`` and a ``parse(body)`` answering the results and the dropped count,
+or :data:`MALFORMED`: a third provider adds a class and an enum value, not a
+contract field. The endpoint is fetched through the same guard and pinning
+as a read but never against ``allowed_hosts``; only a 2xx body is read,
+bounded, and must parse as the documented JSON shape. A result with no title
+or no ``http(s)`` URL is dropped and counted; every excerpt goes through the
+extractor and :func:`cut_utf8`; the results keep the provider's order, at
+most ``max_results``. Admission is shared with reads. The trace names the
+backend and adds only the query's byte length, the result and dropped
+counts, the redirects, the cache-hit flag and the outcome (R7). Brave omits
+``web`` for some empty answers; the specification classifies a missing list
+as malformed, and so does this module.
 
 **``web.read`` (R3, R6).** One call is admitted against the in-flight bound
 (``resource_busy`` when ``max_concurrent_requests`` are already running,
@@ -127,8 +144,10 @@ from __future__ import annotations
 import asyncio
 import codecs
 import functools
+import importlib.metadata
 import inspect
 import ipaddress
+import json
 import re
 import socket
 import urllib.parse
@@ -1366,6 +1385,231 @@ class _ReadProvider:
 
 
 # --------------------------------------------------------------------------- #
+# The search backends (R1, R2)
+# --------------------------------------------------------------------------- #
+
+#: The provider name ``web.search`` binds under; its traces name the backend.
+SEARCH_BINDING_PROVIDER = MODULE_NAME
+
+#: The fixed Brave web-search endpoint: never subject to ``allowed_hosts``.
+BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+#: The characters a Wikipedia article URL keeps unencoded in its title.
+_WIKI_TITLE_SAFE = "/:()_,'-."
+
+#: The markup excerpts and titles are read as: the provider's answer is JSON,
+#: so its strings are already decoded text.
+_MARKUP_UTF8 = "text/html; charset=utf-8"
+
+
+def _product_version() -> str:
+    """This product's installed version, ``0`` when it is not installed."""
+
+    try:
+        return importlib.metadata.version("twitch-ia-compagnon")
+    except importlib.metadata.PackageNotFoundError:
+        return "0"
+
+
+class Malformed:
+    """A provider answer that is not the documented shape (R2): no result."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "Malformed()"
+
+
+MALFORMED = Malformed()
+
+#: What a backend's ``parse`` answers: the kept results and the dropped count.
+ParsedSearch = tuple[list[dict[str, str]], int]
+
+
+def _plain(text: str) -> str:
+    """*text* with its markup removed and its references decoded, on one line."""
+
+    return " ".join(extract_text(text.encode("utf-8"), _MARKUP_UTF8).text.split())
+
+
+def _is_web_url(value: Any) -> bool:
+    """Whether *value* is an absolute ``http(s)`` URL with a host."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme.lower() in _SCHEME_PORTS and bool(parts.hostname)
+
+
+def _search_result(
+    title: Any, url: Any, excerpt: Any, max_excerpt_bytes: int
+) -> dict[str, str] | None:
+    """One result, or ``None`` when it has no title or no ``http(s)`` URL (R2).
+
+    The excerpt goes through the extractor — markup removed, references
+    decoded — and is cut to *max_excerpt_bytes* on a character boundary; a
+    missing excerpt is empty.
+    """
+
+    if not isinstance(title, str) or not title.strip() or not _is_web_url(url):
+        return None
+    plain = _plain(excerpt) if isinstance(excerpt, str) else ""
+    cut, _ = cut_utf8(plain, max_excerpt_bytes)
+    return {"title": title, "url": url, "excerpt": cut}
+
+
+def _json_answer(body: bytes) -> Any:
+    """*body* as JSON, or :data:`MALFORMED`; the decoder's text is never read."""
+
+    try:
+        return json.loads(body)
+    except Exception:  # noqa: BLE001 - the decoder's text would quote the body
+        return MALFORMED
+
+
+class WikipediaBackend:
+    """MediaWiki ``list=search`` on the configured wiki; no credential (R1, R2).
+
+    The result URL is the article on the same wiki, built from the title with
+    spaces as ``_`` and percent-encoded as Wikipedia serves it.
+    """
+
+    __slots__ = ("_language", "_user_agent", "_max_excerpt_bytes")
+
+    name = PROVIDER_WIKIPEDIA
+
+    def __init__(self, settings: _Settings) -> None:
+        self._language = settings.wikipedia_language
+        agent = f"twitch-ia-compagnon/{_product_version()} (web module)"
+        if settings.user_agent_contact:
+            agent = f"{agent}; {settings.user_agent_contact}"
+        self._user_agent = agent
+        self._max_excerpt_bytes = settings.max_excerpt_bytes
+
+    def __repr__(self) -> str:
+        return f"WikipediaBackend(language={self._language!r})"
+
+    def _wiki(self) -> str:
+        return f"https://{self._language}.wikipedia.org"
+
+    def article_url(self, title: str) -> str:
+        return f"{self._wiki()}/wiki/" + urllib.parse.quote(
+            title.replace(" ", "_"), safe=_WIKI_TITLE_SAFE
+        )
+
+    def build_request(self, query: str, limit: int) -> tuple[str, dict[str, str]]:
+        parameters = urllib.parse.urlencode(
+            {
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": limit,
+                "srprop": "snippet",
+                "format": "json",
+                "formatversion": 2,
+                "utf8": 1,
+            }
+        )
+        return f"{self._wiki()}/w/api.php?{parameters}", {"User-Agent": self._user_agent}
+
+    def parse(self, body: bytes) -> ParsedSearch | Malformed:
+        answer = _json_answer(body)
+        query = answer.get("query") if isinstance(answer, dict) else None
+        items = query.get("search") if isinstance(query, dict) else None
+        if not isinstance(items, list):
+            return MALFORMED
+        results: list[dict[str, str]] = []
+        dropped = 0
+        for item in items:
+            title = item.get("title") if isinstance(item, dict) else None
+            result = None
+            if isinstance(title, str) and title.strip():
+                result = _search_result(
+                    title, self.article_url(title), item.get("snippet"), self._max_excerpt_bytes
+                )
+            if result is None:
+                dropped += 1
+            else:
+                results.append(result)
+        return results, dropped
+
+
+class BraveBackend:
+    """Brave Web Search with the configured key (R1, R2).
+
+    The key is resolved once and only ever reaches the request header: the
+    repr omits it, and nothing else this backend returns holds it.
+    """
+
+    __slots__ = ("_key", "_max_excerpt_bytes")
+
+    name = PROVIDER_BRAVE
+
+    def __init__(self, settings: _Settings) -> None:
+        self._key = settings.brave_api_key or ""
+        self._max_excerpt_bytes = settings.max_excerpt_bytes
+
+    def __repr__(self) -> str:
+        return "BraveBackend()"
+
+    def build_request(self, query: str, limit: int) -> tuple[str, dict[str, str]]:
+        parameters = urllib.parse.urlencode({"q": query, "count": limit})
+        return f"{BRAVE_SEARCH_ENDPOINT}?{parameters}", {
+            "Accept": "application/json",
+            "X-Subscription-Token": self._key,
+        }
+
+    def parse(self, body: bytes) -> ParsedSearch | Malformed:
+        answer = _json_answer(body)
+        web = answer.get("web") if isinstance(answer, dict) else None
+        items = web.get("results") if isinstance(web, dict) else None
+        if not isinstance(items, list):
+            return MALFORMED
+        results: list[dict[str, str]] = []
+        dropped = 0
+        for item in items:
+            result = None
+            if isinstance(item, dict):
+                title = item.get("title")
+                result = _search_result(
+                    _plain(title) if isinstance(title, str) else None,
+                    item.get("url"),
+                    item.get("description"),
+                    self._max_excerpt_bytes,
+                )
+            if result is None:
+                dropped += 1
+            else:
+                results.append(result)
+        return results, dropped
+
+
+#: The backend class of each ``provider`` value: a third provider adds a
+#: class and an enum value here, not a contract field (R1).
+SEARCH_BACKENDS: Mapping[str, Callable[[_Settings], Any]] = {
+    PROVIDER_WIKIPEDIA: WikipediaBackend,
+    PROVIDER_BRAVE: BraveBackend,
+}
+
+
+class _SearchProvider:
+    """The ``web.search`` provider the executor invokes (R1, R2)."""
+
+    __slots__ = ("_module",)
+
+    name = SEARCH_BINDING_PROVIDER
+
+    def __init__(self, module: "WebModule") -> None:
+        self._module = module
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        return await self._module._invoke_search(invocation)
+
+
+# --------------------------------------------------------------------------- #
 # The handle
 # --------------------------------------------------------------------------- #
 
@@ -1403,6 +1647,9 @@ class WebModule:
         #: Calls of either action running now, against ``max_concurrent_requests``.
         self._in_flight = 0
         self._read_provider = _ReadProvider(self)
+        self._search_provider = _SearchProvider(self)
+        #: The configured search backend: built here, it opens nothing.
+        self._backend = SEARCH_BACKENDS[settings.provider](settings)
         self._prepared = False
         self._closed = False
 
@@ -1413,20 +1660,23 @@ class WebModule:
     # -- lifecycle hooks ---------------------------------------------------- #
 
     async def prepare(self) -> None:
-        """Bind the ``web.read`` provider and mark ready, opening nothing (R1, AC4).
+        """Bind both providers and mark ready, opening nothing (R1, AC4).
 
-        The spec comes from the colocated manifest. ``web.search`` has no
-        provider yet, so the executor answers it ``provider_not_ready``; no
-        name is resolved and no connection made.
+        Each spec comes from the colocated manifest. No name is resolved and
+        no connection made.
         """
 
         if self._prepared or self._closed:
             return
-        spec = _declared_spec(WEB_READ_ACTION)
         try:
-            self._actions.register(
-                spec, self._read_provider, provider_name=READ_BINDING_PROVIDER
-            )
+            for action_name, provider, provider_name in (
+                (WEB_SEARCH_ACTION, self._search_provider, SEARCH_BINDING_PROVIDER),
+                (WEB_READ_ACTION, self._read_provider, READ_BINDING_PROVIDER),
+            ):
+                spec = _declared_spec(action_name)
+                self._actions.register(spec, provider, provider_name=provider_name)
+        except WebModuleError:
+            raise
         except Exception:
             raise WebModuleError(f"{MODULE_NAME} prepare: action binding failed") from None
         self._actions.mark_ready()
@@ -1508,6 +1758,82 @@ class WebModule:
             status="success",
             provenance=_read_provenance(trace),
             result=result,
+            parts=(),
+        )
+
+    # -- web.search (R1, R2, R4 provider endpoints, R6, R7) ------------------ #
+
+    async def _invoke_search(self, invocation: Any) -> ActionObservation:
+        """Serve one ``web.search`` call for the executor.
+
+        Like a read, a search changes nothing outside: nothing is emitted, and
+        the slot taken against ``max_concurrent_requests`` — shared with
+        reads — is released on every exit.
+        """
+
+        invocation.mark_not_emitted()
+        query = invocation.call.arguments.get("query")
+        trace: dict[str, Any] = {
+            "query_bytes": (
+                len(query.encode("utf-8", errors="replace")) if isinstance(query, str) else 0
+            ),
+            "result_count": 0,
+            "dropped_count": 0,
+            "redirects": 0,
+            "cache_hit": False,
+            "outcome": OUTCOME_OK,
+        }
+        backend = self._backend
+        if self._in_flight >= self._settings.max_concurrent_requests:
+            return _search_failure(backend.name, trace, REFUSAL_RESOURCE_BUSY)
+        self._in_flight += 1
+        try:
+            return await self._search(backend, query, trace)
+        finally:
+            self._in_flight -= 1
+
+    async def _search(
+        self, backend: Any, query: Any, trace: dict[str, Any]
+    ) -> ActionObservation:
+        """Ask *backend* through the guard, never the allowlist; parse, bound (R2).
+
+        The provider endpoint goes through the same scheme and address guard
+        and pinning as a read, but ``allowed_hosts`` does not apply to it
+        (R4). Only a 2xx body is read, bounded by ``max_response_bytes``; one
+        that was cut, or that is not the documented JSON shape, is
+        ``error malformed_response``.
+        """
+
+        settings = self._settings
+        url, headers = backend.build_request(query, settings.max_results)
+        fetched = await self.fetch(
+            url, apply_allowlist=False, accept_body=_successful_answer, headers=headers
+        )
+        trace["redirects"] = fetched.redirects
+        if isinstance(fetched, FetchFailure):
+            return _search_failure(backend.name, trace, fetched)
+        if _classify(WEB_SEARCH_ACTION, fetched.status)[0] != "success":
+            return _search_failure(backend.name, trace, fetched.status)
+        if fetched.body is None or fetched.truncated:
+            return _search_failure(backend.name, trace, ERROR_MALFORMED_RESPONSE)
+        try:
+            parsed = backend.parse(fetched.body)
+        except Exception:  # noqa: BLE001 - the parser's text would quote the answer
+            parsed = MALFORMED
+        if isinstance(parsed, Malformed):
+            return _search_failure(backend.name, trace, ERROR_MALFORMED_RESPONSE)
+        results, dropped = parsed
+        results = results[: settings.max_results]
+        trace["result_count"] = len(results)
+        trace["dropped_count"] = dropped
+        return ActionObservation(
+            status="success",
+            provenance=_search_provenance(backend.name, trace),
+            result={
+                "advisory": advisory_marker(),
+                "provider": backend.name,
+                "results": results,
+            },
             parts=(),
         )
 
@@ -1658,6 +1984,39 @@ def _readable_answer(response: Any) -> bool:
     return media_type in READABLE_CONTENT_TYPES
 
 
+def _successful_answer(response: Any) -> bool:
+    """Whether a provider's final answer body is read: a 2xx only (R2, R6)."""
+
+    status = getattr(response, "status", None)
+    return isinstance(status, int) and 200 <= status < 300
+
+
+def _search_provenance(provider: str, trace: Mapping[str, Any]) -> dict[str, Any]:
+    """A search's provenance: the backend's name and its count-only trace fields."""
+
+    return {"provider": provider, "trace_fields": dict(trace)}
+
+
+def _search_failure(
+    provider: str, trace: dict[str, Any], outcome: FetchFailure | int | str
+) -> ActionObservation:
+    """The terminal observation of a search that did not succeed (R6, R7)."""
+
+    status, code = _classify(WEB_SEARCH_ACTION, outcome)
+    if code is None:  # a success status is never a failure
+        status, code = FETCH_ERROR, ERROR_MALFORMED_RESPONSE
+    trace["outcome"] = code
+    return ActionObservation(
+        status=status,
+        provenance=_search_provenance(provider, trace),
+        error={
+            "code": code,
+            "message": _failure_message(WEB_SEARCH_ACTION, status, code),
+            "retryable": False,
+        },
+    )
+
+
 def _read_provenance(trace: Mapping[str, Any]) -> dict[str, Any]:
     """A read's provenance: the ``http`` provider and its count-only trace fields."""
 
@@ -1745,6 +2104,13 @@ def _require_runtime_surfaces(context: Any) -> None:
 __all__ = [
     "Address",
     "AiohttpTransport",
+    "BRAVE_SEARCH_ENDPOINT",
+    "BraveBackend",
+    "MALFORMED",
+    "Malformed",
+    "SEARCH_BACKENDS",
+    "SEARCH_BINDING_PROVIDER",
+    "WikipediaBackend",
     "CREDENTIAL_HEADERS",
     "ERROR_MALFORMED_RESPONSE",
     "ERROR_TIMED_OUT",

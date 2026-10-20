@@ -1,0 +1,62 @@
+{
+  "batchcomplete": true,
+  "continue": {
+    "sroffset": 8,
+    "continue": "-||"
+  },
+  "query": {
+    "searchinfo": {
+      "totalhits": 1342
+    },
+    "search": [
+      {
+        "ns": 0,
+        "title": "Zebra",
+        "pageid": 1000,
+        "snippet": "The <span class=\"searchmatch\">zebra</span> is an African equine with black &amp; white stripes; three living species are recognised."
+      },
+      {
+        "ns": 0,
+        "title": "Café (film)",
+        "pageid": 1001,
+        "snippet": "<span class=\"searchmatch\">Café</span> is a film about a small coffee shop &amp; the people who meet there each morning."
+      },
+      {
+        "ns": 0,
+        "title": "Plains zebra",
+        "pageid": 1002,
+        "snippet": "The plains <span class=\"searchmatch\">zebra</span> &amp; its kins, the most widespread équidé of all, roam the savanna."
+      },
+      {
+        "ns": 0,
+        "title": "Grévy's zebra",
+        "pageid": 1003,
+        "snippet": "Grévy's <span class=\"searchmatch\">zebra</span> &amp; its habitat: the largest living wild equid, found in Kenya and Ethiopia."
+      },
+      {
+        "ns": 0,
+        "title": "Zebra crossing",
+        "pageid": 1004,
+        "snippet": "A <span class=\"searchmatch\">zebra</span> crossing is a type of pedestrian crossing &amp; is marked by alternating stripes."
+      },
+      {
+        "ns": 0,
+        "title": "Mountain zebra",
+        "pageid": 1005,
+        "snippet": "The mountain <span class=\"searchmatch\">zebra</span> &amp; its subspecies live in south-western Africa."
+      },
+      {
+        "ns": 0,
+        "title": "Zebra mussel",
+        "pageid": 1006,
+        "snippet": "The <span class=\"searchmatch\">zebra</span> mussel is a small freshwater mussel &amp; an invasive species."
+      },
+      {
+        "ns": 0,
+        "title": "Zebra finch",
+        "pageid": 1007,
+        "snippet": "The <span class=\"searchmatch\">zebra</span> finch &amp; its song have been studied extensively."
+      }
+    ]
+  }
+}

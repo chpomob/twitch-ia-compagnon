@@ -18,7 +18,11 @@ for ``brain`` on ``twitch/chan/web``: default-deny (AC1 provider half), the
 url argument rows (AC2), the text bound and the content type judged unread
 (AC8, over ``page_20k.html``), AC9–AC13 again as executor statuses and
 codes, the concurrency bound (AC17), the read rows of the R6 table (AC18)
-and the count-only trace (R7).
+and the count-only trace (R7). Plan step P6 binds ``web.search`` and drives
+it the same way over the MediaWiki and Brave fixtures: the query rows of
+AC2, the request half of AC3, the bounded plain results of AC5, the dropped
+and malformed answers of AC6, the provider endpoint outside the allowlist
+(AC12) and the search rows of AC18, with the twelve AC18 rows walked once.
 
 **No test here opens a real socket.** The autouse :func:`socket_guard`
 replaces ``socket.socket.connect``/``connect_ex``, ``socket.create_connection``,
@@ -39,8 +43,11 @@ from __future__ import annotations
 
 import asyncio
 import asyncio.base_events
+import functools
 import ipaddress
+import json
 import socket
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -54,7 +61,6 @@ import core.main as application
 from core.actions import (
     ERROR_INVALID_ARGUMENTS,
     ERROR_NOT_AUTHORIZED,
-    ERROR_PROVIDER_NOT_READY,
     AuthorizationRule,
 )
 from core.bus import EventBus
@@ -77,6 +83,14 @@ from modules.web import (
     REFUSAL_UNSUPPORTED_CONTENT_TYPE,
     _classify,
     _declared_spec,
+    BRAVE_SEARCH_ENDPOINT,
+    PROVIDER_BRAVE,
+    PROVIDER_WIKIPEDIA,
+    SEARCH_BACKENDS,
+    SEARCH_BINDING_PROVIDER,
+    BraveBackend,
+    Malformed,
+    WikipediaBackend,
     FETCH_ERROR,
     FETCH_REFUSED,
     FETCH_TIMEOUT,
@@ -151,7 +165,6 @@ SPEC_OTHER_DEFAULTS = {
     "debug_lengths": False,
 }
 
-WEB_DESTINATION = Destination(platform="fake", channel_id="channel-1", scope="web")
 PRINCIPAL = "brain"
 
 
@@ -951,32 +964,16 @@ async def test_ac3_a_refused_brave_profile_never_echoes_the_key(
 # --------------------------------------------------------------------------- #
 
 
-def _web_call(action: str, arguments: dict[str, Any]) -> ActionCall:
-    return ActionCall(
-        action_name=action,
-        action_version=1,
-        arguments=arguments,
-        conversation_id="conversation-1",
-        run_id="run-1",
-        call_id=f"call-{action}",
-        source_event_id="source-1",
-        destination=WEB_DESTINATION,
-        principal=PRINCIPAL,
-        deadline=10_000.0,
-        message_id="source-1",
-    )
-
-
 async def test_ac4_activate_prepare_and_ready_open_no_connection(
     socket_guard: SocketGuard,
 ) -> None:
     """AC4: through the real loader and the coordinator, ``activate`` →
     ``prepare`` → ``module.ready`` records 0 connection attempts on the fake
     transport, 0 resolutions on the fake resolver and 0 attempts on the
-    socket guard. Until its provider is bound (P6) a granted ``web.search``
-    is refused ``provider_not_ready`` with 0 invocations. ``web.read`` is
-    bound at ``prepare`` since P5 (R3, superseding the P1 "no provider yet"
-    half of this test), its spec equal to the discovered one, and binding it
+    socket guard. ``web.read`` is bound at ``prepare`` since P5 (R3) and
+    ``web.search`` since P6 (R1: "prepare registers ``web.search``"), which
+    supersede the P1 "no provider yet, ``provider_not_ready``" half of this
+    test: each binding's spec equals the discovered one, and binding them
     opens nothing; stop withdraws readiness and still opens nothing."""
 
     clock = ManualClock()
@@ -1023,23 +1020,14 @@ async def test_ac4_activate_prepare_and_ready_open_no_connection(
     assert resolver.calls == []
     assert socket_guard.attempts == []
 
-    (binding,) = context.actions.bindings(WEB_READ_ACTION)
-    assert binding.spec == context.actions.discovered()[WEB_READ_ACTION]
-    assert binding.provider_name == READ_BINDING_PROVIDER
-    assert WEB_READ_ACTION in context.actions.registered_ready()
-
-    context.actions._authorization.grant(
-        AuthorizationRule(
-            rule_id="grant-web.search",
-            action_name=WEB_SEARCH_ACTION,
-            granted_permissions=(WEB_SEARCH_ACTION,),
-        )
-    )
-    observation = await context.executor.invoke(
-        _web_call(WEB_SEARCH_ACTION, {"query": "anything"})
-    )
-    assert observation.status == "refused"
-    assert observation.error["code"] == ERROR_PROVIDER_NOT_READY
+    for action_name, provider_name in (
+        (WEB_READ_ACTION, READ_BINDING_PROVIDER),
+        (WEB_SEARCH_ACTION, SEARCH_BINDING_PROVIDER),
+    ):
+        (binding,) = context.actions.bindings(action_name)
+        assert binding.spec == context.actions.discovered()[action_name]
+        assert binding.provider_name == provider_name
+        assert action_name in context.actions.registered_ready()
     assert context.executor.provider_invocations == 0
 
     assert (await coordinator.stop()).status == 0
@@ -2940,3 +2928,675 @@ async def test_r7_the_read_trace_carries_counts_and_lengths_only() -> None:
     assert set(observation.provenance["trace_fields"]) == {
         "url_bytes", "text_bytes", "redirects", "cache_hit", "outcome"
     }
+
+
+# --------------------------------------------------------------------------- #
+# P6: web.search through the executor (R1, R2, R4 provider endpoints, R6;
+# AC2 query rows, AC3 request half, AC5, AC6, AC12 search half, AC18)
+# --------------------------------------------------------------------------- #
+
+WIKIPEDIA_EN = "en.wikipedia.org"
+WIKIPEDIA_FR = "fr.wikipedia.org"
+BRAVE_HOST = "api.search.brave.com"
+PUBLIC_WIKI = "198.35.26.96"
+PUBLIC_BRAVE = "151.101.2.217"
+
+
+class PathRecordingTransport(FakeTransport):
+    """A :class:`FakeTransport` that also keeps each request's path and query.
+
+    Only the search tests use it, to assert the endpoint a provider asked;
+    the shared fake keeps the path's length alone.
+    """
+
+    def __init__(self, default: FakeResponse | None = None) -> None:
+        super().__init__(default)
+        self.requests: list[tuple[str, str, dict[str, list[str]]]] = []
+
+    async def open(self, method: str, *, host: str, path_and_query: str, **kwargs: Any) -> Any:
+        parts = urllib.parse.urlsplit(path_and_query)
+        self.requests.append((host, parts.path, urllib.parse.parse_qs(parts.query)))
+        return await super().open(method, host=host, path_and_query=path_and_query, **kwargs)
+
+
+@dataclass
+class SearchRig(ReadRig):
+    """A :class:`ReadRig` whose ``brain`` may also search on ``twitch/chan/web``."""
+
+    searches: int = 0
+
+    def search_call(self, arguments: Mapping[str, Any]) -> ActionCall:
+        self.searches += 1
+        return replace(
+            self.call(arguments), action_name=WEB_SEARCH_ACTION, call_id=f"search-{self.searches}"
+        )
+
+    async def search(self, query: str | None = None, **arguments: Any) -> Any:
+        if query is not None:
+            arguments["query"] = query
+        return await self.executor.invoke(self.search_call(arguments))
+
+    def searched(self) -> list[Mapping[str, Any]]:
+        return [
+            event["payload"]
+            for event in events_of(self.runtime.bus, TRACE_ACTION_COMPLETED)
+            if event["payload"]["action"] == WEB_SEARCH_ACTION
+        ]
+
+
+async def search_rig(*, transport: FakeTransport | None = None, **settings: Any) -> SearchRig:
+    """A prepared handle whose ``brain`` may both search and read."""
+
+    transport = transport if transport is not None else PathRecordingTransport()
+    resolver = FakeResolver(
+        {
+            WIKIPEDIA_EN: [PUBLIC_WIKI],
+            WIKIPEDIA_FR: [PUBLIC_WIKI],
+            BRAVE_HOST: [PUBLIC_BRAVE],
+            "example.org": [PUBLIC_A],
+        }
+    )
+    rig = await read_rig(transport=transport, resolver=resolver, **settings)
+    rig.runtime.actions._authorization.grant(
+        AuthorizationRule(
+            rule_id="grant-brain-web-search",
+            action_name=WEB_SEARCH_ACTION,
+            destination=READ_DESTINATION,
+            principals=(PRINCIPAL,),
+            granted_permissions=(WEB_SEARCH_ACTION,),
+        )
+    )
+    return SearchRig(rig.clock, rig.runtime, rig.handle, rig.transport, rig.resolver)
+
+
+def json_answer(
+    data: bytes, *, status: int = 200, content_type: str = "application/json"
+) -> FakeResponse:
+    return FakeResponse.body(data, status=status, headers={"Content-Type": content_type})
+
+
+def fixture_answer(name: str, **kwargs: Any) -> FakeResponse:
+    return json_answer(fixture_bytes(name), **kwargs)
+
+
+def search_success(observation: Any, provider: str) -> list[Mapping[str, str]]:
+    """The results of a successful search, checked against the manifest's schema."""
+
+    assert observation.status == "success", observation.error
+    assert observation.parts == ()
+    result = observation.result
+    _declared_spec(WEB_SEARCH_ACTION).validate_result(result)
+    assert result["advisory"] == MARKER
+    assert result["provider"] == provider
+    assert observation.provenance["provider"] == provider
+    return [dict(item) for item in result["results"]]
+
+
+def assert_search_outcome(observation: Any, status: str, code: str) -> None:
+    """*observation* ends *status* with *code*, its one fixed message, no result."""
+
+    assert observation.status == status, observation.error
+    assert observation.error["code"] == code
+    assert observation.error["message"] == f"{WEB_SEARCH_ACTION} {status}: {code}"
+    assert observation.result is None
+    assert observation.parts == ()
+
+
+def brave_settings(key: str) -> dict[str, Any]:
+    return {"provider": PROVIDER_BRAVE, "brave_api_key": key}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({"query": ""}, id="empty-query"),
+        pytest.param({"query": "q" * 257}, id="257-chars"),
+        pytest.param({}, id="missing-query"),
+        pytest.param({"query": "zebra", "extra": "x"}, id="extra-key"),
+    ],
+)
+async def test_ac2_invalid_query_arguments_are_refused_with_no_request(
+    arguments: dict[str, Any],
+) -> None:
+    """AC2 query rows: ``query: ""``, a 257-character query, a missing
+    ``query`` and an extra key are ``invalid_arguments`` with 0 invocations,
+    0 resolutions and 0 connections."""
+
+    rig = await search_rig()
+
+    observation = await rig.search(**arguments)
+
+    assert observation.status == "error"
+    assert observation.error["code"] == ERROR_INVALID_ARGUMENTS
+    assert rig.executor.provider_invocations == 0
+    assert rig.transport.connections == []
+    assert rig.resolver.calls == []
+
+
+async def test_ac2_a_256_character_query_reaches_the_provider() -> None:
+    """The control for the 257 row: 256 characters are searched."""
+
+    rig = await search_rig()
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_empty.json"))
+
+    search_success(await rig.search("q" * 256), PROVIDER_WIKIPEDIA)
+    assert len(rig.transport.connections) == 1
+
+
+async def test_ac3_the_default_profile_searches_the_english_wiki_once_with_no_key() -> None:
+    """AC3 request half, default settings: exactly 1 request, to
+    ``en.wikipedia.org`` ``/w/api.php`` with the documented ``list=search``
+    parameters and the product's User-Agent — and no credential header,
+    even with a ``brave_api_key`` configured but not selected."""
+
+    key = fake_key()
+    rig = await search_rig(brave_api_key=key)
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_empty.json"))
+
+    search_success(await rig.search("zebra stripes"), PROVIDER_WIKIPEDIA)
+
+    ((host, path, query),) = rig.transport.requests
+    (connection,) = rig.transport.connections
+    assert (host, path, connection.scheme, connection.port) == (
+        WIKIPEDIA_EN, "/w/api.php", "https", 443
+    )
+    assert query == {
+        "action": ["query"],
+        "list": ["search"],
+        "srsearch": ["zebra stripes"],
+        "srlimit": ["5"],
+        "srprop": ["snippet"],
+        "format": ["json"],
+        "formatversion": ["2"],
+        "utf8": ["1"],
+    }
+    assert connection.headers["User-Agent"].startswith("twitch-ia-compagnon/")
+    assert connection.headers["User-Agent"].endswith(" (web module)")
+    assert "X-Subscription-Token" not in connection.headers
+    assert not leaks(repr(connection.headers), key)
+    assert rig.resolver.calls == [(WIKIPEDIA_EN, 443)]
+
+
+async def test_ac3_wikipedia_language_selects_the_wiki_and_the_contact_is_appended() -> None:
+    """``wikipedia_language: fr`` → ``fr.wikipedia.org``; a
+    ``user_agent_contact`` is appended to the User-Agent after ``; ``."""
+
+    rig = await search_rig(
+        wikipedia_language="fr", user_agent_contact="ops@example.org", max_results=3
+    )
+    rig.transport.script(WIKIPEDIA_FR, fixture_answer("mediawiki_search_empty.json"))
+
+    search_success(await rig.search("zèbre"), PROVIDER_WIKIPEDIA)
+
+    ((host, path, query),) = rig.transport.requests
+    assert (host, path) == (WIKIPEDIA_FR, "/w/api.php")
+    assert query["srsearch"] == ["zèbre"] and query["srlimit"] == ["3"]
+    (connection,) = rig.transport.connections
+    assert connection.headers["User-Agent"].endswith(" (web module); ops@example.org")
+
+
+async def test_ac3_brave_sends_one_request_with_the_key_and_none_to_wikipedia() -> None:
+    """AC3 request half, ``provider: brave`` with the key: exactly 1
+    request, to ``api.search.brave.com`` ``/res/v1/web/search`` with ``q`` and
+    ``count``, carrying ``X-Subscription-Token`` equal to the key and
+    ``Accept: application/json``; 0 requests to any Wikipedia host."""
+
+    key = fake_key()
+    rig = await search_rig(**brave_settings(key), max_results=4)
+    rig.transport.script(BRAVE_HOST, fixture_answer("brave_web_search_3.json"))
+
+    search_success(await rig.search("zebra stripes"), PROVIDER_BRAVE)
+
+    ((host, path, query),) = rig.transport.requests
+    assert f"https://{host}{path}" == BRAVE_SEARCH_ENDPOINT
+    assert query == {"q": ["zebra stripes"], "count": ["4"]}
+    (connection,) = rig.transport.connections
+    assert connection.headers["X-Subscription-Token"] == key
+    assert connection.headers["Accept"] == "application/json"
+    assert not [request for request in rig.transport.requests if "wikipedia" in request[0]]
+    assert [host for host, _port in rig.resolver.calls] == [BRAVE_HOST]
+
+
+async def test_ac5_mediawiki_results_are_bounded_plain_and_in_order() -> None:
+    """AC5: 8 MediaWiki results with ``searchmatch`` markup and ``&amp;``,
+    ``max_results: 5``, ``max_excerpt_bytes: 50`` → exactly 5 results in
+    the answer's order; each excerpt has 0 ``<`` and 0 ``&amp;``, is ≤ 50
+    UTF-8 bytes and valid UTF-8 — the third one's byte 50 falls inside ``é``
+    — and each URL is the article on ``en.wikipedia.org`` with spaces as
+    ``_``, percent-encoded."""
+
+    answer = json.loads(fixture_bytes("mediawiki_search_8.json"))
+    items = answer["query"]["search"]
+    assert len(items) == 8
+    assert all('<span class="searchmatch">' in item["snippet"] for item in items)
+    assert all("&amp;" in item["snippet"] for item in items)
+    third = extract_text(items[2]["snippet"].encode(), "text/html").text.encode()
+    assert third[50] & 0xC0 == 0x80  # byte 50 is inside a multi-byte character
+
+    rig = await search_rig(max_results=5, max_excerpt_bytes=50)
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"))
+
+    results = search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+
+    assert len(results) == 5
+    assert [result["title"] for result in results] == [item["title"] for item in items[:5]]
+    for result, item in zip(results, items):
+        excerpt = result["excerpt"].encode("utf-8")
+        assert "<" not in result["excerpt"] and "&amp;" not in result["excerpt"]
+        assert len(excerpt) <= 50
+        assert excerpt.decode("utf-8") == result["excerpt"]
+        assert result["url"] == "https://en.wikipedia.org/wiki/" + urllib.parse.quote(
+            item["title"].replace(" ", "_"), safe="/:()_,'-."
+        )
+    assert "black & white" in results[0]["excerpt"]  # the reference decoded, not dropped
+    assert results[1]["url"] == "https://en.wikipedia.org/wiki/Caf%C3%A9_(film)"
+    assert results[2]["excerpt"] == "The plains zebra & its kins, the most widespread "
+    assert results[3]["url"] == "https://en.wikipedia.org/wiki/Gr%C3%A9vy's_zebra"
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["dropped_count"]) == (5, 0)
+
+
+@pytest.mark.parametrize(
+    ("title", "path"),
+    [
+        ("Café (film)", "Caf%C3%A9_(film)"),
+        ("AC/DC", "AC/DC"),
+        ("C++", "C%2B%2B"),
+        ("Fish & chips", "Fish_%26_chips"),
+        ("What?", "What%3F"),
+        ("Tōkyō, Japan", "T%C5%8Dky%C5%8D,_Japan"),
+    ],
+)
+def test_r2_a_wikipedia_title_is_percent_encoded_as_wikipedia_serves_it(
+    title: str, path: str
+) -> None:
+    backend = WikipediaBackend(_Settings())
+    assert backend.article_url(title) == f"https://en.wikipedia.org/wiki/{path}"
+
+
+async def test_ac6_a_brave_result_without_a_url_is_dropped_and_counted() -> None:
+    """AC6: 3 Brave results, one with no ``url`` → a success with exactly 2
+    results — Brave's own URLs, titles and descriptions made plain — and
+    ``dropped_count: 1`` in the trace."""
+
+    rig = await search_rig(**brave_settings(fake_key()))
+    rig.transport.script(BRAVE_HOST, fixture_answer("brave_web_search_3.json"))
+
+    observation = await rig.search("zebra stripes")
+    results = search_success(observation, PROVIDER_BRAVE)
+
+    assert results == [
+        {
+            "title": "Why do zebras have stripes? | Example Science",
+            "url": "https://science.example.org/zebra-stripes",
+            "excerpt": "Researchers have tested several ideas about zebra stripes & biting flies.",
+        },
+        {
+            "title": "Stripe patterns of the plains zebra",
+            "url": "https://example.com/plains/zebra?lang=en",
+            "excerpt": "Each zebra has a unique pattern — no two are alike.",
+        },
+    ]
+    (trace,) = rig.searched()
+    assert trace["provider"] == PROVIDER_BRAVE
+    assert (trace["result_count"], trace["dropped_count"]) == (2, 1)
+    assert observation.provenance["trace_fields"]["dropped_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        pytest.param({"url": "https://example.org/a", "description": "d"}, id="no-title"),
+        pytest.param({"title": "  ", "url": "https://example.org/a"}, id="blank-title"),
+        pytest.param({"title": "t", "url": "ftp://example.org/a"}, id="ftp-url"),
+        pytest.param({"title": "t", "url": "javascript:alert(1)"}, id="script-url"),
+        pytest.param({"title": "t", "url": "https:///nohost"}, id="no-host"),
+        pytest.param({"title": "t", "url": 7}, id="url-not-text"),
+        pytest.param("not-an-object", id="not-an-object"),
+    ],
+)
+async def test_r2_a_malformed_single_result_is_dropped_never_presented(item: Any) -> None:
+    rig = await search_rig(**brave_settings(fake_key()))
+    good = {"title": "kept", "url": "https://example.org/kept", "description": "<b>x</b>"}
+    body = json.dumps({"web": {"results": [item, good]}}).encode()
+    rig.transport.script(BRAVE_HOST, json_answer(body))
+
+    results = search_success(await rig.search("q"), PROVIDER_BRAVE)
+
+    assert results == [{"title": "kept", "url": "https://example.org/kept", "excerpt": "x"}]
+    (trace,) = rig.searched()
+    assert trace["dropped_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(fixture_bytes("brave_web_search_no_results.json"), id="no-results-list"),
+        pytest.param(b"<html>not json</html>", id="non-json"),
+        pytest.param(b'{"web": {"results": {"title": "t"}}}', id="results-not-a-list"),
+        pytest.param(b'{"web": []}', id="web-not-an-object"),
+        pytest.param(b"[]", id="top-level-list"),
+        pytest.param(b"", id="empty-body"),
+        pytest.param(b'{"web": {"results": [', id="cut-json"),
+    ],
+)
+async def test_ac6_a_brave_answer_that_is_not_the_documented_shape_is_malformed(
+    body: bytes,
+) -> None:
+    """AC6: a Brave answer missing its results list, and a non-JSON body,
+    each yield ``error malformed_response`` with 0 results."""
+
+    rig = await search_rig(**brave_settings(fake_key()))
+    rig.transport.script(BRAVE_HOST, json_answer(body, content_type="text/html"))
+
+    observation = await rig.search("zebra")
+
+    assert_search_outcome(observation, "error", ERROR_MALFORMED_RESPONSE)
+    (trace,) = rig.searched()
+    assert (trace["result_count"], trace["outcome"]) == (0, ERROR_MALFORMED_RESPONSE)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b'{"batchcomplete": true}', id="no-query"),
+        pytest.param(b'{"query": {"search": null}}', id="search-null"),
+        pytest.param(b'{"query": []}', id="query-not-an-object"),
+        pytest.param(b'{"error": {"code": "badvalue"}}', id="api-error"),
+        pytest.param(b"not json", id="non-json"),
+    ],
+)
+async def test_r2_a_mediawiki_answer_that_is_not_the_documented_shape_is_malformed(
+    body: bytes,
+) -> None:
+    rig = await search_rig()
+    rig.transport.script(WIKIPEDIA_EN, json_answer(body))
+
+    assert_search_outcome(await rig.search("zebra"), "error", ERROR_MALFORMED_RESPONSE)
+
+
+async def test_r2_a_mediawiki_item_with_no_title_is_dropped() -> None:
+    rig = await search_rig()
+    body = json.dumps(
+        {"query": {"search": [{"snippet": "x"}, {"title": 3}, {"title": "Kept", "snippet": "y"}]}}
+    ).encode()
+    rig.transport.script(WIKIPEDIA_EN, json_answer(body))
+
+    results = search_success(await rig.search("q"), PROVIDER_WIKIPEDIA)
+
+    assert results == [
+        {"title": "Kept", "url": "https://en.wikipedia.org/wiki/Kept", "excerpt": "y"}
+    ]
+    (trace,) = rig.searched()
+    assert trace["dropped_count"] == 2
+
+
+async def test_r2_an_answer_cut_by_the_byte_bound_is_malformed_not_partial() -> None:
+    """A 2xx body over ``max_response_bytes`` is read only to the bound plus
+    one byte and is never parsed as a partial answer."""
+
+    rig = await search_rig(max_response_bytes=65_536)
+    answer = json.dumps(
+        {"query": {"search": [{"title": "T", "snippet": "s" * 70_000}]}}
+    ).encode()
+    response = json_answer(answer)
+    rig.transport.script(WIKIPEDIA_EN, response)
+
+    assert_search_outcome(await rig.search("q"), "error", ERROR_MALFORMED_RESPONSE)
+    assert response.delivered <= 65_537
+
+
+async def test_ac12_a_search_reaches_its_provider_outside_the_allowlist() -> None:
+    """AC12 search half: with ``allowed_hosts: [example.org]`` a read of
+    another host is refused, while a search still reaches its provider
+    endpoint, Wikipedia's and Brave's alike."""
+
+    rig = await search_rig(allowed_hosts=["example.org"])
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"))
+
+    search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+    assert [host for host, _path, _query in rig.transport.requests] == [WIKIPEDIA_EN]
+    assert_read_outcome(
+        await rig.read("https://en.wikipedia.org/wiki/Zebra"), "refused", REFUSAL_HOST_NOT_ALLOWED
+    )
+    assert len(rig.transport.connections) == 1
+
+    brave = await search_rig(allowed_hosts=["example.org"], **brave_settings(fake_key()))
+    brave.transport.script(BRAVE_HOST, fixture_answer("brave_web_search_3.json"))
+    search_success(await brave.search("zebra"), PROVIDER_BRAVE)
+    assert [host for host, _path, _query in brave.transport.requests] == [BRAVE_HOST]
+
+
+async def test_r4_the_provider_endpoint_passes_the_address_guard() -> None:
+    """R4 provider endpoints: the endpoint is resolved and checked like any
+    hop — a private answer is ``refused blocked_address`` with 0
+    connections — and the connection is pinned to the checked address."""
+
+    rig = await search_rig()
+    rig.resolver.script(WIKIPEDIA_EN, [PUBLIC_WIKI, "10.0.0.5"])
+
+    assert_search_outcome(await rig.search("zebra"), "refused", REFUSAL_BLOCKED_ADDRESS)
+    assert rig.transport.connections == []
+
+    rig.resolver.script(WIKIPEDIA_EN, [PUBLIC_WIKI])
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_empty.json"))
+    search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+    (connection,) = rig.transport.connections
+    assert connection.pinned == (PUBLIC_WIKI,)
+
+
+async def test_r4_a_provider_redirect_off_origin_drops_the_key_and_is_rechecked() -> None:
+    """A redirect from the Brave endpoint is followed only through the guard
+    — a redirect to loopback is refused after 1 connection — and the key
+    never travels to another origin."""
+
+    key = fake_key()
+    rig = await search_rig(**brave_settings(key))
+    rig.transport.script(BRAVE_HOST, redirect("http://127.0.0.1/"))
+
+    assert_search_outcome(await rig.search("zebra"), "refused", REFUSAL_BLOCKED_ADDRESS)
+    assert len(rig.transport.connections) == 1
+
+    rig.transport.script(BRAVE_HOST, redirect("https://example.org/moved"))
+    rig.transport.script("example.org", fixture_answer("brave_web_search_3.json"))
+    search_success(await rig.search("zebra"), PROVIDER_BRAVE)
+    first, second = rig.transport.connections[1:]
+    assert first.headers["X-Subscription-Token"] == key
+    assert "X-Subscription-Token" not in second.headers
+    (_failed, succeeded) = rig.searched()
+    assert succeeded["redirects"] == 1
+
+
+@pytest.mark.parametrize(
+    ("http_status", "status", "code"),
+    [
+        (401, "refused", REFUSAL_PROVIDER_REFUSED),
+        (403, "refused", REFUSAL_PROVIDER_REFUSED),
+        (429, "refused", REFUSAL_RATE_LIMITED),
+        (500, "error", ERROR_UPSTREAM_STATUS),
+        (503, "error", ERROR_UPSTREAM_STATUS),
+        (404, "error", ERROR_UPSTREAM_STATUS),  # not_found is a read's code only
+    ],
+)
+async def test_ac18_each_http_status_row_of_a_brave_search(
+    http_status: int, status: str, code: str
+) -> None:
+    """AC18 search rows: Brave 401/403 → ``refused provider_refused``, 429
+    → ``refused rate_limited``, 500/503 → ``error upstream_status``. A
+    non-2xx body is never read, and neither the key nor the query reaches
+    the observation or the trace."""
+
+    key = fake_key()
+    rig = await search_rig(**brave_settings(key))
+    response = json_answer(b'{"error": "SECRETBODY"}', status=http_status)
+    rig.transport.script(BRAVE_HOST, response)
+
+    observation = await rig.search("SECRETQ zebra")
+
+    assert_search_outcome(observation, status, code)
+    assert response.reads == 0
+    (trace,) = rig.searched()
+    assert (trace["status"], trace["error_code"], trace["outcome"]) == (status, code, code)
+    assert trace["query_bytes"] == len("SECRETQ zebra")
+    for rendered in (repr(observation), repr(trace), repr(rig.handle._backend)):
+        assert not leaks(rendered, key)
+        assert "SECRETQ" not in rendered and "SECRETBODY" not in rendered
+
+
+async def test_ac18_a_well_formed_empty_mediawiki_list_is_a_success_with_0_results() -> None:
+    rig = await search_rig()
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_empty.json"))
+
+    assert search_success(await rig.search("qzxqzxqzx"), PROVIDER_WIKIPEDIA) == []
+    (trace,) = rig.searched()
+    assert (trace["status"], trace["outcome"], trace["result_count"]) == ("success", OUTCOME_OK, 0)
+
+
+async def test_ac18_a_stalled_provider_body_is_timeout_timed_out() -> None:
+    rig = await search_rig()
+    stalled = FakeResponse.body(
+        b"{}", stalled=asyncio.Event(), headers={"Content-Type": "application/json"}
+    )
+    rig.transport.script(WIKIPEDIA_EN, stalled)
+
+    call = asyncio.ensure_future(rig.search("zebra"))
+    await spin()
+    rig.clock.advance(10)
+    await spin()
+
+    assert_search_outcome(call.result(), "timeout", ERROR_TIMED_OUT)
+    assert rig.handle._in_flight == 0
+
+
+async def test_r5_search_and_read_share_the_concurrency_bound() -> None:
+    """A read held open with ``max_concurrent_requests: 1`` makes a search
+    ``refused resource_busy`` with 0 additional connections."""
+
+    rig = await search_rig(max_concurrent_requests=1)
+    held = asyncio.Event()
+    rig.transport.script("example.org", FakeResponse.body(b"<p>x</p>", held=held))
+    reading = asyncio.ensure_future(rig.read("https://example.org/"))
+    await spin()
+
+    assert_search_outcome(await rig.search("zebra"), "refused", REFUSAL_RESOURCE_BUSY)
+    assert len(rig.transport.connections) == 1
+    held.set()
+    read_success(await reading)
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_empty.json"))
+    search_success(await rig.search("zebra"), PROVIDER_WIKIPEDIA)
+
+
+async def test_r7_the_search_trace_carries_counts_and_lengths_only() -> None:
+    """R7 trace shape: a search's ``action.completed`` trace names the
+    backend and adds only ``query_bytes``, ``result_count``,
+    ``dropped_count``, ``redirects``, ``cache_hit`` and ``outcome``."""
+
+    rig = await search_rig()
+    rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_8.json"))
+    query = "SECRETQ zèbre 42 ?x=1"
+
+    observation = await rig.search(query)
+
+    assert set(observation.provenance["trace_fields"]) == {
+        "query_bytes", "result_count", "dropped_count", "redirects", "cache_hit", "outcome"
+    }
+    (trace,) = rig.searched()
+    assert trace["provider"] == PROVIDER_WIKIPEDIA
+    assert trace["query_bytes"] == len(query.encode("utf-8"))
+    assert (trace["result_count"], trace["dropped_count"]) == (5, 0)
+    assert (trace["redirects"], trace["cache_hit"], trace["outcome"]) == (0, False, OUTCOME_OK)
+    rendered = repr(trace)
+    for secret in ("SECRETQ", "zèbre", "?x=1", "Zebra", "searchmatch"):
+        assert secret not in rendered
+
+
+def test_r1_a_backend_is_a_name_a_request_builder_and_a_parser() -> None:
+    """R1: every backend has a ``name`` equal to its ``provider`` value and
+    the two methods; a malformed answer is :class:`Malformed`; the Brave
+    repr omits the key."""
+
+    key = fake_key()
+    settings = _Settings.from_mapping({"provider": PROVIDER_BRAVE, "brave_api_key": key})
+    assert set(SEARCH_BACKENDS) == {PROVIDER_WIKIPEDIA, PROVIDER_BRAVE}
+    for provider, backend_class in SEARCH_BACKENDS.items():
+        backend = backend_class(settings)
+        assert backend.name == provider
+        url, headers = backend.build_request("zebra", 3)
+        assert url.startswith("https://") and isinstance(headers, dict)
+        assert isinstance(backend.parse(b"not json"), Malformed)
+        assert backend.parse(b'{"web": {"results": []}, "query": {"search": []}}') == ([], 0)
+        assert not leaks(repr(backend), key)
+    assert isinstance(SEARCH_BACKENDS[PROVIDER_BRAVE](settings), BraveBackend)
+
+
+async def test_ac18_the_twelve_rows_walked_once_only_the_last_is_a_success() -> None:
+    """AC18 in one walk: guard refusals (as one row), Brave 401, 403, 429,
+    a read's 404 and 410, 500, 503, a connection reset, malformed JSON, a
+    stalled body and a well-formed empty MediaWiki list — 12 rows, each its
+    listed status and code, and only the last a ``success``."""
+
+    async def guard_refusal() -> Any:
+        rig = await search_rig()
+        return await rig.read("http://127.0.0.1/")
+
+    async def brave_status(http_status: int) -> Any:
+        rig = await search_rig(**brave_settings(fake_key()))
+        rig.transport.script(BRAVE_HOST, json_answer(b"{}", status=http_status))
+        return await rig.search("zebra")
+
+    async def read_status(http_status: int) -> Any:
+        rig = await search_rig()
+        rig.transport.script("example.org", FakeResponse(status=http_status))
+        return await rig.read("https://example.org/")
+
+    async def connection_reset() -> Any:
+        rig = await search_rig()
+        rig.transport.script(WIKIPEDIA_EN, FakeResponse(raises=ConnectionResetError("reset")))
+        return await rig.search("zebra")
+
+    async def malformed_json() -> Any:
+        rig = await search_rig()
+        rig.transport.script(WIKIPEDIA_EN, json_answer(b'{"query": {"search": [}'))
+        return await rig.search("zebra")
+
+    async def stalled_body() -> Any:
+        rig = await search_rig()
+        rig.transport.script(
+            WIKIPEDIA_EN, FakeResponse.body(b"{}", stalled=asyncio.Event())
+        )
+        call = asyncio.ensure_future(rig.search("zebra"))
+        await spin()
+        rig.clock.advance(10)
+        await spin()
+        return call.result()
+
+    async def empty_list() -> Any:
+        rig = await search_rig()
+        rig.transport.script(WIKIPEDIA_EN, fixture_answer("mediawiki_search_empty.json"))
+        return await rig.search("zebra")
+
+    rows = [
+        (guard_refusal, "refused", REFUSAL_BLOCKED_ADDRESS),
+        (functools.partial(brave_status, 401), "refused", REFUSAL_PROVIDER_REFUSED),
+        (functools.partial(brave_status, 403), "refused", REFUSAL_PROVIDER_REFUSED),
+        (functools.partial(brave_status, 429), "refused", REFUSAL_RATE_LIMITED),
+        (functools.partial(read_status, 404), "refused", REFUSAL_NOT_FOUND),
+        (functools.partial(read_status, 410), "refused", REFUSAL_NOT_FOUND),
+        (functools.partial(brave_status, 500), "error", ERROR_UPSTREAM_STATUS),
+        (functools.partial(brave_status, 503), "error", ERROR_UPSTREAM_STATUS),
+        (connection_reset, "error", REFUSAL_TRANSPORT_FAILED),
+        (malformed_json, "error", ERROR_MALFORMED_RESPONSE),
+        (stalled_body, "timeout", ERROR_TIMED_OUT),
+        (empty_list, "success", None),
+    ]
+    assert len(rows) == 12
+
+    outcomes = []
+    for run, status, code in rows:
+        observation = await run()
+        assert observation.status == status, (status, code, observation.error)
+        assert (observation.error or {}).get("code") == code
+        outcomes.append(observation.status)
+
+    assert [outcome == "success" for outcome in outcomes] == [False] * 11 + [True]
+    assert list(observation.result["results"]) == []

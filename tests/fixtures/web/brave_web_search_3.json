@@ -1,0 +1,117 @@
+{
+  "type": "search",
+  "query": {
+    "original": "zebra stripes",
+    "show_strict_warning": false,
+    "is_navigational": false,
+    "is_news_breaking": false,
+    "spellcheck_off": true,
+    "country": "us",
+    "bad_results": false,
+    "should_fallback": false,
+    "postal_code": "",
+    "city": "",
+    "header_country": "",
+    "more_results_available": true,
+    "state": ""
+  },
+  "mixed": {
+    "type": "mixed",
+    "main": [
+      {
+        "type": "web",
+        "index": 0,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 1,
+        "all": false
+      },
+      {
+        "type": "web",
+        "index": 2,
+        "all": false
+      }
+    ],
+    "top": [],
+    "side": []
+  },
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Why do <strong>zebras</strong> have stripes? | Example Science",
+        "url": "https://science.example.org/zebra-stripes",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "Researchers have tested several ideas about <strong>zebra</strong> <strong>stripes</strong> &amp; biting flies.",
+        "profile": {
+          "name": "science.example.org",
+          "url": "https://science.example.org/zebra-stripes",
+          "long_name": "science.example.org",
+          "img": "https://imgs.search.brave.com/science.example.org.png"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "science.example.org",
+          "hostname": "science.example.org",
+          "favicon": "https://imgs.search.brave.com/science.example.org.ico",
+          "path": "› zebra"
+        }
+      },
+      {
+        "title": "<strong>Zebra</strong> facts",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "An unnamed page about <strong>zebras</strong>; this result carries no url.",
+        "profile": {
+          "name": "facts.example.net",
+          "url": "https://facts.example.net/",
+          "long_name": "facts.example.net",
+          "img": "https://imgs.search.brave.com/facts.example.net.png"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "facts.example.net",
+          "hostname": "facts.example.net",
+          "favicon": "https://imgs.search.brave.com/facts.example.net.ico",
+          "path": "› zebra"
+        }
+      },
+      {
+        "title": "Stripe patterns of the plains <strong>zebra</strong>",
+        "url": "https://example.com/plains/zebra?lang=en",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "Each <strong>zebra</strong> has a unique pattern &mdash; no two are alike.",
+        "profile": {
+          "name": "example.com",
+          "url": "https://example.com/plains/zebra?lang=en",
+          "long_name": "example.com",
+          "img": "https://imgs.search.brave.com/example.com.png"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "example.com",
+          "hostname": "example.com",
+          "favicon": "https://imgs.search.brave.com/example.com.ico",
+          "path": "› zebra"
+        }
+      }
+    ],
+    "family_friendly": true
+  }
+}
