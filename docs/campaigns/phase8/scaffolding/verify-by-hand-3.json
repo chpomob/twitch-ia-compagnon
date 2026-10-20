@@ -1,0 +1,24 @@
+{
+  "verdict": "APPROVE",
+  "findings": [
+    {
+      "id": "M1",
+      "status": "RESOLVED",
+      "evidence": "R7 states: \"In `healthy`, a detector failure moves it to `degraded` and reports exactly one `module.degraded` for `audio_input` with the value-free reason `wake_word_detector_failed`.\" Recovery and rearming are now decidable: the first subsequent detector verdict clears degradation and emits exactly one module.ready; another failure reports degradation again. AC39 observes degraded → ready → degraded for both detected and non-detected verdicts, explicitly requires zero duplicate reports between transitions, and checks continued backoff capped at 300 seconds."
+    },
+    {
+      "id": "M2",
+      "status": "RESOLVED",
+      "evidence": "AC26 states: \"The fake source synthesises its WAV from a reference timeline on the injected clock that carries a marker tone at the instant the phrase begins, and writes the window the module's environment asks for; the criterion measures the WAV handed to the transcription.\" The criteria are measurable: AC26 checks duration ≤8 seconds, rejection of an 8.5-second WAV, zero pre-roll starting at the verdict, and late-verdict start offsets and marker positions for two pre-roll settings. R7 defines validated ranges and pre-roll < listen.max_seconds; AC26 checks startup refusals, while AC27–AC28 retain detector isolation and acquisition/transcription accounting."
+    }
+  ],
+  "new_findings": [],
+  "sound_enough_to_plan_from": true,
+  "summary": "Coexisting module-level max_seconds and listen.max_seconds are acceptable because the listening limit is bounded by the module ceiling and audio.capture remains unchanged. Omitting the nested listen.max_seconds from the allowlist and schema notes is acceptable because listen already covers the top-level schema addition, while R7 and AC26 explicitly specify its validation. Passing the pre-roll window through unchanged is acceptable under the configured source's explicit responsibility and the observed-window assertions; the whole-document pass found no regression of the twelve fixes, all seven brief decisions still hold, dependencies remain aiohttp and PyYAML, and no specified path bypasses admission, budgets or DEFAULT-DENY.",
+  "read_files": [
+    "docs/campaigns/phase8/spec.md",
+    "docs/campaigns/phase8/brief.md",
+    "core/triggers.py",
+    "core/contracts.py"
+  ]
+}

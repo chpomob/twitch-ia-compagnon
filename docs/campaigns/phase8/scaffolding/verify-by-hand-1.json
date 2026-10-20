@@ -1,0 +1,88 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "R2: \"`in` (left operand a scalar, right operand a list) is false when the left value is absent or not a scalar, and otherwise is true exactly when the list holds an element of the same JSON type equal to it (strings compared case-sensitively)\". AC4 explicitly requires the membership matcher to accept `gold`."
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "R1: \"A `param` names a property of the type's own `parameter_schema`, or a dot-separated path into a property whose schema is an object (e.g. `window.start_minute`), each segment a declared property\". R8 explicitly names `window.start_minute` and `window.end_minute` as the interval rule's parameter paths."
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "R1: \"An optional `probability_parameter` names a top-level parameter that the schema lists as required and whose schema is a number bounded within [0, 1]; naming a non-required parameter is refused at load.\" Existing declared-schema validation therefore refuses a configured policy omitting that required parameter."
+    },
+    {
+      "id": "S4",
+      "status": "RESOLVED",
+      "evidence": "AC21: \"With `page`, `hotkey` and `overlay` enabled and a 40-character token, a press of configured button `hype` from each of the page, the press command and the overlay produces 3 `manual` events\"."
+    },
+    {
+      "id": "S5",
+      "status": "RESOLVED",
+      "evidence": "R8 specifies \"`text` = that channel's configured `prompt_text`\". AC29 verifies timer events \"each with `text` equal to its channel's `prompt_text`, all accepted.\""
+    },
+    {
+      "id": "S6",
+      "status": "PARTIAL",
+      "evidence": "R7: \"the source is invoked once at activation and invoked again only after the previous invocation's utterance has its trigger decision taken\"; failed source invocations have an explicit retry delay. However, R7 also says \"an utterance whose transcription fails or is empty, or that exceeds `max_bytes`, publishes nothing and is counted.\" A transcription failure or empty transcription produces no event and hence no trigger decision; neither R7 nor AC26 defines when acquisition resumes on those paths."
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "N1",
+      "severity": "major",
+      "section": "R3; AC11–AC14; core/triggers.py::_combine",
+      "summary": "Hook failure semantics are not reconciled with policy combinations that can turn a failed predicate into acceptance.",
+      "evidence": "R3 says \"any other return value or a raised exception → no trigger\" and timeout likewise means no trigger. Existing `_combine` implements `none_of` as \"the policy accepts exactly what no rule matched\" and lets `any_of` accept another matching rule. Mapping hook failure to an ordinary unmatched outcome therefore permits acceptance and can hide the hook error reason; the specification gives no explicit combination-level failure handling, and AC11–AC14 exercise no such combination."
+    },
+    {
+      "id": "N2",
+      "severity": "major",
+      "section": "R7; docs/design-v2.md §§4.1–4.2",
+      "summary": "Starting the utterance source during activation violates the preparation barrier.",
+      "evidence": "R7 requires \"the source is invoked once at activation\". The design states \"Activation does not start the producers\" and requires activation to register resources \"without emitting any input\" before `start_inputs()`. The new requirement starts acquisition before that lifecycle boundary."
+    },
+    {
+      "id": "N3",
+      "severity": "major",
+      "section": "A5; R7; AC26; brief decision 6",
+      "summary": "The automatic acquisition and transcription loop expands the phase into the always-on transcription explicitly excluded by the brief.",
+      "evidence": "The brief says \"Continuous audio and always-on transcription are out of scope\". A5 reinterprets this exclusion as continuous streams handled by the core or listening enabled by default, while R7 automatically invokes another source after each decision and transcribes every delivered utterance; AC26 requires a fourth invocation after three utterances. Bounded individual WAVs and opt-in configuration do not bound the overall listening session or preserve the brief's exclusion."
+    },
+    {
+      "id": "N4",
+      "severity": "major",
+      "section": "A8; targets; AC21",
+      "summary": "The advertised hotkey command needs a package entry point absent from the implementation targets.",
+      "evidence": "A8 specifies \"`python -m modules.operator press <button>`\". The new package's targets list only `modules/operator/__init__.py` and `modules/operator/module.yaml`; executing that package with `python -m` requires `modules/operator/__main__.py`. The listed deliverables therefore do not provide the command AC21 requires."
+    },
+    {
+      "id": "N5",
+      "severity": "minor",
+      "section": "R2; AC7; AC30; docs/design-v2.md §2.4",
+      "summary": "The specification does not define the bounded probability evidence retained with each decision.",
+      "evidence": "The design requires \"the draw and the elements needed to reproduce it are kept in a bounded, redacted form with the decision\". R2 instead says \"The decision keeps its shape (`accepted`, bounded reason, `policy_version`, identifiers, no `run_id`)\" without specifying an accompanying draw record. AC7 and AC30 inspect an injected recorded random source, which does not establish that runtime decisions retain the required replay evidence."
+    },
+    {
+      "id": "N6",
+      "severity": "minor",
+      "section": "A2; AC8",
+      "summary": "The wildcard complexity guarantee has no measurable acceptance check.",
+      "evidence": "A2 promises \"a wildcard is evaluated in time linear in text × pattern\". AC8 only requires that one large example \"completes, and decides, on the injected clock with no timeout path involved.\" An injected clock does not measure CPU work, and completion without an operation or elapsed-time bound cannot distinguish the promised complexity from a much slower implementation."
+    }
+  ],
+  "sound_enough_to_plan_from": false,
+  "summary": "Five challenge findings are resolved; S6 still lacks a restart transition after failed or empty transcription. The remaining major issues concern hook composition, the activation barrier, excluded always-on transcription, and the hotkey command entry point. Probability decision records and wildcard complexity verification also remain underspecified.",
+  "read_files": [
+    "docs/campaigns/phase8/spec.md",
+    "docs/campaigns/phase8/brief.md",
+    "docs/design-v2.md",
+    "core/triggers.py",
+    "core/contracts.py"
+  ]
+}
