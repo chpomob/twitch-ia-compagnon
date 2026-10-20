@@ -7,7 +7,12 @@ and readiness that open nothing (AC4). Plan step P2 adds the network guard
 (R4): URL, host and address checks and the checked resolution, over every
 AC9 address, the AC10 refusals and the AC12 host matching. Plan step P3 adds the
 in-module HTML-to-text extractor and charset decoding (R3): the AC7 pages
-and the text half of AC8, over the fixtures in ``tests/fixtures/web``.
+and the text half of AC8, over the fixtures in ``tests/fixtures/web``. Plan
+step P4 adds the guarded transport (R4, R6): pinned connections (AC10
+rebinding), manual redirects re-checked at every hop (AC11, AC12 redirect
+half), the byte bound measured while streaming and no proxy (AC13), the
+whole-call deadline on the injected clock, and the default transport's
+settings checked without a socket (AC25 default-transport half).
 
 **No test here opens a real socket.** The autouse :func:`socket_guard`
 replaces ``socket.socket.connect``/``connect_ex``, ``socket.create_connection``,
@@ -30,7 +35,7 @@ import asyncio
 import asyncio.base_events
 import ipaddress
 import socket
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,7 +54,19 @@ from conftest import ManualClock, events_of, runtime_context
 from test_integration import _environment
 
 from modules.web import (
+    ERROR_TIMED_OUT,
+    FETCH_ERROR,
+    FETCH_REFUSED,
+    FETCH_TIMEOUT,
     INTEGER_SETTINGS,
+    REFUSAL_HOST_NOT_ALLOWED,
+    REFUSAL_TOO_MANY_REDIRECTS,
+    AiohttpTransport,
+    Fetched,
+    FetchFailure,
+    TransportContractError,
+    _PinnedResolver,
+    read_bounded,
     MANIFEST_PATH,
     MAX_ALLOWED_HOSTS,
     MODULE_NAME,
@@ -258,9 +275,12 @@ class FakeResponse:
 
     ``held`` keeps the request open — the response is not returned — until
     the event is set; ``stalled`` lets the headers through and withholds the
-    first body byte until it is set. :attr:`delivered` counts the body bytes
-    actually handed to the reader, so a bound measured while streaming can
-    be asserted on what was consumed, not only on what was kept.
+    first body byte until it is set. ``read(n)`` serves ``min(n, rest of the
+    current chunk)`` — fewer bytes at a chunk boundary, ``b""`` at the end —
+    and records every requested ``n`` in :attr:`requested` and every
+    delivered count in :attr:`served`, so a bound measured while streaming is
+    asserted on what was consumed, not only on what was kept. ``overserve``
+    makes the fake break the seam's contract by one byte per read.
     """
 
     status: int = 200
@@ -268,9 +288,13 @@ class FakeResponse:
     chunks: Sequence[bytes] = ()
     held: asyncio.Event | None = None
     stalled: asyncio.Event | None = None
-    delivered: int = 0
-    reads: int = 0
     raises: BaseException | None = None
+    overserve: bool = False
+    requested: list[int] = field(default_factory=list)
+    served: list[int] = field(default_factory=list)
+    closed: int = 0
+    _chunk: int = 0
+    _offset: int = 0
 
     @classmethod
     def body(
@@ -281,21 +305,44 @@ class FakeResponse:
         chunks = [data[start : start + chunk_size] for start in range(0, len(data), chunk_size)]
         return cls(chunks=chunks, **kwargs)
 
-    async def iter_chunks(self) -> AsyncIterator[bytes]:
+    @property
+    def delivered(self) -> int:
+        return sum(self.served)
+
+    @property
+    def reads(self) -> int:
+        return len(self.requested)
+
+    async def read(self, max_bytes: int) -> bytes:
+        self.requested.append(max_bytes)
         if self.stalled is not None:
             await self.stalled.wait()
-        for chunk in self.chunks:
-            self.reads += 1
-            self.delivered += len(chunk)
-            yield chunk
+        while self._chunk < len(self.chunks) and self._offset >= len(self.chunks[self._chunk]):
+            self._chunk += 1
+            self._offset = 0
+        if self._chunk >= len(self.chunks):
+            data = b""
+        else:
+            chunk = self.chunks[self._chunk]
+            data = chunk[self._offset : self._offset + max_bytes]
+            self._offset += len(data)
+        if self.overserve:
+            data = data + b"x" * (max_bytes + 1 - len(data))
+        self.served.append(len(data))
+        return data
+
+    async def close(self) -> None:
+        self.closed += 1
 
 
 @dataclass(frozen=True)
 class Connection:
     """One connection attempt, as the transport received it.
 
-    The path is recorded by its byte length only: a fake that kept the path
-    would itself be a record of the URL the tests forbid the module to keep.
+    ``address`` is the pinned address the fake "connects" to (the first of
+    ``pinned``); a transport is never given a name to resolve. The path is
+    recorded by its byte length only: a fake that kept the path would itself
+    be a record of the URL the tests forbid the module to keep.
     """
 
     method: str
@@ -305,6 +352,7 @@ class Connection:
     port: int | None
     path_length: int
     headers: Mapping[str, str]
+    pinned: tuple[str, ...] = ()
 
 
 class FakeTransport:
@@ -313,7 +361,8 @@ class FakeTransport:
     ``script(host, *responses)`` queues answers for a host name; a host with
     an empty queue answers :attr:`default` (a 404 unless set). A response with
     ``raises`` set raises it instead of answering, as a reset connection
-    would. :attr:`closed` counts ``close`` calls.
+    would. :attr:`closed` counts ``close`` calls. A call without pinned
+    addresses is a contract violation the fake refuses loudly.
     """
 
     def __init__(self, default: FakeResponse | None = None) -> None:
@@ -325,26 +374,29 @@ class FakeTransport:
     def script(self, host: str, *responses: FakeResponse) -> None:
         self._scripted.setdefault(host, []).extend(responses)
 
-    async def request(
+    async def open(
         self,
+        method: str,
         *,
-        method: str = "GET",
         scheme: str,
         host: str,
-        address: str,
-        port: int | None = None,
-        path: str = "/",
+        port: int | None,
+        path_and_query: str,
+        pinned_addresses: Sequence[Any],
         headers: Mapping[str, str] | None = None,
     ) -> FakeResponse:
+        pinned = tuple(str(address) for address in pinned_addresses)
+        assert pinned, "the module handed the transport a name without pinned addresses"
         self.connections.append(
             Connection(
                 method=method,
                 scheme=scheme,
                 host=host,
-                address=address,
+                address=pinned[0],
                 port=port,
-                path_length=len(path.encode("utf-8")),
+                path_length=len(path_and_query.encode("utf-8")),
                 headers=dict(headers or {}),
+                pinned=pinned,
             )
         )
         queue = self._scripted.get(host)
@@ -1510,3 +1562,691 @@ def test_ac8_a_1000_byte_text_is_unchanged_and_not_cut() -> None:
     assert cut_utf8(text, 1000) == (text, False)
     assert cut_utf8(text, 999) == ("\u00e9" * 499, True)
     assert cut_utf8(text, 0) == ("", True)
+
+
+# --------------------------------------------------------------------------- #
+# P4: the guarded transport (R4, R6; AC10 rebinding, AC11, AC13, AC25 half)
+# --------------------------------------------------------------------------- #
+
+PUBLIC_A = "93.184.216.34"
+PUBLIC_B = "93.184.216.35"
+MIB = 1_048_576
+
+
+async def fetching_handle(
+    transport: FakeTransport,
+    resolver: FakeResolver,
+    *,
+    clock: ManualClock | None = None,
+    **settings: Any,
+) -> WebModule:
+    """A handle over the fakes, its whole-call deadline on a manual clock."""
+
+    clock = clock if clock is not None else ManualClock()
+    context = runtime_context(clock=clock).for_module(MODULE_NAME)
+    return await activate(
+        context,
+        {"_transport": transport, "_resolver": resolver, "_sleeper": clock.sleep, **settings},
+        {},
+    )
+
+
+def redirect(location: str, status: int = 302) -> FakeResponse:
+    return FakeResponse(status=status, headers={"Location": location}, chunks=[b"moved"])
+
+
+def page(data: bytes = b"<p>hello</p>") -> FakeResponse:
+    return FakeResponse.body(data)
+
+
+async def spin(rounds: int = 20) -> None:
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+async def test_ac10_a_rebinding_name_is_connected_only_at_its_checked_address() -> None:
+    """AC10 rebinding: the resolver answers a public address at the first
+    lookup and ``127.0.0.1`` afterwards. The module resolves once per hop and
+    hands the transport only the checked addresses, so 0 connections go to
+    ``127.0.0.1`` — on a single hop, and when a redirect back to the same name
+    makes the second hop's lookup answer loopback (refused before connecting)."""
+
+    resolver = FakeResolver()
+    resolver.script("rebind.example", [PUBLIC_A], ["127.0.0.1"])
+    transport = FakeTransport()
+    transport.script("rebind.example", page())
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("http://rebind.example/a", apply_allowlist=True)
+
+    assert isinstance(outcome, Fetched) and outcome.status == 200
+    assert resolver.calls == [("rebind.example", 80)]
+    assert [c.pinned for c in transport.connections] == [(PUBLIC_A,)]
+
+    resolver = FakeResolver()
+    resolver.script("rebind.example", [PUBLIC_A], ["127.0.0.1"])
+    transport = FakeTransport()
+    transport.script("rebind.example", redirect("/again"))
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("http://rebind.example/a", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_REFUSED, REFUSAL_BLOCKED_ADDRESS, 1)
+    assert len(resolver.calls) == 2
+    assert len(transport.connections) == 1
+    assert all("127.0.0.1" not in c.pinned for c in transport.connections)
+
+
+async def test_ac11_a_redirect_to_loopback_is_refused_after_one_connection() -> None:
+    """AC11: a public page redirecting to ``http://127.0.0.1/`` is refused
+    ``blocked_address`` after exactly 1 connection; the redirect's body is
+    never read and its response is closed."""
+
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    moved = redirect("http://127.0.0.1/")
+    transport.script("example.org", moved)
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://example.org/", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_REFUSED, REFUSAL_BLOCKED_ADDRESS, 1)
+    assert len(transport.connections) == 1
+    assert moved.requested == [] and moved.closed >= 1
+
+
+def redirect_chain(length: int) -> tuple[FakeResolver, FakeTransport, list[FakeResponse]]:
+    """``hop0.example`` redirecting *length* times, then a page."""
+
+    resolver = FakeResolver({f"hop{index}.example": [PUBLIC_A] for index in range(length + 1)})
+    transport = FakeTransport()
+    responses = []
+    for index in range(length):
+        status = (301, 302, 303, 307, 308)[index % 5]
+        response = redirect(f"https://hop{index + 1}.example/next", status=status)
+        responses.append(response)
+        transport.script(f"hop{index}.example", response)
+    transport.script(f"hop{length}.example", page())
+    return resolver, transport, responses
+
+
+async def test_ac11_four_redirects_over_a_limit_of_three_make_four_connections() -> None:
+    resolver, transport, responses = redirect_chain(4)
+    handle = await fetching_handle(transport, resolver, max_redirects=3)
+
+    outcome = await handle.fetch("https://hop0.example/", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_REFUSED, REFUSAL_TOO_MANY_REDIRECTS, 3)
+    assert len(transport.connections) == 4
+    assert all(response.requested == [] for response in responses)
+
+
+async def test_ac11_a_chain_of_three_redirects_succeeds_with_three_counted() -> None:
+    resolver, transport, _responses = redirect_chain(3)
+    handle = await fetching_handle(transport, resolver, max_redirects=3)
+
+    outcome = await handle.fetch("https://hop0.example/", apply_allowlist=True)
+
+    assert isinstance(outcome, Fetched)
+    assert outcome.status == 200 and outcome.redirects == 3
+    assert outcome.final_url == "https://hop3.example/next"
+    assert outcome.body == b"<p>hello</p>" and outcome.truncated is False
+    assert len(transport.connections) == 4
+    assert [c.host for c in transport.connections] == [f"hop{i}.example" for i in range(4)]
+
+
+async def test_ac11_max_redirects_zero_follows_none() -> None:
+    resolver, transport, _responses = redirect_chain(1)
+    handle = await fetching_handle(transport, resolver, max_redirects=0)
+
+    outcome = await handle.fetch("https://hop0.example/", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_REFUSED, REFUSAL_TOO_MANY_REDIRECTS, 0)
+    assert len(transport.connections) == 1
+
+
+@pytest.mark.parametrize(
+    ("location", "code"),
+    [
+        ("ftp://example.org/file", REFUSAL_UNSUPPORTED_SCHEME),
+        ("file:///etc/passwd", REFUSAL_UNSUPPORTED_SCHEME),
+        ("http://user:pw@example.net/", REFUSAL_UNSUPPORTED_URL),
+        ("//[::1]/", REFUSAL_BLOCKED_ADDRESS),
+        ("http://2130706433/", REFUSAL_BLOCKED_ADDRESS),
+    ],
+)
+async def test_ac11_every_redirect_hop_is_re_checked_in_full(location: str, code: str) -> None:
+    """AC11: a redirect to ``ftp://`` is ``unsupported_scheme``; userinfo,
+    a protocol-relative loopback and a legacy literal are refused the same as
+    on a first hop — after the one connection that answered the redirect."""
+
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    transport.script("example.org", redirect(location))
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://example.org/", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_REFUSED, code, 1)
+    assert len(transport.connections) == 1
+    assert resolver.calls == [("example.org", 443)]
+
+
+async def test_r4_relative_and_protocol_relative_locations_join_the_current_url() -> None:
+    resolver = FakeResolver({"example.org": [PUBLIC_A], "other.example": [PUBLIC_B]})
+    transport = FakeTransport()
+    transport.script("example.org", redirect("/b?c=d"), redirect("//other.example:8443/e"))
+    transport.script("other.example", page())
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://example.org/a", apply_allowlist=True)
+
+    assert isinstance(outcome, Fetched) and outcome.redirects == 2
+    assert outcome.final_url == "https://other.example:8443/e"
+    assert [(c.host, c.port, c.address) for c in transport.connections] == [
+        ("example.org", 443, PUBLIC_A),
+        ("example.org", 443, PUBLIC_A),
+        ("other.example", 8443, PUBLIC_B),
+    ]
+    assert transport.connections[1].path_length == len("/b?c=d")
+
+
+async def test_ac12_a_redirect_off_the_allowlist_is_refused_after_one_connection() -> None:
+    """AC12 redirect half: under ``[example.org]``, ``example.org`` →
+    ``example.com`` is ``host_not_allowed`` after 1 connection, and the
+    refused host is never resolved; a first hop off the list makes 0
+    connections; a fetch that does not apply the list is not limited by it."""
+
+    resolver = FakeResolver({"example.org": [PUBLIC_A], "example.com": [PUBLIC_B]})
+    transport = FakeTransport()
+    transport.script("example.org", redirect("https://example.com/"))
+    handle = await fetching_handle(transport, resolver, allowed_hosts=["example.org"])
+
+    outcome = await handle.fetch("https://EXAMPLE.org/a", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_REFUSED, REFUSAL_HOST_NOT_ALLOWED, 1)
+    assert len(transport.connections) == 1
+    assert resolver.calls == [("example.org", 443)]
+
+    outcome = await handle.fetch("https://example.com/", apply_allowlist=True)
+    assert outcome == FetchFailure(FETCH_REFUSED, REFUSAL_HOST_NOT_ALLOWED, 0)
+    assert len(transport.connections) == 1
+    assert resolver.calls == [("example.org", 443)]
+
+    transport.script("example.com", page())
+    outcome = await handle.fetch("https://example.com/", apply_allowlist=False)
+    assert isinstance(outcome, Fetched) and outcome.status == 200
+
+
+async def test_r4_credential_headers_go_only_to_the_origin_the_call_began_at() -> None:
+    """A credential header follows a same-origin redirect, but a redirect to
+    another host, to another port or from HTTPS to HTTP drops every credential
+    header for that hop and every later one, even one back at the origin;
+    other headers are kept throughout."""
+
+    sent = {
+        "Authorization": "Bearer secret",
+        "x-subscription-token": "key",
+        "Cookie": "a=b",
+        "Accept": "text/html",
+    }
+    resolver = FakeResolver({"example.org": [PUBLIC_A], "other.example": [PUBLIC_B]})
+    transport = FakeTransport()
+    transport.script(
+        "example.org", redirect("/same"), redirect("https://other.example/x"), page()
+    )
+    transport.script("other.example", redirect("https://example.org/back"))
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://example.org/", apply_allowlist=False, headers=sent)
+
+    assert isinstance(outcome, Fetched) and outcome.redirects == 3
+    assert [c.headers for c in transport.connections] == [
+        sent,
+        sent,
+        {"Accept": "text/html"},
+        {"Accept": "text/html"},
+    ]
+
+    for location in ("http://example.org/", "https://example.org:8443/"):
+        resolver = FakeResolver({"example.org": [PUBLIC_A]})
+        transport = FakeTransport()
+        transport.script("example.org", redirect(location), page())
+        handle = await fetching_handle(transport, resolver)
+
+        outcome = await handle.fetch("https://example.org/", apply_allowlist=False, headers=sent)
+
+        assert isinstance(outcome, Fetched) and outcome.redirects == 1
+        assert transport.connections[1].headers == {"Accept": "text/html"}
+
+
+async def test_r6_a_non_redirect_answer_is_returned_for_the_caller_to_classify() -> None:
+    """A 404, a 3xx without ``Location`` and a declined body come back as
+    answers: the caller classifies them (P5/P6); a declined body is not read."""
+
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    pdf = FakeResponse.body(b"%PDF", headers={"Content-Type": "application/pdf"})
+    transport.script(
+        "example.org", FakeResponse(status=404), FakeResponse(status=302, headers={}), pdf
+    )
+    handle = await fetching_handle(transport, resolver)
+
+    missing = await handle.fetch("https://example.org/", apply_allowlist=True)
+    nowhere = await handle.fetch("https://example.org/", apply_allowlist=True)
+    declined = await handle.fetch(
+        "https://example.org/",
+        apply_allowlist=True,
+        accept_body=lambda response: response.headers["Content-Type"] == "text/html",
+    )
+
+    assert isinstance(missing, Fetched) and missing.status == 404 and missing.redirects == 0
+    assert isinstance(nowhere, Fetched) and nowhere.status == 302
+    assert isinstance(declined, Fetched) and declined.body is None
+    assert pdf.requested == [] and pdf.closed >= 1
+
+
+async def test_ac13_no_proxy_from_the_environment_is_ever_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC13: with ``HTTP_PROXY``/``HTTPS_PROXY`` set, the fake transport
+    records 0 requests addressed to the proxy host or its address, and the
+    proxy's name is never resolved."""
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://proxy.example:3128")
+    resolver = FakeResolver({"example.org": [PUBLIC_A], "proxy.example": [PUBLIC_B]})
+    transport = FakeTransport()
+    transport.script("example.org", redirect("http://example.org/b"), page())
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://example.org/a", apply_allowlist=True)
+
+    assert isinstance(outcome, Fetched) and outcome.redirects == 1
+    assert len(transport.connections) == 2
+    assert all(c.host == "example.org" and c.port in (80, 443) for c in transport.connections)
+    assert all(PUBLIC_B not in c.pinned for c in transport.connections)
+    assert all(host != "proxy.example" for host, _port in resolver.calls)
+
+
+def assert_streamed_within_the_allowance(response: FakeResponse, bound: int) -> None:
+    """Every request asked for at most the allowance left at that call, and
+    no read was issued once it reached 0."""
+
+    allowance = bound + 1
+    for requested, served in zip(response.requested, response.served, strict=True):
+        assert allowance > 0, "a read was issued after the allowance reached 0"
+        assert 0 < requested <= allowance
+        assert served <= requested
+        allowance -= served
+
+
+@pytest.mark.parametrize("chunk_size", [65_536, 1000, 100_000])
+async def test_ac13_a_3_mib_body_is_consumed_to_the_bound_plus_one_and_truncated(
+    chunk_size: int,
+) -> None:
+    """AC13: a 3 MiB body with ``max_response_bytes: 1048576`` — whatever
+    the chunking, including chunk sizes that do not divide the bound — has
+    exactly 1048577 bytes delivered by the stream, 1048576 retained,
+    ``truncated`` true, and the response closed."""
+
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    big = FakeResponse.body(b"a" * (3 * MIB), chunk_size=chunk_size)
+    transport.script("example.org", big)
+    handle = await fetching_handle(transport, resolver, max_response_bytes=MIB)
+
+    outcome = await handle.fetch("https://example.org/", apply_allowlist=True)
+
+    assert isinstance(outcome, Fetched)
+    assert big.delivered == MIB + 1
+    assert outcome.body is not None and len(outcome.body) == MIB
+    assert outcome.truncated is True
+    assert_streamed_within_the_allowance(big, MIB)
+    assert big.closed >= 1
+    if chunk_size == 65_536:
+        assert big.requested[-1] == 1
+        assert big.requested[:-1] == [65_536] * 16
+
+
+async def test_ac13_a_body_of_exactly_the_bound_is_whole_and_not_truncated() -> None:
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    exact = FakeResponse.body(b"b" * MIB)
+    transport.script("example.org", exact)
+    handle = await fetching_handle(transport, resolver, max_response_bytes=MIB)
+
+    outcome = await handle.fetch("https://example.org/", apply_allowlist=True)
+
+    assert isinstance(outcome, Fetched)
+    assert outcome.body == b"b" * MIB and outcome.truncated is False
+    assert exact.delivered == MIB
+    assert exact.requested[-1] == 1 and exact.served[-1] == 0
+    assert_streamed_within_the_allowance(exact, MIB)
+
+
+async def test_ac13_a_read_returning_more_than_asked_is_transport_failed() -> None:
+    """A ``read(n)`` that gives ``n + 1`` bytes breaks the seam's contract:
+    ``error transport_failed``, never a body past the bound."""
+
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    transport.script("example.org", FakeResponse.body(b"c" * 10, overserve=True))
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://example.org/", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_ERROR, REFUSAL_TRANSPORT_FAILED, 0)
+    with pytest.raises(TransportContractError):
+        await read_bounded(FakeResponse.body(b"c", overserve=True), 65_536)
+
+
+@pytest.mark.parametrize("timeout", [10, 3])
+async def test_ac13_a_body_that_never_arrives_times_out_at_the_setting(timeout: int) -> None:
+    """AC13: a fake server that sends headers and never a body ends the call
+    ``timeout timed_out`` exactly at ``request_timeout_seconds`` on the
+    injected clock — not a moment before — and the response is closed."""
+
+    clock = ManualClock()
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    stalled = FakeResponse.body(b"never", stalled=asyncio.Event())
+    transport.script("example.org", stalled)
+    handle = await fetching_handle(
+        transport, resolver, clock=clock, request_timeout_seconds=timeout
+    )
+    start = clock.now
+
+    call = asyncio.ensure_future(handle.fetch("https://example.org/", apply_allowlist=True))
+    await spin()
+    assert stalled.requested and not call.done()
+    assert clock.next_deadline() == start + timeout
+
+    clock.advance(timeout - 0.5)
+    await spin()
+    assert not call.done()
+    clock.advance(0.5)
+    await spin()
+
+    assert call.done()
+    assert call.result() == FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT)
+    assert stalled.closed >= 1
+    assert clock.next_deadline() is None
+
+
+async def test_r4_a_timeout_after_a_redirect_keeps_the_redirect_count() -> None:
+    """A call that follows a redirect and then stalls on the final body is
+    ``timeout timed_out`` with the redirect it followed still counted (R7)."""
+
+    clock = ManualClock()
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    stalled = FakeResponse.body(b"never", stalled=asyncio.Event())
+    transport.script("example.org", redirect("/next"), stalled)
+    handle = await fetching_handle(transport, resolver, clock=clock)
+
+    call = asyncio.ensure_future(handle.fetch("https://example.org/", apply_allowlist=True))
+    await spin()
+    assert stalled.requested and not call.done()
+    clock.advance(10)
+    await spin()
+
+    assert call.result() == FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT, 1)
+    assert stalled.closed >= 1
+
+
+async def test_r4_the_deadline_covers_a_connection_that_never_answers() -> None:
+    clock = ManualClock()
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    transport.script("example.org", FakeResponse(held=asyncio.Event()))
+    handle = await fetching_handle(transport, resolver, clock=clock)
+
+    call = asyncio.ensure_future(handle.fetch("https://example.org/", apply_allowlist=True))
+    await spin()
+    clock.advance(10)
+    await spin()
+
+    assert call.result() == FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT)
+    assert len(transport.connections) == 1
+
+
+async def test_r4_a_cancelled_caller_cancels_the_work_and_closes_the_response() -> None:
+    clock = ManualClock()
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    stalled = FakeResponse.body(b"never", stalled=asyncio.Event())
+    transport.script("example.org", stalled)
+    handle = await fetching_handle(transport, resolver, clock=clock)
+
+    call = asyncio.ensure_future(handle.fetch("https://example.org/", apply_allowlist=True))
+    await spin()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert stalled.closed >= 1
+    assert clock.next_deadline() is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ConnectionResetError("reset by secret.example 93.184.216.34"),
+        OSError("tls handshake failed for secret.example"),
+        TimeoutError("secret.example"),
+    ],
+)
+async def test_r6_a_transport_failure_is_transport_failed_value_free(
+    failure: BaseException,
+) -> None:
+    resolver = FakeResolver({"secret.example": [PUBLIC_A]})
+    transport = FakeTransport()
+    transport.script("secret.example", FakeResponse(raises=failure))
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://secret.example/path?q=SECRETQ", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_ERROR, REFUSAL_TRANSPORT_FAILED, 0)
+    for text in (repr(outcome), str(outcome)):
+        assert "secret" not in text and "SECRETQ" not in text and PUBLIC_A not in text
+
+
+async def test_r6_a_failed_resolution_is_error_transport_failed_with_no_connection() -> None:
+    transport = FakeTransport()
+    handle = await fetching_handle(transport, FakeResolver())
+
+    outcome = await handle.fetch("https://unresolved.example/", apply_allowlist=True)
+
+    assert outcome == FetchFailure(FETCH_ERROR, REFUSAL_TRANSPORT_FAILED, 0)
+    assert transport.connections == []
+
+
+async def test_r7_a_fetched_answer_never_renders_its_url_or_body() -> None:
+    resolver = FakeResolver({"example.org": [PUBLIC_A]})
+    transport = FakeTransport()
+    transport.script("example.org", page(b"SECRETBODY"))
+    handle = await fetching_handle(transport, resolver)
+
+    outcome = await handle.fetch("https://example.org/SECRETPATH?q=1", apply_allowlist=True)
+
+    assert isinstance(outcome, Fetched) and outcome.body == b"SECRETBODY"
+    assert "SECRET" not in repr(outcome)
+
+
+# -- the default transport, without a socket ---------------------------------- #
+
+
+class RecordingContent:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.requested: list[int] = []
+
+    async def read(self, max_bytes: int) -> bytes:
+        self.requested.append(max_bytes)
+        data, self._data = self._data[:max_bytes], self._data[max_bytes:]
+        return data
+
+
+class RecordingAiohttpResponse:
+    def __init__(self, data: bytes) -> None:
+        self.status = 200
+        self.headers = {"Content-Type": "text/plain"}
+        self.content = RecordingContent(data)
+        self.released = 0
+
+    def release(self) -> None:
+        self.released += 1
+
+
+class RecordingSession:
+    """The session-factory seam: records how a session is built and used."""
+
+    def __init__(self, sessions: list["RecordingSession"], fail: bool, **kwargs: Any) -> None:
+        sessions.append(self)
+        self.kwargs = kwargs
+        self.requests: list[tuple[str, str, dict[str, Any]]] = []
+        self.closed = 0
+        self.fail = fail
+        self.response = RecordingAiohttpResponse(b"0123456789")
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> RecordingAiohttpResponse:
+        self.requests.append((method, url, kwargs))
+        if self.fail:
+            raise ConnectionResetError("reset")
+        return self.response
+
+    async def close(self) -> None:
+        self.closed += 1
+        await self.kwargs["connector"].close()
+
+
+async def test_ac13_the_default_transport_takes_no_proxy_and_follows_no_redirect(
+    monkeypatch: pytest.MonkeyPatch, socket_guard: SocketGuard
+) -> None:
+    """AC13/R4, default transport: built through a recording session-factory
+    seam, every session is ``trust_env=False`` (no proxy from the
+    environment, which here names one), ``auto_decompress=True`` and
+    time-bounded as a backstop; every request is ``allow_redirects=False``,
+    carries no proxy and keeps the host *name* in the URL while the connector
+    resolves only through the pinned resolver. ``read(n)`` reads at most
+    *n* from the stream; closing releases the response and the session."""
+
+    import aiohttp
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    sessions: list[RecordingSession] = []
+    transport = AiohttpTransport(
+        timeout_seconds=10,
+        session_factory=lambda **kwargs: RecordingSession(sessions, False, **kwargs),
+    )
+    assert sessions == []
+
+    response = await transport.open(
+        "GET",
+        scheme="https",
+        host="example.org",
+        port=443,
+        path_and_query="/a?b=c",
+        pinned_addresses=(ipaddress.ip_address(PUBLIC_A),),
+        headers={"User-Agent": "test"},
+    )
+
+    (session,) = sessions
+    assert session.kwargs["trust_env"] is False
+    assert session.kwargs["auto_decompress"] is True
+    assert session.kwargs["timeout"].total == 11
+    connector = session.kwargs["connector"]
+    assert isinstance(connector, aiohttp.TCPConnector)
+    assert isinstance(connector._resolver, _PinnedResolver)
+    assert connector.use_dns_cache is False
+    ((method, url, kwargs),) = session.requests
+    assert (method, url) == ("GET", "https://example.org:443/a?b=c")
+    assert kwargs["allow_redirects"] is False
+    assert "proxy" not in kwargs
+    assert kwargs["headers"] == {"User-Agent": "test"}
+    assert [answer["host"] for answer in await connector._resolve_host("example.org", 443)] == [
+        PUBLIC_A
+    ]
+
+    assert await response.read(4) == b"0123"
+    assert session.response.content.requested == [4]
+    await response.close()
+    await response.close()
+    assert session.response.released == 1 and session.closed == 1
+    await transport.close()
+    assert session.closed == 1
+    assert socket_guard.attempts == []
+
+
+async def test_r4_the_default_transport_closes_a_session_whose_request_failed() -> None:
+    sessions: list[RecordingSession] = []
+    transport = AiohttpTransport(
+        timeout_seconds=5,
+        session_factory=lambda **kwargs: RecordingSession(sessions, True, **kwargs),
+    )
+
+    with pytest.raises(ConnectionResetError):
+        await transport.open(
+            "GET",
+            scheme="http",
+            host="2606:4700::1111",
+            port=80,
+            path_and_query="/",
+            pinned_addresses=(ipaddress.ip_address("2606:4700::1111"),),
+        )
+
+    (session,) = sessions
+    assert session.requests[0][1] == "http://[2606:4700::1111]:80/"
+    assert session.closed == 1
+    await transport.close()
+    assert session.closed == 1
+
+
+async def test_r4_the_pinned_resolver_answers_only_the_pinned_addresses() -> None:
+    """``_PinnedResolver.resolve`` returns exactly the pinned addresses for
+    the pinned host — filtered by family when one is asked for — and
+    refuses any other host; it never asks the platform."""
+
+    pinned = (ipaddress.ip_address(PUBLIC_A), ipaddress.ip_address("2606:4700::1111"))
+    resolver = _PinnedResolver("example.org", pinned)
+
+    answers = await resolver.resolve("example.org", 443, family=socket.AF_UNSPEC)
+    assert [(a["hostname"], a["host"], a["port"]) for a in answers] == [
+        ("example.org", PUBLIC_A, 443),
+        ("example.org", "2606:4700::1111", 443),
+    ]
+    assert [a["family"] for a in answers] == [socket.AF_INET, socket.AF_INET6]
+    assert [a["host"] for a in await resolver.resolve("example.org", 443)] == [PUBLIC_A]
+    assert [
+        a["host"] for a in await resolver.resolve("example.org", 443, family=socket.AF_INET6)
+    ] == ["2606:4700::1111"]
+    for other in ("example.com", "EXAMPLE.ORG.", "localhost", "127.0.0.1"):
+        with pytest.raises(OSError):
+            await resolver.resolve(other, 443, family=socket.AF_UNSPEC)
+    only_v4 = _PinnedResolver("example.org", pinned[:1])
+    with pytest.raises(OSError):
+        await only_v4.resolve("example.org", 443, family=socket.AF_INET6)
+    await resolver.close()
+
+
+async def test_ac25_activate_and_prepare_with_no_seams_open_nothing(
+    monkeypatch: pytest.MonkeyPatch, socket_guard: SocketGuard
+) -> None:
+    """AC25 default-transport half: with ``BRAVE_API_KEY`` exported, the
+    module activated with **no** seams — the shipped transport, resolver and
+    sleeper — and prepared records 0 socket-guard attempts; even binding the
+    default transport opens no session until a call."""
+
+    key = fake_key()
+    monkeypatch.setenv("BRAVE_API_KEY", key)
+    for settings in ({}, {"provider": "brave", "brave_api_key": key}):
+        context = runtime_context(clock=ManualClock()).for_module(MODULE_NAME)
+        handle = await activate(context, settings, {})
+        await handle.prepare()
+        assert context.actions.is_ready()
+        assert handle._opened_transport is None
+        transport = handle._transport()
+        assert isinstance(transport, AiohttpTransport) and transport._sessions == set()
+        await handle.close()
+        assert socket_guard.attempts == []

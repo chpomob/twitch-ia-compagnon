@@ -69,6 +69,24 @@ compatible forms, so these two are left to ``is_global``. ``is_global``
 treats both as global, so ``64:ff9b::7f00:1`` is not refused as loopback.
 This gap is recorded here and was not checked in another way.
 
+**The guarded transport (R4, R6).** :meth:`WebModule.fetch` is the one
+way out. Per hop it parses the URL, applies ``allowed_hosts`` to reads
+(before any resolution), resolves once through :func:`resolve_checked` and
+hands the transport the *pinned* addresses — never a bare name to resolve —
+so a name that answers differently later cannot reach a refused address.
+A redirect (301, 302, 303, 307, 308 with a ``Location``) is closed unread,
+joined to the current URL and checked again in full; more than
+``max_redirects`` of them is ``too_many_redirects``. :func:`read_bounded`
+asks the stream for at most the remaining ``max_response_bytes + 1``
+allowance per ``read``, so no more than that is ever consumed, and keeps at
+most ``max_response_bytes``. The whole call races one sleep of
+``request_timeout_seconds``; losing it is ``timeout timed_out``. Every
+failure is a code, never an exception's text. :class:`AiohttpTransport`, the
+default, takes no proxy from the environment, follows no redirect itself,
+and connects only through a :class:`_PinnedResolver`. Pinning on a real
+socket is proven by unit checks of that resolver and by the operator trial,
+not by a test.
+
 **The extractor (R3).** :func:`extract_text` turns a body into a title
 and text with no dependency: the charset is the header's ``charset=``, else
 a ``<meta>`` declaration in the first 1024 bytes, else UTF-8, and decoding
@@ -99,7 +117,7 @@ import ipaddress
 import re
 import socket
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -827,6 +845,281 @@ class _TextParser(HTMLParser):
         return " ".join("".join(self._title_parts).split()) or None
 
 
+# --------------------------------------------------------------------------- #
+# The guarded transport (R4, R6)
+# --------------------------------------------------------------------------- #
+
+#: The redirect statuses a fetch follows, each hop re-checked in full.
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+#: The request headers that carry a credential, compared case-insensitively.
+#: They are sent only to the origin the call began at: a redirect to another
+#: scheme, host or port drops them for that hop and every later one.
+CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "x-subscription-token"}
+)
+
+#: The most body bytes one ``read`` asks the stream for.
+READ_CHUNK_BYTES = 65_536
+
+#: How much later than ``request_timeout_seconds`` the default transport's
+#: own timeout fires: a backstop only, the whole-call deadline comes first.
+TRANSPORT_TIMEOUT_MARGIN_SECONDS = 1.0
+
+#: The executor statuses a fetch failure is classified as (R6).
+FETCH_REFUSED = "refused"
+FETCH_ERROR = "error"
+FETCH_TIMEOUT = "timeout"
+
+REFUSAL_TOO_MANY_REDIRECTS = "too_many_redirects"
+ERROR_TIMED_OUT = "timed_out"
+
+
+class TransportContractError(Exception):
+    """A transport broke the seam's contract, e.g. ``read(n)`` gave more than *n*."""
+
+
+@dataclass(frozen=True, slots=True)
+class Fetched:
+    """A non-redirect answer: its status, headers, final URL and bounded body.
+
+    ``body`` is ``None`` when the caller's ``accept_body`` declined it, in
+    which case not one body byte was read; otherwise it holds at most
+    ``max_response_bytes`` bytes and ``truncated`` says whether more existed.
+    The repr names only the status, the counts and the flag: the URL's path
+    and the body are never recorded (R7).
+    """
+
+    status: int
+    headers: Mapping[str, str]
+    final_url: str
+    redirects: int
+    body: bytes | None = None
+    truncated: bool = False
+
+    def __repr__(self) -> str:
+        size = None if self.body is None else len(self.body)
+        return (
+            f"Fetched(status={self.status!r}, redirects={self.redirects!r}, "
+            f"body_bytes={size!r}, truncated={self.truncated!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FetchFailure:
+    """A fetch that ended without an answer: an executor status and a code.
+
+    ``status`` is ``refused``, ``error`` or ``timeout``; ``code`` is from the
+    module's fixed vocabulary. Nothing else is held, so nothing else leaks.
+    """
+
+    status: str
+    code: str
+    redirects: int = 0
+
+
+async def read_bounded(response: Any, max_response_bytes: int) -> tuple[bytes, bool]:
+    """At most *max_response_bytes* body bytes of *response*, and whether more existed.
+
+    The allowance starts at ``max_response_bytes + 1`` and each ``read``
+    asks for at most what remains of it, so the stream never delivers more
+    than that whatever its chunking; the one extra byte only says that more
+    exists. Once the allowance is spent no further read is issued and the
+    response is closed. A ``read`` giving more than it was asked for breaks
+    the seam's contract: :class:`TransportContractError`.
+    """
+
+    allowance = max_response_bytes + 1
+    parts: list[bytes] = []
+    while allowance > 0:
+        requested = min(READ_CHUNK_BYTES, allowance)
+        data = await response.read(requested)
+        if not isinstance(data, (bytes, bytearray)) or len(data) > requested:
+            raise TransportContractError("read returned more than requested")
+        if not data:
+            break
+        parts.append(bytes(data))
+        allowance -= len(data)
+    if allowance <= 0:
+        await _close_response(response)
+    body = b"".join(parts)
+    return body[:max_response_bytes], len(body) > max_response_bytes
+
+
+async def _close_response(response: Any) -> None:
+    """Close *response*, sync or async; a failure to close is not a result."""
+
+    closer = getattr(response, "close", None)
+    if not callable(closer):
+        return
+    try:
+        outcome = closer()
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception:  # noqa: BLE001 - closing must not mask the outcome
+        return
+
+
+def _header(headers: Any, name: str) -> str | None:
+    """The value of header *name* in *headers*, matched case-insensitively."""
+
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        value = getter(name)
+        if isinstance(value, str):
+            return value
+    try:
+        items = headers.items()
+    except AttributeError:
+        return None
+    wanted = name.lower()
+    for key, value in items:
+        if isinstance(key, str) and key.lower() == wanted and isinstance(value, str):
+            return value
+    return None
+
+
+class _PinnedResolver:
+    """aiohttp's resolver for one request: the checked addresses, nothing else.
+
+    It answers only for the host it was pinned to, with exactly the
+    addresses :func:`resolve_checked` returned, and refuses every other
+    host; it never asks the platform. TLS SNI and ``Host`` keep the name,
+    while the connection can only reach an address that passed the guard.
+    """
+
+    def __init__(self, host: str, pinned_addresses: Sequence[Address]) -> None:
+        self._host = host
+        self._addresses = tuple(pinned_addresses)
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> list[dict[str, Any]]:
+        if host != self._host:
+            raise OSError("host is not the pinned host")
+        answers = [
+            {
+                "hostname": host,
+                "host": str(address),
+                "port": port,
+                "family": socket.AF_INET if address.version == 4 else socket.AF_INET6,
+                "proto": 0,
+                "flags": socket.AI_NUMERICHOST,
+            }
+            for address in self._addresses
+        ]
+        if family:
+            answers = [answer for answer in answers if answer["family"] == family]
+        if not answers:
+            raise OSError("no pinned address for this family")
+        return answers
+
+    async def close(self) -> None:
+        return None
+
+
+class _AiohttpResponse:
+    """One aiohttp answer behind the seam: ``read(n)`` gives at most *n* bytes."""
+
+    def __init__(self, response: Any, session: Any, owner: "AiohttpTransport") -> None:
+        self.status = response.status
+        self.headers = response.headers
+        self._response = response
+        self._session = session
+        self._owner = owner
+
+    async def read(self, max_bytes: int) -> bytes:
+        if max_bytes <= 0:
+            return b""
+        return await self._response.content.read(max_bytes)
+
+    async def close(self) -> None:
+        session, self._session = self._session, None
+        if session is None:
+            return
+        try:
+            self._response.release()
+        finally:
+            await self._owner._close_session(session)
+
+
+class AiohttpTransport:
+    """The default transport: aiohttp, pinned, no proxy, no redirect (R4).
+
+    Nothing is opened until the first ``open``. Each request gets its own
+    session, because aiohttp binds a connector to a session and the
+    connector carries the request's :class:`_PinnedResolver`: the session
+    takes no proxy from the environment (``trust_env=False``), the request
+    follows no redirect (``allow_redirects=False``, the module follows them
+    itself, re-checked), bodies are decompressed (the byte bound counts what
+    the extractor would read), and the session's own total timeout is a
+    backstop behind the module's whole-call deadline. ``close`` closes every
+    session still open.
+    """
+
+    def __init__(self, *, timeout_seconds: float, session_factory: Any = None) -> None:
+        self._timeout_seconds = timeout_seconds
+        self._session_factory = session_factory
+        self._sessions: set[Any] = set()
+
+    async def open(
+        self,
+        method: str,
+        *,
+        scheme: str,
+        host: str,
+        port: int,
+        path_and_query: str,
+        pinned_addresses: Sequence[Address],
+        headers: Mapping[str, str] | None = None,
+    ) -> _AiohttpResponse:
+        import aiohttp
+
+        if not pinned_addresses:
+            raise TransportContractError("no pinned address")
+        connector = aiohttp.TCPConnector(
+            resolver=_PinnedResolver(host, pinned_addresses), use_dns_cache=False
+        )
+        factory = self._session_factory or aiohttp.ClientSession
+        session = factory(
+            connector=connector,
+            connector_owner=True,
+            trust_env=False,
+            auto_decompress=True,
+            timeout=aiohttp.ClientTimeout(
+                total=self._timeout_seconds + TRANSPORT_TIMEOUT_MARGIN_SECONDS
+            ),
+        )
+        self._sessions.add(session)
+        netloc = f"[{host}]" if ":" in host else host
+        try:
+            response = await session.request(
+                method,
+                f"{scheme}://{netloc}:{port}{path_and_query}",
+                headers=dict(headers or {}),
+                allow_redirects=False,
+            )
+        except BaseException:
+            await self._close_session(session)
+            raise
+        return _AiohttpResponse(response, session, self)
+
+    async def _close_session(self, session: Any) -> None:
+        self._sessions.discard(session)
+        outcome = session.close()
+        if inspect.isawaitable(outcome):
+            await outcome
+
+    async def close(self) -> None:
+        for session in list(self._sessions):
+            try:
+                await self._close_session(session)
+            except Exception:  # noqa: BLE001 - closing must not mask shutdown
+                continue
+
+
 def _setting_diagnostic(field_name: str, reason: str) -> str:
     return f"module {MODULE_NAME!r}: field {field_name!r}: {reason}"
 
@@ -919,6 +1212,13 @@ class _Settings:
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(slots=True)
+class _Progress:
+    """How far one fetch got, readable after its task is cancelled."""
+
+    redirects: int = 0
+
+
 class WebModule:
     """The v2 handle: ready at ``prepare`` with nothing opened (R1)."""
 
@@ -980,6 +1280,137 @@ class WebModule:
                     await outcome
             except Exception:  # noqa: BLE001 - closing must not mask shutdown
                 return
+
+    # -- the guarded fetch (R4, R6) ----------------------------------------- #
+
+    def _transport(self) -> Any:
+        """The transport, bound on first use: the seam or the default one."""
+
+        if self._opened_transport is None:
+            self._opened_transport = (
+                self._transport_seam
+                if self._transport_seam is not None
+                else AiohttpTransport(timeout_seconds=self._settings.request_timeout_seconds)
+            )
+        return self._opened_transport
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        apply_allowlist: bool,
+        accept_body: Callable[[Any], bool] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Fetched | FetchFailure:
+        """Fetch *url* through the guard, every hop, within one deadline (R4, R6).
+
+        The whole call — resolution, every hop and the body — runs as one task
+        raced against ``request_timeout_seconds`` on the injected sleeper; when
+        that elapses first the task is cancelled, the open response closed,
+        and the call is ``timeout timed_out``. *accept_body* sees the final
+        response before any body byte is read and may decline it; by default
+        the body is read, bounded. A cancellation of the caller cancels the
+        work and is re-raised.
+        """
+
+        sleeper = self._sleeper or asyncio.sleep
+        progress = _Progress()
+        work = asyncio.ensure_future(
+            self._fetch_hops(
+                url,
+                apply_allowlist=apply_allowlist,
+                accept_body=accept_body,
+                headers=headers,
+                progress=progress,
+            )
+        )
+        timer = asyncio.ensure_future(sleeper(self._settings.request_timeout_seconds))
+        try:
+            await asyncio.wait({work, timer}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            work.cancel()
+            timer.cancel()
+            await asyncio.gather(work, timer, return_exceptions=True)
+            raise
+        if not work.done():
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
+            return FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT, progress.redirects)
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        if work.cancelled() or work.exception() is not None:
+            return FetchFailure(FETCH_ERROR, REFUSAL_TRANSPORT_FAILED, progress.redirects)
+        return work.result()
+
+    async def _fetch_hops(
+        self,
+        url: str,
+        *,
+        apply_allowlist: bool,
+        accept_body: Callable[[Any], bool] | None,
+        headers: Mapping[str, str] | None,
+        progress: _Progress,
+    ) -> Fetched | FetchFailure:
+        """Every hop of one fetch: guard, resolve once, connect pinned, follow.
+
+        The redirects followed so far are kept on *progress*, so a call cut
+        short by the deadline still reports them. Credential headers go only
+        to the origin the call began at (:data:`CREDENTIAL_HEADERS`).
+        """
+
+        settings = self._settings
+        redirects = 0
+        hop_headers = dict(headers or {})
+        origin: tuple[str, str, int] | None = None
+        while True:
+            target = parse_target(url)
+            if isinstance(target, GuardRefusal):
+                return FetchFailure(FETCH_REFUSED, target.code, redirects)
+            if origin is None:
+                origin = (target.scheme, target.host, target.port)
+            elif (target.scheme, target.host, target.port) != origin:
+                hop_headers = {
+                    name: value
+                    for name, value in hop_headers.items()
+                    if name.lower() not in CREDENTIAL_HEADERS
+                }
+            if apply_allowlist and not host_allowed(target.host, settings.allowed_hosts):
+                return FetchFailure(FETCH_REFUSED, REFUSAL_HOST_NOT_ALLOWED, redirects)
+            pinned = await resolve_checked(target, self._resolver)
+            if isinstance(pinned, GuardRefusal):
+                status = FETCH_ERROR if pinned.code == REFUSAL_TRANSPORT_FAILED else FETCH_REFUSED
+                return FetchFailure(status, pinned.code, redirects)
+            response = None
+            try:
+                response = await self._transport().open(
+                    "GET",
+                    scheme=target.scheme,
+                    host=target.host,
+                    port=target.port,
+                    path_and_query=target.path,
+                    pinned_addresses=tuple(pinned),
+                    headers=dict(hop_headers),
+                )
+                location = _header(response.headers, "Location")
+                if response.status in REDIRECT_STATUSES and location:
+                    if redirects >= settings.max_redirects:
+                        return FetchFailure(FETCH_REFUSED, REFUSAL_TOO_MANY_REDIRECTS, redirects)
+                    redirects += 1
+                    progress.redirects = redirects
+                    try:
+                        url = urllib.parse.urljoin(url, location)
+                    except ValueError:
+                        return FetchFailure(FETCH_REFUSED, REFUSAL_UNSUPPORTED_URL, redirects)
+                    continue
+                if accept_body is not None and not accept_body(response):
+                    return Fetched(response.status, response.headers, url, redirects)
+                body, truncated = await read_bounded(response, settings.max_response_bytes)
+                return Fetched(response.status, response.headers, url, redirects, body, truncated)
+            except Exception:  # noqa: BLE001 - transport text names the host
+                return FetchFailure(FETCH_ERROR, REFUSAL_TRANSPORT_FAILED, redirects)
+            finally:
+                if response is not None:
+                    await _close_response(response)
 
 
 # --------------------------------------------------------------------------- #
@@ -1044,6 +1475,18 @@ def _require_runtime_surfaces(context: Any) -> None:
 
 __all__ = [
     "Address",
+    "AiohttpTransport",
+    "CREDENTIAL_HEADERS",
+    "ERROR_TIMED_OUT",
+    "FETCH_ERROR",
+    "FETCH_REFUSED",
+    "FETCH_TIMEOUT",
+    "FetchFailure",
+    "Fetched",
+    "READ_CHUNK_BYTES",
+    "REDIRECT_STATUSES",
+    "REFUSAL_TOO_MANY_REDIRECTS",
+    "TransportContractError",
     "DEFAULT_DEBUG_LENGTHS",
     "DEFAULT_PROVIDER",
     "DEFAULT_USER_AGENT_CONTACT",
@@ -1074,6 +1517,7 @@ __all__ = [
     "literal_address",
     "normalize_host_name",
     "parse_target",
+    "read_bounded",
     "resolve_checked",
     "validate_settings",
 ]
