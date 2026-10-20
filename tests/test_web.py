@@ -12,7 +12,13 @@ step P4 adds the guarded transport (R4, R6): pinned connections (AC10
 rebinding), manual redirects re-checked at every hop (AC11, AC12 redirect
 half), the byte bound measured while streaming and no proxy (AC13), the
 whole-call deadline on the injected clock, and the default transport's
-settings checked without a socket (AC25 default-transport half).
+settings checked without a socket (AC25 default-transport half). Plan step
+P5 binds ``web.read`` and drives it through the real executor with a grant
+for ``brain`` on ``twitch/chan/web``: default-deny (AC1 provider half), the
+url argument rows (AC2), the text bound and the content type judged unread
+(AC8, over ``page_20k.html``), AC9–AC13 again as executor statuses and
+codes, the concurrency bound (AC17), the read rows of the R6 table (AC18)
+and the count-only trace (R7).
 
 **No test here opens a real socket.** The autouse :func:`socket_guard`
 replaces ``socket.socket.connect``/``connect_ex``, ``socket.create_connection``,
@@ -36,7 +42,7 @@ import asyncio.base_events
 import ipaddress
 import socket
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -45,20 +51,37 @@ import pytest
 import yaml
 
 import core.main as application
-from core.actions import ERROR_PROVIDER_NOT_READY, AuthorizationRule
+from core.actions import (
+    ERROR_INVALID_ARGUMENTS,
+    ERROR_NOT_AUTHORIZED,
+    ERROR_PROVIDER_NOT_READY,
+    AuthorizationRule,
+)
 from core.bus import EventBus
-from core.contracts import TRACE_MODULE_READY, ActionCall, Destination
+from core.contracts import TRACE_ACTION_COMPLETED, TRACE_MODULE_READY, ActionCall, Destination
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from conftest import ManualClock, events_of, runtime_context
 from test_integration import _environment
 
 from modules.web import (
+    ERROR_MALFORMED_RESPONSE,
     ERROR_TIMED_OUT,
+    ERROR_UPSTREAM_STATUS,
+    OUTCOME_OK,
+    PROVIDER_HTTP,
+    REFUSAL_NOT_FOUND,
+    REFUSAL_PROVIDER_REFUSED,
+    REFUSAL_RATE_LIMITED,
+    REFUSAL_RESOURCE_BUSY,
+    REFUSAL_UNSUPPORTED_CONTENT_TYPE,
+    _classify,
+    _declared_spec,
     FETCH_ERROR,
     FETCH_REFUSED,
     FETCH_TIMEOUT,
     INTEGER_SETTINGS,
+    READ_BINDING_PROVIDER,
     REFUSAL_HOST_NOT_ALLOWED,
     REFUSAL_TOO_MANY_REDIRECTS,
     AiohttpTransport,
@@ -950,9 +973,11 @@ async def test_ac4_activate_prepare_and_ready_open_no_connection(
     """AC4: through the real loader and the coordinator, ``activate`` →
     ``prepare`` → ``module.ready`` records 0 connection attempts on the fake
     transport, 0 resolutions on the fake resolver and 0 attempts on the
-    socket guard. Until the providers are bound (P5/P6) a granted call to
-    either action is refused ``provider_not_ready`` with 0 invocations; stop
-    withdraws readiness and still opens nothing."""
+    socket guard. Until its provider is bound (P6) a granted ``web.search``
+    is refused ``provider_not_ready`` with 0 invocations. ``web.read`` is
+    bound at ``prepare`` since P5 (R3, superseding the P1 "no provider yet"
+    half of this test), its spec equal to the discovered one, and binding it
+    opens nothing; stop withdraws readiness and still opens nothing."""
 
     clock = ManualClock()
     context = runtime_context(clock=clock)
@@ -998,18 +1023,23 @@ async def test_ac4_activate_prepare_and_ready_open_no_connection(
     assert resolver.calls == []
     assert socket_guard.attempts == []
 
-    for action, arguments in (
-        (WEB_SEARCH_ACTION, {"query": "anything"}),
-        (WEB_READ_ACTION, {"url": "https://example.org/"}),
-    ):
-        context.actions._authorization.grant(
-            AuthorizationRule(
-                rule_id=f"grant-{action}", action_name=action, granted_permissions=(action,)
-            )
+    (binding,) = context.actions.bindings(WEB_READ_ACTION)
+    assert binding.spec == context.actions.discovered()[WEB_READ_ACTION]
+    assert binding.provider_name == READ_BINDING_PROVIDER
+    assert WEB_READ_ACTION in context.actions.registered_ready()
+
+    context.actions._authorization.grant(
+        AuthorizationRule(
+            rule_id="grant-web.search",
+            action_name=WEB_SEARCH_ACTION,
+            granted_permissions=(WEB_SEARCH_ACTION,),
         )
-        observation = await context.executor.invoke(_web_call(action, arguments))
-        assert observation.status == "refused", action
-        assert observation.error["code"] == ERROR_PROVIDER_NOT_READY, action
+    )
+    observation = await context.executor.invoke(
+        _web_call(WEB_SEARCH_ACTION, {"query": "anything"})
+    )
+    assert observation.status == "refused"
+    assert observation.error["code"] == ERROR_PROVIDER_NOT_READY
     assert context.executor.provider_invocations == 0
 
     assert (await coordinator.stop()).status == 0
@@ -2250,3 +2280,663 @@ async def test_ac25_activate_and_prepare_with_no_seams_open_nothing(
         assert isinstance(transport, AiohttpTransport) and transport._sessions == set()
         await handle.close()
         assert socket_guard.attempts == []
+
+
+# --------------------------------------------------------------------------- #
+# P5: web.read through the executor (R3, R4, R5 concurrency, R6, R7, R8;
+# AC1 provider half, AC2 url rows, AC8, AC9–AC13 end to end, AC17, AC18)
+# --------------------------------------------------------------------------- #
+
+READ_CHANNEL = "chan"
+READ_DESTINATION = Destination(platform="twitch", channel_id=READ_CHANNEL, scope="web")
+#: The spec's deadline for both actions, which every bound must beat.
+ACTION_DEADLINE_SECONDS = 15
+
+
+@dataclass
+class ReadRig:
+    """A prepared handle over the fakes and the real executor that calls it."""
+
+    clock: ManualClock
+    runtime: Any
+    handle: WebModule
+    transport: FakeTransport
+    resolver: FakeResolver
+    calls: int = 0
+
+    @property
+    def executor(self) -> Any:
+        return self.runtime.executor
+
+    def call(self, arguments: Mapping[str, Any]) -> ActionCall:
+        self.calls += 1
+        return ActionCall(
+            action_name=WEB_READ_ACTION,
+            action_version=1,
+            arguments=dict(arguments),
+            conversation_id="conversation-1",
+            run_id="run-1",
+            call_id=f"read-{self.calls}",
+            source_event_id="source-1",
+            destination=READ_DESTINATION,
+            principal=PRINCIPAL,
+            deadline=10_000.0,
+            message_id="source-1",
+        )
+
+    async def read(self, url: str | None = None, **arguments: Any) -> Any:
+        if url is not None:
+            arguments["url"] = url
+        return await self.executor.invoke(self.call(arguments))
+
+    def completed(self) -> list[Mapping[str, Any]]:
+        return [
+            event["payload"]
+            for event in events_of(self.runtime.bus, TRACE_ACTION_COMPLETED)
+            if event["payload"]["action"] == WEB_READ_ACTION
+        ]
+
+
+async def read_rig(
+    *,
+    grant: bool = True,
+    transport: FakeTransport | None = None,
+    resolver: FakeResolver | None = None,
+    **settings: Any,
+) -> ReadRig:
+    """A prepared ``web`` handle; with *grant*, ``brain`` may read on ``twitch/chan/web``."""
+
+    clock = ManualClock()
+    runtime = runtime_context(clock=clock)
+    transport = transport if transport is not None else FakeTransport()
+    resolver = resolver if resolver is not None else FakeResolver({"example.org": [PUBLIC_A]})
+    handle = await activate(
+        runtime.for_module(MODULE_NAME),
+        {"_transport": transport, "_resolver": resolver, "_sleeper": clock.sleep, **settings},
+        {},
+    )
+    await handle.prepare()
+    if grant:
+        runtime.actions._authorization.grant(
+            AuthorizationRule(
+                rule_id="grant-brain-web-read",
+                action_name=WEB_READ_ACTION,
+                destination=Destination(platform="twitch", channel_id=READ_CHANNEL, scope="web"),
+                principals=(PRINCIPAL,),
+                granted_permissions=(WEB_READ_ACTION,),
+            )
+        )
+    return ReadRig(clock, runtime, handle, transport, resolver)
+
+
+def html_page(data: bytes, *, content_type: str = "text/html; charset=utf-8") -> FakeResponse:
+    return FakeResponse.body(data, headers={"Content-Type": content_type})
+
+
+def read_success(observation: Any) -> Mapping[str, Any]:
+    """The result of a successful read, checked against the manifest's schema."""
+
+    assert observation.status == "success", observation.error
+    assert observation.parts == ()
+    assert not [part for part in observation.parts if part.get("type") == "text"]
+    result = observation.result
+    _declared_spec(WEB_READ_ACTION).validate_result(result)
+    assert result["advisory"] == MARKER
+    return result
+
+
+def assert_read_outcome(observation: Any, status: str, code: str) -> None:
+    """*observation* ends *status* with *code* and its one fixed message."""
+
+    assert observation.status == status, observation.error
+    assert observation.error["code"] == code
+    assert observation.error["message"] == f"{WEB_READ_ACTION} {status}: {code}"
+    assert observation.result is None
+    assert observation.parts == ()
+
+
+async def test_ac1_with_no_rule_the_read_provider_is_never_invoked() -> None:
+    """AC1 provider half: with no rule for ``brain``, a read is refused
+    ``not_authorized``; the provider is invoked 0 times and nothing is
+    resolved or connected."""
+
+    rig = await read_rig(grant=False)
+    rig.transport.default = html_page(b"<p>never</p>")
+
+    observation = await rig.read("https://example.org/")
+
+    assert observation.status == "refused"
+    assert observation.error["code"] == ERROR_NOT_AUTHORIZED
+    assert rig.executor.provider_invocations == 0
+    assert rig.transport.connections == []
+    assert rig.resolver.calls == []
+
+
+async def test_ac1_a_rule_on_another_channel_grants_nothing() -> None:
+    """Default-deny is per destination: a rule for ``twitch/chan/web`` does
+    not authorize a read on another channel, and nothing is connected."""
+
+    rig = await read_rig()
+    call = replace(
+        rig.call({"url": "https://example.org/"}),
+        destination=Destination(platform="twitch", channel_id="other", scope="web"),
+    )
+
+    observation = await rig.executor.invoke(call)
+
+    assert observation.status == "refused"
+    assert observation.error["code"] == ERROR_NOT_AUTHORIZED
+    assert rig.executor.provider_invocations == 0
+    assert rig.transport.connections == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({}, id="missing-url"),
+        pytest.param({"url": "https://example.org/" + "a" * (2049 - 20)}, id="2049-chars"),
+        pytest.param({"url": "https://example.org/", "extra": "x"}, id="extra-key"),
+        pytest.param({"url": ""}, id="empty-url"),
+    ],
+)
+async def test_ac2_invalid_url_arguments_are_refused_with_no_request(
+    arguments: dict[str, Any],
+) -> None:
+    """AC2 url rows: a missing ``url``, a 2049-character ``url`` and an extra
+    key are ``invalid_arguments`` — the executor's own terminal ``error`` —
+    with 0 invocations and 0 connections."""
+
+    if set(arguments) == {"url"} and arguments["url"]:
+        assert len(arguments["url"]) == 2049
+    rig = await read_rig()
+
+    observation = await rig.read(**arguments)
+
+    assert observation.status == "error"
+    assert observation.error["code"] == ERROR_INVALID_ARGUMENTS
+    assert rig.executor.provider_invocations == 0
+    assert rig.transport.connections == []
+    assert rig.resolver.calls == []
+
+
+async def test_ac2_a_2048_character_url_is_within_the_bound() -> None:
+    """The control for the 2049 row: 2048 characters reach the provider."""
+
+    rig = await read_rig()
+    rig.transport.script("example.org", html_page(b"<p>ok</p>"))
+    url = "https://example.org/" + "a" * (2048 - 20)
+    assert len(url) == 2048
+
+    read_success(await rig.read(url))
+    assert len(rig.transport.connections) == 1
+
+
+async def test_ac8_a_20000_byte_page_is_cut_to_8192_valid_utf8_bytes() -> None:
+    """AC8: ``page_20k.html``, whose extracted text is 20 000 bytes, read
+    with ``max_text_bytes: 8192`` yields at most 8192 bytes of valid UTF-8
+    — the cut falls inside a multi-byte character — and ``truncated: true``."""
+
+    data = fixture_bytes("page_20k.html")
+    full = extract_text(data, "text/html; charset=utf-8")
+    assert len(full.text.encode()) == 20_000
+    assert full.text.encode()[8192] & 0xC0 == 0x80
+    rig = await read_rig(max_text_bytes=8192)
+    rig.transport.script("example.org", html_page(data))
+
+    result = read_success(await rig.read("https://example.org/twenty"))
+
+    text_bytes = result["text"].encode("utf-8")
+    assert len(text_bytes) <= 8192
+    assert text_bytes.decode("utf-8") == result["text"]
+    assert full.text.startswith(result["text"])
+    assert result["truncated"] is True
+    assert result["title"] == full.title == "Vingt mille octets"
+    assert result["final_url"] == "https://example.org/twenty"
+    (trace,) = rig.completed()
+    assert trace["text_bytes"] == len(text_bytes)
+
+
+async def test_ac8_a_1000_byte_page_is_whole_and_not_truncated() -> None:
+    rig = await read_rig()
+    rig.transport.script(
+        "example.org", html_page(b"<p>" + "é".encode() * 500 + b"</p>")
+    )
+
+    result = read_success(await rig.read("https://example.org/"))
+
+    assert result["text"] == "é" * 500
+    assert len(result["text"].encode()) == 1000
+    assert result["truncated"] is False
+    assert "title" not in result
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["application/pdf", "image/png", "application/json", "text/css", None],
+)
+async def test_ac8_an_unreadable_content_type_is_refused_with_0_reads(
+    content_type: str | None,
+) -> None:
+    """AC8: ``application/pdf`` — or any type but the three readable ones,
+    or none — is ``refused unsupported_content_type`` after 1 connection,
+    with 0 ``read`` calls on the response and the response closed."""
+
+    rig = await read_rig()
+    headers = {} if content_type is None else {"Content-Type": content_type}
+    response = FakeResponse.body(b"%PDF-1.7 SECRETBODY", headers=headers)
+    rig.transport.script("example.org", response)
+
+    observation = await rig.read("https://example.org/doc.pdf")
+
+    assert_read_outcome(observation, "refused", REFUSAL_UNSUPPORTED_CONTENT_TYPE)
+    assert response.reads == 0
+    assert response.delivered == 0
+    assert response.closed >= 1
+    assert len(rig.transport.connections) == 1
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["text/html", "TEXT/HTML; charset=UTF-8", "application/xhtml+xml", "text/plain"],
+)
+async def test_r3_each_readable_content_type_is_read(content_type: str) -> None:
+    rig = await read_rig()
+    rig.transport.script("example.org", html_page(b"hello", content_type=content_type))
+
+    assert read_success(await rig.read("https://example.org/"))["text"] == "hello"
+
+
+@pytest.mark.parametrize("url", AC9_LITERAL_URLS)
+async def test_ac9_every_literal_is_refused_blocked_address_end_to_end(url: str) -> None:
+    rig = await read_rig()
+
+    assert_read_outcome(await rig.read(url), "refused", REFUSAL_BLOCKED_ADDRESS)
+    assert rig.transport.connections == []
+    assert rig.resolver.calls == []
+
+
+async def test_ac9_a_name_with_one_private_answer_is_refused_end_to_end() -> None:
+    resolver = FakeResolver({"mixed.example": [PUBLIC_A, "10.0.0.5"]})
+    rig = await read_rig(resolver=resolver)
+
+    assert_read_outcome(
+        await rig.read("http://mixed.example/"), "refused", REFUSAL_BLOCKED_ADDRESS
+    )
+    assert rig.transport.connections == []
+
+
+@pytest.mark.parametrize(
+    ("url", "code"),
+    [
+        ("ftp://example.org/", REFUSAL_UNSUPPORTED_SCHEME),
+        ("file:///etc/passwd", REFUSAL_UNSUPPORTED_SCHEME),
+        ("gopher://example.org/", REFUSAL_UNSUPPORTED_SCHEME),
+        ("http://user:pw@example.org/", REFUSAL_UNSUPPORTED_URL),
+    ],
+)
+async def test_ac10_schemes_and_userinfo_are_refused_end_to_end(url: str, code: str) -> None:
+    rig = await read_rig()
+
+    assert_read_outcome(await rig.read(url), "refused", code)
+    assert rig.transport.connections == []
+    assert rig.resolver.calls == []
+
+
+async def test_ac10_a_rebinding_name_never_reaches_loopback_end_to_end() -> None:
+    resolver = FakeResolver()
+    resolver.script("example.org", [PUBLIC_A], ["127.0.0.1"])
+    rig = await read_rig(resolver=resolver)
+    rig.transport.script("example.org", html_page(b"<p>public</p>"))
+
+    read_success(await rig.read("https://example.org/"))
+    assert [connection.address for connection in rig.transport.connections] == [PUBLIC_A]
+
+
+async def test_ac11_redirects_end_to_end() -> None:
+    """AC11 end to end: a redirect to loopback is ``refused blocked_address``
+    after 1 connection; 4 redirects over ``max_redirects: 3`` are ``refused
+    too_many_redirects`` after 4; a chain of 3 succeeds with ``redirects: 3``
+    in the ``action.completed`` trace; a redirect to ``ftp://`` is ``refused
+    unsupported_scheme``."""
+
+    rig = await read_rig()
+    rig.transport.script("example.org", redirect("http://127.0.0.1/"))
+    assert_read_outcome(await rig.read("https://example.org/"), "refused", REFUSAL_BLOCKED_ADDRESS)
+    assert len(rig.transport.connections) == 1
+
+    resolver, transport, _responses = redirect_chain(4)
+    rig = await read_rig(transport=transport, resolver=resolver, max_redirects=3)
+    assert_read_outcome(
+        await rig.read("https://hop0.example/"), "refused", REFUSAL_TOO_MANY_REDIRECTS
+    )
+    assert len(transport.connections) == 4
+    assert rig.completed()[-1]["redirects"] == 3
+
+    resolver, transport, _responses = redirect_chain(3)
+    rig = await read_rig(transport=transport, resolver=resolver, max_redirects=3)
+    result = read_success(await rig.read("https://hop0.example/"))
+    assert result["final_url"] == "https://hop3.example/next"
+    assert len(transport.connections) == 4
+    (trace,) = rig.completed()
+    assert trace["redirects"] == 3
+
+    rig = await read_rig()
+    rig.transport.script("example.org", redirect("ftp://example.org/file"))
+    assert_read_outcome(
+        await rig.read("https://example.org/"), "refused", REFUSAL_UNSUPPORTED_SCHEME
+    )
+    assert len(rig.transport.connections) == 1
+
+
+async def test_ac12_allowed_hosts_end_to_end() -> None:
+    resolver = FakeResolver(
+        {"example.org": [PUBLIC_A], "example.com": [PUBLIC_B], "sub.example.org": [PUBLIC_B]}
+    )
+    rig = await read_rig(resolver=resolver, allowed_hosts=["example.org"])
+    rig.transport.script("example.org", html_page(b"<p>allowed</p>"))
+
+    assert read_success(await rig.read("https://EXAMPLE.org/a"))["text"] == "allowed"
+    assert len(rig.transport.connections) == 1
+    for url in ("https://sub.example.org/", "https://example.com/"):
+        assert_read_outcome(await rig.read(url), "refused", REFUSAL_HOST_NOT_ALLOWED)
+    assert len(rig.transport.connections) == 1
+
+    rig.transport.script("example.org", redirect("https://example.com/elsewhere"))
+    assert_read_outcome(
+        await rig.read("https://example.org/"), "refused", REFUSAL_HOST_NOT_ALLOWED
+    )
+    assert len(rig.transport.connections) == 2
+    assert {connection.host for connection in rig.transport.connections} == {"example.org"}
+
+
+async def test_ac13_no_proxy_from_the_environment_is_reached_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://proxy.example:3128")
+    rig = await read_rig()
+    rig.transport.script("example.org", html_page(b"<p>direct</p>"))
+
+    read_success(await rig.read("https://example.org/"))
+
+    assert [connection.host for connection in rig.transport.connections] == ["example.org"]
+    assert [connection.address for connection in rig.transport.connections] == [PUBLIC_A]
+    assert ("proxy.example", 3128) not in rig.resolver.calls
+
+
+async def test_ac13_a_3_mib_body_is_cut_at_the_byte_bound_end_to_end() -> None:
+    rig = await read_rig(max_response_bytes=MIB)
+    response = FakeResponse.body(
+        b"a" * (3 * MIB), chunk_size=65_536, headers={"Content-Type": "text/plain"}
+    )
+    rig.transport.script("example.org", response)
+
+    result = read_success(await rig.read("https://example.org/big"))
+
+    assert response.delivered <= MIB + 1
+    assert result["truncated"] is True
+    assert len(result["text"].encode()) == 8192
+
+
+async def test_ac13_a_whole_1_mib_html_body_with_1000_bytes_of_text_is_not_truncated() -> None:
+    """AC13 (a): a ``text/html`` body of exactly 1048576 bytes whose text is
+    1000 bytes — the rest an HTML comment — yields that text and
+    ``truncated: false`` with the default bounds."""
+
+    text = "t" * 1000
+    head = f"<p>{text}</p><!--".encode()
+    tail = b"-->"
+    data = head + b"c" * (MIB - len(head) - len(tail)) + tail
+    assert len(data) == MIB
+    rig = await read_rig()
+    response = html_page(data)
+    rig.transport.script("example.org", response)
+
+    result = read_success(await rig.read("https://example.org/"))
+
+    assert result["text"] == text
+    assert result["truncated"] is False
+    assert response.delivered == MIB
+
+
+async def test_ac13_a_20000_byte_text_plain_body_yields_exactly_8192_bytes() -> None:
+    """AC13 (b): 20 000 ASCII bytes of ``text/plain`` within the byte bound
+    yield exactly 8192 bytes of text and ``truncated: true``."""
+
+    rig = await read_rig()
+    rig.transport.script("example.org", html_page(b"p" * 20_000, content_type="text/plain"))
+
+    result = read_success(await rig.read("https://example.org/plain.txt"))
+
+    assert result["text"] == "p" * 8192
+    assert result["truncated"] is True
+
+
+async def test_ac13_a_stalled_body_is_timeout_timed_out_before_the_deadline() -> None:
+    """AC13/AC18: headers and never a body end the call — as the executor
+    reports it — ``timeout`` with the provider's own ``timed_out`` code at
+    ``request_timeout_seconds`` on the injected clock, before the action's
+    15 s deadline. The slot is released and the response closed."""
+
+    rig = await read_rig()
+    stalled = FakeResponse.body(
+        b"<p>never</p>", stalled=asyncio.Event(), headers={"Content-Type": "text/html"}
+    )
+    rig.transport.script("example.org", stalled)
+    start = rig.clock.now
+
+    call = asyncio.ensure_future(rig.read("https://example.org/"))
+    await spin()
+    assert stalled.requested and not call.done()
+    rig.clock.advance(9.5)
+    await spin()
+    assert not call.done()
+    rig.clock.advance(0.5)
+    await spin()
+
+    assert call.done()
+    observation = call.result()
+    assert_read_outcome(observation, "timeout", ERROR_TIMED_OUT)
+    assert rig.clock.now - start == 10 < ACTION_DEADLINE_SECONDS
+    assert stalled.closed >= 1
+    assert rig.handle._in_flight == 0
+    (trace,) = rig.completed()
+    assert trace["status"] == "timeout"
+    assert trace["error_code"] == ERROR_TIMED_OUT
+    assert trace["outcome"] == ERROR_TIMED_OUT
+
+
+async def test_ac17_a_call_beyond_the_concurrency_bound_is_resource_busy() -> None:
+    """AC17: with ``max_concurrent_requests: 2`` and 2 requests held open, a
+    3rd call is ``refused resource_busy`` with 0 additional resolutions or
+    connections, and succeeds once one of the 2 completes."""
+
+    rig = await read_rig(max_concurrent_requests=2)
+    first, second = asyncio.Event(), asyncio.Event()
+    rig.transport.script(
+        "example.org",
+        FakeResponse.body(b"<p>one</p>", held=first),
+        FakeResponse.body(b"<p>two</p>", held=second),
+        html_page(b"<p>three</p>"),
+    )
+    held = [
+        asyncio.ensure_future(rig.read("https://example.org/1")),
+        asyncio.ensure_future(rig.read("https://example.org/2")),
+    ]
+    await spin()
+    assert len(rig.transport.connections) == 2
+    assert rig.handle._in_flight == 2
+
+    busy = await rig.read("https://example.org/3")
+
+    assert_read_outcome(busy, "refused", REFUSAL_RESOURCE_BUSY)
+    assert len(rig.transport.connections) == 2
+    assert len(rig.resolver.calls) == 2
+
+    first.set()
+    assert read_success(await held[0])["text"] == "one"
+    assert rig.handle._in_flight == 1
+    assert read_success(await rig.read("https://example.org/3"))["text"] == "three"
+    assert len(rig.transport.connections) == 3
+
+    second.set()
+    assert read_success(await held[1])["text"] == "two"
+    assert rig.handle._in_flight == 0
+
+
+async def test_r5_a_failed_call_releases_its_slot() -> None:
+    """The slot is released on every exit: after a reset connection and a
+    refused type, ``max_concurrent_requests: 1`` still admits a read."""
+
+    rig = await read_rig(max_concurrent_requests=1)
+    rig.transport.script(
+        "example.org",
+        FakeResponse(raises=ConnectionResetError("reset")),
+        FakeResponse.body(b"x", headers={"Content-Type": "application/pdf"}),
+        html_page(b"<p>ok</p>"),
+    )
+
+    assert (await rig.read("https://example.org/")).status == "error"
+    assert (await rig.read("https://example.org/")).status == "refused"
+    read_success(await rig.read("https://example.org/"))
+    assert rig.handle._in_flight == 0
+
+
+@pytest.mark.parametrize(
+    ("http_status", "status", "code"),
+    [
+        (404, "refused", REFUSAL_NOT_FOUND),
+        (410, "refused", REFUSAL_NOT_FOUND),
+        (500, "error", ERROR_UPSTREAM_STATUS),
+        (503, "error", ERROR_UPSTREAM_STATUS),
+        (401, "refused", REFUSAL_PROVIDER_REFUSED),
+        (403, "refused", REFUSAL_PROVIDER_REFUSED),
+        (429, "refused", REFUSAL_RATE_LIMITED),
+        (204, "success", None),
+        (302, "error", ERROR_UPSTREAM_STATUS),  # a redirect with no Location
+        (418, "error", ERROR_UPSTREAM_STATUS),
+    ],
+)
+async def test_ac18_each_http_status_row_of_a_read(
+    http_status: int, status: str, code: str | None
+) -> None:
+    """AC18 read rows: 404 and 410 are ``refused not_found``, 500 and 503
+    ``error upstream_status`` — and the shared rows: 401/403
+    ``provider_refused``, 429 ``rate_limited``. A non-2xx body is never read."""
+
+    rig = await read_rig()
+    response = FakeResponse.body(
+        b"<p>SECRETBODY</p>", status=http_status, headers={"Content-Type": "text/html"}
+    )
+    rig.transport.script("example.org", response)
+
+    observation = await rig.read("https://example.org/page")
+
+    if code is None:
+        assert read_success(observation)["text"] == "SECRETBODY"
+        return
+    assert_read_outcome(observation, status, code)
+    assert response.reads == 0
+    assert len(rig.transport.connections) == 1
+    (trace,) = rig.completed()
+    assert (trace["status"], trace["error_code"], trace["outcome"]) == (status, code, code)
+
+
+async def test_ac18_a_connection_reset_is_error_transport_failed_value_free() -> None:
+    rig = await read_rig()
+    rig.transport.script(
+        "example.org", FakeResponse(raises=ConnectionResetError("reset SECRETPATH"))
+    )
+
+    observation = await rig.read("https://example.org/SECRETPATH")
+
+    assert_read_outcome(observation, "error", REFUSAL_TRANSPORT_FAILED)
+    assert "SECRETPATH" not in repr(observation.error)
+
+
+async def test_r6_a_body_the_extractor_cannot_parse_is_error_malformed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import modules.web as web
+
+    def broken(_body: bytes, _header: str | None) -> Extracted:
+        raise ValueError("SECRETBODY")
+
+    monkeypatch.setattr(web, "extract_text", broken)
+    rig = await read_rig()
+    rig.transport.script("example.org", html_page(b"<p>x</p>"))
+
+    observation = await rig.read("https://example.org/")
+
+    assert_read_outcome(observation, "error", ERROR_MALFORMED_RESPONSE)
+    assert "SECRETBODY" not in repr(observation.error)
+
+
+@pytest.mark.parametrize(
+    ("action", "outcome", "expected"),
+    [
+        (WEB_READ_ACTION, 200, ("success", None)),
+        (WEB_READ_ACTION, 404, ("refused", REFUSAL_NOT_FOUND)),
+        (WEB_SEARCH_ACTION, 404, ("error", ERROR_UPSTREAM_STATUS)),
+        (WEB_SEARCH_ACTION, 410, ("error", ERROR_UPSTREAM_STATUS)),
+        (WEB_SEARCH_ACTION, 401, ("refused", REFUSAL_PROVIDER_REFUSED)),
+        (WEB_SEARCH_ACTION, 429, ("refused", REFUSAL_RATE_LIMITED)),
+        (WEB_SEARCH_ACTION, 502, ("error", ERROR_UPSTREAM_STATUS)),
+        (WEB_READ_ACTION, FetchFailure(FETCH_REFUSED, REFUSAL_BLOCKED_ADDRESS),
+         ("refused", REFUSAL_BLOCKED_ADDRESS)),
+        (WEB_READ_ACTION, FetchFailure(FETCH_TIMEOUT, ERROR_TIMED_OUT),
+         ("timeout", ERROR_TIMED_OUT)),
+        (WEB_READ_ACTION, FetchFailure(FETCH_ERROR, REFUSAL_TRANSPORT_FAILED),
+         ("error", REFUSAL_TRANSPORT_FAILED)),
+        (WEB_SEARCH_ACTION, ERROR_MALFORMED_RESPONSE, ("error", ERROR_MALFORMED_RESPONSE)),
+        (WEB_SEARCH_ACTION, REFUSAL_RESOURCE_BUSY, ("refused", REFUSAL_RESOURCE_BUSY)),
+        (WEB_READ_ACTION, REFUSAL_UNSUPPORTED_CONTENT_TYPE,
+         ("refused", REFUSAL_UNSUPPORTED_CONTENT_TYPE)),
+        (WEB_READ_ACTION, REFUSAL_TOO_MANY_REDIRECTS, ("refused", REFUSAL_TOO_MANY_REDIRECTS)),
+        (WEB_READ_ACTION, "not-a-code", ("error", ERROR_MALFORMED_RESPONSE)),
+    ],
+)  # fmt: skip
+def test_r6_one_classifier_answers_both_actions(
+    action: str, outcome: Any, expected: tuple[str, str | None]
+) -> None:
+    """R6: the one table both actions use — 404/410 is ``not_found`` on a
+    read only; a code outside the vocabulary is never a success."""
+
+    assert _classify(action, outcome) == expected
+
+
+async def test_r7_the_read_trace_carries_counts_and_lengths_only() -> None:
+    """R7 trace shape: the ``action.completed`` trace of a read names the
+    ``http`` provider and adds only ``url_bytes``, ``text_bytes``,
+    ``redirects``, ``cache_hit`` and ``outcome`` to the executor's own
+    fields — no path, query string or page text."""
+
+    url = "https://example.org/p/SECRETPATH?token=SECRETQS#frag"
+    rig = await read_rig()
+    rig.transport.script(
+        "example.org", redirect("/q/SECRETPATH2?token=SECRETQS"), html_page(b"<p>PAGETEXT</p>")
+    )
+    observation = await rig.read(url)
+    result = read_success(observation)
+    rig.transport.script("example.org", FakeResponse(status=404))
+    await rig.read(url)
+
+    success, refused = rig.completed()
+    for trace in (success, refused):
+        assert trace["provider"] == PROVIDER_HTTP
+        assert trace["url_bytes"] == len(url.encode())
+        assert trace["cache_hit"] is False
+        assert trace["redirects"] in (0, 1)
+        rendered = repr(trace)
+        for secret in ("SECRETPATH", "SECRETQS", "token=", "PAGETEXT", "frag"):
+            assert secret not in rendered
+    assert (success["outcome"], success["text_bytes"], success["redirects"]) == (
+        OUTCOME_OK,
+        len(result["text"].encode()),
+        1,
+    )
+    assert (refused["outcome"], refused["text_bytes"]) == (REFUSAL_NOT_FOUND, 0)
+    assert observation.provenance["provider"] == PROVIDER_HTTP
+    assert set(observation.provenance["trace_fields"]) == {
+        "url_bytes", "text_bytes", "redirects", "cache_hit", "outcome"
+    }

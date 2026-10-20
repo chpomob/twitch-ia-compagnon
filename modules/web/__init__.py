@@ -39,11 +39,26 @@ what the subset cannot say: at most 64 ``allowed_hosts``, each a host name;
 the ``wikipedia_language`` shape; and a non-empty ``brave_api_key`` under
 ``provider: brave``.
 
-**Readiness.** ``prepare`` marks the module ready and opens nothing: no
-resolution and no connection happen before a call (R1, AC4). Until the
-providers are bound, the executor refuses both actions
+**Readiness.** ``prepare`` binds the ``web.read`` provider, its spec built
+from the colocated manifest, and marks the module ready, opening nothing: no
+resolution and no connection happen before a call (R1, AC4). Until its
+provider is bound, the executor refuses ``web.search``
 ``provider_not_ready`` — the kernel's own answer. ``close`` withdraws
 readiness and closes a transport a call opened.
+
+**``web.read`` (R3, R6).** One call is admitted against the in-flight bound
+(``resource_busy`` when ``max_concurrent_requests`` are already running,
+before any resolution or connection), fetched through the guard with the
+allowlist applied, and its content type judged on the final answer's headers
+alone: anything but ``text/html``, ``application/xhtml+xml`` or
+``text/plain`` is ``refused unsupported_content_type`` with the response
+closed before one ``read``. The bounded body is extracted, cut to
+``max_text_bytes`` and returned with the marker, the final URL, the title
+when there is one and ``truncated`` — whether the body or the text was cut.
+:func:`_classify` is the one R6 table both actions answer from, and each
+code has one fixed message. The provenance names the provider ``http`` and
+adds to the ``action.completed`` trace only counts, lengths, the cache-hit
+flag and the outcome code (R7).
 
 **The network guard (R4).** Every request goes through the same guard,
 at every hop. :func:`parse_target` accepts only ``http``/``https`` URLs that
@@ -125,7 +140,7 @@ from typing import Any
 
 import yaml
 
-from core.contracts import mask_known
+from core.contracts import ActionObservation, ActionSpec, Destination, mask_known
 
 
 MODULE_NAME = "web"
@@ -1208,6 +1223,149 @@ class _Settings:
 
 
 # --------------------------------------------------------------------------- #
+# Outcome classification (R6)
+# --------------------------------------------------------------------------- #
+
+#: The provider name ``web.read`` binds under, and the one its traces carry.
+READ_BINDING_PROVIDER = MODULE_NAME
+#: The provider a read's observation names: the public web over HTTP(S).
+PROVIDER_HTTP = "http"
+
+REFUSAL_UNSUPPORTED_CONTENT_TYPE = "unsupported_content_type"
+REFUSAL_RESOURCE_BUSY = "resource_busy"
+REFUSAL_PROVIDER_REFUSED = "provider_refused"
+REFUSAL_RATE_LIMITED = "rate_limited"
+REFUSAL_NOT_FOUND = "not_found"
+ERROR_UPSTREAM_STATUS = "upstream_status"
+ERROR_MALFORMED_RESPONSE = "malformed_response"
+
+#: The trace's ``outcome`` for a success; every other outcome is its code.
+OUTCOME_OK = "ok"
+
+#: The media types ``web.read`` reads; any other is refused unread (R3).
+READABLE_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml", _PLAIN_TEXT})
+
+#: Every code of the module's fixed vocabulary, by the status it ends in.
+_STATUS_OF_CODE: Mapping[str, str] = {
+    **dict.fromkeys(
+        (
+            REFUSAL_BLOCKED_ADDRESS,
+            REFUSAL_HOST_NOT_ALLOWED,
+            REFUSAL_UNSUPPORTED_SCHEME,
+            REFUSAL_UNSUPPORTED_URL,
+            REFUSAL_TOO_MANY_REDIRECTS,
+            REFUSAL_UNSUPPORTED_CONTENT_TYPE,
+            REFUSAL_RESOURCE_BUSY,
+            REFUSAL_PROVIDER_REFUSED,
+            REFUSAL_RATE_LIMITED,
+            REFUSAL_NOT_FOUND,
+        ),
+        FETCH_REFUSED,
+    ),
+    **dict.fromkeys(
+        (REFUSAL_TRANSPORT_FAILED, ERROR_UPSTREAM_STATUS, ERROR_MALFORMED_RESPONSE),
+        FETCH_ERROR,
+    ),
+    ERROR_TIMED_OUT: FETCH_TIMEOUT,
+}
+
+
+def _classify(action: str, outcome: FetchFailure | int | str) -> tuple[str, str | None]:
+    """The executor status and module code of *outcome*, the R6 table.
+
+    *outcome* is a :class:`FetchFailure`, the HTTP status of a final answer,
+    or a module code. A 2xx status is ``("success", None)``; 401 and 403
+    are ``refused provider_refused``, 429 ``refused rate_limited``, 404 and
+    410 on a ``web.read`` ``refused not_found``, and every other status
+    ``error upstream_status``. A failure or a code keeps the status its code
+    ends in — guard refusals and ``resource_busy`` ``refused``, transport
+    and malformed answers ``error``, the deadline ``timeout``. A code
+    outside the vocabulary is ``error malformed_response``: nothing is ever
+    reported as a success it was not.
+    """
+
+    if isinstance(outcome, FetchFailure):
+        code = outcome.code
+    elif isinstance(outcome, int) and not isinstance(outcome, bool):
+        if 200 <= outcome < 300:
+            return "success", None
+        if outcome in (401, 403):
+            code = REFUSAL_PROVIDER_REFUSED
+        elif outcome == 429:
+            code = REFUSAL_RATE_LIMITED
+        elif outcome in (404, 410) and action == WEB_READ_ACTION:
+            code = REFUSAL_NOT_FOUND
+        else:
+            code = ERROR_UPSTREAM_STATUS
+    else:
+        code = outcome
+    if code not in _STATUS_OF_CODE:
+        code = ERROR_MALFORMED_RESPONSE
+    return _STATUS_OF_CODE[code], code
+
+
+def _failure_message(action: str, status: str, code: str) -> str:
+    """The one fixed message of *code*: vocabulary only, never a value (R7)."""
+
+    return f"{action} {status}: {code}"
+
+
+def _declared_spec(action_name: str) -> ActionSpec:
+    """Build *action_name*'s contract from the colocated manifest (R1).
+
+    The spec registered at ``prepare`` must equal the one the loader declared
+    at discovery, field for field: reading the same file keeps the two from
+    drifting, and the registry refuses a redeclaration that differs.
+    """
+
+    try:
+        manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in manifest["actions"]
+            if isinstance(item, Mapping) and item.get("name") == action_name
+        )
+        return ActionSpec(
+            name=entry["name"],
+            version=entry["version"],
+            description=entry["description"],
+            argument_schema=entry["argument_schema"],
+            result_schema=entry["result_schema"],
+            nature=entry["nature"],
+            required_permissions=tuple(entry.get("required_permissions", ())),
+            supported_destinations=tuple(
+                Destination(
+                    platform=item.get("platform"),
+                    channel_id=item.get("channel_id"),
+                    scope=item.get("scope"),
+                )
+                for item in entry["supported_destinations"]
+            ),
+            timeout_seconds=entry["timeout_seconds"],
+            idempotency=entry["idempotency"],
+            delivery=entry.get("delivery"),
+        )
+    except Exception:
+        raise WebModuleError(
+            f"{MODULE_NAME} prepare: manifest declaration of {action_name!r} is invalid"
+        ) from None
+
+
+class _ReadProvider:
+    """The ``web.read`` provider the executor invokes (R3)."""
+
+    __slots__ = ("_module",)
+
+    name = READ_BINDING_PROVIDER
+
+    def __init__(self, module: "WebModule") -> None:
+        self._module = module
+
+    async def invoke(self, invocation: Any) -> ActionObservation:
+        return await self._module._invoke_read(invocation)
+
+
+# --------------------------------------------------------------------------- #
 # The handle
 # --------------------------------------------------------------------------- #
 
@@ -1242,6 +1400,9 @@ class WebModule:
         self._sleeper = sleeper
         #: The transport a call opened, which ``close`` must close.
         self._opened_transport: Any = None
+        #: Calls of either action running now, against ``max_concurrent_requests``.
+        self._in_flight = 0
+        self._read_provider = _ReadProvider(self)
         self._prepared = False
         self._closed = False
 
@@ -1252,14 +1413,22 @@ class WebModule:
     # -- lifecycle hooks ---------------------------------------------------- #
 
     async def prepare(self) -> None:
-        """Mark the module ready, opening nothing (R1, AC4).
+        """Bind the ``web.read`` provider and mark ready, opening nothing (R1, AC4).
 
-        No provider is bound yet, so the executor answers both actions
-        ``provider_not_ready``; no name is resolved and no connection made.
+        The spec comes from the colocated manifest. ``web.search`` has no
+        provider yet, so the executor answers it ``provider_not_ready``; no
+        name is resolved and no connection made.
         """
 
         if self._prepared or self._closed:
             return
+        spec = _declared_spec(WEB_READ_ACTION)
+        try:
+            self._actions.register(
+                spec, self._read_provider, provider_name=READ_BINDING_PROVIDER
+            )
+        except Exception:
+            raise WebModuleError(f"{MODULE_NAME} prepare: action binding failed") from None
         self._actions.mark_ready()
         self._prepared = True
 
@@ -1280,6 +1449,67 @@ class WebModule:
                     await outcome
             except Exception:  # noqa: BLE001 - closing must not mask shutdown
                 return
+
+    # -- web.read (R3, R5 concurrency, R6, R7, R8) -------------------------- #
+
+    async def _invoke_read(self, invocation: Any) -> ActionObservation:
+        """Serve one ``web.read`` call for the executor.
+
+        A read is a request for public data and changes nothing outside, so
+        nothing is emitted and an interruption stays a certain ``timeout``.
+        The slot taken against ``max_concurrent_requests`` is released on
+        every exit, a cancellation included.
+        """
+
+        invocation.mark_not_emitted()
+        url = invocation.call.arguments.get("url")
+        trace: dict[str, Any] = {
+            "url_bytes": len(url.encode("utf-8", errors="replace")) if isinstance(url, str) else 0,
+            "text_bytes": 0,
+            "redirects": 0,
+            "cache_hit": False,
+            "outcome": OUTCOME_OK,
+        }
+        if self._in_flight >= self._settings.max_concurrent_requests:
+            return _read_failure(trace, REFUSAL_RESOURCE_BUSY)
+        self._in_flight += 1
+        try:
+            return await self._read(url, trace)
+        finally:
+            self._in_flight -= 1
+
+    async def _read(self, url: Any, trace: dict[str, Any]) -> ActionObservation:
+        """Fetch, judge the content type unread, extract, bound (R3)."""
+
+        settings = self._settings
+        fetched = await self.fetch(url, apply_allowlist=True, accept_body=_readable_answer)
+        trace["redirects"] = fetched.redirects
+        if isinstance(fetched, FetchFailure):
+            return _read_failure(trace, fetched)
+        if _classify(WEB_READ_ACTION, fetched.status)[0] != "success":
+            return _read_failure(trace, fetched.status)
+        if fetched.body is None:
+            return _read_failure(trace, REFUSAL_UNSUPPORTED_CONTENT_TYPE)
+        try:
+            extracted = extract_text(fetched.body, _header(fetched.headers, "Content-Type"))
+        except Exception:  # noqa: BLE001 - the parser's text would quote the page
+            return _read_failure(trace, ERROR_MALFORMED_RESPONSE)
+        text, text_cut = cut_utf8(extracted.text, settings.max_text_bytes)
+        trace["text_bytes"] = len(text.encode("utf-8"))
+        result: dict[str, Any] = {
+            "advisory": advisory_marker(),
+            "final_url": fetched.final_url,
+            "text": text,
+            "truncated": fetched.truncated or text_cut,
+        }
+        if extracted.title is not None:
+            result["title"] = extracted.title
+        return ActionObservation(
+            status="success",
+            provenance=_read_provenance(trace),
+            result=result,
+            parts=(),
+        )
 
     # -- the guarded fetch (R4, R6) ----------------------------------------- #
 
@@ -1413,6 +1643,45 @@ class WebModule:
                     await _close_response(response)
 
 
+def _readable_answer(response: Any) -> bool:
+    """Whether a final answer's body is read: a 2xx of a readable media type.
+
+    Judged on the status and the headers alone, before any body byte: a
+    refused type or a status that is not a page is closed unread (R3, AC8).
+    """
+
+    status = getattr(response, "status", None)
+    if not isinstance(status, int) or not 200 <= status < 300:
+        return False
+    header = _header(getattr(response, "headers", None), "Content-Type")
+    media_type, _charset = _content_type(header)
+    return media_type in READABLE_CONTENT_TYPES
+
+
+def _read_provenance(trace: Mapping[str, Any]) -> dict[str, Any]:
+    """A read's provenance: the ``http`` provider and its count-only trace fields."""
+
+    return {"provider": PROVIDER_HTTP, "trace_fields": dict(trace)}
+
+
+def _read_failure(trace: dict[str, Any], outcome: FetchFailure | int | str) -> ActionObservation:
+    """The terminal observation of a read that did not succeed (R6, R7)."""
+
+    status, code = _classify(WEB_READ_ACTION, outcome)
+    if code is None:  # a success status is never a failure
+        status, code = FETCH_ERROR, ERROR_MALFORMED_RESPONSE
+    trace["outcome"] = code
+    return ActionObservation(
+        status=status,
+        provenance=_read_provenance(trace),
+        error={
+            "code": code,
+            "message": _failure_message(WEB_READ_ACTION, status, code),
+            "retryable": False,
+        },
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Activation
 # --------------------------------------------------------------------------- #
@@ -1477,7 +1746,18 @@ __all__ = [
     "Address",
     "AiohttpTransport",
     "CREDENTIAL_HEADERS",
+    "ERROR_MALFORMED_RESPONSE",
     "ERROR_TIMED_OUT",
+    "ERROR_UPSTREAM_STATUS",
+    "OUTCOME_OK",
+    "PROVIDER_HTTP",
+    "READABLE_CONTENT_TYPES",
+    "READ_BINDING_PROVIDER",
+    "REFUSAL_NOT_FOUND",
+    "REFUSAL_PROVIDER_REFUSED",
+    "REFUSAL_RATE_LIMITED",
+    "REFUSAL_RESOURCE_BUSY",
+    "REFUSAL_UNSUPPORTED_CONTENT_TYPE",
     "FETCH_ERROR",
     "FETCH_REFUSED",
     "FETCH_TIMEOUT",
