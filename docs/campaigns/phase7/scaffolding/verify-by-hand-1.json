@@ -1,0 +1,43 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "R7: \"Fixed values the product would record for any input — field names, provider names, error codes, status names, the marker — are not input-derived, and their coincidental equality with an input (a query of `wikipedia`, say) is not a violation.\" AC19 explicitly tests that case."
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "R4: \"the module retains at most `max_response_bytes` body bytes and consumes at most `max_response_bytes` + 1 body bytes from the response stream\". AC13 aligns both measurements: \"≤ 1048577 body bytes delivered by the fake stream to the module, ≤ 1048576 body bytes retained\"."
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "R5 defines accounting: \"an entry's stored size is the UTF-8 byte length of its key plus the UTF-8 byte length of the cached observation serialised as compact JSON (no insignificant whitespace, keys sorted) — every title, URL, excerpt, text and metadata field of the observation counts — and the cache's stored content is the sum over its entries.\" AC16 explicitly measures stored content per R5."
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "N1",
+      "severity": "major",
+      "section": "Acceptance criteria — AC3",
+      "summary": "AC3 requires a diagnostic to contain a configured value while simultaneously forbidding it.",
+      "evidence": "AC3: \"with `provider: brave` and no key, `--check-config` exits non-zero naming `brave_api_key`, and the diagnostic contains 0 characters of any configured value.\" The mandatory field name `brave_api_key` contains the complete configured provider value `brave`, making these assertions mutually exclusive."
+    },
+    {
+      "id": "N2",
+      "severity": "major",
+      "section": "Requirements R10; acceptance criterion AC25; frontmatter targets",
+      "summary": "The specification introduces real-network test nodes that the operator's brief explicitly excludes.",
+      "evidence": "The brief's Out of scope section states: \"Real-network trials in the test suite: every test uses a fake transport\" and requires an operator trial \"recorded separately\". R10 instead says \"real-network trials are opt-in nodes\", the target `tests/test_phase7_trials.py` specifies \"opt-in real-network trial nodes\", and AC25 requires their collection; skipping them by default does not satisfy the brief's exclusion."
+    }
+  ],
+  "sound_enough_to_plan_from": false,
+  "summary": "All three challenge findings are resolved. AC3 contains an impossible diagnostic assertion, and the real-network test nodes conflict with the brief's explicit scope. These defects prevent approval for planning.",
+  "read_files": [
+    "docs/campaigns/phase7/spec.md",
+    "docs/campaigns/phase7/brief.md",
+    "docs/design-v2.md"
+  ]
+}

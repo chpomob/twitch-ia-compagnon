@@ -1,0 +1,53 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "R7: \"Fixed values the product would record for any input — field names, provider names, error codes, status names, the marker — are not input-derived, and their coincidental equality with an input (a query of `wikipedia`, say) is not a violation.\" AC19 explicitly verifies that coincidence."
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "R4: \"the module retains at most `max_response_bytes` body bytes and consumes at most `max_response_bytes` + 1 body bytes from the response stream\". AC13 measures both limits, including bytes delivered by the fake stream."
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "R5: \"an entry's stored size is the UTF-8 byte length of its key plus the UTF-8 byte length of the cached observation serialised as compact JSON (no insignificant whitespace, keys sorted)\". AC16 measures the sum using that definition."
+    },
+    {
+      "id": "N1",
+      "status": "RESOLVED",
+      "evidence": "AC3: \"its diagnostic names the setting `brave_api_key` (a setting name and a reference are not configured values, R7).\" R7 expressly distinguishes reference names from resolved credential values, and AC3 checks resolved-key leakage with an inserted-key negative control."
+    },
+    {
+      "id": "N2",
+      "status": "RESOLVED",
+      "evidence": "R10: \"the phase adds no real-network test node, opt-in or otherwise.\" AC25 requires \"0 test files and 0 test nodes that use a real transport\"; the targets now describe the real-instance trial as a manual operator procedure."
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "N3",
+      "severity": "major",
+      "section": "Assumptions; R7; AC19; docs/design-v2.md §§2.1, 5.2",
+      "summary": "The product-wide query prohibition includes existing input bus history, making a viewer message subsequently used as a search query violate the recording contract.",
+      "evidence": "The assumptions include \"bus history and retention\" in what the product records, while R7 requires \"No query, URL query string or page text in anything the product records\" and AC19 scans \"bus history entry\" for query sentinels. The design defines `channel.chat.message` with `payload.text` and retains \"bus history circular, limited in events/bytes/TTL\". An ingested message containing `SECRETQ` remains in that history when the brain searches those words; only the brain's in-memory conversation is expressly exempted. The module-only targets provide no reconciliation of those contracts, and AC19 does not require this ingestion-to-search scenario."
+    },
+    {
+      "id": "N4",
+      "severity": "minor",
+      "section": "R3; AC13",
+      "summary": "AC13 makes the combined truncation flag depend solely on response-body size even though extracted-text truncation can independently require it to be true.",
+      "evidence": "R3 defines `truncated` as \"true iff text or bytes were cut by a bound\", but AC13 says \"a fake body of exactly 1048576 bytes yields `truncated: false`\". With the default `max_text_bytes: 8192`, an allowed text/plain body of that size must instead yield true. AC13 specifies neither extracted content nor a separate body-truncation indicator, so its expected flag cannot be decided from the stated fixture size."
+    }
+  ],
+  "sound_enough_to_plan_from": false,
+  "summary": "All five previous findings are resolved. The six binding decisions remain stated, but query redaction conflicts with existing input retention and AC13 leaves truncation ambiguous. These issues prevent approval for planning.",
+  "read_files": [
+    "docs/campaigns/phase7/spec.md",
+    "docs/campaigns/phase7/brief.md",
+    "docs/design-v2.md"
+  ]
+}

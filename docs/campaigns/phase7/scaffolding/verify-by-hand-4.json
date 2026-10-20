@@ -1,0 +1,53 @@
+{
+  "verdict": "APPROVE",
+  "findings": [
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "R7: \"Fixed values the product would record for any input — field names, provider names, error codes, status names, the marker — are not input-derived, and their coincidental equality with an input (a query of `wikipedia`, say) is not a violation.\" AC19 explicitly tests that distinction."
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "AC13 requires \"≤ 1048577 body bytes delivered by the fake stream to the module, ≤ 1048576 body bytes retained\"; this measures both consumption and retention against R4's explicit one-byte lookahead allowance."
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "R5 defines stored size as \"the UTF-8 byte length of its key plus the UTF-8 byte length of the cached observation serialised as compact JSON (no insignificant whitespace, keys sorted)\"; AC16 measures the sum using that definition."
+    },
+    {
+      "id": "N1",
+      "status": "RESOLVED",
+      "evidence": "AC3: \"its diagnostic names the setting `brave_api_key` (a setting name and a reference are not configured values, R7).\" It separately checks resolved-key leakage for referenced and literal credentials and includes an inserted-key negative control."
+    },
+    {
+      "id": "N2",
+      "status": "RESOLVED",
+      "evidence": "R10: \"the phase adds no real-network test node, opt-in or otherwise.\" The manual trial is documented separately, and the targets introduce no real-network pytest file."
+    },
+    {
+      "id": "N3",
+      "status": "RESOLVED",
+      "evidence": "R7: \"A viewer's chat message that becomes a query is recorded by the input module that ingested it, as that input's own record under its own contract, and is not this module's record; R7 requires only that this module add no copy of it.\" AC19 excludes that upstream event by emitter."
+    },
+    {
+      "id": "N4",
+      "status": "RESOLVED",
+      "evidence": "AC13 distinguishes an exactly 1048576-byte HTML body yielding \"that 1000-byte text and `truncated: false`\" from a 20000-byte plain-text body yielding \"exactly 8192 bytes of text and `truncated: true`\", consistently with R3."
+    },
+    {
+      "id": "N5",
+      "status": "RESOLVED",
+      "evidence": "R7: \"The one exception is the `result` of a successful observation\" and \"that content is asserted by the R2/R3/R8 criteria, not by this requirement.\" AC19 enumerates recording surfaces and observation `error.message`, excluding successful `result` by this governing exception; its statement that no module output is excluded applies within that scan."
+    }
+  ],
+  "new_findings": [],
+  "sound_enough_to_plan_from": true,
+  "summary": "R5 expressly permits the raw in-memory cache key, and R7 restricts keys and entries wherever they leave that cache, without a contradictory product-wide prohibition; digesting the key remains optional hardening for the operator to decide. AC19 is decidable under R7's successful-result exception, so explicitly repeating the exclusion would be optional clarification. All six binding decisions remain honoured, identifiers are continuous, the declared existing-test adaptations have targets, and the whole-document review found no additional actionable defect.",
+  "read_files": [
+    "docs/campaigns/phase7/spec.md",
+    "docs/campaigns/phase7/brief.md",
+    "docs/design-v2.md"
+  ]
+}
