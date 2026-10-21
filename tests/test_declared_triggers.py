@@ -37,6 +37,15 @@ each load through the loader against the shipped manifests; it says that a
 configured policy replaces the default and that continuous listening is out
 of scope; the README names each family as proven against fakes only.
 
+P16 holds the evidence half of AC32 and AC33 on the whole suite (R9): the
+trial record exists with status ``not run`` and the fields the procedure
+fills; the phase summary cites R1–R9 each with a commit and a test id that
+exists, and lists every converted node of the D8 probe with the fidelity its
+conversion lost; every collected item runs under ``_ac33_isolation``, which is
+autouse and has no ledger, and none would run unpatched in this run; an
+``ast`` scan of ``tests/`` finds no call to a spawn or socket API outside the
+guard, its fakes and the refusal self-tests.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -58,6 +67,7 @@ then shows what the profile does with them.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import gc
 import json
@@ -107,6 +117,7 @@ from core.contracts import (
     validate_against_schema,
     validate_event_kind,
 )
+import conftest
 from conftest import (
     FakeCaptureSource,
     FakeResponse,
@@ -116,6 +127,7 @@ from conftest import (
     events_of,
     final,
     settle,
+    trial_opted_in,
 )
 from core.triggers import (
     BUILTIN_TRIGGER_TYPE_NAMES,
@@ -130,6 +142,7 @@ from core.triggers import (
     decision_trace_payload,
 )
 from modules.twitch import EVENTSUB_SUBSCRIPTIONS_URL
+from test_ac33_isolation import AC33_PROBE
 from test_examples import ROOT, DeviceEdges, _activate_example, _sample_environ
 from test_presence_pack import PresenceTwitchSession, presence_environ
 from test_integration import FakeWebSocket, welcome
@@ -3280,3 +3293,237 @@ def test_p15_the_readme_lists_each_family_as_proven_against_fakes_only() -> None
     for family in ("Channel points", "Operator button", "Listening", "Timer"):
         (bullet,) = [bullet for bullet in bullets if bullet.startswith(f"- **{family}")]
         assert "proven against fakes only" in " ".join(bullet.split()), family
+
+
+# --------------------------------------------------------------------------- #
+# P16: the phase summary, the trial record and the whole suite under the guard
+# --------------------------------------------------------------------------- #
+
+SUMMARY = ROOT / "docs" / "campaigns" / "phase8" / "summary.md"
+TRIAL_RECORD = ROOT / "docs" / "campaigns" / "phase8" / "trial-record.md"
+TRIAL_FAMILIES = ("Channel points", "Button", "Voice", "Timer")
+FIDELITY_LOST = frozenset({"fake-OS only", "in-process topology", "no real install"})
+_COMMIT = re.compile(r"`[0-9a-f]{7,40}`")
+_TEST_ID = re.compile(r"`(tests/[\w/]+\.py)::(test_\w+)`")
+_CONVERSION_ROW = re.compile(
+    r"^\| `(tests/[\w/]+\.py::test_\w+)` \| (P15[a-e]) \| `([0-9a-f]{7,40})` \| ([^|]+) \|$",
+    re.MULTILINE,
+)
+
+
+def _defines_test(path: Path, name: str) -> bool:
+    """Whether *path* is a test file whose top level defines test *name*:
+    the shape pytest collects, read without importing the file."""
+
+    if not (path.is_file() and path.name.startswith("test_")):
+        return False
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        for node in ast.parse(path.read_text(encoding="utf-8")).body
+    )
+
+
+def test_p16_ac32_the_summary_cites_r1_to_r9_and_the_trial_is_not_run() -> None:
+    """AC32 (R9), evidence half: the trial record exists with status ``not
+    run`` and the fields the procedure fills, per family; the summary lists
+    R1–R9, each with a commit hash and a ``tests/...::...`` id, and every id
+    it cites names a test that exists. A commit cannot be looked up without
+    ``git`` (a process), so its shape is checked."""
+
+    record = TRIAL_RECORD.read_text(encoding="utf-8")
+    assert re.search(r"^Status: not run$", record, re.MULTILINE)
+    for field in ("- Date:", "- Version (commit):", "- Platform (OS, Python version):"):
+        assert record.count(field) == 1, field
+    for family in TRIAL_FAMILIES:
+        (section,) = re.findall(rf"^## {family}\b.*?(?=^## |\Z)", record, re.MULTILINE | re.DOTALL)
+        for field in ("- What was triggered", "- Decision trace excerpt:", "- Outcome"):
+            assert section.count(field) == 1, (family, field)
+
+    summary = SUMMARY.read_text(encoding="utf-8")
+    for number in range(1, 10):
+        (row,) = re.findall(rf"^\| R{number} .*$", summary, re.MULTILINE)
+        assert _COMMIT.search(row), number
+        assert _TEST_ID.search(row), number
+    cited = set(_TEST_ID.findall(summary))
+    assert cited
+    missing = [f"{path}::{name}" for path, name in sorted(cited) if not _defines_test(ROOT / path, name)]
+    assert missing == []
+
+
+def test_p16_the_summary_lists_each_converted_node_with_its_fidelity_lost() -> None:
+    """R9 (plan P16, D8): the summary records the suite count and the D8
+    conversion list — each node of the committed probe once, with the step
+    that converted it and the fidelity that conversion lost."""
+
+    summary = SUMMARY.read_text(encoding="utf-8")
+    assert re.search(r"\*\*[\d,]+ passed, \d+ skipped\*\*", summary)
+    assert "**164 nodes in 24 files**" in summary
+    rows = _CONVERSION_ROW.findall(summary)
+    nodes = [node for node, _, _, _ in rows]
+    assert len(nodes) == len(set(nodes)) == len(AC33_PROBE)
+    assert set(nodes) == AC33_PROBE
+    assert {loss.strip() for _, _, _, loss in rows} <= FIDELITY_LOST
+    assert {step for _, step, _, _ in rows} == {"P15a", "P15b", "P15c", "P15d", "P15e"}
+
+
+def test_ac33_the_whole_suite_runs_under_the_guard(request: pytest.FixtureRequest) -> None:
+    """AC33 (R9, plan P16): ``_ac33_isolation`` is autouse and has no ledger
+    left; every collected item uses it, and no other file defines a fixture of
+    that name that could shadow it; with this run's environment (CI opts no
+    trial in) 0 items would run unpatched."""
+
+    source = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+    (fixture,) = [
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_ac33_isolation"
+    ]
+    (decorator,) = fixture.decorator_list
+    assert isinstance(decorator, ast.Call) and ast.unparse(decorator.func) == "pytest.fixture"
+    assert [(keyword.arg, ast.literal_eval(keyword.value)) for keyword in decorator.keywords] == [
+        ("autouse", True)
+    ]
+    assert not hasattr(conftest, "AC33_PENDING") and "AC33_PENDING" not in source
+    shadows = [
+        path.relative_to(ROOT).as_posix()
+        for path in sorted((ROOT / "tests").rglob("*.py"))
+        if path.name != "conftest.py" or path.parent != ROOT / "tests"
+        if any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_ac33_isolation"
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    ]
+    assert shadows == []
+
+    items = request.session.items
+    assert request.node in items
+    assert [item.nodeid for item in items if "_ac33_isolation" not in item.fixturenames] == []
+    unpatched = [
+        item.nodeid
+        for item in items
+        if trial_opted_in(
+            Path(str(item.path)).name, item.module, getattr(item, "originalname", item.name)
+        )
+    ]
+    assert unpatched == []
+
+
+#: The spawn and socket APIs the scan looks for, by the name they are called by.
+_SPAWN_OR_SOCKET = frozenset(
+    {"Popen", "create_subprocess_exec", "TCPSite", "TestServer", "create_connection"}
+)
+#: The guard and its fakes live here, so the scan skips the file by path.
+_GUARD_FILE = "tests/conftest.py"
+#: The guard's own tests: a call is allowed there inside ``pytest.raises`` only.
+_GUARD_TESTS = "tests/test_ac33_isolation.py"
+#: Two other guards' self-tests, each asserting its own refusal of a call
+#: inside ``pytest.raises`` (under the suite guard, which refuses it too):
+#: ``(file, test, call)``. Pinned exactly, so a new call cannot hide here.
+_OTHER_GUARD_REFUSALS = frozenset(
+    {
+        ("tests/test_config_ui.py", "test_ac5_the_socket_patch_is_effective", "socket.create_connection"),
+        (
+            "tests/test_web.py",
+            "test_the_socket_guard_refuses_and_records_every_non_loopback_surface",
+            "socket.create_connection",
+        ),
+        (
+            "tests/test_web.py",
+            "test_the_socket_guard_refuses_and_records_every_non_loopback_surface",
+            "loop.create_connection",
+        ),
+    }
+)
+
+
+def _spawn_or_socket_calls(source: str) -> list[tuple[int, str, str, bool]]:
+    """Every call of a spawn or socket API in *source*, as ``(line, call,
+    enclosing top-level function, inside pytest.raises)``. Only calls count:
+    a name in an annotation, an ``isinstance`` or a ``setattr`` is no call."""
+
+    found: list[tuple[int, str, str, bool]] = []
+
+    def called(function: ast.expr) -> bool:
+        if isinstance(function, ast.Attribute):
+            if function.attr == "system":
+                return isinstance(function.value, ast.Name) and function.value.id == "os"
+            return function.attr in _SPAWN_OR_SOCKET
+        return isinstance(function, ast.Name) and function.id in _SPAWN_OR_SOCKET
+
+    def raises(item: ast.withitem) -> bool:
+        context = item.context_expr
+        return isinstance(context, ast.Call) and ast.unparse(context.func) in ("pytest.raises", "raises")
+
+    def visit(node: ast.AST, function: str, inside: bool) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not function:
+            function = node.name
+        if isinstance(node, ast.Call) and called(node.func):
+            found.append((node.lineno, ast.unparse(node.func), function, inside))
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                visit(item, function, inside)
+            body_inside = inside or any(raises(item) for item in node.items)
+            for statement in node.body:
+                visit(statement, function, body_inside)
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, function, inside)
+
+    visit(ast.parse(source), "", False)
+    return found
+
+
+def test_ac33_the_scan_flags_calls_and_not_names() -> None:
+    """The scan below bites: each of the six APIs called is found, a name that
+    only annotates, compares or patches is not, and a ``pytest.raises`` block
+    is told apart."""
+
+    source = '''
+def test_calls(app, runner, monkeypatch):
+    subprocess.Popen(["x"])
+    asyncio.create_subprocess_exec("x")
+    os.system("x")
+    web.TCPSite(runner)
+    TestServer(app)
+    socket.create_connection(("h", 1))
+    process: subprocess.Popen = None
+    isinstance(process, subprocess.Popen)
+    monkeypatch.setattr(subprocess, "Popen", None)
+    platform.system()
+    with pytest.raises(AssertionError):
+        os.system("x")
+'''
+    assert _spawn_or_socket_calls(source) == [
+        (3, "subprocess.Popen", "test_calls", False),
+        (4, "asyncio.create_subprocess_exec", "test_calls", False),
+        (5, "os.system", "test_calls", False),
+        (6, "web.TCPSite", "test_calls", False),
+        (7, "TestServer", "test_calls", False),
+        (8, "socket.create_connection", "test_calls", False),
+        (14, "os.system", "test_calls", True),
+    ]
+
+
+def test_ac33_no_test_reaches_a_real_spawn_or_socket() -> None:
+    """AC33 (R9, plan P16): no file under ``tests/`` calls ``Popen``,
+    ``create_subprocess_exec``, ``os.system``, ``TCPSite``, ``TestServer`` or
+    ``create_connection``, except the guard and its fakes
+    (``tests/conftest.py``), the guard's own ``pytest.raises`` self-tests
+    (``tests/test_ac33_isolation.py``) and the two other guards' refusal
+    self-tests pinned in :data:`_OTHER_GUARD_REFUSALS`."""
+
+    offenders: list[str] = []
+    other_guards: set[tuple[str, str, str]] = set()
+    for path in sorted((ROOT / "tests").rglob("*.py")):
+        relative = path.relative_to(ROOT).as_posix()
+        if relative == _GUARD_FILE:
+            continue
+        for line, call, function, inside in _spawn_or_socket_calls(path.read_text(encoding="utf-8")):
+            if inside and relative == _GUARD_TESTS:
+                continue
+            if inside and (relative, function, call) in _OTHER_GUARD_REFUSALS:
+                other_guards.add((relative, function, call))
+                continue
+            offenders.append(f"{relative}:{line}: {call}")
+    assert offenders == []
+    assert other_guards == _OTHER_GUARD_REFUSALS
