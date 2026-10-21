@@ -12,6 +12,11 @@ manifest keys, and refuses a malformed declared type at discovery — before any
 transport is opened — with a diagnostic at ``triggers.<input>.types[i]`` and
 the sub-path, echoing no configured value.
 
+P5 holds the policy half of AC1 and AC3, and AC6 (R1, R2 scoping): the
+registry accepts a well-formed declared type, validates a declared rule's
+parameters against the declared schema and the kernel's checks, and refuses
+an override naming a declared type for an input that did not declare it.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -83,7 +88,12 @@ from conftest import (
     final,
     settle,
 )
-from core.triggers import BUILTIN_TRIGGER_TYPE_NAMES, BUILTIN_TRIGGER_TYPES
+from core.triggers import (
+    BUILTIN_TRIGGER_TYPE_NAMES,
+    BUILTIN_TRIGGER_TYPES,
+    TriggerEngine,
+    TriggerRegistry,
+)
 from modules.twitch import EVENTSUB_SUBSCRIPTIONS_URL
 from test_examples import ROOT, DeviceEdges, _activate_example, _sample_environ
 from test_presence_pack import PresenceTwitchSession, presence_environ
@@ -1469,3 +1479,356 @@ async def test_p4_a_malformed_field_catalog_is_refused_at_load(tmp_path: Path) -
         tmp_path, manifest, "triggers", "rank.sentinel", "colour_sentinel"
     )
     assert "TriggerSpec.fields[1]" in diagnostic
+
+
+# --------------------------------------------------------------------------- #
+# P5 (R1, R2 scoping): the registry accepts declared types; AC1, AC3, AC6
+# --------------------------------------------------------------------------- #
+
+#: A second fixture input, declaring only the generic ``keyword`` type.
+SECOND_INPUT = "second"
+
+
+def _gold() -> TriggerPolicy:
+    return TriggerPolicy(rules=(TriggerRule("badge_tier", {"tiers": ["gold"]}),))
+
+
+def _badge_registry(declaration: TriggerTypeDeclaration | None = None) -> TriggerRegistry:
+    registry = TriggerRegistry(companion_name="companion")
+    registry.register(INPUT, _badge_spec(_badge() if declaration is None else declaration))
+    return registry
+
+
+def _second_spec(*types: TriggerTypeDeclaration) -> TriggerSpec:
+    keyword = next(d for d in BUILTIN_TRIGGER_TYPES if d.name == "keyword")
+    return TriggerSpec(
+        types=(keyword, *types),
+        combinations=("all_of",),
+        default_policy=TriggerPolicy(
+            rules=(TriggerRule("keyword", {"keywords": ["hello"]}),)
+        ),
+    )
+
+
+def _second_message(message_id: str, text: str = "hello") -> dict[str, Any]:
+    return {
+        "type": "channel.chat.message",
+        "payload": {
+            "platform": "twitch",
+            "kind": "message",
+            "channel_id": "channel-1",
+            "author": {"id": "viewer-1", "display_name": "Viewer"},
+            "message_id": message_id,
+            "text": text,
+            "badge": {"tier": "gold"},
+        },
+        "metadata": {"schema_version": 2, "source": SECOND_INPUT},
+    }
+
+
+def _registry_refused(build: Any, field: str, *configured: str) -> ContractError:
+    """Like :func:`_refused`, but the field is checked as the diagnostic's
+    prefix the way the loader quotes it."""
+
+    error = _refused(build, field, *configured)
+    assert str(error).startswith(f"{field}: "), str(error)
+    return error
+
+
+def test_p5_ac1_the_registry_accepts_the_badge_tier_declaration() -> None:
+    """AC1 (R1), policy half: the declared ``badge_tier`` type registers — the
+    "is not a trigger type this runtime can evaluate" refusal no longer
+    applies to it — with its default policy, and the configured policy
+    ``badge_tier{tiers: ["gold"]}`` validates and is selected."""
+
+    registry = _badge_registry()
+
+    assert registry.inputs() == (INPUT,)
+    registry.validate_policy(INPUT, _gold())
+    registry.configure(INPUT, _gold())
+    assert registry.resolve(INPUT) == _gold()
+
+
+async def test_p5_ac1_the_badge_fixture_registers_when_enabled(tmp_path: Path) -> None:
+    """AC1 (R1): the fixture manifest, enabled, passes registration and opens
+    its one transport; the engine's registry then holds the declared type and
+    validates the configured ``badge_tier{tiers: ["gold"]}``."""
+
+    _write_module(tmp_path, _fixture_manifest())
+    transport = CountingTransport()
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context, environ={})
+
+    activations = await loader.activate_enabled(
+        {"enabled_modules": [INPUT], "modules": {INPUT: {"transport": transport}}}
+    )
+
+    assert [activation.name for activation in activations] == [INPUT]
+    assert transport.opened == 1
+    registry = context.triggers.registry
+    (declaration,) = registry.spec(INPUT).types
+    assert declaration.name == "badge_tier" and declaration.declared
+    registry.validate_policy(INPUT, _gold())
+    for activation in activations:
+        await activation.close()
+
+
+def test_p5_a_non_generic_undeclared_name_keeps_the_existing_refusal() -> None:
+    """R1: a non-generic name that carries no match rule and no hook is not a
+    declared type, and the registry refuses it as before."""
+
+    bare = TriggerTypeDeclaration(name="badge_tier", parameter_schema=BADGE_SCHEMA)
+    assert not bare.declared
+    spec = TriggerSpec(types=(bare,), combinations=("all_of",), default_policy=_gold())
+
+    error = _registry_refused(
+        lambda: TriggerRegistry().register(INPUT, spec), f"triggers.{INPUT}.types[0].name"
+    )
+    assert "is not a trigger type this runtime can evaluate" in str(error)
+
+
+@pytest.mark.parametrize("policy", [None, {}], ids=["none", "mapping"])
+def test_p5_a_policy_that_is_not_a_trigger_policy_keeps_its_contract_error(
+    policy: Any,
+) -> None:
+    """A *policy* that is not a :class:`TriggerPolicy` is refused with the
+    spec's field-specific ContractError — the value-stripping step never
+    reads ``rules`` from it."""
+
+    registry = _badge_registry()
+
+    with pytest.raises(ContractError) as caught:
+        registry.validate_policy(INPUT, policy)
+    assert caught.value.field == f"triggers.{INPUT}.policy"
+    assert "must be a TriggerPolicy" in caught.value.reason
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        pytest.param(BADGE_SCHEMA, id="closed-schema"),
+        pytest.param(
+            {key: value for key, value in BADGE_SCHEMA.items() if key != "additionalProperties"},
+            id="open-schema",
+        ),
+    ],
+)
+def test_p5_ac3_a_parameter_outside_the_declared_schema_is_refused(
+    schema: dict[str, Any],
+) -> None:
+    """AC3 (R1), policy half: a configured parameter outside the declared
+    schema is refused naming
+    ``triggers.<input>.policy.rules[0].parameters.<key>``, echoing no
+    configured value — whether or not the schema itself closes its
+    properties, since a declared type only narrows."""
+
+    registry = _badge_registry(_badge(parameter_schema=schema))
+    policy = TriggerPolicy(
+        rules=(
+            TriggerRule(
+                "badge_tier", {"tiers": ["gold_sentinel"], "rank": "value_sentinel"}
+            ),
+        )
+    )
+
+    _registry_refused(
+        lambda: registry.validate_policy(INPUT, policy),
+        f"triggers.{INPUT}.policy.rules[0].parameters.rank",
+        "gold_sentinel",
+        "value_sentinel",
+    )
+    assert registry.resolve(INPUT) == _badge_spec(_badge()).default_policy
+
+
+def test_p5_ac3_a_parameter_of_the_wrong_type_echoes_no_value() -> None:
+    """AC3 (R1): a declared parameter failing its declared schema is refused
+    at its own path, echoing no configured value."""
+
+    registry = _badge_registry()
+    policy = TriggerPolicy(rules=(TriggerRule("badge_tier", {"tiers": "gold_sentinel"}),))
+
+    _registry_refused(
+        lambda: registry.configure(INPUT, policy),
+        f"triggers.{INPUT}.policy.rules[0].parameters.tiers",
+        "gold_sentinel",
+    )
+
+
+def test_p5_a_value_outside_a_declared_enumeration_echoes_no_value() -> None:
+    """AC3 (R1): the schema validator quotes an offending value; for a
+    declared rule the diagnostic keeps its path and wording, not the value."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "tiers": {"type": "array", "items": {"type": "string", "enum": ["gold", "silver"]}}
+        },
+        "required": ["tiers"],
+    }
+    registry = _badge_registry(_badge(parameter_schema=schema))
+    policy = TriggerPolicy(
+        rules=(TriggerRule("badge_tier", {"tiers": ["gold", "bronze_sentinel"]}),)
+    )
+
+    error = _registry_refused(
+        lambda: registry.validate_policy(INPUT, policy),
+        f"triggers.{INPUT}.policy.rules[0].parameters.tiers[1]",
+        "bronze_sentinel",
+    )
+    assert "must be one of" in error.reason
+
+
+def test_p5_a_nested_parameter_outside_its_object_is_refused() -> None:
+    """R1: the kernel's key check descends into object parameters, so a key
+    the declared object does not list is refused at its full path."""
+
+    declaration = TriggerTypeDeclaration(
+        name="interval",
+        parameter_schema=INTERVAL_SCHEMA,
+        kinds=("timer",),
+        match=_interval_match(),
+        probability_parameter="probability",
+    )
+    window = {"start_minute": 600, "end_minute": 700}
+    accepted = {"every_minutes": 5, "probability": 0.25, "window": window}
+    spec = TriggerSpec(
+        types=(declaration,),
+        combinations=("all_of",),
+        default_policy=TriggerPolicy(rules=(TriggerRule("interval", accepted),)),
+        fields={"timer.minute_of_day": "integer"},
+    )
+    registry = TriggerRegistry()
+    registry.register(INPUT, spec)
+    registry.validate_policy(INPUT, TriggerPolicy(rules=(TriggerRule("interval", accepted),)))
+
+    nested = {**accepted, "window": {**window, "lunch_sentinel": 4242}}
+    _registry_refused(
+        lambda: registry.validate_policy(
+            INPUT, TriggerPolicy(rules=(TriggerRule("interval", nested),))
+        ),
+        f"triggers.{INPUT}.policy.rules[0].parameters.window.lunch_sentinel",
+        "4242",
+    )
+
+
+@pytest.mark.parametrize("probability", [1.5, -0.25, True])
+def test_p5_a_probability_parameter_outside_0_to_1_is_refused(probability: Any) -> None:
+    """R1: the probability parameter's configured value is a number in
+    [0, 1], refused at its path otherwise, echoing no value."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "tiers": {"type": "array", "items": {"type": "string"}},
+            "chance": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["tiers", "chance"],
+    }
+    half = TriggerPolicy(
+        rules=(TriggerRule("badge_tier", {"tiers": ["gold"], "chance": 0.5}),)
+    )
+    registry = TriggerRegistry()
+    registry.register(
+        INPUT,
+        TriggerSpec(
+            types=(_badge(parameter_schema=schema, probability_parameter="chance"),),
+            combinations=("all_of",),
+            default_policy=half,
+            fields={"badge.tier": "string"},
+        ),
+    )
+    registry.validate_policy(INPUT, half)
+    policy = TriggerPolicy(
+        rules=(TriggerRule("badge_tier", {"tiers": ["gold"], "chance": probability}),)
+    )
+
+    _registry_refused(
+        lambda: registry.validate_policy(INPUT, policy),
+        f"triggers.{INPUT}.policy.rules[0].parameters.chance",
+        str(probability),
+    )
+
+
+def test_p5_a_configured_declared_policy_replaces_the_default_without_merge() -> None:
+    """R1 risk: policy resolution is untouched — a configured declared policy
+    replaces the module default entirely, nothing merged into it."""
+
+    registry = _badge_registry()
+    silver = TriggerPolicy(rules=(TriggerRule("badge_tier", {"tiers": ["silver"]}),))
+
+    assert registry.resolve(INPUT) == _badge_spec(_badge()).default_policy
+    registry.configure(INPUT, silver)
+
+    resolved = registry.resolve(INPUT)
+    assert resolved == silver
+    assert [dict(rule.parameters) for rule in resolved.rules] == [{"tiers": ("silver",)}]
+
+
+@pytest.mark.parametrize(
+    "second_types",
+    [
+        pytest.param((), id="generic-only"),
+        pytest.param(
+            (_badge(name="rank_tier", match={"in": [{"field": "badge.tier"}, {"param": "tiers"}]}),),
+            id="own-declared-type",
+        ),
+    ],
+)
+def test_p5_ac6_an_override_naming_another_inputs_type_is_refused(
+    second_types: tuple[TriggerTypeDeclaration, ...],
+) -> None:
+    """AC6 (R2): a per-call override naming ``badge_tier`` on an event whose
+    ``metadata.source`` is a second input that does not declare it raises a
+    ContractError naming that input, before any rule runs: the declaring
+    input's rule is evaluated 0 times, no value is drawn and nothing is
+    recorded."""
+
+    registry = _badge_registry()
+    registry.register(
+        SECOND_INPUT,
+        TriggerSpec(
+            types=_second_spec().types + second_types,
+            combinations=("all_of",),
+            default_policy=_second_spec().default_policy,
+            fields={"badge.tier": "string"} if second_types else {},
+        ),
+    )
+    rng = RecordedRandom((0.5,))
+    engine = TriggerEngine(
+        registry, dedup_max_entries=8, dedup_ttl_seconds=60.0, clock=ManualClock(), rng=rng
+    )
+    control = engine.evaluate(_second_message("m0"))
+    assert control.accepted and control.input_name == SECOND_INPUT
+    evaluations, window = engine.rule_evaluations, engine.window_size
+
+    with pytest.raises(ContractError) as caught:
+        engine.evaluate(_second_message("m1"), policy=_gold())
+
+    assert caught.value.field == f"triggers.{SECOND_INPUT}.policy.rules[0].type"
+    assert f"triggers.{INPUT}" not in str(caught.value)
+    assert engine.rule_evaluations - evaluations == 0
+    assert engine.window_size == window
+    assert rng.ordinal == 0
+
+
+def test_p5_the_registry_keeps_a_hook_slot_per_hooked_type() -> None:
+    """R1, R3 groundwork: per input, the registry keeps one slot for each
+    hooked type it declared, unfilled until a hook is supplied; a match type
+    has none, and the table is read-only."""
+
+    hooked = _badge(name="wake", match=None, hook=True, hook_timeout_seconds=0.5)
+    spec = TriggerSpec(
+        types=(_badge(), hooked),
+        combinations=("all_of",),
+        default_policy=_gold(),
+        fields={"badge.tier": "string"},
+    )
+    registry = TriggerRegistry()
+    registry.register(INPUT, spec)
+    registry.register(SECOND_INPUT, _second_spec())
+
+    assert dict(registry.hook_slots(INPUT)) == {"wake": None}
+    assert dict(registry.hook_slots(SECOND_INPUT)) == {}
+    assert dict(registry.hook_slots("nobody")) == {}
+    with pytest.raises(TypeError):
+        registry.hook_slots(INPUT)["wake"] = object()  # type: ignore[index]

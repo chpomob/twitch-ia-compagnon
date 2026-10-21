@@ -68,6 +68,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from .contracts import (
@@ -81,6 +82,7 @@ from .contracts import (
     TriggerRule,
     TriggerSpec,
     TriggerTypeDeclaration,
+    validate_against_schema,
     validate_event_kind,
 )
 
@@ -432,7 +434,14 @@ class TriggerRegistry:
     ingestion by :class:`TriggerEngine`.
     """
 
-    __slots__ = ("_companion_name", "_names", "_specs", "_inputs", "_channels")
+    __slots__ = (
+        "_companion_name",
+        "_names",
+        "_specs",
+        "_inputs",
+        "_channels",
+        "_hooks",
+    )
 
     def __init__(self, *, companion_name: str | None = None) -> None:
         """Build a registry resolving :data:`COMPANION_NAME_TOKEN` to *companion_name*.
@@ -450,6 +459,9 @@ class TriggerRegistry:
         self._specs: dict[str, TriggerSpec] = {}
         self._inputs: dict[str, TriggerPolicy] = {}
         self._channels: dict[tuple[str, str], TriggerPolicy] = {}
+        # Per input, one slot per hooked type it declared; a slot holds the
+        # hook its own module supplied, ``None`` until one is.
+        self._hooks: dict[str, dict[str, Any]] = {}
 
     @property
     def companion_name(self) -> str | None:
@@ -475,11 +487,12 @@ class TriggerRegistry:
     ) -> None:
         """Record the :class:`~core.contracts.TriggerSpec` *input_name* declares.
 
-        Every declared type must be one this engine can execute and every
-        declared schema must be one the matching evaluator understands, both
-        checked here so a manifest that could only fail at ingestion fails at
-        load instead. The module's own default policy is validated the same way
-        as a configured one. *companion_name* is the name configured in this
+        Every declared type must be one this engine can execute — a generic
+        type, or a type the module declares with its own match rule or hook
+        (R1) — and every generic schema must be one the matching evaluator
+        understands, both checked here so a manifest that could only fail at
+        ingestion fails at load instead. The module's own default policy is
+        validated the same way as a configured one. *companion_name* is the name configured in this
         input's own settings; it resolves the token for this input only.
         """
 
@@ -494,6 +507,10 @@ class TriggerRegistry:
             _require_text(companion_name, f"triggers.{name}.{COMPANION_NAME_SETTING}")
 
         for index, declaration in enumerate(spec.types):
+            if declaration.declared:
+                # Its shape was checked when it was constructed (R1); a
+                # generic name never carries the declared keys.
+                continue
             if declaration.name not in _BUILTIN_BY_NAME:
                 supported = ", ".join(BUILTIN_TRIGGER_TYPE_NAMES)
                 raise ContractError(
@@ -505,6 +522,7 @@ class TriggerRegistry:
         if spec.default_policy is not None:
             self._validate_executable(
                 spec.default_policy,
+                spec=spec,
                 label=f"triggers.{name}.default_policy",
                 companion_name=(
                     self._companion_name if companion_name is None else companion_name
@@ -512,8 +530,20 @@ class TriggerRegistry:
             )
 
         self._specs[name] = spec
+        self._hooks[name] = {
+            declaration.name: None for declaration in spec.types if declaration.hook
+        }
         if companion_name is not None:
             self._names[name] = companion_name
+
+    def hook_slots(self, input_name: str) -> Mapping[str, Any]:
+        """Return *input_name*'s hook slot table, read-only.
+
+        One slot per hooked type the input declared, holding the hook its own
+        module supplied or ``None``; empty for an unregistered input.
+        """
+
+        return MappingProxyType(self._hooks.get(input_name, {}))
 
     def spec(self, input_name: str) -> TriggerSpec | None:
         """Return the spec declared for *input_name*, or ``None``."""
@@ -544,9 +574,12 @@ class TriggerRegistry:
                 label,
                 f"names an input no module declares; declared inputs: {declared}",
             )
-        spec.validate_policy(policy, label=label)
+        try:
+            spec.validate_policy(policy, label=label)
+        except ContractError as error:
+            raise _value_free(error, policy, spec=spec, label=label) from None
         self._validate_executable(
-            policy, label=label, companion_name=self.companion_name_for(name)
+            policy, spec=spec, label=label, companion_name=self.companion_name_for(name)
         )
 
     def configure(
@@ -591,15 +624,29 @@ class TriggerRegistry:
 
     @staticmethod
     def _validate_executable(
-        policy: TriggerPolicy, *, label: str, companion_name: str | None
+        policy: TriggerPolicy,
+        *,
+        spec: TriggerSpec,
+        label: str,
+        companion_name: str | None,
     ) -> None:
-        """Check every rule against the canonical schema of its built-in type."""
+        """Check every rule against what the kernel can evaluate for it.
+
+        A rule naming a type *spec* declares is held to the kernel's checks of
+        a declared type; any other rule to the canonical schema of its
+        built-in type, exactly as before.
+        """
 
         for index, rule in enumerate(policy.rules):
+            location = f"{label}.rules[{index}]"
+            declaration = spec.declaration(rule.type)
+            if declaration is not None and declaration.declared:
+                _validate_declared_rule(rule, declaration, label=location)
+                continue
             _validate_builtin_rule(
                 rule,
                 companion_name=companion_name,
-                label=f"{label}.rules[{index}]",
+                label=location,
             )
 
 
@@ -1322,6 +1369,65 @@ def _validate_builtin_rule(
                     f"{label}.parameters.kinds[{index}]", f"repeats {kind!r}"
                 )
             seen.add(kind)
+
+
+def _value_free(
+    error: ContractError, policy: Any, *, spec: TriggerSpec, label: str
+) -> ContractError:
+    """Return *error*, stripped of the configured value when it is a declared
+    rule's parameter diagnostic (R1).
+
+    The schema validator quotes the offending value after ``, got``; a
+    declared rule's diagnostic names the parameter path and keeps the
+    wording, never the value. Any other diagnostic — including the one for a
+    *policy* that is not a :class:`TriggerPolicy` at all — is returned
+    unchanged.
+    """
+
+    if not isinstance(policy, TriggerPolicy):
+        return error
+    for index, rule in enumerate(policy.rules):
+        location = f"{label}.rules[{index}].parameters"
+        inside = error.field == location or error.field.startswith(
+            (f"{location}.", f"{location}[")
+        )
+        if not inside:
+            continue
+        declaration = spec.declaration(rule.type)
+        if declaration is None or not declaration.declared:
+            return error
+        return ContractError(error.field, error.reason.split(", got ", 1)[0])
+    return error
+
+
+def _validate_declared_rule(
+    rule: TriggerRule, declaration: TriggerTypeDeclaration, *, label: str
+) -> None:
+    """Check *rule* against the kernel's checks of its declared type (R1).
+
+    The declared parameter schema itself was already applied. On top of it a
+    declared rule only narrows: the schema is read closed, so every configured
+    key of an object declaring ``properties`` must be one of them, at every
+    depth, unless the schema explicitly opens it — and the probability
+    parameter, when the type has one, is a number in [0, 1]. Every diagnostic
+    names the parameter path and echoes no configured value.
+    """
+
+    location = f"{label}.parameters"
+    validate_against_schema(
+        rule.parameters, declaration.parameter_schema, label=location, closed=True
+    )
+    parameter = declaration.probability_parameter
+    if parameter is not None:
+        value = rule.parameters.get(parameter)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not 0 <= value <= 1
+        ):
+            raise ContractError(
+                f"{location}.{parameter}", "must be a probability in [0, 1]"
+            )
 
 
 def _resolved_keywords(
