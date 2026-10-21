@@ -31,12 +31,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.metadata
 import importlib.util
 import json
-import os
 import re
 import shlex
-import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -117,25 +116,28 @@ def _profile(guide: Path) -> str:
 
 @pytest.mark.parametrize("guide", GUIDES, ids=lambda path: path.name)
 def test_the_guides_profile_is_accepted_by_the_real_entry_point(
-    guide: Path, tmp_path: Path
+    guide: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``--check-config`` over the printed block, with the eight printed values."""
+    """``--check-config`` over the printed block, with the eight printed values.
+
+    Phase 8 (R9, AC33, plan P15e): the entry point's ``main`` is called
+    in-process with the arguments the reader types, instead of a child
+    interpreter: the same argument parsing, the same check and the same
+    status, with nothing printed to either stream."""
 
     config = tmp_path / PROFILE_NAME
     config.write_text(_profile(guide), encoding="utf-8")
     # The guide's own values, over whatever this developer has exported.
-    environment = {**os.environ, **VALUES, "NO_COLOR": "1"}
+    for name, value in {**VALUES, "NO_COLOR": "1"}.items():
+        monkeypatch.setenv(name, value)
 
-    completed = subprocess.run(
-        [sys.executable, "-m", "core.main", "--config", str(config), "--check-config"],
-        cwd=ROOT,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert completed.stdout == "" and completed.stderr == ""
+    status = application.main(["--config", str(config), "--check-config"])
+    captured = capsys.readouterr()
+    assert status == 0, captured.out + captured.err
+    assert captured.out == "" and captured.err == ""
 
 
 @pytest.mark.parametrize("guide", GUIDES, ids=lambda path: path.name)
@@ -295,11 +297,27 @@ def _readme_config_ui_command() -> str:
     raise AssertionError("README: no configuration-UI command")
 
 
-def _run_with_help(command: str) -> subprocess.CompletedProcess[str]:
-    """Run *command* as printed, its arguments replaced by ``--help``.
+def _exit_status(entry: Any, argv: list[str]) -> int:
+    """What a process running *entry* with *argv* exits with."""
 
-    The command is everything before its first option; ``python`` is the
-    interpreter running this suite, which is the reader's activated one.
+    try:
+        code = entry(argv)
+    except SystemExit as exit_:
+        code = exit_.code
+    if code is None:
+        return 0
+    return code if isinstance(code, int) else 1
+
+
+def _run_with_help(command: str, capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
+    """Run *command* as printed, its arguments replaced by ``--help``: its
+    exit status and what it printed.
+
+    The command is everything before its first option. Phase 8 (R9, AC33,
+    plan P15e): it runs in-process, not in a child interpreter. ``python -m
+    X`` calls ``X``'s ``main`` — a name no module answers to exits 1, as the
+    interpreter does — and a console script is the ``main`` its installed
+    entry point names, resolved through ``importlib.metadata``.
     """
 
     words = shlex.split(command)
@@ -307,35 +325,59 @@ def _run_with_help(command: str) -> subprocess.CompletedProcess[str]:
         (index for index, word in enumerate(words) if word.startswith("--")), len(words)
     )
     program = words[:first_option]
+    capsys.readouterr()
     if program[0] in ("python", "python3"):
-        program[0] = sys.executable
-    return subprocess.run(
-        [*program, "--help"],
-        cwd=ROOT,
-        env={**os.environ, "NO_COLOR": "1"},
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+        assert program[1] == "-m" and len(program) == 3, program
+        try:
+            spec = importlib.util.find_spec(program[2])
+        except (ImportError, ValueError):
+            spec = None
+        if spec is None:
+            return 1, ""
+        entry = importlib.import_module(program[2]).main
+    else:
+        entry = _console_script(program[0])
+    status = _exit_status(entry, ["--help"])
+    return status, capsys.readouterr().out
 
 
-def test_the_readme_config_ui_command_runs() -> None:
+def _console_script(name: str) -> Any:
+    """The callable the installed console script *name* runs."""
+
+    found = [
+        point for point in importlib.metadata.entry_points(group="console_scripts")
+        if point.name == name
+    ]
+    assert len(found) == 1, f"{name}: not an installed console script"
+    return found[0].load()
+
+
+def test_the_readme_config_ui_command_runs(capsys: pytest.CaptureFixture[str]) -> None:
     """The README's configuration-UI command runs, as printed (F16, R8).
 
     Executed exactly as printed with its arguments replaced by ``--help``: it
-    exits 0 within 30 s and prints the usage naming ``--config``. The pre-fix
-    line, under the same check, exits non-zero.
+    exits 0 and prints the usage naming ``--config``. The pre-fix line, under
+    the same check, exits non-zero. The ``[project.scripts]`` console script
+    for the same entry point, resolved through the installed distribution's
+    entry points, answers ``--help`` alike (phase 8 R9, AC33: in-process).
     """
 
     command = _readme_config_ui_command()
     assert command.endswith(f"--config {README_PROFILE_NAME}")
-    completed = _run_with_help(command)
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "usage:" in completed.stdout
-    assert "--config" in completed.stdout
+    status, output = _run_with_help(command, capsys)
+    assert status == 0, output
+    assert "usage:" in output
+    assert "--config" in output
 
-    assert _run_with_help(PRE_FIX_README_COMMAND).returncode != 0
+    assert _run_with_help(PRE_FIX_README_COMMAND, capsys)[0] != 0
+
+    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "scripts"
+    ]
+    (script,) = [name for name, target in scripts.items() if target == "core.config_ui:main"]
+    status, output = _run_with_help(f"{script} --config {README_PROFILE_NAME}", capsys)
+    assert status == 0, output
+    assert "usage:" in output and "--config" in output
 
 
 # --------------------------------------------------------------------------- #

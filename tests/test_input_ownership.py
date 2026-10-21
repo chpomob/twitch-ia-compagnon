@@ -2692,8 +2692,6 @@ import itertools  # noqa: E402
 from collections.abc import Callable  # noqa: E402
 
 from conftest import (  # noqa: E402
-    AC33_PENDING,
-    ac33_node,
     baseline_numstat,
     ownership_rejection_probe,
 )
@@ -3004,10 +3002,8 @@ def test_ac44_the_integration_scenarios_count_zero_ownership_rejections(
     Run in-process (AC33, P15a), not in a child ``pytest``: the scenarios are
     read from each file with ``ast`` and called with their parameter sets,
     under counting wrappers of the input guard and of the rejection counter.
-    An integration node still in ``AC33_PENDING`` opens a socket or starts a
-    process, so it is left out here and runs under the same probe in its own
-    execution (``tests/test_integration.py``'s ``_ac44_pending_probe``)
-    until its conversion removes it and it joins this run."""
+    Every integration scenario runs here: P15e emptied and deleted the AC33
+    ledger, so none is left out to be probed in its own execution."""
 
     import test_examples
     import test_integration
@@ -3017,7 +3013,6 @@ def test_ac44_the_integration_scenarios_count_zero_ownership_rejections(
     scenarios = [
         (test_integration, name)
         for name in _test_names(test_integration)
-        if ac33_node(f"tests/test_integration.py::{name}") not in AC33_PENDING
     ] + [(test_examples, name) for name in _EXAMPLE_ACTIVATIONS]
     assert set(_EXAMPLE_ACTIVATIONS) <= set(_test_names(test_examples))
     failures: list[str] = []

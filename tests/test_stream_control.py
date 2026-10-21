@@ -2233,11 +2233,8 @@ def test_no_lead_or_margin_exists_in_stream_control() -> None:
 # --------------------------------------------------------------------------- #
 
 import json  # noqa: E402
-import socket  # noqa: E402
 
-from aiohttp import web  # noqa: E402
-
-from conftest import MemoryWebSocketPair, WSMsgType  # noqa: E402
+from conftest import MemoryWebSocketPair, WebSocketEndpoints, WSMsgType  # noqa: E402
 from modules.stream_control import (  # noqa: E402
     REQUEST_CURRENT_SCENE,
     REQUEST_LIST_SCENES,
@@ -2899,27 +2896,37 @@ async def test_close_while_connected_closes_the_socket() -> None:
     assert h.context.tasks.active == 0
 
 
-# -- The default factory over a real loopback socket ------------------------ #
+# -- The default factory over the installed client framing ----------------- #
 
 
 @pytest.mark.asyncio
-async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket() -> None:
+async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """AC36: without an injected factory the provider dials with ``aiohttp``:
-    a real loopback server receives ``Identify`` (op 1) with the derived
+    the server end receives ``Identify`` (op 1) with the derived
     authentication and then one ``GetSceneList`` request (op 6) as JSON text
     frames, answers them, and the action becomes ready. No timer fires: the
-    clock is never advanced."""
+    clock is never advanced.
+
+    Phase 8 (R9, AC33, plan P15e): no socket is opened. ``aiohttp``'s
+    ``ClientSession`` is the in-memory one of :class:`WebSocketEndpoints`:
+    the shipped ``default_websocket_factory`` still builds it and dials, and
+    every frame it sends goes through the installed ``WebSocketWriter`` —
+    masked RFC 6455 bytes onto a recording transport — and is parsed back
+    from those bytes before the server end reads it."""
 
     received: list[str] = []
+    endpoints = WebSocketEndpoints().install(monkeypatch)
+    url = f"ws://127.0.0.1:{endpoints.allocate()}/"
+    served: list[asyncio.Task[None]] = []
 
-    async def serve(request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
+    async def serve(ws: Any) -> None:
         await ws.send_str(
             json.dumps({"op": 0, "d": {"rpcVersion": 1, "authentication": WS_CHALLENGE}})
         )
         async for message in ws:
-            if message.type is not aiohttp.WSMsgType.TEXT:
+            if message.type != aiohttp.WSMsgType.TEXT:
                 break
             received.append(message.data)
             frame = json.loads(message.data)
@@ -2933,20 +2940,12 @@ async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_sock
                     "responseData": {"scenes": [{"sceneName": "Talking", "sceneIndex": 0}]},
                 }
                 await ws.send_str(json.dumps({"op": 7, "d": answer}))
-        return ws
 
-    app = web.Application()
-    app.router.add_get("/", serve)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    site = web.SockSite(runner, sock)
-    await site.start()
+    endpoints.serve(url, lambda pair: served.append(asyncio.ensure_future(serve(pair.server))))
     peer = ScenePeer()
-    h = await websocket_harness(peer, url=f"ws://127.0.0.1:{port}/", factory=False)
+    h = await websocket_harness(peer, url=url, factory=False)
     try:
+        assert endpoints.attempts == [url]
         assert SCENE_ACTION in h.runtime.actions.registered_ready()
         frames = [json.loads(text) for text in received]
         assert frames[0] == {
@@ -2960,7 +2959,9 @@ async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_sock
         assert peer.dials == 0
     finally:
         await h.handle.close()
-        await runner.cleanup()
+        for task in served:
+            task.cancel()
+        await asyncio.gather(*served, return_exceptions=True)
 
 
 # --------------------------------------------------------------------------- #

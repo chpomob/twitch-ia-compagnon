@@ -81,16 +81,13 @@ from core.runtime import (
 )
 from core.triggers import TriggerRegistry
 from conftest import (
-    AC33_PENDING,
     FakeResponse,
     FakeSession,
     HeldSession,
     ManualClock,
     UnreachableSession,
-    ac33_node,
     completion,
     events_of,
-    ownership_rejection_probe,
     runtime_context as build_context,
     settle,
     wait_until,
@@ -130,27 +127,6 @@ The provider records the confirmed send the instant the platform confirms but
 hands the fact to the loop only through the invocation's completion hook, so
 the executor's own completion is published first and the fact after it.
 """
-
-
-@pytest.fixture(autouse=True)
-def _ac44_pending_probe(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> Any:
-    """AC44 (R3, R1): a node still in ``AC33_PENDING`` counts no rejection.
-
-    ``tests/test_input_ownership.py`` runs this file's converted scenarios
-    under the ownership probe in-process; a pending node opens a socket or
-    starts a process, so it is probed here, in its own execution, until its
-    conversion moves it into that run.
-    """
-
-    if ac33_node(request.node.nodeid) not in AC33_PENDING:
-        yield
-        return
-    seen = ownership_rejection_probe(monkeypatch)
-    yield
-    assert seen["guards"] > 0 and seen["admits"] > 0, seen
-    assert seen["rejections"] == 0 and seen["counted"] == 0, seen
 
 
 # --------------------------------------------------------------------------- #

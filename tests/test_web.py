@@ -239,9 +239,15 @@ class GuardViolation(AssertionError):
 
 @dataclass
 class SocketGuard:
-    """Every non-loopback attempt the guard refused, as ``(surface, target)``."""
+    """Every non-loopback attempt the guard refused, as ``(surface, target)``.
+
+    ``resolve`` is the resolver a loopback ``getaddrinfo`` reaches once the
+    guard let it through: the real one, which AC33 (R9) refuses as a socket
+    entry point, unless a test answers in its place.
+    """
 
     attempts: list[tuple[str, str]] = field(default_factory=list)
+    resolve: Any = None
 
     def check(self, surface: str, host: Any) -> None:
         if _is_loopback(host):
@@ -283,11 +289,10 @@ def socket_guard(monkeypatch: pytest.MonkeyPatch) -> Any:
     record fails at teardown, whatever it caught.
     """
 
-    guard = SocketGuard()
+    guard = SocketGuard(resolve=socket.getaddrinfo)
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
     real_create_connection = socket.create_connection
-    real_getaddrinfo = socket.getaddrinfo
     real_loop_create_connection = asyncio.base_events.BaseEventLoop.create_connection
     real_loop_getaddrinfo = asyncio.base_events.BaseEventLoop.getaddrinfo
 
@@ -305,7 +310,7 @@ def socket_guard(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
         guard.check("socket.getaddrinfo", host)
-        return real_getaddrinfo(host, *args, **kwargs)
+        return guard.resolve(host, *args, **kwargs)
 
     async def loop_create_connection(
         self: Any, protocol_factory: Any, host: Any = None, *args: Any, **kwargs: Any
@@ -614,7 +619,12 @@ async def test_the_socket_guard_refuses_and_records_every_non_loopback_surface(
 ) -> None:
     """AC25 groundwork: each patched surface refuses a public target before
     any packet leaves, and records it; a loopback target is not recorded.
-    The record is emptied at the end so teardown judges only the module."""
+    The record is emptied at the end so teardown judges only the module.
+
+    AC33 (R9, plan P15e): the loopback lookup still crosses both patched
+    resolution surfaces (the loop's, then the module's in the executor), but
+    the resolver behind them answers in-process — a real lookup is a socket
+    entry point the suite-wide guard refuses."""
 
     loop = asyncio.get_running_loop()
     with pytest.raises(GuardViolation):
@@ -641,7 +651,16 @@ async def test_the_socket_guard_refuses_and_records_every_non_loopback_surface(
         "socket.connect",
         "socket.connect_ex",
     ]
-    assert await loop.getaddrinfo("127.0.0.1", 1) and len(socket_guard.attempts) == 6
+    resolved: list[Any] = []
+    answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 1))]
+
+    def resolve(host: Any, *args: Any, **kwargs: Any) -> Any:
+        resolved.append(host)
+        return answer
+
+    socket_guard.resolve = resolve
+    assert await loop.getaddrinfo("127.0.0.1", 1) == answer
+    assert resolved == ["127.0.0.1"] and len(socket_guard.attempts) == 6
     socket_guard.attempts.clear()
 
 

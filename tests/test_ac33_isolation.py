@@ -4,9 +4,10 @@
 socket or starting a process raises, except the event loop's own wakeup pair.
 These tests run under it, so each refusal below is the guard's, and the
 ``asyncio.run`` that succeeds proves the self-pipe exception holds on this
-interpreter. The transitional ledger ``AC33_PENDING`` is checked against the
-collected suite (no stale entry) and against :data:`AC33_PROBE`, the probe's
-list as committed at ``7782e5f`` (it never grows). The real-instance trials
+interpreter. The transitional ledger is gone (P15e converted its last node
+and deleted it): :func:`test_the_guard_has_no_ledger` checks no ledger symbol
+or branch is left, and :data:`AC33_PROBE` stays as the probe's list committed
+at ``7782e5f``, the record of the conversion. The real-instance trials
 are exempt only once an operator opts one in, and in the default run none is.
 """
 
@@ -22,17 +23,18 @@ from typing import Any
 
 import pytest
 
+import conftest
 import test_phase2_trials
 import test_phase3_trials
 import test_phase5_trials
-from conftest import AC33_PENDING, ac33_node, trial_opted_in
+from conftest import trial_opted_in
 
 ROOT = Path(__file__).resolve().parent.parent
 
 #: The D8 probe's list, verbatim: every pre-existing node (``file::test``,
 #: parameter suffix stripped) that created a socket other than the event
 #: loop's wakeup pair, or started a process, in a full run at ``7782e5f``.
-#: This list is the ledger's upper bound and is never edited.
+#: This list was the ledger's upper bound and is never edited.
 AC33_PROBE: frozenset[str] = frozenset(
     {
         "tests/test_agentic_loop.py::test_ac31_the_core_and_the_neutral_modules_name_no_platform",
@@ -305,51 +307,44 @@ def test_the_other_process_paths_raise(request: pytest.FixtureRequest) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The transitional ledger
+# No ledger left (P15e)
 # --------------------------------------------------------------------------- #
 
 
-def _defined(entry: str) -> bool:
-    """Whether *entry*'s file defines its test, read from the source."""
+def test_the_guard_has_no_ledger() -> None:
+    """AC33 (R9, plan P15e): the transitional ledger is gone. ``conftest``
+    defines no ``AC33_PENDING`` symbol (nor its node-key helper), its source
+    names none, and the only early, unpatched exit of ``_ac33_isolation`` is
+    the operator's trial opt-in."""
 
-    file_name, *names = entry.split("::")
-    path = ROOT / file_name
-    if not path.is_file() or not names:
-        return False
-    body: list[Any] = ast.parse(path.read_text(encoding="utf-8")).body
-    for index, name in enumerate(names):
-        last = index == len(names) - 1
-        kinds: tuple[type, ...] = (
-            (ast.FunctionDef, ast.AsyncFunctionDef) if last else (ast.ClassDef,)
-        )
-        found = next(
-            (node for node in body if isinstance(node, kinds) and node.name == name), None
-        )
-        if found is None:
-            return False
-        body = found.body
-    return True
-
-
-def test_every_ledger_entry_names_a_collected_test(request: pytest.FixtureRequest) -> None:
-    """No stale entry: each one is a node this session collected — or, for a
-    file this session did not collect, a test its source defines."""
-
-    collected = {ac33_node(item.nodeid) for item in request.session.items}
-    collected_files = {node.split("::")[0] for node in collected}
-    stale = sorted(
-        entry
-        for entry in AC33_PENDING
-        if (entry not in collected if entry.split("::")[0] in collected_files else not _defined(entry))
-    )
-    assert stale == []
+    assert not hasattr(conftest, "AC33_PENDING")
+    assert not hasattr(conftest, "ac33_node")
+    source = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+    assert "AC33_PENDING" not in source
+    (fixture,) = [
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_ac33_isolation"
+    ]
+    exits = [
+        node
+        for node in ast.walk(fixture)
+        if isinstance(node, ast.If) and any(isinstance(item, ast.Return) for item in node.body)
+    ]
+    assert len(exits) == 1
+    (condition,) = exits
+    assert isinstance(condition.test, ast.Call)
+    assert isinstance(condition.test.func, ast.Name)
+    assert condition.test.func.id == "trial_opted_in"
 
 
-def test_the_ledger_never_grows_past_the_probe() -> None:
+def test_the_probe_list_is_the_committed_record() -> None:
+    """The D8 probe's list stays as committed at ``7782e5f`` (the phase
+    summary's conversion list); every node on it now runs under the guard."""
+
     assert len(AC33_PROBE) == 164
     assert len({entry.split("::")[0] for entry in AC33_PROBE}) == 24
-    assert AC33_PENDING <= AC33_PROBE
-    assert all(entry == ac33_node(entry) for entry in AC33_PROBE)
+    assert all("[" not in entry for entry in AC33_PROBE)
     assert all(entry.startswith("tests/test_") and "::" in entry for entry in AC33_PROBE)
 
 

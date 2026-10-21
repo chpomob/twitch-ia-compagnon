@@ -1,42 +1,55 @@
-"""Two real processes on loopback: brain and PC agent (R6, R7; AC39).
+"""Brain and PC agent on one in-memory link, from the shipped profiles (R6, R7; AC39).
 
-Both are ``python -m core.main --config <tmp>`` children of the test — the
-brain under a profile derived from ``config.server.yaml.example`` (the chat
-input replaced by the ``fakeplatform`` fixture, whose scripted ``feed`` fires
-on every ``agent.status`` the paired agent sends; TLS removed for a loopback
-listener; the model endpoint pointed at a fake Chat Completions server run in
-this process; the audit written to a temp file; ``modules_directory`` a temp
-copy of the shipped and fixture modules, plan decision 7) and the agent under
-a profile derived from ``agent.yaml.example`` (``ws://127.0.0.1:<port>``, a
-``file`` source for the end-to-end scenarios and a ``gated`` ``command``
-source whose helper answers to a loopback gate this test owns).
+Both runtimes are ``core.main.run`` over a profile file, in this test's event
+loop — the brain under a profile derived from ``config.server.yaml.example``
+(the chat input replaced by the ``fakeplatform`` fixture, whose scripted
+``feed`` fires on every ``agent.status`` the paired agent sends; TLS removed
+for a loopback listener; the model endpoint answered by a fake Chat
+Completions session; the audit written to a temp file; ``modules_directory``
+a temp copy of the shipped and fixture modules, plan decision 7) and the agent
+under a profile derived from ``agent.yaml.example`` (``ws://127.0.0.1:<port>``,
+a ``file`` source for the end-to-end scenarios and a ``gated`` ``command``
+source whose program this test holds).
 
-**The capture gate.** The ``gated`` helper connects to a TCP gate server of
-this process as soon as the agent's capture provider starts it — that
-connection is the *capture-start acknowledgement* — then blocks reading one
-byte. On a byte it writes the PNG to its stdout, tells the gate ``D`` and
-exits 0; on EOF it exits 1 having written nothing. The test therefore holds
-a ``screen.capture`` in flight for exactly as long as it wants, kills the
-agent only after the acknowledgement, and releases the orphaned helper by
-half-closing the gate afterwards (in a ``finally``, so a failing test leaves
-no child behind). What the helper sent before EOF makes the kill
+Phase 8 (R9, AC33, plan P15e) supersedes the two ``python -m core.main``
+children on loopback: no test opens a socket or starts a process. Each
+profile's file is loaded by the real entry point, which activates and starts
+its modules through the real loader and phase coordinator; the edges the
+process cannot own are the seams the modules already have, injected into the
+loaded configuration. The brain's ``proxy`` listens through its
+``_server_factory`` seam: every dial is a :class:`MemoryWebSocketPair` whose
+server end the listener's own connection handler serves, the way
+``tests/test_proxy.py`` joins them. The agent's ``agent_link`` dials through
+its ``_connector`` seam, once per runtime — a runtime that lost its link
+does not dial again — and the ``gated`` source's program runs through the
+capture module's ``_subprocess_runner`` seam. What is lost — that two
+operating-system processes cooperate — is named in the phase summary as an
+in-process topology (D8).
+
+**The capture gate.** The gated program reports to :class:`CaptureGate` as
+soon as the agent's capture provider starts it — that report is the
+*capture-start acknowledgement* — then waits. Released with a byte, it writes
+the PNG to its stdout, tells the gate ``D`` and exits 0; released with EOF it
+exits 1 having written nothing; it dies, having written nothing, with an agent
+that is killed. The test therefore holds a ``screen.capture``
+in flight for exactly as long as it wants and kills the agent only after the
+acknowledgement. What the program sent before EOF makes the kill
 deterministic rather than vacuous: ``D`` before the kill would mean the
-capture completed first, and the test fails on it.
+capture completed first, and the test fails on it. A kill is what ``SIGKILL``
+does to the agent: its link is lost abruptly (no close handshake, close code
+1006) and its runtime is cancelled.
 
-**What is waited on.** Readiness through each process's ``ready`` line; the
-run's progress through the model requests the fake server answers (the
+**What is waited on.** Readiness through each runtime's ``ready`` report; the
+run's progress through the model requests the fake session answers (the
 brain's own transcript, tool results and image parts included); the capture
-start through the gate; pairing refusals through the agent's stderr and a
-direct dial; and the processes' exits. Every wait is a bounded
+start through the gate; pairing refusals through the agent's diagnostics and
+a direct dial; and the runtimes' returns. Every wait is a bounded
 ``asyncio.wait_for``; there is no sleep. The brain's audit file — every bus
 event, the agent's ``agent.status`` events and the proxy's readiness
-transitions included — is read once both processes have exited on
-``SIGTERM``, complete: the pairings, the attachment reference (never a
-path), the ``error proxy_disconnected`` observation of the killed capture
-and the readiness transitions around it are asserted there.
-
-The module skips itself, naming the reason, when no free loopback port can
-be bound.
+transitions included — is read once both runtimes have returned on their
+stop, complete: the pairings, the attachment reference (never a path), the
+``error proxy_disconnected`` observation of the killed capture and the
+readiness transitions around it are asserted there.
 """
 
 from __future__ import annotations
@@ -46,10 +59,7 @@ import base64
 import json
 import os
 import shutil
-import signal
-import socket
 import sys
-import textwrap
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -57,8 +67,8 @@ from typing import Any
 import pytest
 import yaml
 
+import core.main as application
 from core.contracts import (
-    PROBE_TOOL,
     PROXY_CLOSE_AUTH_FAILED,
     PROXY_ERROR_AUTH_FAILED,
     PROXY_ERROR_PROXY_DISCONNECTED,
@@ -69,11 +79,16 @@ from core.contracts import (
     TRACE_MODULE_DEGRADED,
     TRACE_MODULE_READY,
 )
-from conftest import final, is_probe_request, png_bytes, tool_call
-
-
-aiohttp = pytest.importorskip("aiohttp")
-from aiohttp import WSMsgType, web  # noqa: E402  (after the import-or-skip)
+from conftest import (
+    WS_ABNORMAL_CLOSURE,
+    FakeResponse,
+    FakeSession,
+    MemoryWebSocketPair,
+    WSMsgType,
+    final,
+    png_bytes,
+    tool_call,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -82,11 +97,15 @@ AGENT_PROFILE = ROOT / "agent.yaml.example"
 FIXTURE_MODULES = ROOT / "tests" / "fixtures" / "modules"
 
 #: The bound of every wait (plan P22): generous next to the runs, far under
-#: the brain's ``total_run_seconds`` (60) and the gated helper's
+#: the brain's ``total_run_seconds`` (60) and the gated source's
 #: ``command_timeout_seconds`` (60), so neither budget races the test.
 WAIT_SECONDS = 30.0
 HELPER_TIMEOUT_SECONDS = 60
 LOOPBACK = "127.0.0.1"
+#: The nominal port the proxy listens on: nothing is ever bound.
+PROXY_PORT = 8765
+#: The nominal model endpoint: the brain's session answers it in memory.
+MODEL_ENDPOINT = f"http://{LOOPBACK}:41100/v1/chat/completions"
 
 PLATFORM = "fake"
 CHANNEL = "channel-1"
@@ -114,45 +133,16 @@ API_KEY = "loopback-api-key"
 AGENT_STATUS = "agent.status"
 OBSERVATION_TRACE = "brain.run.observation"
 READY_LINE = "ready"
+#: What a killed runtime returns in place of a status.
+KILLED = "killed"
 
-#: What the gated helper tells the gate once its PNG is on stdout.
+#: What the gated program tells the gate once its PNG is on stdout.
 HELPER_DONE = b"D"
-#: The byte that releases a gated capture.
-HELPER_RELEASE = b"\x01"
-
-HELPER_SCRIPT = textwrap.dedent(
-    """
-    import socket
-    import sys
-
-    gate_port = int(sys.argv[1])
-    png = open(sys.argv[2], "rb").read()
-    with socket.create_connection(("127.0.0.1", gate_port)) as gate:
-        released = gate.recv(1)
-        if not released:
-            sys.exit(1)
-        sys.stdout.buffer.write(png)
-        sys.stdout.buffer.flush()
-        gate.sendall(b"D")
-    sys.exit(0)
-    """
-)
 
 
 # --------------------------------------------------------------------------- #
-# Ports, profiles, modules directory
+# Profiles, modules directory
 # --------------------------------------------------------------------------- #
-
-
-def _free_loopback_port() -> int:
-    """A port the kernel just handed out on loopback, or a skip naming why."""
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind((LOOPBACK, 0))
-            return int(probe.getsockname()[1])
-    except OSError as exc:
-        pytest.skip(f"no free loopback port can be bound: {exc}")
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -193,7 +183,7 @@ def _brain_profile(
 
     ``twitch`` becomes ``fakeplatform`` (its feed fires on ``agent.status``);
     the served channel's trigger policy and the four grants move to
-    platform ``fake``; the brain's endpoint is the fake model server; the
+    platform ``fake``; the brain's endpoint is the fake model session; the
     audit goes to a file; the proxy listens on loopback without TLS. The
     budgets, limits and the delivery list are the profile's own.
     """
@@ -263,7 +253,6 @@ def _agent_profile(
     agent_id: str,
     png_path: Path,
     helper_path: Path,
-    gate_port: int,
 ) -> Path:
     """``agent.yaml.example`` as the agent of this trial runs it: two
     capture sources — ``file`` (default) and the gated ``command`` — and the
@@ -293,7 +282,7 @@ def _agent_profile(
             SOURCE_FILE: {"kind": "file", "path": str(png_path)},
             SOURCE_GATED: {
                 "kind": "command",
-                "argv": [sys.executable, str(helper_path), str(gate_port), str(png_path)],
+                "argv": [sys.executable, str(helper_path), str(png_path)],
                 "command_timeout_seconds": HELPER_TIMEOUT_SECONDS,
             },
         },
@@ -312,7 +301,7 @@ def _agent_profile(
 
 
 # --------------------------------------------------------------------------- #
-# The fake model server (Chat Completions shape, decision 2)
+# The fake model session (Chat Completions shape, decision 2)
 # --------------------------------------------------------------------------- #
 
 
@@ -358,7 +347,7 @@ def _image_parts(body: Mapping[str, Any]) -> list[bytes]:
     return images
 
 
-class FakeModelServer:
+class FakeModel(FakeSession):
     """The brain's backend: probes answered with the forced tool call,
     scenario requests scripted by viewer message and by turn.
 
@@ -367,43 +356,33 @@ class FakeModelServer:
     :data:`MESSAGE_GATED` — then answer :data:`FINAL_TEXT`, whatever the
     second observation was. Every scenario request body is put on
     ``requests`` once answered, so the test awaits the run's progress on a
-    bounded ``get``.
+    bounded ``get``; one no script answers is a 500, kept in ``unscripted``.
     """
 
     def __init__(self) -> None:
+        super().__init__()
         self.requests: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self.probes: list[dict[str, Any]] = []
         self.unscripted: list[dict[str, Any]] = []
-        self._runner: web.AppRunner | None = None
-        self.endpoint = ""
+        self.urls: set[str] = set()
 
-    async def start(self) -> None:
-        app = web.Application()
-        app.router.add_post("/{tail:.*}", self._handle)
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, LOOPBACK, 0)
-        await site.start()
-        server = getattr(site, "_server", None)
-        assert server is not None and server.sockets
-        port = server.sockets[0].getsockname()[1]
-        self.endpoint = f"http://{LOOPBACK}:{port}/v1/chat/completions"
+    @property
+    def probes(self) -> list[dict[str, Any]]:
+        return self.probe_calls
 
-    async def close(self) -> None:
-        if self._runner is not None:
-            await self._runner.cleanup()
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.urls.add(url)
+        return await super().post(url, **kwargs)
 
-    async def _handle(self, request: web.Request) -> web.Response:
-        body = await request.json()
-        if is_probe_request(body):
-            self.probes.append(body)
-            return web.json_response(tool_call(PROBE_TOOL, {"ok": True}))
+    async def _answer(self, url: str, kwargs: dict[str, Any]) -> Any:
+        body = kwargs.get("json")
+        assert isinstance(body, Mapping)
+        self.post_calls.append({"url": url, **kwargs})
         reply = self._script(body)
         if reply is None:
-            self.unscripted.append(body)
-            return web.Response(status=500, text="unscripted request")
-        await self.requests.put(body)
-        return web.json_response(reply)
+            self.unscripted.append(dict(body))
+            return FakeResponse(500, "unscripted request")
+        await self.requests.put(dict(body))
+        return FakeResponse(200, reply)
 
     @staticmethod
     def _script(body: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -432,178 +411,225 @@ class FakeModelServer:
 # --------------------------------------------------------------------------- #
 
 
+class GatedCapture:
+    """One start of the gated program: held until :meth:`release`."""
+
+    def __init__(self, argv: list[str], png: bytes) -> None:
+        self.argv = argv
+        self._png = png
+        self.outcome: asyncio.Future[tuple[int, bytes]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        #: What the program told the gate before it exited.
+        self.sent = b""
+
+    def release(self, *, byte: bool) -> bytes:
+        """End this capture and return what the program sent before it
+        exited: with *byte* it writes its PNG and reports ``D``; without, EOF
+        makes it exit 1 having sent nothing. A program whose capture was
+        abandoned (its agent killed) sends nothing either way."""
+
+        if not self.outcome.done():
+            if byte:
+                self.outcome.set_result((0, self._png))
+                self.sent = HELPER_DONE
+            else:
+                self.outcome.set_result((1, b""))
+        return self.sent
+
+    def abandon(self) -> None:
+        """The program dies with its killed agent: the run of it ends
+        interrupted, having sent nothing more."""
+
+        self.outcome.cancel()
+
+
 class CaptureGate:
-    """The loopback server the gated helper connects to when it starts."""
+    """Where the gated program reports its start: the capture module's
+    ``_subprocess_runner`` seam, for the ``gated`` source's argv only."""
 
-    def __init__(self) -> None:
-        self.connections: asyncio.Queue[
-            tuple[asyncio.StreamReader, asyncio.StreamWriter]
-        ] = asyncio.Queue()
-        self._server: asyncio.AbstractServer | None = None
-        self.port = 0
+    def __init__(self, gated_argv: list[str], png: bytes) -> None:
+        self.gated_argv = gated_argv
+        self._png = png
+        self.starts: asyncio.Queue[GatedCapture] = asyncio.Queue()
 
-    async def start(self) -> None:
-        self._server = await asyncio.start_server(self._accept, LOOPBACK, 0)
-        self.port = self._server.sockets[0].getsockname()[1]
+    async def runner(self, argv: Any, *, limit: int) -> tuple[int | None, bytes]:
+        assert list(argv) == self.gated_argv, argv
+        capture = GatedCapture(list(argv), self._png)
+        await self.starts.put(capture)
+        code, data = await capture.outcome
+        assert len(data) <= limit
+        return code, data
 
-    async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-
-    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await self.connections.put((reader, writer))
-
-    async def acknowledged(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def acknowledged(self) -> GatedCapture:
         """The next capture-start acknowledgement, bounded."""
 
-        return await asyncio.wait_for(self.connections.get(), WAIT_SECONDS)
-
-    @staticmethod
-    async def release(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, byte: bool
-    ) -> bytes:
-        """End one gated capture and return what the helper sent before it
-        exited: with *byte* the helper writes its PNG and reports ``D``;
-        without, the half-close is its EOF and it exits having sent nothing.
-        Either way the helper is gone once EOF comes back."""
-
-        try:
-            if byte:
-                writer.write(HELPER_RELEASE)
-                await writer.drain()
-            writer.write_eof()
-            return await asyncio.wait_for(reader.read(), WAIT_SECONDS)
-        finally:
-            writer.close()
+        return await asyncio.wait_for(self.starts.get(), WAIT_SECONDS)
 
 
 # --------------------------------------------------------------------------- #
-# The processes
+# The link: the proxy's listener and the agents' dials
 # --------------------------------------------------------------------------- #
 
 
-class _Stream:
-    """One captured output stream: every line kept, waiters resolved as
-    lines arrive, so a wait on a line is a bounded await and no sleep."""
+class Listener:
+    """What the brain proxy's ``_server_factory`` seam opens: the handler of
+    every connection, served on the server end of one in-memory pair."""
 
-    def __init__(self, reader: asyncio.StreamReader) -> None:
-        self.lines: list[str] = []
-        self._eof = False
-        self._waiters: list[tuple[Callable[[str], bool], asyncio.Future[str]]] = []
-        self._task = asyncio.ensure_future(self._pump(reader))
+    def __init__(self) -> None:
+        self.handler: Callable[[Any], Any] | None = None
+        self.listening: dict[str, Any] = {}
+        self.closed = False
+        self._served: list[asyncio.Task[Any]] = []
 
-    async def _pump(self, reader: asyncio.StreamReader) -> None:
-        try:
-            while True:
-                raw = await reader.readline()
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip("\n")
-                self.lines.append(line)
-                for predicate, future in list(self._waiters):
-                    if not future.done() and predicate(line):
-                        future.set_result(line)
-                self._waiters = [(p, f) for p, f in self._waiters if not f.done()]
-        finally:
-            self._eof = True
-            for _predicate, future in self._waiters:
-                if not future.done():
-                    future.set_exception(EOFError("stream closed before the line arrived"))
-            self._waiters.clear()
+    async def factory(self, handler: Any, **kwargs: Any) -> Listener:
+        assert self.handler is None
+        self.handler = handler
+        self.listening = dict(kwargs)
+        return self
 
-    async def line(self, predicate: Callable[[str], bool]) -> str:
-        for existing in self.lines:
-            if predicate(existing):
-                return existing
-        if self._eof:
-            raise EOFError("stream closed before the line arrived")
-        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._waiters.append((predicate, future))
-        return await asyncio.wait_for(future, WAIT_SECONDS)
+    async def stop(self) -> None:
+        self.handler = None
 
-    async def drained(self) -> None:
-        await self._task
+    async def close(self) -> None:
+        self.closed = True
 
-    def cancel(self) -> None:
-        self._task.cancel()
+    def dial(self) -> MemoryWebSocketPair:
+        assert self.handler is not None, "the brain is not listening"
+        pair = MemoryWebSocketPair()
+        self._served.append(asyncio.ensure_future(self.handler(pair.server)))
+        return pair
+
+    async def settle(self) -> None:
+        for task in self._served:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*self._served, return_exceptions=True)
 
 
-class Process:
-    """One ``python -m core.main --config <profile>`` child."""
+class Runtime:
+    """One ``core.main.run`` over a profile file, in this event loop.
+
+    The seams of each module are added to the configuration the entry point
+    loads (:func:`inject_seams`). ``diagnostics`` collects every line the
+    entry point and the modules given a reporter print.
+    """
 
     def __init__(self, name: str, profile: Path, environ: Mapping[str, str]) -> None:
         self.name = name
         self.profile = profile
         self.environ = dict(environ)
-        self.process: asyncio.subprocess.Process | None = None
-        self.stdout: _Stream | None = None
-        self.stderr: _Stream | None = None
+        self.diagnostics: list[str] = []
+        self.task: asyncio.Task[int] | None = None
+        self.pair: MemoryWebSocketPair | None = None
+        self._stop = asyncio.Event()
+        self._ready = asyncio.Event()
+        self._changed = asyncio.Event()
+
+    def report(self, line: str) -> None:
+        self.diagnostics.append(line)
+        self._changed.set()
+
+    def ready_reporter(self, line: str) -> None:
+        assert line == READY_LINE, line
+        self._ready.set()
 
     async def start(self) -> None:
-        self.process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "core.main",
-            "--config",
-            str(self.profile),
-            cwd=str(ROOT),
-            env=self.environ,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        self.task = asyncio.ensure_future(
+            application.run(
+                self.profile,
+                self._stop,
+                environ=self.environ,
+                ready_reporter=self.ready_reporter,
+                diagnostic_reporter=self.report,
+            )
         )
-        assert self.process.stdout is not None and self.process.stderr is not None
-        self.stdout = _Stream(self.process.stdout)
-        self.stderr = _Stream(self.process.stderr)
 
     async def ready(self) -> None:
-        assert self.stdout is not None
-        await self.stdout.line(lambda line: line == READY_LINE)
+        assert self.task is not None
+        waiter = asyncio.ensure_future(self._ready.wait())
+        await asyncio.wait(
+            {waiter, self.task}, timeout=WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED
+        )
+        waiter.cancel()
+        assert self._ready.is_set(), self.describe()
 
     async def diagnostic(self, needle: str) -> str:
-        assert self.stderr is not None
-        return await self.stderr.line(lambda line: needle in line)
+        async def found() -> str:
+            while True:
+                for line in self.diagnostics:
+                    if needle in line:
+                        return line
+                self._changed.clear()
+                await self._changed.wait()
+
+        return await asyncio.wait_for(found(), WAIT_SECONDS)
+
+    async def connect(self, listener: Listener) -> Any:
+        """The agent link's ``_connector``: one dial per runtime. A runtime
+        whose link was lost does not reach the brain again."""
+
+        if self.pair is not None:
+            await asyncio.Event().wait()
+        self.pair = listener.dial()
+        return self.pair.client
 
     @property
     def alive(self) -> bool:
-        return self.process is not None and self.process.returncode is None
+        return self.task is not None and not self.task.done()
 
     def kill(self) -> None:
-        assert self.process is not None
-        self.process.send_signal(signal.SIGKILL)
+        """What ``SIGKILL`` does: the link is lost abruptly, the runtime ends."""
 
-    async def exited(self) -> int:
-        assert self.process is not None and self.stdout is not None and self.stderr is not None
-        code = await asyncio.wait_for(self.process.wait(), WAIT_SECONDS)
-        drained = asyncio.gather(self.stdout.drained(), self.stderr.drained())
-        await asyncio.wait_for(drained, WAIT_SECONDS)
-        return code
+        assert self.task is not None and self.pair is not None
+        self.pair.drop()
+        self.task.cancel()
 
-    async def terminate(self) -> int:
-        assert self.process is not None
-        self.process.send_signal(signal.SIGTERM)
+    async def exited(self) -> int | str:
+        assert self.task is not None
+        try:
+            return await asyncio.wait_for(asyncio.shield(self.task), WAIT_SECONDS)
+        except asyncio.CancelledError:
+            if self.task.cancelled():
+                return KILLED
+            raise
+
+    async def terminate(self) -> int | str:
+        self._stop.set()
         return await self.exited()
 
     async def reap(self) -> None:
-        """Last resort for a failing test: kill and reap whatever is left."""
+        """Last resort for a failing test: end whatever is left."""
 
-        if self.process is None:
+        if self.task is None or self.task.done():
             return
-        if self.process.returncode is None:
-            try:
-                self.process.kill()
-            except ProcessLookupError:
-                pass
-            await self.process.wait()
-        for stream in (self.stdout, self.stderr):
-            if stream is not None:
-                stream.cancel()
+        self._stop.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(self.task), WAIT_SECONDS)
+        except BaseException:  # noqa: BLE001 - reaping must not mask the failure
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
 
-    def report(self) -> str:
-        out = "\n".join(self.stdout.lines if self.stdout else ())
-        err = "\n".join(self.stderr.lines if self.stderr else ())
-        return f"[{self.name} stdout]\n{out}\n[{self.name} stderr]\n{err}"
+    def describe(self) -> str:
+        return f"[{self.name} diagnostics]\n" + "\n".join(self.diagnostics)
+
+
+def inject_seams(
+    monkeypatch: pytest.MonkeyPatch, seams: dict[Path, Callable[[], dict[str, dict[str, Any]]]]
+) -> None:
+    """Add each profile's module seams to the configuration ``core.main``
+    loads from it: the file is read and validated as before, then the seams
+    the process could not own are set on the loaded modules."""
+
+    real_load_config = application.load_config
+
+    def load_with_seams(path: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        config = real_load_config(path, *args, **kwargs)
+        for module, settings in seams[Path(path)]().items():
+            config["modules"][module].update(settings)
+        return config
+
+    monkeypatch.setattr(application, "load_config", load_with_seams)
 
 
 # --------------------------------------------------------------------------- #
@@ -644,32 +670,32 @@ def _string_leaves(value: Any) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-async def _dial_with_wrong_token(brain_url: str) -> tuple[dict[str, Any], int | None]:
-    """``hello`` with the wrong token over the real transport: the ``error``
-    frame received and the close code the brain closed with."""
+async def _dial_with_wrong_token(listener: Listener) -> tuple[dict[str, Any], int | None]:
+    """``hello`` with the wrong token over the listener's own connection
+    handler: the ``error`` frame received and the close code the brain
+    closed with."""
 
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(brain_url) as ws:
-            await ws.send_str(
-                json.dumps(
-                    {
-                        "v": PROXY_PROTOCOL_VERSION,
-                        "type": FRAME_HELLO,
-                        "id": "nonce-intruder",
-                        "agent_id": INTRUDER_ID,
-                        "token": WRONG_TOKEN,
-                        "actions": [],
-                        "max_frame_bytes": 1048576,
-                    }
-                )
-            )
-            message = await asyncio.wait_for(ws.receive(), WAIT_SECONDS)
-            assert message.type == WSMsgType.TEXT, message
-            error = json.loads(message.data)
-            closing = await asyncio.wait_for(ws.receive(), WAIT_SECONDS)
-            assert closing.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED), closing
-            await asyncio.wait_for(ws.close(), WAIT_SECONDS)
-            return error, ws.close_code
+    ws = listener.dial().client
+    await ws.send_str(
+        json.dumps(
+            {
+                "v": PROXY_PROTOCOL_VERSION,
+                "type": FRAME_HELLO,
+                "id": "nonce-intruder",
+                "agent_id": INTRUDER_ID,
+                "token": WRONG_TOKEN,
+                "actions": [],
+                "max_frame_bytes": 1048576,
+            }
+        )
+    )
+    message = await asyncio.wait_for(ws.receive(), WAIT_SECONDS)
+    assert message.type == WSMsgType.TEXT, message
+    error = json.loads(message.data)
+    closing = await asyncio.wait_for(ws.receive(), WAIT_SECONDS)
+    assert closing.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED), closing
+    await asyncio.wait_for(ws.close(), WAIT_SECONDS)
+    return error, ws.close_code
 
 
 # --------------------------------------------------------------------------- #
@@ -677,46 +703,50 @@ async def _dial_with_wrong_token(brain_url: str) -> tuple[dict[str, Any], int | 
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac39_two_process_topology_over_loopback(tmp_path: Path) -> None:
-    """AC39 (R6, R7): brain and agent as two real processes on loopback.
+async def test_ac39_two_process_topology_over_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC39 (R6, R7): brain and agent from their shipped profiles, on one link.
 
     In order: the brain reports ready (probes answered by the fake model);
-    an agent presenting the wrong token is told ``auth_failed`` (its stderr)
-    and a direct dial with that token is closed 4401; the valid agent pairs,
-    which fires the feed: the ``file`` run completes end to end with the
-    image transferred by reference and reaching the model, then the
+    an agent presenting the wrong token is told ``auth_failed`` (its
+    diagnostics) and a direct dial with that token is closed 4401; the valid
+    agent pairs, which fires the feed: the ``file`` run completes end to end
+    with the image transferred by reference and reaching the model, then the
     ``gated`` run starts its capture — the gate acknowledges, the agent is
     killed with the capture in flight, the run observes ``error
     proxy_disconnected`` and still answers; the agent restarts, pairs again,
     and both runs succeed a second time, the gated capture released through
-    the gate this time; both processes exit 0 on SIGTERM. The audit file
+    the gate this time; both runtimes return 0 on their stop. The audit file
     then shows the two pairings, the readiness transitions, the attachment
     references and never a path.
+
+    Phase 8 (R9, AC33, plan P15e): the two runtimes run in this event loop,
+    joined by in-memory pairs (see the module docstring); the assertions are
+    the two-process ones.
     """
 
-    proxy_port = _free_loopback_port()
-    brain_url = f"ws://{LOOPBACK}:{proxy_port}"
+    brain_url = f"ws://{LOOPBACK}:{PROXY_PORT}"
     png = png_bytes(16, 9)
     png_path = tmp_path / "screen.png"
     png_path.write_bytes(png)
+    # The gated source's program: named in the profile, never executed.
     helper_path = tmp_path / "gated_capture.py"
-    helper_path.write_text(HELPER_SCRIPT, encoding="utf-8")
     audit_path = tmp_path / "audit.jsonl"
     modules_directory = _modules_directory(tmp_path / "modules")
 
-    model = FakeModelServer()
-    gate = CaptureGate()
-    processes: list[Process] = []
-    gated: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
+    model = FakeModel()
+    gate = CaptureGate([sys.executable, str(helper_path), str(png_path)], png)
+    listener = Listener()
+    runtimes: list[Runtime] = []
+    gated: GatedCapture | None = None
 
     try:
-        await model.start()
-        await gate.start()
         brain_profile = _brain_profile(
             tmp_path / "brain.yaml",
             modules_directory=modules_directory,
-            model_endpoint=model.endpoint,
-            proxy_port=proxy_port,
+            model_endpoint=MODEL_ENDPOINT,
+            proxy_port=PROXY_PORT,
             audit_path=audit_path,
         )
 
@@ -728,34 +758,62 @@ async def test_ac39_two_process_topology_over_loopback(tmp_path: Path) -> None:
                 agent_id=agent_id,
                 png_path=png_path,
                 helper_path=helper_path,
-                gate_port=gate.port,
             )
 
         base_environ = {
             key: value for key, value in os.environ.items() if key != TOKEN_VARIABLE
         }
-        base_environ["PYTHONUNBUFFERED"] = "1"
         valid_environ = {**base_environ, TOKEN_VARIABLE: PAIRING_TOKEN}
         wrong_environ = {**base_environ, TOKEN_VARIABLE: WRONG_TOKEN}
 
-        brain = Process("brain", brain_profile, valid_environ)
-        intruder = Process("intruder", agent_profile("intruder.yaml", INTRUDER_ID), wrong_environ)
-        agent = Process("agent", agent_profile("agent.yaml", AGENT_ID), valid_environ)
-        restarted = Process("agent-restarted", agent.profile, valid_environ)
-        processes.extend((brain, intruder, agent, restarted))
+        brain = Runtime("brain", brain_profile, valid_environ)
+        intruder = Runtime("intruder", agent_profile("intruder.yaml", INTRUDER_ID), wrong_environ)
+        agent = Runtime("agent", agent_profile("agent.yaml", AGENT_ID), valid_environ)
+        restarted = Runtime("agent-restarted", tmp_path / "agent-restarted.yaml", valid_environ)
+        shutil.copyfile(agent.profile, restarted.profile)
+        runtimes.extend((brain, intruder, agent, restarted))
+        agents = {runtime.profile: runtime for runtime in (intruder, agent, restarted)}
+
+        def brain_seams() -> dict[str, dict[str, Any]]:
+            return {
+                "brain": {"_session_factory": lambda: model},
+                "proxy": {
+                    "_server_factory": listener.factory,
+                    "diagnostic_reporter": brain.report,
+                },
+            }
+
+        def agent_seams(runtime: Runtime) -> Callable[[], dict[str, dict[str, Any]]]:
+            return lambda: {
+                "capture": {"_subprocess_runner": gate.runner},
+                "agent_link": {
+                    "_connector": lambda url, **kwargs: runtime.connect(listener),
+                    "diagnostic_reporter": runtime.report,
+                },
+            }
+
+        inject_seams(
+            monkeypatch,
+            {
+                brain.profile: brain_seams,
+                **{profile: agent_seams(runtime) for profile, runtime in agents.items()},
+            },
+        )
 
         # -- the brain: ready once both probes are answered ---------------- #
         await brain.start()
         await brain.ready()
-        assert len(model.probes) == 2, brain.report()
+        assert len(model.probes) == 2, brain.describe()
+        assert listener.listening["host"] == LOOPBACK and listener.listening["port"] == PROXY_PORT
+        assert listener.listening["ssl_context"] is None
 
-        # -- invalid token: auth_failed on the agent's stderr, close 4401 -- #
+        # -- invalid token: auth_failed in the agent's diagnostics, 4401 --- #
         await intruder.start()
         await intruder.ready()
         refused = await intruder.diagnostic(PROXY_ERROR_AUTH_FAILED)
         assert WRONG_TOKEN not in refused and PAIRING_TOKEN not in refused
-        assert await intruder.terminate() == 0, intruder.report()
-        error, close_code = await _dial_with_wrong_token(brain_url)
+        assert await intruder.terminate() == 0, intruder.describe()
+        error, close_code = await _dial_with_wrong_token(listener)
         assert error["type"] == FRAME_ERROR and error["code"] == PROXY_ERROR_AUTH_FAILED
         assert error["id"] == "nonce-intruder"
         assert close_code == PROXY_CLOSE_AUTH_FAILED == 4401
@@ -785,15 +843,19 @@ async def test_ac39_two_process_topology_over_loopback(tmp_path: Path) -> None:
         gated_second = await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         assert _current_message_id(gated_second) == MESSAGE_GATED
         gated = await gate.acknowledged()
-        assert model.requests.empty()
+        assert model.requests.empty(), [
+            (_current_message_id(body), len(_tool_messages(body)), body["messages"][-1])
+            for body in model.requests._queue  # type: ignore[attr-defined]
+        ]
         assert agent.alive
         agent.kill()
-        assert await agent.exited() == -signal.SIGKILL
-        reader, writer = gated
-        gated = None
-        # EOF releases the orphaned helper; what it sent first is the proof
-        # the capture had not completed before the kill.
-        assert await CaptureGate.release(reader, writer, byte=False) == b""
+        gated.abandon()
+        assert await agent.exited() == KILLED
+        assert agent.pair is not None and agent.pair.server.close_code == WS_ABNORMAL_CLOSURE
+        killed, gated = gated, None
+        # What the abandoned program sent before it died is the proof the
+        # capture had not completed before the kill.
+        assert killed.release(byte=False) == b""
         gated_third = await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         assert _current_message_id(gated_third) == MESSAGE_GATED
         disconnected = _tool_envelope(gated_third, 1)
@@ -819,32 +881,27 @@ async def test_ac39_two_process_topology_over_loopback(tmp_path: Path) -> None:
         assert _current_message_id(again_gated_first) == f"{MESSAGE_GATED}#2"
         await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         gated = await gate.acknowledged()
-        reader, writer = gated
-        gated = None
-        assert await CaptureGate.release(reader, writer, byte=True) == HELPER_DONE
+        released, gated = gated, None
+        assert released.release(byte=True) == HELPER_DONE
         again_gated_third = await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         assert _current_message_id(again_gated_third) == f"{MESSAGE_GATED}#2"
-        released = _tool_envelope(again_gated_third, 1)
-        assert released["status"] == "success", released
-        assert released["result"]["source"] == SOURCE_GATED
+        released_result = _tool_envelope(again_gated_third, 1)
+        assert released_result["status"] == "success", released_result
+        assert released_result["result"]["source"] == SOURCE_GATED
         assert _image_parts(again_gated_third) == [png]
 
-        # -- both exit 0 on SIGTERM ---------------------------------------- #
-        assert await restarted.terminate() == 0, restarted.report()
-        assert await brain.terminate() == 0, brain.report()
+        # -- both return 0 on their stop ----------------------------------- #
+        assert await restarted.terminate() == 0, restarted.describe()
+        assert await brain.terminate() == 0, brain.describe()
         assert model.unscripted == []
         assert model.requests.empty()
+        assert model.urls == {MODEL_ENDPOINT}
     finally:
         if gated is not None:
-            reader, writer = gated
-            try:
-                await CaptureGate.release(reader, writer, byte=False)
-            except Exception:
-                pass
-        for process in processes:
-            await process.reap()
-        await gate.close()
-        await model.close()
+            gated.release(byte=False)
+        for runtime in runtimes:
+            await runtime.reap()
+        await listener.settle()
 
     # -- the audit file, complete once the brain exited --------------------- #
     records = _audit_records(audit_path)

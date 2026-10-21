@@ -61,8 +61,8 @@ regardless of which component incremented (R8, AC28).
 Phase 8 (P1) adds a recorded random source (:class:`RecordedRandom`) and the
 autouse guard ``_ac33_isolation``: under it, creating a socket (the event
 loop's own wakeup pair excepted) or starting a process raises, for every test
-of the suite but the nodes of the shrinking ``AC33_PENDING`` ledger and an
-operator-opted-in real-instance trial. P15a adds the in-process readers of
+of the suite but an operator-opted-in real-instance trial (P15e deleted the
+transitional ledger once its last node was converted). P15a adds the in-process readers of
 repository facts that replace ``grep``, ``git`` and child interpreters:
 :func:`files_containing`, :func:`tracked_files` (the git index read
 directly), :func:`ignored` (the ignore files) and :func:`baseline_numstat`
@@ -81,7 +81,10 @@ P15d adds :class:`WebSocketEndpoints`, nominal WebSocket URLs served in
 memory to a module that builds its own ``aiohttp.ClientSession``: each
 connect is a :class:`MemoryWebSocketPair` whose client end
 (:class:`MemoryClientWebSocket`) writes through the installed ``aiohttp``
-writer onto an in-memory transport.
+writer onto an in-memory transport. P15e adds :class:`MemorySites`, under
+which ``aiohttp.web.TCPSite`` binds nothing, and :class:`MemoryHTTPConnection`,
+raw client bytes fed to a runner's own server protocol over a recording
+transport, so a shipped listener's HTTP parser and WebSocket reader run.
 
 This file is a single point of failure for every suite that imports it; a
 change here must be reviewed against each consumer, not just the suite that
@@ -3265,6 +3268,149 @@ class _EndpointSession:
 
 
 # --------------------------------------------------------------------------- #
+# A real aiohttp listener's server protocol over in-memory bytes (P15e)
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingServerTransport(asyncio.Transport):
+    """The transport under one :class:`MemoryHTTPConnection`: every byte the
+    server writes is kept; ``close`` loses the connection on the next loop
+    turn, as a socket transport does."""
+
+    def __init__(self, connection: MemoryHTTPConnection) -> None:
+        super().__init__()
+        self._connection = connection
+        self._closing = False
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
+        return default
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    def write(self, data: Any) -> None:
+        self._connection.written += data
+
+    def writelines(self, chunks: Any) -> None:
+        for chunk in chunks:
+            self.write(chunk)
+
+    def pause_reading(self) -> None:
+        return None
+
+    def resume_reading(self) -> None:
+        return None
+
+    def get_write_buffer_size(self) -> int:
+        return 0
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        asyncio.get_running_loop().call_soon(self._connection.protocol.connection_lost, None)
+
+    def abort(self) -> None:
+        self.close()
+
+
+class MemoryHTTPConnection:
+    """One client connection to an ``aiohttp`` server, held in memory (AC33).
+
+    The server's own protocol (``aiohttp.web_protocol.RequestHandler``, built
+    by the runner's ``web.Server``) is connected to a recording transport:
+    :meth:`send` hands it raw bytes exactly as a socket's ``data_received``
+    would — the HTTP parser, the upgrade and the WebSocket reader the
+    response installs all run — and ``written`` is every byte it answered.
+    """
+
+    def __init__(self, server: Any) -> None:
+        self.written = bytearray()
+        self.protocol = server()
+        self.transport = _RecordingServerTransport(self)
+        self.protocol.connection_made(self.transport)
+
+    def send(self, data: bytes) -> None:
+        self.protocol.data_received(data)
+
+    @property
+    def closed(self) -> bool:
+        return self.transport.is_closing()
+
+    def head(self) -> bytes:
+        """The HTTP response head the server wrote, ``b""`` until it has."""
+
+        end = self.written.find(b"\r\n\r\n")
+        return b"" if end < 0 else bytes(self.written[: end + 4])
+
+    def frames(self) -> list[tuple[int, bytes]]:
+        """The WebSocket frames (``(opcode, payload)``) written after the head."""
+
+        head = self.head()
+        buffer = bytes(self.written[len(head) :]) if head else b""
+        frames: list[tuple[int, bytes]] = []
+        while len(buffer) >= 2:
+            length, offset = buffer[1] & 0x7F, 2
+            if length == 126:
+                (length,) = struct.unpack_from("!H", buffer, 2)
+                offset = 4
+            elif length == 127:
+                (length,) = struct.unpack_from("!Q", buffer, 2)
+                offset = 10
+            if len(buffer) < offset + length:
+                break
+            frames.append((buffer[0] & 0x0F, buffer[offset : offset + length]))
+            buffer = buffer[offset + length :]
+        return frames
+
+
+class MemorySites:
+    """``aiohttp.web.TCPSite`` patched to listen nowhere (AC33, P15e).
+
+    :meth:`install` replaces the site class: ``start`` registers the site
+    with its runner as the real one does and keeps the runner, but binds
+    nothing. :meth:`connect` opens a :class:`MemoryHTTPConnection` to the
+    server of the runner listening at ``(host, port)``.
+    """
+
+    def __init__(self) -> None:
+        self.runners: dict[tuple[str, int], Any] = {}
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> MemorySites:
+        from aiohttp import web
+        from aiohttp.web_runner import BaseSite
+
+        sites = self
+
+        class MemorySite(BaseSite):
+            def __init__(self, runner: Any, host: str | None = None, port: int | None = None, **_: Any) -> None:
+                super().__init__(runner)
+                self._host = host or "0.0.0.0"
+                self._port = port or 0
+
+            @property
+            def name(self) -> str:
+                return f"http://{self._host}:{self._port}"
+
+            async def start(self) -> None:
+                await super().start()
+                sites.runners[(self._host, self._port)] = self._runner
+
+            async def stop(self) -> None:
+                sites.runners.pop((self._host, self._port), None)
+                await super().stop()
+
+        monkeypatch.setattr(web, "TCPSite", MemorySite)
+        return self
+
+    def connect(self, host: str, port: int) -> MemoryHTTPConnection:
+        runner = self.runners.get((host, port))
+        if runner is None:
+            raise connector_error(f"http://{host}:{port}")
+        return MemoryHTTPConnection(runner.server)
+
+
+# --------------------------------------------------------------------------- #
 # The YouTube edge (phase 3 P20): a token endpoint and a live-chat API
 # --------------------------------------------------------------------------- #
 
@@ -3720,31 +3866,6 @@ _TRIAL_GATES: dict[str, tuple[str, dict[str, str]]] = {
 }
 _PHASE5_TRIALS = "test_phase5_trials.py"
 
-#: The transitional ledger (D8): the pre-existing nodes the probe at
-#: ``7782e5f`` found opening a socket or starting a process, by node id with
-#: the parameter suffix stripped. It may only shrink: P15a–P15e remove the
-#: nodes they convert and P16 asserts it is empty. Nothing is ever added.
-AC33_PENDING: frozenset[str] = frozenset(
-    {
-        "tests/test_installation_doc.py::test_the_guides_profile_is_accepted_by_the_real_entry_point",
-        "tests/test_installation_doc.py::test_the_readme_config_ui_command_runs",
-        "tests/test_phase5_docs_status.py::test_ac36_the_socket_count_sees_a_local_and_a_network_socket",
-        "tests/test_phase5_docs_status.py::test_ac36_the_trial_file_skips_its_eight_nodes_opening_no_socket",
-        "tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help",
-        "tests/test_proxy_process.py::test_ac39_two_process_topology_over_loopback",
-        "tests/test_proxy.py::test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it",
-        "tests/test_stream_control.py::test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket",
-        "tests/test_web.py::test_the_socket_guard_refuses_and_records_every_non_loopback_surface",
-    }
-)
-
-
-def ac33_node(nodeid: str) -> str:
-    """*nodeid* without its parameter suffix: the ledger's key."""
-
-    return nodeid.split("[", 1)[0]
-
-
 def ownership_rejection_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """AC44 (R3, R1): count input guards, their admissions and rejections.
 
@@ -3827,8 +3948,9 @@ def _ac33_isolation(
 ) -> Any:
     """AC33 (R9, D8): creating a socket or starting a process raises.
 
-    Every test runs under it except a ledger node (until its conversion)
-    and a real-instance trial an operator opted in. ``monkeypatch`` undoes
+    Every test runs under it except a real-instance trial an operator opted
+    in (P15e converted the last node of the transitional ledger and deleted
+    it). ``monkeypatch`` undoes
     every patch after the test. An entry point an enclosing module-wide
     fixture already replaced with its own refusal (``tests/test_config_ui.py``
     asserts its patch is the one installed) is left to that fixture.
@@ -3836,7 +3958,7 @@ def _ac33_isolation(
 
     nodeid = request.node.nodeid
     file_name = Path(str(request.node.path)).name
-    if ac33_node(nodeid) in AC33_PENDING or trial_opted_in(
+    if trial_opted_in(
         file_name, request.module, getattr(request.node, "originalname", request.node.name)
     ):
         yield

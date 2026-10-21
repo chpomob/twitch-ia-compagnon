@@ -320,6 +320,7 @@ from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, RuntimeContext
 from conftest import (
     ManualClock,
+    MemorySites,
     MemoryWebSocketPair,
     WSMsgType,
     events_of,
@@ -1274,24 +1275,53 @@ def test_the_frame_gate_refuses_a_text_frame_above_max_frame_bytes_too() -> None
     assert isinstance(error, _MessageTooBig)
 
 
-async def test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it() -> None:
+#: A client's opening handshake (RFC 6455 §4.1), as raw bytes.
+UPGRADE_REQUEST = (
+    b"GET / HTTP/1.1\r\n"
+    b"Host: 127.0.0.1:8765\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n"
+    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    b"Sec-WebSocket-Version: 13\r\n"
+    b"\r\n"
+)
+
+
+async def test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The shipped ``aiohttp`` listener with ``max_frame_bytes`` 4096 and a
     binary bound of 2048: a 3000-byte text frame reaches the module (it is
     answered); a 3000-byte binary frame — legal for the reader's single
     bound — is cut by the gate: the socket closes 1009 and the module's
-    binary handler never runs. No diagnostic says the gate did not install."""
+    binary handler never runs. No diagnostic says the gate did not install.
 
-    aiohttp = pytest.importorskip("aiohttp")
-    import socket
+    Phase 8 (R9, AC33, plan P15e): no socket is opened. The shipped
+    ``default_server_factory`` builds its application and runner as before;
+    its site binds nothing (:class:`MemorySites`), and the client's bytes —
+    the opening handshake, then each masked frame — are fed raw to the
+    runner's own server protocol (:class:`MemoryHTTPConnection`): its HTTP
+    parser upgrades the connection and the ``WebSocketReader`` the bounded
+    response configures (``max_msg_size`` the larger bound, 4096), fronted by
+    the gate, reads them. What the listener answers is read back from the
+    bytes it wrote."""
 
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    pytest.importorskip("aiohttp")
+    sites = MemorySites().install(monkeypatch)
+    accepted: list[Any] = []
+
+    async def shipped_factory(handler: Any, **kwargs: Any) -> Any:
+        async def recording(ws: Any) -> None:
+            accepted.append(ws)
+            await handler(ws)
+
+        return await default_server_factory(recording, **kwargs)
+
     brain = Brain(
         max_frame_bytes=4096,
         max_attachment_bytes=2048,
-        _server_factory=default_server_factory,
-        listen={"host": "127.0.0.1", "port": port},
+        _server_factory=shipped_factory,
+        listen={"host": "127.0.0.1", "port": 8765},
     )
     binary_frames: list[int] = []
     try:
@@ -1303,22 +1333,32 @@ async def test_the_real_listener_cuts_an_oversized_binary_frame_before_the_modul
             await original(connection, data)
 
         module._on_binary = spy  # type: ignore[method-assign]
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(f"ws://127.0.0.1:{port}/", max_msg_size=0) as ws:
-                text = json.dumps({"v": 1, "type": FRAME_PING, "id": "x" * 2900})
-                assert 2048 < len(text.encode("utf-8")) < 4096
-                await ws.send_str(text)
-                message = await ws.receive()
-                assert message.type == WSMsgType.TEXT
-                assert json.loads(message.data)["code"] == PROXY_ERROR_UNKNOWN_SESSION
+        connection = sites.connect("127.0.0.1", 8765)
+        connection.send(UPGRADE_REQUEST)
+        await wait_until(lambda: bool(connection.head()) and bool(accepted))
+        assert connection.head().startswith(b"HTTP/1.1 101 "), connection.head()
+        (ws,) = accepted
+        assert ws._max_msg_size == 4096 and ws.gate_installed
+        gate = connection.protocol._payload_parser
+        assert type(gate).__name__ == "_FrameSizeGate"
+        assert type(gate._inner).__name__ == "WebSocketReader"
 
-                await ws.send_bytes(b"\x00" * 3000)
-                # No ``error`` text frame precedes the close: the payload was
-                # never read, so the module had nothing to answer.
-                message = await ws.receive()
-                assert message.type == WSMsgType.CLOSE and message.data == 1009, message
-                await wait_until(lambda: ws.closed)
-                assert ws.close_code == 1009
+        text = json.dumps({"v": 1, "type": FRAME_PING, "id": "x" * 2900})
+        assert 2048 < len(text.encode("utf-8")) < 4096
+        connection.send(ws_frame(1, text.encode("utf-8")))
+        await wait_until(lambda: len(connection.frames()) >= 1)
+        ((opcode, payload),) = connection.frames()
+        assert opcode == WSMsgType.TEXT
+        assert json.loads(payload)["code"] == PROXY_ERROR_UNKNOWN_SESSION
+
+        connection.send(ws_frame(2, b"\x00" * 3000))
+        # No ``error`` text frame precedes the close: the payload was
+        # never read, so the module had nothing to answer.
+        await wait_until(lambda: len(connection.frames()) >= 2)
+        opcode, payload = connection.frames()[1]
+        assert opcode == WSMsgType.CLOSE, connection.frames()
+        assert int.from_bytes(payload[:2], "big") == 1009
+        await wait_until(lambda: connection.closed)
         assert binary_frames == []
         await wait_until(lambda: not module._connections)
         assert not any("gate did not install" in d for d in brain.diagnostics), brain.diagnostics

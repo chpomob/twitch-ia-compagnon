@@ -110,9 +110,19 @@ def no_socket_creation() -> Iterator[None]:
     assert _SOCKET_ATTEMPTS["count"] == 0, "a test other than the self-test created a socket"
 
 
-def test_ac5_the_socket_patch_is_effective() -> None:
-    """The fixture self-test; its own attempts are removed from the counter."""
+def test_ac5_the_socket_patch_is_effective(request: pytest.FixtureRequest) -> None:
+    """The fixture self-test; its own attempts are removed from the counter.
 
+    Phase 8 (R9, AC33, plan P15e): the claim is asserted inside the suite's
+    isolation guard. The guard runs on this node, leaves the socket entry
+    points to this module's patch (``_refuse`` is the one installed) and still
+    refuses a process for it."""
+
+    assert "_ac33_isolation" in request.fixturenames
+    assert socket.socket.__init__ is _refuse
+    assert all(getattr(socket, name) is _refuse for name in ("socketpair", "create_connection"))
+    with pytest.raises(AssertionError, match=f"^AC33: {re.escape(request.node.nodeid)} started a process$"):
+        subprocess.run(["true"])
     before = _SOCKET_ATTEMPTS["count"]
     try:
         with pytest.raises(AssertionError, match="socket created"):
