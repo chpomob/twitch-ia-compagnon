@@ -65,6 +65,7 @@ from __future__ import annotations
 import math
 import random
 import time
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -110,6 +111,7 @@ __all__ = [
     "TriggerRegistry",
     "TrustedClaim",
     "companion_mention_policy",
+    "decision_trace_payload",
 ]
 
 Clock = Callable[[], float]
@@ -176,6 +178,17 @@ REASON_NOT_NORMALIZED = "not_normalized"
 REASON_UNAUTHENTICATED = "unauthenticated"
 REASON_SELF_AUTHORED = "self_authored"
 REASON_NO_POLICY = "no_policy"
+
+DRAW_ENTRY_KEYS = ("rule", "parameter", "probability", "draw", "ordinal")
+"""The closed key set of one :attr:`TriggerDecision.draws` entry (R2).
+
+Five scalars that, with the recorded random source, reproduce one draw of a
+declared probability rule. The list is its redaction: no payload field, no
+event text and no other parameter is ever part of an entry.
+"""
+
+COUNT_WILDCARD_STEPS = "wildcard_steps"
+"""The engine count of pattern/text comparisons ``matches`` has taken (A2)."""
 
 _ACCEPTED_PREFIX = "accepted"
 _REJECTED_PREFIX = "rejected"
@@ -374,6 +387,11 @@ class TriggerDecision:
     ``run_id`` and must never grow one** (R8, AC27): a trigger decision is taken
     before admission, so at the moment it exists no run exists to name, and a
     field here would invite the ingestion path to invent one.
+
+    ``draws`` holds one entry per evaluated declared rule with a
+    ``probability_parameter``, in policy order, each exactly the five scalars
+    of :data:`DRAW_ENTRY_KEYS` (R2). Every generic-only policy — the generic
+    ``probability`` type included — leaves it ``()``.
     """
 
     accepted: bool
@@ -383,6 +401,7 @@ class TriggerDecision:
     input_name: str | None = None
     platform: str | None = None
     channel_id: str | None = None
+    draws: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.accepted, bool):
@@ -407,6 +426,7 @@ class TriggerDecision:
                 raise ContractError(
                     field_name, f"must be a string or None, got {type(value).__name__}"
                 )
+        object.__setattr__(self, "draws", _validated_draws(self.draws))
 
     @property
     def traceable(self) -> bool:
@@ -666,6 +686,55 @@ class _Normalized:
     message_id: str
     text: str
     kind: str
+    payload: Mapping[str, Any]
+
+    def field(self, path: str) -> tuple[bool, Any]:
+        """Return ``(present, value)`` for a dotted ``field`` path (R2).
+
+        Read-only: the walk only reads mappings. ``kind`` reads the
+        normalised kind, so an absent ``payload.kind`` reads as ``message``
+        exactly as every other evaluator sees it.
+        """
+
+        if path == "kind":
+            return True, self.kind
+        node: Any = self.payload
+        for segment in path.split("."):
+            if not isinstance(node, Mapping) or segment not in node:
+                return False, None
+            node = node[segment]
+        return True, node
+
+
+class _Source:
+    """The engine's random source, counting the values it has served.
+
+    ``served`` is the 0-based ordinal of the next value, which is what a
+    :attr:`TriggerDecision.draws` entry records so the recorded source
+    reproduces the draw (R2).
+    """
+
+    __slots__ = ("_rng", "served")
+
+    def __init__(self, rng: RandomSource | weakref.ref[RandomSource]) -> None:
+        # Either the source itself, or a weak reference to it when the engine
+        # must not keep an override alive (it is called while the caller still
+        # holds the object, so the reference is live whenever it is drawn on).
+        self._rng = rng
+        self.served = 0
+
+    @property
+    def rng(self) -> RandomSource | None:
+        if isinstance(self._rng, weakref.ref):
+            return self._rng()
+        return self._rng
+
+    def random(self) -> float:
+        rng = self.rng
+        assert rng is not None, "a weakly held source is drawn on only while alive"
+        draw = rng.random()
+        self.served += 1
+        return draw
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,6 +791,9 @@ class TriggerEngine:
         "_window",
         "_window_clock",
         "_rule_evaluations",
+        "_source",
+        "_override_sources",
+        "_counts",
     )
 
     def __init__(
@@ -774,6 +846,13 @@ class TriggerEngine:
         # replay cannot record in one time domain and expire in another.
         self._window_clock: Clock = self._clock
         self._rule_evaluations = 0
+        # Values served by the injected source, and by every override source a
+        # call has passed, each counted from its own zero (R2). Overrides are
+        # keyed by identity and kept for as long as the object lives, so
+        # alternating between two overrides never restarts either count.
+        self._source = _Source(self._rng)
+        self._override_sources: dict[int, _Source] = {}
+        self._counts: dict[str, int] = {COUNT_WILDCARD_STEPS: 0}
 
     @property
     def registry(self) -> TriggerRegistry:
@@ -792,6 +871,12 @@ class TriggerEngine:
         """
 
         return self._rule_evaluations
+
+    @property
+    def counts(self) -> Mapping[str, int]:
+        """The engine's own counts, read-only: ``wildcard_steps`` (A2, AC36)."""
+
+        return MappingProxyType(self._counts)
 
     @property
     def window_size(self) -> int:
@@ -856,7 +941,9 @@ class TriggerEngine:
         """
 
         clock = self._clock if clock is None else _validated_clock(clock, "clock")
-        rng = self._rng if rng is None else _validated_rng(rng, "rng")
+        source = self._source_for(
+            None if rng is None else _validated_rng(rng, "rng")
+        )
         if context is None:
             context = _EMPTY_CONTEXT
         elif not isinstance(context, TriggerContext):
@@ -925,8 +1012,8 @@ class TriggerEngine:
                 raise ContractError(
                     "policy", f"must be a TriggerPolicy, got {type(resolved).__name__}"
                 )
-            accepted, token = self._apply(
-                resolved, normalized=normalized, context=context, rng=rng
+            accepted, token, draws = self._apply(
+                resolved, normalized=normalized, context=context, source=source
             )
             prefix = _ACCEPTED_PREFIX if accepted else _REJECTED_PREFIX
             decision = TriggerDecision(
@@ -937,6 +1024,7 @@ class TriggerEngine:
                 input_name=normalized.input_name,
                 platform=normalized.platform,
                 channel_id=normalized.channel_id,
+                draws=draws,
             )
 
         self._record(key, decision, now)
@@ -979,34 +1067,75 @@ class TriggerEngine:
             return None
         return entry.decision
 
+    def _source_for(self, rng: RandomSource | None) -> _Source:
+        """Return the counting source a call draws from.
+
+        The injected source keeps one count for the engine's life; an override
+        counts from its own zero, and keeps counting whenever a later call
+        passes the same object, whatever other sources were used in between
+        (R2). Passing the injected source itself shares its count.
+
+        An override's count is dropped when the object is garbage-collected,
+        so a fresh object reusing its ``id`` starts from zero; an object that
+        cannot be weakly referenced is retained for the engine's life instead,
+        since forgetting it would let its ``id`` be reused under a stale count.
+        """
+
+        if rng is None or rng is self._rng:
+            return self._source
+        key = id(rng)
+        source = self._override_sources.get(key)
+        if source is not None and source.rng is rng:
+            return source
+        try:
+            # The entry must not keep the object alive, or it would never be
+            # collected and its entry never dropped.
+            source = _Source(weakref.ref(rng))
+        except TypeError:
+            source = _Source(rng)
+        else:
+            weakref.finalize(rng, self._override_sources.pop, key, None)
+        self._override_sources[key] = source
+        return source
+
     def _apply(
         self,
         policy: TriggerPolicy,
         *,
         normalized: _Normalized,
         context: TriggerContext,
-        rng: RandomSource,
-    ) -> tuple[bool, str]:
-        """Evaluate every rule of *policy* and combine the outcomes."""
+        source: _Source,
+    ) -> tuple[bool, str, tuple[Mapping[str, Any], ...]]:
+        """Evaluate every rule of *policy* and combine the outcomes.
 
+        Also returns the ``draws`` entries of its declared probability rules,
+        in policy order.
+        """
+
+        spec = self._registry.spec(normalized.input_name)
+        companion_name = self._registry.companion_name_for(normalized.input_name)
         outcomes: list[_Outcome] = []
+        draws: list[Mapping[str, Any]] = []
         for index, rule in enumerate(policy.rules):
             label = f"policy.rules[{index}]"
             self._rule_evaluations += 1
-            outcomes.append(
-                _evaluate_rule(
-                    rule,
-                    text=normalized.text,
-                    kind=normalized.kind,
-                    context=context,
-                    rng=rng,
-                    companion_name=self._registry.companion_name_for(
-                        normalized.input_name
-                    ),
-                    label=label,
-                )
+            declaration = None if spec is None else spec.declaration(rule.type)
+            outcome, steps, draw = _evaluate_rule(
+                rule,
+                declaration=declaration,
+                normalized=normalized,
+                context=context,
+                source=source,
+                companion_name=companion_name,
+                index=index,
+                label=label,
             )
-        return _combine(policy.combination, outcomes)
+            self._counts[COUNT_WILDCARD_STEPS] += steps
+            if draw is not None:
+                draws.append(draw)
+            outcomes.append(outcome)
+        accepted, token = _combine(policy.combination, outcomes)
+        return accepted, token, tuple(draws)
 
     def _is_companion(self, author_id: str) -> bool:
         """Whether *author_id* is the companion's own identity (anti-echo).
@@ -1191,6 +1320,7 @@ def _normalize(event: Any) -> _Normalized:
         message_id=message_id,
         text=text,
         kind=kind,
+        payload=MappingProxyType(payload),
     )
 
 
@@ -1202,14 +1332,19 @@ def _normalize(event: Any) -> _Normalized:
 def _evaluate_rule(
     rule: TriggerRule,
     *,
-    text: str,
-    kind: str,
+    declaration: TriggerTypeDeclaration | None,
+    normalized: _Normalized,
     context: TriggerContext,
-    rng: RandomSource,
+    source: _Source,
     companion_name: str | None,
+    index: int,
     label: str,
-) -> _Outcome:
+) -> tuple[_Outcome, int, Mapping[str, Any] | None]:
     """Dispatch one rule to its evaluator.
+
+    Returns the outcome, the wildcard steps it took and its ``draws`` entry,
+    if any. A rule naming a type its input declared goes to
+    :func:`_evaluate_declared`; any other to its built-in evaluator.
 
     Dispatch is explicit rather than table-driven so each evaluator can take
     exactly what it is allowed to read: ``_evaluate_audience`` is never handed
@@ -1219,16 +1354,24 @@ def _evaluate_rule(
     so it can neither read the body nor shift a draw count.
     """
 
+    if declaration is not None and declaration.declared:
+        _validate_declared_rule(rule, declaration, label=label)
+        return _evaluate_declared(
+            declaration, rule.parameters, normalized, source, index, label=label
+        )
     _validate_builtin_rule(rule, companion_name=companion_name, label=label)
     parameters = rule.parameters
     if rule.type == TRIGGER_TYPE_PROBABILITY:
-        return _evaluate_probability(parameters, rng)
+        return _evaluate_probability(parameters, source), 0, None
     if rule.type == TRIGGER_TYPE_AUDIENCE:
-        return _evaluate_audience(parameters, context)
+        return _evaluate_audience(parameters, context), 0, None
     if rule.type == TRIGGER_TYPE_KEYWORD:
-        return _evaluate_keyword(parameters, text, companion_name, label=label)
+        outcome = _evaluate_keyword(
+            parameters, normalized.text, companion_name, label=label
+        )
+        return outcome, 0, None
     if rule.type == TRIGGER_TYPE_EVENT_KIND:
-        return _evaluate_event_kind(parameters, kind)
+        return _evaluate_event_kind(parameters, normalized.kind), 0, None
     # Unreachable while every built-in name has a branch above; a built-in
     # added without one must fail loudly rather than decide by default.
     raise ContractError(
@@ -1236,20 +1379,280 @@ def _evaluate_rule(
     )
 
 
-def _evaluate_probability(parameters: Mapping[str, Any], rng: RandomSource) -> _Outcome:
-    """Draw once from the injected random source and compare to the threshold.
+def _evaluate_declared(
+    declaration: TriggerTypeDeclaration,
+    parameters: Mapping[str, Any],
+    normalized: _Normalized,
+    source: _Source,
+    index: int,
+    *,
+    label: str,
+) -> tuple[_Outcome, int, Mapping[str, Any] | None]:
+    """Evaluate a declared type's rule over the normalised event (R2).
 
-    Exactly one draw per evaluation, taken whatever the threshold is, so the
-    number of values consumed depends only on the policy — which is what makes
-    a replay of the same sequence reproduce the same decisions (AC3).
+    Runs no module code and opens no transport: the frozen ``match`` tree is
+    read over the payload and the configured parameters, nothing else. A
+    kind outside ``kinds`` does not match. When the type declares a
+    ``probability_parameter``, exactly one value is drawn per evaluation —
+    after the tree, before the combination, whatever the tree or the kind
+    decided — so the number of draws depends on the policy alone; the rule
+    then matches only when the tree matched and the draw is below the
+    configured probability.
     """
 
-    threshold = float(parameters["probability"])
-    draw = rng.random()
+    name = declaration.name
+    if declaration.match is None:
+        # A hooked type is evaluated only where its hook can be bounded.
+        raise ContractError(
+            f"{label}.type", "is a hooked trigger type this path cannot evaluate"
+        )
+    kind_matches = normalized.kind in declaration.kinds
+    matched, steps = (
+        _evaluate_tree(declaration.match, parameters, normalized)
+        if kind_matches
+        else (False, 0)
+    )
+
+    entry: Mapping[str, Any] | None = None
+    missed = False
+    parameter = declaration.probability_parameter
+    if parameter is not None:
+        probability = parameters[parameter]
+        ordinal = source.served
+        draw = _checked_draw(source)
+        entry = {
+            "rule": index,
+            "parameter": parameter,
+            "probability": probability,
+            "draw": draw,
+            "ordinal": ordinal,
+        }
+        missed = not draw < probability
+
+    if not kind_matches:
+        return _Outcome(False, f"{name}_kind_mismatch"), steps, entry
+    if not matched:
+        return _Outcome(False, f"{name}_no_match"), steps, entry
+    if missed:
+        return _Outcome(False, f"{name}_probability_miss"), steps, entry
+    return _Outcome(True, f"{name}_match"), steps, entry
+
+
+def _evaluate_tree(
+    tree: Mapping[str, Any], parameters: Mapping[str, Any], normalized: _Normalized
+) -> tuple[bool, int]:
+    """Return whether *tree* holds, and the wildcard steps it took (R2).
+
+    Iterative: logical nodes are frames on an explicit stack, so the tree's
+    depth — bounded at construction — never becomes recursion. ``all`` and
+    ``any`` stop at their first deciding operand; nothing here draws.
+    """
+
+    steps = 0
+    # Each frame is [operator, operands, index of the operand being evaluated].
+    stack: list[list[Any]] = []
+    node = tree
+    while True:
+        ((operator, operands),) = node.items()
+        if operator == "not":
+            stack.append([operator, None, 0])
+            node = operands
+            continue
+        if operator in ("all", "any"):
+            stack.append([operator, operands, 0])
+            node = operands[0]
+            continue
+        value, taken = _compare(operator, operands, parameters, normalized)
+        steps += taken
+        while True:
+            if not stack:
+                return value, steps
+            frame = stack[-1]
+            frame_operator, frame_operands, position = frame
+            if frame_operator == "not":
+                stack.pop()
+                value = not value
+                continue
+            decided = value if frame_operator == "any" else not value
+            if decided or position + 1 == len(frame_operands):
+                stack.pop()
+                continue
+            frame[2] = position + 1
+            node = frame_operands[position + 1]
+            break
+
+
+_ABSENT_FIELD = object()
+_ABSENT_PARAM = object()
+
+
+def _compare(
+    operator: str,
+    operands: Sequence[Any],
+    parameters: Mapping[str, Any],
+    normalized: _Normalized,
+) -> tuple[bool, int]:
+    """Decide one comparison node, returning its wildcard steps (R2).
+
+    A ``param`` operand absent from the configured parameters makes the
+    comparison true — an unset optional parameter narrows nothing; otherwise
+    an absent ``field`` makes it false. ``equals``, ``gte`` and ``lte`` need
+    two scalars of the same JSON type — a boolean is never a number — and
+    ``gte``/``lte`` order numbers, or strings by code point; ``equals``
+    compares strings case-sensitively. ``in`` needs a scalar left value and a
+    list holding an equal element of the same JSON type. ``matches`` needs a
+    string and a string pattern, compared by :func:`_wildcard_match`.
+    """
+
+    left, right = (_operand(operand, parameters, normalized) for operand in operands)
+    if left is _ABSENT_PARAM or right is _ABSENT_PARAM:
+        return True, 0
+    if left is _ABSENT_FIELD or right is _ABSENT_FIELD:
+        return False, 0
+    left_type = _json_type(left)
+    if left_type is None:
+        return False, 0
+    if operator == "in":
+        if isinstance(right, (str, Mapping)) or not isinstance(right, Sequence):
+            return False, 0
+        return (
+            any(_json_type(item) == left_type and item == left for item in right),
+            0,
+        )
+    if left_type != _json_type(right):
+        return False, 0
+    if operator == "equals":
+        return left == right, 0
+    if operator == "matches":
+        if left_type != "string":
+            return False, 0
+        return _wildcard_match(right, left)
+    if left_type == "boolean":
+        return False, 0
+    if operator == "gte":
+        return left >= right, 0
+    return left <= right, 0
+
+
+def _operand(
+    operand: Any, parameters: Mapping[str, Any], normalized: _Normalized
+) -> Any:
+    """Resolve one operand to its value, or to an absence sentinel."""
+
+    if isinstance(operand, Mapping):
+        ((reference, path),) = operand.items()
+        if reference == "field":
+            present, value = normalized.field(path)
+            return value if present else _ABSENT_FIELD
+        node: Any = parameters
+        for segment in path.split("."):
+            if not isinstance(node, Mapping) or segment not in node:
+                return _ABSENT_PARAM
+            node = node[segment]
+        return node
+    return operand
+
+
+def _json_type(value: Any) -> str | None:
+    """The JSON scalar type of *value*, or ``None`` for a non-scalar."""
+
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return None
+
+
+def _wildcard_match(pattern: str, text: str) -> tuple[bool, int]:
+    """Match *text* against a case-insensitive wildcard *pattern* (A2, D5).
+
+    ``*`` is any run of characters and ``?`` exactly one. Segment-based and
+    non-recursive: the pattern is split on ``*``; the anchored prefix and
+    suffix segments are checked first, then each middle segment is located
+    leftmost, in order, after the previous one — leftmost placement is
+    optimal for ``*``-separated segments, ``?`` included, so nothing is ever
+    backtracked. Returns ``(matched, steps)``, a step being one comparison of
+    a pattern position with a text position. Characters are compared one by
+    one, each single character case-folded, so folding never changes the
+    text length and the steps stay within
+    ``(len(text) + 1) × (len(pattern) + 1)``, growing linearly in the text.
+    """
+
+    steps = 0
+    segments = pattern.split("*")
+    length = len(text)
+    if len(segments) == 1:
+        if len(pattern) != length:
+            return False, 0
+        for position, wanted in enumerate(pattern):
+            steps += 1
+            if not _same_character(wanted, text[position]):
+                return False, steps
+        return True, steps
+
+    prefix, suffix = segments[0], segments[-1]
+    if len(prefix) + len(suffix) > length:
+        return False, 0
+    for position, wanted in enumerate(prefix):
+        steps += 1
+        if not _same_character(wanted, text[position]):
+            return False, steps
+    end = length - len(suffix)
+    for position, wanted in enumerate(suffix):
+        steps += 1
+        if not _same_character(wanted, text[end + position]):
+            return False, steps
+
+    cursor = len(prefix)
+    for segment in segments[1:-1]:
+        size = len(segment)
+        if not size:
+            continue
+        start = cursor
+        while True:
+            if start + size > end:
+                return False, steps
+            for offset in range(size):
+                steps += 1
+                if not _same_character(segment[offset], text[start + offset]):
+                    break
+            else:
+                break
+            start += 1
+        cursor = start + size
+    return True, steps
+
+
+def _same_character(wanted: str, seen: str) -> bool:
+    """Whether one pattern character accepts one text character."""
+
+    return wanted == "?" or wanted == seen or wanted.casefold() == seen.casefold()
+
+
+def _checked_draw(source: _Source) -> float:
+    """Draw one value and check it is a float in ``[0, 1)``."""
+
+    draw = source.random()
     if not isinstance(draw, float) or not 0.0 <= draw < 1.0:
         raise ContractError(
             "rng.random", f"must return a float in [0, 1), got {draw!r}"
         )
+    return draw
+
+
+def _evaluate_probability(parameters: Mapping[str, Any], rng: _Source) -> _Outcome:
+    """Draw once from the injected random source and compare to the threshold.
+
+    Exactly one draw per evaluation, taken whatever the threshold is, so the
+    number of values consumed depends only on the policy — which is what makes
+    a replay of the same sequence reproduce the same decisions (AC3). Its draw
+    is counted by the source but recorded in no ``draws`` entry (R2).
+    """
+
+    threshold = float(parameters["probability"])
+    draw = _checked_draw(rng)
     matched = draw < threshold
     return _Outcome(matched, "probability_hit" if matched else "probability_miss")
 
@@ -1453,6 +1856,59 @@ def _resolved_keywords(
             raise ContractError(location, "must not be empty")
         resolved.append(keyword)
     return tuple(resolved)
+
+
+# --------------------------------------------------------------------------- #
+# Draws and traces (R2, D6)
+# --------------------------------------------------------------------------- #
+
+
+def decision_trace_payload(decision: TriggerDecision) -> dict[str, Any]:
+    """Return the ``input.trigger.*`` trace payload of *decision* (D6).
+
+    The six keys every input's trace carries, plus ``draws`` — a list of the
+    five-scalar entries — only when the decision has any, so a generic-only
+    decision's trace is byte-identical to the one an input built before.
+    """
+
+    payload: dict[str, Any] = {
+        "source_event_id": decision.source_event_id,
+        "input": decision.input_name,
+        "platform": decision.platform,
+        "channel_id": decision.channel_id,
+        "policy_version": decision.policy_version,
+        "reason": decision.reason,
+    }
+    if decision.draws:
+        payload["draws"] = [dict(entry) for entry in decision.draws]
+    return payload
+
+
+def _validated_draws(value: Any) -> tuple[Mapping[str, Any], ...]:
+    """Return *value* as a tuple of read-only five-scalar entries, or raise.
+
+    Each entry holds exactly :data:`DRAW_ENTRY_KEYS`, each a string, a number
+    or a boolean. No diagnostic echoes a value.
+    """
+
+    label = "TriggerDecision.draws"
+    if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, Sequence):
+        raise ContractError(label, "must be a sequence of draw entries")
+    entries: list[Mapping[str, Any]] = []
+    expected = frozenset(DRAW_ENTRY_KEYS)
+    for index, entry in enumerate(value):
+        location = f"{label}[{index}]"
+        if not isinstance(entry, Mapping):
+            raise ContractError(location, "must be a mapping")
+        if len(entry) != len(DRAW_ENTRY_KEYS) or frozenset(entry) != expected:
+            raise ContractError(
+                location, f"must hold exactly the keys {', '.join(DRAW_ENTRY_KEYS)}"
+            )
+        for key in DRAW_ENTRY_KEYS:
+            if _json_type(entry[key]) is None:
+                raise ContractError(f"{location}.{key}", "must be a scalar")
+        entries.append(MappingProxyType({key: entry[key] for key in DRAW_ENTRY_KEYS}))
+    return tuple(entries)
 
 
 # --------------------------------------------------------------------------- #

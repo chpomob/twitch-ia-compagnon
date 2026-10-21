@@ -17,6 +17,13 @@ registry accepts a well-formed declared type, validates a declared rule's
 parameters against the declared schema and the kernel's checks, and refuses
 an override naming a declared type for an input that did not declare it.
 
+P6 holds AC4, AC5, AC7, AC8, AC35 and AC36 (R2): the engine evaluates a
+declared rule's frozen ``match`` tree over the normalised payload, the
+``matches`` wildcard is segment-based with a counted, linear step bound, a
+declared probability parameter draws exactly once per evaluation, and each
+such draw is recorded in the decision's ``draws``. AC10 is the unmodified
+``tests/test_triggers.py``.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -91,8 +98,13 @@ from conftest import (
 from core.triggers import (
     BUILTIN_TRIGGER_TYPE_NAMES,
     BUILTIN_TRIGGER_TYPES,
+    COUNT_WILDCARD_STEPS,
+    DRAW_ENTRY_KEYS,
+    TriggerDecision,
     TriggerEngine,
     TriggerRegistry,
+    _wildcard_match,
+    decision_trace_payload,
 )
 from modules.twitch import EVENTSUB_SUBSCRIPTIONS_URL
 from test_examples import ROOT, DeviceEdges, _activate_example, _sample_environ
@@ -1832,3 +1844,590 @@ def test_p5_the_registry_keeps_a_hook_slot_per_hooked_type() -> None:
     assert dict(registry.hook_slots("nobody")) == {}
     with pytest.raises(TypeError):
         registry.hook_slots(INPUT)["wake"] = object()  # type: ignore[index]
+
+
+# --------------------------------------------------------------------------- #
+# P6 (R2): declared-rule evaluation, the wildcard matcher, probability draws
+# and ``draws``; AC4, AC5, AC7, AC8, AC35, AC36 (AC10: test_triggers.py runs
+# unmodified)
+# --------------------------------------------------------------------------- #
+
+#: The schema of a declared probability type: ``p`` is the probability, and
+#: ``label`` a second parameter no ``draws`` entry may ever carry.
+LUCKY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "p": {"type": "number", "minimum": 0, "maximum": 1},
+        "label": {"type": "string"},
+    },
+    "required": ["p"],
+    "additionalProperties": False,
+}
+LUCKY_MATCH = {"equals": [{"field": "badge.tier"}, "gold"]}
+COMPANION = "companion-bot"
+
+
+def _event(
+    message_id: str,
+    *,
+    tier: Any = "gold",
+    kind: str = "message",
+    text: str = "hello",
+    author: str = "viewer-1",
+    source: str = INPUT,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "platform": "twitch",
+        "kind": kind,
+        "channel_id": "channel-1",
+        "author": {"id": author, "display_name": "Viewer"},
+        "message_id": message_id,
+        "text": text,
+    }
+    badge = dict(extra.pop("badge", {}))
+    if tier is not None:
+        badge["tier"] = tier
+    if badge:
+        payload["badge"] = badge
+    payload.update(extra)
+    return {
+        "type": "channel.chat.message",
+        "payload": payload,
+        "metadata": {"schema_version": 2, "source": source},
+    }
+
+
+def _declared_engine(
+    *types: TriggerTypeDeclaration,
+    default: TriggerPolicy | None = None,
+    fields: Mapping[str, str] | None = None,
+    values: tuple[float, ...] = (0.5,) * 8,
+    generic: tuple[str, ...] = (),
+) -> tuple[TriggerEngine, RecordedRandom, ManualClock]:
+    if default is None:
+        # A spec declaring types must carry a default; a generic one serves.
+        generic = (*generic, "keyword")
+        default = _policy("keyword", keywords=["hello"])
+    builtins = tuple(d for d in BUILTIN_TRIGGER_TYPES if d.name in generic)
+    spec = TriggerSpec(
+        types=builtins + types,
+        combinations=("all_of", "any_of", "none_of"),
+        default_policy=default,
+        fields={"badge.tier": "string"} if fields is None else fields,
+    )
+    registry = TriggerRegistry(companion_name="companion")
+    registry.register(INPUT, spec)
+    rng = RecordedRandom(values)
+    clock = ManualClock()
+    engine = TriggerEngine(
+        registry,
+        dedup_max_entries=512,
+        dedup_ttl_seconds=600.0,
+        companion_identity=COMPANION,
+        clock=clock,
+        rng=rng,
+    )
+    return engine, rng, clock
+
+
+def _lucky(**overrides: Any) -> TriggerTypeDeclaration:
+    arguments: dict[str, Any] = {
+        "name": "lucky",
+        "parameter_schema": LUCKY_SCHEMA,
+        "kinds": ("message",),
+        "match": LUCKY_MATCH,
+        "probability_parameter": "p",
+    }
+    arguments.update(overrides)
+    return TriggerTypeDeclaration(**arguments)
+
+
+def _policy(type_name: str, **parameters: Any) -> TriggerPolicy:
+    return TriggerPolicy(rules=(TriggerRule(type_name, parameters),))
+
+
+def test_p6_ac4_badge_tier_decides_by_the_payload_field() -> None:
+    """AC4 (R2): with the AC1 type and policy, ``gold`` matches; ``silver``,
+    an absent tier and the integer ``7`` (a JSON-type mismatch) do not; a
+    ``cue`` decides ``kind_mismatch``; with ``["gold", "silver"]``, ``silver``
+    matches and ``Gold`` does not (strings compare case-sensitively)."""
+
+    engine, rng, _ = _declared_engine(_badge(), default=_gold())
+
+    reasons = [
+        engine.evaluate(_event("m1", tier="gold")).reason,
+        engine.evaluate(_event("m2", tier="silver")).reason,
+        engine.evaluate(_event("m3", tier=None)).reason,
+        engine.evaluate(_event("m4", tier=7)).reason,
+        engine.evaluate(_event("m5", tier="gold", kind="cue")).reason,
+    ]
+    assert reasons == [
+        "accepted:badge_tier_match",
+        "rejected:badge_tier_no_match",
+        "rejected:badge_tier_no_match",
+        "rejected:badge_tier_no_match",
+        "rejected:badge_tier_kind_mismatch",
+    ]
+
+    engine.registry.configure(INPUT, _policy("badge_tier", tiers=["gold", "silver"]))
+    assert engine.evaluate(_event("m6", tier="silver")).reason == "accepted:badge_tier_match"
+    assert engine.evaluate(_event("m7", tier="Gold")).reason == "rejected:badge_tier_no_match"
+    # A type without a probability parameter draws nothing and records nothing.
+    assert rng.ordinal == 0
+    assert engine.evaluate(_event("m8")).draws == ()
+
+
+def test_p6_ac5_invariants_run_before_any_declared_rule() -> None:
+    """AC5 (R2): a self-authored event, an internal trace and a
+    non-schema-2 event are rejected by their existing invariant reasons with
+    0 rule evaluations and 0 draws; a redelivery inside the dedup window
+    returns the recorded decision with 0 evaluations and 0 draws."""
+
+    engine, rng, _ = _declared_engine(_lucky(), default=_policy("lucky", p=0.9))
+
+    self_authored = _event("m1", author=COMPANION.upper())
+    trace = dict(_event("m2"), type=TRACE_INPUT_TRIGGER_ACCEPTED)
+    legacy = _event("m3")
+    legacy["metadata"] = {"schema_version": 1, "source": INPUT}
+
+    reasons = [engine.evaluate(event).reason for event in (self_authored, trace, legacy)]
+    assert reasons == [
+        "self_authored",
+        "internal_trace",
+        "not_normalized:metadata.schema_version",
+    ]
+    assert engine.rule_evaluations == 0
+    assert rng.ordinal == 0
+
+    first = engine.evaluate(_event("m4"))
+    evaluations, served = engine.rule_evaluations, rng.ordinal
+    assert (evaluations, served) == (1, 1)
+    again = engine.evaluate(_event("m4"))
+    assert again is first
+    assert engine.rule_evaluations - evaluations == 0
+    assert rng.ordinal - served == 0
+
+
+def test_p6_ac7_one_draw_per_evaluation_and_a_reproducible_replay() -> None:
+    """AC7 (R2): 100 events — 50 matching the tree, 50 not — consume exactly
+    100 draws; the same events replayed from the same source yield the
+    identical 100 decisions; a matching event whose draw is at or above the
+    probability decides ``probability_miss``."""
+
+    values = tuple((index * 37 % 100) / 100 for index in range(100))
+    events = [
+        _event(f"m{index}", tier="gold" if index % 2 == 0 else "silver")
+        for index in range(100)
+    ]
+
+    def run() -> tuple[list[TriggerDecision], RecordedRandom]:
+        engine, rng, _ = _declared_engine(
+            _lucky(), default=_policy("lucky", p=0.5), values=values
+        )
+        return [engine.evaluate(event) for event in events], rng
+
+    decisions, rng = run()
+    assert rng.ordinal == 100
+    assert [len(decision.draws) for decision in decisions] == [1] * 100
+    assert [decision.draws[0]["ordinal"] for decision in decisions] == list(range(100))
+
+    replayed, replay_rng = run()
+    assert replay_rng.ordinal == 100
+    assert replayed == decisions
+
+    by_reason = {decision.reason for decision in decisions}
+    assert by_reason == {
+        "accepted:lucky_match",
+        "rejected:lucky_no_match",
+        "rejected:lucky_probability_miss",
+    }
+    for index, decision in enumerate(decisions):
+        draw = values[index]
+        if index % 2:
+            expected = "rejected:lucky_no_match"
+        elif draw < 0.5:
+            expected = "accepted:lucky_match"
+        else:
+            expected = "rejected:lucky_probability_miss"
+        assert decision.reason == expected, (index, draw, decision.reason)
+
+
+def test_p6_a_kind_mismatch_still_takes_its_one_draw() -> None:
+    """R2: the number of draws depends on the policy alone, so a declared
+    probability rule draws once even for an event its ``kinds`` exclude."""
+
+    engine, rng, _ = _declared_engine(_lucky(), default=_policy("lucky", p=0.5))
+    decision = engine.evaluate(_event("m1", kind="cue"))
+    assert decision.reason == "rejected:lucky_kind_mismatch"
+    assert rng.ordinal == 1
+    assert [entry["ordinal"] for entry in decision.draws] == [0]
+
+
+def test_p6_ac8_matches_is_a_case_insensitive_wildcard() -> None:
+    """AC8 (R2): ``hi*bot?`` matches ``Hi there BOTs`` and not ``hi bot``; a
+    pattern of 128 ``*`` over a 10 000-character text decides on the injected
+    clock, synchronously, with no timeout path involved."""
+
+    greeting = TriggerTypeDeclaration(
+        name="greeting",
+        parameter_schema={"type": "object", "properties": {}},
+        kinds=("message",),
+        match={"matches": [{"field": "text"}, "hi*bot?"]},
+    )
+    stars = TriggerTypeDeclaration(
+        name="stars",
+        parameter_schema={"type": "object", "properties": {}},
+        kinds=("message",),
+        match={"matches": [{"field": "text"}, "*" * 128]},
+    )
+    engine, rng, clock = _declared_engine(greeting, stars, default=_policy("greeting"))
+
+    assert engine.evaluate(_event("m1", text="Hi there BOTs")).reason == "accepted:greeting_match"
+    assert engine.evaluate(_event("m2", text="hi bot")).reason == "rejected:greeting_no_match"
+
+    started = clock.now
+    decision = engine.evaluate(_event("m3", text="x" * 10_000), policy=_policy("stars"))
+    assert decision.reason == "accepted:stars_match"
+    assert clock.now == started
+    assert rng.ordinal == 0
+
+
+def test_p6_ac35_draws_record_the_five_scalars_of_each_draw() -> None:
+    """AC35 (R2): under ``t{p: 0.3}`` and the values ``0.9, 0.1, 0.42``, three
+    tree-matching events decide miss, match, miss, and the third ``draws`` is
+    the literal entry; a replay from the re-seeded source yields equal
+    ``draws``; a redelivery of the third returns the same ``draws`` with 0
+    draws taken; a generic-only policy (``probability`` included) has
+    ``draws == ()``; no entry carries a payload field, the event text or a
+    parameter other than ``p``."""
+
+    values = (0.9, 0.1, 0.42)
+    secret_text = "secret text of the viewer"
+    policy = _policy("t", p=0.3, label="other-parameter-value")
+    events = [
+        _event(f"m{index}", text=secret_text, badge={"note": "payload-value"})
+        for index in range(3)
+    ]
+
+    def run(rng_values: tuple[float, ...]) -> tuple[TriggerEngine, RecordedRandom, list[TriggerDecision]]:
+        engine, rng, _ = _declared_engine(
+            _lucky(name="t"), default=policy, values=rng_values,
+            fields={"badge.tier": "string", "badge.note": "string"},
+            generic=("probability", "keyword"),
+        )
+        return engine, rng, [engine.evaluate(event) for event in events]
+
+    engine, rng, decisions = run(values)
+    assert [decision.reason for decision in decisions] == [
+        "rejected:t_probability_miss",
+        "accepted:t_match",
+        "rejected:t_probability_miss",
+    ]
+    assert decisions[2].draws == (
+        {"rule": 0, "parameter": "p", "probability": 0.3, "draw": 0.42, "ordinal": 2},
+    )
+
+    rng.seed()
+    _, replay_rng, replayed = run(rng.values)
+    assert replay_rng.values == values
+    assert [d.draws for d in replayed] == [d.draws for d in decisions]
+
+    served = rng.ordinal
+    again = engine.evaluate(events[2])
+    assert again.draws == decisions[2].draws
+    assert rng.ordinal == served
+
+    generic = TriggerPolicy(
+        rules=(
+            TriggerRule("probability", {"probability": 0.5}),
+            TriggerRule("keyword", {"keywords": ["secret"]}),
+        ),
+        combination="any_of",
+    )
+    generic_decision = engine.evaluate(_event("g1"), policy=generic)
+    assert generic_decision.draws == ()
+    assert set(decision_trace_payload(generic_decision)) == {
+        "source_event_id", "input", "platform", "channel_id", "policy_version", "reason",
+    }
+
+    forbidden = (secret_text, "payload-value", "other-parameter-value", "label", "gold")
+    for decision in decisions:
+        for entry in decision.draws:
+            assert tuple(entry) == DRAW_ENTRY_KEYS
+            assert entry["parameter"] == "p"
+            for value in entry.values():
+                assert not any(text in str(value) for text in forbidden), entry
+    trace = decision_trace_payload(decisions[2])
+    assert trace["draws"] == [
+        {"rule": 0, "parameter": "p", "probability": 0.3, "draw": 0.42, "ordinal": 2}
+    ]
+    assert json.dumps(trace)  # five scalars, serialisable as a trace payload
+
+
+def test_p6_draws_follow_policy_order_and_an_override_counts_from_zero() -> None:
+    """R2: one entry per evaluated declared probability rule, in policy order,
+    with ``rule`` its index; a generic ``probability`` draw is counted by the
+    source (so ordinals reproduce the draw) yet recorded in no entry; an
+    ``rng`` override counts from its own zero."""
+
+    engine, rng, _ = _declared_engine(
+        _lucky(), _lucky(name="second_lucky"), generic=("probability",),
+        values=(0.1, 0.2, 0.3, 0.4),
+    )
+    policy = TriggerPolicy(
+        rules=(
+            TriggerRule("lucky", {"p": 0.9}),
+            TriggerRule("probability", {"probability": 0.9}),
+            TriggerRule("second_lucky", {"p": 0.25}),
+        )
+    )
+    decision = engine.evaluate(_event("m1"), policy=policy)
+    assert decision.draws == (
+        {"rule": 0, "parameter": "p", "probability": 0.9, "draw": 0.1, "ordinal": 0},
+        {"rule": 2, "parameter": "p", "probability": 0.25, "draw": 0.3, "ordinal": 2},
+    )
+    assert decision.reason == "rejected:second_lucky_probability_miss"
+
+    override = RecordedRandom((0.7, 0.6))
+    first = engine.evaluate(_event("m2"), policy=_policy("lucky", p=0.5), rng=override)
+    second = engine.evaluate(_event("m3"), policy=_policy("lucky", p=0.5), rng=override)
+    assert [first.draws[0]["ordinal"], second.draws[0]["ordinal"]] == [0, 1]
+    assert rng.ordinal == 3
+
+
+def test_p6_each_override_source_keeps_its_own_count() -> None:
+    """R2: an override's ordinals count the values that object has served,
+    so alternating between two overrides — or passing one on a call an
+    invariant refuses — never restarts the other's count, and passing the
+    injected source itself shares the engine's count."""
+
+    engine, rng, _ = _declared_engine(_lucky(), values=(0.1, 0.2))
+    policy = _policy("lucky", p=0.5)
+    a = RecordedRandom((0.7, 0.6, 0.5))
+    b = RecordedRandom((0.4, 0.3))
+    ordinals = [
+        engine.evaluate(_event(message_id), policy=policy, rng=source).draws[0]["ordinal"]
+        for message_id, source in (("m1", a), ("m2", b), ("m3", a))
+    ]
+    assert ordinals == [0, 0, 1]
+    refused = engine.evaluate(_event("m4", author=COMPANION), policy=policy, rng=b)
+    assert refused.reason == "self_authored"
+    assert engine.evaluate(_event("m5"), policy=policy, rng=a).draws[0]["ordinal"] == 2
+    assert engine.evaluate(_event("m6"), policy=policy, rng=b).draws[0]["ordinal"] == 1
+    assert [a.ordinal, b.ordinal] == [3, 2]
+
+    first = engine.evaluate(_event("m7"), policy=policy)
+    shared = engine.evaluate(_event("m8"), policy=policy, rng=rng)
+    assert [first.draws[0]["ordinal"], shared.draws[0]["ordinal"]] == [0, 1]
+
+
+def test_p6_comparisons_follow_the_json_type_rules() -> None:
+    """R2: a boolean is never a number for ``gte``/``lte``/``equals``/``in``;
+    an absent ``param`` operand makes its comparison true; an absent
+    ``field`` makes it false; ``in`` is false for a non-scalar left value."""
+
+    level = TriggerTypeDeclaration(
+        name="level",
+        parameter_schema={
+            "type": "object",
+            "properties": {
+                "minimum": {"type": "integer"},
+                "maximum": {"type": "integer"},
+                "flags": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["minimum"],
+        },
+        kinds=("message",),
+        match={
+            "all": [
+                {"gte": [{"field": "badge.level"}, {"param": "minimum"}]},
+                {"lte": [{"field": "badge.level"}, {"param": "maximum"}]},
+                {"in": [{"field": "badge.level"}, {"param": "flags"}]},
+            ]
+        },
+    )
+    flag = TriggerTypeDeclaration(
+        name="flag",
+        parameter_schema={"type": "object", "properties": {}},
+        kinds=("message",),
+        match={"any": [{"equals": [{"field": "badge.on"}, 1]}, {"in": [{"field": "badge.on"}, [1, 0]]}]},
+    )
+    engine, _, _ = _declared_engine(
+        level, flag, fields={"badge.level": "integer", "badge.on": "boolean"}
+    )
+    minimum_only = _policy("level", minimum=3)
+
+    def reason(message_id: str, policy: TriggerPolicy, **badge: Any) -> str:
+        event = _event(message_id, tier=None, badge=badge)
+        return engine.evaluate(event, policy=policy).reason
+
+    # ``maximum`` and ``flags`` are unset: their comparisons narrow nothing.
+    assert reason("a", minimum_only, level=5) == "accepted:level_match"
+    assert reason("b", minimum_only, level=2) == "rejected:level_no_match"
+    assert reason("c", minimum_only, level=True) == "rejected:level_no_match"
+    assert reason("d", minimum_only, level="5") == "rejected:level_no_match"
+    assert reason("e", minimum_only) == "rejected:level_no_match"
+    assert reason("f", minimum_only, level=[5]) == "rejected:level_no_match"
+    bounded = _policy("level", minimum=3, maximum=4, flags=[4, 9])
+    assert reason("g", bounded, level=4) == "accepted:level_match"
+    assert reason("h", bounded, level=5) == "rejected:level_no_match"
+    assert reason("i", _policy("level", minimum=0, flags=[1]), level=True) == (
+        "rejected:level_no_match"
+    )
+    assert reason("j", _policy("flag"), on=True) == "rejected:flag_no_match"
+    assert reason("k", _policy("flag"), on=1) == "accepted:flag_match"
+
+
+def test_p6_not_and_nested_logic_evaluate_iteratively() -> None:
+    """R2: ``not``, ``all`` and ``any`` combine at depth, the eight-deep
+    tree the contract allows included."""
+
+    deep = TriggerTypeDeclaration(
+        name="deep",
+        parameter_schema={"type": "object", "properties": {}},
+        kinds=("message",),
+        match=_nested_not(8),
+    )
+    mixed = TriggerTypeDeclaration(
+        name="mixed",
+        parameter_schema={"type": "object", "properties": {}},
+        kinds=("message",),
+        match={
+            "any": [
+                {"all": [{"equals": [{"field": "text"}, "a"]}, {"not": {"equals": [{"field": "kind"}, "cue"]}}]},
+                {"matches": [{"field": "author.id"}, "VIP-*"]},
+            ]
+        },
+    )
+    engine, _, _ = _declared_engine(deep, mixed, fields={})
+
+    # Eight levels: seven ``not`` around one ``equals`` — an odd count negates.
+    assert engine.evaluate(_event("d1", text="deep_sentinel"), policy=_policy("deep")).reason == (
+        "rejected:deep_no_match"
+    )
+    assert engine.evaluate(_event("d2", text="other"), policy=_policy("deep")).reason == (
+        "accepted:deep_match"
+    )
+    assert engine.evaluate(_event("x1", text="a"), policy=_policy("mixed")).accepted
+    assert not engine.evaluate(_event("x2", text="b"), policy=_policy("mixed")).accepted
+    assert engine.evaluate(_event("x3", text="b", author="vip-7"), policy=_policy("mixed")).accepted
+
+
+@pytest.mark.parametrize(
+    ("pattern", "text", "expected"),
+    [
+        pytest.param("", "", True, id="empty-pattern-empty-text"),
+        pytest.param("", "a", False, id="empty-pattern-text"),
+        pytest.param("*", "", True, id="star-empty-text"),
+        pytest.param("*", "anything at all", True, id="star-only"),
+        pytest.param("***", "x", True, id="stars-only"),
+        pytest.param("?abc", "xabc", True, id="question-first"),
+        pytest.param("abc?", "abcx", True, id="question-last"),
+        pytest.param("?", "", False, id="question-needs-a-character"),
+        pytest.param("a?", "a", False, id="question-at-end-needs-a-character"),
+        pytest.param("a*b*c", "aXXbYYc", True, id="middle-segment"),
+        pytest.param("a*b", "ab", True, id="star-empty-run"),
+        pytest.param("ab*ba", "aba", False, id="prefix-and-suffix-may-not-overlap"),
+        pytest.param("*b?b*", "abcbbxb", True, id="question-inside-a-middle-segment"),
+        pytest.param("HELLO", "hello", True, id="case-insensitive"),
+        pytest.param("hello", "hello!", False, id="anchored-without-star"),
+        pytest.param("STRAßE", "straße", True, id="sharp-s-folds-per-character"),
+        pytest.param("strasse", "straße", False, id="sharp-s-never-expands-the-text"),
+        pytest.param("?", "ß", True, id="question-takes-one-sharp-s"),
+        pytest.param("İ", "İ", True, id="dotted-capital-i-equals-itself"),
+        pytest.param("i", "İ", False, id="dotted-capital-i-is-not-i"),
+        pytest.param("*i*", "İİİ", False, id="dotted-capital-i-under-stars"),
+    ],
+)
+def test_p6_the_wildcard_matcher_table(pattern: str, text: str, expected: bool) -> None:
+    """A2, D5: the matcher's verdicts, each within the
+    ``(len(text) + 1) × (len(pattern) + 1)`` step bound — case folding is
+    per character, so it never changes the length the bound is taken over."""
+
+    matched, steps = _wildcard_match(pattern, text)
+    assert matched is expected
+    assert 0 <= steps <= (len(text) + 1) * (len(pattern) + 1)
+
+
+def test_p6_ac36_the_matcher_is_linear_in_the_text() -> None:
+    """AC36 (R2): the 128-character pattern of 63 ``*a`` pairs and ``*b``,
+    over 5 000 and 10 000 ``a``, decides no match within
+    ``(len(text) + 1) × 129`` steps, steps(10 000) ≤ 2 × steps(5 000) + 129,
+    and the engine's ``counts["wildcard_steps"]`` grows by exactly the
+    matcher's reported steps."""
+
+    pattern = "*a" * 63 + "*b"
+    assert len(pattern) == 128
+    steps: dict[int, int] = {}
+    for size in (5_000, 10_000):
+        matched, steps[size] = _wildcard_match(pattern, "a" * size)
+        assert matched is False
+        assert steps[size] <= (size + 1) * 129
+    assert steps[10_000] <= 2 * steps[5_000] + 129
+
+    # A middle segment that scans the whole text and fails late at every
+    # position: the bound and the linear growth hold where the work is real,
+    # not only where the suffix fails at once.
+    hard = "*abac*"
+    hard_steps: dict[int, int] = {}
+    for size in (2_500, 5_000):
+        matched, hard_steps[size] = _wildcard_match(hard, "ab" * size)
+        assert matched is False
+        assert 2 * size < hard_steps[size] <= (2 * size + 1) * (len(hard) + 1)
+    assert hard_steps[5_000] <= 2 * hard_steps[2_500] + len(hard) + 1
+
+    spread = "*a" * 63 + "*"
+    matched, spread_steps = _wildcard_match(spread, "a" * 10_000)
+    assert matched is True and spread_steps == 63
+
+    rule = TriggerTypeDeclaration(
+        name="pattern",
+        parameter_schema={"type": "object", "properties": {}},
+        kinds=("message",),
+        match={"matches": [{"field": "text"}, pattern]},
+    )
+    engine, _, _ = _declared_engine(rule, fields={})
+    for size in (5_000, 10_000):
+        before = engine.counts[COUNT_WILDCARD_STEPS]
+        decision = engine.evaluate(_event(f"w{size}", text="a" * size), policy=_policy("pattern"))
+        assert decision.reason == "rejected:pattern_no_match"
+        assert engine.counts[COUNT_WILDCARD_STEPS] - before == steps[size]
+    # A text the pattern matches: every middle segment is located.
+    before = engine.counts[COUNT_WILDCARD_STEPS]
+    mixed_text = "ab" * 5_000
+    decision = engine.evaluate(_event("w-mixed", text=mixed_text), policy=_policy("pattern"))
+    assert decision.reason == "accepted:pattern_match"
+    assert engine.counts[COUNT_WILDCARD_STEPS] - before == _wildcard_match(pattern, mixed_text)[1]
+    with pytest.raises(TypeError):
+        engine.counts[COUNT_WILDCARD_STEPS] = 0  # type: ignore[index]
+
+
+def test_p6_draws_shape_is_validated_and_value_free() -> None:
+    """R2: a ``draws`` entry holds exactly the five keys, each a scalar; a
+    refusal names the entry and echoes no value; entries are read-only."""
+
+    base = {
+        "accepted": True,
+        "reason": "accepted:t_match",
+        "policy_version": None,
+        "source_event_id": "m1",
+    }
+    entry = {"rule": 0, "parameter": "p", "probability": 0.3, "draw": 0.1, "ordinal": 0}
+    decision = TriggerDecision(**base, draws=[entry])
+    assert decision.draws == (entry,)
+    with pytest.raises(TypeError):
+        decision.draws[0]["draw"] = 0.9  # type: ignore[index]
+    assert TriggerDecision(**base).draws == ()
+
+    with_text = dict(entry, text="viewer secret")
+    _refused(lambda: TriggerDecision(**base, draws=(with_text,)), "TriggerDecision.draws[0]", "viewer secret")
+    missing = {key: entry[key] for key in DRAW_ENTRY_KEYS[:4]}
+    _refused(lambda: TriggerDecision(**base, draws=(missing,)), "TriggerDecision.draws[0]")
+    nested = dict(entry, parameter={"secret": "viewer secret"})
+    _refused(
+        lambda: TriggerDecision(**base, draws=(nested,)),
+        "TriggerDecision.draws[0].parameter",
+        "viewer secret",
+    )
+    _refused(lambda: TriggerDecision(**base, draws=entry), "TriggerDecision.draws")  # type: ignore[arg-type]
