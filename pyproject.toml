@@ -57,6 +57,7 @@ modules = ["*/module.yaml"]
 "modules.streamerbot" = ["module.yaml"]
 "modules.web" = ["module.yaml"]
 "modules.operator" = ["module.yaml"]
+"modules.timer" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

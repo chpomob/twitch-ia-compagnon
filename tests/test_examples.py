@@ -116,6 +116,8 @@ MODULE_NAMES = (
     "web",
     # Phase 8 R6 (plan P9, allowlisted): the operator's button, the 20th.
     "operator",
+    # Phase 8 R8 (plan P11, allowlisted): the timed random trigger, the 21st.
+    "timer",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -426,6 +428,17 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": ["input"]},
         "settings_validator": "validate_settings",
     },
+    # Phase 8 R8 (plan P11): an input building the `timer` chat event.
+    "timer": {
+        "name": "timer",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": ["channel.chat.message"],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": ["input"]},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
 # R8): only the chat input — and, from phase 3's R6, the watch input —
@@ -470,6 +483,8 @@ DECLARATION_KEYS = {
     "web": {"actions", "credentials"},
     # Phase 8 R6 (plan P9): its `event_kind` and `button` types and its token.
     "operator": {"triggers", "credentials"},
+    # Phase 8 R8 (plan P11): its `event_kind` and `interval` types.
+    "timer": {"triggers"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -671,8 +686,9 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    # Phase 8 R6 (plan P9, allowlisted): 19 → 20 with `operator`.
-    assert len(names) == 20
+    # Phase 8 R6 (plan P9, allowlisted): 19 → 20 with `operator`; R8 (plan
+    # P11, allowlisted): 20 → 21 with `timer`.
+    assert len(names) == 21
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():

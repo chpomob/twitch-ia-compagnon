@@ -959,8 +959,9 @@ def test_ac15_the_base_page_lists_every_module_and_the_origin(
 
     listed = dict(re.findall(r'<tr data-module="([^"]+)" data-enabled="(true|false)">', page))
     # Phase 5 P12 adds streamerbot (18); phase 7 R1, R9 (plan P1) adds web (19);
-    # phase 8 R6 (plan P9, allowlisted) adds operator (20).
-    assert len(SHIPPED_MODULES) == 20
+    # phase 8 R6 (plan P9, allowlisted) adds operator (20); phase 8 R8 (plan
+    # P11, allowlisted) adds timer (21).
+    assert len(SHIPPED_MODULES) == 21
     assert sorted(listed) == list(SHIPPED_MODULES)
     enabled = set(read_base(REPO / profile)["enabled_modules"])
     assert {name for name, state in listed.items() if state == "true"} == enabled

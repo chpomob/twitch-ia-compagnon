@@ -151,6 +151,8 @@ PRESENTED = (
     "stream_control",
     # Phase 5 R6 (plan P12, AC23): the automation bridge.
     "streamerbot",
+    # Phase 8 R8 (plan P11): the timed random trigger.
+    "timer",
     "twitch",
     "users",
     "viewer_memory",
@@ -246,10 +248,11 @@ def test_presented_covers_every_shipped_manifest() -> None:
     18 since phase 5 R10 (plan P12, AC23) ships the automation bridge
     (allowlisted: 17 → 18), and 19 since phase 7 R1, R9 (plan P1) ships
     ``web`` (allowlisted: 18 → 19), and 20 since phase 8 R6 (plan P9) ships
-    ``operator`` (allowlisted: 19 → 20)."""
+    ``operator`` (allowlisted: 19 → 20), and 21 since phase 8 R8 (plan P11)
+    ships ``timer`` (allowlisted: 20 → 21)."""
 
     shipped = _shipped_manifests()
-    assert len(shipped) == 20
+    assert len(shipped) == 21
     assert len(PRESENTED) == len(set(PRESENTED))
     assert set(PRESENTED) == shipped
 

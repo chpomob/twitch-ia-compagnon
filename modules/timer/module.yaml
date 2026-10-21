@@ -1,0 +1,144 @@
+# A timed random trigger: the `timer` input — manifest v2 (phase 8 R8).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no action and no grant live here. For
+# each configured channel the module builds one `timer` event every
+# `every_minutes` of the runtime clock, read from the trigger policy resolved
+# for that channel; the event is decided by the kernel with the declared
+# `interval` type and an accepted one is admitted like any other input's
+# event. No platform name appears here: the channel an event answers on is
+# the configured `destination`.
+
+name: timer
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# A firing enters as the one normalised chat event shape every input builds,
+# with `payload.kind: timer`.
+produces:
+  - channel.chat.message
+consumes: []
+middleware: false
+
+# The input role: the loops start in `start_inputs` (after the readiness
+# barrier) and stop in `stop_inputs`; no event is built outside that span.
+lifecycle:
+  roles:
+    - input
+
+# The shapes are checked by the declared hook, one value-free diagnostic per
+# field, before any loop starts: 1 to 32 channels, each with a destination
+# and a non-empty `prompt_text`, no destination listed twice.
+settings_schema:
+  title: Timer settings
+  type: object
+  properties:
+    channels:
+      title: Channels
+      type: array
+      description: >-
+        The channels a timer event is built for, 1 to 32 entries; each
+        destination is listed once. The interval, the probability and the
+        window are the channel's trigger policy, not settings.
+      items:
+        title: Channel
+        type: object
+        properties:
+          destination:
+            title: Destination
+            type: object
+            description: The channel the event's run answers on.
+            properties:
+              platform:
+                title: Platform
+                type: string
+              channel_id:
+                title: Channel id
+                type: string
+          prompt_text:
+            title: Prompt text
+            type: string
+            description: >-
+              The text each event carries, non-empty and at most 500
+              characters.
+settings_validator: validate_settings
+
+# A firing is trigger-evaluated with this module's policy (phase 8 R8).
+triggers:
+  types:
+    # Selects on the normalised event's kind; a firing is always `timer`.
+    - name: event_kind
+      parameter_schema:
+        type: object
+        properties:
+          kinds:
+            type: array
+            items:
+              type: string
+              enum:
+                - timer
+        required:
+          - kinds
+        additionalProperties: false
+    # Every `every_minutes`, with the one draw below `probability`, inside the
+    # optional window of the host's local minute of the day (both bounds
+    # inclusive). Declared, evaluated by the kernel: no module code runs for
+    # it, and it grants nothing. An absent window narrows nothing.
+    - name: interval
+      kinds:
+        - timer
+      parameter_schema:
+        type: object
+        properties:
+          every_minutes:
+            type: integer
+            minimum: 1
+            maximum: 1440
+          probability:
+            type: number
+            minimum: 0
+            maximum: 1
+          window:
+            type: object
+            properties:
+              start_minute:
+                type: integer
+                minimum: 0
+                maximum: 1439
+              end_minute:
+                type: integer
+                minimum: 0
+                maximum: 1439
+            required:
+              - start_minute
+              - end_minute
+            additionalProperties: false
+        required:
+          - every_minutes
+          - probability
+        additionalProperties: false
+      probability_parameter: probability
+      match:
+        all:
+          - gte:
+              - field: timer.minute_of_day
+              - param: window.start_minute
+          - lte:
+              - field: timer.minute_of_day
+              - param: window.end_minute
+  # The payload fields this input emits beyond the canonical ones (phase 8
+  # A4), so a declared type may only read what a firing carries.
+  fields:
+    timer.minute_of_day: integer
+    timer.sequence: integer
+  combinations:
+    - all_of
+  default_policy:
+    combination: all_of
+    rules:
+      - type: interval
+        parameters:
+          every_minutes: 30
+          probability: 0.25
