@@ -33,7 +33,6 @@ import asyncio
 import base64
 import json
 import shutil
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +86,7 @@ from conftest import (
     ManualClock,
     ScriptedModel,
     events_of,
+    files_containing,
     final,
     png_bytes,
     runtime_context as build_context,
@@ -1945,12 +1945,7 @@ def test_ac31_the_core_and_the_neutral_modules_name_no_platform(directory: str) 
     and of the event, never a name in the neutral code (``modules/proxy``
     and ``modules/agent_link`` join this grep when they exist)."""
 
-    completed = subprocess.run(
-        ["grep", "-r", "--exclude-dir=__pycache__", "twitch", str(ROOT / directory)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    completed = files_containing(ROOT / directory, "twitch")
     matches = [line for line in completed.stdout.splitlines() if line]
     assert completed.returncode in (0, 1), completed.stderr
     assert matches == [], "\n".join(matches)

@@ -30,7 +30,6 @@ import functools
 import inspect
 import struct
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -59,6 +58,7 @@ from conftest import (
     FakeCaptureSource,
     ManualClock,
     events_of,
+    files_containing,
     png_bytes,
     runtime_context,
     settle,
@@ -1408,11 +1408,8 @@ def test_module_names_no_platform() -> None:
     platform a capture is observed for is the destination's, a runtime
     value, never a name in code."""
 
-    completed = subprocess.run(
-        ["grep", "-r", "-i", "-c", "twitch", str(MODULE_DIR / "__init__.py"), str(MANIFEST_PATH)],
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = files_containing(
+        [MODULE_DIR / "__init__.py", MANIFEST_PATH], "twitch", ignore_case=True, count=True
     )
     assert completed.returncode == 1, completed.stdout
     assert all(line.endswith(":0") for line in completed.stdout.splitlines())

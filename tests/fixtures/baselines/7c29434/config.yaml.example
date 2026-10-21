@@ -1,0 +1,501 @@
+# The PC profile (R7, R9): one process on the streaming PC runs the chat
+# input, the brain, the local capture, the audio capture and playback, the
+# stream control and the observation modules. Copy this file
+# to config.yaml, export the referenced environment variables, then run:
+#   python -m core.main --config config.yaml
+# or, once installed, `twitch-ia-compagnon --config config.yaml`; validate
+# it first without opening any transport with `--check-config`.
+# Environment references must remain in the exact ${NAME} form shown below,
+# and resolve in values and in mapping keys alike.
+#
+# The two other shipped profiles run the same entry point:
+#   config.server.yaml.example — the brain on a server, the screen captured
+#                                on the PC through the `proxy` module;
+#   agent.yaml.example         — the PC agent that pairs with that server.
+
+# The directory the module manifests are discovered in, relative to this
+# file; the reserved value `builtin` names the modules shipped with the
+# installed distribution instead (R8).
+modules_directory: ./modules
+
+# Every module enabled here is activated, in this order, through its
+# manifest; the set below is what makes this the PC profile. The three phase 2
+# modules (`audio_input`, `audio_output`, `stream_control`) are optional: each
+# ships with `required: false`, so a dependency that is unavailable at startup
+# leaves its actions unbound — reported once as `module.degraded`, never
+# offered to the brain — and startup continues (R8). Removing the three lines
+# gives the chat-only profile, which behaves exactly as phase 1.
+enabled_modules:
+  - twitch
+  - chat_context
+  - users
+  - capture
+  - audio_input
+  - audio_output
+  - stream_control
+  - brain
+  - audit
+
+modules:
+  twitch:
+    client_id: ${TWITCH_CLIENT_ID}
+    client_secret: ${TWITCH_CLIENT_SECRET}
+    access_token: ${TWITCH_ACCESS_TOKEN}
+    broadcaster_id: ${TWITCH_BROADCASTER_ID}
+    bot_user_id: ${TWITCH_BOT_USER_ID}
+    # The name viewers use to address the companion. Configuration owns this
+    # value: the module manifest's default trigger policy ("the message
+    # mentions the companion name") refers to it by token only.
+    companion_name: Companion
+
+  # The retained chat transcript the brain reads through `chat.read` (R1).
+  # The module owns no business setting: its bounds are the `chat_context`
+  # group of `limits` below, handed to it as its accepted copy.
+  chat_context: {}
+
+  # The bounded directory of observed chat authors the brain reads through
+  # `users.read` (decision 5). Every bound is required and acted on: authors
+  # beyond `max_users_per_channel`, channels beyond `max_channels` and
+  # entries older than `max_age_seconds` are evicted; the page returned is
+  # never the whole audience.
+  users:
+    max_channels: 8
+    max_users_per_channel: 500
+    max_age_seconds: 3600
+
+  # The local screen capture the brain reads through `screen.capture` (R5).
+  # A `command` source runs `argv` and takes its standard output — one PNG or
+  # JPEG — bounded in time by `command_timeout_seconds` and in size by
+  # `max_bytes`; a `file` source (`kind: file`, `path: <image>`) reads one
+  # image file instead.
+  capture:
+    sources:
+      screen:
+        kind: command
+        # PLACEHOLDER — replace the shell line with the screenshot tool of
+        # your desktop writing one PNG or JPEG to standard output, e.g.
+        # `grim -` (wlroots), `spectacle -bno /dev/stdout` (KDE) or
+        # `import -window root png:-` (ImageMagick, X11). Running it through
+        # `sh` lets startup pass on a machine without the tool — the tool is
+        # then checked at the first capture, which returns an explicit error
+        # observation when it is missing; point `argv` at the tool itself
+        # (`argv: [grim, "-"]`) to have startup refuse a missing tool instead.
+        argv: [sh, -c, "grim -"]
+        command_timeout_seconds: 5
+    default_source: screen
+    # The largest capture admitted, in bytes; it may not exceed
+    # `limits.attachments.max_object_bytes` below, which the store enforces
+    # on every object it retains.
+    max_bytes: 1048576
+
+  # The on-demand audio capture the brain reads through `audio.capture` (R3):
+  # one bounded segment per call, PCM 16-bit, 16 000 Hz, mono, stored in the
+  # run's attachment store and returned by reference. Nothing is recorded in
+  # the background. A `command` source runs `argv` at the call and takes the
+  # WAV it writes on standard output, stopped once the requested duration is
+  # recorded; a `file` source (`kind: file`, `path: <wav>`) re-reads one WAV.
+  audio_input:
+    sources:
+      mic:
+        kind: command
+        # AUDIO_RECORDER names a program writing a 16 kHz mono 16-bit WAV to
+        # standard output until it is stopped; replace "-" with the options
+        # your recorder needs for that format. A program that does not
+        # resolve to an executable leaves `audio.capture` unbound (R8).
+        argv:
+          - ${AUDIO_RECORDER}
+          - "-"
+    default_source: mic
+    # The optional transcription of each stored segment. No provider is
+    # assumed (AC43): while `endpoint` is empty nothing is sent, the
+    # transcription is reported unavailable and every capture still succeeds
+    # with its audio reference. Set the endpoint, the model and — when the
+    # service needs one — the key (an environment reference, e.g.
+    # `api_key: ${TRANSCRIPTION_API_KEY}`) to enable it.
+    transcription:
+      enabled: true
+      endpoint: ""
+      model: ""
+      api_key: ""
+    required: false
+
+  # Speech and clip playback through `audio.speak` and `audio.play` (R1).
+  # Speech is synthesised by an HTTP endpoint answering a WAV; each output is
+  # a player command fed the whole WAV on its standard input; success means
+  # the player consumed the whole segment and exited normally.
+  audio_output:
+    # No provider is assumed (AC43): while `endpoint` is empty no request is
+    # sent, `audio.speak` stays unbound and is named not ready at startup,
+    # and `audio.play` still plays the configured clips. Set the endpoint,
+    # the model and — when the service needs one — the key (an environment
+    # reference, e.g. `api_key: ${SPEECH_API_KEY}`) to enable speech.
+    synthesis:
+      endpoint: ""
+      model: ""
+      api_key: ""
+    # The voices a call may name — names the synthesis service accepts — and
+    # the one used when it names none.
+    voices:
+      allowed:
+        - default
+      default: default
+    outputs:
+      default:
+        player:
+          # AUDIO_PLAYER names a program playing the WAV it reads on standard
+          # input; replace "-" with the options your player needs for that. A
+          # program that does not resolve to an executable leaves both audio
+          # actions unbound (R8).
+          argv:
+            - ${AUDIO_PLAYER}
+            - "-"
+    default_output: default
+    # The clips `audio.play` may name: each a WAV file on this machine,
+    # re-read at each call.
+    clips:
+      chime:
+        path: ${AUDIO_CHIME_PATH}
+    required: false
+
+  # Stream scenes and platform polls through `stream.scene.set` and
+  # `stream.poll.create` (R6, R7). The scene provider is the broadcast
+  # software's websocket interface (protocol version 5): `ws://` is accepted
+  # on a loopback host only, `wss://` anywhere. An unreachable provider at
+  # startup leaves `stream.scene.set` unbound (R8).
+  stream_control:
+    scenes:
+      provider:
+        kind: websocket
+        url: ${SCENE_WEBSOCKET_URL}
+        # Declared as a credential by the manifest: redacted from every trace.
+        password: ${SCENE_WEBSOCKET_PASSWORD}
+      # The scenes a call may switch to, by their exact names.
+      allowed:
+        - Main
+        - Break
+    # Polls are created through the poll service the platform module
+    # publishes. Off here: enable them once the platform token carries the
+    # poll scope; with polls enabled and no service published,
+    # `stream.poll.create` stays unbound (R8).
+    polls:
+      enabled: false
+    required: false
+
+  brain:
+    endpoint: ${OPENAI_ENDPOINT}
+    model: ${OPENAI_MODEL}
+    api_key: ${OPENAI_API_KEY}
+    # The limits the brain owns (R3). Its manifest requires the three blocks
+    # below and its settings validator checks each value is finite and
+    # positive before any transport opens; startup stops with a diagnostic
+    # naming the field when one is absent, zero, negative or infinite. The
+    # admission and conversation_memory groups are the same limits the entry
+    # point accepts under `limits` below: it hands its accepted block to every
+    # enabled module, and the brain's validator refuses a value here that
+    # differs from `limits.admission` or `limits.conversation_memory`, naming
+    # the field, before any module is activated (R6). Change both together.
+    # The queued wait is part of the total run deadline and may not exceed it.
+    admission:
+      session_queue_capacity: 4
+      global_pending_capacity: 64
+      max_sessions: 32
+      workers: 4
+      wait_seconds: 30
+      total_run_seconds: 60
+    # Per-run budgets, every one acted on: model turns, the deadline of one
+    # model call, the deadline of one action call (delivery included), the
+    # cumulated token budget, the largest observation admitted, the action
+    # calls a run may make (every delivery entry and the fallback included),
+    # how many times one identical proposal is executed, and the time kept
+    # back before the total deadline for the whole terminal delivery step.
+    budget:
+      model_turns: 5
+      model_call_seconds: 30
+      action_seconds: 10
+      max_tokens: 8192
+      max_observation_bytes: 5242880
+      max_action_calls: 6
+      max_repeated_actions: 2
+      delivery_reserve_seconds: 10
+    conversation_memory:
+      max_sessions: 64
+      max_exchanges: 20
+      max_bytes: 65536
+      max_age_seconds: 3600
+    # What is delivered, through the same delivery list as an answer, when a
+    # run ends without one — budgets exhausted, deadline reached or the
+    # message dropped stale (R3). Disable it to send nothing in those cases.
+    fallback:
+      enabled: true
+      text: "I could not answer in time."
+    # The backend capabilities verified at startup, before the brain reports
+    # ready (R2): `structured_output` (mandatory — the loop needs one tool
+    # call or a final text per turn) and `vision` (the model accepts image
+    # observations, such as a screen capture). A capability the backend does
+    # not verify stops startup naming it. `audio` (the model accepts audio
+    # observations, such as an `audio.capture` segment) is verified the same
+    # way when listed; without it a captured segment reaches the model as its
+    # transcription only.
+    capabilities:
+      required:
+        - structured_output
+        - vision
+        # - audio
+    # The terminal delivery step (R1): the ordered list of actions the final
+    # answer is handed to, one authorized executor call per entry, resolved
+    # against the enabled modules at startup. `mode: fixed` lists the entries
+    # here; `text_argument` names the argument the answer text is put under
+    # (`none` for an effect-only entry such as a scene change). The model
+    # never selects a delivery. `mode: modules` derives the list from every
+    # enabled action that declares a delivery capability, ordered by an
+    # optional `preference` list; `overrides` keyed `<platform>/<channel_id>`
+    # select another list per destination.
+    # Speaking the answer too is one more entry, once a synthesis endpoint
+    # is configured above and `audio.speak` is bound:
+    #   - action: audio.speak
+    #     text_argument: text
+    delivery:
+      mode: fixed
+      actions:
+        - action: chat.write
+          text_argument: text
+
+  audit:
+    output: stdout
+    # The record queue the audit module owns (R6). Its manifest requires both
+    # bounds and its settings validator checks each is a finite positive
+    # integer before any transport opens. When either bound is reached the
+    # newly offered record is dropped and the audit loss counter incremented;
+    # publication never waits. The values are the same bounds the entry point
+    # accepts as `limits.observation_queue` below: a value here that differs
+    # from the accepted one stops startup naming the field, so the queue is
+    # never bounded by a stale mirror. Change both together.
+    queue:
+      max_records: 1000
+      max_bytes: 4194304
+
+# Redaction (R8). The credentials proper need no entry here: each module's
+# manifest declares which of its settings are credentials (`credentials:` in
+# modules/twitch/module.yaml, modules/brain/module.yaml and the three phase 2
+# manifests), and their
+# accepted values — literal or resolved — are redacted from every supervision
+# trace and every lost-trace diagnostic before any module is activated,
+# whether or not this block exists. This optional block adds references the
+# modules do not declare; every reference listed is redacted, once resolved,
+# wherever it appears — verbatim, nested or embedded in a longer string. The
+# list is never resolved on its own: a reference takes the value an enabled
+# module's setting resolved it to, so listing a disabled module's credential
+# looks nothing up (R7). Identifiers that traces correlate by — the
+# broadcaster, the bot account — are deliberately not listed: a redacted
+# channel would break correlation, not protect a secret. The backend URL is
+# listed because such a URL may embed a credential; the declared credentials
+# are repeated for the reader, which redacts nothing twice.
+secrets:
+  - ${TWITCH_CLIENT_SECRET}
+  - ${TWITCH_ACCESS_TOKEN}
+  - ${OPENAI_API_KEY}
+  - ${OPENAI_ENDPOINT}
+
+# Trigger policies, selected per input and per channel (R1). The key under
+# `triggers` names the input module. An entry under `channels` selects the
+# policy for that one channel and replaces the module default entirely:
+# rules are never merged with the default they replace. A channel with no
+# entry of its own falls back to the default the input's manifest declares
+# — for the chat input, "the message text mentions the configured companion
+# name" (AC1). Only types the module declares may be configured (the chat
+# input declares `probability`, `audience` and `keyword`), only parameters
+# their schemas accept and only combination operators its manifest
+# supports; anything else stops startup before any transport opens.
+triggers:
+  twitch:
+    channels:
+      # The served channel answers only to an explicit keyword; a mention of
+      # the companion name alone no longer triggers a run here.
+      ${TWITCH_BROADCASTER_ID}:
+        combination: all_of
+        rules:
+          - type: keyword
+            parameters:
+              keywords:
+                - "!ask"
+      # A channel with no entry of its own keeps the module default: the
+      # message text mentions `companion_name` above. Deleting the entry
+      # above hands the served channel back to that default.
+
+# Explicit action authorization rules (R5). Authorization is default-deny:
+# the absence of an applicable rule is a refusal — for reads exactly as for
+# writes — and the provider is never invoked for a refused call. Declaring
+# an action in a module manifest grants nothing by itself, and the executor
+# re-evaluates these rules on every call, so removing a rule below refuses
+# the very next call of its action. The nine rules grant exactly the
+# provided-action set of this profile — the actions the enabled manifests
+# declare — to the brain's principal on the served channel: the reads on the
+# channel's `chat` scope, the screen capture on its `capture` scope, the
+# audio capture and the two playbacks on `audio`, the scene change on
+# `stream`, the poll on `poll`, the reply delivery on `chat` (R7, R9). A rule
+# grants; it binds nothing: an action whose module left it unbound is still
+# refused `provider_not_ready` and never offered to the model (R8).
+actions:
+  # The retained transcript of the served channel.
+  - rule_id: brain-reads-chat
+    action_name: chat.read
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: chat
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - chat.read
+  # The directory of authors observed on the served channel.
+  - rule_id: brain-reads-users
+    action_name: users.read
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: chat
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - users.read
+  # The screen capture, addressed on the served channel's `capture` scope.
+  - rule_id: brain-captures-screen
+    action_name: screen.capture
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: capture
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - screen.capture
+  # One bounded audio segment, addressed on the served channel's `audio` scope.
+  - rule_id: brain-captures-audio
+    action_name: audio.capture
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - audio.capture
+  # Speech on a configured output, as a tool or as a delivery entry.
+  - rule_id: brain-speaks
+    action_name: audio.speak
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.speak
+  # A configured clip on a configured output.
+  - rule_id: brain-plays-clips
+    action_name: audio.play
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.play
+  # A switch to an allowed scene, on the served channel's `stream` scope.
+  - rule_id: brain-sets-scenes
+    action_name: stream.scene.set
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: stream
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.scene
+  # One poll on the served channel, on its `poll` scope.
+  - rule_id: brain-creates-polls
+    action_name: stream.poll.create
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: poll
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.poll
+  # The reply delivery the brain module asks for, on the served channel.
+  - rule_id: brain-delivers-chat-replies
+    action_name: chat.write
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: chat
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - chat.write
+
+# Retention and admission limits. The block is optional as a whole, but a
+# module built against the versioned runtime (the chat input declares triggers) needs
+# it: without it the application runs the compatibility runtime and refuses
+# such a module at startup. With the block present every limit below is
+# required and must be finite and positive; startup stops before any
+# transport opens when one is absent, negative, non-numeric or infinite.
+# The accepted block is handed to every enabled module as its reserved
+# `limits` setting: the module that owns a group (`observation_queue`,
+# `conversation_memory`, `admission`) validates its own copy above against
+# it and refuses a difference by field, so the bounds the runtime actually
+# runs under are exactly the ones accepted here (R6).
+limits:
+  bus_history:
+    max_events: 1000
+    max_bytes: 4194304
+    max_age_seconds: 600
+  observation_queue:
+    max_records: 1000
+    max_bytes: 4194304
+  dedup:
+    max_entries: 4096
+    ttl_seconds: 600
+  attachments:
+    max_object_bytes: 1048576
+    max_objects: 256
+    max_total_bytes: 67108864
+    max_bytes_per_run: 8388608
+    ttl_seconds: 900
+  conversation_memory:
+    max_sessions: 64
+    max_exchanges: 20
+    max_bytes: 65536
+    max_age_seconds: 3600
+  chat_context:
+    max_messages: 50
+    max_bytes: 65536
+    max_age_seconds: 900
+    max_channels: 8
+  admission:
+    session_queue_capacity: 4
+    global_pending_capacity: 64
+    max_sessions: 32
+    workers: 4
+    wait_seconds: 30
+    total_run_seconds: 60

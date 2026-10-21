@@ -2677,11 +2677,16 @@ async def test_ac14_the_real_users_and_bridge_split_the_viewer_read() -> None:
 
 import ast  # noqa: E402
 import contextlib  # noqa: E402
-import json  # noqa: E402
-import os  # noqa: E402
-import shutil  # noqa: E402
-import subprocess  # noqa: E402
-import sys  # noqa: E402
+import inspect  # noqa: E402
+import itertools  # noqa: E402
+from collections.abc import Callable  # noqa: E402
+
+from conftest import (  # noqa: E402
+    AC33_PENDING,
+    ac33_node,
+    baseline_numstat,
+    ownership_rejection_probe,
+)
 
 from core.contracts import (  # noqa: E402
     COUNTER_INPUT_OWNERSHIP_REJECTIONS as _REJECTIONS,
@@ -2812,36 +2817,25 @@ def test_ac2_no_shipped_profile_names_the_bridge_or_an_inputs_key(name: str) -> 
     assert _INPUTS_KEY_LINE.search("a:\n  inputs: {}\n")
 
 
-def _git(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(ROOT), *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-
-
 def test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base() -> None:
     """AC2 (R1): ``git diff --stat <phase base>`` over the 4 shipped profiles
-    — the working tree against ``f900f27`` — reports 0 changed lines."""
+    — the working tree against ``f900f27`` — reports 0 changed lines.
 
-    if shutil.which("git") is None:
-        pytest.skip("git is not available: the phase-base diff cannot be taken")
-    if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
-        pytest.skip("not a git work tree: the phase-base diff cannot be taken")
-    if _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode != 0:
-        pytest.skip(f"the phase base {PHASE_BASE} is not in this clone (shallow?)")
+    Read in-process (AC33, P15a): the profiles as they were at the phase
+    base are committed under ``tests/fixtures/baselines/f900f27/`` (taken
+    with ``git show``, the hash in its ``SOURCE``), and
+    :func:`conftest.baseline_numstat` compares them byte for byte with the
+    working tree — the same claim as an empty ``--numstat``."""
 
-    diff = _git("diff", "--stat", PHASE_BASE, "--", *SHIPPED_PROFILES)
+    diff = baseline_numstat(PHASE_BASE, SHIPPED_PROFILES)
     assert diff.returncode == 0, diff.stderr
     assert diff.stdout.strip() == ""
-    numstat = _git("diff", "--numstat", PHASE_BASE, "--", *SHIPPED_PROFILES)
+    numstat = baseline_numstat(PHASE_BASE, SHIPPED_PROFILES)
     assert numstat.returncode == 0 and numstat.stdout.strip() == ""
     # Each profile exists at the phase base, so an empty diff is no accident
     # of a path the base never had.
     for name in SHIPPED_PROFILES:
-        assert _git("cat-file", "-e", f"{PHASE_BASE}:{name}").returncode == 0, name
+        assert baseline_numstat(PHASE_BASE, [name]).returncode == 0, name
 
 
 # -- AC44, shipped half: no undeclared publisher meets a resolved owner ------- #
@@ -2926,95 +2920,111 @@ async def test_ac44_no_undeclared_shipped_publisher_meets_a_resolved_owner(
         assert _FAMILY_EVENT not in produced, module
 
 
-_PROBE_PLUGIN = '''
-"""P19's counter probe: every input-ownership rejection, every guard built."""
-
-import json
-import os
-from pathlib import Path
-
-from core import contracts, runtime
-
-_seen = {"guards": 0, "admits": 0, "rejections": 0, "counted": 0}
-
-_init = runtime._InputGuard.__init__
-_admits = runtime._InputGuard.admits
-_reject = runtime._InputGuard.reject
-_increment = contracts.Counters.increment
+#: The shipped-profile activations of ``tests/test_examples.py`` the probe
+#: runs beside every scenario of ``tests/test_integration.py``.
+_EXAMPLE_ACTIVATIONS = (
+    "test_example_trigger_policies_give_the_two_channels_two_distinct_policies",
+    "test_profile_grants_exactly_its_provided_action_set",
+    "test_ac30_the_chat_only_profile_starts_and_runs_the_phase_1_scenario",
+    "test_ac12_every_shipped_example_passes_check_config",
+)
 
 
-def _probe_init(self, *args, **kwargs):
-    _seen["guards"] += 1
-    _init(self, *args, **kwargs)
+def _test_names(module: Any) -> list[str]:
+    """The test functions *module*'s source defines at top level, in order."""
+
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    ]
 
 
-def _probe_admits(self, family, platform):
-    _seen["admits"] += 1
-    return _admits(self, family, platform)
+def _parameter_sets(function: Callable[..., Any]) -> list[dict[str, Any]]:
+    """Every argument set the function's ``parametrize`` marks expand to."""
+
+    axes: list[list[dict[str, Any]]] = []
+    for mark in getattr(function, "pytestmark", []):
+        if mark.name != "parametrize":
+            continue
+        names, values = mark.args[0], mark.args[1]
+        if isinstance(names, str):
+            names = [name.strip() for name in names.split(",") if name.strip()]
+        rows = []
+        for value in values:
+            value = getattr(value, "values", value)
+            if len(names) == 1 and not (isinstance(value, tuple) and len(value) == 1):
+                value = (value,)
+            rows.append(dict(zip(names, value)))
+        axes.append(rows)
+    return [
+        {key: item for row in combination for key, item in row.items()}
+        for combination in itertools.product(*axes)
+    ]
 
 
-async def _probe_reject(self, family, platform):
-    _seen["rejections"] += 1
-    await _reject(self, family, platform)
+def _run_scenario(
+    function: Callable[..., Any], arguments: dict[str, Any], scratch: Path
+) -> None:
+    """Run one test function in-process with the fixtures it names."""
 
-
-def _probe_increment(self, name, *args, **kwargs):
-    if name == contracts.COUNTER_INPUT_OWNERSHIP_REJECTIONS:
-        _seen["counted"] += 1
-    return _increment(self, name, *args, **kwargs)
-
-
-runtime._InputGuard.__init__ = _probe_init
-runtime._InputGuard.admits = _probe_admits
-runtime._InputGuard.reject = _probe_reject
-contracts.Counters.increment = _probe_increment
-
-
-def pytest_sessionfinish(session, exitstatus):
-    Path(os.environ["P19_PROBE_OUTPUT"]).write_text(json.dumps(_seen), encoding="utf-8")
-'''
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        fixtures = {"tmp_path": scratch, "monkeypatch": monkeypatch}
+        for name in inspect.signature(function).parameters:
+            if name not in arguments:
+                assert name in fixtures, f"{function.__name__}: fixture {name} is not provided"
+                arguments[name] = fixtures[name]
+        scratch.mkdir(parents=True)
+        result = function(**arguments)
+        if inspect.iscoroutine(result):
+            asyncio.run(result)
 
 
 def test_ac44_the_integration_scenarios_count_zero_ownership_rejections(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC44 (R3, R1), shipped half: ``tests/test_integration.py`` and the
     shipped-profile activations of ``tests/test_examples.py``, run whole
     with a counter probe, pass and record ``input_ownership_rejections == 0``
     while ownership guards were built and consulted — the shipped modules'
-    declarations leave every pair they publish admitted."""
+    declarations leave every pair they publish admitted.
 
-    (tmp_path / "p19_probe.py").write_text(_PROBE_PLUGIN, encoding="utf-8")
-    output = tmp_path / "probe.json"
-    environ = {
-        **os.environ,
-        "PYTHONPATH": os.pathsep.join(
-            [str(tmp_path), str(ROOT), os.environ.get("PYTHONPATH", "")]
-        ),
-        "P19_PROBE_OUTPUT": str(output),
-    }
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "tests/test_integration.py",
-            "tests/test_examples.py",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "p19_probe",
-        ],
-        cwd=ROOT,
-        env=environ,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=600,
-    )
-    assert completed.returncode == 0, completed.stdout[-4000:] + completed.stderr[-4000:]
-    seen = json.loads(output.read_text(encoding="utf-8"))
+    Run in-process (AC33, P15a), not in a child ``pytest``: the scenarios are
+    read from each file with ``ast`` and called with their parameter sets,
+    under counting wrappers of the input guard and of the rejection counter.
+    An integration node still in ``AC33_PENDING`` opens a socket or starts a
+    process, so it is left out here and runs under the same probe in its own
+    execution (``tests/test_integration.py``'s ``_ac44_pending_probe``)
+    until its conversion removes it and it joins this run."""
+
+    import test_examples
+    import test_integration
+
+    seen = ownership_rejection_probe(monkeypatch)
+
+    scenarios = [
+        (test_integration, name)
+        for name in _test_names(test_integration)
+        if ac33_node(f"tests/test_integration.py::{name}") not in AC33_PENDING
+    ] + [(test_examples, name) for name in _EXAMPLE_ACTIVATIONS]
+    assert set(_EXAMPLE_ACTIVATIONS) <= set(_test_names(test_examples))
+    failures: list[str] = []
+    ran = 0
+    for module, name in scenarios:
+        function = getattr(module, name)
+        for arguments in _parameter_sets(function) or [{}]:
+            ran += 1
+            label = f"{module.__name__}::{name}{sorted(arguments.items())}"
+            try:
+                _run_scenario(function, dict(arguments), tmp_path / f"scenario-{ran}")
+            except pytest.skip.Exception:
+                continue
+            except (Exception, pytest.fail.Exception) as error:
+                failures.append(f"{label}: {type(error).__name__}: {error}")
+    assert ran > 0
+    assert failures == [], "\n".join(failures)
     assert seen["guards"] > 0 and seen["admits"] > 0, seen
     assert seen["rejections"] == 0 and seen["counted"] == 0, seen
 

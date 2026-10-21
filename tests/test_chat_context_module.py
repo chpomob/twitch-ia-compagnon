@@ -16,7 +16,6 @@ executor's, not mocked — with the transcript on the injected clock.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,7 +33,7 @@ from core.contracts import ActionCall, ActionObservation, Destination
 from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext
-from conftest import ManualClock, runtime_context
+from conftest import ManualClock, files_containing, runtime_context
 
 from modules.chat_context import (
     CHAT_READ_ACTION,
@@ -551,11 +550,8 @@ def test_module_names_no_platform() -> None:
     """R5/AC31: ``grep twitch`` over the module directory is 0 lines — the
     platform is the destination's, a runtime value, never a name in code."""
 
-    completed = subprocess.run(
-        ["grep", "-r", "-i", "-c", "twitch", str(MODULE_DIR / "__init__.py"), str(MANIFEST_PATH)],
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = files_containing(
+        [MODULE_DIR / "__init__.py", MANIFEST_PATH], "twitch", ignore_case=True, count=True
     )
     # ``grep -c`` prints ``<file>:0`` per file and exits 1 when nothing matched.
     assert completed.returncode == 1, completed.stdout

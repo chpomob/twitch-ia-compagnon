@@ -62,7 +62,11 @@ Phase 8 (P1) adds a recorded random source (:class:`RecordedRandom`) and the
 autouse guard ``_ac33_isolation``: under it, creating a socket (the event
 loop's own wakeup pair excepted) or starting a process raises, for every test
 of the suite but the nodes of the shrinking ``AC33_PENDING`` ledger and an
-operator-opted-in real-instance trial.
+operator-opted-in real-instance trial. P15a adds the in-process readers of
+repository facts that replace ``grep``, ``git`` and child interpreters:
+:func:`files_containing`, :func:`tracked_files` (the git index read
+directly), :func:`ignored` (the ignore files) and :func:`baseline_numstat`
+(the committed ``tests/fixtures/baselines/<commit>/`` copies).
 
 This file is a single point of failure for every suite that imports it; a
 change here must be reviewed against each consumer, not just the suite that
@@ -73,7 +77,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import errno
+import fnmatch
 import hashlib
 import json
 import os
@@ -2896,7 +2902,6 @@ _PHASE5_TRIALS = "test_phase5_trials.py"
 #: nodes they convert and P16 asserts it is empty. Nothing is ever added.
 AC33_PENDING: frozenset[str] = frozenset(
     {
-        "tests/test_agentic_loop.py::test_ac31_the_core_and_the_neutral_modules_name_no_platform",
         "tests/test_audio_input.py::test_the_real_transport_against_a_closed_port_degrades_the_transcription",
         "tests/test_audio_input.py::test_the_shipped_runner_is_not_held_by_a_fast_recorder_after_its_segment",
         "tests/test_audio_input.py::test_the_shipped_runner_kills_a_child_left_by_an_exited_wrapper",
@@ -2945,7 +2950,6 @@ AC33_PENDING: frozenset[str] = frozenset(
         "tests/test_automation_bridge.py::test_ac34_another_channel_is_refused_unsupported_destination",
         "tests/test_automation_bridge.py::test_ac34_a_page_holds_at_most_limit_and_the_cursor_pages_the_same_list",
         "tests/test_automation_bridge.py::test_ac34_the_owned_channel_reads_one_page_of_active_viewers",
-        "tests/test_automation_bridge.py::test_ac37_the_status_guard_runs_unmarked_and_the_trial_file_keeps_eight_nodes",
         "tests/test_automation_bridge.py::test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degraded_bridge",
         "tests/test_automation_bridge.py::test_ac43_owning_chat_each_fixture_gives_one_event_and_unmapped_is_dropped",
         "tests/test_automation_bridge.py::test_ac43_owning_only_twitch_the_kick_and_youtube_fixtures_give_nothing",
@@ -2983,9 +2987,7 @@ AC33_PENDING: frozenset[str] = frozenset(
         "tests/test_automation_bridge.py::test_without_owning_viewers_the_read_is_declared_and_never_bound",
         "tests/test_capture.py::test_command_exiting_non_zero_is_capture_failed_and_oversize_output_is_refused",
         "tests/test_capture.py::test_command_source_runs_a_python_one_liner_writing_a_png_to_stdout",
-        "tests/test_capture.py::test_module_names_no_platform",
         "tests/test_capture.py::test_run_command_reads_bounded_stdout_and_kills_a_flooding_child",
-        "tests/test_chat_context_module.py::test_module_names_no_platform",
         "tests/test_clips.py::test_ac12_with_only_kick_required_unset_starts_with_the_action_unbound",
         "tests/test_config_ui.py::test_ac30_a_child_exiting_2_is_refused_with_its_status_and_diagnostic",
         "tests/test_config_ui.py::test_ac30_a_child_writing_nothing_within_the_window_is_unknown",
@@ -3001,10 +3003,7 @@ AC33_PENDING: frozenset[str] = frozenset(
         "tests/test_config_ui.py::test_d9_draining_continues_after_acceptance",
         "tests/test_config_ui.py::test_d9_the_refused_tail_is_redacted_and_value_free",
         "tests/test_config_ui.py::test_the_child_inherits_the_environment_plus_the_status_variable",
-        "tests/test_hygiene.py::test_n8_the_generated_overlay_and_status_files_are_ignored",
         "tests/test_input_ownership.py::test_ac14_the_real_users_and_bridge_split_the_viewer_read",
-        "tests/test_input_ownership.py::test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base",
-        "tests/test_input_ownership.py::test_ac44_the_integration_scenarios_count_zero_ownership_rejections",
         "tests/test_input_ownership.py::test_ac5_a_twitch_event_is_dropped_while_the_owning_bridge_is_down",
         "tests/test_installation_doc.py::test_the_guides_profile_is_accepted_by_the_real_entry_point",
         "tests/test_installation_doc.py::test_the_readme_config_ui_command_runs",
@@ -3044,20 +3043,14 @@ AC33_PENDING: frozenset[str] = frozenset(
         "tests/test_main.py::test_the_accepted_limits_bound_the_real_scheduler_memory_and_audit_queue",
         "tests/test_phase5_docs_status.py::test_ac36_the_socket_count_sees_a_local_and_a_network_socket",
         "tests/test_phase5_docs_status.py::test_ac36_the_trial_file_skips_its_eight_nodes_opening_no_socket",
-        "tests/test_phase5_docs_status.py::test_ac37_no_document_calls_the_bridge_delivered",
-        "tests/test_phase5_docs_status.py::test_ac37_the_exclusion_covers_only_the_campaign_papers",
         "tests/test_profiles.py::test_ac31_the_full_pc_profile_degrades_three_modules_and_still_chats",
         "tests/test_profiles.py::test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not_ready_too",
         "tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help",
         "tests/test_proxy_process.py::test_ac39_two_process_topology_over_loopback",
-        "tests/test_proxy.py::test_ac31_the_proxy_and_the_agent_link_name_no_platform",
         "tests/test_proxy.py::test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it",
         "tests/test_shutdown.py::test_cli_deadline_covers_cancellation_resistant_task",
         "tests/test_shutdown.py::test_cli_process_exits_with_synchronous_audit_writer",
         "tests/test_stream_control.py::test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket",
-        "tests/test_users.py::test_module_names_no_platform",
-        "tests/test_viewer_memory.py::test_ac19_cli_the_module_entry_runs_without_a_network_client",
-        "tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base",
         "tests/test_web.py::test_the_socket_guard_refuses_and_records_every_non_loopback_surface",
         "tests/test_youtube.py::test_ac39_three_platforms_on_one_runtime",
     }
@@ -3068,6 +3061,45 @@ def ac33_node(nodeid: str) -> str:
     """*nodeid* without its parameter suffix: the ledger's key."""
 
     return nodeid.split("[", 1)[0]
+
+
+def ownership_rejection_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """AC44 (R3, R1): count input guards, their admissions and rejections.
+
+    Wraps ``core.runtime._InputGuard`` and the rejection counter under
+    *monkeypatch*; the returned tallies grow as the patched code runs.
+    """
+
+    from core import contracts, runtime
+
+    seen = {"guards": 0, "admits": 0, "rejections": 0, "counted": 0}
+    init = runtime._InputGuard.__init__
+    admits = runtime._InputGuard.admits
+    reject = runtime._InputGuard.reject
+    increment = contracts.Counters.increment
+
+    def probe_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        seen["guards"] += 1
+        init(self, *args, **kwargs)
+
+    def probe_admits(self: Any, family: Any, platform: Any) -> Any:
+        seen["admits"] += 1
+        return admits(self, family, platform)
+
+    async def probe_reject(self: Any, family: Any, platform: Any) -> None:
+        seen["rejections"] += 1
+        await reject(self, family, platform)
+
+    def probe_increment(self: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == contracts.COUNTER_INPUT_OWNERSHIP_REJECTIONS:
+            seen["counted"] += 1
+        return increment(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(runtime._InputGuard, "__init__", probe_init)
+    monkeypatch.setattr(runtime._InputGuard, "admits", probe_admits)
+    monkeypatch.setattr(runtime._InputGuard, "reject", probe_reject)
+    monkeypatch.setattr(contracts.Counters, "increment", probe_increment)
+    return seen
 
 
 def trial_opted_in(file_name: str, module: Any, test_name: str) -> bool:
@@ -3162,3 +3194,324 @@ def _ac33_isolation(
         if hasattr(os, name):
             install(os, name, no_process)
     yield
+
+
+# --------------------------------------------------------------------------- #
+# AC33: repository facts read in-process (phase 8, P15a, D8)
+# --------------------------------------------------------------------------- #
+
+#: The repository the suite runs from.
+REPOSITORY = Path(__file__).resolve().parent.parent
+#: The shipped profiles as they were at a phase base, one directory per commit.
+BASELINES = REPOSITORY / "tests" / "fixtures" / "baselines"
+
+
+def files_containing(
+    root: str | Path | Sequence[str | Path],
+    needle: str,
+    ignore_case: bool = False,
+    *,
+    count: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """``grep -r [-i] [-c] <needle> <root>...`` answered in-process.
+
+    Walks each *root* (a file or a directory, ``__pycache__`` skipped) and
+    answers in grep's shape, so a converted assertion reads the same:
+    ``stdout`` holds one ``<path>:<line>`` per matching line (with *count*,
+    one ``<path>:<n>`` per file read), and ``returncode`` is 0 when a line
+    matched, 1 when none did and 2 when a root does not exist.
+    """
+
+    roots = [root] if isinstance(root, (str, Path)) else list(root)
+    wanted = needle.lower() if ignore_case else needle
+    out: list[str] = []
+    errors: list[str] = []
+    matched = False
+    for start in map(Path, roots):
+        if start.is_file():
+            files = [start]
+        elif start.is_dir():
+            files = sorted(
+                path
+                for path in start.rglob("*")
+                if path.is_file() and "__pycache__" not in path.relative_to(start).parts
+            )
+        else:
+            errors.append(f"grep: {start}: No such file or directory")
+            continue
+        for path in files:
+            text = path.read_bytes().decode("utf-8", errors="replace")
+            lines = [
+                line
+                for line in text.splitlines()
+                if wanted in (line.lower() if ignore_case else line)
+            ]
+            matched = matched or bool(lines)
+            if count:
+                out.append(f"{path}:{len(lines)}")
+            else:
+                out.extend(f"{path}:{line}" for line in lines)
+    returncode = 2 if errors else (0 if matched else 1)
+    stdout = "".join(f"{line}\n" for line in out)
+    stderr = "".join(f"{line}\n" for line in errors)
+    return subprocess.CompletedProcess(
+        ("files_containing", needle, *map(str, roots)), returncode, stdout, stderr
+    )
+
+
+def git_directory(root: Path = REPOSITORY) -> Path:
+    """*root*'s git directory, following a worktree's ``.git`` file."""
+
+    dot_git = root / ".git"
+    if dot_git.is_file():
+        line = dot_git.read_text(encoding="utf-8").strip()
+        if not line.startswith("gitdir:"):
+            raise AssertionError(f"{dot_git} names no gitdir")
+        target = Path(line[len("gitdir:"):].strip())
+        return target if target.is_absolute() else (root / target).resolve()
+    return dot_git
+
+
+def _ewah_positions(data: bytes) -> list[int]:
+    """The set bits of an EWAH bitmap (git's ``ewah/ewah_io.c`` layout)."""
+
+    bit_count, word_count = struct.unpack_from(">II", data, 0)
+    words = struct.unpack_from(f">{word_count}Q", data, 8)
+    positions: list[int] = []
+    word_index = 0
+    bit = 0
+    while word_index < word_count:
+        marker = words[word_index]
+        word_index += 1
+        running_bit = marker & 1
+        running_length = (marker >> 1) & 0xFFFFFFFF
+        literals = marker >> 33
+        if running_bit:
+            positions.extend(range(bit, bit + 64 * running_length))
+        bit += 64 * running_length
+        for literal in words[word_index:word_index + literals]:
+            positions.extend(bit + offset for offset in range(64) if literal >> offset & 1)
+            bit += 64
+        word_index += literals
+    return [position for position in positions if position < bit_count]
+
+
+def _read_index(path: Path) -> tuple[list[str], dict[bytes, bytes]]:
+    """The entry names (one per stage) and the extensions of a git index."""
+
+    data = path.read_bytes()
+    signature, version, entry_count = struct.unpack_from(">4sII", data, 0)
+    if signature != b"DIRC" or version not in (2, 3, 4):
+        raise AssertionError(f"{path}: not a git index of version 2-4")
+    offset = 12
+    names: list[str] = []
+    previous = b""
+    for _ in range(entry_count):
+        start = offset
+        mode = struct.unpack_from(">I", data, start + 24)[0]
+        flags = struct.unpack_from(">H", data, start + 60)[0]
+        offset = start + 62
+        if version >= 3 and flags & 0x4000:
+            offset += 2
+        if version == 4:
+            byte = data[offset]
+            offset += 1
+            strip = byte & 0x7F
+            while byte & 0x80:
+                byte = data[offset]
+                offset += 1
+                strip = ((strip + 1) << 7) | (byte & 0x7F)
+            end = data.index(b"\0", offset)
+            name = previous[: len(previous) - strip] + data[offset:end]
+            offset = end + 1
+        else:
+            end = data.index(b"\0", offset)
+            name = data[offset:end]
+            offset = start + ((end - start + 8) & ~7)
+        if mode >> 12 == 0o04:
+            raise AssertionError(f"{path}: a sparse index directory entry is not read")
+        names.append(name.decode("utf-8"))
+        previous = name
+    extensions: dict[bytes, bytes] = {}
+    while offset + 8 <= len(data) - 20:
+        tag, size = struct.unpack_from(">4sI", data, offset)
+        extensions[tag] = data[offset + 8: offset + 8 + size]
+        offset += 8 + size
+    return names, extensions
+
+
+def index_paths(index: Path) -> list[str]:
+    """``git ls-files`` of the index file *index*: sorted, each path once.
+
+    Reads formats 2 to 4 (extended flags, v4 prefix compression) and a split
+    index: the ``link`` extension names the shared index beside *index*,
+    whose entries the delete bitmap removes and the replace bitmap renames
+    by the split index's own entries, in order.
+    """
+
+    names, extensions = _read_index(index)
+    link = extensions.get(b"link")
+    if link is not None:
+        shared_name = link[:20].hex()
+        shared, _ = _read_index(index.parent / f"sharedindex.{shared_name}")
+        deleted: set[int] = set()
+        replaced: list[int] = []
+        if len(link) > 20:
+            delete_bitmap = link[20:]
+            deleted = set(_ewah_positions(delete_bitmap))
+            delete_size = 12 + 8 * struct.unpack_from(">I", delete_bitmap, 4)[0]
+            replaced = _ewah_positions(delete_bitmap[delete_size:])
+        own = iter(names)
+        merged = list(shared)
+        for position in replaced:
+            replacement = next(own)
+            merged[position] = replacement or merged[position]
+        merged = [name for position, name in enumerate(merged) if position not in deleted]
+        names = merged + list(own)
+    return sorted(set(names))
+
+
+def tracked_files(pattern: str | None = None, root: Path = REPOSITORY) -> list[str]:
+    """``git ls-files -- <pattern>`` read from *root*'s index, no ``git`` run.
+
+    A pathspec without wildcard names a file or a directory prefix; with one
+    it is matched by ``fnmatch`` over the whole path, ``*`` crossing ``/`` as
+    git's default pathspec does.
+    """
+
+    paths = index_paths(git_directory(root) / "index")
+    if pattern is None:
+        return paths
+    prefix = pattern.rstrip("/") + "/"
+    return [
+        path
+        for path in paths
+        if fnmatch.fnmatchcase(path, pattern) or path == pattern or path.startswith(prefix)
+    ]
+
+
+def _gitignore_rules(text: str, base: str) -> list[tuple[str, str, bool, bool]]:
+    """The rules of one ignore file: ``(base, pattern, negated, directory only)``."""
+
+    rules: list[tuple[str, str, bool, bool]] = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if raw.endswith("\\ "):
+            line += " "
+        if not line or line.startswith("#"):
+            continue
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        elif line.startswith("\\!") or line.startswith("\\#"):
+            line = line[1:]
+        directory_only = line.endswith("/")
+        line = line.rstrip("/")
+        if line:
+            rules.append((base, line, negated, directory_only))
+    return rules
+
+
+def _segments_match(pattern: list[str], parts: list[str]) -> bool:
+    if not pattern:
+        return not parts
+    if pattern[0] == "**":
+        return any(_segments_match(pattern[1:], parts[index:]) for index in range(len(parts) + 1))
+    return bool(parts) and fnmatch.fnmatchcase(parts[0], pattern[0]) and _segments_match(
+        pattern[1:], parts[1:]
+    )
+
+
+def _rule_matches(rule: tuple[str, str, bool, bool], path: str, is_dir: bool) -> bool:
+    base, pattern, _negated, directory_only = rule
+    if directory_only and not is_dir:
+        return False
+    if base:
+        if not path.startswith(base + "/"):
+            return False
+        path = path[len(base) + 1:]
+    parts = path.split("/")
+    if "/" not in pattern:
+        return fnmatch.fnmatchcase(parts[-1], pattern)
+    return _segments_match(pattern.lstrip("/").split("/"), parts)
+
+
+def ignored(path: str, root: Path = REPOSITORY) -> bool:
+    """``git check-ignore --no-index <path>`` answered from the ignore files.
+
+    Reads ``.git/info/exclude`` and every ``.gitignore`` from *root* down to
+    *path*'s directory; within them the last matching rule wins (``!``
+    re-includes), a pattern without ``/`` matches the name at any depth, one
+    with ``/`` is anchored at its file's directory, ``**`` spans directories
+    and a trailing ``/`` matches directories only. A path under an ignored
+    directory is ignored, and no rule re-includes it.
+    """
+
+    parts = path.strip("/").split("/")
+    rules: list[tuple[str, str, bool, bool]] = []
+    exclude = git_directory(root) / "info" / "exclude"
+    if exclude.is_file():
+        rules.extend(_gitignore_rules(exclude.read_text(encoding="utf-8"), ""))
+    for depth in range(len(parts)):
+        base = "/".join(parts[:depth])
+        candidate = "/".join(parts[: depth + 1])
+        ignore_file = root / base / ".gitignore"
+        if ignore_file.is_file():
+            rules.extend(_gitignore_rules(ignore_file.read_text(encoding="utf-8"), base))
+        is_dir = depth < len(parts) - 1 or (root / candidate).is_dir()
+        verdict = False
+        for rule in rules:
+            if _rule_matches(rule, candidate, is_dir):
+                verdict = not rule[2]
+        if verdict:
+            return True
+    return False
+
+
+def baseline_numstat(
+    commit: str,
+    names: Sequence[str],
+    *,
+    root: Path = REPOSITORY,
+    baselines: Path = BASELINES,
+) -> subprocess.CompletedProcess[str]:
+    """``git diff --numstat <commit> -- <names>`` against the committed baseline.
+
+    The baseline directory ``<baselines>/<commit>/`` holds each file as it was
+    at *commit* (taken with ``git show`` when the fixture was authored) and a
+    ``SOURCE`` file naming the full commit hash. ``stdout`` has one
+    ``<added>\\t<deleted>\\t<name>`` line per file whose bytes differ from the
+    working tree's (a missing side counts all its lines); ``returncode`` is
+    128 when the baseline is absent or recorded from another commit, or a
+    name is not in it, as git answers an unknown revision or path.
+    """
+
+    directory = baselines / commit
+    source = directory / "SOURCE"
+    recorded = source.read_text(encoding="utf-8").split() if source.is_file() else []
+    if not recorded or not recorded[0].startswith(commit):
+        return subprocess.CompletedProcess(
+            ("baseline_numstat", commit), 128, "", f"fatal: no baseline recorded for {commit}\n"
+        )
+    missing = [name for name in names if not (directory / name).is_file()]
+    if missing:
+        return subprocess.CompletedProcess(
+            ("baseline_numstat", commit), 128, "", f"fatal: {missing} not at {commit}\n"
+        )
+    lines: list[str] = []
+    for name in names:
+        before = (directory / name).read_bytes()
+        current = root / name
+        after = current.read_bytes() if current.is_file() else b""
+        if before == after:
+            continue
+        added = deleted = 0
+        matcher = difflib.SequenceMatcher(
+            None, before.splitlines(keepends=True), after.splitlines(keepends=True), autojunk=False
+        )
+        for tag, low_a, high_a, low_b, high_b in matcher.get_opcodes():
+            if tag != "equal":
+                deleted += high_a - low_a
+                added += high_b - low_b
+        lines.append(f"{added}\t{deleted}\t{name}\n")
+    return subprocess.CompletedProcess(("baseline_numstat", commit), 0, "".join(lines), "")

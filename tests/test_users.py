@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import base64
 import inspect
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -43,7 +42,7 @@ from core.lifecycle import PhaseCoordinator
 from core.loader import ModuleLoader, _validate_manifest, resolve_input_ownership
 from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext
 from core.triggers import TriggerRegistry
-from conftest import ManualClock, runtime_context
+from conftest import ManualClock, files_containing, runtime_context
 
 from modules.users import (
     CHAT_EVENT,
@@ -1152,11 +1151,8 @@ def test_module_names_no_platform() -> None:
     platform is the event's and the destination's, a runtime value, never a
     name in code."""
 
-    completed = subprocess.run(
-        ["grep", "-r", "-i", "-c", "twitch", str(MODULE_DIR / "__init__.py"), str(MANIFEST_PATH)],
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = files_containing(
+        [MODULE_DIR / "__init__.py", MANIFEST_PATH], "twitch", ignore_case=True, count=True
     )
     # ``grep -c`` prints ``<file>:0`` per file and exits 1 when nothing matched.
     assert completed.returncode == 1, completed.stdout

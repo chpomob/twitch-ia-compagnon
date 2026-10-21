@@ -1,0 +1,583 @@
+# The presence profile (phase 3 R1, R8): one process on the streaming PC
+# runs the chat input with community notices, the transcript, the users
+# directory, speech and jingles, scenes, clips, the viewer memory, moderation
+# alerts, a commanded screen watch and a brain with a persona and routes.
+# Everything the presence pack does is configuration below: the persona, the
+# routes and the grants. Copy this file to presence.yaml, export the
+# referenced environment variables, then run:
+#   python -m core.main --config presence.yaml
+# or, once installed, `twitch-ia-compagnon --config presence.yaml`; validate
+# it first without opening any transport with `--check-config`.
+# Environment references must remain in the exact ${NAME} form shown below,
+# and resolve in values and in mapping keys alike.
+#
+# The three phase 2 profiles run the same entry point unchanged:
+#   config.yaml.example        — the PC profile, without the presence pack;
+#   config.server.yaml.example — the brain on a server;
+#   agent.yaml.example         — the PC agent that pairs with that server.
+
+# The directory the module manifests are discovered in, relative to this
+# file; the reserved value `builtin` names the modules shipped with the
+# installed distribution instead (R8).
+modules_directory: ./modules
+
+# Every module enabled here is activated, in this order, through its
+# manifest. The optional modules ship with `required: false` where they have
+# the setting: a dependency unavailable at startup leaves their actions
+# unbound — reported once as `module.degraded`, never offered to the brain —
+# and startup continues.
+enabled_modules:
+  - twitch
+  - chat_context
+  - users
+  - capture
+  - audio_output
+  - stream_control
+  - clips
+  - viewer_memory
+  - moderation
+  - watch
+  - brain
+
+modules:
+  twitch:
+    client_id: ${TWITCH_CLIENT_ID}
+    client_secret: ${TWITCH_CLIENT_SECRET}
+    access_token: ${TWITCH_ACCESS_TOKEN}
+    broadcaster_id: ${TWITCH_BROADCASTER_ID}
+    bot_user_id: ${TWITCH_BOT_USER_ID}
+    # The name viewers use to address the companion; the trigger policy
+    # below lists it as a keyword.
+    companion_name: Companion
+    # Community notices (R1): each listed kind is fed to the chat context,
+    # trigger-evaluated and admitted like a message, its author (the raider,
+    # the gifter, the follower) being the viewer of the run. `follow` needs
+    # the moderator follower-read scope on the bot token; without it only
+    # the follow notices degrade and the chat continues. The clip service
+    # this module publishes needs the clip-edit scope.
+    notices:
+      kinds:
+        - sub
+        - resub
+        - sub_gift
+        - community_sub_gift
+        - raid
+        - follow
+
+  # The retained chat transcript the brain reads through `chat.read`: the
+  # `!missed` summary reads it. Its bounds are `limits.chat_context` below.
+  chat_context: {}
+
+  # The bounded directory of observed chat authors (`users.read`).
+  users:
+    max_channels: 8
+    max_users_per_channel: 500
+    max_age_seconds: 3600
+
+  # The on-demand screen capture a watch run reads through `screen.capture`.
+  # Nothing is captured in the background: only a run of an active watch
+  # session (below) is granted the capture.
+  capture:
+    sources:
+      screen:
+        kind: command
+        # PLACEHOLDER — replace the shell line with the screenshot tool of
+        # your desktop writing one PNG or JPEG to standard output. Running it
+        # through `sh` lets startup pass on a machine without the tool; the
+        # first capture then returns an explicit error observation.
+        argv: [sh, -c, "grim -"]
+        command_timeout_seconds: 5
+    default_source: screen
+    # At most `limits.attachments.max_object_bytes` below.
+    max_bytes: 1048576
+
+  # Speech and jingles through `audio.speak` and `audio.play`. The notice
+  # thanks route below plays the `chime` clip after its chat message.
+  audio_output:
+    # No provider is assumed: while `endpoint` is empty no request is sent
+    # and `audio.speak` stays unbound; `audio.play` still plays the clips.
+    # Set the endpoint, the model and — when the service needs one — add the
+    # key as an environment reference, e.g. `api_key: ${SPEECH_API_KEY}`.
+    # No key is written here: this profile holds no credential literal, not
+    # even an empty one.
+    synthesis:
+      endpoint: ""
+      model: ""
+    voices:
+      allowed:
+        - default
+      default: default
+    outputs:
+      default:
+        player:
+          # AUDIO_PLAYER names a program playing the WAV it reads on standard
+          # input; replace "-" with the options your player needs for that.
+          argv:
+            - ${AUDIO_PLAYER}
+            - "-"
+    default_output: default
+    # The clips `audio.play` may name: each a WAV file on this machine.
+    clips:
+      chime:
+        path: ${AUDIO_CHIME_PATH}
+    required: false
+
+  # The scenes the broadcaster's `!soon`, `!brb` and `!end` routes switch to
+  # through `stream.scene.set`. The provider is the broadcast software's
+  # websocket interface (protocol version 5): `ws://` on a loopback host
+  # only, `wss://` anywhere. An unreachable provider leaves the action
+  # unbound.
+  stream_control:
+    scenes:
+      provider:
+        kind: websocket
+        url: ${SCENE_WEBSOCKET_URL}
+        # Declared as a credential by the manifest: redacted from every trace.
+        password: ${SCENE_WEBSOCKET_PASSWORD}
+      # The scenes a call may switch to, by their exact names — the ones the
+      # scene routes below name.
+      allowed:
+        - Starting
+        - Main
+        - Break
+        - Ending
+    polls:
+      enabled: false
+    required: false
+
+  # Live clips through `stream.clip.create` (R2), an effect-only delivery
+  # the moderators' `!clip` route uses; the model never proposes a clip. At
+  # most one create request per call, one per channel every
+  # `min_interval_seconds`.
+  clips:
+    min_interval_seconds: 30
+    max_waiters: 4
+    required: false
+
+  # The viewer memory (R3, R4): one small file per viewer of a channel in
+  # `directory`, recalled by the model through `memory.recall` and recorded
+  # by the brain after each delivery through `memory.record`. A viewer
+  # erases their own file with `!forgetme`.
+  viewer_memory:
+    # The directory the memory files live in, created at startup.
+    directory: ${VIEWER_MEMORY_DIRECTORY}
+    retention_days: 30
+    max_files: 1000
+    max_file_bytes: 4096
+    max_total_bytes: 16777216
+    max_notes: 10
+    sweep_interval_seconds: 3600
+    max_recall_bytes: 1024
+    forget_command: "!forgetme"
+
+  # Moderation (R5). Mode `alert` records each request the model makes as a
+  # `moderation.decision` fact and sends nothing to the platform; `propose`
+  # and `act` are opt-in.
+  moderation:
+    mode: alert
+
+  # The screen watch (R6): no tick until the broadcaster sends `!watch` in
+  # the watched channel; `!unwatch` stops it, and it stops by itself after
+  # `max_active_seconds`. Each tick is one run under the principal
+  # `brain.watch`, which the rules below grant the capture and the chat
+  # reply only.
+  watch:
+    # The watched channel, as `<platform>/<channel_id>` — export it as, for
+    # example, WATCH_CHANNEL=twitch/<the broadcaster id>.
+    channels:
+      - ${WATCH_CHANNEL}
+    interval_seconds: 60
+    max_ticks_per_hour: 30
+    max_active_seconds: 1800
+    activation: command
+    start_command: "!watch"
+    stop_command: "!unwatch"
+    command_audience: broadcaster
+    prompt_text: "Look at the stream screen and say one short, friendly remark about it."
+
+  brain:
+    endpoint: ${MODEL_ENDPOINT}
+    model: ${MODEL_NAME}
+    api_key: ${MODEL_API_KEY}
+    # The same admission and conversation memory values as `limits` below.
+    admission:
+      session_queue_capacity: 4
+      global_pending_capacity: 64
+      max_sessions: 32
+      workers: 4
+      wait_seconds: 30
+      total_run_seconds: 90
+    # An action is allowed the clip's whole timeout (`stream.clip.create`:
+    # 20 s, its 15 s confirmation window included), which also covers a
+    # scene change (15 s); the chime's `audio.play` is cut at 20 s. The
+    # delivery reserve covers the longest route list (a clip, then the chat
+    # message: 20 s + 10 s), and the run's total leaves room for a full
+    # queued wait and a model turn outside that reserve.
+    budget:
+      model_turns: 5
+      model_call_seconds: 30
+      action_seconds: 20
+      max_tokens: 8192
+      max_observation_bytes: 5242880
+      max_action_calls: 6
+      max_repeated_actions: 2
+      delivery_reserve_seconds: 30
+    conversation_memory:
+      max_sessions: 64
+      max_exchanges: 20
+      max_bytes: 65536
+      max_age_seconds: 3600
+    fallback:
+      enabled: true
+      text: "I could not answer in time."
+    capabilities:
+      required:
+        - structured_output
+        - vision
+    # The destination's list: a run no route below redirects answers in the
+    # chat.
+    delivery:
+      mode: fixed
+      actions:
+        - action: chat.write
+          text_argument: text
+    # Presence (R1). The persona replaces the opening identity line of the
+    # system instructions (at most 2000 characters); the fixed lines about
+    # tools and plain-text output are always kept.
+    persona: >-
+      You are Companion, the cheerful co-host of this live stream. You keep
+      answers short, warm and in the language the viewer wrote in.
+    # The routes, evaluated in order once per run from the triggering event;
+    # the first match wins, and with none the destination's list and the
+    # plain instructions apply. A `command` is the first token of the text; an
+    # `audience` is satisfied only by a role the platform attested, never by
+    # the text. A route whose list holds an effect (a scene, a clip, a
+    # jingle) is reachable only by the broadcaster, the moderators or a
+    # platform notice — startup refuses it otherwise.
+    routes:
+      # Thanks on community notices, with a jingle after the chat message.
+      - name: thanks
+        match:
+          kinds: [sub, resub, sub_gift, community_sub_gift, raid, follow]
+        instructions: >-
+          A community notice arrived: thank the viewer by name for it, in one
+          short sentence.
+        delivery:
+          mode: fixed
+          actions:
+            - action: chat.write
+              text_argument: text
+            - action: audio.play
+              text_argument: none
+              arguments:
+                sound: chime
+      # The broadcaster's scene commands: starting soon, break, ending.
+      - name: scene-soon
+        match:
+          kinds: [message]
+          command: "!soon"
+          audience: broadcaster
+        instructions: "The stream is about to start: announce it in one short sentence."
+        delivery:
+          mode: fixed
+          actions:
+            - action: stream.scene.set
+              text_argument: none
+              arguments:
+                scene: Starting
+            - action: chat.write
+              text_argument: text
+      - name: scene-brb
+        match:
+          kinds: [message]
+          command: "!brb"
+          audience: broadcaster
+        instructions: "The broadcaster takes a short break: say so in one short sentence."
+        delivery:
+          mode: fixed
+          actions:
+            - action: stream.scene.set
+              text_argument: none
+              arguments:
+                scene: Break
+            - action: chat.write
+              text_argument: text
+      - name: scene-end
+        match:
+          kinds: [message]
+          command: "!end"
+          audience: broadcaster
+        instructions: "The stream is ending: thank the chat in one short sentence."
+        delivery:
+          mode: fixed
+          actions:
+            - action: stream.scene.set
+              text_argument: none
+              arguments:
+                scene: Ending
+            - action: chat.write
+              text_argument: text
+      # A moderator (or the broadcaster) clips the moment.
+      - name: clip
+        match:
+          kinds: [message]
+          command: "!clip"
+          audience: moderators
+        instructions: "A clip of the stream is being made: say so in one short sentence."
+        delivery:
+          mode: fixed
+          actions:
+            - action: stream.clip.create
+              text_argument: none
+            - action: chat.write
+              text_argument: text
+      # "What did I miss?": a summary of the recent chat.
+      - name: missed
+        match:
+          kinds: [message]
+          command: "!missed"
+        instructions: >-
+          The viewer asks what they missed: read the recent chat with
+          chat.read first, then summarise it in at most three short sentences.
+      # Translation of the rest of the message.
+      - name: translate
+        match:
+          kinds: [message]
+          command: "!translate"
+        instructions: >-
+          Translate the text after the command into English, or into the
+          language the viewer names first; answer with the translation only.
+      # The commanded screen watch: each tick of an active session.
+      - name: watch
+        match:
+          kinds: [watch_tick]
+        instructions: >-
+          Capture the screen with screen.capture, then make one short remark
+          about what is on it. Say nothing about a screen you could not see.
+      # Mention replies: every other message that reached the brain.
+      - name: mention
+        match:
+          kinds: [message]
+        instructions: >-
+          A viewer addressed you: recall what you know of them with
+          memory.recall when it helps, then answer in one or two sentences.
+
+# Redaction (R8). The credentials the manifests declare are redacted whether
+# or not they are listed here; the backend URL is listed because such a URL
+# may embed a credential.
+secrets:
+  - ${TWITCH_CLIENT_SECRET}
+  - ${TWITCH_ACCESS_TOKEN}
+  - ${MODEL_API_KEY}
+  - ${MODEL_ENDPOINT}
+
+# Trigger policies (R1). The served channel admits a message that mentions
+# the companion or starts one of the route commands, and every community
+# notice listed above. `!watch` is not listed: the watch module reads it
+# itself, so the command starts a session without a run of its own.
+triggers:
+  twitch:
+    channels:
+      ${TWITCH_BROADCASTER_ID}:
+        combination: any_of
+        rules:
+          - type: keyword
+            parameters:
+              keywords:
+                - Companion
+                - "!missed"
+                - "!translate"
+                - "!soon"
+                - "!brb"
+                - "!end"
+                - "!clip"
+          - type: event_kind
+            parameters:
+              kinds: [sub, resub, sub_gift, community_sub_gift, raid, follow]
+
+# Explicit action authorization rules (R5). Authorization is default-deny,
+# for reads as for writes, and a rule grants without binding. Chat runs act
+# under principal `brain`; watch runs under `brain.watch`, which is granted
+# only the screen capture and its chat reply. Each rule is on the served
+# channel and on its action's declared scope.
+actions:
+  # The retained transcript (`!missed`).
+  - rule_id: brain-reads-chat
+    action_name: chat.read
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: chat
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - chat.read
+  # The directory of observed authors.
+  - rule_id: brain-reads-users
+    action_name: users.read
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: chat
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - users.read
+  # The chat reply, for chat runs and watch runs.
+  - rule_id: brain-delivers-chat-replies
+    action_name: chat.write
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: chat
+    principals:
+      - brain
+      - brain.watch
+    natures:
+      - write
+    granted_permissions:
+      - chat.write
+  # The screen, for watch runs only.
+  - rule_id: watch-captures-screen
+    action_name: screen.capture
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: capture
+    principals:
+      - brain.watch
+    natures:
+      - read
+    granted_permissions:
+      - screen.capture
+  # Speech, once a synthesis endpoint is configured.
+  - rule_id: brain-speaks
+    action_name: audio.speak
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.speak
+  # The notice jingle.
+  - rule_id: brain-plays-clips
+    action_name: audio.play
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: audio
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - audio.play
+  # The broadcaster's scene routes.
+  - rule_id: brain-sets-scenes
+    action_name: stream.scene.set
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: stream
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.scene
+  # The moderators' clip route.
+  - rule_id: brain-creates-clips
+    action_name: stream.clip.create
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: clip
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - stream.clip
+  # The viewer memory: recalled by the model, recorded after the delivery.
+  - rule_id: brain-recalls-viewers
+    action_name: memory.recall
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: memory
+    principals:
+      - brain
+    natures:
+      - read
+    granted_permissions:
+      - memory.recall
+  - rule_id: brain-records-viewers
+    action_name: memory.record
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: memory
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - memory.record
+  # Moderation requests, recorded as alerts in mode `alert`.
+  - rule_id: brain-requests-moderation
+    action_name: moderation.request
+    destination:
+      platform: twitch
+      channel_id: ${TWITCH_BROADCASTER_ID}
+      scope: moderation
+    principals:
+      - brain
+    natures:
+      - write
+    granted_permissions:
+      - moderation.request
+
+# Retention and admission limits: every limit finite and positive; the
+# brain's `admission` and `conversation_memory` above equal the groups here.
+limits:
+  bus_history:
+    max_events: 1000
+    max_bytes: 4194304
+    max_age_seconds: 600
+  observation_queue:
+    max_records: 1000
+    max_bytes: 4194304
+  dedup:
+    max_entries: 4096
+    ttl_seconds: 600
+  attachments:
+    max_object_bytes: 1048576
+    max_objects: 256
+    max_total_bytes: 67108864
+    max_bytes_per_run: 8388608
+    ttl_seconds: 900
+  conversation_memory:
+    max_sessions: 64
+    max_exchanges: 20
+    max_bytes: 65536
+    max_age_seconds: 3600
+  chat_context:
+    max_messages: 50
+    max_bytes: 65536
+    max_age_seconds: 900
+    max_channels: 8
+  admission:
+    session_queue_capacity: 4
+    global_pending_capacity: 64
+    max_sessions: 32
+    workers: 4
+    wait_seconds: 30
+    total_run_seconds: 90

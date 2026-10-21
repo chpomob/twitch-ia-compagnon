@@ -1,0 +1,4 @@
+f900f2734c6a0bb751bc2e0a1db11daabd598718
+
+The four shipped profiles as they were at this commit, each taken with
+`git show f900f2734c6a0bb751bc2e0a1db11daabd598718:<file>` when the fixture was authored (phase 8, P15a).

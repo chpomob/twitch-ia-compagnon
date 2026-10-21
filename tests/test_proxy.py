@@ -3072,7 +3072,6 @@ def test_the_proxy_package_names_no_platform() -> None:
 # on both sides. No positive-duration sleep anywhere.
 
 import shutil
-import subprocess
 
 from core.actions import (
     ERROR_CALL_ID_CONFLICT,
@@ -3091,7 +3090,7 @@ from core.contracts import (
 )
 from core.context import ChatContext
 from core.triggers import TriggerRegistry
-from conftest import FakeCaptureSource, ScriptedModel
+from conftest import FakeCaptureSource, ScriptedModel, files_containing
 from modules import agent_link
 from modules import capture as capture_module
 from modules.agent_link import (
@@ -5292,12 +5291,7 @@ def test_ac31_the_proxy_and_the_agent_link_name_no_platform(directory: str) -> N
     the agentic-loop suite (``core/``, ``modules/brain``, ``modules/chat_context``,
     ``modules/users``, ``modules/capture``) to the two directories P20 adds."""
 
-    completed = subprocess.run(
-        ["grep", "-r", "-i", "--exclude-dir=__pycache__", "twitch", str(ROOT / directory)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    completed = files_containing(ROOT / directory, "twitch", ignore_case=True)
     matches = [line for line in completed.stdout.splitlines() if line]
     assert completed.returncode in (0, 1), completed.stderr
     assert matches == [], "\n".join(matches)

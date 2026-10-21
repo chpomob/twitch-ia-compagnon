@@ -1,0 +1,4 @@
+7c294346e847aa3833421db5267befbdf505f2e5
+
+The four shipped profiles as they were at this commit, each taken with
+`git show 7c294346e847aa3833421db5267befbdf505f2e5:<file>` when the fixture was authored (phase 8, P15a).

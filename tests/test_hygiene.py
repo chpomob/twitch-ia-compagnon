@@ -51,19 +51,31 @@ Three checks over the files themselves, none over the runtime:
 * Ignore rules (phase 4 gate-8 N8): the managed overlay (``*.local.yaml``)
   and the status record (``*.status.json``) are per-operator generated
   files, so ``git check-ignore`` must report them ignored.
+
+Phase 8 (P15a, AC33, D8): the repository facts are read in-process, with no
+``git`` or ``grep`` run — ``conftest.ignored`` answers ``git check-ignore``
+from the ignore files. The readers of ``tests/conftest.py`` are checked here
+against what the real tools answered when they were authored: the index
+reader against ``git ls-files`` over committed index files (formats 2, 3, 4
+and a split index), the ignore matcher against ``git check-ignore`` over a
+planted tree, and ``files_containing`` and ``baseline_numstat`` are shown to
+see one planted needle and one changed byte.
 """
 
 from __future__ import annotations
 
 import ast
+import base64
 import io
 import re
 import shutil
-import subprocess
 import tokenize
+import zlib
 from pathlib import Path
 
 import pytest
+
+from conftest import BASELINES, baseline_numstat, files_containing, ignored, tracked_files
 
 ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = ROOT / "tests"
@@ -760,15 +772,255 @@ GENERATED_OPERATOR_FILES = (
 
 
 def test_n8_the_generated_overlay_and_status_files_are_ignored() -> None:
-    git = shutil.which("git")
-    if git is None or not (ROOT / ".git").exists():
-        pytest.skip("no git checkout to ask")
-    result = subprocess.run(
-        [git, "check-ignore", "--no-index", "--", *GENERATED_OPERATOR_FILES],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+    """``git check-ignore --no-index`` answered by :func:`conftest.ignored`
+    (AC33, P15a): its exit 0 is "at least one path is ignored", its output
+    the ignored paths in order — here every generated file."""
+
+    listed = [path for path in GENERATED_OPERATOR_FILES if ignored(path, ROOT)]
+    assert listed != [], "no generated file is ignored"
+    assert listed == list(GENERATED_OPERATOR_FILES)
+
+
+# --------------------------------------------------------------------------- #
+# The in-process repository readers (phase 8, P15a, AC33)
+# --------------------------------------------------------------------------- #
+
+#: Index files written by ``git`` when this check was authored (P15a), each
+#: zlib-compressed and base64-encoded, beside what ``git ls-files`` listed:
+#: format 2; format 3 with extended flags (an intent-to-add entry and a
+#: skip-worktree one); format 4's prefix-compressed names; and a split index
+#: whose shared index loses one entry by the delete bitmap and has six
+#: entries rewritten by the replace bitmap.
+GIT_INDEX_FIXTURES: dict[str, str] = {
+    "v2": (
+        "eNpz8QxyZmBgYAJi9qwbt23kjmpVwmgGRmYmpgVKJxgYGpcwMDC/gGAGri3WP7ID/vaaai64"
+        "w6ZjwJB3ud9gHgNnkKuji6+rXm4KAw5zTqKb092VMn3WHY/XDu6Mp+J4r5QuOaS2nIEzJT+5"
+        "WD8Rjzmn0Mzh5z/6Mb4u7saCh5mNNTmTdywWsDSxYeADm5OSmlqgnwQyDAhwmHcazTyh1a/z"
+        "353a4l7fd0L03+SrQlOOnD6ZzSCIMC+1SD8Zj/vOoLtP7ZJn5raSVy4NM3emsr503Hmp+MR1"
+        "Br7c/JTSnFSgV/Ur9Aoq8bjvLLp5/ucFb5eGP5eIVmSLXSVR8eXzyXfayOZV4jfvHHo89LDt"
+        "3bj3qffLSpsV0Wb//h6YPc/3OANnlV5qRWJuQU4qQ0iQqytQ3QoGcwUjrhvfzv3beUVsrajv"
+        "HNs/2YfEf3hmZYCChsFYwZBryZKsgsLrs0PNasNaWHQX3j2ueyIQFGQMRkDJhj8H26edND04"
+        "RUPweV5ftHR15kSv1CIGQwUDrluBSXO5crPY7G/Ucr2QEftyjiuyBOofsNaCMGO3lztfuc5r"
+        "26JQvZFpyoQ7nyITgTIGXFfzppxe17QmnuHrclcrj4ypD3emqC1Xrv2y5OrRtnVbw7YpRn6v"
+        "vn9UnA8AuksVEA=="
+    ),
+    "v3": (
+        "eNpz8QxyZmBgYAZijqwbt23kp/1hhdEMjMxMTAuUTjAwNC4BKnkBwQxcW6x/ZAf87TXVXHCH"
+        "TceAIe9yv8E8Bs4gV0cXX1e93BQGHOacRDenuytl+qw7Hq8d3BlPxfFeKV1ySG25A6cDQ0p+"
+        "crF+IsgkCMBh3ik08/j5j36Mr4u7seBhZmNNzuQdiwUsTWwY+MCmpaSmFugnQY0Em7NkWRiM"
+        "hpp3Gs08odWv89+d2uJe33dC9N/kq0JTjpw+mc0giDAvtUg/Ge5fTPPOoLtP7ZJn5raSVy4N"
+        "M3emsr503Hmp+MR1Br7c/JTSnFSgh/Ur9Aoq8bjvLLp5/ucFb5eGP5eIVmSLXSVR8eXzyXfa"
+        "yOZVQs3DDUDmIcCzuY9mb7p4zdm7W3NdedSNQ096gic6sCkw5KWWg0MOh7vOocdrD9vejXuf"
+        "er+stFkRbfbv74HZ83yPM3BW6aVWJOYW5KQyhAS5ugLVNTHoGioYcYHCE8Qy5AIFKoMRkNHw"
+        "52D7tJOmB6doCD7P64uWrs6c6JVaxGCoYMB1KzBpLlduFpv9jVquFzJiX85xRZZAfQzWWhBm"
+        "7PZy5yvXeW1bFKo3Mk2ZcOdTZCJQxoDrat6U0+ua1sQzfF3uauWRMfXhzhQ1huT1LDlNT/fI"
+        "K5fbxJVv21+196Q4AOW3ET8="
+    ),
+    "v4": (
+        "eNpz8QxyZmBgYAFi9qwbt20UZpxaAqMZGJmZmBYonWBgaFzCwMD8AoIZuLZY/8gO+Ntrqrng"
+        "DpuOAUPe5X6DeQycDEGuji6+rnq5KQw4DDqJblB3V8r0WXc8Xju4M56K471SuuSQ2nIGTs6U"
+        "/ORi/UQ8Bp1CM4if/+jH+Lq4GwseZjbW5EzesVjA0sSGgY8lJTW1QD8Jj0Gn0QwSWv06/92p"
+        "Le71fSdE/02+KjTlyOmT2QyCLKlF+sl4jDmD7h61S56Z20peuTTM3JnK+tJx56XiE9cZ+ARz"
+        "81NKc1KBftOv0CuoxGXaWXTT/M8L3i4Nfy4RrcgWu0qi4svnk++0gb6rxGPGOfSg7mHbu3Hv"
+        "U++XlTYros3+/T0we57vcQZOviq91IrE3IKcVIaQIFdXoMIVDOYKRlw3vp37t/OK2FpR3zm2"
+        "f7IPif/wzMoAxQqDsYIh15IlWQWF12eHmtWGtbDoLrx7XPdEICikGYyAkg1/DrZPO2l6cIqG"
+        "4PO8vmjp6syJXqlFDIYKBly3ApPmcuVmsdnfqOV6ISP25RxXZAk0RMBaC8KM3V7ufOU6r22L"
+        "QvVGpikT7nyKTATKGHBdzZtyel3TmniGr8tdrTwypj7cmaK2/cW/ks36E822d9jwTFP5vIS1"
+        "9nAhAC+DE/Y="
+    ),
+    "split": (
+        "eNpz8QxyZmBgYAJi9qwbt22UTHNLYDQDIzMT0wKlEwwMjUsYGJhfQDCD0AOF40wcTvtv/Tfq"
+        "lMh5vN903d5Lc4HiDCB9ij3vPsNoqP6TaPq5urtSps+64/HawZ3xVBzvldIlh9SW49F/Ck0/"
+        "P//Rj/F1cTcWPMxsrMmZvGOxgKWJDR79p9Hdv/p1/rtTW9zr+06I/pt8VWjKkdMns/HoP4Nu"
+        "v9olz8xtJa9cGmbuTGV96bjzUvGJ63j0n0P3fw/b3o17n3q/rLRZEW327++B2fN8j8P0K3E0"
+        "vYTRUP0P0PQz7VnOb2rYb3hXVlZWVy/l4OwOjpn/GThT8pOL9Qv1clMYcjLzQP7x+cv3RKF7"
+        "d0zzw65Zqemztaf1ikzyAIqzQeMbhGFAAUqzY5GLBxEhQa6uQCqGQddQwYgLZBeIZciVkppa"
+        "wGAEZDT8Odg+7aTpwSkags/z+qKlqzMneqUWMRgqGHDdCkyay5WbxWZ/o5brhYzYl3NckSW5"
+        "+SmlOalQQxJBlAEXI/OZg9c/8Pqwt11t36z4P2hn1aqTABKq5Ls="
+    ),
+    "sharedindex.fd0ee4208bbb5c83e18a9a65679b2b968d149248": (
+        "eNpz8QxyZmBgYAJi9qwbt20Ue959htEMjMxMTAuUTjAwNC5hYGB+AcEMXFusf2QH/O011Vxw"
+        "h03HgCHvcr/BPAbOIFdHF19XvdwUBhzmnEQ3p7srZfqsOx6vHdwZT8XxXildckhtOQNnSn5y"
+        "sX4iHnNOoZnDz3/0Y3xd3I0FDzMba3Im71gsYGliw8AHNiclNbVAPwlkGBDgMO80mnlCq1/n"
+        "vzu1xb2+74Tov8lXhaYcOX0ym0EQYV5qkX4yHvedQXef2iXPzG0lr1waZu5MZX3puPNS8Ynr"
+        "DHy5+SmlOalAr+pX6BVU4nHfWXTz/M8L3i4Nfy4RrcgWu0qi4svnk++0kc2rxG/eOfR46GHb"
+        "u3HvU++XlTYros3+/T0we57vcQbOKr3UisTcgpxUhr98TxS6d8c0P+yalZo+W3tar8gkDwCj"
+        "49kr"
+    ),
+}
+GIT_LS_FILES: dict[str, list[str]] = {
+    "v2": [
+        "README.md",
+        "docs/a.md",
+        "docs/deep/b.md",
+        "docs/deep/er/c.md",
+        "modules/a/x.py",
+        "modules/a/y.py",
+        "z.example",
+    ],
+    "v3": [
+        "README.md",
+        "docs/a.md",
+        "docs/deep/b.md",
+        "docs/deep/er/c.md",
+        "modules/a/x.py",
+        "modules/a/y.py",
+        "new.md",
+        "z.example",
+    ],
+    "v4": [
+        "README.md",
+        "docs/a.md",
+        "docs/deep/b.md",
+        "docs/deep/er/c.md",
+        "modules/a/x.py",
+        "modules/a/y.py",
+        "z.example",
+    ],
+    "split": [
+        "README.md",
+        "docs/a.md",
+        "docs/deep/b.md",
+        "docs/deep/er/c.md",
+        "docs/q.md",
+        "modules/a/x.py",
+        "z.example",
+    ],
+}
+SHARED_INDEX = "sharedindex.fd0ee4208bbb5c83e18a9a65679b2b968d149248"
+
+
+def _index_bytes(name: str) -> bytes:
+    return zlib.decompress(base64.b64decode(GIT_INDEX_FIXTURES[name]))
+
+
+def _plant_index(git_dir: Path, version: str) -> None:
+    git_dir.mkdir(parents=True)
+    (git_dir / "index").write_bytes(_index_bytes(version))
+    if version == "split":
+        (git_dir / SHARED_INDEX).write_bytes(_index_bytes(SHARED_INDEX))
+
+
+@pytest.mark.parametrize("version", sorted(GIT_LS_FILES))
+def test_the_index_reader_lists_what_git_ls_files_listed(version: str, tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _plant_index(repository / ".git", version)
+    assert tracked_files(root=repository) == GIT_LS_FILES[version]
+    expected_markdown = [path for path in GIT_LS_FILES[version] if path.endswith(".md")]
+    assert tracked_files("*.md", repository) == expected_markdown
+    assert tracked_files("docs", repository) == [
+        path for path in GIT_LS_FILES[version] if path.startswith("docs/")
+    ]
+    # A worktree's ``.git`` is a file naming its git directory.
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    _plant_index(tmp_path / "gitdirs" / "worktree", version)
+    (worktree / ".git").write_text("gitdir: ../gitdirs/worktree\n", encoding="utf-8")
+    assert tracked_files(root=worktree) == GIT_LS_FILES[version]
+
+
+def test_the_index_reader_refuses_what_is_not_an_index(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "index").write_bytes(b"DIRC" + bytes(8) + bytes(20))
+    with pytest.raises(AssertionError, match="not a git index"):
+        tracked_files(root=tmp_path)
+
+
+def test_the_repository_index_lists_the_shipped_profiles() -> None:
+    assert {path for path in tracked_files("*.example", ROOT) if "/" not in path} == {
+        "agent.yaml.example",
+        "config.server.yaml.example",
+        "config.yaml.example",
+        "presence.yaml.example",
+    }
+
+
+#: The answers ``git check-ignore -q --no-index`` gave over the tree
+#: :func:`_ignore_tree` plants, recorded when the matcher was authored.
+GIT_CHECK_IGNORE = {
+    "a.log": True,
+    "keep.log": False,
+    "sub/deep.log": True,
+    "build/x": True,
+    "build": True,
+    "sub/build/y": True,
+    "top.txt": True,
+    "sub/top.txt": False,
+    "docs/gen.md": True,
+    "docs/a/b/gen.md": True,
+    "#hash": True,
+    "sub/local.yaml": True,
+    "sub/local.keep": False,
+    "local.yaml": False,
+    "out/again.txt": True,
+    "plain.py": False,
+}
+
+
+def _ignore_tree(root: Path) -> None:
+    (root / ".gitignore").write_text(
+        "*.log\n!keep.log\nbuild/\n/top.txt\ndocs/**/gen.md\n\\#hash\n# comment\n"
+        "out/\n!out/again.txt\n",
+        encoding="utf-8",
     )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == list(GENERATED_OPERATOR_FILES)
+    for directory in ("sub", "build", "docs/a/b", "out", ".git"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    (root / "sub" / ".gitignore").write_text("local.*\n!local.keep\n", encoding="utf-8")
+
+
+def test_the_ignore_matcher_answers_as_git_check_ignore(tmp_path: Path) -> None:
+    _ignore_tree(tmp_path)
+    assert {path: ignored(path, tmp_path) for path in GIT_CHECK_IGNORE} == GIT_CHECK_IGNORE
+    # ``.git/info/exclude`` is read too.
+    (tmp_path / ".git" / "info").mkdir()
+    (tmp_path / ".git" / "info" / "exclude").write_text("plain.py\n", encoding="utf-8")
+    assert ignored("plain.py", tmp_path)
+
+
+def test_files_containing_finds_a_planted_needle(tmp_path: Path) -> None:
+    clean = tmp_path / "package" / "clean.py"
+    clean.parent.mkdir()
+    clean.write_text("neutral = True\n", encoding="utf-8")
+    cache = tmp_path / "package" / "__pycache__" / "clean.cpython.pyc"
+    cache.parent.mkdir()
+    cache.write_bytes(b"twitch")
+    assert files_containing(tmp_path, "twitch").returncode == 1
+
+    planted = tmp_path / "package" / "planted.py"
+    planted.write_text("first\nplatform = 'Twitch'\n", encoding="utf-8")
+    assert files_containing(tmp_path, "twitch").returncode == 1
+    found = files_containing(tmp_path, "twitch", ignore_case=True)
+    assert found.returncode == 0
+    assert found.stdout.splitlines() == [f"{planted}:platform = 'Twitch'"]
+    counted = files_containing([clean, planted], "twitch", ignore_case=True, count=True)
+    assert counted.returncode == 0
+    assert counted.stdout.splitlines() == [f"{clean}:0", f"{planted}:1"]
+    assert files_containing(tmp_path / "absent", "twitch").returncode == 2
+
+
+SHIPPED_PROFILES = (
+    "config.yaml.example",
+    "config.server.yaml.example",
+    "agent.yaml.example",
+    "presence.yaml.example",
+)
+
+
+@pytest.mark.parametrize("commit", ["f900f27", "7c29434"])
+def test_baseline_numstat_sees_one_changed_byte(commit: str, tmp_path: Path) -> None:
+    baselines = tmp_path / "baselines"
+    shutil.copytree(BASELINES / commit, baselines / commit)
+    unchanged = baseline_numstat(commit, SHIPPED_PROFILES, baselines=baselines)
+    assert unchanged.returncode == 0 and unchanged.stdout == ""
+
+    target = baselines / commit / "agent.yaml.example"
+    data = bytearray(target.read_bytes())
+    data[len(data) // 2] ^= 0x01
+    target.write_bytes(bytes(data))
+    changed = baseline_numstat(commit, SHIPPED_PROFILES, baselines=baselines)
+    assert changed.returncode == 0
+    assert changed.stdout == "1\t1\tagent.yaml.example\n"
+
+    (baselines / commit / "SOURCE").write_text("0" * 40 + "\n", encoding="utf-8")
+    assert baseline_numstat(commit, SHIPPED_PROFILES, baselines=baselines).returncode == 128
+    assert baseline_numstat("0000000", SHIPPED_PROFILES, baselines=baselines).returncode == 128

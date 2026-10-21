@@ -74,9 +74,7 @@ import ipaddress
 import json
 import logging
 import re
-import shutil
 import socket
-import subprocess
 import threading
 import time
 import urllib.parse
@@ -112,10 +110,12 @@ from core.loader import ModuleLoader
 from conftest import (
     ManualClock,
     ScriptedModel,
+    baseline_numstat,
     events_of,
     final,
     runtime_context,
     tool_call,
+    tracked_files,
     wait_until,
 )
 from test_agentic_loop import CHAT_WRITE_SPEC, SendProvider
@@ -6305,34 +6305,26 @@ def test_ac24_pyproject_declares_exactly_two_runtime_dependencies() -> None:
     assert project["tool"]["setuptools"]["package-data"]["modules.web"] == ["module.yaml"]
 
 
-def _git(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(ROOT), *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-
-
 def test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base() -> None:
     """AC24 (R9): ``git diff 7c29434 -- '*.example'`` — the working tree
     against the tree before phase 7 — has 0 changed lines in the 4 shipped
-    profiles."""
+    profiles.
 
-    # A missing git, work tree or base commit is a broken checkout of this
-    # repository, never a reason to pass: each is a hard failure.
-    assert shutil.which("git") is not None, "git is not available: the phase-base diff cannot be taken"
-    assert _git("rev-parse", "--is-inside-work-tree").returncode == 0, "not a git work tree"
-    assert _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode == 0, (
-        f"the phase base {PHASE_BASE} is not in this clone: a broken checkout"
-    )
+    Read in-process (AC33, P15a): the profiles as they were at ``7c29434``
+    are committed under ``tests/fixtures/baselines/7c29434/`` (taken with
+    ``git show``, the hash in its ``SOURCE``) and compared byte for byte by
+    :func:`conftest.baseline_numstat`. ``'*.example'`` is every shipped
+    profile the index tracks at the top of the tree."""
 
-    numstat = _git("diff", "--numstat", PHASE_BASE, "--", "*.example")
+    # A missing baseline, or one recorded from another commit, is a broken
+    # fixture, never a reason to pass: each is a hard failure.
+    examples = [path for path in tracked_files("*.example", ROOT) if "/" not in path]
+    assert sorted(examples) == sorted(SHIPPED_PROFILES), examples
+    numstat = baseline_numstat(PHASE_BASE, examples)
     assert numstat.returncode == 0, numstat.stderr
     assert numstat.stdout.strip() == ""
     for name in SHIPPED_PROFILES:
-        assert _git("cat-file", "-e", f"{PHASE_BASE}:{name}").returncode == 0, name
+        assert baseline_numstat(PHASE_BASE, [name]).returncode == 0, name
         assert (ROOT / name).is_file(), name
 
 

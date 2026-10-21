@@ -40,6 +40,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import tracked_files
+
 REPOSITORY = Path(__file__).resolve().parent.parent
 RECORD = REPOSITORY / "docs" / "campaigns" / "phase5" / "bridge-trial-record.md"
 STATUS_FILES = ("README.md", "docs/README.md")
@@ -122,18 +124,10 @@ def record_problems(text: str) -> list[str]:
 
 
 def tracked_markdown() -> list[str]:
-    listed = subprocess.run(
-        ["git", "ls-files", "-z", "--", "*.md"],
-        cwd=REPOSITORY,
-        capture_output=True,
-        check=True,
-        timeout=60,
-    )
-    return sorted(
-        path
-        for path in listed.stdout.decode("utf-8").split("\0")
-        if path and not path.startswith(EXCLUDED_PREFIXES)
-    )
+    """``git ls-files -- '*.md'`` read from the index in-process (AC33, P15a)."""
+
+    listed = tracked_files("*.md", REPOSITORY)
+    return sorted(path for path in listed if path and not path.startswith(EXCLUDED_PREFIXES))
 
 
 def read(path: str) -> str:

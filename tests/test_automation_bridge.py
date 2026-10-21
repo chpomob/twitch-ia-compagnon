@@ -72,6 +72,7 @@ import copy
 import dataclasses
 import inspect
 import itertools
+import importlib
 import textwrap
 import hashlib
 import json
@@ -79,7 +80,6 @@ import logging
 import math
 import re
 import socket
-import subprocess
 import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -4575,15 +4575,30 @@ def test_ac37_the_status_guard_runs_unmarked_and_the_trial_file_keeps_eight_node
         assert docs_status.states_not_delivered(path.read_text(encoding="utf-8")), path
     assert docs_status.every_claim(docs_status.tracked_markdown()) == []
 
-    collected = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
-         "tests/test_phase5_trials.py"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert collected.returncode == 0, collected.stdout + collected.stderr
-    nodes = [line for line in collected.stdout.splitlines() if "::" in line]
-    assert len(nodes) == 8, collected.stdout
+    # ``pytest --collect-only`` read in-process (AC33, P15a): the module
+    # imports, and its source defines its nodes as top-level functions none
+    # of which is parametrized and no test class, so each is one node.
+    trials = importlib.import_module("test_phase5_trials")
+    tree = ast.parse((ROOT / "tests" / "test_phase5_trials.py").read_text(encoding="utf-8"))
+    assert not [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name.startswith("Test")
+    ]
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test")
+    ]
+    assert not [
+        function.name
+        for function in functions
+        if "parametrize" in "".join(ast.unparse(decorator) for decorator in function.decorator_list)
+    ]
+    nodes = [
+        f"tests/test_phase5_trials.py::{function.name}"
+        for function in functions
+        if callable(getattr(trials, function.name, None))
+    ]
+    assert len(nodes) == 8, nodes

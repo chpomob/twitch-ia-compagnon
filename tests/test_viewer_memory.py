@@ -13,6 +13,7 @@ positive-duration sleep.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import errno
 import gc
@@ -23,8 +24,6 @@ import os
 import re
 import shutil
 import socket
-import subprocess
-import sys
 import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
@@ -1937,34 +1936,112 @@ def test_ac19_cli_an_invalid_configuration_exits_2(
     assert len(json_names()) == len(paths)
 
 
-def test_ac19_cli_the_module_entry_runs_without_a_network_client(tmp_path: Path) -> None:
-    """``python -m modules.viewer_memory`` runs in a fresh interpreter; its
-    import trace shows no ``aiohttp``, and no ``${…}`` secret is needed."""
+def _module_source(name: str) -> Path | None:
+    """The in-repository source file of module *name*, if it has one."""
+
+    base = REPOSITORY.joinpath(*name.split("."))
+    for candidate in (base / "__init__.py", base.with_suffix(".py")):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _module_level_imports(name: str, source: Path) -> set[str]:
+    """The modules *source* imports when it is imported: every ``import``
+    outside a function body (``if TYPE_CHECKING:`` blocks excepted), with
+    relative names resolved against *name*'s package."""
+
+    package = name if source.name == "__init__.py" else name.rpartition(".")[0]
+    found: set[str] = set()
+
+    def visit(statements: list[ast.stmt]) -> None:
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(statement, ast.Import):
+                found.update(alias.name for alias in statement.names)
+            elif isinstance(statement, ast.ImportFrom):
+                base = statement.module or ""
+                if statement.level:
+                    anchor = package.split(".")
+                    anchor = anchor[: len(anchor) - (statement.level - 1)]
+                    base = ".".join([*anchor, base] if base else anchor)
+                found.add(base)
+                found.update(f"{base}.{alias.name}" for alias in statement.names)
+            elif isinstance(statement, ast.If) and "TYPE_CHECKING" in ast.unparse(statement.test):
+                visit(statement.orelse)
+                continue
+            for field_name in ("body", "orelse", "finalbody", "handlers"):
+                visit([node for node in getattr(statement, field_name, []) if isinstance(node, ast.stmt)])
+            for handler in getattr(statement, "handlers", []):
+                visit(handler.body)
+
+    visit(ast.parse(source.read_text(encoding="utf-8")).body)
+    return found
+
+
+def importable_from(entry: str) -> set[str]:
+    """Every module importing *entry* imports: its packages, its module-level
+    imports and, transitively, those of each in-repository module reached
+    (``python -X importtime`` read with ``ast``, AC33 P15a). A name that is
+    an attribute rather than a module (``from m import function``) is kept
+    out unless it is a module of the repository."""
+
+    imported: set[str] = set()
+    pending = [entry]
+    while pending:
+        name = pending.pop()
+        parts = name.split(".")
+        for depth in range(1, len(parts) + 1):
+            module = ".".join(parts[:depth])
+            if module in imported:
+                continue
+            source = _module_source(module)
+            if source is None and depth == len(parts) and depth > 1:
+                parent = ".".join(parts[:-1])
+                if parent in imported and _module_source(parent) is not None:
+                    continue  # ``from <in-repo module> import <attribute>``
+            imported.add(module)
+            if source is not None:
+                pending.extend(_module_level_imports(module, source))
+    return imported
+
+
+def test_ac19_cli_the_module_entry_runs_without_a_network_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``python -m modules.viewer_memory`` runs; its import trace shows no
+    ``aiohttp``, and no ``${…}`` secret is needed.
+
+    In-process (AC33, P15a): the entry's ``main`` runs with the secret unset,
+    and the import trace is the module-level imports of
+    ``modules/viewer_memory/__main__.py`` and of every in-repository module
+    they reach, read with ``ast`` (:func:`importable_from`)."""
 
     directory, _ = memory_directory(tmp_path)
     paths, _ = three_viewers_and_notes(directory)
     config = command_config(tmp_path, directory)
-    environment = {
-        key: value for key, value in os.environ.items() if key != "TWITCH_CLIENT_SECRET"
-    }
+    monkeypatch.delenv("TWITCH_CLIENT_SECRET", raising=False)
 
-    completed = subprocess.run(
-        [sys.executable, "-X", "importtime", "-m", "modules.viewer_memory", "stats",
-         "--config", str(config)],
-        cwd=REPOSITORY,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    returncode = memory_command(["stats", "--config", str(config)])
+    completed = capsys.readouterr()
 
-    assert completed.returncode == 0, completed.stderr
+    assert returncode == 0, completed.err
     expected = sum(path.stat().st_size for path in paths)
-    assert completed.stdout == f"files=3 bytes={expected}\n"
-    imported = {line.rsplit("|", 1)[-1].strip() for line in completed.stderr.splitlines()}
+    assert completed.out == f"files=3 bytes={expected}\n"
+    imported = importable_from("modules.viewer_memory.__main__")
     assert not {name for name in imported if name.split(".")[0] == "aiohttp"}
     assert "yaml" in imported
+
+
+def test_ac19_the_import_reader_sees_a_network_client() -> None:
+    """The reader is not blind: it follows the entry into ``core`` and the
+    package, and it finds the client a networked module imports."""
+
+    imported = importable_from("modules.viewer_memory.__main__")
+    assert {"core.loader", "modules.viewer_memory", "argparse", "yaml"} <= imported
+    reached = importable_from("modules.streamerbot")
+    assert "aiohttp" in reached
 
 
 # --------------------------------------------------------------------------- #
