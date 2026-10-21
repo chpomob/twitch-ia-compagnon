@@ -1,6 +1,8 @@
 """The ``operator`` input: manifest, settings, request core, page and overlay,
 lifecycle (phase 8 R6, plan step P9; AC21 page and overlay halves, AC22,
-AC23, AC24).
+AC23, AC24), and the press command ``python -m modules.operator press``
+(plan step P10; AC40, AC21's hotkey third) through a fake opener that hands
+its request to the input's request core.
 
 The module is discovered and activated by the real loader over the shipped
 ``modules/`` directory, on a :func:`~conftest.runtime_context` whose
@@ -14,10 +16,18 @@ module is enabled anywhere here (AC24).
 
 from __future__ import annotations
 
+import email.message
 import functools
+import http.client
+import importlib
+import io
 import json
 import logging
+import socket
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +43,7 @@ from core.contracts import (
 from core.loader import ModuleLoader, ModuleLoadError
 from core.triggers import TriggerRegistry
 import modules.operator as operator
+import modules.operator.__main__ as press_command
 from modules.brain import BrainModule
 from modules.operator import (
     COUNT_ADMITTED,
@@ -852,4 +863,384 @@ def test_ac24_no_streamerbot_module_is_needed_or_enabled() -> None:
 async def test_the_handle_settings_never_show_the_token() -> None:
     h = await operated()
     assert TOKEN not in repr(h.handle.settings)
+    await h.handle.close()
+
+
+# -- AC40 and AC21's third surface: the press command ----------------------------- #
+
+
+class CoreOpener:
+    """The press command's ``opener``: records the ``Request`` the command
+    built and hands it to the input's request core, as the listener would.
+
+    The ``Host`` header is the one ``urllib`` sends, taken from the URL; a
+    non-2xx answer is raised as :class:`urllib.error.HTTPError`, as the real
+    opener's error processor does. No socket is opened.
+    """
+
+    def __init__(self, harness: Operated) -> None:
+        self.harness = harness
+        self.requests: list[Any] = []
+        self.timeouts: list[Any] = []
+
+    def __call__(self, request: Any, timeout: Any = None) -> Any:
+        self.requests.append(request)
+        self.timeouts.append(timeout)
+        headers = {name: value for name, value in request.header_items()}
+        headers["Host"] = request.host
+        parts = urllib.parse.urlsplit(request.full_url)
+        path = parts.path + (f"?{parts.query}" if parts.query else "")
+        status, text = self.harness.handle.core.handle(
+            request.get_method(), path, headers, request.data
+        )
+        if not 200 <= status < 300:
+            raise urllib.error.HTTPError(
+                request.full_url, status, "refused", email.message.Message(), io.BytesIO(text.encode())
+            )
+        return Answer(text.encode())
+
+
+class Answer(io.BytesIO):
+    """The response a successful ``open`` returns: a readable context manager."""
+
+
+class FailingOpener:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.calls = 0
+
+    def __call__(self, request: Any, timeout: Any = None) -> Any:
+        self.calls += 1
+        raise self.error
+
+
+def write_profile(tmp_path: Path, **changes: Any) -> Path:
+    """A profile enabling the operator with the AC21 settings, token by reference."""
+
+    profile = tmp_path / "profile.yaml"
+    document = {
+        "enabled_modules": ["operator"],
+        "modules": {"operator": operator_settings(**changes)},
+    }
+    profile.write_text(yaml.safe_dump(document), encoding="utf-8")
+    return profile
+
+
+@pytest.fixture
+def token_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(TOKEN_VARIABLE, TOKEN)
+
+
+def assert_no_token(capsys: pytest.CaptureFixture[str]) -> None:
+    captured = capsys.readouterr()
+    assert TOKEN not in captured.out and TOKEN not in captured.err
+    assert TOKEN_VARIABLE not in captured.out and TOKEN_VARIABLE not in captured.err
+
+
+async def test_ac40_one_post_to_the_press_endpoint_naming_hype_hotkey_and_the_token(
+    tmp_path: Path, token_environment: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC40: exactly 1 POST to the configured address's ``/press``, its JSON
+    body naming ``hype`` with surface ``hotkey`` and the token in the header,
+    a 5 s timeout; the core answers accepted, so the command returns 0."""
+
+    h = await operated()
+    opener = CoreOpener(h)
+    profile = write_profile(tmp_path)
+    assert press_command.main(["press", "hype", "--profile", str(profile)], opener=opener) == 0
+
+    (request,) = opener.requests
+    assert request.full_url == f"http://127.0.0.1:{PORT}/press"
+    assert request.get_method() == "POST"
+    assert json.loads(request.data) == {"button": "hype", "surface": "hotkey"}
+    headers = {name.lower(): value for name, value in request.header_items()}
+    assert headers["x-operator-token"] == TOKEN
+    assert headers["content-type"] == "application/json"
+    assert opener.timeouts == [5]
+    (event,) = h.events()
+    assert event["payload"]["button"] == {"id": "hype", "surface": "hotkey"}
+    assert h.handle.counts()[COUNT_PRESSED] == 1
+    assert_no_token(capsys)
+    await h.handle.close()
+
+
+async def test_ac40_each_core_refusal_returns_2_with_no_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    token_environment: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC40: an unknown button, a press inside the cooldown, a wrong token
+    and a disabled ``hotkey`` surface are each the core's refusal: the
+    command returns 2 and the refusal adds 0 events."""
+
+    profile = write_profile(tmp_path)
+    argv = ["press", "hype", "--profile", str(profile)]
+
+    h = await operated()
+    opener = CoreOpener(h)
+    assert press_command.main(["press", "unknown-button", "--profile", str(profile)], opener=opener) == 2
+    assert h.events() == [] and h.handle.counts()[COUNT_REFUSED_UNKNOWN_BUTTON] == 1
+
+    assert press_command.main(argv, opener=opener) == 0
+    h.clock.advance(1)
+    assert press_command.main(argv, opener=opener) == 2
+    assert len(h.events()) == 1 and h.handle.counts()[COUNT_REFUSED_COOLDOWN] == 1
+
+    h.clock.advance(60)
+    monkeypatch.setenv(TOKEN_VARIABLE, "W" * 40)
+    assert press_command.main(argv, opener=opener) == 2
+    assert len(h.events()) == 1 and h.handle.counts()[COUNT_REFUSED_TOKEN] == 1
+    assert len(opener.requests) == 4
+    await h.handle.close()
+
+    monkeypatch.setenv(TOKEN_VARIABLE, TOKEN)
+    disabled = await operated(surfaces={"page": True, "hotkey": False, "overlay": True})
+    opener = CoreOpener(disabled)
+    assert press_command.main(argv, opener=opener) == 2
+    assert disabled.events() == [] and disabled.handle.counts()[COUNT_REFUSED_SURFACE] == 1
+    assert len(opener.requests) == 1
+    assert_no_token(capsys)
+    await disabled.handle.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+        ConnectionRefusedError(111, "Connection refused"),
+        TimeoutError("timed out"),
+        socket.timeout("timed out"),
+        urllib.error.URLError(TimeoutError("timed out")),
+        http.client.IncompleteRead(b'{"sta', 10),
+    ],
+    ids=["url-error", "connection-refused", "timeout", "socket-timeout", "url-timeout", "incomplete-read"],
+)
+def test_ac40_a_connection_error_or_a_timeout_returns_3(
+    error: BaseException,
+    tmp_path: Path,
+    token_environment: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC40: the input cannot be reached — refused or timed out — 3."""
+
+    opener = FailingOpener(error)
+    profile = write_profile(tmp_path)
+    assert press_command.main(["press", "hype", "--profile", str(profile)], opener=opener) == 3
+    assert opener.calls == 1
+    assert_no_token(capsys)
+
+
+def _profile_variant(tmp_path: Path, variant: str) -> str:
+    if variant == "missing-file":
+        return str(tmp_path / "absent.yaml")
+    profile = tmp_path / "profile.yaml"
+    if variant == "invalid-yaml":
+        profile.write_text(f"modules: {{operator: [token: {TOKEN}\n", encoding="utf-8")
+    elif variant == "not-a-mapping":
+        profile.write_text("- one\n- two\n", encoding="utf-8")
+    elif variant == "no-operator":
+        profile.write_text(yaml.safe_dump({"modules": {}}), encoding="utf-8")
+    elif variant == "no-listen":
+        settings = operator_settings()
+        del settings["listen"]
+        profile.write_text(yaml.safe_dump({"modules": {"operator": settings}}), encoding="utf-8")
+    elif variant == "no-port":
+        write_profile(tmp_path, listen={"host": "127.0.0.1"})
+    elif variant == "no-token":
+        settings = operator_settings()
+        del settings["token"]
+        profile.write_text(yaml.safe_dump({"modules": {"operator": settings}}), encoding="utf-8")
+    elif variant == "unset-variable":
+        write_profile(tmp_path, token="${OPERATOR_TOKEN_UNSET}")
+    elif variant == "partial-reference":
+        write_profile(tmp_path, token=f"prefix-${{{TOKEN_VARIABLE}}}")
+    elif variant == "newline-token":
+        write_profile(tmp_path, token=f"{TOKEN}\n")
+    elif variant == "inner-line-break-token":
+        write_profile(tmp_path, token=f"{TOKEN}\r\nX-Other: 1")
+    elif variant == "non-latin-1-token":
+        write_profile(tmp_path, token=f"{TOKEN}\u2603")
+    else:  # pragma: no cover - the parametrisation names every variant
+        raise AssertionError(variant)
+    return str(profile)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "missing-file",
+        "invalid-yaml",
+        "not-a-mapping",
+        "no-operator",
+        "no-listen",
+        "no-port",
+        "no-token",
+        "unset-variable",
+        "partial-reference",
+        "newline-token",
+        "inner-line-break-token",
+        "non-latin-1-token",
+    ],
+)
+def test_ac40_an_unreadable_or_incomplete_profile_returns_64_and_sends_nothing(
+    variant: str,
+    tmp_path: Path,
+    token_environment: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC40: a profile that cannot be read, is not YAML, or lacks the listen
+    address or the token is a usage error: 64, no request, no token printed."""
+
+    opener = FailingOpener(AssertionError("no request is sent"))
+    profile = _profile_variant(tmp_path, variant)
+    assert press_command.main(["press", "hype", "--profile", profile], opener=opener) == 64
+    assert opener.calls == 0
+    assert_no_token(capsys)
+
+
+def test_ac40_a_referenced_token_that_is_no_header_value_returns_64_and_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A token whose environment value ends in a line break would make
+    ``http.client`` raise an error quoting it: it is refused as a profile
+    error before any request, and never printed."""
+
+    monkeypatch.setenv(TOKEN_VARIABLE, f"{TOKEN}\n")
+    opener = FailingOpener(AssertionError("no request is sent"))
+    profile = write_profile(tmp_path)
+    assert press_command.main(["press", "hype", "--profile", str(profile)], opener=opener) == 64
+    assert opener.calls == 0
+    assert_no_token(capsys)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["press"], [], ["press", "hype", "extra"], ["release", "hype"], ["press", "hype", "--profile"]],
+    ids=["no-button", "no-command", "extra-argument", "unknown-command", "profile-without-path"],
+)
+def test_ac40_a_usage_error_returns_64_with_a_fixed_message(
+    argv: list[str], tmp_path: Path, token_environment: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC40: no button argument (or any other usage error) is 64, not
+    argparse's 2, and the message never echoes the arguments."""
+
+    opener = FailingOpener(AssertionError("no request is sent"))
+    assert press_command.main(argv, opener=opener) == 64
+    assert opener.calls == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == press_command.MESSAGE_USAGE
+
+
+def test_ac40_the_default_opener_is_urllib_with_a_5_second_timeout(
+    tmp_path: Path, token_environment: None, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without an ``opener`` the command opens through
+    ``urllib.request.build_opener().open`` with a 5 s timeout — faked here."""
+
+    calls: list[tuple[Any, Any]] = []
+
+    class FakeDirector:
+        def open(self, request: Any, timeout: Any = None) -> Any:
+            calls.append((request, timeout))
+            return Answer(b'{"status":"accepted"}')
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: FakeDirector())
+    profile = write_profile(tmp_path)
+    assert press_command.main(["press", "hype", "--profile", str(profile)]) == 0
+    (request, timeout), = calls
+    assert timeout == 5 and request.full_url == f"http://127.0.0.1:{PORT}/press"
+    assert_no_token(capsys)
+
+
+def test_ac40_the_command_repeats_the_input_names_it_must_not_import() -> None:
+    """The command keeps its own copy of the input's route, header and
+    surface names (it imports only the standard library and ``yaml``)."""
+
+    assert press_command.PATH_PRESS == operator.PATH_PRESS
+    assert press_command.TOKEN_HEADER.lower() == operator.TOKEN_HEADER
+    assert press_command.SURFACE_HOTKEY == operator.SURFACE_HOTKEY
+    assert press_command.MODULE_NAME == operator.MODULE_NAME
+    assert press_command.DEFAULT_HOST == operator.DEFAULT_HOST
+    source = (MODULES / "operator" / "__main__.py").read_text(encoding="utf-8")
+    imported = {
+        line.split()[1].split(".")[0]
+        for line in source.splitlines()
+        if line.startswith(("import ", "from "))
+    }
+    assert imported <= {"__future__", "argparse", "http", "json", "os", "re", "sys", "urllib",
+                        "collections", "typing", "yaml"}
+
+
+def test_ac40_importing_the_command_imports_no_runtime_loader_or_lifecycle() -> None:
+    """AC40 / A8: with ``modules.operator``, ``modules.operator.__main__``,
+    ``core.runtime``, ``core.loader`` and ``core.lifecycle`` removed from
+    ``sys.modules``, importing ``modules.operator.__main__`` leaves the last
+    three absent."""
+
+    guarded = ("core.runtime", "core.loader", "core.lifecycle")
+    removed = ("modules.operator", "modules.operator.__main__", *guarded)
+    saved = {name: sys.modules[name] for name in removed if name in sys.modules}
+    for name in saved:
+        del sys.modules[name]
+    try:
+        importlib.import_module("modules.operator.__main__")
+        assert [name for name in guarded if name in sys.modules] == []
+    finally:
+        for name in removed:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+
+
+async def test_ac21_a_press_from_each_surface_gives_three_manual_events(
+    tmp_path: Path, token_environment: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC21 (the hotkey third, completing P9's page and overlay halves): a
+    press of ``hype`` from the page, from the press command — through a fake
+    opener that hands its request to the input's request core — and from
+    the overlay produce 3 ``manual`` events, each with ``payload.button.id``
+    ``hype``, its surface, the prompt text, author ``operator:hype``, the
+    configured destination and a distinct ``message_id``, each decided and
+    admitted through the scheduler. After ``stop_inputs`` the command's
+    press produces 0 events."""
+
+    h = await operated()
+    opener = CoreOpener(h)
+    argv = ["press", "hype", "--profile", str(write_profile(tmp_path))]
+
+    assert await h.press(surface="page") == (200, {"status": "accepted"})
+    h.clock.advance(2)
+    assert press_command.main(argv, opener=opener) == 0
+    h.clock.advance(2)
+    assert await h.press(surface="overlay") == (200, {"status": "accepted"})
+
+    events = h.events()
+    assert [event["payload"]["button"] for event in events] == [
+        {"id": "hype", "surface": surface} for surface in ("page", "hotkey", "overlay")
+    ]
+    for event in events:
+        payload = event["payload"]
+        assert event["type"] == "channel.chat.message"
+        assert payload["kind"] == "manual"
+        assert payload["text"] == HYPE_PROMPT
+        assert payload["author"] == {"id": "operator:hype", "display_name": "Hype!"}
+        assert (payload["platform"], payload["channel_id"]) == (PLATFORM, CHANNEL)
+    assert len({event["payload"]["message_id"] for event in events}) == 3
+    assert len(h.scheduler.admissions) == 3
+    assert h.handle.counts()[COUNT_ADMITTED] == 3
+    # The hotkey press was decided too; its trace is published with the next
+    # request's flush, so all three are recorded by now.
+    decisions = h.decisions()
+    assert [d["reason"] for d in decisions] == ["accepted:event_kind_manual"] * 3
+    assert sorted(d["source_event_id"] for d in decisions) == sorted(
+        event["payload"]["message_id"] for event in events
+    )
+
+    await h.handle.stop_inputs()
+    h.clock.advance(60)
+    assert press_command.main(argv, opener=opener) == 2
+    assert len(h.events()) == 3 and h.handle.counts()[COUNT_REFUSED_CLOSED] == 1
+    assert_no_token(capsys)
     await h.handle.close()
