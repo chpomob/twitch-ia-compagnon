@@ -222,8 +222,16 @@ _ACTION_KEYS: frozenset[str] = frozenset(
 )
 
 _DESTINATION_KEYS: frozenset[str] = frozenset({"platform", "channel_id", "scope"})
-_TRIGGER_KEYS: frozenset[str] = frozenset({"types", "combinations", "default_policy"})
-_TRIGGER_TYPE_KEYS: frozenset[str] = frozenset({"name", "parameter_schema"})
+_TRIGGER_KEYS: frozenset[str] = frozenset(
+    {"types", "combinations", "default_policy", "fields"}
+)
+#: The keys only a declared trigger type carries (phase 8, R1).
+_DECLARED_TRIGGER_TYPE_KEYS: frozenset[str] = frozenset(
+    {"kinds", "match", "probability_parameter", "hook", "hook_timeout_seconds"}
+)
+_TRIGGER_TYPE_KEYS: frozenset[str] = (
+    frozenset({"name", "parameter_schema"}) | _DECLARED_TRIGGER_TYPE_KEYS
+)
 _POLICY_KEYS: frozenset[str] = frozenset({"rules", "combination"})
 _RULE_KEYS: frozenset[str] = frozenset({"type", "parameters"})
 
@@ -2105,7 +2113,12 @@ def _destination(name: str, field_name: str, value: Any) -> Destination:
 
 
 def _manifest_triggers(name: str, manifest: Mapping[str, Any]) -> TriggerSpec | None:
-    """Parse the declared ``triggers`` into a :class:`TriggerSpec` (R1, R7)."""
+    """Parse the declared ``triggers`` into a :class:`TriggerSpec` (R1, R7).
+
+    A generic type's refusal is reported at ``triggers.types[i]``; a declared
+    type's (phase 8) at ``triggers.<input>.types[i].<sub-path>``, the input
+    being this manifest's name.
+    """
 
     if MANIFEST_TRIGGERS_KEY not in manifest:
         return None
@@ -2135,6 +2148,9 @@ def _manifest_triggers(name: str, manifest: Mapping[str, Any]) -> TriggerSpec | 
             raise _field_error(
                 name, field_name, f"declares unknown keys: {', '.join(unknown)}"
             )
+        if _is_declared_type_entry(entry):
+            types.append(_declared_trigger_type(name, index, entry))
+            continue
         try:
             types.append(
                 TriggerTypeDeclaration(
@@ -2166,11 +2182,115 @@ def _manifest_triggers(name: str, manifest: Mapping[str, Any]) -> TriggerSpec | 
             types=tuple(types),
             combinations=tuple(raw_combinations),
             default_policy=default_policy,
+            fields=declared.get("fields", {}),
         )
-    except (ContractError, TypeError, ValueError) as exc:
+    except ContractError as exc:
+        # A refusal inside a declared type — a ``field`` operand the input
+        # does not emit — is reported where that type is declared (R1).
+        located = _declared_type_location(name, exc.field, types)
+        if located is not None:
+            raise _field_error(name, located, _sanitised_reason(exc.reason)) from None
         raise _field_error(
             name, MANIFEST_TRIGGERS_KEY, _sanitised_reason(str(exc))
         ) from None
+    except (TypeError, ValueError) as exc:
+        raise _field_error(
+            name, MANIFEST_TRIGGERS_KEY, _sanitised_reason(str(exc))
+        ) from None
+
+
+_TRIGGER_TYPE_CONTRACT_PREFIX = "TriggerTypeDeclaration."
+_TRIGGER_SPEC_TYPE_FIELD = re.compile(r"TriggerSpec\.types\[(?P<index>\d+)\](?P<rest>.*)\Z")
+
+
+def _is_declared_type_entry(entry: Mapping[str, Any]) -> bool:
+    """Whether a manifest trigger type is a declared one, not a generic one.
+
+    An entry carrying any declared-only key is declared, whatever its name, so
+    a declaration reusing a generic name is refused where it is declared (R1,
+    AC2). A bare name and schema is a generic declaration: a name outside the
+    four is then refused by the trigger registry, at the same
+    ``triggers.<input>.types[i].name``, when its module is enabled.
+    """
+
+    return any(key in entry for key in _DECLARED_TRIGGER_TYPE_KEYS)
+
+
+def _declared_type_field(name: str, index: int, sub_path: str = "") -> str:
+    """``triggers.<input>.types[i]<.sub-path>``, a declared type's location (R1)."""
+
+    location = f"{MANIFEST_TRIGGERS_KEY}.{name}.types[{index}]"
+    return f"{location}.{sub_path}" if sub_path else location
+
+
+def _declared_type_arguments(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """The declared-only keys an entry carries, a YAML ``kinds`` list as a tuple."""
+
+    arguments = {key: entry[key] for key in _DECLARED_TRIGGER_TYPE_KEYS if key in entry}
+    if isinstance(arguments.get("kinds"), list):
+        arguments["kinds"] = tuple(arguments["kinds"])
+    return arguments
+
+
+def _declared_trigger_type(
+    name: str, index: int, entry: Mapping[str, Any]
+) -> TriggerTypeDeclaration:
+    """One declared trigger type, every refusal at its own sub-path (R1, AC2, AC3).
+
+    The diagnostic carries the contract's reason only, which names fields and
+    bounds, never a configured value; a malformed parameter schema, whose
+    reasons can quote one, is reported with a fixed reason.
+    """
+
+    if entry.get("match") is None and entry.get("hook") is not True:
+        raise _field_error(
+            name, _declared_type_field(name, index, "name"), "declares neither match nor hook"
+        )
+    try:
+        return TriggerTypeDeclaration(
+            name=entry.get("name"),
+            parameter_schema=entry.get("parameter_schema"),
+            **_declared_type_arguments(entry),
+        )
+    except SchemaError:
+        # A schema diagnostic may quote what the schema declares — an unknown
+        # type, a duplicated name, a default and the enum it misses — and its
+        # path names properties, so it is reported at the key with a fixed
+        # reason: the refusal echoes no configured value (R1).
+        raise _field_error(
+            name,
+            _declared_type_field(name, index, "parameter_schema"),
+            "is not a valid parameter schema",
+        ) from None
+    except ContractError as exc:
+        sub_path = (
+            exc.field.removeprefix(_TRIGGER_TYPE_CONTRACT_PREFIX)
+            if exc.field.startswith(_TRIGGER_TYPE_CONTRACT_PREFIX)
+            else ""
+        )
+        raise _field_error(
+            name,
+            _declared_type_field(name, index, sub_path),
+            _sanitised_reason(exc.reason),
+        ) from None
+    except (TypeError, ValueError):
+        raise _field_error(
+            name, _declared_type_field(name, index), "is not a valid declared trigger type"
+        ) from None
+
+
+def _declared_type_location(
+    name: str, field_name: str, types: Sequence[TriggerTypeDeclaration]
+) -> str | None:
+    """The manifest location of a spec refusal inside a declared type, or ``None``."""
+
+    found = _TRIGGER_SPEC_TYPE_FIELD.match(field_name)
+    if found is None:
+        return None
+    index = int(found["index"])
+    if index >= len(types) or not types[index].declared:
+        return None
+    return _declared_type_field(name, index, found["rest"].removeprefix("."))
 
 
 def _trigger_policy(

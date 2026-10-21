@@ -1,0 +1,53 @@
+# Declared trigger type fixture — a minimal input, manifest v2 (phase 8, R1; AC1).
+#
+# It declares the AC1 type `badge_tier`: candidacy for a `message` whose
+# payload `badge.tier` is one of the configured `tiers`. The field is not a
+# canonical normalized one, so the input declares it under `triggers.fields`.
+# The module opens nothing: it lives one directory below `tests/fixtures/modules`
+# so the two-fixture discovery there never sees it.
+
+name: badge
+manifest_version: 2
+runtime_api: 2
+
+produces:
+  - channel.chat.message
+consumes: []
+middleware: false
+
+lifecycle:
+  roles:
+    - input
+
+credentials: []
+
+triggers:
+  fields:
+    badge.tier: string
+  types:
+    - name: badge_tier
+      parameter_schema:
+        type: object
+        properties:
+          tiers:
+            type: array
+            items:
+              type: string
+        required:
+          - tiers
+        additionalProperties: false
+      kinds:
+        - message
+      match:
+        in:
+          - field: badge.tier
+          - param: tiers
+  combinations:
+    - all_of
+  default_policy:
+    combination: all_of
+    rules:
+      - type: badge_tier
+        parameters:
+          tiers:
+            - gold

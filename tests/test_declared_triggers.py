@@ -7,6 +7,11 @@ P3 holds the construction-level half of AC2 and AC8's pattern length (R1):
 the shapes of a declared trigger type and their structural validation, each
 refusal naming its sub-path and echoing no configured value.
 
+P4 holds AC1, AC2 and the load half of AC3 (R1): the loader parses the new
+manifest keys, and refuses a malformed declared type at discovery — before any
+transport is opened — with a diagnostic at ``triggers.<input>.types[i]`` and
+the sub-path, echoing no configured value.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -46,7 +51,10 @@ else:  # pragma: no cover - exercised on the 3.10 floor only
 
 import pytest
 
+import yaml
+
 import core.main as application
+from core.loader import ModuleLoader, ModuleLoadError
 from core.contracts import (
     CHAT_FAMILY_KINDS,
     EVENT_KINDS,
@@ -82,6 +90,7 @@ from test_presence_pack import PresenceTwitchSession, presence_environ
 from test_integration import FakeWebSocket, welcome
 from test_stream_control import ScenePeer
 from test_twitch import chat_notice, follow_notice
+from test_loader import runtime_context
 
 BASELINE = Path(__file__).parent / "fixtures" / "phase8" / "profile_baseline.json"
 #: The shipped profiles, by file name: every one of them is replayed.
@@ -1047,3 +1056,416 @@ def test_p3_malformed_nodes_and_operands_are_refused_by_sub_path(
     """R1: the closed node set and its operand shapes."""
 
     _refused(lambda: _badge(match=tree), f"TriggerTypeDeclaration.{field}")
+
+
+# --------------------------------------------------------------------------- #
+# P4 (R1): the loader parses and diagnoses the new manifest keys; AC1, AC2, AC3
+# --------------------------------------------------------------------------- #
+
+DECLARED_FIXTURES = Path(__file__).parent / "fixtures" / "modules" / "declared"
+INPUT = "badge"
+
+#: A module that opens one transport the moment it is activated, so a refusal
+#: at load is seen to open none.
+COUNTING_SOURCE = """
+class Handle:
+    def __init__(self, transport):
+        self.transport = transport
+
+    async def start_inputs(self):
+        return None
+
+    async def close(self):
+        self.transport.close()
+
+
+async def activate(context, settings, catalog):
+    transport = settings["transport"]
+    transport.open()
+    return Handle(transport)
+"""
+
+
+class CountingTransport:
+    """The transport fake: counts every open and every close."""
+
+    def __init__(self) -> None:
+        self.opened = 0
+        self.closed = 0
+
+    def open(self) -> None:
+        self.opened += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def _fixture_manifest() -> dict[str, Any]:
+    with (DECLARED_FIXTURES / INPUT / "module.yaml").open(encoding="utf-8") as stream:
+        return yaml.safe_load(stream)
+
+
+def _with_type(**overrides: Any) -> dict[str, Any]:
+    """The fixture manifest with its one declared type overridden; a ``None``
+    override removes the key."""
+
+    manifest = _fixture_manifest()
+    declaration = manifest["triggers"]["types"][0]
+    for key, value in overrides.items():
+        if value is None:
+            declaration.pop(key, None)
+        else:
+            declaration[key] = value
+    return manifest
+
+
+def _write_module(root: Path, manifest: Mapping[str, Any]) -> Path:
+    directory = root / INPUT
+    directory.mkdir()
+    (directory / "module.yaml").write_text(yaml.safe_dump(dict(manifest)), encoding="utf-8")
+    (directory / "__init__.py").write_text(COUNTING_SOURCE, encoding="utf-8")
+    return directory
+
+
+async def _load(root: Path, transport: CountingTransport) -> list[Any]:
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, root, context=context, environ={})
+    return await loader.activate_enabled(
+        {"enabled_modules": [INPUT], "modules": {INPUT: {"transport": transport}}}
+    )
+
+
+async def _refused_at_load(
+    tmp_path: Path, manifest: Mapping[str, Any], field: str, *configured: str
+) -> str:
+    """Load *manifest* enabled, expect a refusal at exactly *field* with 0
+    transports opened, and check no *configured* string reaches it."""
+
+    _write_module(tmp_path, manifest)
+    transport = CountingTransport()
+    with pytest.raises(ModuleLoadError) as caught:
+        await _load(tmp_path, transport)
+    diagnostic = str(caught.value)
+    assert transport.opened == 0
+    assert f"module {INPUT!r}: field {field!r}: " in diagnostic, diagnostic
+    for value in configured:
+        assert value not in diagnostic, (value, diagnostic)
+    return diagnostic
+
+
+async def test_p4_ac1_the_badge_tier_manifest_loads_with_its_declared_field() -> None:
+    """AC1 (R1), load level: the fixture manifest declaring ``badge_tier`` and
+    ``triggers.fields: {badge.tier: string}`` is parsed at discovery into the
+    declared type, and the policy ``badge_tier{tiers: ["gold"]}`` validates
+    against what was parsed."""
+
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, DECLARED_FIXTURES, context=context, environ={})
+
+    assert await loader.activate_enabled({"enabled_modules": [], "modules": {}}) == []
+
+    assert set(loader.discovered) == {INPUT}
+    spec = loader.discovered[INPUT].declaration.triggers
+    assert spec is not None
+    assert dict(spec.fields) == {"badge.tier": "string"}
+    (declaration,) = spec.types
+    assert declaration.name == "badge_tier" and declaration.declared
+    assert declaration.kinds == ("message",)
+    assert declaration.match == {"in": ({"field": "badge.tier"}, {"param": "tiers"})}
+    assert declaration.hook is False and declaration.probability_parameter is None
+    assert spec.default_policy.rules[0].type == "badge_tier"
+    spec.validate_policy(
+        TriggerPolicy(rules=(TriggerRule("badge_tier", {"tiers": ["gold"]}),))
+    )
+
+
+async def test_p4_the_counting_transport_counts_an_accepted_load(tmp_path: Path) -> None:
+    """The control of AC2's count: the same module with a generic trigger
+    type loads and opens exactly one transport, so the 0 of a refusal is the
+    loader's doing, not a fake that never counts."""
+
+    manifest = _fixture_manifest()
+    manifest["triggers"] = {
+        "types": [
+            {
+                "name": "keyword",
+                "parameter_schema": {
+                    "type": "object",
+                    "properties": {"keywords": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["keywords"],
+                },
+            }
+        ],
+        "combinations": ["all_of"],
+        "default_policy": {
+            "rules": [{"type": "keyword", "parameters": {"keywords": ["hello"]}}]
+        },
+    }
+    _write_module(tmp_path, manifest)
+    transport = CountingTransport()
+
+    activations = await _load(tmp_path, transport)
+
+    assert [activation.name for activation in activations] == [INPUT]
+    assert transport.opened == 1
+    for activation in activations:
+        await activation.close()
+
+
+_DECLARED_AT = f"triggers.{INPUT}.types[0]"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "sub_path", "configured"),
+    [
+        pytest.param({"name": "keyword"}, "name", (), id="generic-name"),
+        pytest.param({"name": "q" * 33}, "name", ("q" * 33,), id="33-characters"),
+        pytest.param({"kinds": []}, "kinds", (), id="empty-kinds"),
+        pytest.param({"kinds": ["banana"]}, "kinds[0]", ("banana",), id="unknown-kind"),
+        pytest.param(
+            {"hook": True, "hook_timeout_seconds": 1}, "hook", (), id="match-and-hook"
+        ),
+        pytest.param(
+            {
+                "match": {
+                    "all": [
+                        {"equals": [{"field": "text"}, "hello_sentinel"]},
+                        {"regex": [{"field": "text"}, "re_sentinel"]},
+                    ]
+                }
+            },
+            "match.all[1]",
+            ("regex", "re_sentinel", "hello_sentinel"),
+            id="operator-regex",
+        ),
+        pytest.param(
+            {
+                "match": {
+                    "all": [
+                        {"equals": [{"field": "text"}, "hello_sentinel"]},
+                        {"in": [{"field": "secret.token"}, {"param": "tiers"}]},
+                    ]
+                }
+            },
+            "match.all[1].in[0].field",
+            ("secret.token", "hello_sentinel"),
+            id="undeclared-field",
+        ),
+        pytest.param(
+            {"match": {"in": [{"field": "badge.tier"}, {"param": "ranks_sentinel"}]}},
+            "match.in[1].param",
+            ("ranks_sentinel",),
+            id="unknown-param",
+        ),
+        pytest.param(
+            {"match": _nested_not(9)}, "match" + ".not" * 8, ("deep_sentinel",), id="depth-9"
+        ),
+    ],
+)
+async def test_p4_ac2_each_fixture_declaration_is_refused_at_load(
+    tmp_path: Path,
+    overrides: dict[str, Any],
+    sub_path: str,
+    configured: tuple[str, ...],
+) -> None:
+    """AC2 (R1): each of the nine fixture declarations is refused at load,
+    the module enabled, with 0 transports opened and a diagnostic naming
+    ``triggers.<input>.types[i]`` and the offending sub-path — the field the
+    input does not emit included, which only the spec can see — and echoing
+    no configured string."""
+
+    await _refused_at_load(
+        tmp_path, _with_type(**overrides), f"{_DECLARED_AT}.{sub_path}", *configured
+    )
+
+
+async def test_p4_ac2_the_diagnostic_names_the_declaring_position(tmp_path: Path) -> None:
+    """AC2 (R1): the index is the declared type's own position in
+    ``triggers.types``, after a generic type the same input declares."""
+
+    manifest = _with_type(kinds=["banana"])
+    manifest["triggers"]["types"].insert(
+        0,
+        {
+            "name": "probability",
+            "parameter_schema": {
+                "type": "object",
+                "properties": {"probability": {"type": "number", "minimum": 0, "maximum": 1}},
+                "required": ["probability"],
+            },
+        },
+    )
+    await _refused_at_load(tmp_path, manifest, f"triggers.{INPUT}.types[1].kinds[0]", "banana")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"match": None}, id="kinds-without-match"),
+        pytest.param({"match": None, "hook": False}, id="hook-false"),
+        pytest.param({"match": None, "kinds": None, "hook": False}, id="hook-false-alone"),
+    ],
+)
+async def test_p4_ac3_neither_match_nor_hook_is_refused_at_name(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    """AC3 (R1), load half: a declared type with neither ``match`` nor a hook
+    is refused at ``triggers.<input>.types[0].name``, echoing no name."""
+
+    await _refused_at_load(tmp_path, _with_type(**overrides), f"{_DECLARED_AT}.name", "badge_tier")
+
+
+async def test_p4_a_bare_non_generic_name_is_still_refused_at_its_name(tmp_path: Path) -> None:
+    """R1: a non-generic name carrying no declared key at all is a generic
+    declaration to the manifest parser, so a disabled module declaring one is
+    still discovered; enabled, it is refused before any transport opens by
+    the registry's existing refusal, at ``triggers.<input>.types[0].name``."""
+
+    manifest = _with_type(match=None, kinds=None)
+    _write_module(tmp_path, manifest)
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context, environ={})
+    await loader.activate_enabled({"enabled_modules": [], "modules": {}})
+    (declaration,) = loader.discovered[INPUT].declaration.triggers.types
+    assert not declaration.declared
+
+    transport = CountingTransport()
+    with pytest.raises(ModuleLoadError) as caught:
+        await _load(tmp_path, transport)
+    assert transport.opened == 0
+    assert f"{_DECLARED_AT}.name: is not a trigger type" in str(caught.value)
+
+
+async def test_p4_ac3_a_non_required_probability_parameter_is_refused(tmp_path: Path) -> None:
+    """AC3 (R1), load half: a ``probability_parameter`` the schema does not
+    list as required is refused at its own key, echoing no configured name."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "tiers": {"type": "array", "items": {"type": "string"}},
+            "chance_sentinel": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["tiers"],
+    }
+    await _refused_at_load(
+        tmp_path,
+        _with_type(parameter_schema=schema, probability_parameter="chance_sentinel"),
+        f"{_DECLARED_AT}.probability_parameter",
+        "chance_sentinel",
+    )
+
+
+async def test_p4_a_required_probability_parameter_loads(tmp_path: Path) -> None:
+    """R1: the same declaration with the parameter required is accepted at
+    discovery and keeps its probability parameter."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "tiers": {"type": "array", "items": {"type": "string"}},
+            "chance": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["tiers", "chance"],
+    }
+    manifest = _with_type(parameter_schema=schema, probability_parameter="chance")
+    manifest["triggers"]["default_policy"]["rules"][0]["parameters"]["chance"] = 0.5
+    _write_module(tmp_path, manifest)
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context, environ={})
+
+    await loader.activate_enabled({"enabled_modules": [], "modules": {}})
+
+    (declaration,) = loader.discovered[INPUT].declaration.triggers.types
+    assert declaration.probability_parameter == "chance"
+
+
+async def test_p4_a_hooked_declaration_loads_with_its_bound(tmp_path: Path) -> None:
+    """R1, R3: ``hook: true`` with ``hook_timeout_seconds`` parses from a
+    manifest; the bound outside (0, 10] is refused at its key."""
+
+    _write_module(tmp_path, _with_type(match=None, hook=True, hook_timeout_seconds=0.5))
+    context = runtime_context()
+    loader = ModuleLoader(context.bus, tmp_path, context=context, environ={})
+    await loader.activate_enabled({"enabled_modules": [], "modules": {}})
+    (declaration,) = loader.discovered[INPUT].declaration.triggers.types
+    assert declaration.hook is True and declaration.hook_timeout_seconds == 0.5
+
+    refused = tmp_path / "refused"
+    refused.mkdir()
+    await _refused_at_load(
+        refused,
+        _with_type(match=None, hook=True, hook_timeout_seconds=10.5),
+        f"{_DECLARED_AT}.hook_timeout_seconds",
+    )
+
+
+@pytest.mark.parametrize(
+    ("schema", "configured"),
+    [
+        pytest.param({"type": "secret_sentinel"}, ("secret_sentinel",), id="unknown-type"),
+        pytest.param(
+            {
+                "type": "object",
+                "properties": {"tiers_sentinel": {"type": "string"}},
+                "required": ["tiers_sentinel", "tiers_sentinel"],
+            },
+            ("tiers_sentinel",),
+            id="duplicated-required",
+        ),
+        pytest.param(
+            {
+                "type": "object",
+                "properties": {
+                    "tiers": {
+                        "type": "string",
+                        "enum": ["gold_sentinel"],
+                        "default": "lead_sentinel",
+                    }
+                },
+            },
+            ("tiers", "gold_sentinel", "lead_sentinel"),
+            id="default-outside-enum",
+        ),
+    ],
+)
+async def test_p4_a_malformed_parameter_schema_echoes_no_value(
+    tmp_path: Path, schema: dict[str, Any], configured: tuple[str, ...]
+) -> None:
+    """R1: a declared type whose parameter schema is malformed is refused at
+    ``triggers.<input>.types[i].parameter_schema``; the schema diagnostic,
+    which can quote a declared type, name or default, reaches it as a fixed
+    reason, echoing no configured value."""
+
+    diagnostic = await _refused_at_load(
+        tmp_path,
+        _with_type(parameter_schema=schema),
+        f"{_DECLARED_AT}.parameter_schema",
+        *configured,
+    )
+    assert "is not a valid parameter schema" in diagnostic
+
+
+async def test_p4_a_generic_type_keeps_its_existing_diagnostic(tmp_path: Path) -> None:
+    """R1 risk: a generic declaration's refusal keeps the pre-existing
+    ``triggers.types[i]`` wording, with no input segment."""
+
+    manifest = _fixture_manifest()
+    manifest["triggers"]["types"] = [
+        {"name": "keyword", "parameter_schema": {"type": "banana"}}
+    ]
+    diagnostic = await _refused_at_load(tmp_path, manifest, "triggers.types[0]")
+    assert f"triggers.{INPUT}.types" not in diagnostic
+
+
+async def test_p4_a_malformed_field_catalog_is_refused_at_load(tmp_path: Path) -> None:
+    """R1, A4: ``triggers.fields`` is parsed into the spec, so an entry that
+    redeclares a canonical field or names no scalar type is refused at load
+    by position, echoing neither its path nor its type."""
+
+    manifest = _fixture_manifest()
+    manifest["triggers"]["fields"] = {"badge.tier": "string", "rank.sentinel": "colour_sentinel"}
+    diagnostic = await _refused_at_load(
+        tmp_path, manifest, "triggers", "rank.sentinel", "colour_sentinel"
+    )
+    assert "TriggerSpec.fields[1]" in diagnostic
