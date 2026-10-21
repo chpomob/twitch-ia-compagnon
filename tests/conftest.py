@@ -77,6 +77,11 @@ handler on a mocked request; :class:`InMemoryNetwork`, under which
 reaches those listeners (HTTP and WebSocket); and :class:`UnreachableSession`,
 the patched ``aiohttp.ClientSession`` of an endpoint nothing listens on,
 raising ``aiohttp.ClientConnectorError`` beneath the production transport.
+P15d adds :class:`WebSocketEndpoints`, nominal WebSocket URLs served in
+memory to a module that builds its own ``aiohttp.ClientSession``: each
+connect is a :class:`MemoryWebSocketPair` whose client end
+(:class:`MemoryClientWebSocket`) writes through the installed ``aiohttp``
+writer onto an in-memory transport.
 
 This file is a single point of failure for every suite that imports it; a
 change here must be reviewed against each consumer, not just the suite that
@@ -2090,6 +2095,25 @@ class MemoryWebSocket:
     def exception(self) -> BaseException | None:
         return None
 
+    async def ping(self, message: bytes = b"") -> None:
+        """A ping the peer answers by itself, as ``aiohttp``'s autoping does:
+        recorded in ``sent``, never surfaced by either end's ``receive``. A
+        closed end refuses it as it refuses any write."""
+
+        if self._peer is None:
+            raise RuntimeError("memory websocket: end is not paired")
+        if self.closed or self._peer.closed:
+            raise ConnectionResetError("Cannot write to closing transport")
+        self.sent.append(WSMessage(WSMsgType.PING, bytes(message)))
+
+    def _drop(self) -> None:
+        """End abruptly: no close handshake, ``close_code`` 1006, then ``CLOSED``."""
+
+        if not self.closed:
+            self.closed = True
+            self.close_code = WS_ABNORMAL_CLOSURE
+            self._inbox.put_nowait(WSMessage(WSMsgType.CLOSED, None))
+
     def __aiter__(self) -> MemoryWebSocket:
         return self
 
@@ -2105,12 +2129,13 @@ class MemoryWebSocketPair:
     ``WebSocketResponse``) and ``client`` (the agent's
     ``ClientWebSocketResponse``). ``drop`` ends both abruptly, as a lost
     connection would: no close handshake, ``close_code`` 1006 on both ends,
-    frames already queued still readable, then ``CLOSED``.
+    frames already queued still readable, then ``CLOSED``. *client*, when
+    given, is the client end to pair (a :class:`MemoryClientWebSocket`).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, client: MemoryWebSocket | None = None) -> None:
         self.server = MemoryWebSocket()
-        self.client = MemoryWebSocket()
+        self.client = client if client is not None else MemoryWebSocket()
         self.server._attach(self.client)
         self.client._attach(self.server)
 
@@ -2120,10 +2145,7 @@ class MemoryWebSocketPair:
 
     def drop(self) -> None:
         for end in self.ends:
-            if not end.closed:
-                end.closed = True
-                end.close_code = WS_ABNORMAL_CLOSURE
-                end._inbox.put_nowait(WSMessage(WSMsgType.CLOSED, None))
+            end._drop()
 
 
 # --------------------------------------------------------------------------- #
@@ -2876,12 +2898,19 @@ class InMemoryNetwork:
             raise connector_error(str(url))
         return app
 
-    async def connect(self, url: Any) -> MemoryWebSocket:
-        """One WebSocket connect: the listener's handler serves the server end."""
+    async def connect(self, url: Any, compress: int = 15) -> MemoryWebSocket:
+        """One WebSocket connect: the listener's handler serves the server end.
+
+        A URL a :class:`WebSocketEndpoints` serves (P15d) is the same
+        in-memory loopback: the connect is that endpoint's.
+        """
 
         from aiohttp.test_utils import make_mocked_request
         from yarl import URL
 
+        for endpoints in _WEBSOCKET_ENDPOINTS:
+            if endpoints.serves(str(url)):
+                return await endpoints.connect(url, compress)
         app = self.listener(url)
         client = _MemoryClientWebSocket()
         request = make_mocked_request(
@@ -2951,8 +2980,8 @@ class _NetworkSession:
     def post(self, url: Any, **kwargs: Any) -> Any:
         return self.request("POST", url, **kwargs)
 
-    def ws_connect(self, url: Any, **kwargs: Any) -> Any:
-        return _Pending(lambda: self._network.connect(url))
+    def ws_connect(self, url: Any, *, compress: int = 15, **kwargs: Any) -> Any:
+        return _Pending(lambda: self._network.connect(url, compress))
 
     async def close(self) -> None:
         self.closed = True
@@ -2966,6 +2995,273 @@ class _NetworkSession:
 
 def _json_dumps(value: Any) -> bytes:
     return json.dumps(value).encode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket endpoints in memory, under the installed client writer (P15d)
+# --------------------------------------------------------------------------- #
+
+
+#: Every :class:`WebSocketEndpoints` built: an :class:`InMemoryNetwork`
+#: session reaches the URLs they serve too (one in-memory loopback).
+_WEBSOCKET_ENDPOINTS: list[WebSocketEndpoints] = []
+
+
+class _WriterTransport(asyncio.Transport):
+    """The transport under a :class:`MemoryClientWebSocket`'s real writer.
+
+    ``write`` parses the bytes the installed ``WebSocketWriter`` wrote —
+    masked, and deflated when the connect asked for compression — back into
+    frames and hands each to the end, which delivers it to its peer. ``close``
+    closes at once and loses the connection on the next loop turn, as a
+    socket transport does: both ends end abruptly (``close_code`` 1006).
+    """
+
+    def __init__(self, end: MemoryClientWebSocket) -> None:
+        super().__init__()
+        self._end = end
+        self._closing = False
+        self._buffer = bytearray()
+        self._inflate = zlib.decompressobj(-zlib.MAX_WBITS)
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
+        return default
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        asyncio.get_running_loop().call_soon(self._end._transport_lost)
+
+    def abort(self) -> None:
+        self.close()
+
+    def write(self, data: Any) -> None:
+        self._buffer += data
+        while (frame := self._frame()) is not None:
+            self._end._transmit(*frame)
+
+    def _frame(self) -> tuple[int, bytes] | None:
+        """The next whole frame in the buffer, consumed, or ``None``."""
+
+        buffer = self._buffer
+        if len(buffer) < 2:
+            return None
+        first, second = buffer[0], buffer[1]
+        length, offset = second & 0x7F, 2
+        if length == 126:
+            if len(buffer) < 4:
+                return None
+            (length,) = struct.unpack_from("!H", buffer, 2)
+            offset = 4
+        elif length == 127:
+            if len(buffer) < 10:
+                return None
+            (length,) = struct.unpack_from("!Q", buffer, 2)
+            offset = 10
+        mask = b""
+        if second & 0x80:
+            mask, offset = bytes(buffer[offset : offset + 4]), offset + 4
+        if len(buffer) < offset + length:
+            return None
+        payload = bytes(buffer[offset : offset + length])
+        del buffer[: offset + length]
+        if mask:
+            payload = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
+        if first & 0x40:
+            payload = self._inflate.decompress(payload + b"\x00\x00\xff\xff")
+        return first & 0x0F, payload
+
+
+class MemoryClientWebSocket(_AiohttpTypedWebSocket):
+    """The client end an ``aiohttp.ClientSession.ws_connect`` hands out, in memory.
+
+    Its ``_writer`` is the installed ``aiohttp`` ``WebSocketWriter`` over a
+    :class:`_WriterTransport` and a real ``BaseProtocol``, built as the
+    client builds it (masked, ``compress`` as the connect asked), so
+    ``send_str`` runs the installed write path — its closing checks, its
+    synchronous transport write, its drain — and the module's ``_writer``
+    probe reads a live connection until the end closes. Received messages
+    carry ``aiohttp.WSMsgType``.
+    """
+
+    def __init__(self, *, compress: int = 0) -> None:
+        from aiohttp._websocket.writer import WebSocketWriter
+        from aiohttp.base_protocol import BaseProtocol
+
+        super().__init__()
+        self.compress = compress
+        transport = _WriterTransport(self)
+        protocol = BaseProtocol(asyncio.get_running_loop())
+        protocol.connection_made(transport)
+        self._client_writer = WebSocketWriter(
+            protocol, transport, use_mask=True, compress=compress
+        )
+
+    @property
+    def _writer(self) -> Any:
+        return self._client_writer
+
+    async def send_str(self, data: str) -> None:
+        if not isinstance(data, str):
+            raise TypeError(f"data argument must be str ({type(data)!r})")
+        await self._client_writer.send_frame(data.encode("utf-8"), WSMsgType.TEXT)
+
+    async def send_bytes(self, data: bytes) -> None:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"data argument must be byte-ish ({type(data)!r})")
+        await self._client_writer.send_frame(bytes(data), WSMsgType.BINARY)
+
+    async def close(self, code: int = 1000, message: bytes = b"") -> bool:
+        closed = await super().close(code, message)
+        self._release()
+        return closed
+
+    def _drop(self) -> None:
+        super()._drop()
+        self._release()
+
+    def _release(self) -> None:
+        """The writer closing and the connection lost, as after a real close."""
+
+        writer = self._client_writer
+        writer._closing = True
+        writer.transport._closing = True
+        if writer.protocol.transport is not None:
+            writer.protocol.connection_lost(None)
+
+    def _transport_lost(self) -> None:
+        self._drop()
+        if self._peer is not None:
+            self._peer._drop()
+
+    def _transmit(self, opcode: int, payload: bytes) -> None:
+        """One frame the writer wrote: a data frame reaches an open peer;
+        a control frame is answered by the peer's own protocol, unseen."""
+
+        if opcode == WSMsgType.TEXT:
+            message = WSMessage(WSMsgType.TEXT, payload.decode("utf-8"))
+        elif opcode == WSMsgType.BINARY:
+            message = WSMessage(WSMsgType.BINARY, payload)
+        else:
+            return
+        self.sent.append(message)
+        peer = self._peer
+        if peer is not None and not peer.closed:
+            peer._inbox.put_nowait(message)
+
+
+class _Connecting:
+    """``ws_connect``'s answer: awaitable, or entered with ``async with``,
+    which closes the WebSocket on exit as ``aiohttp``'s does."""
+
+    def __init__(self, connect: Callable[[], Any]) -> None:
+        self._connect = connect
+        self._ws: Any = None
+
+    def __await__(self) -> Any:
+        return self._connect().__await__()
+
+    async def __aenter__(self) -> Any:
+        self._ws = await self._connect()
+        return self._ws
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._ws.close()
+
+
+class WebSocketEndpoints:
+    """WebSocket endpoints served in memory, by URL (AC33, P15d).
+
+    :meth:`install` patches ``aiohttp.ClientSession`` for a module that
+    builds its own session: ``ws_connect(url)`` pairs a
+    :class:`MemoryClientWebSocket` (the client end, ``compress`` as asked)
+    with a server end in one :class:`MemoryWebSocketPair` and hands the pair
+    to the endpoint served at *url*; a URL nothing serves raises
+    ``aiohttp.ClientConnectorError``, as a refused connection does. URLs are
+    nominal (``ws://<host>:<n>/``): no port is ever bound.
+    """
+
+    FIRST_PORT = 41000
+
+    def __init__(self) -> None:
+        self._served: dict[str, Callable[[MemoryWebSocketPair], None]] = {}
+        self._next_port = self.FIRST_PORT
+        #: Every URL a connect was attempted at, in order.
+        self.attempts: list[str] = []
+        _WEBSOCKET_ENDPOINTS.append(self)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> WebSocketEndpoints:
+        import aiohttp
+
+        monkeypatch.setattr(
+            aiohttp, "ClientSession", lambda *args, **kwargs: _EndpointSession(self)
+        )
+        return self
+
+    def allocate(self) -> int:
+        """A fresh nominal port: nothing serves it until :meth:`serve`."""
+
+        port = self._next_port
+        self._next_port += 1
+        return port
+
+    def serve(self, url: str, accept: Callable[[MemoryWebSocketPair], None]) -> None:
+        self._served[url] = accept
+
+    def withdraw(self, url: str) -> None:
+        self._served.pop(url, None)
+
+    def serves(self, url: str) -> bool:
+        return url in self._served
+
+    async def connect(self, url: Any, compress: int) -> MemoryClientWebSocket:
+        target = str(url)
+        self.attempts.append(target)
+        accept = self._served.get(target)
+        if accept is None:
+            raise connector_error(target)
+        client = MemoryClientWebSocket(compress=compress)
+        accept(MemoryWebSocketPair(client))
+        return client
+
+
+class _EndpointSession:
+    """The ``aiohttp.ClientSession`` a :class:`WebSocketEndpoints` hands out.
+
+    ``close`` loses every connection it opened that is still open, as the
+    connector closing its transports does.
+    """
+
+    def __init__(self, endpoints: WebSocketEndpoints) -> None:
+        self._endpoints = endpoints
+        self._opened: list[MemoryClientWebSocket] = []
+        self.closed = False
+
+    def ws_connect(self, url: Any, *, compress: int = 15, **kwargs: Any) -> _Connecting:
+        async def connect() -> MemoryClientWebSocket:
+            if self.closed:
+                raise RuntimeError("Session is closed")
+            ws = await self._endpoints.connect(url, compress)
+            self._opened.append(ws)
+            return ws
+
+        return _Connecting(connect)
+
+    async def close(self) -> None:
+        self.closed = True
+        for ws in self._opened:
+            if not ws.closed:
+                ws._writer.transport.close()
+
+    async def __aenter__(self) -> _EndpointSession:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -3430,83 +3726,6 @@ _PHASE5_TRIALS = "test_phase5_trials.py"
 #: nodes they convert and P16 asserts it is empty. Nothing is ever added.
 AC33_PENDING: frozenset[str] = frozenset(
     {
-        "tests/test_automation_bridge.py::test_ac15_phase6_a_permanently_raising_trace_keeps_the_backoff",
-        "tests/test_automation_bridge.py::test_ac15_phase6_a_raising_reconcile_trace_leaves_the_owner_alive",
-        "tests/test_automation_bridge.py::test_ac16_no_run_observation_is_a_success",
-        "tests/test_automation_bridge.py::test_ac16_row_acknowledged_is_execution_unconfirmed",
-        "tests/test_automation_bridge.py::test_ac16_row_bridge_not_ready",
-        "tests/test_automation_bridge.py::test_ac16_row_cancelled_before_the_frame_left",
-        "tests/test_automation_bridge.py::test_ac16_row_instance_action_ambiguous",
-        "tests/test_automation_bridge.py::test_ac16_row_instance_action_disabled",
-        "tests/test_automation_bridge.py::test_ac16_row_instance_action_missing",
-        "tests/test_automation_bridge.py::test_ac16_row_instance_error_answer",
-        "tests/test_automation_bridge.py::test_ac16_row_invalid_arguments",
-        "tests/test_automation_bridge.py::test_ac16_row_no_acknowledgement_before_the_deadline",
-        "tests/test_automation_bridge.py::test_ac16_row_not_allowlisted",
-        "tests/test_automation_bridge.py::test_ac17_a_late_acknowledgement_is_lost_and_never_re_invoked",
-        "tests/test_automation_bridge.py::test_ac17_an_answer_landing_while_the_timer_is_cleaned_up_is_lost",
-        "tests/test_automation_bridge.py::test_ac18_a_group_entry_reaches_its_actions_only",
-        "tests/test_automation_bridge.py::test_ac18_an_empty_or_absent_allowlist_refuses_everything",
-        "tests/test_automation_bridge.py::test_ac18_only_allowlisted_names_are_reachable",
-        "tests/test_automation_bridge.py::test_ac19_the_entry_schema_decides_the_arguments",
-        "tests/test_automation_bridge.py::test_ac20_reconciliation_names_the_unmatched_entries_once",
-        "tests/test_automation_bridge.py::test_ac21_a_principal_without_a_rule_is_refused_before_the_provider",
-        "tests/test_automation_bridge.py::test_ac24_the_challenge_answer_and_readiness_only_after_the_inventory",
-        "tests/test_automation_bridge.py::test_ac25_a_failed_start_retries_and_a_success_reports_ready",
-        "tests/test_automation_bridge.py::test_ac25_a_lost_connection_degrades_at_once_and_reconnects_after_the_minimum",
-        "tests/test_automation_bridge.py::test_ac25_the_backoff_doubles_from_the_minimum_and_is_capped_at_the_maximum",
-        "tests/test_automation_bridge.py::test_ac26_a_full_queue_drops_and_counts_and_never_stalls_the_connection",
-        "tests/test_automation_bridge.py::test_ac27_owning_only_cues_subscribes_to_the_custom_category_only",
-        "tests/test_automation_bridge.py::test_ac27_owning_twitch_chat_adds_only_twitch_chat_and_notices",
-        "tests/test_automation_bridge.py::test_ac28_a_run_in_flight_at_shutdown_is_acknowledgement_lost",
-        "tests/test_automation_bridge.py::test_ac28_cancelling_the_owner_task_propagates_and_releases_the_connection",
-        "tests/test_automation_bridge.py::test_ac28_shutdown_closes_within_budget_and_fails_a_pending_request",
-        "tests/test_automation_bridge.py::test_ac29_a_configured_policy_under_the_bridge_decides_its_cues",
-        "tests/test_automation_bridge.py::test_ac29_a_valid_cue_is_one_normalised_event_the_default_policy_accepts",
-        "tests/test_automation_bridge.py::test_ac30_a_cue_without_user_has_one_stable_author_unlike_the_companion",
-        "tests/test_automation_bridge.py::test_ac30_a_malformed_or_oversized_envelope_is_dropped_and_counted",
-        "tests/test_automation_bridge.py::test_ac32_instance_roles_satisfy_an_audience_only_when_trusted",
-        "tests/test_automation_bridge.py::test_ac33_a_mapped_chat_event_authored_by_the_companion_is_refused",
-        "tests/test_automation_bridge.py::test_ac33_engine_half_an_event_authored_by_the_companion_is_refused",
-        "tests/test_automation_bridge.py::test_ac33_the_refusal_comes_from_the_identities_the_bridge_hands_over",
-        "tests/test_automation_bridge.py::test_ac34_another_channel_is_refused_unsupported_destination",
-        "tests/test_automation_bridge.py::test_ac34_a_page_holds_at_most_limit_and_the_cursor_pages_the_same_list",
-        "tests/test_automation_bridge.py::test_ac34_the_owned_channel_reads_one_page_of_active_viewers",
-        "tests/test_automation_bridge.py::test_ac3_an_unreachable_instance_leaves_a_ready_companion_and_a_degraded_bridge",
-        "tests/test_automation_bridge.py::test_ac43_owning_chat_each_fixture_gives_one_event_and_unmapped_is_dropped",
-        "tests/test_automation_bridge.py::test_ac43_owning_only_twitch_the_kick_and_youtube_fixtures_give_nothing",
-        "tests/test_automation_bridge.py::test_ac45_every_matching_group_entry_must_accept",
-        "tests/test_automation_bridge.py::test_ac45_the_action_entry_beats_the_group_entry",
-        "tests/test_automation_bridge.py::test_ac4_each_failure_mode_degrades_with_its_reason_and_leaks_nothing",
-        "tests/test_automation_bridge.py::test_a_connection_loss_fails_every_pending_request",
-        "tests/test_automation_bridge.py::test_a_cursor_from_another_destination_or_not_minted_here_is_refused",
-        "tests/test_automation_bridge.py::test_a_malformed_viewer_answer_is_a_provider_failure",
-        "tests/test_automation_bridge.py::test_an_instance_without_a_challenge_is_not_sent_an_authentication",
-        "tests/test_automation_bridge.py::test_a_platform_the_bridge_does_not_own_is_never_bound_to_it",
-        "tests/test_automation_bridge.py::test_a_withheld_viewer_list_ends_timeout_never_external_unknown",
-        "tests/test_automation_bridge.py::test_d8_a_connection_closed_before_the_segment_is_provider_not_ready",
-        "tests/test_automation_bridge.py::test_d8_an_interruption_in_the_drain_after_the_write_is_acknowledgement_lost",
-        "tests/test_automation_bridge.py::test_d8_a_pre_write_failure_sends_nothing_and_withdraws_readiness",
-        "tests/test_automation_bridge.py::test_d8_behaviour_the_frame_reaches_the_transport_in_the_marking_segment",
-        "tests/test_automation_bridge.py::test_d8_cancelling_after_the_segment_is_acknowledgement_lost",
-        "tests/test_automation_bridge.py::test_d8_negative_control_the_behavioural_check_catches_f2s_mutation",
-        "tests/test_automation_bridge.py::test_d8_the_executor_deadline_before_the_frame_left_is_a_timeout",
-        "tests/test_automation_bridge.py::test_fake_instance_answers_one_hello_and_records_one_frame",
-        "tests/test_automation_bridge.py::test_fake_instance_authentication_switches",
-        "tests/test_automation_bridge.py::test_fake_instance_holds_withholds_and_rejects_acknowledgements",
-        "tests/test_automation_bridge.py::test_fake_instance_malformed_hello_and_failed_inventory",
-        "tests/test_automation_bridge.py::test_fake_instance_pushes_events_echoes_subscriptions_and_closes",
-        "tests/test_automation_bridge.py::test_fake_instance_stop_ends_the_connection",
-        "tests/test_automation_bridge.py::test_r1_a_withheld_inventory_degrades_within_the_startup_bound",
-        "tests/test_automation_bridge.py::test_r5_reconciliation_runs_again_at_every_connection",
-        "tests/test_automation_bridge.py::test_r6_a_refused_subscription_leaves_the_bridge_not_ready",
-        "tests/test_automation_bridge.py::test_r7_a_cue_for_a_platform_not_owned_is_dropped_by_the_bridge",
-        "tests/test_automation_bridge.py::test_r7_an_accepted_cue_is_admitted_to_the_shared_scheduler",
-        "tests/test_automation_bridge.py::test_r7_a_replayed_cue_id_is_neither_republished_nor_redecided",
-        "tests/test_automation_bridge.py::test_r7b_a_replayed_event_without_an_id_is_not_published_twice",
-        "tests/test_automation_bridge.py::test_r7b_mapped_chat_feeds_the_shared_transcript_once",
-        "tests/test_automation_bridge.py::test_the_loader_activates_the_bridge_and_a_run_is_refused_not_ready",
-        "tests/test_automation_bridge.py::test_without_owning_viewers_the_read_is_declared_and_never_bound",
         "tests/test_installation_doc.py::test_the_guides_profile_is_accepted_by_the_real_entry_point",
         "tests/test_installation_doc.py::test_the_readme_config_ui_command_runs",
         "tests/test_phase5_docs_status.py::test_ac36_the_socket_count_sees_a_local_and_a_network_socket",

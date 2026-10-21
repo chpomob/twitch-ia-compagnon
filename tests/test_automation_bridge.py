@@ -7,8 +7,10 @@ first half), the package-data line and unchanged dependencies (R10, AC41),
 and the vendor-free kernel (AC11, re-run). Nothing here opens a socket.
 
 Plan step P13 adds the instance fixtures' provenance guard (R8, AC35) and
-:class:`FakeInstance`, the loopback WebSocket server that replays them; only
-its own self-tests open a socket, on ``127.0.0.1``.
+:class:`FakeInstance`, the WebSocket server that replays them. Since P15d
+(AC33) it serves a nominal ``ws://127.0.0.1:<n>/`` in memory: each connect
+is a ``MemoryWebSocketPair`` whose client end writes through the installed
+``aiohttp`` writer, so no test here opens a socket.
 
 Plan step P14 adds the connection lifecycle against :class:`FakeInstance`:
 startup that never fails (R1; AC3 run-action half, AC4), the challenge answer
@@ -93,7 +95,7 @@ else:  # pragma: no cover - exercised on the 3.10 floor only
 import aiohttp
 import pytest
 import yaml
-from aiohttp import WSMsgType, web
+from aiohttp import WSMsgType
 
 from core import main as application
 from core.actions import (
@@ -126,7 +128,15 @@ from core.lifecycle import DEFAULT_HOOK_TIMEOUT_SECONDS, PhaseCoordinator
 from core.loader import ModuleLoader, _validate_manifest
 from core.runtime import RUNTIME_API, OwnedInputs
 from core.triggers import REASON_SELF_AUTHORED, TriggerRegistry
-from conftest import ManualClock, RecordingScheduler, runtime_context
+from conftest import (
+    ManualClock,
+    MemoryClientWebSocket,
+    MemoryWebSocket,
+    MemoryWebSocketPair,
+    RecordingScheduler,
+    WebSocketEndpoints,
+    runtime_context,
+)
 import test_kick as native_kick
 import test_twitch as native_twitch
 import test_youtube as native_youtube
@@ -900,11 +910,26 @@ MALFORMED_HELLO = '{"request": "Hello"'
 FAKE_WAIT_SECONDS = 5.0
 
 
-class FakeInstance:
-    """A loopback WebSocket server replaying the fixture frames (R8).
+#: The in-memory loopback every fake instance serves on (AC33, P15d).
+ENDPOINTS = WebSocketEndpoints()
 
-    It listens on ``127.0.0.1`` at an ephemeral port, sends the hello on each
-    connection, records every received frame in arrival order and by request
+
+@pytest.fixture(autouse=True)
+def _in_memory_instances(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC33 (R9, D8): the bridge builds its own ``aiohttp.ClientSession``;
+    the session it gets connects to a :class:`FakeInstance` in memory. A
+    dependency patch, not the subject: the module is unchanged."""
+
+    ENDPOINTS.install(monkeypatch)
+
+
+class FakeInstance:
+    """An in-memory WebSocket server replaying the fixture frames (R8).
+
+    It serves a nominal ``ws://127.0.0.1:<n>/`` on :data:`ENDPOINTS`: each
+    connect is one :class:`MemoryWebSocketPair` (``pair``, the latest), whose
+    client end the module holds and whose server end :meth:`_handle` serves.
+    It sends the hello on each connection, records every received frame in arrival order and by request
     id, and answers each documented request with its fixture frame, the
     request's id substituted. The fault switches:
 
@@ -921,9 +946,10 @@ class FakeInstance:
     - ``withhold_acknowledgements`` never answers ``DoAction``;
     - ``withhold_viewers`` never answers ``GetActiveViewers``.
 
-    :meth:`close_connection` closes the current socket, :meth:`push_events`
-    sends one fixture event N times, :meth:`stop` shuts the server down. A
-    request with no documented answer gets none.
+    :meth:`close_connection` closes the current socket, ``pair.drop()`` loses
+    it abruptly (close code 1006), :meth:`push_events` sends one fixture event
+    N times, :meth:`stop` shuts the server down: a later connect is refused.
+    A request with no documented answer gets none.
     """
 
     def __init__(
@@ -957,8 +983,10 @@ class FakeInstance:
         self.connections = 0
         self.disconnections = 0
         self.url = ""
-        self._runner: web.AppRunner | None = None
-        self._socket: web.WebSocketResponse | None = None
+        self.pair: MemoryWebSocketPair | None = None
+        self._socket: MemoryWebSocket | None = None
+        self._sockets: set[MemoryWebSocket] = set()
+        self._handlers: set[asyncio.Task[None]] = set()
         self._released = asyncio.Event()
         self._inventory_released = asyncio.Event()
         self._changed = asyncio.Event()
@@ -972,25 +1000,31 @@ class FakeInstance:
         await self.stop()
 
     async def start(self) -> None:
-        app = web.Application()
-        app.router.add_get("/", self._handle)
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, LOOPBACK, 0)
-        await site.start()
-        server = getattr(site, "_server", None)
-        assert server is not None and server.sockets
-        port = server.sockets[0].getsockname()[1]
-        self.url = f"ws://{LOOPBACK}:{port}/"
+        self.url = f"ws://{LOOPBACK}:{ENDPOINTS.allocate()}/"
+        ENDPOINTS.serve(self.url, self._accept)
 
     async def stop(self) -> None:
+        ENDPOINTS.withdraw(self.url)
         for task in self._pending:
             task.cancel()
         await asyncio.gather(*self._pending, return_exceptions=True)
         await self.close_connection()
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
+        for socket in tuple(self._sockets):
+            await socket.close()
+        await asyncio.gather(*self._handlers, return_exceptions=True)
+
+    def _accept(self, pair: MemoryWebSocketPair) -> None:
+        """One connect: serve the pair's server end.
+
+        The server end is registered here, before the handler first runs, so
+        a :meth:`stop` right after the connect still closes it (else the
+        handler would wait on a socket nobody closes)."""
+
+        self.pair = pair
+        self._sockets.add(pair.server)
+        handler = asyncio.ensure_future(self._handle(pair.server))
+        self._handlers.add(handler)
+        handler.add_done_callback(self._handlers.discard)
 
     def requests(self, name: str) -> list[dict[str, Any]]:
         """The received frames naming request *name*."""
@@ -1043,9 +1077,7 @@ class FakeInstance:
         for _ in range(count):
             await socket.send_json(frame)
 
-    async def _handle(self, request: web.Request) -> web.WebSocketResponse:
-        socket = web.WebSocketResponse()
-        await socket.prepare(request)
+    async def _handle(self, socket: MemoryWebSocket) -> None:
         self.connections += 1
         self._socket = socket
         try:
@@ -1054,17 +1086,17 @@ class FakeInstance:
             else:
                 await socket.send_json(fixture_frame("hello", 1 if self.require_authentication else 0))
             async for message in socket:
-                if message.type is not WSMsgType.TEXT:
+                if message.type != WSMsgType.TEXT:
                     continue
                 frame = self._record(message.data)
                 if isinstance(frame, dict):
                     await self._answer(socket, frame)
         finally:
+            self._sockets.discard(socket)
             if self._socket is socket:
                 self._socket = None
             self.disconnections += 1
             self._changed.set()
-        return socket
 
     def _record(self, text: str) -> Any:
         try:
@@ -1077,7 +1109,7 @@ class FakeInstance:
         self._changed.set()
         return frame
 
-    async def _answer(self, socket: web.WebSocketResponse, frame: dict[str, Any]) -> None:
+    async def _answer(self, socket: MemoryWebSocket, frame: dict[str, Any]) -> None:
         name = frame.get("request")
         if name == "Authenticate":
             reply = fixture_frame("error_response" if self.refuse_authentication else "authentication")
@@ -1112,14 +1144,14 @@ class FakeInstance:
         await socket.send_json(reply)
 
     def _answer_later(
-        self, socket: web.WebSocketResponse, reply: dict[str, Any], gate: asyncio.Event
+        self, socket: MemoryWebSocket, reply: dict[str, Any], gate: asyncio.Event
     ) -> None:
         task = asyncio.ensure_future(self._answer_when_released(socket, reply, gate))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
 
     async def _answer_when_released(
-        self, socket: web.WebSocketResponse, reply: dict[str, Any], gate: asyncio.Event
+        self, socket: MemoryWebSocket, reply: dict[str, Any], gate: asyncio.Event
     ) -> None:
         await gate.wait()
         if not socket.closed:
@@ -1240,6 +1272,74 @@ async def test_fake_instance_stop_ends_the_connection() -> None:
     assert fake.by_request_id["v-1"] == [{"request": "GetActiveViewers", "id": "v-1"}]
 
 
+async def test_fake_instance_stop_right_after_a_connect_ends_the_connection() -> None:
+    """A stop before the handler first ran still closes the server end.
+
+    ``asyncio.timeout`` bounds the stop in this task: ``wait_for`` would run
+    it in a new one, which lets the handler start first and hides the race."""
+
+    fake = FakeInstance()
+    await fake.start()
+    async with aiohttp.ClientSession() as session:
+        client = await session.ws_connect(fake.url)
+        assert fake.connections == 0
+        async with asyncio.timeout(FAKE_WAIT_SECONDS):
+            await fake.stop()
+        await client.close()
+    assert not fake._handlers
+
+
+
+# -- P15d: the in-memory client end (AC33) ---------------------------------- #
+
+
+async def test_the_memory_client_end_offers_every_method_the_bridge_calls() -> None:
+    """AC33 (R9, P15d): every attribute the bridge reads on its client
+    WebSocket exists on :class:`MemoryClientWebSocket`, and the two the plan
+    names as possibly missing behave as ``aiohttp``'s: ``exception()`` is
+    ``None`` on a healthy end; ``ping`` is answered by the peer unseen (no
+    message surfaces on either end) and refused once the end is closed."""
+
+    source = Path(streamerbot.__file__).read_text(encoding="utf-8")
+    called = set(re.findall(r"\bws\.(\w+)", source))
+    assert called == {"send_str", "close", "closed", "receive"}, called
+    pair = MemoryWebSocketPair(MemoryClientWebSocket(compress=0))
+    client = pair.client
+    assert all(hasattr(client, name) for name in called | {"_writer", "__aiter__"})
+    assert client.exception() is None
+    await client.ping(b"p")
+    assert client.sent[-1].type == WSMsgType.PING
+    assert pair.server._inbox.empty() and client._inbox.empty()
+    await client.send_str("after the ping")
+    assert (await pair.server.receive()).data == "after the ping"
+    await client.close()
+    with pytest.raises(ConnectionResetError):
+        await client.ping()
+
+
+async def test_the_writer_probe_sees_a_live_memory_connection() -> None:
+    """AC33 (R9, P15d): the bridge's synchronous pre-write probe (D8,
+    ``_writable``, a ``getattr`` chain with defaults over ``ws._writer``)
+    reads a live connection on the in-memory client end of a ready bridge,
+    and a closed one once that end is dropped (close code 1006) — so a run
+    is not refused ``provider_not_ready`` merely for the fake transport."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, reconnect=RECONNECT)
+        try:
+            connection = bridge.handle._connection
+            assert isinstance(connection.ws, MemoryClientWebSocket)
+            assert connection.ws._writer.transport is not None
+            assert bridge.handle._writable(connection)
+            assert fake.pair is not None
+            fake.pair.drop()
+            assert connection.ws.close_code == fake.pair.server.close_code == 1006
+            assert not bridge.handle._writable(connection)
+        finally:
+            await bridge.stop()
+
+
 # -- P14: the connection lifecycle (R1, R6) --------------------------------- #
 
 #: The configured password of the connection scenarios; every sweep looks for
@@ -1258,11 +1358,9 @@ def _expected_authentication(password: str, salt: str, challenge: str) -> str:
 
 
 def _silent_loopback_port() -> int:
-    """A loopback port nothing listens on: bound once, then released."""
+    """A nominal loopback port nothing serves: a connect to it is refused."""
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind((LOOPBACK, 0))
-        return int(probe.getsockname()[1])
+    return ENDPOINTS.allocate()
 
 
 async def _until(predicate: Any) -> None:
@@ -1827,6 +1925,36 @@ async def test_ac25_a_failed_start_retries_and_a_success_reports_ready() -> None
                 (TRACE_MODULE_DEGRADED, "inventory_unavailable"),
                 (TRACE_MODULE_READY, None),
             ]
+            assert bridge.run_ready
+        finally:
+            await bridge.stop()
+
+
+async def test_ac25_a_dropped_pair_degrades_and_reconnects_after_the_minimum() -> None:
+    """AC33 (R9, P15d), AC25 (R6) on the in-memory transport: a pair dropped
+    with no close handshake (close code 1006 on both ends) degrades the
+    bridge at once (``unreachable``), withdraws the run action, and the next
+    attempt after the minimum delay (manual clock) connects again and is
+    ready: 2 connections, 1 delay asked for."""
+
+    async with FakeInstance() as fake:
+        bridge = _Bridge()
+        await bridge.start(url=fake.url, password=PASSWORD, reconnect=RECONNECT)
+        try:
+            assert bridge.state == "ready" and bridge.run_ready
+            first = fake.pair
+            assert first is not None
+            first.drop()
+            assert first.client.close_code == first.server.close_code == 1006
+            await _until(lambda: bridge.state == "degraded")
+            assert not bridge.run_ready
+            assert bridge.health()[-1] == (TRACE_MODULE_DEGRADED, "unreachable")
+            await asyncio.wait_for(fake.wait_for_disconnections(1), FAKE_WAIT_SECONDS)
+            await _until(lambda: bridge.clock.next_deadline() is not None)
+            assert bridge.delays == [RECONNECT["min_delay_seconds"]]
+            bridge.clock.advance(RECONNECT["min_delay_seconds"])
+            await _until(lambda: bridge.state == "ready")
+            assert fake.connections == 2 and fake.pair is not first
             assert bridge.run_ready
         finally:
             await bridge.stop()
