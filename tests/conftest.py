@@ -66,7 +66,11 @@ operator-opted-in real-instance trial. P15a adds the in-process readers of
 repository facts that replace ``grep``, ``git`` and child interpreters:
 :func:`files_containing`, :func:`tracked_files` (the git index read
 directly), :func:`ignored` (the ignore files) and :func:`baseline_numstat`
-(the committed ``tests/fixtures/baselines/<commit>/`` copies).
+(the committed ``tests/fixtures/baselines/<commit>/`` copies). P15b adds
+:class:`FakeOSProcess`, a scripted stand-in for ``asyncio.subprocess.Process``
+and ``subprocess.Popen``, and the ``fake_spawn`` fixture (a :class:`FakeOS`
+routing ``os.kill``/``os.killpg`` to the fakes) that the shipped runners'
+child-process tests start them through.
 
 This file is a single point of failure for every suite that imports it; a
 change here must be reviewed against each consumer, not just the suite that
@@ -84,10 +88,12 @@ import hashlib
 import json
 import os
 import random
+import signal
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zlib
 import tempfile
@@ -2903,11 +2909,6 @@ _PHASE5_TRIALS = "test_phase5_trials.py"
 AC33_PENDING: frozenset[str] = frozenset(
     {
         "tests/test_audio_input.py::test_the_real_transport_against_a_closed_port_degrades_the_transcription",
-        "tests/test_audio_input.py::test_the_shipped_runner_is_not_held_by_a_fast_recorder_after_its_segment",
-        "tests/test_audio_input.py::test_the_shipped_runner_kills_a_child_left_by_an_exited_wrapper",
-        "tests/test_audio_input.py::test_the_shipped_runner_kills_a_silent_real_recorder_at_the_deadline",
-        "tests/test_audio_input.py::test_the_shipped_runner_records_a_real_process",
-        "tests/test_audio_output.py::test_the_subprocess_runner_feeds_a_real_player_its_stdin",
         "tests/test_automation_bridge.py::test_ac15_phase6_a_permanently_raising_trace_keeps_the_backoff",
         "tests/test_automation_bridge.py::test_ac15_phase6_a_raising_reconcile_trace_leaves_the_owner_alive",
         "tests/test_automation_bridge.py::test_ac16_no_run_observation_is_a_success",
@@ -2985,24 +2986,7 @@ AC33_PENDING: frozenset[str] = frozenset(
         "tests/test_automation_bridge.py::test_r7b_mapped_chat_feeds_the_shared_transcript_once",
         "tests/test_automation_bridge.py::test_the_loader_activates_the_bridge_and_a_run_is_refused_not_ready",
         "tests/test_automation_bridge.py::test_without_owning_viewers_the_read_is_declared_and_never_bound",
-        "tests/test_capture.py::test_command_exiting_non_zero_is_capture_failed_and_oversize_output_is_refused",
-        "tests/test_capture.py::test_command_source_runs_a_python_one_liner_writing_a_png_to_stdout",
-        "tests/test_capture.py::test_run_command_reads_bounded_stdout_and_kills_a_flooding_child",
         "tests/test_clips.py::test_ac12_with_only_kick_required_unset_starts_with_the_action_unbound",
-        "tests/test_config_ui.py::test_ac30_a_child_exiting_2_is_refused_with_its_status_and_diagnostic",
-        "tests/test_config_ui.py::test_ac30_a_child_writing_nothing_within_the_window_is_unknown",
-        "tests/test_config_ui.py::test_ac30_a_ready_record_of_the_child_with_the_on_disk_digest_is_accepted",
-        "tests/test_config_ui.py::test_ac30_the_launch_argv_runs_without_a_shell",
-        "tests/test_config_ui.py::test_ac31_a_child_ignoring_terminate_is_killed_after_the_bounded_wait",
-        "tests/test_config_ui.py::test_ac31_apply_never_signals_a_foreign_record_pid",
-        "tests/test_config_ui.py::test_ac32_after_a_successful_apply_every_page_shows_in_sync",
-        "tests/test_config_ui.py::test_ac35_no_secret_value_reaches_any_response_log_report_or_record",
-        "tests/test_config_ui.py::test_ac39_ac40_a_child_writing_only_an_unaccepted_record_is_unknown",
-        "tests/test_config_ui.py::test_d9_a_chatty_child_is_accepted_within_the_window",
-        "tests/test_config_ui.py::test_d9_a_refused_report_carries_the_last_line_within_2_kib",
-        "tests/test_config_ui.py::test_d9_draining_continues_after_acceptance",
-        "tests/test_config_ui.py::test_d9_the_refused_tail_is_redacted_and_value_free",
-        "tests/test_config_ui.py::test_the_child_inherits_the_environment_plus_the_status_variable",
         "tests/test_input_ownership.py::test_ac14_the_real_users_and_bridge_split_the_viewer_read",
         "tests/test_input_ownership.py::test_ac5_a_twitch_event_is_dropped_while_the_owning_bridge_is_down",
         "tests/test_installation_doc.py::test_the_guides_profile_is_accepted_by_the_real_entry_point",
@@ -3048,8 +3032,6 @@ AC33_PENDING: frozenset[str] = frozenset(
         "tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help",
         "tests/test_proxy_process.py::test_ac39_two_process_topology_over_loopback",
         "tests/test_proxy.py::test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it",
-        "tests/test_shutdown.py::test_cli_deadline_covers_cancellation_resistant_task",
-        "tests/test_shutdown.py::test_cli_process_exits_with_synchronous_audit_writer",
         "tests/test_stream_control.py::test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket",
         "tests/test_web.py::test_the_socket_guard_refuses_and_records_every_non_loopback_surface",
         "tests/test_youtube.py::test_ac39_three_platforms_on_one_runtime",
@@ -3515,3 +3497,583 @@ def baseline_numstat(
                 added += high_b - low_b
         lines.append(f"{added}\t{deleted}\t{name}\n")
     return subprocess.CompletedProcess(("baseline_numstat", commit), 0, "".join(lines), "")
+
+
+# --------------------------------------------------------------------------- #
+# AC33: child processes as scripted fakes (phase 8, P15b, D8)
+# --------------------------------------------------------------------------- #
+
+#: A pipe's capacity on Linux: a writer blocks once this much is unread.
+PIPE_CAPACITY = 65_536
+#: The first fake pid: above the kernel's largest ``pid_max`` (2²²), so a
+#: fake pid can never name a real process.
+FAKE_PID_BASE = 1 << 22
+#: The wall-time bound on a fake child's script thread reaching a resting
+#: point (holding or exited). Only a broken script ever reaches it.
+FAKE_SETTLE_SECONDS = 5.0
+#: The real signal entry points, captured before any fake routed them.
+_REAL_KILL = os.kill
+
+
+class _FakeExit(BaseException):
+    """Unwinds a fake child's script: it exited, or a signal ended it."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+class FakeChild:
+    """What a :class:`FakeOSProcess` script runs against: the child's side.
+
+    A ``subprocess.Popen`` fake runs its script in a thread of its own, as a
+    child runs beside its parent. :meth:`write_stderr` writes to the stderr
+    pipe with the pipe's own backpressure (it blocks until the parent reads),
+    :meth:`write_stdout` goes to an inherited stdout (discarded, counted),
+    :meth:`exit` ends the child with a status and :meth:`hold` parks it until
+    a signal it does not ignore ends it — or, *resumable*, until the test
+    calls :meth:`FakeOSProcess.resume`. :meth:`ignore_terminate` is the
+    child's ``signal(SIGTERM, SIG_IGN)``.
+    """
+
+    def __init__(self, process: "FakeOSProcess") -> None:
+        self._process = process
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def parent_pid(self) -> int:
+        return os.getpid()
+
+    @property
+    def argv(self) -> list[str]:
+        return list(self._process.argv)
+
+    @property
+    def env(self) -> dict[str, str]:
+        env = self._process.options.get("env")
+        return dict(os.environ if env is None else env)
+
+    def write_stderr(self, data: bytes | str) -> None:
+        self._process._child_write_stderr(data.encode("utf-8") if isinstance(data, str) else data)
+
+    def write_stdout(self, data: bytes | str) -> None:
+        self._process.stdout_bytes += len(data)
+
+    def exit(self, status: int) -> None:
+        raise _FakeExit(status)
+
+    def ignore_terminate(self) -> None:
+        self._process.ignore_terminate = True
+
+    def hold(self, *, resumable: bool = False) -> None:
+        self._process._child_hold(resumable)
+
+
+class _FakeReader:
+    """The parent's end of a fake stdout pipe: ``StreamReader.read`` semantics."""
+
+    def __init__(self, process: "FakeOSProcess") -> None:
+        self._process = process
+
+    async def read(self, n: int = -1) -> bytes:
+        return await self._process._read_stdout(n)
+
+
+class _FakeStdin:
+    """The parent's end of a fake stdin pipe: ``StreamWriter`` semantics."""
+
+    def __init__(self, process: "FakeOSProcess") -> None:
+        self._process = process
+        self.received = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        if self.closed:
+            raise BrokenPipeError("stdin is closed")
+        self.received += data
+
+    async def drain(self) -> None:
+        await asyncio.sleep(0)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._process._stdin_closed()
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    async def wait_closed(self) -> None:
+        await asyncio.sleep(0)
+
+
+class _FakeSubprocessTransport:
+    """``Process._transport``: only ``get_pipe_transport(1).close()`` is used."""
+
+    def __init__(self, process: "FakeOSProcess") -> None:
+        self._process = process
+
+    def get_pipe_transport(self, fd: int) -> Any:
+        if fd != 1 or self._process.stdout is None:
+            return None
+        return SimpleNamespace(close=self._process._close_stdout)
+
+
+class FakeOSProcess:
+    """A scripted stand-in for ``asyncio.subprocess.Process`` and ``subprocess.Popen``.
+
+    It has a pid, a process group (its own pid when started with
+    ``start_new_session``, else the test's), a script and modes, and starts
+    nothing. Every ``send_signal``/``terminate``/``kill`` call and every
+    ``os.kill``/``os.killpg`` the :class:`FakeOS` routes to it is recorded in
+    :attr:`events`, with the argv and the options (``start_new_session``,
+    ``env``, ``shell`` …) it was given.
+
+    The ``asyncio`` flavour is declarative. *stdout* (bytes, or a callable of
+    the process) is written into a pipe of :data:`PIPE_CAPACITY`: the
+    process exits with *exit_code* once its output fits in the pipe, the
+    reader's draining unblocking it as a real writer is; with stdin a pipe it
+    first reads stdin to EOF (*exit_code* may then be a callable of the bytes
+    it read). The modes: *exit_code* ``None`` holds forever; *never_write*
+    holds without a byte; *flood* writes its pattern without end;
+    *ignore_terminate* survives ``SIGTERM``; *leave_child* leaves a child in
+    the group (pid ``pid + 1``) that holds stdout and never writes, ended
+    only by a signal to the group. A death reports its exit a loop turn
+    later, as the child watcher would. The reader closing stdout under a
+    writer that still has output breaks its pipe (*broken_pipe_exit*).
+    :meth:`wait` returns once the exit is known *and* stdout is
+    disconnected — every writer gone or the reader's end closed — so a child
+    holding the pipe stalls it as it stalls asyncio.
+
+    The ``popen`` flavour runs *script* (a callable of :class:`FakeChild`)
+    in a thread; ``stderr=PIPE`` is a real ``os.pipe`` the parent drains.
+    ``wait(timeout)`` waits for the script to rest (hold or exit) and, on a
+    child still holding, moves the :class:`FakeOS` clock by *timeout* and
+    raises ``TimeoutExpired`` — no wall time elapses — while ``wait()``
+    without a bound on such a child fails the test instead of hanging.
+    """
+
+    def __init__(
+        self,
+        fake_os: "FakeOS",
+        argv: Sequence[str],
+        options: Mapping[str, Any],
+        *,
+        pid: int,
+        flavour: str,
+        stdout: bytes | Callable[["FakeOSProcess"], bytes] = b"",
+        exit_code: int | Callable[[bytes], int] | None = 0,
+        ignore_terminate: bool = False,
+        never_write: bool = False,
+        leave_child: bool = False,
+        flood: bytes | None = None,
+        broken_pipe_exit: int = 1,
+        script: Callable[[FakeChild], Any] | None = None,
+    ) -> None:
+        self.fake_os = fake_os
+        self.argv = tuple(argv)
+        self.args = list(argv)
+        self.options = dict(options)
+        self.pid = pid
+        self.pgid = pid if self.options.get("start_new_session") else os.getpgrp()
+        self.flavour = flavour
+        self.events: list[str] = []
+        self.returncode: int | None = None
+        self.reaped = False
+        self.ignore_terminate = ignore_terminate
+        self.stdout_bytes = 0
+        self.stdin: Any = None
+        self.stdout: Any = None
+        self.stderr: Any = None
+        self.child_pid: int | None = pid + 1 if leave_child else None
+        self.child_running = leave_child
+        if never_write:
+            stdout, exit_code = b"", None
+        if flavour == "asyncio":
+            self._init_asyncio(stdout, exit_code, flood, broken_pipe_exit)
+        else:
+            self._init_popen(script)
+
+    # -- the asyncio flavour ------------------------------------------------- #
+
+    def _init_asyncio(
+        self,
+        stdout: Any,
+        exit_code: Any,
+        flood: bytes | None,
+        broken_pipe_exit: int,
+    ) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._exit_code = exit_code
+        self._flood = flood
+        self._broken_pipe_exit = broken_pipe_exit
+        self._leader_alive = True
+        #: A signal or a broken pipe already decided how the leader ends.
+        self._ending = False
+        self._stdout_eof = False
+        self._reader_closed = False
+        self._changed: asyncio.Future[None] = self._loop.create_future()
+        self._finished: asyncio.Future[None] = self._loop.create_future()
+        self._transport = _FakeSubprocessTransport(self)
+        piped = self.options.get("stdout") == asyncio.subprocess.PIPE
+        self._unread = bytearray(stdout(self) if callable(stdout) else stdout) if piped else bytearray()
+        if piped:
+            self.stdout = _FakeReader(self)
+        else:
+            self._stdout_eof = True
+        if self.options.get("stdin") == asyncio.subprocess.PIPE:
+            self.stdin = _FakeStdin(self)
+        self._loop.call_soon(self._progress)
+
+    def _writing(self) -> bool:
+        return self._flood is not None or len(self._unread) > PIPE_CAPACITY
+
+    def _progress(self) -> None:
+        """Exit the leader once its script is done: stdin read, output in the pipe."""
+
+        if not self._leader_alive or self._ending or self._exit_code is None:
+            return
+        if self.stdin is not None and not self.stdin.closed:
+            return
+        if self._writing():
+            return
+        code = self._exit_code
+        if callable(code):
+            code = code(bytes(self.stdin.received if self.stdin is not None else b""))
+        self._end_leader(code)
+
+    def _end_leader(self, status: int) -> None:
+        if not self._leader_alive:
+            return
+        self._leader_alive = False
+        if status < 0:
+            # A signal ends the writer: only what already sat in the pipe stays.
+            del self._unread[PIPE_CAPACITY:]
+            self._flood = None
+        self.returncode = status
+        self.events.append(f"exit:{status}")
+        self._writers_changed()
+
+    def _end_child(self) -> None:
+        if self.child_running:
+            self.child_running = False
+            self.events.append("child_exit")
+            self._writers_changed()
+
+    def _writers_changed(self) -> None:
+        if not self._leader_alive and not self.child_running:
+            self._stdout_eof = True
+        self._wake()
+        self._try_finish()
+
+    def _wake(self) -> None:
+        if not self._changed.done():
+            self._changed.set_result(None)
+        self._changed = self._loop.create_future()
+
+    def _try_finish(self) -> None:
+        disconnected = self._stdout_eof or self._reader_closed
+        if self.returncode is not None and disconnected and not self._finished.done():
+            self._finished.set_result(None)
+
+    async def _read_stdout(self, n: int) -> bytes:
+        while True:
+            if self._reader_closed:
+                return b""
+            if self._unread:
+                size = len(self._unread) if n < 0 else min(n, len(self._unread))
+                chunk = bytes(self._unread[:size])
+                del self._unread[:size]
+                self._progress()
+                return chunk
+            if self._flood is not None and self._leader_alive:
+                size = PIPE_CAPACITY if n < 0 else n
+                return (self._flood * (size // len(self._flood) + 1))[:size]
+            if self._stdout_eof:
+                return b""
+            await self._changed
+
+    def _close_stdout(self) -> None:
+        self.events.append("close_stdout")
+        self._reader_closed = True
+        broken = self._leader_alive and self._writing()
+        self._unread.clear()
+        if broken and not self._ending:
+            # The writer's next write fails with EPIPE: it exits on its own.
+            self._ending = True
+            self._loop.call_soon(self._end_leader, self._broken_pipe_exit)
+        self._wake()
+        self._try_finish()
+
+    def _stdin_closed(self) -> None:
+        self.events.append("close_stdin")
+        self._loop.call_soon(self._progress)
+
+    # -- the popen flavour --------------------------------------------------- #
+
+    def _init_popen(self, script: Callable[[FakeChild], Any] | None) -> None:
+        self._lock = threading.Lock()
+        self._idle = threading.Event()
+        self._wake_child = threading.Event()
+        self._done = threading.Event()
+        self._fatal: int | None = None
+        self._resumed = False
+        self.script_error: BaseException | None = None
+        self._stderr_write: int | None = None
+        if self.options.get("stderr") == subprocess.PIPE:
+            read_end, self._stderr_write = os.pipe()
+            self.stderr = os.fdopen(read_end, "rb")
+        self._thread = threading.Thread(
+            target=self._run_script,
+            args=(script or (lambda child: None),),
+            name=f"fake-child-{self.pid}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run_script(self, script: Callable[[FakeChild], Any]) -> None:
+        status = 0
+        try:
+            script(FakeChild(self))
+        except _FakeExit as exit_:
+            status = exit_.status
+        except BaseException as error:  # noqa: BLE001 - surfaced by FakeOS.settle
+            self.script_error = error
+            status = 1
+        finally:
+            if self._stderr_write is not None:
+                os.close(self._stderr_write)
+                self._stderr_write = None
+            with self._lock:
+                self.returncode = status
+                self.events.append(f"exit:{status}")
+                self._done.set()
+                self._idle.set()
+
+    def _child_write_stderr(self, data: bytes) -> None:
+        if self._stderr_write is None:
+            return
+        view = memoryview(data)
+        while view:
+            if self._fatal is not None:
+                raise _FakeExit(self._fatal)
+            written = os.write(self._stderr_write, view[:PIPE_CAPACITY])
+            view = view[written:]
+
+    def _child_hold(self, resumable: bool) -> None:
+        with self._lock:
+            if self._fatal is None and not (resumable and self._resumed):
+                self._idle.set()
+        while True:
+            with self._lock:
+                if self._fatal is not None:
+                    raise _FakeExit(self._fatal)
+                if resumable and self._resumed:
+                    self._resumed = False
+                    self._idle.clear()
+                    return
+            self._wake_child.wait()
+            self._wake_child.clear()
+
+    def resume(self) -> None:
+        """Let a child parked in a resumable :meth:`FakeChild.hold` go on."""
+
+        with self._lock:
+            self._resumed = True
+            self._idle.clear()
+        self._wake_child.set()
+
+    def end(self) -> None:
+        """The fake OS's own end of a child left running by its test."""
+
+        if self.flavour == "popen" and not self._done.is_set():
+            with self._lock:
+                self._fatal = -signal.SIGKILL
+            self._wake_child.set()
+            self._thread.join(FAKE_SETTLE_SECONDS)
+
+    def poll(self) -> int | None:
+        if self.flavour == "asyncio":
+            return self.returncode
+        return self.returncode if self._done.is_set() else None
+
+    def _wait_popen(self, timeout: float | None) -> int:
+        self.events.append("wait")
+        if not self._idle.wait(FAKE_SETTLE_SECONDS):
+            raise AssertionError(f"fake child {self.pid}: its script never came to rest")
+        if self._done.is_set():
+            self.reaped = True
+            self.events.append("reaped")
+            return self.returncode  # type: ignore[return-value]
+        if timeout is None:
+            raise AssertionError(
+                f"fake child {self.pid}: an unbounded wait on a child that never exits by itself"
+            )
+        if self.fake_os.clock is not None:
+            self.fake_os.clock.advance(timeout)
+        raise subprocess.TimeoutExpired(self.args, timeout)
+
+    async def _wait_asyncio(self) -> int:
+        self.events.append("wait")
+        await self._finished
+        self.reaped = True
+        self.events.append("reaped")
+        return self.returncode  # type: ignore[return-value]
+
+    # -- the parent's API, both flavours -------------------------------------- #
+
+    def wait(self, timeout: float | None = None) -> Any:
+        if self.flavour == "asyncio":
+            return self._wait_asyncio()
+        return self._wait_popen(timeout)
+
+    def send_signal(self, signum: int) -> None:
+        self.events.append(f"send_signal:{signum}")
+        self._signal(signum)
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+        self._signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self.events.append("kill")
+        self._signal(signal.SIGKILL)
+
+    def _signal(self, signum: int) -> None:
+        # As ``Popen.send_signal``: a known exit sends nothing; asyncio's
+        # process refuses once it is reaped.
+        if self.flavour == "asyncio" and self.reaped:
+            raise ProcessLookupError(self.pid)
+        if self.returncode is not None:
+            return
+        os.kill(self.pid, signum)
+
+    # -- signals the FakeOS delivers ------------------------------------------ #
+
+    @property
+    def in_group(self) -> bool:
+        """Whether a member of the group still exists (a zombie counts)."""
+
+        return not self.reaped or self.child_running
+
+    def deliver(self, signum: int, label: str, *, group: bool) -> None:
+        self.events.append(f"{label}:{signum}")
+        if signum == 0:
+            return
+        if self.flavour == "asyncio":
+            if self._leader_alive and not (signum == signal.SIGTERM and self.ignore_terminate):
+                self._ending = True
+                self._loop.call_soon(self._end_leader, -signum)
+            if group and self.child_running:
+                self._loop.call_soon(self._end_child)
+            return
+        if self._done.is_set() or (signum == signal.SIGTERM and self.ignore_terminate):
+            return
+        with self._lock:
+            if self._fatal is None:
+                self._fatal = -signum
+                self._idle.clear()
+        self._wake_child.set()
+
+
+class FakeOS:
+    """The fake operating system under :class:`FakeOSProcess` (AC33, D8).
+
+    :meth:`__call__` returns a ``create_subprocess_exec``-shaped spawn and
+    :meth:`popen` a ``subprocess.Popen``-shaped one; each call makes one
+    :class:`FakeOSProcess` with the given script. ``os.kill`` and
+    ``os.killpg`` are routed to the fakes: a group signal reaches every
+    member of the fake group, and a signal to a pid no fake owns fails the
+    test (signal 0, the liveness probe, alone goes to the real OS).
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.processes: dict[int, FakeOSProcess] = {}
+        #: The clock a bounded ``Popen.wait`` moves instead of waiting.
+        self.clock: ManualClock | None = None
+        self._next_pid = FAKE_PID_BASE
+        monkeypatch.setattr(os, "kill", self._kill)
+        monkeypatch.setattr(os, "killpg", self._killpg, raising=False)
+
+    def _new(self, argv: Sequence[str], options: Mapping[str, Any], flavour: str, script: Mapping[str, Any]) -> FakeOSProcess:
+        pid = self._next_pid
+        self._next_pid += 2
+        process = FakeOSProcess(self, argv, options, pid=pid, flavour=flavour, **script)
+        self.processes[pid] = process
+        return process
+
+    def __call__(self, **script: Any) -> Callable[..., Any]:
+        async def spawn(*argv: str, **options: Any) -> FakeOSProcess:
+            return self._new(argv, options, "asyncio", script)
+
+        return spawn
+
+    def popen(self, script: Callable[[FakeChild], Any], **modes: Any) -> Callable[..., FakeOSProcess]:
+        def popen(argv: Sequence[str], **options: Any) -> FakeOSProcess:
+            return self._new(argv, options, "popen", {"script": script, **modes})
+
+        return popen
+
+    @property
+    def spawned(self) -> list[FakeOSProcess]:
+        return list(self.processes.values())
+
+    def settle(self) -> None:
+        """Wait until every ``popen`` child's script rests; raise a script's error."""
+
+        for process in self.spawned:
+            if process.flavour != "popen":
+                continue
+            if not process._idle.wait(FAKE_SETTLE_SECONDS):
+                raise AssertionError(f"fake child {process.pid}: its script never came to rest")
+            if process.script_error is not None:
+                raise process.script_error
+
+    def is_gone(self, pid: int) -> bool:
+        """Whether *pid* (a fake leader or its left child) no longer runs."""
+
+        for process in self.spawned:
+            if pid == process.child_pid:
+                return not process.child_running
+            if pid == process.pid:
+                return process.returncode is not None
+        raise AssertionError(f"pid {pid} is no fake's")
+
+    def zombie_children(self) -> list[int]:
+        """Fake leaders that exited and were never reaped."""
+
+        return [p.pid for p in self.spawned if p.returncode is not None and not p.reaped]
+
+    def _kill(self, pid: int, signum: int) -> None:
+        process = self.processes.get(pid)
+        if process is None:
+            if signum == 0:
+                return _REAL_KILL(pid, 0)
+            raise AssertionError(f"signal {signum} sent to pid {pid}, which no fake owns")
+        if process.reaped:
+            raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+        process.deliver(signum, "os.kill", group=False)
+
+    def _killpg(self, pgid: int, signum: int) -> None:
+        members = [p for p in self.spawned if p.pgid == pgid and p.in_group]
+        if not members:
+            raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+        for process in members:
+            process.deliver(signum, "os.killpg", group=True)
+
+
+@pytest.fixture
+def fake_spawn(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A :class:`FakeOS`: one :class:`FakeOSProcess` per spawn, signals routed to them.
+
+    A ``popen`` child its test left running is ended afterwards, so no
+    script thread outlives the test.
+    """
+
+    fake_os = FakeOS(monkeypatch)
+    yield fake_os
+    for process in fake_os.spawned:
+        process.end()

@@ -50,9 +50,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
-import os
 import re
-import select
+import signal
 import struct
 import sys
 from pathlib import Path
@@ -72,6 +71,7 @@ from core.triggers import TriggerRegistry
 from conftest import (
     HELD,
     FakeAudioSource,
+    FakeOS,
     FakeBytesResponse,
     ManualClock,
     RecordingScheduler,
@@ -1312,18 +1312,27 @@ async def test_the_loader_discovers_the_manifest_and_prepare_binds_the_declared_
 
 
 # --------------------------------------------------------------------------- #
-# The shipped runner against real processes
+# The shipped runner over fake OS processes (AC33, D8)
+#
+# The shipped ``spawn_recorder`` and its ``RecorderProcess`` wrapper run; only
+# ``asyncio.create_subprocess_exec`` beneath them is a ``FakeOSProcess``, and
+# ``os.killpg`` reaches the fake's group. Fake-OS only: these nodes prove what
+# the runner asks of the OS, not that the OS delivers a group kill (D8).
 # --------------------------------------------------------------------------- #
 
-#: Writes a 5 s 16 kHz mono 16-bit WAV to stdout, then exits.
-WAV_WRITER = (
-    "import struct, sys; n = 5 * 32000; "
-    "sys.stdout.buffer.write(b'RIFF' + struct.pack('<I', 36 + n) + b'WAVEfmt ' "
-    "+ struct.pack('<IHHIIHH', 16, 1, 1, 16000, 32000, 2, 16) + b'data' "
-    "+ struct.pack('<I', n) + bytes(n))"
-)
-#: Emits nothing and never exits on its own: only a signal ends it.
-SILENT_RECORDER = "import select; select.select([], [], [])"
+
+def wav_stream_header(data_bytes: int) -> bytes:
+    """The canonical 16 kHz mono 16-bit header announcing *data_bytes*."""
+
+    return (
+        b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16) + b"data"
+        + struct.pack("<I", data_bytes)
+    )
+
+
+#: What a recorder writing a 5 s WAV to stdout, then exiting, writes.
+WAV_WRITER = wav_stream_header(5 * 32000) + bytes(5 * 32000)
 
 
 def real_runner(processes: list[Any], spawned: asyncio.Event) -> Any:
@@ -1346,17 +1355,22 @@ def real_settings(argv: list[str], runner: Any) -> Any:
     }
 
 
-async def test_the_shipped_runner_records_a_real_process() -> None:
+def fake_recorders(monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS, **script: Any) -> None:
+    """``asyncio.create_subprocess_exec`` beneath the shipped wrapper is the fake."""
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn(**script))
+
+
+async def test_the_shipped_runner_records_a_real_process(
+    monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
+) -> None:
     """The default runner spawns the configured program; its stdout is read
     until the segment is held, the recorder stopped and reaped."""
 
+    fake_recorders(monkeypatch, fake_spawn, stdout=WAV_WRITER)
     processes: list[Any] = []
     spawned = asyncio.Event()
-    h = await harness(
-        settings=real_settings(
-            [sys.executable, "-c", WAV_WRITER], real_runner(processes, spawned)
-        )
-    )
+    h = await harness(settings=real_settings(RECORDER_ARGV, real_runner(processes, spawned)))
 
     observation = await finished(asyncio.ensure_future(h.capture(seconds=3)))
 
@@ -1364,19 +1378,24 @@ async def test_the_shipped_runner_records_a_real_process() -> None:
     assert observation.result["size"] == 96_044
     (process,) = processes
     assert process.returncode is not None
+    (fake,) = fake_spawn.spawned
+    assert fake.argv == tuple(RECORDER_ARGV)
+    assert fake.options["start_new_session"] is True
+    assert fake.reaped
 
 
-async def test_the_shipped_runner_kills_a_silent_real_recorder_at_the_deadline() -> None:
-    """AC39 against a real process: a recorder that emits nothing is killed
+async def test_the_shipped_runner_kills_a_silent_real_recorder_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
+) -> None:
+    """AC39 over the shipped wrapper: a recorder that emits nothing is killed
     (its whole process group) when the clock reaches the deadline, the call
     ends ``capture_timed_out`` with nothing stored and the process is reaped."""
 
+    fake_recorders(monkeypatch, fake_spawn, never_write=True)
     processes: list[Any] = []
     spawned = asyncio.Event()
     h = await harness(
-        settings=real_settings(
-            [sys.executable, "-c", SILENT_RECORDER], real_runner(processes, spawned)
-        ),
+        settings=real_settings(RECORDER_ARGV, real_runner(processes, spawned)),
         start=90.0,
     )
     h.deadline = DEADLINE
@@ -1396,56 +1415,28 @@ async def test_the_shipped_runner_kills_a_silent_real_recorder_at_the_deadline()
     assert process.returncode is not None and process.returncode < 0
     assert_failure(observation, "error", ERROR_CAPTURE_TIMED_OUT)
     assert_nothing_stored(h)
+    (fake,) = fake_spawn.spawned
+    assert f"os.killpg:{signal.SIGKILL}" in fake.events
+    assert fake.returncode == -signal.SIGKILL
 
 
-#: Streams a WAV header and then audio without end, ignoring SIGTERM: only a
-#: closed stdout (or a kill) stops it.
-ENDLESS_STUBBORN_RECORDER = (
-    "import signal, struct, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-    "out = sys.stdout.buffer; n = 0x7FFFFFF0; "
-    "out.write(b'RIFF' + struct.pack('<I', 36 + n) + b'WAVEfmt ' "
-    "+ struct.pack('<IHHIIHH', 16, 1, 1, 16000, 32000, 2, 16) + b'data' "
-    "+ struct.pack('<I', n))\n"
-    "while True: out.write(bytes(65536))"
-)
-#: A silent recorder that holds the FIFO ``argv[1]`` open for writing and
-#: announces itself with one byte: the FIFO reads EOF once it has ended.
-HELD_CHILD = (
-    "import select, sys; alive = open(sys.argv[1], 'wb', buffering=0); "
-    "alive.write(b'r'); select.select([], [], [])"
-)
-#: Starts :data:`HELD_CHILD` in its own process group and exits, leaving the
-#: child holding stdout.
-LEAVING_WRAPPER = (
-    "import subprocess, sys; "
-    f"subprocess.Popen([sys.executable, '-c', {HELD_CHILD!r}, sys.argv[1]])"
-)
-
-
-async def _readable(fd: int) -> None:
-    """Return once *fd* is readable, failing (never hanging) after 5 s."""
-
-    loop = asyncio.get_running_loop()
-    ready = loop.create_future()
-    loop.add_reader(fd, lambda: ready.done() or ready.set_result(None))
-    try:
-        await asyncio.wait_for(ready, 5.0)
-    finally:
-        loop.remove_reader(fd)
-
-
-async def test_the_shipped_runner_is_not_held_by_a_fast_recorder_after_its_segment() -> None:
+async def test_the_shipped_runner_is_not_held_by_a_fast_recorder_after_its_segment(
+    monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
+) -> None:
     """A recorder streaming faster than it is read — and ignoring SIGTERM —
     does not park the call once the segment is held: its stdout is closed
     before it is awaited, so the capture succeeds without the deadline."""
 
+    fake_recorders(
+        monkeypatch,
+        fake_spawn,
+        stdout=wav_stream_header(0x7FFFFFF0),
+        flood=bytes(65536),
+        ignore_terminate=True,
+    )
     processes: list[Any] = []
     spawned = asyncio.Event()
-    h = await harness(
-        settings=real_settings(
-            [sys.executable, "-c", ENDLESS_STUBBORN_RECORDER], real_runner(processes, spawned)
-        )
-    )
+    h = await harness(settings=real_settings(RECORDER_ARGV, real_runner(processes, spawned)))
 
     observation = await finished(asyncio.ensure_future(h.capture(seconds=1)))
 
@@ -1453,49 +1444,85 @@ async def test_the_shipped_runner_is_not_held_by_a_fast_recorder_after_its_segme
     assert observation.result["size"] == 32_044
     (process,) = processes
     assert process.returncode is not None
+    (fake,) = fake_spawn.spawned
+    # SIGTERM reached the group and was ignored; the closed pipe ended it.
+    assert fake.events.index(f"os.killpg:{signal.SIGTERM}") < fake.events.index("close_stdout")
+    assert fake.events.index("close_stdout") < fake.events.index("wait")
 
 
-async def test_the_shipped_runner_kills_a_child_left_by_an_exited_wrapper(tmp_path: Path) -> None:
+async def test_the_shipped_runner_kills_a_child_left_by_an_exited_wrapper(
+    monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
+) -> None:
     """A wrapper that exits while its recording child still holds stdout is
     reaped first; the kill at the deadline still reaches the child through
     the process group."""
 
-    alive = tmp_path / "alive"
-    os.mkfifo(alive)
-    fd = os.open(alive, os.O_RDONLY | os.O_NONBLOCK)
-    try:
-        processes: list[Any] = []
-        spawned = asyncio.Event()
-        h = await harness(
-            settings=real_settings(
-                [sys.executable, "-c", LEAVING_WRAPPER, str(alive)],
-                real_runner(processes, spawned),
-            ),
-            start=90.0,
-        )
-        h.deadline = DEADLINE
+    fake_recorders(monkeypatch, fake_spawn, leave_child=True)
+    processes: list[Any] = []
+    spawned = asyncio.Event()
+    h = await harness(
+        settings=real_settings(RECORDER_ARGV, real_runner(processes, spawned)),
+        start=90.0,
+    )
+    h.deadline = DEADLINE
 
-        task = h.start(seconds=10)
-        await asyncio.wait_for(spawned.wait(), 5.0)
-        (process,) = processes
-        await _readable(fd)
-        assert os.read(fd, 1) == b"r"
-        # ``wait()`` would park until the child closes stdout: the exit is
-        # observed on ``returncode``.
-        await wait_until(lambda: process.returncode is not None, turns=200_000)
-        assert process.returncode == 0
-        assert select.select([fd], [], [], 0)[0] == []  # the child still runs
-        assert not task.done()
+    task = h.start(seconds=10)
+    await asyncio.wait_for(spawned.wait(), 5.0)
+    (process,) = processes
+    (fake,) = fake_spawn.spawned
+    assert fake.child_pid is not None and not fake_spawn.is_gone(fake.child_pid)
+    # ``wait()`` would park until the child closes stdout: the exit is
+    # observed on ``returncode``.
+    await wait_until(lambda: process.returncode is not None, turns=200_000)
+    assert process.returncode == 0
+    assert not fake_spawn.is_gone(fake.child_pid)  # the child still runs
+    assert not task.done()
 
-        advance_to(h.clock, DEADLINE)
-        observation = await finished(task)
+    advance_to(h.clock, DEADLINE)
+    observation = await finished(task)
 
-        assert_failure(observation, "error", ERROR_CAPTURE_TIMED_OUT)
-        assert_nothing_stored(h)
-        await _readable(fd)
-        assert os.read(fd, 1) == b""  # the child ended with the group
-    finally:
-        os.close(fd)
+    assert_failure(observation, "error", ERROR_CAPTURE_TIMED_OUT)
+    assert_nothing_stored(h)
+    await spin()
+    assert fake_spawn.is_gone(fake.child_pid)  # the child ended with the group
+    assert f"os.killpg:{signal.SIGKILL}" in fake.events
+
+
+async def test_negative_a_runner_forgetting_killpg_fails_the_wrapper_test(
+    monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
+) -> None:
+    """The fake is not trivially green (D8): with the shipped group signal
+    replaced by one to the process alone — a runner that forgets ``killpg`` —
+    the child the exited wrapper left survives the deadline, so the wrapper
+    test's last assertion fails."""
+
+    def process_only(process: Any, signum: int) -> None:
+        if process.returncode is None:
+            process.send_signal(signum)
+
+    monkeypatch.setattr(audio_input_module, "_signal_group", process_only)
+    fake_recorders(monkeypatch, fake_spawn, leave_child=True)
+    processes: list[Any] = []
+    spawned = asyncio.Event()
+    h = await harness(
+        settings=real_settings(RECORDER_ARGV, real_runner(processes, spawned)),
+        start=90.0,
+    )
+    h.deadline = DEADLINE
+
+    task = h.start(seconds=10)
+    await asyncio.wait_for(spawned.wait(), 5.0)
+    (process,) = processes
+    (fake,) = fake_spawn.spawned
+    await wait_until(lambda: process.returncode is not None, turns=200_000)
+
+    advance_to(h.clock, DEADLINE)
+    await finished(task)
+    await spin()
+
+    assert fake.child_pid is not None
+    assert not fake_spawn.is_gone(fake.child_pid)
+    assert not any(event.startswith("os.killpg") for event in fake.events)
 
 
 # --------------------------------------------------------------------------- #

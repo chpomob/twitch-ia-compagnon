@@ -49,6 +49,7 @@ from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext
 from conftest import (
     HELD,
     FakeBytesResponse,
+    FakeOS,
     FakePlayer,
     ManualClock,
     RecordingPlayerRunner,
@@ -1129,25 +1130,33 @@ async def test_activation_defaults_to_the_subprocess_runner_and_opens_no_session
         audio_output.SESSION_FACTORY = original
 
 
-async def test_the_subprocess_runner_feeds_a_real_player_its_stdin() -> None:
+async def test_the_subprocess_runner_feeds_a_real_player_its_stdin(fake_spawn: FakeOS) -> None:
     """Decision 2: the shipped runner starts the configured command, writes
-    the bytes to its stdin, closes it and reaps the exit status."""
+    the bytes to its stdin, closes it and reaps the exit status.
+
+    AC33 (D8): the player is a ``FakeOSProcess`` behind the runner's
+    ``spawn`` seam; it reads its stdin to EOF and exits 0 only on the whole
+    WAV, as the child script did. Fake-OS only: no real pipe is written."""
 
     from modules.audio_output import SubprocessPlayerRunner
 
-    runner = SubprocessPlayerRunner()
     body = wav_bytes(0.25)
-    script = (
-        "import sys; data = sys.stdin.buffer.read(); "
-        f"sys.exit(0 if len(data) == {len(body)} and data[:4] == b'RIFF' else 3)"
+    player = fake_spawn(
+        exit_code=lambda data: 0 if len(data) == len(body) and data[:4] == b"RIFF" else 3
     )
-    process = await runner.start([sys.executable, "-c", script])
+    runner = SubprocessPlayerRunner(spawn=player)
+    process = await runner.start(PLAYER_ARGV)
     accepted = 0
     for offset in range(0, len(body), WRITE_CHUNK_BYTES):
         accepted += await runner.write(process, body[offset : offset + WRITE_CHUNK_BYTES])
     await runner.close_stdin(process)
     assert accepted == len(body)
     assert await runner.wait(process) == 0
+    (fake,) = fake_spawn.spawned
+    assert fake.argv == tuple(PLAYER_ARGV)
+    assert fake.options["stdin"] is asyncio.subprocess.PIPE
+    assert fake.options["start_new_session"] is True
+    assert fake.events[-3:] == ["exit:0", "wait", "reaped"]
 
 
 class _SignalledProcess:

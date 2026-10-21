@@ -80,7 +80,8 @@ from core.config_ui import (
     startup_checks,
 )
 from core.main import LIMIT_DECLARATION
-from core.overlay import on_disk_digest, read_base
+from core.overlay import STATUS_FILE_VARIABLE, on_disk_digest, read_base
+from conftest import FakeChild, FakeOS, ManualClock
 
 # ---------------------------------------------------------------------------
 # AC5: socket creation patched to raise for the whole module
@@ -3935,9 +3936,13 @@ def test_ac32_drift_follows_the_overlay_and_the_record(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # P15: Apply — the supervised restart (R7, A4, D9)
 #
-# Real fake children: scripts written to tmp_path, run with sys.executable,
-# publishing through the core.overlay helpers. Every wait is a bounded
-# Event.wait (never a sleep) and every window is about 1 s.
+# Fake children (AC33, D8): ``Supervisor(popen=...)`` starts a FakeOSProcess
+# whose script runs in a thread of its own and publishes the status record
+# the shipped child writes, through the core.overlay helpers. Its stderr is
+# a real pipe the supervisor's drain reads, with the pipe's backpressure.
+# The Apply window runs on a ManualClock: each poll waits for the child's
+# script to rest, then moves the clock. Fake-OS only: no real child is
+# signalled (D8).
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -3946,42 +3951,44 @@ APPLY_WINDOW = 1.0
 ACCEPT_WINDOW = 10.0
 STOP_GRACE = 0.5
 MIB = 1024 * 1024
-
-CHILD_PRELUDE = f"""\
-import json, os, signal, sys, threading
-sys.path.insert(0, {str(REPO_ROOT)!r})
-from core.overlay import STATUS_FILE_VARIABLE, on_disk_digest
-
-STATUS = os.environ[STATUS_FILE_VARIABLE]
-BASE, OVERLAY = sys.argv[1], sys.argv[2]
+#: The launch argv's program: a name only, nothing is executed.
+CHILD_PROGRAM = "companion-under-test"
 
 
-def publish(data=None, **changes):
+def publish(child: FakeChild, data: bytes | None = None, **changes: object) -> None:
+    """Write the status record the shipped child writes, atomically.
+
+    The child's argv is ``[program, base, overlay, ...]`` and the status path
+    is the variable its environment carries.
+    """
+
+    status = child.env[STATUS_FILE_VARIABLE]
+    base, overlay = child.argv[1], child.argv[2]
     if data is None:
-        record = {{
+        record: dict[str, object] = {
             "version": 1,
-            "pid": os.getpid(),
+            "pid": child.pid,
             "started_at": "2026-09-28T14:03:07Z",
             "published_at": "2026-09-28T14:03:08Z",
             "sequence": 1,
-            "digest": on_disk_digest(BASE, OVERLAY),
+            "digest": on_disk_digest(base, overlay),
             "state": "ready",
-            "modules": {{"M": {{"state": "ready"}}, "N": {{"state": "ready"}}}},
-        }}
+            "modules": {"M": {"state": "ready"}, "N": {"state": "ready"}},
+        }
         record.update(changes)
         data = json.dumps(record).encode("utf-8")
-    temporary = STATUS + ".tmp"
+    temporary = status + ".tmp"
     with open(temporary, "wb") as handle:
         handle.write(data)
-    os.replace(temporary, STATUS)
+    os.replace(temporary, status)
 
 
-def hold():
-    threading.Event().wait(60)
+def _ready_child(child: FakeChild) -> None:
+    publish(child)
+    child.hold()
 
-"""
 
-READY_CHILD = "publish()\nhold()\n"
+READY_CHILD = _ready_child
 
 
 def _passing_checker(*args: object) -> tuple[bool, list[str]]:
@@ -3993,8 +4000,11 @@ def _failing_checker(*args: object) -> tuple[bool, list[str]]:
 
 
 @pytest.fixture
-def launched() -> Iterator[list[config_ui.Supervisor]]:
-    """Every supervisor a test builds; each one's child is stopped afterwards."""
+def launched(fake_spawn: FakeOS) -> Iterator[list[config_ui.Supervisor]]:
+    """Every supervisor a test builds; each one's child is stopped afterwards.
+
+    It depends on ``fake_spawn`` so the stop still reaches the fakes.
+    """
 
     supervisors: list[config_ui.Supervisor] = []
     yield supervisors
@@ -4003,37 +4013,50 @@ def launched() -> Iterator[list[config_ui.Supervisor]]:
         supervisor.stop()
 
 
+def _on_the_manual_clock(fake_spawn: FakeOS) -> dict[str, object]:
+    """The Supervisor's ``clock`` and ``wait``: each poll lets the child rest, then moves the clock."""
+
+    clock = ManualClock()
+    fake_spawn.clock = clock
+
+    def wait(interval: float) -> None:
+        fake_spawn.settle()
+        clock.advance(interval)
+
+    return {"clock": clock, "wait": wait}
+
+
 def _apply_ui(
     tmp_path: Path,
     launched: list[config_ui.Supervisor],
-    body: str,
+    fake_spawn: FakeOS,
+    body: Callable[[FakeChild], object],
     *,
     window: float = ACCEPT_WINDOW,
     checker: object = _passing_checker,
     **supervisor_options: object,
 ) -> ConfigUI:
-    """The P14 status fixture whose launch argv (after ``--``) runs *body*."""
+    """The P14 status fixture whose launch argv (after ``--``) runs the fake script *body*."""
 
     ui = _status_ui(tmp_path)
-    script = tmp_path / "child.py"
-    script.write_text(CHILD_PRELUDE + body, encoding="utf-8")
     settings = UISettings.from_argv(
         [
             "--config",
             str(ui.base_path),
             "--",
-            sys.executable,
-            str(script),
+            CHILD_PROGRAM,
             str(ui.base_path),
             str(ui.overlay_path),
         ]
     )
+    options: dict[str, object] = {"popen": fake_spawn.popen(body), **_on_the_manual_clock(fake_spawn)}
+    options.update(supervisor_options)
     supervisor = config_ui.Supervisor(
         config_ui.default_launch_argv(settings),
         settings.status_path,
         stop_grace=STOP_GRACE,
         apply_window=window,
-        **supervisor_options,  # type: ignore[arg-type]
+        **options,  # type: ignore[arg-type]
     )
     launched.append(supervisor)
     return ConfigUI(settings, checker=checker, supervisor=supervisor)  # type: ignore[arg-type]
@@ -4096,12 +4119,16 @@ class _SpiedChild:
 
 
 def test_ac29_a_failing_on_disk_check_refuses_and_touches_no_process(
-    tmp_path: Path, launched: list[config_ui.Supervisor], caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    launched: list[config_ui.Supervisor],
+    fake_spawn: FakeOS,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     started: list[object] = []
     ui = _apply_ui(
         tmp_path,
         launched,
+        fake_spawn,
         READY_CHILD,
         checker=_failing_checker,
         popen=lambda *args, **kwargs: started.append(args),
@@ -4126,9 +4153,9 @@ def test_ac29_a_failing_on_disk_check_refuses_and_touches_no_process(
 
 
 def test_ac30_a_ready_record_of_the_child_with_the_on_disk_digest_is_accepted(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
-    ui = _apply_ui(tmp_path, launched, READY_CHILD)
+    ui = _apply_ui(tmp_path, launched, fake_spawn, READY_CHILD)
     report = ui.apply()
     assert report.outcome == config_ui.APPLY_ACCEPTED
     record = read_status(ui.status_path).record
@@ -4138,10 +4165,13 @@ def test_ac30_a_ready_record_of_the_child_with_the_on_disk_digest_is_accepted(
 
 
 def test_ac30_a_child_exiting_2_is_refused_with_its_status_and_diagnostic(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
-    body = "sys.stderr.write('config error: modules.M.a is not valid\\n')\nsys.exit(2)\n"
-    ui = _apply_ui(tmp_path, launched, body)
+    def body(child: FakeChild) -> None:
+        child.write_stderr("config error: modules.M.a is not valid\n")
+        child.exit(2)
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, body)
     cookie, csrf = _login(ui)
     page = _post(ui, "/apply", cookie, csrf).body.decode("utf-8")
     report = ui.last_apply
@@ -4154,9 +4184,9 @@ def test_ac30_a_child_exiting_2_is_refused_with_its_status_and_diagnostic(
 
 
 def test_ac30_a_child_writing_nothing_within_the_window_is_unknown(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
-    ui = _apply_ui(tmp_path, launched, "hold()\n", window=APPLY_WINDOW)
+    ui = _apply_ui(tmp_path, launched, fake_spawn, FakeChild.hold, window=APPLY_WINDOW)
     report = ui.apply()
     assert report.outcome == config_ui.APPLY_UNKNOWN
     assert report.exit_status is None
@@ -4164,29 +4194,41 @@ def test_ac30_a_child_writing_nothing_within_the_window_is_unknown(
 
 
 def test_ac30_the_launch_argv_runs_without_a_shell(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
     seen = tmp_path / "argv.json"
-    body = f"open({str(seen)!r}, 'w').write(json.dumps(sys.argv[1:]))\npublish()\nhold()\n"
-    ui = _apply_ui(tmp_path, launched, body)
+
+    def body(child: FakeChild) -> None:
+        seen.write_text(json.dumps(child.argv[1:]), encoding="utf-8")
+        publish(child)
+        child.hold()
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, body)
     ui.supervisor.argv = (*ui.supervisor.argv, ";echo x", "$HOME", "a b")
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
     arguments = json.loads(seen.read_text(encoding="utf-8"))
     assert arguments[2:] == [";echo x", "$HOME", "a b"]
+    # The literal argv reached the launch as a list, with no shell between.
+    (child,) = fake_spawn.spawned
+    assert child.args[-3:] == [";echo x", "$HOME", "a b"]
+    assert child.options["shell"] is False
 
 
 def test_the_child_inherits_the_environment_plus_the_status_variable(
-    tmp_path: Path, launched: list[config_ui.Supervisor], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    launched: list[config_ui.Supervisor],
+    fake_spawn: FakeOS,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: list[dict[str, object]] = []
-    real = subprocess.Popen
+    real = fake_spawn.popen(READY_CHILD)
 
     def spy(argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         captured.append(kwargs)
         return real(argv, **kwargs)  # type: ignore[call-overload, no-any-return]
 
     monkeypatch.setenv("P15_INHERITED", "yes")
-    ui = _apply_ui(tmp_path, launched, READY_CHILD, popen=spy)
+    ui = _apply_ui(tmp_path, launched, fake_spawn, READY_CHILD, popen=spy)
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
     (options,) = captured
     env = options["env"]
@@ -4201,12 +4243,18 @@ def test_the_child_inherits_the_environment_plus_the_status_variable(
 # -- AC31: terminate, bounded wait, kill; a foreign pid is never signalled --------
 
 
+def _ignoring_terminate(child: FakeChild) -> None:
+    child.ignore_terminate()
+    publish(child)
+    child.hold()
+
+
 def test_ac31_a_child_ignoring_terminate_is_killed_after_the_bounded_wait(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
     calls: list[tuple[int, str]] = []
     children: list[subprocess.Popen[bytes]] = []
-    real = subprocess.Popen
+    real = fake_spawn.popen(_ignoring_terminate)
 
     def spied(argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         child = real(argv, **kwargs)  # type: ignore[call-overload]
@@ -4225,8 +4273,7 @@ def test_ac31_a_child_ignoring_terminate_is_killed_after_the_bounded_wait(
         children.append(child)
         return child
 
-    body = "signal.signal(signal.SIGTERM, signal.SIG_IGN)\npublish()\nhold()\n"
-    ui = _apply_ui(tmp_path, launched, body, popen=spied)
+    ui = _apply_ui(tmp_path, launched, fake_spawn, _ignoring_terminate, popen=spied)
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
     first = children[0]
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
@@ -4238,6 +4285,29 @@ def test_ac31_a_child_ignoring_terminate_is_killed_after_the_bounded_wait(
     ]
     assert first.returncode == -signal.SIGKILL
     assert ui.child is children[1] and children[1].poll() is None
+    # The terminate reached the child and was ignored; the kill ended it.
+    (fake, _second) = fake_spawn.spawned
+    assert fake.events[:5] == [
+        "terminate",
+        f"os.kill:{signal.SIGTERM}",
+        "wait",
+        "kill",
+        f"os.kill:{signal.SIGKILL}",
+    ]
+
+
+def test_ac31_negative_an_unbounded_wait_fails_the_ignore_terminate_child(
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
+) -> None:
+    """The fake is not trivially green (D8): a supervisor that waits for the
+    terminated child without a bound fails on the ManualClock — the child
+    ignoring terminate would never exit — instead of hanging or passing."""
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, _ignoring_terminate)
+    assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    ui.supervisor.stop_grace = None  # type: ignore[assignment]
+    with pytest.raises(AssertionError, match="an unbounded wait on a child that never exits"):
+        ui.apply()
 
 
 def test_stop_waits_for_the_grace_before_killing() -> None:
@@ -4264,15 +4334,18 @@ def test_stop_waits_for_the_grace_before_killing() -> None:
 
 
 def test_ac31_apply_never_signals_a_foreign_record_pid(
-    tmp_path: Path, launched: list[config_ui.Supervisor], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    launched: list[config_ui.Supervisor],
+    fake_spawn: FakeOS,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ui = _apply_ui(tmp_path, launched, READY_CHILD)
+    ui = _apply_ui(tmp_path, launched, fake_spawn, READY_CHILD)
     foreign = os.getpid()
     _publish(ui, _valid(ui, pid=foreign))
     cookie = _logged_in(ui)
     assert _supervision(_get(ui, "/", cookie).body.decode("utf-8")) == NOT_SUPERVISED
     sent: list[tuple[int, int]] = []
-    real_kill = os.kill
+    real_kill = os.kill  # the FakeOS router: only fakes are ever signalled
 
     def spy(pid: int, signal_number: int) -> None:
         sent.append((pid, signal_number))
@@ -4290,9 +4363,9 @@ def test_ac31_apply_never_signals_a_foreign_record_pid(
 
 
 def test_ac32_after_a_successful_apply_every_page_shows_in_sync(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
-    ui = _apply_ui(tmp_path, launched, READY_CHILD)
+    ui = _apply_ui(tmp_path, launched, fake_spawn, READY_CHILD)
     cookie, csrf = _login(ui)
     _publish(ui, _valid(ui))
     assert {_drift(page) for page in _status_pages(ui, cookie).values()} == {DRIFT_IN_SYNC}
@@ -4321,17 +4394,24 @@ def test_the_base_page_posts_apply_with_the_csrf_token(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "publication",
     [
-        "publish(b'not json at all')",
-        "publish(pid='123')",
-        "publish(state='starting')",
-        "publish(pid=os.getppid())",
-        "publish(digest='0' * 64)",
+        pytest.param(lambda child: publish(child, b"not json at all"), id="publish(b'not json at all')"),
+        pytest.param(lambda child: publish(child, pid="123"), id="publish(pid='123')"),
+        pytest.param(lambda child: publish(child, state="starting"), id="publish(state='starting')"),
+        pytest.param(lambda child: publish(child, pid=child.parent_pid), id="publish(pid=os.getppid())"),
+        pytest.param(lambda child: publish(child, digest="0" * 64), id="publish(digest='0' * 64)"),
     ],
 )
 def test_ac39_ac40_a_child_writing_only_an_unaccepted_record_is_unknown(
-    publication: str, tmp_path: Path, launched: list[config_ui.Supervisor]
+    publication: Callable[[FakeChild], None],
+    tmp_path: Path,
+    launched: list[config_ui.Supervisor],
+    fake_spawn: FakeOS,
 ) -> None:
-    ui = _apply_ui(tmp_path, launched, f"{publication}\nhold()\n", window=APPLY_WINDOW)
+    def body(child: FakeChild) -> None:
+        publication(child)
+        child.hold()
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, body, window=APPLY_WINDOW)
     report = ui.apply()
     assert report.outcome == config_ui.APPLY_UNKNOWN
     assert ui.status_path.exists()
@@ -4341,39 +4421,47 @@ def test_ac39_ac40_a_child_writing_only_an_unaccepted_record_is_unknown(
 
 
 def test_d9_a_chatty_child_is_accepted_within_the_window(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
-    body = (
-        f"sys.stderr.write('e' * {MIB})\nsys.stderr.flush()\n"
-        f"sys.stdout.write('o' * {MIB})\nsys.stdout.flush()\n"
-        "publish()\nhold()\n"
-    )
-    ui = _apply_ui(tmp_path, launched, body, window=APPLY_WINDOW)
+    def body(child: FakeChild) -> None:
+        child.write_stderr(b"e" * MIB)
+        child.write_stdout(b"o" * MIB)
+        publish(child)
+        child.hold()
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, body, window=APPLY_WINDOW)
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
 
 
 def test_d9_draining_continues_after_acceptance(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
     marker = tmp_path / "marker"
-    body = (
-        "publish()\n"
-        f"sys.stderr.write('e' * {MIB})\nsys.stderr.flush()\n"
-        f"open({str(marker)!r}, 'w').close()\nhold()\n"
-    )
-    ui = _apply_ui(tmp_path, launched, body)
+
+    def body(child: FakeChild) -> None:
+        publish(child)
+        # The rest of the script runs once Apply has accepted the record.
+        child.hold(resumable=True)
+        child.write_stderr(b"e" * MIB)
+        marker.touch()
+        child.hold()
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, body)
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
+    assert not marker.exists()
+    ui.child.resume()
     assert _bounded_until(marker.exists)
 
 
 def test_d9_a_refused_report_carries_the_last_line_within_2_kib(
-    tmp_path: Path, launched: list[config_ui.Supervisor]
+    tmp_path: Path, launched: list[config_ui.Supervisor], fake_spawn: FakeOS
 ) -> None:
-    body = (
-        f"sys.stderr.write('filler line\\n' * ({MIB} // 12))\n"
-        "sys.stderr.write('LAST-LINE\\n')\nsys.exit(2)\n"
-    )
-    ui = _apply_ui(tmp_path, launched, body)
+    def body(child: FakeChild) -> None:
+        child.write_stderr("filler line\n" * (MIB // 12))
+        child.write_stderr("LAST-LINE\n")
+        child.exit(2)
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, body)
     report = ui.apply()
     assert report.outcome == config_ui.APPLY_REFUSED
     assert report.exit_status == 2
@@ -4382,14 +4470,19 @@ def test_d9_a_refused_report_carries_the_last_line_within_2_kib(
 
 
 def test_d9_the_refused_tail_is_redacted_and_value_free(
-    tmp_path: Path, launched: list[config_ui.Supervisor], caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    launched: list[config_ui.Supervisor],
+    fake_spawn: FakeOS,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     canary = "CANARY-TAIL-7f3a"
-    body = (
-        f"sys.stderr.write('token {canary} rejected\\n')\n"
-        "sys.stderr.write('modules.M.a: must be an integer, got 91827\\n')\nsys.exit(1)\n"
-    )
-    ui = _apply_ui(tmp_path, launched, body)
+
+    def body(child: FakeChild) -> None:
+        child.write_stderr(f"token {canary} rejected\n")
+        child.write_stderr("modules.M.a: must be an integer, got 91827\n")
+        child.exit(1)
+
+    ui = _apply_ui(tmp_path, launched, fake_spawn, body)
     ui.secret_values = frozenset({canary})
     caplog.set_level(logging.DEBUG, logger="core.config_ui")
     cookie, csrf = _login(ui)
@@ -4905,21 +4998,19 @@ def test_ac36_the_url_audit_finds_every_external_target() -> None:
     moved = UIResponse(status=303, headers=(("Location", "https://evil.example.invalid/"),))
     assert _url_violations(moved, accepted) == ["https://evil.example.invalid/"]
 
-SWEEP_CHILD = """\
-from pathlib import Path
-
-if Path(BASE).with_name("refuse.flag").exists():
-    sys.stderr.write("config error near " + os.environ["TWITCH_CLIENT_SECRET"] + "\\n")
-    sys.stderr.write("literal " + {literal!r} + " rejected\\n")
-    sys.exit(2)
-publish()
-hold()
-"""
+def _sweep_child(child: FakeChild) -> None:
+    if Path(child.argv[1]).with_name("refuse.flag").exists():
+        child.write_stderr("config error near " + child.env["TWITCH_CLIENT_SECRET"] + "\n")
+        child.write_stderr("literal " + LITERAL_CANARY + " rejected\n")
+        child.exit(2)
+    publish(child)
+    child.hold()
 
 
 def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     tmp_path: Path,
     launched: list[config_ui.Supervisor],
+    fake_spawn: FakeOS,
     ui_log: _Collector,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4963,13 +5054,11 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     # profile, its status record published by a supervised P15 fake child.
     ui, base = _sweep_profile(tmp_path, "config.yaml.example", {}, "writes")
     overlay = base.parent / "config.local.yaml"
-    script = tmp_path / "child.py"
-    script.write_text(CHILD_PRELUDE + SWEEP_CHILD.format(literal=LITERAL_CANARY), encoding="utf-8")
     settings = UISettings.from_argv(
         [
             "--config", str(base),
             "--status-file", str(base.parent / "status.json"),
-            "--", sys.executable, str(script), str(base), str(overlay),
+            "--", CHILD_PROGRAM, str(base), str(overlay),
         ]
     )
     supervisor = config_ui.Supervisor(
@@ -4978,6 +5067,8 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
         stop_grace=STOP_GRACE,
         apply_window=ACCEPT_WINDOW,
         environ={**os.environ, **environ},
+        popen=fake_spawn.popen(_sweep_child),
+        **_on_the_manual_clock(fake_spawn),  # type: ignore[arg-type]
     )
     launched.append(supervisor)
     ui = ConfigUI(settings, environ=environ, supervisor=supervisor)

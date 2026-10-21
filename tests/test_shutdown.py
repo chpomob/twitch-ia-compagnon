@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
-import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -446,108 +446,175 @@ async def test_stubborn_close_is_bounded_and_audit_still_closes(monkeypatch) -> 
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def run_cli_in_process(
+    monkeypatch, run, process_exit
+) -> tuple[int, list[float], list[int], list[threading.Thread]]:
+    """``core.main.main(["--config", "unused"])`` in this process (AC33, D8).
+
+    The CLI's shutdown deadline is the real ``ProcessWatchdog`` timer; only
+    its ``exit_process`` is replaced. When the deadline fires it records the
+    status ``os._exit`` would have ended the process with, then calls
+    *process_exit*, which releases what that exit would have killed. The exit
+    code is that status when the deadline fired, otherwise what ``main``
+    returned. Returns the exit code, the deadlines the CLI armed, the
+    statuses fired and the non-daemon threads ``main`` left behind — none,
+    which stands in for "the process exits".
+    """
+
+    deadlines: list[float] = []
+    fired: list[int] = []
+    real_watchdog = application.ProcessWatchdog
+
+    def watchdog(seconds, **options):
+        deadlines.append(seconds)
+
+        def exit_process(status: int) -> None:
+            fired.append(status)
+            process_exit()
+
+        return real_watchdog(seconds, exit_process=exit_process, **options)
+
+    monkeypatch.setattr(application, "ProcessWatchdog", watchdog)
+    monkeypatch.setattr(application, "run", run)
+    before = set(threading.enumerate())
+    status = application.main(["--config", "unused"])
+    left = [
+        thread
+        for thread in threading.enumerate()
+        if thread not in before and not thread.daemon and thread.is_alive()
+    ]
+    return (fired[0] if fired else status), deadlines, fired, left
+
+
 @pytest.mark.parametrize("blocked", [True, False])
-def test_cli_process_exits_with_synchronous_audit_writer(blocked: bool) -> None:
-    # A real subprocess is essential: coroutine-only tests miss the executor's
-    # thread join during asyncio.run() and interpreter shutdown.
-    script = '''
-import asyncio
-import threading
-import core.main as app
-from core.loader import ModuleActivation
-from modules.audit import AuditModule
+def test_cli_process_exits_with_synchronous_audit_writer(
+    blocked: bool, monkeypatch, capsys
+) -> None:
+    """The CLI's shutdown deadline covers the executor's thread join during
+    ``asyncio.run()``: a writer blocked in its executor thread ends the
+    process with status 1 at the deadline, an unblocked one with 0.
 
-app._SHUTDOWN_TIMEOUT_SECONDS = 0.3
-blocked = BLOCKED
-loop = None
-started = None
+    AC33 (D8): ``core.main.main(argv)`` runs in-process instead of in a child
+    interpreter; the deadline's ``os._exit`` is recorded, and releases the
+    blocked writer as the process exit would (see :func:`run_cli_in_process`).
+    """
 
-def writer(line):
-    # The writer runs in an executor thread: it signals its start to the
-    # loop thread-safely, so the coroutine awaits an event, never a poll.
-    loop.call_soon_threadsafe(started.set)
-    if blocked:
-        threading.Event().wait()
+    monkeypatch.setattr(application, "_SHUTDOWN_TIMEOUT_SECONDS", 0.3)
+    exited = threading.Event()
+    state: dict[str, Any] = {}
 
-async def run(config):
-    global loop, started
-    loop = asyncio.get_running_loop()
-    started = asyncio.Event()
-    handle = AuditModule(writer, close_timeout_seconds=0.02)
-    handle.handle_event({"type": "test.event", "payload": {}})
-    await started.wait()
-    # The declared observation role puts the writer in the flush and
-    # observation-close phases; the coordinator never reads its name (R4).
-    coordinator = app._coordinator(
-        [ModuleActivation(
-            "audit", {}, handle, roles=frozenset({"observation"}), manifest_version=2
-        )],
-        app._assemble_runtime({}),
-        lambda _message: None,
-    )
-    report = await coordinator.stop()
-    assert not report.failures
-    print("cleanup completed", flush=True)
-    return 0
+    def writer(line):
+        # The writer runs in an executor thread: it signals its start to the
+        # loop thread-safely, so the coroutine awaits an event, never a poll.
+        state["loop"].call_soon_threadsafe(state["started"].set)
+        if blocked:
+            # Only the process exit (the deadline) ends it; the bound only
+            # keeps a regression from hanging the suite.
+            exited.wait(5.0)
 
-app.run = run
-raise SystemExit(app.main(["--config", "unused"]))
-'''.replace("BLOCKED", repr(blocked))
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).resolve().parents[1],
-        capture_output=True, text=True, timeout=3,
-    )
-    assert result.returncode == (1 if blocked else 0)
-    assert result.stdout == "cleanup completed\n"
-    assert result.stderr == ""
+    async def run(config):
+        state["loop"] = asyncio.get_running_loop()
+        state["started"] = asyncio.Event()
+        handle = audit.AuditModule(writer, close_timeout_seconds=0.02)
+        handle.handle_event({"type": "test.event", "payload": {}})
+        await state["started"].wait()
+        # The declared observation role puts the writer in the flush and
+        # observation-close phases; the coordinator never reads its name (R4).
+        coordinator = application._coordinator(
+            [ModuleActivation(
+                "audit", {}, handle, roles=frozenset({"observation"}), manifest_version=2
+            )],
+            application._assemble_runtime({}),
+            lambda _message: None,
+        )
+        report = await coordinator.stop()
+        assert not report.failures
+        print("cleanup completed", flush=True)
+        return 0
+
+    returncode, deadlines, fired, left = run_cli_in_process(monkeypatch, run, exited.set)
+    result = capsys.readouterr()
+    assert returncode == (1 if blocked else 0)
+    assert result.out == "cleanup completed\n"
+    assert result.err == ""
+    assert deadlines == [0.3]
+    assert fired == ([1] if blocked else [])
+    assert left == []
 
 
-def test_cli_deadline_covers_cancellation_resistant_task() -> None:
-    script = """
-import asyncio
-from types import SimpleNamespace
-import core.main as app
-from core.loader import ModuleActivation
+def test_cli_deadline_covers_cancellation_resistant_task(monkeypatch, capsys) -> None:
+    """A close that resists cancellation is bounded and reported by module,
+    and the CLI's deadline still ends the process with status 1.
 
-app._SHUTDOWN_TIMEOUT_SECONDS = 0.3
-app._CLOSE_TIMEOUT_SECONDS = 0.01
-app._CANCEL_TIMEOUT_SECONDS = 0.01
+    AC33 (D8): in-process, as above; the close resists cancellation until the
+    deadline's recorded process exit, which is what ended it in a child.
+    """
 
-async def close():
-    while True:
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            pass
+    monkeypatch.setattr(application, "_SHUTDOWN_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(application, "_CLOSE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(application, "_CANCEL_TIMEOUT_SECONDS", 0.01)
+    exited = threading.Event()
+    held: list[asyncio.Future] = []
+    state: dict[str, Any] = {}
 
-async def run(config):
-    # A versioned activation with no declared role: closed as an ordinary
-    # resource in the close phase, bounded and reported by module (R4).
-    coordinator = app._coordinator(
-        [ModuleActivation(
-            "brain", {}, SimpleNamespace(close=close), roles=frozenset(), manifest_version=2
-        )],
-        app._assemble_runtime({}),
-        lambda _message: None,
-    )
-    report = await coordinator.stop()
-    assert report.status == 1
-    assert report.failures == ("module 'brain': phase 'close' timed out",)
-    print("cleanup bounded", flush=True)
-    return 1
+    async def close():
+        while not exited.is_set():
+            waiter = asyncio.get_running_loop().create_future()
+            held.append(waiter)
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass
 
-app.run = run
-raise SystemExit(app.main(["--config", "unused"]))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).resolve().parents[1],
-        capture_output=True, text=True, timeout=3,
-    )
-    assert result.returncode == 1
-    assert result.stdout == "cleanup bounded\n"
-    assert result.stderr == ""
+    def release() -> None:
+        exited.set()
+
+        def wake() -> None:
+            for waiter in held:
+                if not waiter.done():
+                    waiter.set_result(None)
+
+        state["loop"].call_soon_threadsafe(wake)
+
+    def process_exit() -> None:
+        release()
+
+    async def run(config):
+        state["loop"] = asyncio.get_running_loop()
+        # A versioned activation with no declared role: closed as an ordinary
+        # resource in the close phase, bounded and reported by module (R4).
+        coordinator = application._coordinator(
+            [ModuleActivation(
+                "brain", {}, SimpleNamespace(close=close), roles=frozenset(), manifest_version=2
+            )],
+            application._assemble_runtime({}),
+            lambda _message: None,
+        )
+        report = await coordinator.stop()
+        assert report.status == 1
+        assert report.failures == ("module 'brain': phase 'close' timed out",)
+        print("cleanup bounded", flush=True)
+        return 1
+
+    # Only the deadline's process exit should end the close; this independent
+    # bound only keeps a watchdog regression from hanging the suite, and then
+    # fails on ``fired`` below.
+    fallback = threading.Timer(5.0, release)
+    fallback.daemon = True
+    fallback.start()
+    try:
+        returncode, deadlines, fired, left = run_cli_in_process(
+            monkeypatch, run, process_exit
+        )
+    finally:
+        fallback.cancel()
+    result = capsys.readouterr()
+    assert returncode == 1
+    assert result.out == "cleanup bounded\n"
+    assert result.err == ""
+    assert deadlines == [0.3]
+    assert fired == [1]
+    assert left == []
 
 
 @pytest.mark.parametrize("close_mode", ["normal", "blocked", "error"])

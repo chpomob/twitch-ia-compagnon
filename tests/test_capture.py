@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import signal
 import struct
 import os
 import sys
@@ -56,6 +57,7 @@ from core.loader import ModuleLoader
 from core.runtime import RUNTIME_API, ModuleContext, RuntimeContext
 from conftest import (
     FakeCaptureSource,
+    FakeOS,
     ManualClock,
     events_of,
     files_containing,
@@ -117,9 +119,6 @@ LIMITS: dict[str, Any] = {
 
 #: The one-liner a ``command`` source runs in the end-to-end test: it writes
 #: the PNG it is handed (as hex) to stdout and nothing else.
-PNG_WRITER = "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))"
-
-
 # --------------------------------------------------------------------------- #
 # Harness
 # --------------------------------------------------------------------------- #
@@ -469,15 +468,28 @@ async def test_cancelling_the_call_cancels_the_runner_and_stores_nothing() -> No
         await handle.close()
 
 
-async def test_command_source_runs_a_python_one_liner_writing_a_png_to_stdout() -> None:
+def fake_runner(fake_spawn: FakeOS, **script: Any) -> Any:
+    """The shipped :func:`run_command` over its ``spawn`` seam: a ``FakeOSProcess``."""
+
+    return functools.partial(run_command, spawn=fake_spawn(**script))
+
+
+async def test_command_source_runs_a_python_one_liner_writing_a_png_to_stdout(
+    fake_spawn: FakeOS,
+) -> None:
     """R5 end to end through the real runner: the configured ``argv`` runs
-    the interpreter with a one-liner writing a PNG to stdout; the observation
-    carries its dimensions and size and the store holds the very bytes."""
+    a program writing a PNG to stdout; the observation carries its
+    dimensions and size and the store holds the very bytes. AC33 (D8): the
+    program is a ``FakeOSProcess`` behind ``run_command``'s ``spawn`` seam."""
 
     image = png_bytes(12, 7)
     clock = ManualClock()
     context = module_context(clock)
-    settings = command_settings([sys.executable, "-c", PNG_WRITER, image.hex()], timeout=30.0)
+    settings = command_settings(
+        [sys.executable, "-c", "write-a-png"],
+        timeout=30.0,
+        _subprocess_runner=fake_runner(fake_spawn, stdout=image),
+    )
     handle = await prepared_module(context, settings)
     grant_capture(context)
     try:
@@ -493,16 +505,20 @@ async def test_command_source_runs_a_python_one_liner_writing_a_png_to_stdout() 
         await handle.close()
 
 
-async def test_command_exiting_non_zero_is_capture_failed_and_oversize_output_is_refused() -> None:
+async def test_command_exiting_non_zero_is_capture_failed_and_oversize_output_is_refused(
+    fake_spawn: FakeOS,
+) -> None:
     """R5: a program that exits non-zero is ``error capture_failed``; one
     that writes more than ``max_bytes`` is killed and the call is
     ``error attachment_refused`` — both with 0 bytes retained and nothing
-    the program printed in the error."""
+    the program printed in the error. AC33 (D8): both programs are
+    ``FakeOSProcess`` objects behind ``run_command``'s ``spawn`` seam."""
 
     context = module_context()
     failing = command_settings(
-        [sys.executable, "-c", "import sys; sys.stderr.write('/leaked/path'); sys.exit(3)"],
+        [sys.executable, "-c", "print-/leaked/path-and-exit-3"],
         timeout=30.0,
+        _subprocess_runner=fake_runner(fake_spawn, exit_code=3),
     )
     handle = await prepared_module(context, failing)
     grant_capture(context)
@@ -516,9 +532,10 @@ async def test_command_exiting_non_zero_is_capture_failed_and_oversize_output_is
 
     context = module_context()
     flooding = command_settings(
-        [sys.executable, "-c", PNG_WRITER, (png_bytes(1, 1) + b"\x00" * 4096).hex()],
+        [sys.executable, "-c", "write-an-oversized-png"],
         timeout=30.0,
         max_bytes=1024,
+        _subprocess_runner=fake_runner(fake_spawn, stdout=png_bytes(1, 1) + b"\x00" * 4096),
     )
     handle = await prepared_module(context, flooding)
     grant_capture(context)
@@ -528,24 +545,33 @@ async def test_command_exiting_non_zero_is_capture_failed_and_oversize_output_is
         assert_nothing_retained(context)
     finally:
         await handle.close()
+    oversized = fake_spawn.spawned[-1]
+    assert f"os.killpg:{signal.SIGKILL}" in oversized.events
 
 
-async def test_run_command_reads_bounded_stdout_and_kills_a_flooding_child() -> None:
+async def test_run_command_reads_bounded_stdout_and_kills_a_flooding_child(
+    fake_spawn: FakeOS,
+) -> None:
     """The default runner: at most ``limit + 1`` bytes are read, a child that
     writes more is killed rather than drained, and a clean exit reports its
-    status with the whole output."""
+    status with the whole output. AC33 (D8): over the ``spawn`` seam."""
 
     status, output = await run_command(
-        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 10)"], limit=64
+        [sys.executable, "-c", "write-10-bytes"], limit=64, spawn=fake_spawn(stdout=b"x" * 10)
     )
     assert (status, output) == (0, b"x" * 10)
 
     status, output = await run_command(
-        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'y' * 1_000_000)"],
+        [sys.executable, "-c", "write-1-000-000-bytes"],
         limit=100,
+        spawn=fake_spawn(stdout=b"y" * 1_000_000),
     )
     assert 100 < len(output) < 1_000_000
     assert status is not None
+    flooding = fake_spawn.spawned[-1]
+    assert flooding.options["start_new_session"] is True
+    assert flooding.events[:3] == [f"os.killpg:{signal.SIGKILL}", "close_stdout", "wait"]
+    assert status == -signal.SIGKILL, flooding.events
 
 
 # --------------------------------------------------------------------------- #
@@ -771,100 +797,17 @@ async def test_a_group_that_cannot_be_signalled_falls_back_to_killing_the_proces
     assert process.events == ["kill", "close_pipe", "wait", "reaped"]
 
 
-# The real thing, on Linux: a shell script launching a long-lived capture
-# program that inherits stdout. The program reports its pid to the test over
-# loopback, then idles; the script either waits on it or returns at once,
-# leaving it behind in the group. Nothing in the test sleeps: the program's
-# start is awaited on the socket, its end on a pidfd.
-
-_CAPTURE_PROGRAM = """
-import os, socket, sys, time
-with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as link:
-    link.sendall(str(os.getpid()).encode())
-time.sleep(120)
-"""
-
-_PIDFD = sys.platform.startswith("linux") and hasattr(os, "pidfd_open")
+# The wrapper-script shape over the fake OS (AC33, D8): a shell script
+# launching a long-lived capture program that inherits stdout and never
+# writes. The script either waits on it or returns at once, leaving it behind
+# in the group. Fake-OS only: the group kill is what ``run_command`` asks of
+# the OS, not a kill the OS was seen to deliver.
 
 
-async def wait_for_termination(pid: int) -> None:
-    """Event-driven: a pidfd becomes readable when its process terminates."""
-
-    try:
-        pidfd = os.pidfd_open(pid)
-    except ProcessLookupError:
-        return  # already reaped
-    loop = asyncio.get_running_loop()
-    terminated: asyncio.Future[None] = loop.create_future()
-    loop.add_reader(pidfd, lambda: terminated.done() or terminated.set_result(None))
-    try:
-        done, _pending = await asyncio.wait({terminated}, timeout=15.0)
-        assert terminated in done, "the capture program is still running"
-    finally:
-        loop.remove_reader(pidfd)
-        os.close(pidfd)
-
-
-def _is_gone(pid: int) -> bool:
-    """Whether *pid* no longer names a live process (a zombie counts as gone)."""
-
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    try:
-        with open(f"/proc/{pid}/stat") as handle:
-            return handle.read().rsplit(")", 1)[1].split()[0] == "Z"
-    except OSError:
-        return True
-
-
-def zombie_children() -> list[int]:
-    """Children of this process that exited and were never reaped."""
-
-    zombies: list[int] = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat") as handle:
-                state, ppid = handle.read().rsplit(")", 1)[1].split()[:2]
-        except OSError:
-            continue
-        if state == "Z" and int(ppid) == os.getpid():
-            zombies.append(int(entry))
-    return zombies
-
-
-async def shell_script_with_background_program(
-    tmp_path: Path, ending: str
-) -> tuple[Path, Any, "asyncio.Future[int]"]:
-    """Write the script and the program; serve the program's pid report."""
-
-    program = tmp_path / "program.py"
-    program.write_text(_CAPTURE_PROGRAM)
-    loop = asyncio.get_running_loop()
-    reported: asyncio.Future[int] = loop.create_future()
-
-    async def on_report(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        pid = int(await reader.read(32))
-        writer.close()
-        if not reported.done():
-            reported.set_result(pid)
-
-    server = await asyncio.start_server(on_report, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    script = tmp_path / "wrapper.sh"
-    script.write_text(f"#!/bin/sh\n{sys.executable} {program} {port} &\n{ending}\n")
-    script.chmod(0o755)
-    return script, server, reported
-
-
-@pytest.mark.skipif(not _PIDFD, reason="needs Linux process groups, /proc and pidfd")
 @pytest.mark.parametrize("ending", ["wait", "exit 0"], ids=["wrapper-waits", "wrapper-returns"])
 @pytest.mark.parametrize("interruption", ["timeout", "cancellation"])
 async def test_a_shell_script_s_background_capture_program_is_terminated_and_reaped_promptly(
-    tmp_path: Path, ending: str, interruption: str
+    fake_spawn: FakeOS, ending: str, interruption: str
 ) -> None:
     """Finding 1 end to end: the configured shell script starts the capture
     program in the background — it inherits stdout and never writes — and
@@ -874,23 +817,22 @@ async def test_a_shell_script_s_background_capture_program_is_terminated_and_rea
     arrives at once, not when the program would have let go of the pipe;
     (c) no zombie of ours survives — the wrapper was reaped."""
 
-    script, server, reported = await shell_script_with_background_program(tmp_path, ending)
+    spawn = fake_spawn(leave_child=True, exit_code=None if ending == "wait" else 0)
     clock = ManualClock()
     source = CommandSource(
-        SourceSpec("tool", "command", argv=(str(script),), command_timeout_seconds=2.0),
-        runner=run_command,
+        SourceSpec("tool", "command", argv=("/opt/capture/wrapper.sh",), command_timeout_seconds=2.0),
+        runner=functools.partial(run_command, spawn=spawn),
         sleeper=clock.sleep,
     )
-    program_pid: int | None = None
     pending = asyncio.ensure_future(source.read(max_bytes=4096))
     try:
-        done, _ = await asyncio.wait(
-            {reported, pending}, return_when=asyncio.FIRST_COMPLETED, timeout=15.0
-        )
-        assert reported in done, "the capture program never started"
-        program_pid = reported.result()
+        await wait_until(lambda: fake_spawn.spawned)
+        (wrapper,) = fake_spawn.spawned
+        program_pid = wrapper.child_pid
+        assert program_pid is not None
+        await settle()
         assert not pending.done()
-        assert not _is_gone(program_pid)
+        assert not fake_spawn.is_gone(program_pid)
 
         started = time.monotonic()
         if interruption == "timeout":
@@ -906,51 +848,37 @@ async def test_a_shell_script_s_background_capture_program_is_terminated_and_rea
         else:
             assert pending.cancelled()
 
-        await wait_for_termination(program_pid)
-        assert _is_gone(program_pid)
-        assert zombie_children() == []
+        await settle()
+        assert fake_spawn.is_gone(program_pid)
+        assert fake_spawn.zombie_children() == []
     finally:
-        server.close()
-        await server.wait_closed()
         if not pending.done():
             pending.cancel()
             await asyncio.wait({pending})
-        if program_pid is not None and not _is_gone(program_pid):
-            os.kill(program_pid, 9)
 
 
-# A wrapper that starts a long-lived grandchild sharing its stdout, reports the
-# grandchild's pid, then floods stdout past the limit so the runner kills it.
-_WRAPPER_WITH_GRANDCHILD = """
-import subprocess, sys, time
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-sys.stdout.write(f"{child.pid:>10}")
-sys.stdout.flush()
-sys.stdout.buffer.write(b"z" * 4096)
-sys.stdout.flush()
-time.sleep(120)
-"""
-
-
-@pytest.mark.skipif(not _PIDFD, reason="needs Linux process groups, /proc and pidfd")
-async def test_run_command_kills_the_whole_process_group_of_a_wrapper_script() -> None:
+async def test_run_command_kills_the_whole_process_group_of_a_wrapper_script(
+    fake_spawn: FakeOS,
+) -> None:
     """A configured wrapper that launches the real capture program must not
     leave that program running past a kill — nor holding the inherited stdout
     open, which would keep the runner waiting on the pipe long after the
-    wrapper itself is dead."""
+    wrapper itself is dead. The wrapper reports its grandchild's pid, then
+    floods stdout past the limit so the runner kills it."""
 
+    spawn = fake_spawn(
+        leave_child=True,
+        exit_code=None,
+        stdout=lambda process: f"{process.child_pid:>10}".encode() + b"z" * 4096,
+    )
     status, output = await asyncio.wait_for(
-        run_command([sys.executable, "-c", _WRAPPER_WITH_GRANDCHILD], limit=100), timeout=15.0
+        run_command(["/opt/capture/wrapper.sh"], limit=100, spawn=spawn), timeout=15.0
     )
     assert status is not None
     grandchild = int(output[:10])
-    try:
-        await wait_for_termination(grandchild)
-        assert _is_gone(grandchild)
-        assert zombie_children() == []
-    finally:
-        if not _is_gone(grandchild):
-            os.kill(grandchild, 9)
+    await settle()
+    assert fake_spawn.is_gone(grandchild)
+    assert fake_spawn.zombie_children() == []
 
 
 # --------------------------------------------------------------------------- #
