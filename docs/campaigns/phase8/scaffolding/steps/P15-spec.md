@@ -91,8 +91,6 @@ this phase; the seven allowlisted tests are adapted as the specification lists t
 An example that drifts from the manifests misleads operators — the test loads each
   example. The FR file must keep the same headings structure the bilingual test checks.
 
-### P15a: AC33 conversion — repository facts without `git`, `grep` or a child interpreter (R9; AC33; D8)
-
 ## Constraints
 
 - One atomic commit for the whole step when the suite is green; Conventional Commit message

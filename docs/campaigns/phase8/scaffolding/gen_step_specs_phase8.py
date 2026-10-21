@@ -72,7 +72,7 @@ def rewrite_root_targets(files: str) -> str:
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     plan = PLAN.read_text(encoding='utf-8')
-    chunks = re.split(r'^### (P\d+): (.*)$', plan, flags=re.M)
+    chunks = re.split(r'^### (P\d+[a-z]?): (.*)$', plan, flags=re.M)
     items = [(chunks[i], chunks[i + 1].strip(), chunks[i + 2]) for i in range(1, len(chunks), 3)]
 
     written = []

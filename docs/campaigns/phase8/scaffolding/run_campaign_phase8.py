@@ -64,7 +64,7 @@ LOOP_PY = f"{REPO}/.venv/bin/python"
 # P1..P16 are the plan's implementation steps. P21 is the full-branch review gate: it is executed by
 # run_gate() below, with the gate prompt, so that the closing report is produced by the reviewer and
 # not by a code loop's DEV.
-STEP_IDS = [f"P{i}" for i in range(1, 17)] + [
+STEP_IDS = [f"P{i}" for i in range(1, 16)] + ["P15a", "P15b", "P15c", "P15d", "P15e"] + ["P16"] + [
     s.strip() for s in os.environ.get("EXTRA_STEPS", "").split(",") if s.strip()]
 DEV_CLAUDE_TUI = f"python3 {CLAUDE} --timeout 2700 --hard-timeout 3900 --cwd {REPO}"
 DEV_GLM = "pi -p --provider zai --model glm-5.3 --thinking high"
