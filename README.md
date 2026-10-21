@@ -49,8 +49,24 @@ Actions matrix runs that suite on **Python 3.10, 3.11, 3.12 and 3.13** — see t
 - The kernel: bounded admission, explicit terminal outcomes for every action call, a single global
   startup/shutdown deadline, bounded retention, and secret redaction in traces and diagnostics.
 - **Default-deny authorization**, reads included: nothing happens without a rule the operator wrote.
-- 19 modules with declared manifests and machine-readable settings schemas (one of them, the
+- 21 modules with declared manifests and machine-readable settings schemas (one of them, the
   automation bridge, is not delivered — see below).
+- **Declared triggers**: an input declares the trigger types its events can be selected by, and the
+  kernel evaluates them; a trigger only decides candidacy, admission and authorization still decide
+  the rest. See the [triggers guide](docs/triggers.md) (also [in French](docs/triggers.fr.md)). The
+  four families below are proven against fakes only:
+- **Channel points** (`twitch`, `reward`): a redemption of a listed reward, within an optional cost
+  range, triggers a run — proven against fakes only (a fake platform replaying the redemption
+  notification); fulfilling or refunding is out of scope.
+- **Operator button** (`operator`, `button`): one configured button pressed from a local page, an
+  overlay browser source or a hotkey bound to the shipped press command — proven against fakes only
+  (no real browser, no real key binding).
+- **Listening** (`audio_input`, `wake_word` and `keyword`): opt-in, detection by detection — a
+  configured wake-word detector, then one bounded segment transcribed only for an accepted wake word
+  — proven against fakes only (a fake detector and recorder, no microphone); continuous listening is
+  out of scope.
+- **Timer** (`timer`, `interval`): every N minutes, with a probability and an optional time-of-day
+  window — proven against fakes only (an injected clock and random source).
 - **Web knowledge** (`web`): `web.search` (Wikipedia by default, with no key; Brave Search as an
   option) and `web.read` (one public page, as bounded text), off until two rules grant them, behind
   a network guard that refuses loopback, private and other non-public addresses at every hop. See
@@ -100,7 +116,8 @@ or you want to help make it real — read on.
               ↑ manifests                 ↓ observations
      modules/twitch · kick · youtube · chat_context · users · capture · clips ·
      audio_input · audio_output · stream_control · viewer_memory · moderation ·
-     watch · web · brain · proxy · agent_link · audit · streamerbot (optional bridge)
+     watch · web · brain · proxy · agent_link · audit · operator · timer ·
+     streamerbot (optional bridge)
 ```
 
 - **The brain** runs a bounded multi-turn loop: it reasons, proposes a *read* action, receives the
@@ -161,8 +178,12 @@ python -m pytest tests/ -q
 | `core/` | The kernel: bus, admission, triggers, brain loop, actions, loader, runtime, audit |
 | `core/config_ui/` | The local web configuration UI (separate process) |
 | `demo/` | The offline demo (`python -m demo`): the scripted scenario, narrated |
-| `modules/` | 19 modules, each with a `module.yaml` manifest declaring its actions, schema and capabilities |
+| `modules/` | 21 modules, each with a `module.yaml` manifest declaring its actions, schema and capabilities |
 | `modules/web/` | Web knowledge: `web.search` (Wikipedia by default, Brave optional) and `web.read`, behind the network guard |
+| `modules/twitch/` | The Twitch input and chat delivery, including channel points (`reward`) — proven against fakes only |
+| `modules/audio_input/` | Audio capture, and opt-in listening on a configured wake-word detector — proven against fakes only |
+| `modules/operator/` | The operator's button: local page, overlay browser source and press command — proven against fakes only |
+| `modules/timer/` | A timed random trigger: every N minutes, a probability, an optional window — proven against fakes only |
 | `modules/streamerbot/` | The optional automation bridge — not delivered — awaiting real-instance trial |
 | `tests/` | ~3,100 tests over Python 3.10–3.13, plus opt-in real-integration trials |
 | `docs/design-v2.md` | The design blueprint the phases implement |
@@ -171,6 +192,7 @@ python -m pytest tests/ -q
 | `docs/proxy-protocol.md` | The remote-deployment proxy protocol |
 | `docs/automation-bridge.md` | Operator guide for the optional automation bridge (also in French) |
 | `docs/web-knowledge.md` | Operator guide for web knowledge: settings, network guard, grant and Brave fragments, operator trial (normative; also in French) |
+| `docs/triggers.md` | Operator guide for triggers: generic and declared types, the four families with examples, the manual trial (normative; also in French) |
 | `docs/campaigns/phase{1,2,3,4,5}/` | The specifications, plans, per-step specs, gate prompts and **gate reports** of each delivery phase |
 
 ## How this was built

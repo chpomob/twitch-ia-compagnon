@@ -31,6 +31,12 @@ bound on the engine's clock, and any failed outcome vetoes the decision before
 the combination; an accepted declared decision still meets admission and the
 authorization view unchanged.
 
+P15 holds the docs half of AC32 (R9): ``docs/triggers.md`` and its French
+translation are a discovered bilingual pair; the guide's four family examples
+each load through the loader against the shipped manifests; it says that a
+configured policy replaces the default and that continuous listening is out
+of scope; the README names each family as proven against fakes only.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -76,7 +82,7 @@ import yaml
 import core.main as application
 from core.actions import ActionRegistry, AuthorizationPolicy
 from core.admission import REASON_GLOBAL_PENDING_CAP, AdmissionScheduler, Work
-from core.loader import ModuleLoader, ModuleLoadError
+from core.loader import ModuleLoader, ModuleLoadError, _profile_settings_schema, _validate_manifest
 from core.runtime import REASON_INPUT_NOT_OWNED
 from core.contracts import (
     CHAT_FAMILY_KINDS,
@@ -98,6 +104,7 @@ from core.contracts import (
     Destination,
     SessionKey,
     input_family_of_event,
+    validate_against_schema,
     validate_event_kind,
 )
 from conftest import (
@@ -3134,3 +3141,142 @@ def test_p7_ac9_an_accepted_declared_decision_grants_nothing() -> None:
     offered = actions.authorized(principal="operator:companion")
     assert [s for s in offered.values() if s.nature == "write"] == []
     assert len(offered) == 0
+
+
+# -- P15: the operator guide (AC32, docs half) ------------------------------- #
+
+GUIDE = ROOT / "docs" / "triggers.md"
+GUIDE_FR = ROOT / "docs" / "triggers.fr.md"
+
+#: The four families of R9, by the input each example configures.
+GUIDE_FAMILIES = {"twitch": "reward", "operator": "button", "audio_input": "wake_word", "timer": "interval"}
+
+REPLACES_THE_DEFAULT = "A configured policy replaces the default entirely."
+
+_YAML_BLOCK = re.compile(r"^```yaml\n(?P<body>.*?)^```$", re.MULTILINE | re.DOTALL)
+
+
+def _guide_examples() -> dict[str, dict[str, Any]]:
+    """Every ``yaml`` block of the guide that configures a policy, by input."""
+
+    examples: dict[str, dict[str, Any]] = {}
+    for match in _YAML_BLOCK.finditer(GUIDE.read_text(encoding="utf-8")):
+        fragment = yaml.safe_load(match.group("body"))
+        if isinstance(fragment, dict) and "triggers" in fragment:
+            (input_name,) = fragment["triggers"]
+            assert input_name not in examples, f"two examples configure {input_name}"
+            examples[input_name] = fragment
+    return examples
+
+
+def _without_required(schema: Any) -> Any:
+    """*schema* with every ``required`` list dropped: an example is a fragment."""
+
+    if isinstance(schema, Mapping):
+        return {key: _without_required(value) for key, value in schema.items() if key != "required"}
+    if isinstance(schema, list):
+        return [_without_required(value) for value in schema]
+    return schema
+
+
+def _load_guide_example(input_name: str, fragment: Mapping[str, Any]) -> TriggerRegistry:
+    """Validate one guide example through the loader against the shipped manifest.
+
+    The manifest is parsed by the loader's own validation, its declaration is
+    registered by the loader's own path, and the example's ``triggers`` block is
+    applied exactly as a profile's is at startup; the example's ``modules``
+    fragment is checked, closed, against the manifest's settings schema.
+    """
+
+    manifest = yaml.safe_load((ROOT / "modules" / input_name / "module.yaml").read_text(encoding="utf-8"))
+    declaration = _validate_manifest(input_name, manifest)
+    settings = fragment.get("modules", {}).get(input_name, {})
+    validate_against_schema(
+        settings,
+        _profile_settings_schema(_without_required(declaration.settings_schema), settings),
+        label="settings",
+        closed=True,
+    )
+    runtime = runtime_context()
+    loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
+    loader._register_declarations(input_name, declaration, settings)
+    loader._apply_trigger_configuration({"triggers": fragment["triggers"]})
+    return runtime.triggers.registry
+
+
+def test_p15_ac32_the_triggers_guide_is_a_discovered_bilingual_pair() -> None:
+    """AC32 (R9): ``docs/triggers.md`` and its translation exist, are
+    discovered as a pair by the bilingual guard, and the translation says the
+    English text wins."""
+
+    from test_docs_bilingual import GUIDES, PAIRS
+
+    assert GUIDE.is_file() and GUIDE_FR.is_file()
+    assert (GUIDE, GUIDE_FR) in PAIRS
+    assert "triggers" in GUIDES
+    assert "le texte anglais fait foi" in GUIDE_FR.read_text(encoding="utf-8")
+
+
+def test_p15_ac32_one_example_per_family_loads_against_the_shipped_manifests() -> None:
+    """AC32 (R9): the guide holds one configuration example per family (4),
+    each parsed with ``yaml.safe_load`` and accepted by the loader against the
+    shipped manifest: the configured policy is what the registry resolves."""
+
+    examples = _guide_examples()
+    assert set(examples) == set(GUIDE_FAMILIES)
+    for input_name, family in GUIDE_FAMILIES.items():
+        fragment = examples[input_name]
+        registry = _load_guide_example(input_name, fragment)
+        ((channel_id, configured),) = fragment["triggers"][input_name]["channels"].items()
+        resolved = registry.resolve(input_name, channel_id=channel_id)
+        assert [rule.type for rule in resolved.rules] == [rule["type"] for rule in configured["rules"]]
+        assert family in [rule.type for rule in resolved.rules]
+
+
+def test_p15_the_example_loader_refuses_a_drifted_example() -> None:
+    """The check above bites: an example naming a parameter its type does not
+    declare, or a setting its module does not declare, is refused."""
+
+    timer = _guide_examples()["timer"]
+    drifted = json.loads(json.dumps(timer))
+    (channel,) = drifted["triggers"]["timer"]["channels"].values()
+    channel["rules"][0]["parameters"]["every_hours"] = 1
+    with pytest.raises(ModuleLoadError):
+        _load_guide_example("timer", drifted)
+
+    drifted = json.loads(json.dumps(timer))
+    drifted["modules"]["timer"]["interval"] = 20
+    with pytest.raises(ContractError):
+        _load_guide_example("timer", drifted)
+
+
+def test_p15_ac32_the_guide_says_a_policy_replaces_the_default() -> None:
+    """AC32 (R9): the sentence that a configured policy replaces the default."""
+
+    assert REPLACES_THE_DEFAULT in GUIDE.read_text(encoding="utf-8")
+
+
+def test_p15_ac32_the_guide_puts_continuous_listening_out_of_scope() -> None:
+    """AC32 (R9): continuous listening is stated out of scope, and a future,
+    deliberately expensive plugin."""
+
+    text = GUIDE.read_text(encoding="utf-8")
+    assert "## Out of scope: continuous listening" in text
+    assert "Continuous listening is out of scope." in text
+    assert "deliberately expensive" in text
+    assert "docs/campaigns/phase8/trial-record.md" in text
+
+
+def test_p15_the_readme_lists_each_family_as_proven_against_fakes_only() -> None:
+    """R9: the README's capability list and layout table name ``operator``,
+    ``timer``, listening and channel points, each proven against fakes only."""
+
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "| `modules/operator/` |" in text
+    assert "| `modules/timer/` |" in text
+    assert "| `docs/triggers.md` |" in text
+    assert "](docs/triggers.md)" in text and "](docs/triggers.fr.md)" in text
+    bullets = re.findall(r"^- \*\*.*(?:\n  .*)*", text, re.MULTILINE)
+    for family in ("Channel points", "Operator button", "Listening", "Timer"):
+        (bullet,) = [bullet for bullet in bullets if bullet.startswith(f"- **{family}")]
+        assert "proven against fakes only" in " ".join(bullet.split()), family

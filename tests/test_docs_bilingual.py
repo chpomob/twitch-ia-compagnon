@@ -52,6 +52,7 @@ GUIDES = (
     "design-v2",
     "automation-bridge",
     "web-knowledge",
+    "triggers",
 )
 """The guides that must exist in both languages.
 
