@@ -2859,7 +2859,10 @@ class Voice:
         return self.h.handle
 
     def transcriptions(self) -> list[dict[str, Any]]:
-        return call_requests(self.transport)
+        """Every transcription request the transport saw, unfiltered: a
+        listening module sends no probe (P17F1), so nothing is set aside."""
+
+        return list(self.transport.requests)
 
     def speech_events(self) -> list[dict[str, Any]]:
         return [
@@ -2890,7 +2893,7 @@ async def voice(
 ) -> Voice:
     clock = ManualClock(1000.0)
     runner = runner_class(clock, detections=detections, segments=segments, phrase_at=phrase_at)
-    transport = ScriptedTranscriptionTransport(PROBE_OK, *answers)
+    transport = ScriptedTranscriptionTransport(*answers)
     settings = listen_settings(runner, clock, detector=detector, **listen)  # type: ignore[arg-type]
     settings["transcription"] = stt_settings()
     settings["_transcription_transport"] = transport
@@ -3089,7 +3092,7 @@ async def test_p13_ac26_an_honest_header_over_max_seconds_is_a_source_failure() 
     clock = ManualClock(1000.0)
     source = FakeAudioSource(wav_bytes(8.5))
     runner = ListenRunner(clock, detections=[(0, b"nova")])
-    transport = ScriptedTranscriptionTransport(PROBE_OK, {"text": TRANSCRIPT})
+    transport = ScriptedTranscriptionTransport({"text": TRANSCRIPT})
     settings = listen_settings(runner, clock, max_seconds=8)  # type: ignore[arg-type]
     settings["_source_factory"] = lambda spec: source
     settings["transcription"] = stt_settings()
@@ -3100,7 +3103,7 @@ async def test_p13_ac26_an_honest_header_over_max_seconds_is_a_source_failure() 
     assert await h.handle.listen_once() == "source_failure"
 
     assert source.reads == [8]
-    assert call_requests(transport) == []
+    assert list(transport.requests) == []
     assert h.handle.counts()["source_failures"] == 1
     assert h.scheduler.admissions == []
 
@@ -3149,7 +3152,7 @@ async def test_p13_r7_an_acquisition_is_killed_at_its_hard_deadline() -> None:
 
     clock = ManualClock(1000.0)
     runner = _HeldSourceRunner(clock, detections=[(0, b"nova")])
-    transport = ScriptedTranscriptionTransport(PROBE_OK, {"text": TRANSCRIPT})
+    transport = ScriptedTranscriptionTransport({"text": TRANSCRIPT})
     settings = listen_settings(runner, clock, max_seconds=8)  # type: ignore[arg-type]
     settings["transcription"] = stt_settings()
     settings["_transcription_transport"] = transport
@@ -3168,7 +3171,7 @@ async def test_p13_r7_an_acquisition_is_killed_at_its_hard_deadline() -> None:
 
     source = runner.processes[-1]
     assert runner.kills == [source.pid]
-    assert call_requests(transport) == []
+    assert list(transport.requests) == []
     assert h.handle.counts()["source_failures"] == 1
     assert h.scheduler.admissions == []
 
@@ -3686,6 +3689,42 @@ async def test_p14_ac37_nothing_before_start_inputs_then_one_detector_invocation
     assert v.handle.listen_owner.active == 1
     await v.handle.stop_inputs()
     assert v.handle.listen_owner.active == 0
+
+
+@pytest.mark.parametrize(
+    ("case", "settings", "requests"),
+    [
+        ("never fires", {"detections": [NO_VERDICT] * 2, "triggers": ACCEPT_ALL}, 0),
+        ("declined", {"detections": [DETECTED], "triggers": keyword_policy("banana")}, 0),
+        ("accepted", {"detections": [DETECTED], "triggers": ACCEPT_ALL}, 1),
+    ],
+)
+async def test_p17f1_the_listening_path_transcribes_only_an_accepted_candidate(
+    case: str, settings: dict[str, Any], requests: int
+) -> None:
+    """P17F1 (R7, AC26, AC37): counted on the transport itself, with no
+    request set aside, a listening module sends 0 transcription requests at
+    ``prepare`` and before ``start_inputs`` — no probe, no session opened —
+    and then over 60 s of its loop a detector that never fires sends 0, a
+    declined candidate 0, and only an accepted candidate exactly 1."""
+
+    v = await voice(runner_class=PendingRunner, **settings)
+    assert list(v.transport.requests) == [] and v.transport.factory_calls == 0
+    await run_for(v, 600.0)
+    assert list(v.transport.requests) == []
+
+    await v.handle.start_inputs()
+    await run_for(v, 60.0)
+
+    assert len(list(v.transport.requests)) == requests
+    if case == "never fires":
+        assert v.candidates() == []
+    else:
+        ((_event, decision, seen),) = v.engine.decided
+        assert decision.accepted is (case == "accepted")
+        assert seen == (0, 0)  # source, transcription — at decision time
+    assert len(v.runner.source_calls) == requests
+    await v.handle.stop_inputs()
 
 
 async def test_p14_ac37_a_failed_startup_invokes_nothing_for_audio_input() -> None:

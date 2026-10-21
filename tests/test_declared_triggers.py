@@ -74,6 +74,7 @@ import json
 import re
 import ssl
 import sys
+import threading
 import time
 import types
 from collections.abc import Mapping
@@ -134,6 +135,7 @@ from core.triggers import (
     BUILTIN_TRIGGER_TYPES,
     COUNT_WILDCARD_STEPS,
     DRAW_ENTRY_KEYS,
+    MAX_OUTSTANDING_HOOK_WORKERS,
     REASON_DECISION_PENDING,
     TriggerDecision,
     TriggerEngine,
@@ -2863,6 +2865,181 @@ async def test_p7_ac34_a_failed_hook_vetoes_whatever_the_combination() -> None:
     assert admitted == []
     assert scheduler.pending == 0
     await scheduler.aclose()
+
+
+#: P17F1: the hard bound of the probe below, how long its hook holds its
+#: thread without yielding, and the margin the evaluation may exceed the bound
+#: by — well under the spin, so a waited-for hook cannot pass.
+HARD_BOUND = 0.01
+SPIN_SECONDS = 0.12
+HARD_MARGIN = 0.04
+
+
+def _real_time_wake_engine(bound: float) -> TriggerEngine:
+    """A wake engine on real time — the default clock and sleeper, as built by
+    ``core.main`` — so the hook bound is the hard one (brief decision 2)."""
+
+    base, rng, _ = _wake_engine(hook_timeout_seconds=bound)
+    return TriggerEngine(
+        base.registry,
+        dedup_max_entries=512,
+        dedup_ttl_seconds=60.0,
+        companion_identity=COMPANION,
+        rng=rng,
+    )
+
+
+async def test_p17f1_a_hook_that_never_yields_is_abandoned_at_the_hard_bound() -> None:
+    """R3, brief decision 2 (gate finding F1): with a 0.01 s bound a hook that
+    busy-waits 0.12 s without yielding decides ``rejected:wake_hook_timeout``
+    in about 0.01 s, not 0.12 s; a heartbeat due mid-bound fires before the
+    decision, and one due at 0.02 s fires while the hook still spins, so the
+    loop was never blocked. The hook's late ``True`` is discarded, and under
+    ``none_of`` the same hook still vetoes — a timeout is never inverted into
+    an acceptance."""
+
+    engine = _real_time_wake_engine(HARD_BOUND)
+    loop = asyncio.get_running_loop()
+    finished = threading.Event()
+
+    async def blocking(event: Any, parameters: Any) -> bool:
+        deadline = time.monotonic() + SPIN_SECONDS
+        while time.monotonic() < deadline:
+            pass
+        finished.set()
+        return True
+
+    _supply(engine, INPUT, "wake", blocking)
+    for message_id, policy in (("b1", None), ("b2", _wake_policy("none_of"))):
+        finished.clear()
+        midway: asyncio.Future[bool] = loop.create_future()
+        heartbeat: asyncio.Future[bool] = loop.create_future()
+        loop.call_later(HARD_BOUND / 2, lambda: midway.set_result(finished.is_set()))
+        loop.call_later(0.02, lambda: heartbeat.set_result(finished.is_set()))
+        began = time.monotonic()
+        decision = await engine.evaluate_async(_event(message_id), policy=policy)
+        elapsed = time.monotonic() - began
+
+        assert decision.accepted is False
+        assert decision.reason == "rejected:wake_hook_timeout"
+        assert elapsed < HARD_BOUND + HARD_MARGIN, elapsed
+        assert midway.done() and midway.result() is False
+        assert await heartbeat is False  # fired while the hook still spun
+        assert finished.wait(5.0)  # the hook ran to its end, on its own thread
+        await _settle()
+        assert engine.recorded(
+            platform="twitch", channel_id="channel-1", source_event_id=message_id
+        ) is decision
+    assert engine.counters.get("trigger_rejections") == 2
+
+
+async def test_p17f1_a_real_time_hook_still_decides_and_fails_closed() -> None:
+    """R3: on real time, the worker-thread hook decides as the loop one does —
+    ``True`` matches, ``False`` does not, a raise or a non-boolean is a hook
+    error — and a cancelled evaluation propagates its cancellation."""
+
+    engine = _real_time_wake_engine(HOOK_BOUND)
+    hook = Hook()
+    _supply(engine, INPUT, "wake", hook.hook)
+    reasons = []
+    for index, answer in enumerate((True, False, RuntimeError("boom"), "yes")):
+        hook.answer = answer
+        reasons.append((await engine.evaluate_async(_event(f"r{index}"))).reason)
+    assert reasons == [
+        "accepted:wake_match",
+        "rejected:wake_no_match",
+        "rejected:wake_hook_error",
+        "rejected:wake_hook_error",
+    ]
+    assert len(hook.calls) == 4
+
+    hook.answer = NEVER
+    pending = asyncio.ensure_future(engine.evaluate_async(_event("r9")))
+    await _settle()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert engine.window_size == 4
+
+
+async def test_p17f1_abandoned_hook_threads_are_bounded_and_fail_closed() -> None:
+    """R3 (review finding A1): a hook that never yields keeps its thread after
+    the bound abandons it, so the engine caps the abandoned threads still
+    alive. At the cap a further hooked event is refused as
+    ``rejected:wake_hook_unavailable`` without its hook being called — no
+    thread is started — and once the held threads end, hooks run again."""
+
+    engine = _real_time_wake_engine(HARD_BOUND)
+    release = threading.Event()
+    calls: list[Any] = []
+
+    async def holding(event: Any, parameters: Any) -> bool:
+        calls.append(event)
+        release.wait(10.0)  # holds its thread without ever yielding
+        return True
+
+    _supply(engine, INPUT, "wake", holding)
+    try:
+        for index in range(MAX_OUTSTANDING_HOOK_WORKERS):
+            decision = await engine.evaluate_async(_event(f"h{index}"))
+            assert decision.reason == "rejected:wake_hook_timeout"
+        before = threading.active_count()
+        decision = await engine.evaluate_async(_event("over"))
+        assert decision.accepted is False
+        assert decision.reason == "rejected:wake_hook_unavailable"
+        assert threading.active_count() == before
+        assert len(calls) == MAX_OUTSTANDING_HOOK_WORKERS  # not called for "over"
+    finally:
+        release.set()
+    for thread in threading.enumerate():
+        if thread.name.startswith("trigger-hook:"):
+            thread.join(5.0)
+            assert not thread.is_alive()
+
+    async def answering(event: Any, parameters: Any) -> bool:
+        return True
+
+    _supply(engine, INPUT, "wake", answering)
+    decision = await engine.evaluate_async(_event("after"))
+    assert decision.reason == "accepted:wake_match"
+
+
+async def test_p17f1_concurrent_hook_threads_count_against_the_cap() -> None:
+    """R3 (review finding A1, round 2): a worker counts against the cap from
+    its start, not only once abandoned, so evaluations running concurrently
+    cannot each start a thread past it. Of one more concurrent hooked event
+    than the cap, exactly one is refused as ``rejected:wake_hook_unavailable``
+    without its hook being called."""
+
+    engine = _real_time_wake_engine(HARD_BOUND)
+    release = threading.Event()
+    calls: list[Any] = []
+
+    async def holding(event: Any, parameters: Any) -> bool:
+        calls.append(event)
+        release.wait(10.0)  # holds its thread without ever yielding
+        return True
+
+    _supply(engine, INPUT, "wake", holding)
+    try:
+        decisions = await asyncio.gather(
+            *(
+                engine.evaluate_async(_event(f"c{index}"))
+                for index in range(MAX_OUTSTANDING_HOOK_WORKERS + 1)
+            )
+        )
+        reasons = sorted(decision.reason for decision in decisions)
+        assert reasons == sorted(
+            ["rejected:wake_hook_timeout"] * MAX_OUTSTANDING_HOOK_WORKERS
+            + ["rejected:wake_hook_unavailable"]
+        )
+        assert len(calls) == MAX_OUTSTANDING_HOOK_WORKERS
+    finally:
+        release.set()
+    for thread in threading.enumerate():
+        if thread.name.startswith("trigger-hook:"):
+            thread.join(5.0)
+            assert not thread.is_alive()
 
 
 async def _never_run(context: Any) -> Any:  # pragma: no cover - never admitted

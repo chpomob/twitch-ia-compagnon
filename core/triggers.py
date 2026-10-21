@@ -66,7 +66,9 @@ type or widen a schema the module narrowed (R1, AC2).
 the module that declared it and nobody else, awaited at most once per
 evaluation of an eligible event under its declared bound, and only a boolean
 answer enters the policy's combination: an error, a timeout or a missing hook
-vetoes the whole decision before the combination is consulted.
+vetoes the whole decision before the combination is consulted. On real time the
+bound is hard: the hook runs on a worker thread with a loop of its own, so a
+hook that never yields is abandoned at the bound and stalls nothing.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ import asyncio
 import inspect
 import math
 import random
+import threading
 import time
 import weakref
 from collections import OrderedDict
@@ -217,6 +220,16 @@ HOOK_UNAVAILABLE = "hook_unavailable"
 """The suffixes of a hooked type's reasons, ``<type>_<suffix>`` (R3).
 
 The last three are the failed outcomes: each vetoes the whole decision."""
+
+MAX_OUTSTANDING_HOOK_WORKERS = 4
+"""How many hook threads may be outstanding per engine at once (R3).
+
+A worker is outstanding from its start until its answer is read or — when it
+was abandoned at its bound — until its thread ends: a hook asked to cancel
+that never yields keeps its thread. Concurrent evaluations count as much as
+abandoned ones. While this many are outstanding the engine starts no other:
+a hooked rule then fails closed as ``<type>_hook_unavailable`` without its
+hook being called, until one ends."""
 
 _ACCEPTED_PREFIX = "accepted"
 _REJECTED_PREFIX = "rejected"
@@ -885,6 +898,7 @@ class TriggerEngine:
         "_override_sources",
         "_counts",
         "_in_flight",
+        "_hook_workers",
     )
 
     def __init__(
@@ -963,6 +977,10 @@ class TriggerEngine:
         self._in_flight: dict[
             tuple[str, str, str], asyncio.Future[TriggerDecision | None]
         ] = {}
+        # Outstanding hook workers: each is added as it starts, removed once
+        # its answer is read, and — abandoned at its bound — kept until its
+        # thread ends, pruned each time a worker is about to start (R3).
+        self._hook_workers: set[_HookWorker] = set()
 
     @property
     def registry(self) -> TriggerRegistry:
@@ -1084,7 +1102,11 @@ class TriggerEngine:
         are never interleaved with another's. Then each eligible hooked rule's
         hook, in policy order, receives a read-only view of the event and of
         the rule's parameters, is invoked once and is raced against the
-        engine's sleeper for the type's ``hook_timeout_seconds``. ``True``
+        engine's sleeper for the type's ``hook_timeout_seconds`` — on real
+        time (the sleeper :func:`asyncio.sleep`) from a worker thread with a
+        loop of its own, so the bound is hard whatever the hook does and a
+        hook that blocks never stalls this loop; on an injected clock, whose
+        time only that clock moves, on this loop. ``True``
         matches and ``False`` does not; anything else, an exception, the
         bound elapsing or no hook supplied is a failed outcome, and the first
         one in policy order rejects the decision before the combination is
@@ -1313,10 +1335,20 @@ class TriggerEngine:
         if hook is None:
             return _hook_outcome(pending, HOOK_UNAVAILABLE)
         bound = float(declaration.hook_timeout_seconds)
+        on_worker = self._sleeper is asyncio.sleep
+        if on_worker:
+            self._hook_workers = {w for w in self._hook_workers if w.alive}
+            if len(self._hook_workers) >= MAX_OUTSTANDING_HOOK_WORKERS:
+                # Too many hooks still hold their threads, awaited or
+                # abandoned: no other starts, and the rule fails closed
+                # without a call.
+                return _hook_outcome(pending, HOOK_UNAVAILABLE)
         try:
             invocation = hook(_read_only(event), _read_only(pending.parameters))
         except Exception:
             return _hook_outcome(pending, HOOK_ERROR)
+        if on_worker:
+            return await self._await_hook_on_worker(pending, invocation, bound)
         # The answer is dated on the engine's clock — the bound's own domain —
         # the moment the hook settles, so an answer given after the bound is
         # a timeout even when the timer and the hook are released together
@@ -1356,14 +1388,64 @@ class TriggerEngine:
             return _hook_outcome(pending, HOOK_TIMEOUT)
         if call.cancelled() or call.exception() is not None:
             return _hook_outcome(pending, HOOK_ERROR)
-        answer = call.result()
-        if answer is True:
-            if pending.missed:
-                return _Outcome(False, f"{declaration.name}_probability_miss")
-            return _hook_outcome(pending, HOOK_MATCH)
-        if answer is False:
-            return _hook_outcome(pending, HOOK_NO_MATCH)
-        return _hook_outcome(pending, HOOK_ERROR)
+        return _answer_outcome(pending, call.result())
+
+    async def _await_hook_on_worker(
+        self, pending: _PendingHook, invocation: Any, bound: float
+    ) -> _Outcome:
+        """Run one invocation on a worker thread, and wait for it no longer
+        than the bound (R3, brief decision 2: a hard timeout).
+
+        The hook runs on a loop of its own, so this loop only waits, on its
+        own timer armed before the worker starts, for the bound.
+        When the bound elapses first the worker is abandoned — asked to
+        cancel the hook, its eventual answer discarded — and the outcome is a
+        timeout, whether the hook awaits, raises later or never yields at
+        all. An answer is dated on the engine's clock where it settles, so
+        one given after the bound is a timeout here too.
+        """
+
+        clock = self._clock
+        loop = asyncio.get_running_loop()
+        started = clock()
+        answered: asyncio.Future[tuple[float, bool, Any]] = loop.create_future()
+        # The sleeper here is :func:`asyncio.sleep`, so the bound is armed on
+        # this loop's own timer before the worker starts: starting a thread
+        # beside a hook that holds the interpreter spends the bound, it does
+        # not extend it.
+        elapsed = loop.create_future()
+        timer = loop.call_later(bound, _deliver, elapsed, None)
+        worker = _HookWorker(
+            invocation, clock, answered, name=f"trigger-hook:{pending.declaration.name}"
+        )
+        try:
+            worker.start()
+        except Exception:
+            timer.cancel()
+            worker.discard()
+            return _hook_outcome(pending, HOOK_ERROR)
+        # Registered before this loop yields, so evaluations running
+        # concurrently each see the others' workers against the cap.
+        self._hook_workers.add(worker)
+        try:
+            await asyncio.wait((answered, elapsed), return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            worker.abandon()
+            raise
+        finally:
+            timer.cancel()
+        if not answered.done():
+            # Abandoned, it stays outstanding until its thread ends.
+            worker.abandon()
+            return _hook_outcome(pending, HOOK_TIMEOUT)
+        # Answered: its thread is only closing its own loop.
+        self._hook_workers.discard(worker)
+        settled, failed, answer = answered.result()
+        if settled - started > bound:
+            return _hook_outcome(pending, HOOK_TIMEOUT)
+        if failed:
+            return _hook_outcome(pending, HOOK_ERROR)
+        return _answer_outcome(pending, answer)
 
     def recorded(
         self,
@@ -1811,6 +1893,120 @@ def _hook_outcome(pending: _PendingHook, suffix: str) -> _Outcome:
         f"{pending.declaration.name}_{suffix}",
         vetoes=suffix in (HOOK_ERROR, HOOK_TIMEOUT, HOOK_UNAVAILABLE),
     )
+
+
+def _answer_outcome(pending: _PendingHook, answer: Any) -> _Outcome:
+    """The outcome of a hook's answer: only a boolean decides (R3)."""
+
+    if answer is True:
+        if pending.missed:
+            return _Outcome(False, f"{pending.declaration.name}_probability_miss")
+        return _hook_outcome(pending, HOOK_MATCH)
+    if answer is False:
+        return _hook_outcome(pending, HOOK_NO_MATCH)
+    return _hook_outcome(pending, HOOK_ERROR)
+
+
+class _HookWorker:
+    """One hook invocation on a daemon thread of its own, with its own loop.
+
+    The answer — ``(settled, failed, value)``, ``settled`` read on the
+    engine's clock — is handed to the evaluating loop through ``answered``
+    unless the worker was abandoned first, in which case it is dropped. An
+    abandoned worker's hook is asked to cancel; one that never yields keeps
+    only its own thread, never the evaluating loop. Everything the hook
+    raises, cancellation included, is retrieved here as a failed answer.
+    """
+
+    __slots__ = ("_invocation", "_clock", "_home", "_answered", "_lock", "_loop",
+                 "_task", "_abandoned", "_thread")
+
+    def __init__(
+        self,
+        invocation: Any,
+        clock: Clock,
+        answered: asyncio.Future[tuple[float, bool, Any]],
+        *,
+        name: str,
+    ) -> None:
+        self._invocation = invocation
+        self._clock = clock
+        self._home = answered.get_loop()
+        self._answered = answered
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task[tuple[float, bool, Any]] | None = None
+        self._abandoned = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        """Whether the worker's thread is still running."""
+
+        return self._thread.is_alive()
+
+    def discard(self) -> None:
+        """Close an invocation that will never run, so none is left unawaited."""
+
+        close = getattr(self._invocation, "close", None)
+        if inspect.iscoroutine(self._invocation) and callable(close):
+            close()
+
+    def abandon(self) -> None:
+        """Give up on the answer, and ask the hook to cancel."""
+
+        with self._lock:
+            self._abandoned = True
+            loop, task = self._loop, self._task
+        if loop is not None and task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # the worker's loop is already closed: nothing to cancel
+
+    async def _dated(self) -> tuple[float, bool, Any]:
+        try:
+            value = await self._invocation
+        except BaseException:
+            return self._clock(), True, None
+        return self._clock(), False, value
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            with self._lock:
+                if self._abandoned:
+                    self.discard()
+                    return
+                task = loop.create_task(self._dated())
+                self._loop, self._task = loop, task
+            answer = loop.run_until_complete(task)
+            with self._lock:
+                abandoned = self._abandoned
+            if not abandoned:
+                try:
+                    self._home.call_soon_threadsafe(_deliver, self._answered, answer)
+                except RuntimeError:
+                    pass  # the evaluating loop is closed: nobody waits
+            # Whatever the hook left running on this loop ends with it.
+            leftovers = asyncio.all_tasks(loop)
+            for leftover in leftovers:
+                leftover.cancel()
+            if leftovers:
+                loop.run_until_complete(asyncio.gather(*leftovers, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
+
+
+def _deliver(answered: asyncio.Future[Any], answer: Any) -> None:
+    """Settle *answered* with a worker's answer, on the evaluating loop."""
+
+    if not answered.done():
+        answered.set_result(answer)
 
 
 def _consume(task: asyncio.Future[Any]) -> None:

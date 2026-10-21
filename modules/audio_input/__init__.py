@@ -96,9 +96,11 @@ exercised on an injected clock without a sleeping child. They are read from
 ``wake_word.detector`` configure it; they are checked only when
 ``listen.enabled`` is true, each refusal naming its key and echoing no value.
 The declared ``wake_word`` type is decided by :func:`_wake_word_hook`, which
-reads the candidate's ``payload.wake_word.detected`` and nothing else. With
-listening off no detector and no source is ever started and the module is the
-phase-7 one.
+reads the candidate's ``payload.wake_word.detected`` and nothing else. A
+listening module sends no transcription probe at ``prepare`` — the only
+transcription request it makes is the one an accepted candidate's segment
+needs. With listening off no detector and no source is ever started and the
+module is the phase-7 one, its probe included.
 
 **One iteration of listening** (R7, A5) — :meth:`AudioInputModule.listen_once`
 — runs four steps in this order and never in another. (1) *Verdict*: the
@@ -2013,7 +2015,11 @@ class AudioInputModule:
         registers the module's own supervised-task registry as the listen
         loop's owner and supplies :func:`_wake_word_hook` for the declared
         ``wake_word`` type; it starts no process, reads no audio and emits no
-        input. With listening off none of this happens.
+        input. It also sends no transcription probe: the listening path
+        transcribes nothing before an accepted decision, so the probe — the
+        capture action's readiness check — runs only when the module is not
+        listening, and a listening module's transcription is judged by each
+        call it makes. With listening off none of this happens.
         """
 
         if self._prepared or self._closed:
@@ -2031,7 +2037,7 @@ class AudioInputModule:
                 unusable.append(name)
         usable = frozenset(name for name in settings.sources if name not in unusable)
         transcription_failed = False
-        if settings.transcription.enabled and usable:
+        if settings.transcription.enabled and usable and settings.listen is None:
             transcription_failed = not await self._probe_transcription()
             if transcription_failed:
                 self._transcription_available = False
