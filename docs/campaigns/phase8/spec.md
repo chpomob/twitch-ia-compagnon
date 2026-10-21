@@ -599,6 +599,26 @@ criterion is renumbered to sit beside its requirement.
   with a commit and a test identifier.
 - AC33 (R9): The full suite runs with network access blocked at the socket layer (a test fixture that
   makes socket creation raise) and passes, and no test spawns a process outside a fake runner.
+
+  **Amendment A2 (2026-10-21).** Implementing this criterion by converting every node produced
+  conversions that lost the guarantee the node existed for: the installation test stopped installing, and
+  the git-fact test stopped reading a work tree. The operator's decision is that a proof that cannot be
+  made in-process **stays real and is named**, rather than replaced by a weaker one. Three nodes are
+  therefore exempted by name, each journaled when it does so:
+  - `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help`
+    — installs into a throwaway environment and asserts the installed layout, the import isolation and the
+    launcher; it spawns `pip` and a child interpreter on purpose;
+  - `tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base` —
+    reads the repository facts through `git`; the work-tree and base-commit existence assertions are part
+    of the proof;
+  - `tests/test_kick.py::test_ac34_the_listener_runs_on_the_configured_host_and_port` — binds a loopback
+    listener, pre-existing and expressly outside this phase's scope; the file is restored to its phase
+    base content and not otherwise touched.
+
+  Every other node that creates a socket or starts a process still raises, and that negative control is
+  unchanged. Away from these three, a fake must be made faithful enough to carry an existing assertion;
+  an assertion is never dropped to fit a fake, and a node that cannot be carried by a fake is reported
+  instead of converted.
 - AC34 (R3): With a hooked fixture type `<t>` under the policy `{combination: none_of, rules: [<t>]}`,
   a hook that raises decides `rejected:<t>_hook_error`, a hook that never returns decides
   `rejected:<t>_hook_timeout` once the bound has elapsed on the ManualClock, and no hook supplied
