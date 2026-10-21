@@ -17,18 +17,27 @@ runtime_api: 2
 
 # A capture is on demand only: the brain asks for one segment when it needs
 # it, the module records it and returns a reference. Nothing is recorded in
-# the background and nothing is published: the module produces and consumes
-# no event.
-produces: []
+# the background. With `listen.enabled` (phase 8 R7) the streamer's voice is
+# also an input: a configured wake-word detector's verdict is decided by the
+# kernel first, and only an accepted one acquires a segment, transcribes it
+# once and publishes it as the one normalised chat event shape every input
+# builds, with `payload.kind: speech`. With listening off nothing is
+# published and the module behaves as in phase 7.
+produces:
+  - channel.chat.message
 consumes: []
 middleware: false
 
-# No lifecycle role: the handle takes part in `prepare` (probe every
-# configured source, bind the provider when one is usable), in `drain` (kill
-# a running recorder, the call ending `cancelled`) and in `close` (withdraw
-# readiness) — and it spawns no task and no process outside a call.
+# The input role (phase 8 R7): the listen loop may only start in
+# `start_inputs`, after the readiness barrier, and stops in `stop_inputs`;
+# with listening off both are no-ops. The handle also takes part in
+# `prepare` (probe every configured source, bind the provider when one is
+# usable), in `drain` (kill a running recorder, the call ending `cancelled`)
+# and in `close` (withdraw readiness) — and a capture spawns no task and no
+# process outside a call.
 lifecycle:
-  roles: []
+  roles:
+    - input
 
 # The sources this module may record from, which one is used when the call
 # names none, and the bounds every capture is held to (R3). The shapes inside
@@ -126,6 +135,100 @@ settings_schema:
       description: >-
         Whether an unusable source at `prepare` fails startup (true) or is
         reported and left aside (false). Default false.
+    listen:
+      title: Listen
+      type: object
+      description: >-
+        The voice input (phase 8 R7). Off by default: no detector and no
+        source is ever started while `enabled` is false. Each detected wake
+        word is decided by the trigger policy before any audio is acquired.
+        The ranges below are checked by the declared hook, and only while
+        listening is enabled.
+      properties:
+        enabled:
+          title: Enabled
+          default: false
+          type: boolean
+          description: Whether the voice input runs. Default false.
+        source:
+          title: Source
+          type: string
+          description: >-
+            The configured `command` source a segment is acquired from once
+            a wake word is accepted.
+        pre_roll_seconds:
+          title: Pre-roll seconds
+          default: 2
+          type: number
+          description: >-
+            How far before the verdict the segment may start, 0 to 5 and less
+            than `max_seconds`. Default 2.
+        speaker:
+          title: Speaker
+          default: streamer
+          type: string
+          description: The speaker named in the event's author, `voice:<speaker>`.
+        destination:
+          title: Destination
+          type: object
+          description: The channel the event's run answers on.
+          properties:
+            platform:
+              title: Platform
+              type: string
+            channel_id:
+              title: Channel id
+              type: string
+        retry_seconds:
+          title: Retry seconds
+          default: 5
+          type: number
+          description: >-
+            The first restart delay after an unproductive iteration, doubled
+            up to 300 s. Default 5.
+        max_seconds:
+          title: Max seconds
+          default: 10
+          type: integer
+          description: >-
+            The longest segment one wake word acquires, 1 to the module's
+            `max_seconds`. Default 10.
+    wake_word:
+      title: Wake word
+      type: object
+      description: >-
+        The configured wake-word detector, required when listening is
+        enabled. None is embedded and none is assumed.
+      properties:
+        detector:
+          title: Detector
+          type: object
+          description: >-
+            A `command` detector (`kind: command`, `argv`) answers with its
+            exit status and the matched phrase on stdout; an `http` detector
+            (`kind: http`, `endpoint`, optional `api_key`) answers one request
+            with a JSON verdict. Neither is given any audio.
+          properties:
+            kind:
+              title: Kind
+              type: string
+              enum:
+                - command
+                - http
+            argv:
+              title: Argv
+              type: array
+              items:
+                type: string
+            endpoint:
+              title: Endpoint
+              type: string
+            api_key:
+              title: API key
+              type: string
+              description: >-
+                Optional credential of an `http` detector, redacted from every
+                trace and diagnostic.
     limits:
       title: Limits
       type: object
@@ -139,6 +242,64 @@ settings_validator: validate_settings
 
 credentials:
   - transcription.api_key
+  - wake_word.detector.api_key
+
+# A detected wake word is trigger-evaluated with this module's policy before
+# anything is acquired (phase 8 R7). The candidate carries the detector's
+# verdict and phrase, never a transcription.
+triggers:
+  types:
+    # The phrase the detector reported, as the wake word.
+    - name: keyword
+      parameter_schema:
+        type: object
+        properties:
+          keywords:
+            type: array
+            items:
+              type: string
+        required:
+          - keywords
+        additionalProperties: false
+    # Selects on the normalised event's kind; a candidate is always `speech`.
+    - name: event_kind
+      parameter_schema:
+        type: object
+        properties:
+          kinds:
+            type: array
+            items:
+              type: string
+              enum:
+                - speech
+        required:
+          - kinds
+        additionalProperties: false
+    # The detector's verdict, read by this module's own hook under a 2 s
+    # bound: raising or exceeding it is no trigger (R3). It grants nothing.
+    - name: wake_word
+      kinds:
+        - speech
+      parameter_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      hook: true
+      hook_timeout_seconds: 2
+  # The payload fields a candidate carries beyond the canonical ones (phase
+  # 8 A4), so a declared type may only read what this input emits.
+  fields:
+    wake_word.detected: boolean
+    wake_word.phrase: string
+  combinations:
+    - all_of
+    - any_of
+    - none_of
+  default_policy:
+    combination: all_of
+    rules:
+      - type: wake_word
+        parameters: {}
 
 # The `audio.capture` contract (R3, R4). The optional `source` names a
 # configured source; the result states which source served, what was stored

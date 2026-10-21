@@ -316,14 +316,16 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": []},
         "settings_validator": "validate_settings",
     },
+    # Phase 8 R7 (plan P12, allowlisted): the voice input produces the chat
+    # shape and takes the input role.
     "audio_input": {
         "name": "audio_input",
         "manifest_version": 2,
         "runtime_api": RUNTIME_API,
-        "produces": [],
+        "produces": ["channel.chat.message"],
         "consumes": [],
         "middleware": False,
-        "lifecycle": {"roles": []},
+        "lifecycle": {"roles": ["input"]},
         "settings_validator": "validate_settings",
     },
     "stream_control": {
@@ -459,7 +461,8 @@ DECLARATION_KEYS = {
     "proxy": {"credentials"},
     "agent_link": {"credentials"},
     "audio_output": {"actions", "credentials"},
-    "audio_input": {"actions", "credentials"},
+    # Phase 8 R7 (plan P12, allowlisted): and its wake-word triggers.
+    "audio_input": {"actions", "credentials", "triggers"},
     "stream_control": {"actions", "credentials"},
     "clips": {"actions"},
     # Phase 3 R4 (plan P11): the store declares its recall and record.
@@ -517,7 +520,8 @@ SECRET_SETTINGS = {
     "proxy": ("pairing_token",),
     "agent_link": ("pairing_token",),
     "audio_output": ("synthesis.api_key",),
-    "audio_input": ("transcription.api_key",),
+    # Phase 8 R7 (plan P12): and the optional HTTP detector's key.
+    "audio_input": ("transcription.api_key", "wake_word.detector.api_key"),
     "stream_control": ("scenes.provider.password",),
     "kick": ("client_secret", "access_token"),
     "youtube": ("client_secret", "refresh_token"),
@@ -533,7 +537,13 @@ SECRET_SETTINGS = {
 UNCONFIGURED_CREDENTIALS = {"audio_output.synthesis.api_key", "audio_input.transcription.api_key"}
 #: The credentials a profile has no setting for at all: the server runs no
 #: scene provider (``kind: none``), so it configures no scene password.
-ABSENT_CREDENTIALS = {"server": {"stream_control.scenes.provider.password"}}
+ABSENT_CREDENTIALS = {
+    "server": {"stream_control.scenes.provider.password"},
+    # Phase 8 R7 (plan P12): listening ships off, so no profile configures
+    # the optional HTTP detector's key; no profile is edited.
+    "pc": {"audio_input.wake_word.detector.api_key"},
+    "agent": {"audio_input.wake_word.detector.api_key"},
+}
 #: The endpoint settings of every module, by dotted path: each is a
 #: ``${NAME}`` reference, except the speech and transcription endpoints,
 #: which ship EMPTY — no provider is assumed (R9, AC32, AC43).

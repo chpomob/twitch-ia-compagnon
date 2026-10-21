@@ -58,13 +58,15 @@ from core.actions import ERROR_INVALID_ARGUMENTS, ERROR_TIMED_OUT, ActionExecuto
 from core.attachments import AttachmentExpired, AttachmentStore
 from core.contracts import COUNTER_ACTION_TIMEOUTS, ActionCall, ActionObservation, Destination
 from core.lifecycle import PhaseCoordinator
-from core.loader import ModuleLoader
+from core.loader import ModuleLoader, ModuleLoadError
 from core.runtime import ModuleContext, RuntimeContext
+from core.triggers import TriggerRegistry
 from conftest import (
     HELD,
     FakeAudioSource,
     FakeBytesResponse,
     ManualClock,
+    RecordingScheduler,
     RecordingSubprocessRunner,
     ScriptedTranscriptionTransport,
     events_of,
@@ -76,6 +78,7 @@ from conftest import (
     wav_bytes,
 )
 
+import modules.audio_input as audio_input_module
 from modules.audio_input import (
     CAPTURE_ACTION,
     DEFAULT_MAX_BYTES,
@@ -917,8 +920,13 @@ async def test_without_a_rule_the_capture_is_refused_before_the_provider() -> No
 
 async def test_prepare_starts_no_task_and_spawns_nothing() -> None:
     """AC12: 0 supervised tasks and 0 spawns after activation and
-    ``prepare``; the handle offers no input hook to start; a spawn happens
-    only inside a call, and the call leaves no task behind."""
+    ``prepare``; a spawn happens only inside a call, and the call leaves no
+    task behind.
+
+    Phase 8 R7 (AC25) supersedes "the handle offers no input hook to start":
+    the manifest now takes the ``input`` role, so the handle has
+    ``start_inputs`` and ``stop_inputs`` — and with listening off both start
+    0 tasks and spawn nothing."""
 
     runner = CallTrackingRunner(wav_bytes(2.0))
     h = await harness(runner=runner, prepare=False)
@@ -926,7 +934,12 @@ async def test_prepare_starts_no_task_and_spawns_nothing() -> None:
     await h.handle.prepare()
     assert h.context.tasks.active == 0
     assert runner.spawn_count == 0
-    assert not hasattr(h.handle, "start_inputs")
+    await h.handle.start_inputs()
+    await settle()
+    assert h.context.tasks.active == 0
+    assert runner.spawn_count == 0
+    await h.handle.stop_inputs()
+    assert h.context.tasks.active == 0
 
     observation = await h.capture(seconds=1)
     assert observation.status == "success", observation.error
@@ -935,19 +948,24 @@ async def test_prepare_starts_no_task_and_spawns_nothing() -> None:
 
 
 def test_manifest_declares_an_on_demand_read_with_no_role() -> None:
-    """AC12/R3: ``produces: []``, ``consumes: []``, no middleware, no
-    lifecycle role; the one ``read`` action on ``*/*/audio`` with its
-    permission, no delivery capability, 45 s, ``idempotency: none``; the
-    settings and the credential R3 names, and no lead/margin key (AC41)."""
+    """AC12/R3: ``consumes: []``, no middleware; the one ``read`` action on
+    ``*/*/audio`` with its permission, no delivery capability, 45 s,
+    ``idempotency: none``; the settings and the credential R3 names, and no
+    lead/margin key (AC41).
+
+    Allowlisted, phase 8 R7 (plan P12): ``audio_input`` produces
+    ``channel.chat.message``, takes the ``input`` role, gains the ``listen``
+    and ``wake_word`` settings and declares the detector's ``api_key`` as a
+    credential; the ``audio.capture`` assertions stay exact."""
 
     manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
     assert manifest["name"] == MODULE_NAME
     assert manifest["manifest_version"] == 2
-    assert manifest["produces"] == []
+    assert manifest["produces"] == ["channel.chat.message"]
     assert manifest["consumes"] == []
     assert manifest["middleware"] is False
-    assert manifest["lifecycle"] == {"roles": []}
-    assert manifest["credentials"] == ["transcription.api_key"]
+    assert manifest["lifecycle"] == {"roles": ["input"]}
+    assert manifest["credentials"] == ["transcription.api_key", "wake_word.detector.api_key"]
     assert manifest["settings_validator"] == "validate_settings"
     properties = manifest["settings_schema"]["properties"]
     assert set(properties) == {
@@ -958,7 +976,25 @@ def test_manifest_declares_an_on_demand_read_with_no_role() -> None:
         "grace_seconds",
         "transcription",
         "required",
+        "listen",
+        "wake_word",
         "limits",
+    }
+    assert set(properties["listen"]["properties"]) == {
+        "enabled",
+        "source",
+        "pre_roll_seconds",
+        "speaker",
+        "destination",
+        "retry_seconds",
+        "max_seconds",
+    }
+    assert set(properties["wake_word"]["properties"]) == {"detector"}
+    assert set(properties["wake_word"]["properties"]["detector"]["properties"]) == {
+        "kind",
+        "argv",
+        "endpoint",
+        "api_key",
     }
     assert set(properties["transcription"]["properties"]) == {
         "enabled",
@@ -1194,11 +1230,17 @@ async def test_the_loader_discovers_the_manifest_and_prepare_binds_the_declared_
     """R7/R9: the real loader validates the manifest and runs the hook with
     the reserved ``limits`` block; ``prepare`` binds the very spec
     discovered; a granted call succeeds on a second platform; the declared
-    credential is redacted; ``stop`` withdraws readiness."""
+    credential is redacted; ``stop`` withdraws readiness.
+
+    Phase 8 R7 (plan P12): the manifest now declares triggers and the
+    ``input`` role, so the loader needs the trigger registry every shipped
+    input is loaded with, and the activation carries the role."""
 
     clock = ManualClock()
     store = AttachmentStore(clock=clock, **STORE_LIMITS)
-    context = runtime_context(clock=clock, attachments=store)
+    context = runtime_context(
+        clock=clock, attachments=store, trigger_registry=TriggerRegistry()
+    )
     runner = CallTrackingRunner(wav_bytes(2.0))
     loader = ModuleLoader(context.bus, ROOT / "modules", context=context, environ={})
     settings = _valid()
@@ -1213,7 +1255,7 @@ async def test_the_loader_discovers_the_manifest_and_prepare_binds_the_declared_
     )
     (activation,) = activations
     assert activation.manifest_version == 2
-    assert activation.roles == frozenset()
+    assert activation.roles == frozenset({"input"})
     assert CAPTURE_ACTION in context.actions.discovered()
     assert context.actions.bindings(CAPTURE_ACTION) == ()
 
@@ -2074,6 +2116,494 @@ def test_no_lead_or_margin_exists_in_the_module_or_its_manifest() -> None:
     assert MODULE_DIR / "__init__.py" in files and MANIFEST_PATH in files
     for path in files:
         assert pattern.findall(path.read_text(encoding="utf-8")) == [], path
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8 R7 (plan P12): the voice input's settings and the wake-word hook
+# --------------------------------------------------------------------------- #
+
+LISTEN_DESTINATION = {"platform": "fake", "channel_id": "channel-9"}
+#: A detector argv and endpoint no diagnostic may echo.
+DETECTOR_ARGV = [sys.executable, "detector-secret-argv", "--wake"]
+DETECTOR_ENDPOINT = "http://detector-secret-host.invalid/verdict"
+DETECTOR_KEY = "detector-key-secret"
+
+
+def listen_settings(
+    runner: CallTrackingRunner,
+    clock: ManualClock,
+    *,
+    detector: Any = None,
+    **listen: Any,
+) -> dict[str, Any]:
+    """Listening enabled over the shipped command source and runner."""
+
+    settings = command_settings(runner, clock)
+    settings["listen"] = {
+        "enabled": True,
+        "source": "mic",
+        "destination": dict(LISTEN_DESTINATION),
+        **listen,
+    }
+    settings["wake_word"] = {
+        "detector": {"kind": "command", "argv": list(DETECTOR_ARGV)}
+        if detector is None
+        else detector
+    }
+    return settings
+
+
+class Listening:
+    """``audio_input`` loaded by the real loader over a real trigger engine."""
+
+    def __init__(self, runtime: RuntimeContext, clock: ManualClock, handle: AudioInputModule,
+                 activations: Any, scheduler: RecordingScheduler) -> None:
+        self.runtime = runtime
+        self.clock = clock
+        self.handle = handle
+        self.activations = activations
+        self.scheduler = scheduler
+
+    @property
+    def engine(self) -> Any:
+        return self.runtime.triggers
+
+    def hook_slots(self) -> dict[str, Any]:
+        return dict(self.engine.registry.hook_slots(MODULE_NAME))
+
+
+async def listening(settings: dict[str, Any], clock: ManualClock) -> Listening:
+    scheduler = RecordingScheduler()
+    runtime = runtime_context(
+        clock=clock,
+        attachments=AttachmentStore(clock=clock, **STORE_LIMITS),
+        trigger_registry=TriggerRegistry(),
+        scheduler=scheduler,
+    )
+    loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
+    activations = await loader.activate_enabled(
+        {"enabled_modules": [MODULE_NAME], "modules": {MODULE_NAME: settings}}
+    )
+    (activation,) = activations
+    return Listening(runtime, clock, activation.handle, activations, scheduler)
+
+
+def candidate(message_id: str, **payload: Any) -> dict[str, Any]:
+    """A schema-2 ``speech`` candidate of this input (R7 step 2)."""
+
+    body: dict[str, Any] = {
+        "platform": LISTEN_DESTINATION["platform"],
+        "kind": "speech",
+        "channel_id": LISTEN_DESTINATION["channel_id"],
+        "author": {"id": "voice:streamer", "display_name": "streamer"},
+        "message_id": message_id,
+        "text": "hey nova",
+        **payload,
+    }
+    return {
+        "type": "channel.chat.message",
+        "payload": body,
+        "metadata": {"schema_version": 2, "source": MODULE_NAME},
+    }
+
+
+def test_p12_the_manifest_declares_the_wake_word_types_and_default() -> None:
+    """R7: generic ``keyword``, ``event_kind`` narrowed to ``[speech]``, the
+    hooked ``wake_word`` (kinds ``[speech]``, empty schema, 2 s bound), the
+    two verdict fields and the default policy ``wake_word{}``."""
+
+    manifest = yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+    triggers = manifest["triggers"]
+    assert [entry["name"] for entry in triggers["types"]] == ["keyword", "event_kind", "wake_word"]
+    keyword, event_kind, wake_word = triggers["types"]
+    assert set(keyword) == {"name", "parameter_schema"}
+    assert event_kind["parameter_schema"]["properties"]["kinds"]["items"]["enum"] == ["speech"]
+    assert wake_word["kinds"] == ["speech"]
+    assert wake_word["parameter_schema"] == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    assert wake_word["hook"] is True and wake_word["hook_timeout_seconds"] == 2
+    assert "match" not in wake_word
+    assert triggers["fields"] == {"wake_word.detected": "boolean", "wake_word.phrase": "string"}
+    assert triggers["default_policy"]["rules"] == [{"type": "wake_word", "parameters": {}}]
+
+
+@pytest.mark.parametrize("listen", ["absent", "disabled"])
+async def test_p12_ac25_without_listening_nothing_is_invoked_over_60_seconds(listen: str) -> None:
+    """AC25 (R7): with ``listen`` absent or ``enabled: false`` — a detector
+    configured all the same — the real loader and coordinator start the
+    module through ``start_inputs``; over 60 s of the injected clock 0
+    detector or source processes start, 0 tasks run, no hook is supplied
+    and 0 ``speech`` events are published. ``stop`` ends cleanly."""
+
+    clock = ManualClock(1000.0)
+    runner = CallTrackingRunner(wav_bytes(2.0))
+    settings = command_settings(runner, clock)
+    if listen == "disabled":
+        # Out of range on purpose: nothing new is checked while disabled.
+        settings["listen"] = {"enabled": False, "source": "mic", "max_seconds": 0}
+        settings["wake_word"] = {"detector": {"kind": "command", "argv": list(DETECTOR_ARGV)}}
+    h = await listening(settings, clock)
+    assert h.activations[0].roles == frozenset({"input"})
+    assert h.handle.listening is False
+
+    diagnostics: list[str] = []
+    coordinator = PhaseCoordinator(
+        h.activations, tasks=h.runtime.tasks, reporter=diagnostics.append
+    )
+    assert (await coordinator.start()).status == 0
+    for _ in range(60):
+        clock.advance(1.0)
+        await settle()
+
+    assert runner.spawn_count == 0
+    assert h.runtime.for_module(MODULE_NAME).tasks.active == 0
+    assert h.handle.listen_source is None and h.handle.listen_owner is None
+    assert h.hook_slots() == {"wake_word": None}
+    assert [
+        event for event in events_of(h.runtime.bus, "channel.chat.message")
+        if event["payload"].get("kind") == "speech"
+    ] == []
+    assert h.scheduler.admissions == []
+    # The phase-7 capture is bound exactly as before.
+    assert CAPTURE_ACTION in h.runtime.actions.registered_ready()
+    assert (await coordinator.stop()).status == 0
+    assert diagnostics == []
+
+
+async def test_p12_prepare_resolves_the_source_and_owner_and_starts_nothing() -> None:
+    """R7 lifecycle: with listening enabled, ``prepare`` resolves
+    ``listen.source``, registers the module's supervised-task registry as
+    the loop's owner and supplies the hook; it starts no process and no
+    task, and ``start_inputs``/``stop_inputs`` start nothing in this step."""
+
+    clock = ManualClock(1000.0)
+    runner = CallTrackingRunner()
+    h = await listening(listen_settings(runner, clock), clock)
+    assert h.handle.listening is True
+    assert h.hook_slots() == {"wake_word": None}
+
+    await h.handle.prepare()
+
+    assert h.handle.listen_source is h.handle.sources["mic"]
+    assert h.handle.listen_owner is not None
+    assert h.handle.listen_owner.module == MODULE_NAME
+    (supplied,) = h.hook_slots().values()
+    # The loader imports the package itself: the same function, by origin.
+    assert supplied.__qualname__ == audio_input_module._wake_word_hook.__qualname__
+    assert supplied.__code__.co_filename == audio_input_module._wake_word_hook.__code__.co_filename
+    assert runner.spawn_count == 0
+    assert h.handle.listen_owner.active == 0
+    await h.handle.start_inputs()
+    await h.handle.stop_inputs()
+    assert runner.spawn_count == 0
+    assert h.handle.listen_owner.active == 0
+
+
+async def test_p12_ac27_the_hook_decides_by_the_verdict_alone() -> None:
+    """AC27 hook rows (R3, R7): through the real engine with the hook
+    ``prepare`` supplied, ``{detected: true}`` decides
+    ``accepted:wake_word_match``, ``{detected: false}``
+    ``rejected:wake_word_no_match``, a candidate without ``wake_word`` (or
+    with a non-boolean verdict) ``rejected:wake_word_hook_error``; 0 runs
+    are admitted by the decisions and 0 processes started."""
+
+    clock = ManualClock(1000.0)
+    runner = CallTrackingRunner()
+    h = await listening(listen_settings(runner, clock), clock)
+    await h.handle.prepare()
+
+    accepted = await h.engine.evaluate_async(
+        candidate("c-1", wake_word={"detected": True, "phrase": "hey nova"})
+    )
+    declined = await h.engine.evaluate_async(
+        candidate("c-2", wake_word={"detected": False})
+    )
+    missing = await h.engine.evaluate_async(candidate("c-3"))
+    malformed = await h.engine.evaluate_async(
+        candidate("c-4", wake_word={"detected": "yes"})
+    )
+
+    assert accepted.reason == "accepted:wake_word_match"
+    assert declined.reason == "rejected:wake_word_no_match"
+    assert missing.reason == "rejected:wake_word_hook_error"
+    assert malformed.reason == "rejected:wake_word_hook_error"
+    assert h.scheduler.admissions == []
+    assert runner.spawn_count == 0
+
+
+async def test_p12_the_hook_reads_nothing_but_the_verdict() -> None:
+    """R7: ``_wake_word_hook`` answers the boolean verdict and raises on any
+    other shape; the parameters and the rest of the event are not read."""
+
+    hook = audio_input_module._wake_word_hook
+    class Untouchable(dict):
+        def __getitem__(self, key: Any) -> Any:
+            raise AssertionError("the parameters are read")
+
+    assert await hook({"payload": {"wake_word": {"detected": True}}}, Untouchable()) is True
+    assert await hook({"payload": {"wake_word": {"detected": False}}}, Untouchable()) is False
+    for view in (
+        {"payload": {}},
+        {"payload": {"wake_word": {}}},
+        {"payload": {"wake_word": {"detected": 1}}},
+        {"payload": {"wake_word": {"detected": None}}},
+        {"payload": {"wake_word": "detected"}},
+    ):
+        with pytest.raises(Exception):
+            await hook(view, Untouchable())
+
+
+async def test_p12_ac27_a_never_returning_hook_times_out_after_2_seconds() -> None:
+    """AC27 (R3): with the module's hook replaced by one that never returns,
+    the candidate decides ``rejected:wake_word_hook_timeout`` once the
+    injected clock has advanced the declared 2 s, not before."""
+
+    clock = ManualClock(1000.0)
+    runner = CallTrackingRunner()
+    h = await listening(listen_settings(runner, clock), clock)
+    await h.handle.prepare()
+    calls: list[Any] = []
+
+    async def never(view: Any, parameters: Any) -> bool:
+        calls.append(view)
+        await asyncio.get_running_loop().create_future()
+        return True  # pragma: no cover - never reached
+
+    h.runtime.for_module(MODULE_NAME).supply_trigger_hook("wake_word", never)
+    pending = asyncio.ensure_future(
+        h.engine.evaluate_async(candidate("t-1", wake_word={"detected": True, "phrase": "x"}))
+    )
+    await settle()
+    assert len(calls) == 1 and not pending.done()
+    clock.advance(1.75)
+    await settle()
+    assert not pending.done()
+    clock.advance(0.25)
+    await settle()
+    assert pending.done()
+    assert pending.result().reason == "rejected:wake_word_hook_timeout"
+    assert h.scheduler.admissions == []
+    assert runner.spawn_count == 0
+
+
+@pytest.mark.parametrize("listen", ["not-prepared", "disabled"])
+async def test_p12_ac27_with_no_hook_supplied_the_default_policy_is_unavailable(
+    listen: str,
+) -> None:
+    """AC27 (R3): with no hook supplied — listening enabled but ``prepare``
+    not run, or listening off so ``prepare`` supplies none — the default
+    policy decides ``rejected:wake_word_hook_unavailable`` and 0 runs are
+    admitted."""
+
+    clock = ManualClock(1000.0)
+    runner = CallTrackingRunner()
+    if listen == "disabled":
+        h = await listening(command_settings(runner, clock), clock)
+        await h.handle.prepare()
+    else:
+        h = await listening(listen_settings(runner, clock), clock)
+    assert h.hook_slots() == {"wake_word": None}
+
+    decision = await h.engine.evaluate_async(
+        candidate("u-1", wake_word={"detected": True, "phrase": "hey nova"})
+    )
+
+    assert decision.reason == "rejected:wake_word_hook_unavailable"
+    assert h.scheduler.admissions == []
+    assert runner.spawn_count == 0
+
+
+def _assert_load_refused(raised: Any, key: str) -> None:
+    message = "\n".join([str(raised.value), *getattr(raised.value, "diagnostics", ())])
+    assert key in message, message
+    for secret in ("detector-secret-argv", "detector-secret-host", DETECTOR_KEY):
+        assert secret not in message
+
+
+LISTEN_REFUSALS = {
+    # AC27: listening enabled with no detector.
+    "no-detector": ({"_drop_detector": True}, "wake_word.detector"),
+    # AC26: the ranges of ``listen.max_seconds`` and ``listen.pre_roll_seconds``.
+    "max-seconds-0": ({"max_seconds": 0}, "listen.max_seconds"),
+    "max-seconds-above-module": ({"max_seconds": 31}, "listen.max_seconds"),
+    "pre-roll-6": ({"pre_roll_seconds": 6}, "listen.pre_roll_seconds"),
+    "pre-roll-equal-max": ({"pre_roll_seconds": 3, "max_seconds": 3}, "listen.pre_roll_seconds"),
+    "pre-roll-above-max": ({"pre_roll_seconds": 4, "max_seconds": 3}, "listen.pre_roll_seconds"),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(LISTEN_REFUSALS))
+async def test_p12_ac26_ac27_a_refused_listen_setting_names_the_key_and_starts_nothing(
+    variant: str,
+) -> None:
+    """AC26/AC27 diagnostic rows (R7): no ``wake_word.detector``,
+    ``listen.max_seconds: 0`` or above the module's ``max_seconds`` (30),
+    ``listen.pre_roll_seconds: 6``, and a pre-roll not less than
+    ``listen.max_seconds`` are each refused by the settings hook and by the
+    real loader, the diagnostic naming the key and echoing no value; 0
+    processes are started and nothing is activated."""
+
+    overrides, key = LISTEN_REFUSALS[variant]
+    overrides = dict(overrides)
+    drop = overrides.pop("_drop_detector", False)
+    clock = ManualClock(1000.0)
+    runner = CallTrackingRunner()
+    settings = listen_settings(runner, clock, **overrides)
+    settings["max_seconds"] = 30
+    if drop:
+        del settings["wake_word"]
+
+    diagnostics = validate_settings(settings)
+    assert any(f"'{key}'" in diagnostic for diagnostic in diagnostics), diagnostics
+    for diagnostic in diagnostics:
+        assert diagnostic.startswith(f"module {MODULE_NAME!r}")
+        assert "detector-secret-argv" not in diagnostic
+
+    runtime = runtime_context(
+        clock=clock,
+        attachments=AttachmentStore(clock=clock, **STORE_LIMITS),
+        trigger_registry=TriggerRegistry(),
+    )
+    loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
+    with pytest.raises(ModuleLoadError) as raised:
+        await loader.activate_enabled(
+            {"enabled_modules": [MODULE_NAME], "modules": {MODULE_NAME: settings}}
+        )
+    _assert_load_refused(raised, key)
+    clock.advance(60.0)
+    await settle()
+    assert runner.spawn_count == 0
+
+
+@pytest.mark.parametrize(
+    ("mutate", "field"),
+    [
+        (lambda s: s["listen"].update(source="elsewhere"), "listen.source"),
+        (lambda s: s["sources"].update(loop={"kind": "file", "path": "/secret-loop.wav"})
+         or s["listen"].update(source="loop"), "listen.source"),
+        (lambda s: s["listen"].pop("source"), "listen.source"),
+        (lambda s: s["listen"].update(max_seconds=2.5), "listen.max_seconds"),
+        (lambda s: s["listen"].update(max_seconds=True), "listen.max_seconds"),
+        (lambda s: s["listen"].update(pre_roll_seconds=-1), "listen.pre_roll_seconds"),
+        (lambda s: s["listen"].update(retry_seconds=0), "listen.retry_seconds"),
+        (lambda s: s["listen"].update(retry_seconds=301), "listen.retry_seconds"),
+        (lambda s: s["listen"].update(speaker=""), "listen.speaker"),
+        (lambda s: s["listen"].pop("destination"), "listen.destination"),
+        (lambda s: s["listen"]["destination"].update(channel_id=""), "listen.destination.channel_id"),
+        (lambda s: s["listen"].update(continuous=True), "listen.continuous"),
+        (lambda s: s["wake_word"].update(detector={"kind": "embedded"}), "wake_word.detector.kind"),
+        (lambda s: s["wake_word"]["detector"].update(argv=[]), "wake_word.detector.argv"),
+        (lambda s: s["wake_word"].update(detector={"kind": "http"}), "wake_word.detector.endpoint"),
+        (lambda s: s["wake_word"].update(
+            detector={"kind": "http", "endpoint": DETECTOR_ENDPOINT, "api_key": 5}
+        ), "wake_word.detector.api_key"),
+        (lambda s: s["wake_word"]["detector"].update(endpoint=DETECTOR_ENDPOINT),
+         "wake_word.detector.endpoint"),
+    ],
+)
+def test_p12_an_enabled_listen_names_each_offending_field_without_its_value(
+    mutate: Any, field: str
+) -> None:
+    """R7: with listening enabled each refused ``listen`` or
+    ``wake_word.detector`` field is named, value-free."""
+
+    settings = listen_settings(CallTrackingRunner(), ManualClock())
+    mutate(settings)
+
+    diagnostics = validate_settings(settings)
+
+    assert any(f"'{field}'" in diagnostic for diagnostic in diagnostics), diagnostics
+    for diagnostic in diagnostics:
+        for secret in ("detector-secret", "secret-loop"):
+            assert secret not in diagnostic
+
+
+def test_p12_the_listen_settings_accept_both_detectors_and_the_bounds() -> None:
+    """R7: the defaults, a command detector, an HTTP detector with its
+    credential, and the bounds (pre-roll 0 and 5, max 1 and the module max)
+    are accepted; with ``listen`` disabled or absent nothing new is checked."""
+
+    runner, clock = CallTrackingRunner(), ManualClock()
+    assert validate_settings(listen_settings(runner, clock)) == []
+    assert validate_settings(
+        listen_settings(
+            runner,
+            clock,
+            detector={"kind": "http", "endpoint": DETECTOR_ENDPOINT, "api_key": DETECTOR_KEY},
+            pre_roll_seconds=5,
+            max_seconds=30,
+            retry_seconds=300,
+            speaker="host",
+        )
+    ) == []
+    assert validate_settings(listen_settings(runner, clock, pre_roll_seconds=0, max_seconds=1)) == []
+    disabled = listen_settings(runner, clock, max_seconds=0, pre_roll_seconds=9)
+    disabled["listen"]["enabled"] = False
+    del disabled["wake_word"]
+    assert validate_settings(disabled) == []
+    assert validate_settings(command_settings(runner, clock)) == []
+
+
+async def test_p12_the_http_detector_key_is_a_redacted_credential() -> None:
+    """R7: ``wake_word.detector.api_key`` is declared a credential: the
+    loader redacts it, and no trace carries it."""
+
+    clock = ManualClock(1000.0)
+    runner = CallTrackingRunner()
+    h = await listening(
+        listen_settings(
+            runner,
+            clock,
+            detector={"kind": "http", "endpoint": DETECTOR_ENDPOINT, "api_key": DETECTOR_KEY},
+        ),
+        clock,
+    )
+    await h.handle.prepare()
+    assert h.handle.settings.listen is not None
+    assert h.handle.settings.listen.detector.api_key == DETECTOR_KEY
+    assert all(DETECTOR_KEY not in text for text in trace_texts(h.runtime.bus))
+    assert runner.spawn_count == 0
+
+
+class _OwnedByAnother:
+    """An ownership table naming another module the owner of every pair."""
+
+    def owner(self, family: str, platform: str) -> str | None:
+        return "another_input"
+
+    def is_set_none(self, family: str, platform: str) -> bool:
+        return False
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        return (("chat", "*"), ("cues", "*"), ("viewers", "*"))
+
+    def excluded(self, family: str) -> frozenset[str]:
+        return frozenset()
+
+
+async def test_p12_a_speech_event_passes_the_ownership_guard() -> None:
+    """R7 risk (P2): ``produces: [channel.chat.message]`` does not trip the
+    ownership guard — ``speech`` belongs to no family, so a ``speech`` event
+    published through ``audio_input``'s owned bus, with another module
+    owning every chat pair, reaches the bus and counts no rejection, while
+    a chat ``message`` through the same bus is refused."""
+
+    clock = ManualClock(1000.0)
+    runtime = runtime_context(clock=clock)
+    context = runtime.for_module(MODULE_NAME, ownership=_OwnedByAnother(), declared=False)
+    speech = candidate("s-1")
+    speech["payload"]["text"] = "hey nova what is this"
+    message = candidate("m-1", kind="message")
+
+    for event in (speech, message):
+        await context.bus.publish(event["type"], event["payload"], event["metadata"])
+
+    published = events_of(runtime.bus, "channel.chat.message")
+    assert [event["payload"]["message_id"] for event in published] == ["s-1"]
+    assert runtime.supervision.snapshot()["input_ownership_rejections"] == 1
 
 
 # --------------------------------------------------------------------------- #

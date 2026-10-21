@@ -91,7 +91,16 @@ and ``_sleeper`` the sleep every bound is raced against, so a deadline is
 exercised on an injected clock without a sleeping child. They are read from
 *settings* and never from a configuration file.
 
-Lifecycle: the manifest declares no role, so the handle takes part in
+**The voice input** (phase 8 R7). ``listen`` (off by default) and
+``wake_word.detector`` configure it; they are checked only when
+``listen.enabled`` is true, each refusal naming its key and echoing no value.
+The declared ``wake_word`` type is decided by :func:`_wake_word_hook`, which
+reads the candidate's ``payload.wake_word.detected`` and nothing else. With
+listening off no detector and no source is ever started and the module is the
+phase-7 one.
+
+Lifecycle: the manifest declares the ``input`` role, so ``start_inputs`` and
+``stop_inputs`` are phases of the handle — no-ops while listening is off — beside
 ``prepare``, ``drain`` and ``close``. ``prepare`` probes each source — a
 ``command`` must name an executable, a ``file`` must be readable — binds
 ``audio.capture`` when at least one is usable and reports ``module.degraded``
@@ -118,6 +127,7 @@ import struct
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -224,6 +234,8 @@ _SETTING_MAX_BYTES = "max_bytes"
 _SETTING_GRACE_SECONDS = "grace_seconds"
 _SETTING_TRANSCRIPTION = "transcription"
 _SETTING_REQUIRED = "required"
+_SETTING_LISTEN = "listen"
+_SETTING_WAKE_WORD = "wake_word"
 _SETTINGS = frozenset(
     {
         _SETTING_SOURCES,
@@ -233,12 +245,58 @@ _SETTINGS = frozenset(
         _SETTING_GRACE_SECONDS,
         _SETTING_TRANSCRIPTION,
         _SETTING_REQUIRED,
+        _SETTING_LISTEN,
+        _SETTING_WAKE_WORD,
     }
 )
 _TRANSCRIPTION_TEXT_FIELDS = ("endpoint", "model", "api_key", "language")
 _TRANSCRIPTION_FIELDS = frozenset(
     {"enabled", "timeout_seconds", "max_chars", *_TRANSCRIPTION_TEXT_FIELDS}
 )
+
+#: The voice input (phase 8 R7): the ``listen`` fields and their defaults.
+_LISTEN_ENABLED = "enabled"
+_LISTEN_SOURCE = "source"
+_LISTEN_PRE_ROLL_SECONDS = "pre_roll_seconds"
+_LISTEN_SPEAKER = "speaker"
+_LISTEN_DESTINATION = "destination"
+_LISTEN_RETRY_SECONDS = "retry_seconds"
+_LISTEN_MAX_SECONDS = "max_seconds"
+_LISTEN_FIELDS = frozenset(
+    {
+        _LISTEN_ENABLED,
+        _LISTEN_SOURCE,
+        _LISTEN_PRE_ROLL_SECONDS,
+        _LISTEN_SPEAKER,
+        _LISTEN_DESTINATION,
+        _LISTEN_RETRY_SECONDS,
+        _LISTEN_MAX_SECONDS,
+    }
+)
+DEFAULT_LISTEN_PRE_ROLL_SECONDS = 2.0
+DEFAULT_LISTEN_SPEAKER = "streamer"
+DEFAULT_LISTEN_RETRY_SECONDS = 5.0
+DEFAULT_LISTEN_MAX_SECONDS = 10
+LISTEN_PRE_ROLL_MAX_SECONDS = 5
+LISTEN_RETRY_MIN_SECONDS = 1
+LISTEN_RETRY_MAX_SECONDS = 300
+_DESTINATION_FIELDS = ("platform", "channel_id")
+
+#: The wake-word detector: ``{kind: command, argv}`` or ``{kind: http,
+#: endpoint, api_key?}``, configured, never embedded and never assumed.
+_WAKE_WORD_DETECTOR = "detector"
+DETECTOR_KIND_COMMAND = "command"
+DETECTOR_KIND_HTTP = "http"
+_DETECTOR_FIELDS = {
+    DETECTOR_KIND_COMMAND: frozenset({"kind", "argv"}),
+    DETECTOR_KIND_HTTP: frozenset({"kind", "endpoint", "api_key"}),
+}
+
+WAKE_WORD_TYPE = "wake_word"
+"""The hooked trigger type this module declares and supplies the hook of (R3, R7)."""
+
+_WAKE_WORD_PAYLOAD = "wake_word"
+_WAKE_WORD_DETECTED = "detected"
 
 #: The injection seams: read from *settings*, never from a configuration file.
 _SEAM_SOURCE_FACTORY = "_source_factory"
@@ -370,6 +428,155 @@ def validate_settings(settings: Any) -> list[str]:
         diagnostics.extend(_transcription_diagnostics(settings[_SETTING_TRANSCRIPTION]))
     if _SETTING_REQUIRED in settings and not isinstance(settings[_SETTING_REQUIRED], bool):
         diagnostics.append(_setting_diagnostic(_SETTING_REQUIRED, "must be a boolean"))
+    if _listening(settings):
+        diagnostics.extend(_listen_diagnostics(settings))
+    return diagnostics
+
+
+def _listening(settings: Mapping[str, Any]) -> bool:
+    """Whether *settings* enable the voice input (phase 8 R7)."""
+
+    listen = settings.get(_SETTING_LISTEN)
+    return isinstance(listen, Mapping) and listen.get(_LISTEN_ENABLED) is True
+
+
+def _listen_diagnostics(settings: Mapping[str, Any]) -> list[str]:
+    """The diagnostics of an enabled ``listen`` and its detector, value-free (R7).
+
+    Only called with listening enabled: with ``listen`` absent or disabled
+    nothing here is checked and the module is the phase-7 one.
+    """
+
+    listen = settings[_SETTING_LISTEN]
+    field = _SETTING_LISTEN
+    diagnostics: list[str] = []
+    for key in listen:
+        if key not in _LISTEN_FIELDS:
+            diagnostics.append(
+                _setting_diagnostic(f"{field}.{key}", "is not a field of the voice input")
+            )
+
+    source = listen.get(_LISTEN_SOURCE)
+    sources = settings.get(_SETTING_SOURCES)
+    entry = sources.get(source) if isinstance(sources, Mapping) and _is_text(source) else None
+    if not isinstance(entry, Mapping) or entry.get("kind") != SOURCE_KIND_COMMAND:
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{field}.{_LISTEN_SOURCE}", "must name a configured 'command' source"
+            )
+        )
+
+    module_max = settings.get(_SETTING_MAX_SECONDS, DEFAULT_MAX_SECONDS)
+    max_seconds = listen.get(_LISTEN_MAX_SECONDS, DEFAULT_LISTEN_MAX_SECONDS)
+    max_valid = _is_positive_int(max_seconds) and (
+        not _is_positive_int(module_max) or max_seconds <= module_max
+    )
+    if not max_valid:
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{field}.{_LISTEN_MAX_SECONDS}",
+                f"must be an integer from 1 to the module's {_SETTING_MAX_SECONDS!r}",
+            )
+        )
+    pre_roll = listen.get(_LISTEN_PRE_ROLL_SECONDS, DEFAULT_LISTEN_PRE_ROLL_SECONDS)
+    if not _is_non_negative_number(pre_roll) or pre_roll > LISTEN_PRE_ROLL_MAX_SECONDS:
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{field}.{_LISTEN_PRE_ROLL_SECONDS}",
+                f"must be a number from 0 to {LISTEN_PRE_ROLL_MAX_SECONDS}",
+            )
+        )
+    elif max_valid and not pre_roll < max_seconds:
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{field}.{_LISTEN_PRE_ROLL_SECONDS}",
+                f"must be less than {field}.{_LISTEN_MAX_SECONDS}",
+            )
+        )
+    if _LISTEN_SPEAKER in listen and not _is_text(listen[_LISTEN_SPEAKER]):
+        diagnostics.append(
+            _setting_diagnostic(f"{field}.{_LISTEN_SPEAKER}", "must be a non-empty string")
+        )
+    retry = listen.get(_LISTEN_RETRY_SECONDS, DEFAULT_LISTEN_RETRY_SECONDS)
+    if not _is_finite_number(retry) or not (
+        LISTEN_RETRY_MIN_SECONDS <= retry <= LISTEN_RETRY_MAX_SECONDS
+    ):
+        diagnostics.append(
+            _setting_diagnostic(
+                f"{field}.{_LISTEN_RETRY_SECONDS}",
+                f"must be a number from {LISTEN_RETRY_MIN_SECONDS} "
+                f"to {LISTEN_RETRY_MAX_SECONDS}",
+            )
+        )
+    diagnostics.extend(_destination_diagnostics(listen.get(_LISTEN_DESTINATION)))
+    diagnostics.extend(_detector_diagnostics(settings.get(_SETTING_WAKE_WORD)))
+    return diagnostics
+
+
+def _destination_diagnostics(destination: Any) -> list[str]:
+    field = f"{_SETTING_LISTEN}.{_LISTEN_DESTINATION}"
+    if not isinstance(destination, Mapping):
+        return [_setting_diagnostic(field, "must be a mapping of platform and channel_id")]
+    diagnostics = [
+        _setting_diagnostic(f"{field}.{key}", "must be a non-empty string")
+        for key in _DESTINATION_FIELDS
+        if not _is_text(destination.get(key))
+    ]
+    for key in destination:
+        if key not in _DESTINATION_FIELDS:
+            diagnostics.append(
+                _setting_diagnostic(f"{field}.{key}", "is not a field of the destination")
+            )
+    return diagnostics
+
+
+def _detector_diagnostics(wake_word: Any) -> list[str]:
+    """The diagnostics of ``wake_word.detector``, required while listening."""
+
+    field = f"{_SETTING_WAKE_WORD}.{_WAKE_WORD_DETECTOR}"
+    if wake_word is not None and not isinstance(wake_word, Mapping):
+        return [_setting_diagnostic(_SETTING_WAKE_WORD, "must be a mapping")]
+    diagnostics: list[str] = []
+    for key in wake_word or {}:
+        if key != _WAKE_WORD_DETECTOR:
+            diagnostics.append(
+                _setting_diagnostic(
+                    f"{_SETTING_WAKE_WORD}.{key}", "is not a field of the wake word"
+                )
+            )
+    detector = (wake_word or {}).get(_WAKE_WORD_DETECTOR)
+    if detector is None:
+        diagnostics.append(_setting_diagnostic(field, "is required while listening is enabled"))
+        return diagnostics
+    if not isinstance(detector, Mapping):
+        diagnostics.append(_setting_diagnostic(field, "must be a mapping"))
+        return diagnostics
+    kind = detector.get("kind")
+    if not isinstance(kind, str) or kind not in _DETECTOR_FIELDS:
+        diagnostics.append(_setting_diagnostic(f"{field}.kind", "must be 'command' or 'http'"))
+        return diagnostics
+    if kind == DETECTOR_KIND_COMMAND:
+        argv = detector.get("argv")
+        if (
+            not isinstance(argv, (list, tuple))
+            or not argv
+            or not all(_is_text(item) for item in argv)
+        ):
+            diagnostics.append(
+                _setting_diagnostic(f"{field}.argv", "must be a non-empty list of strings")
+            )
+    else:
+        if not _is_text(detector.get("endpoint")):
+            diagnostics.append(
+                _setting_diagnostic(f"{field}.endpoint", "must be a non-empty string")
+            )
+        if "api_key" in detector and not isinstance(detector["api_key"], str):
+            diagnostics.append(_setting_diagnostic(f"{field}.api_key", "must be a string"))
+    for key in detector:
+        if key not in _DETECTOR_FIELDS[kind]:
+            diagnostics.append(
+                _setting_diagnostic(f"{field}.{key}", "is not a field of this detector kind")
+            )
     return diagnostics
 
 
@@ -510,6 +717,62 @@ class _Transcription:
 
 
 @dataclass(frozen=True, slots=True)
+class DetectorSpec:
+    """The configured wake-word detector; never rendered into a diagnostic."""
+
+    kind: str
+    argv: tuple[str, ...] = ()
+    endpoint: str = ""
+    api_key: str = ""
+
+    @classmethod
+    def from_mapping(cls, entry: Mapping[str, Any]) -> "DetectorSpec":
+        if entry["kind"] == DETECTOR_KIND_COMMAND:
+            return cls(
+                kind=DETECTOR_KIND_COMMAND, argv=tuple(str(item) for item in entry["argv"])
+            )
+        return cls(
+            kind=DETECTOR_KIND_HTTP,
+            endpoint=str(entry["endpoint"]),
+            api_key=str(entry.get("api_key", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ListenSettings:
+    """The enabled voice input, parsed (phase 8 R7)."""
+
+    source: str
+    pre_roll_seconds: float
+    speaker: str
+    #: ``{platform, channel_id}``: the channel the event's run answers on.
+    destination: Mapping[str, str]
+    retry_seconds: float
+    max_seconds: int
+    detector: DetectorSpec
+
+    @classmethod
+    def from_mapping(cls, settings: Mapping[str, Any]) -> "ListenSettings":
+        listen = settings[_SETTING_LISTEN]
+        destination = listen[_LISTEN_DESTINATION]
+        return cls(
+            source=str(listen[_LISTEN_SOURCE]),
+            pre_roll_seconds=float(
+                listen.get(_LISTEN_PRE_ROLL_SECONDS, DEFAULT_LISTEN_PRE_ROLL_SECONDS)
+            ),
+            speaker=str(listen.get(_LISTEN_SPEAKER, DEFAULT_LISTEN_SPEAKER)),
+            destination=MappingProxyType(
+                {key: str(destination[key]) for key in _DESTINATION_FIELDS}
+            ),
+            retry_seconds=float(listen.get(_LISTEN_RETRY_SECONDS, DEFAULT_LISTEN_RETRY_SECONDS)),
+            max_seconds=int(listen.get(_LISTEN_MAX_SECONDS, DEFAULT_LISTEN_MAX_SECONDS)),
+            detector=DetectorSpec.from_mapping(
+                settings[_SETTING_WAKE_WORD][_WAKE_WORD_DETECTOR]
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _Settings:
     """The accepted settings, parsed once."""
 
@@ -520,6 +783,8 @@ class _Settings:
     grace_seconds: float
     transcription: _Transcription
     required: bool
+    #: ``None`` unless ``listen.enabled`` is true: the phase-7 module.
+    listen: ListenSettings | None = None
 
     @classmethod
     def from_mapping(cls, settings: Mapping[str, Any]) -> "_Settings":
@@ -534,7 +799,31 @@ class _Settings:
             grace_seconds=float(settings.get(_SETTING_GRACE_SECONDS, DEFAULT_GRACE_SECONDS)),
             transcription=_Transcription.from_mapping(settings.get(_SETTING_TRANSCRIPTION, {})),
             required=bool(settings.get(_SETTING_REQUIRED, False)),
+            listen=ListenSettings.from_mapping(settings) if _listening(settings) else None,
         )
+
+
+# --------------------------------------------------------------------------- #
+# The wake-word hook (phase 8 R3, R7)
+# --------------------------------------------------------------------------- #
+
+
+async def _wake_word_hook(view: Mapping[str, Any], parameters: Mapping[str, Any]) -> bool:
+    """Decide a candidate by the verdict it carries, and nothing else.
+
+    ``True`` iff ``payload.wake_word.detected`` is ``True``, ``False`` iff it
+    is ``False``; any other shape raises, which the engine records as
+    ``wake_word_hook_error`` — never a silent pass. The rule's parameters
+    are empty and not read, nor is any other field of the event.
+    """
+
+    del parameters
+    detected = view["payload"][_WAKE_WORD_PAYLOAD][_WAKE_WORD_DETECTED]
+    if detected is True:
+        return True
+    if detected is False:
+        return False
+    raise ValueError("payload.wake_word.detected is not a boolean")
 
 
 # --------------------------------------------------------------------------- #
@@ -1076,8 +1365,14 @@ class AudioInputModule:
         self._attachments = context.attachments
         self._clock: Callable[[], float] = context.clock
         self._supervision = getattr(context, "supervision", None)
+        self._tasks = getattr(context, "tasks", None)
+        self._supply_trigger_hook = getattr(context, "supply_trigger_hook", None)
         self._settings = settings
         self._sources = dict(sources)
+        # The voice input's source and its loop's task owner, resolved at
+        # ``prepare`` when listening is enabled (R7); nothing is started there.
+        self._listen_source: Any | None = None
+        self._listen_owner: Any | None = None
         self._sleeper = sleeper
         # The transcription transport: made on first use, released by close.
         self._transport_factory = transport_factory
@@ -1113,6 +1408,24 @@ class AudioInputModule:
 
         return self._transcription_available
 
+    @property
+    def listening(self) -> bool:
+        """Whether the voice input is enabled (phase 8 R7)."""
+
+        return self._settings.listen is not None
+
+    @property
+    def listen_source(self) -> Any | None:
+        """The source a wake word acquires from, resolved at ``prepare``."""
+
+        return self._listen_source
+
+    @property
+    def listen_owner(self) -> Any | None:
+        """The supervised-task owner the listen loop runs under, from ``prepare``."""
+
+        return self._listen_owner
+
     # -- lifecycle hooks ---------------------------------------------------- #
 
     async def prepare(self) -> None:
@@ -1137,11 +1450,19 @@ class AudioInputModule:
         unavailable`` and no capability (decision 11), and every capture
         reports ``unavailable`` without a request. Nothing is spawned and no
         task is started.
+
+        With listening enabled (phase 8 R7) it also resolves ``listen.source``,
+        registers the module's own supervised-task registry as the listen
+        loop's owner and supplies :func:`_wake_word_hook` for the declared
+        ``wake_word`` type; it starts no process, reads no audio and emits no
+        input. With listening off none of this happens.
         """
 
         if self._prepared or self._closed:
             return
         settings = self._settings
+        if settings.listen is not None:
+            self._prepare_listening(settings.listen)
         unusable: list[str] = []
         for name in settings.sources:
             if _probe(self._sources[name]) is not None:
@@ -1183,6 +1504,39 @@ class AudioInputModule:
         if transcription_failed:
             await self._report_degraded(TRANSCRIPTION_DEGRADED_REASON, [])
         self._actions.mark_ready()
+
+    def _prepare_listening(self, listen: ListenSettings) -> None:
+        """Resolve the voice input's source and owner, supply the hook (R7)."""
+
+        if not callable(getattr(self._tasks, "spawn", None)):
+            raise AudioInputModuleError(
+                f"{MODULE_NAME} prepare: field '{_SETTING_LISTEN}': "
+                "no supervised task registry owns the listen loop"
+            )
+        if not callable(self._supply_trigger_hook):
+            raise AudioInputModuleError(
+                f"{MODULE_NAME} prepare: field '{_SETTING_LISTEN}': "
+                "no trigger engine decides the wake word"
+            )
+        try:
+            self._supply_trigger_hook(WAKE_WORD_TYPE, _wake_word_hook)
+        except Exception:
+            raise AudioInputModuleError(
+                f"{MODULE_NAME} prepare: field '{_SETTING_LISTEN}': "
+                f"the {WAKE_WORD_TYPE!r} hook could not be supplied"
+            ) from None
+        self._listen_source = self._sources[listen.source]
+        self._listen_owner = self._tasks
+
+    async def start_inputs(self) -> None:
+        """The input phase (R7): with listening off, nothing starts.
+
+        The listen loop is not run by this step; this phase starts no task,
+        no detector and no source.
+        """
+
+    async def stop_inputs(self) -> None:
+        """The end of the input phase: with nothing started, nothing stops."""
 
     async def drain(self, deadline_seconds: float) -> None:
         """Kill every running recorder; let the transcriptions end within the deadline.
@@ -1869,6 +2223,12 @@ __all__ = [
     "CAPTURE_ACTION",
     "CHANNELS",
     "CONTENT_TYPE_WAV",
+    "DEFAULT_LISTEN_MAX_SECONDS",
+    "DEFAULT_LISTEN_PRE_ROLL_SECONDS",
+    "DEFAULT_LISTEN_RETRY_SECONDS",
+    "DEFAULT_LISTEN_SPEAKER",
+    "DETECTOR_KIND_COMMAND",
+    "DETECTOR_KIND_HTTP",
     "DEFAULT_GRACE_SECONDS",
     "DEFAULT_MAX_BYTES",
     "DEFAULT_MAX_SECONDS",
@@ -1898,14 +2258,17 @@ __all__ = [
     "TRANSCRIPTION_STT_TIMED_OUT",
     "TRANSCRIPTION_STT_UNAVAILABLE",
     "TRANSCRIPTION_UNAVAILABLE",
+    "WAKE_WORD_TYPE",
     "WAV_HEADER_BYTES",
     "AudioInputModule",
     "AudioInputModuleError",
     "CaptureError",
     "CommandRecording",
     "CommandSource",
+    "DetectorSpec",
     "FileSource",
     "InvalidSegment",
+    "ListenSettings",
     "RecorderProcess",
     "Segment",
     "SourceSpec",

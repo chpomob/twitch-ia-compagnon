@@ -2849,6 +2849,11 @@ def test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base()
 #: The event type whose payload carries a (family, platform) pair (D1).
 _FAMILY_EVENT = "channel.chat.message"
 
+#: Undeclared shipped modules that produce the family event with a payload
+#: kind no family covers: ``audio_input`` publishes only ``speech`` (R7), so
+#: no (family, platform) pair it builds can meet a resolved owner.
+_NO_FAMILY_PRODUCERS = frozenset({"audio_input"})
+
 
 def _manifest_of(name: str) -> dict[str, Any]:
     loaded = yaml.safe_load(
@@ -2910,6 +2915,8 @@ async def test_ac44_no_undeclared_shipped_publisher_meets_a_resolved_owner(
 
     for module in undeclared:
         produced = _manifest_of(module).get("produces") or []
+        if module in _NO_FAMILY_PRODUCERS:
+            continue
         families = ("chat", "cues") if _FAMILY_EVENT in produced else ()
         for family in families:
             for row_family, platform in rows:

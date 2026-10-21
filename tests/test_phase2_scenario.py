@@ -564,6 +564,7 @@ async def start_agent_side(clock: ManualClock, audio: AudioSeams) -> AgentSide:
     store = AttachmentStore(clock=clock, **STORE_LIMITS)
     context = build_context(
         clock=clock,
+        trigger_registry=TriggerRegistry(companion_name=COMPANION),
         attachments=store,
         authorization=AuthorizationPolicy(
             [agent_grant(AUDIO_CAPTURE), agent_grant(AUDIO_SPEAK)]
