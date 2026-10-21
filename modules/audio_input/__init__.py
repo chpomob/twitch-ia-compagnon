@@ -86,7 +86,8 @@ with no request (decision 11).
 each configured source (by default :class:`FileSource` and
 :class:`CommandSource`; a harness hands in its own), ``_subprocess_runner``
 replaces ``asyncio.create_subprocess_exec`` for the command sources,
-``_transcription_transport`` the HTTP session of the optional transcription
+``_transcription_transport`` the HTTP session of the optional transcription,
+``_detector_session`` the HTTP session of an ``http`` wake-word detector
 and ``_sleeper`` the sleep every bound is raced against, so a deadline is
 exercised on an injected clock without a sleeping child. They are read from
 *settings* and never from a configuration file.
@@ -98,6 +99,35 @@ The declared ``wake_word`` type is decided by :func:`_wake_word_hook`, which
 reads the candidate's ``payload.wake_word.detected`` and nothing else. With
 listening off no detector and no source is ever started and the module is the
 phase-7 one.
+
+**One iteration of listening** (R7, A5) — :meth:`AudioInputModule.listen_once`
+— runs four steps in this order and never in another. (1) *Verdict*: the
+configured detector is awaited once, with no deadline of the companion's —
+a ``command`` detector (:class:`CommandDetector`) is started through the
+``_subprocess_runner`` seam with its standard input empty, exit 0 with a
+trimmed standard output of 1 to 64 characters is a detection, exit 1 no
+verdict, anything else a failure; an ``http`` detector (:class:`HttpDetector`)
+sends one request carrying no audio through the ``_detector_session`` seam,
+with no request timeout, and only ``{"detected": true, "phrase": …}`` or
+``{"detected": false}`` are verdicts. A failure is a fixed code, never a
+stringified exception. (2) *Candidate*: a detection builds a schema-2
+``speech`` candidate (:func:`speech_candidate`) carrying ``payload.wake_word``
+and the phrase as its text, decided by ``context.triggers.evaluate_async``
+and traced; it is never published. (3) *Acquisition*: only an accepted
+candidate invokes ``listen.source`` once, with ``AUDIO_INPUT_PRE_ROLL_SECONDS``
+and ``AUDIO_INPUT_MAX_SECONDS`` in its environment; a WAV whose header is
+not honest about its data, lasts more than ``listen.max_seconds`` by that
+header or weighs more than ``max_bytes`` is a counted source failure — never
+trimmed or padded — and the segment is transcribed once through the
+``transcription`` settings, held in a local only until then: nothing reaches
+the attachment store, the disk or the bus. (4) *Event*: a non-empty
+transcription is published once as a ``speech`` event with the candidate's
+author, ``message_id``, destination and source and no ``wake_word``; it is
+never submitted to the engine. Admission is exactly once, as for the
+operator's press: a scheduler the context carries is admitted into directly;
+otherwise the brain owns the scheduler and its bus consumer admits the
+published copy under the candidate's recorded decision. Each settlement is
+counted (:meth:`AudioInputModule.counts`).
 
 Lifecycle: the manifest declares the ``input`` role, so ``start_inputs`` and
 ``stop_inputs`` are phases of the handle — no-ops while listening is off — beside
@@ -124,6 +154,7 @@ import os
 import shutil
 import signal
 import struct
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,15 +169,20 @@ except ModuleNotFoundError:  # pragma: no cover - production installs dependenci
     aiohttp = None  # type: ignore[assignment]
 
 from core.actions import ERROR_CANCELLED, ERROR_INVALID_ARGUMENTS
+from core.admission import Work
 from core.attachments import AttachmentRefused
 from core.contracts import (
     BRAIN_ERROR_ATTACHMENT_REFUSED,
     BRAIN_ERROR_INVALID_RESULT,
     PART_TYPE_AUDIO_REF,
+    TRACE_INPUT_TRIGGER_ACCEPTED,
+    TRACE_INPUT_TRIGGER_REJECTED,
     ActionObservation,
     ActionSpec,
     Destination,
+    SessionKey,
 )
+from core.triggers import NORMALIZED_SCHEMA_VERSION, decision_trace_payload
 
 
 MODULE_NAME = "audio_input"
@@ -297,14 +333,79 @@ WAKE_WORD_TYPE = "wake_word"
 
 _WAKE_WORD_PAYLOAD = "wake_word"
 _WAKE_WORD_DETECTED = "detected"
+_WAKE_WORD_PHRASE = "phrase"
+
+#: The voice input's events: kind, bus type, reserved author and work kind.
+SPEECH_KIND = "speech"
+SPEECH_EVENT_TYPE = "channel.chat.message"
+VOICE_AUTHOR_PREFIX = "voice:"
+WORK_KIND = "audio_input.speech"
+#: The service key the brain publishes its owned scheduler under.
+ADMISSION_SERVICE_KIND = "admission"
+ADMISSION_SERVICE_SCOPE = "runs"
+
+#: The environment an acquisition's source is started with (R7 step 3).
+ENV_PRE_ROLL_SECONDS = "AUDIO_INPUT_PRE_ROLL_SECONDS"
+ENV_MAX_SECONDS = "AUDIO_INPUT_MAX_SECONDS"
+
+PHRASE_MAX_CHARS = 64
+"""The longest phrase a detector may report (R7)."""
+
+#: How much of a command detector's stdout, and of an HTTP detector's
+#: answer, is held: a phrase is at most 64 characters, so anything past
+#: this is not a verdict.
+_DETECTOR_OUTPUT_MAX_BYTES = 4096
+_DETECTOR_READ_CHUNK = 4096
+
+#: The fixed codes a detector failure carries; never an exception's text.
+DETECTOR_UNSTARTABLE = "detector_unstartable"
+DETECTOR_EXIT_STATUS = "detector_exit_status"
+DETECTOR_INVALID_PHRASE = "detector_invalid_phrase"
+DETECTOR_OUTPUT_TOO_LONG = "detector_output_too_long"
+DETECTOR_UNREACHABLE = "detector_unreachable"
+DETECTOR_HTTP_STATUS = "detector_http_status"
+DETECTOR_INVALID_ANSWER = "detector_invalid_answer"
+
+#: How one iteration of listening settled (:meth:`AudioInputModule.listen_once`).
+SETTLED_STOPPED = "stopped"
+SETTLED_NO_VERDICT = "no_verdict"
+SETTLED_DETECTOR_FAILURE = "detector_failure"
+SETTLED_DECLINED = "declined"
+SETTLED_SOURCE_FAILURE = "source_failure"
+SETTLED_TRANSCRIPTION_ERROR = "transcription_error"
+SETTLED_EMPTY_TRANSCRIPTION = "empty_transcription"
+SETTLED_PUBLISHED = "published"
+
+#: The counts :meth:`AudioInputModule.counts` reports for listening.
+COUNT_DETECTOR_FAILURES = "detector_failures"
+COUNT_SOURCE_FAILURES = "source_failures"
+COUNT_TRANSCRIPTION_ERRORS = "transcription_errors"
+COUNT_EMPTY_TRANSCRIPTIONS = "empty_transcriptions"
+COUNT_CANDIDATES = "candidates"
+COUNT_PUBLISHED = "published"
+_LISTEN_COUNTS = (
+    COUNT_DETECTOR_FAILURES,
+    COUNT_SOURCE_FAILURES,
+    COUNT_TRANSCRIPTION_ERRORS,
+    COUNT_EMPTY_TRANSCRIPTIONS,
+    COUNT_CANDIDATES,
+    COUNT_PUBLISHED,
+)
 
 #: The injection seams: read from *settings*, never from a configuration file.
 _SEAM_SOURCE_FACTORY = "_source_factory"
 _SEAM_SUBPROCESS_RUNNER = "_subprocess_runner"
 _SEAM_TRANSCRIPTION_TRANSPORT = "_transcription_transport"
 _SEAM_SLEEPER = "_sleeper"
+_SEAM_DETECTOR_SESSION = "_detector_session"
 _SEAMS = frozenset(
-    {_SEAM_SOURCE_FACTORY, _SEAM_SUBPROCESS_RUNNER, _SEAM_TRANSCRIPTION_TRANSPORT, _SEAM_SLEEPER}
+    {
+        _SEAM_SOURCE_FACTORY,
+        _SEAM_SUBPROCESS_RUNNER,
+        _SEAM_TRANSCRIPTION_TRANSPORT,
+        _SEAM_SLEEPER,
+        _SEAM_DETECTOR_SESSION,
+    }
 )
 
 #: The multipart field names and the file name the transcription request uses.
@@ -1038,9 +1139,20 @@ class CommandSource:
             return "does not resolve to an executable"
         return None
 
-    def begin(self) -> "CommandRecording":
+    def begin(self, environment: Mapping[str, str] | None = None) -> "CommandRecording":
+        """One recording; *environment* is added to the recorder's own (R7).
+
+        A recording begun with an environment is the voice input's
+        acquisition: it is read until the source exits on its own.
+        """
+
         return CommandRecording(
-            self._argv, runner=self._runner, sleeper=self._sleeper, limit=self._limit
+            self._argv,
+            runner=self._runner,
+            sleeper=self._sleeper,
+            limit=self._limit,
+            environment=environment,
+            until_exit=environment is not None,
         )
 
 
@@ -1054,23 +1166,58 @@ class CommandRecording:
     flushed until its stdout closes. Memory never holds more than the bound,
     however long a recorder streams. :meth:`kill` is synchronous and
     idempotent: one kill per recording, whatever triggers it.
+
+    With an *environment* (the voice input's acquisition, R7) the recorder
+    is started with it added to the process's own environment; without one
+    the recorder inherits it unchanged, as every ``audio.capture`` does.
+    :attr:`failed_exit` tells whether the recorder ended on its own with a
+    status other than 0 — never the case for one this reader stopped.
+
+    With *until_exit* (the acquisition) the source ends the segment itself:
+    nothing stops it at ``seconds`` or at a data size — the caller's own
+    deadline kills it — and :attr:`failed_exit` holds unless it exited with
+    status 0 by itself; a source that reached the byte bound is terminated
+    and failed too. R7 counts every outcome but a clean exit as a failure.
     """
 
-    __slots__ = ("_argv", "_killed", "_limit", "_process", "_runner", "_sleeper")
+    __slots__ = (
+        "_argv",
+        "_environment",
+        "_killed",
+        "_limit",
+        "_process",
+        "_runner",
+        "_sleeper",
+        "_until_exit",
+        "failed_exit",
+    )
 
     def __init__(
-        self, argv: Sequence[str], *, runner: SubprocessRunner, sleeper: Sleeper, limit: int
+        self,
+        argv: Sequence[str],
+        *,
+        runner: SubprocessRunner,
+        sleeper: Sleeper,
+        limit: int,
+        environment: Mapping[str, str] | None = None,
+        until_exit: bool = False,
     ) -> None:
         self._argv = tuple(argv)
         self._runner = runner
         self._sleeper = sleeper
         self._limit = int(limit)
+        self._environment = None if environment is None else dict(environment)
         self._process: Any | None = None
         self._killed = False
+        self._until_exit = bool(until_exit)
+        self.failed_exit = False
 
     async def read(self, seconds: int) -> bytes:
         if self._killed:
             return b""
+        options: dict[str, Any] = {}
+        if self._environment is not None:
+            options["env"] = {**os.environ, **self._environment}
         try:
             process = await self._runner(
                 *self._argv,
@@ -1078,6 +1225,7 @@ class CommandRecording:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
+                **options,
             )
         except asyncio.CancelledError:
             raise
@@ -1088,12 +1236,15 @@ class CommandRecording:
             # Killed while it was being started: it never records.
             self._kill_process()
             return b""
+        if self._until_exit:
+            return await self._read_until_exit(process)
 
         needed = int(seconds) * BYTES_PER_SECOND
         buffer = bytearray()
         timer = asyncio.ensure_future(self._sleeper(float(seconds)))
         reading: asyncio.Future[Any] | None = None
         terminated = False
+        stopped = False
         try:
             while True:
                 reading = asyncio.ensure_future(process.stdout.read(_READ_CHUNK))
@@ -1112,6 +1263,7 @@ class CommandRecording:
                     break
                 buffer += chunk
                 if len(buffer) >= self._limit or _holds(buffer, needed):
+                    stopped = True
                     break
             if not terminated:
                 self._terminate()
@@ -1120,7 +1272,15 @@ class CommandRecording:
             close_stdout = getattr(process, "close_stdout", None)
             if callable(close_stdout):
                 close_stdout()
-            await process.wait()
+            status = await process.wait()
+            # Only an exit status the recorder chose: a signal may be the
+            # terminate this reader sent once its stdout closed.
+            self.failed_exit = (
+                not (terminated or stopped)
+                and isinstance(status, int)
+                and not isinstance(status, bool)
+                and status > 0
+            )
         except BaseException:
             if reading is not None and not reading.done():
                 reading.cancel()
@@ -1129,6 +1289,40 @@ class CommandRecording:
         finally:
             if not timer.done():
                 timer.cancel()
+        return bytes(buffer[: self._limit])
+
+    async def _read_until_exit(self, process: Any) -> bytes:
+        """Read until the source closes its stdout and exits; fail unless it exits 0."""
+
+        buffer = bytearray()
+        reading: asyncio.Future[Any] | None = None
+        overflowed = False
+        try:
+            while True:
+                reading = asyncio.ensure_future(process.stdout.read(_READ_CHUNK))
+                chunk = await reading
+                reading = None
+                if not chunk:
+                    break
+                buffer += chunk
+                if len(buffer) >= self._limit:
+                    # Past the byte bound: the segment is refused whatever
+                    # follows, so the source is stopped and failed.
+                    overflowed = True
+                    self._terminate()
+                    break
+            close_stdout = getattr(process, "close_stdout", None)
+            if callable(close_stdout):
+                close_stdout()
+            status = await process.wait()
+            self.failed_exit = overflowed or not (
+                isinstance(status, int) and not isinstance(status, bool) and status == 0
+            )
+        except BaseException:
+            if reading is not None and not reading.done():
+                reading.cancel()
+            self._kill_process()
+            raise
         return bytes(buffer[: self._limit])
 
     def kill(self) -> None:
@@ -1272,6 +1466,287 @@ def default_source_factory(
 
 
 # --------------------------------------------------------------------------- #
+# The voice input: detectors, candidate, segment (phase 8 R7)
+# --------------------------------------------------------------------------- #
+
+
+class DetectorFailure(Exception):
+    """A detector invocation that settled without a verdict (R7).
+
+    ``code`` is one of the fixed ``DETECTOR_*`` codes; no exception text,
+    argv, endpoint or output is ever carried.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class Verdict:
+    """A detection: the phrase the detector matched, and nothing else."""
+
+    phrase: str
+
+
+def _phrase_or_failure(phrase: Any) -> str:
+    """The trimmed phrase of 1 to 64 characters, else a detector failure."""
+
+    if not isinstance(phrase, str):
+        raise DetectorFailure(DETECTOR_INVALID_PHRASE)
+    trimmed = phrase.strip()
+    if not trimmed or len(trimmed) > PHRASE_MAX_CHARS:
+        raise DetectorFailure(DETECTOR_INVALID_PHRASE)
+    return trimmed
+
+
+class CommandDetector:
+    """A ``command`` detector: ``argv`` started per invocation, given no audio.
+
+    Its standard input is empty and the companion sets no deadline on it: the
+    wait is the detector's own. Exit 0 with a trimmed standard output of 1 to
+    64 characters is a detection, exit 1 no verdict; any other status (a
+    signal included), a longer output or a start failure is a
+    :class:`DetectorFailure`. :meth:`terminate` stops the invocation in
+    flight, for the loop's stop.
+    """
+
+    __slots__ = ("_argv", "_process", "_runner")
+
+    def __init__(self, argv: Sequence[str], *, runner: SubprocessRunner) -> None:
+        self._argv = tuple(argv)
+        self._runner = runner
+        self._process: Any | None = None
+
+    async def wait(self) -> Verdict | None:
+        try:
+            process = await self._runner(
+                *self._argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise DetectorFailure(DETECTOR_UNSTARTABLE) from None
+        self._process = process
+        output = bytearray()
+        try:
+            while True:
+                chunk = await process.stdout.read(_DETECTOR_READ_CHUNK)
+                if not chunk:
+                    break
+                output += chunk
+                if len(output) > _DETECTOR_OUTPUT_MAX_BYTES:
+                    _kill_quietly(process)
+                    await process.wait()
+                    raise DetectorFailure(DETECTOR_OUTPUT_TOO_LONG)
+            status = await process.wait()
+        except (asyncio.CancelledError, DetectorFailure):
+            _kill_quietly(process)
+            raise
+        except Exception:
+            _kill_quietly(process)
+            raise DetectorFailure(DETECTOR_EXIT_STATUS) from None
+        finally:
+            self._process = None
+        if status == 1:
+            return None
+        if status != 0:
+            raise DetectorFailure(DETECTOR_EXIT_STATUS)
+        try:
+            text = bytes(output).decode("utf-8")
+        except UnicodeDecodeError:
+            raise DetectorFailure(DETECTOR_INVALID_PHRASE) from None
+        return Verdict(_phrase_or_failure(text))
+
+    def terminate(self) -> None:
+        """Kill the invocation in flight, if any."""
+
+        if self._process is not None:
+            _kill_quietly(self._process)
+
+
+def _kill_quietly(process: Any) -> None:
+    try:
+        process.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+class HttpDetector:
+    """An ``http`` detector: one request per invocation, carrying no audio.
+
+    The request is a ``POST`` with no body, a bearer header when ``api_key``
+    is set, and no request timeout: the session the ``_detector_session``
+    seam makes (by default an ``aiohttp`` session whose timeout is
+    disabled) is made on first use and released by :meth:`close`. Only a
+    200 answer whose JSON body is exactly ``{"detected": true, "phrase":
+    <1 to 64 characters>}`` or ``{"detected": false}`` is a verdict;
+    anything else — another status, a body that is not such JSON, a refused
+    or lost connection — is a :class:`DetectorFailure`.
+    """
+
+    __slots__ = ("_api_key", "_endpoint", "_factory", "_session")
+
+    def __init__(self, endpoint: str, api_key: str, *, session_factory: Callable[[], Any]) -> None:
+        self._endpoint = endpoint
+        self._api_key = api_key
+        self._factory = session_factory
+        self._session: Any | None = None
+
+    async def wait(self) -> Verdict | None:
+        session = await self._session_or_failure()
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        try:
+            response = await session.post(self._endpoint, headers=headers)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - every transport failure is the same code
+            raise DetectorFailure(DETECTOR_UNREACHABLE) from None
+        try:
+            status = getattr(response, "status", None)
+            if status != 200 or isinstance(status, bool):
+                raise DetectorFailure(DETECTOR_HTTP_STATUS)
+            try:
+                body = await _read_bounded(response, _DETECTOR_OUTPUT_MAX_BYTES)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a body lost mid-answer
+                raise DetectorFailure(DETECTOR_UNREACHABLE) from None
+            try:
+                decoded = json.loads(body.decode("utf-8")) if body is not None else None
+            except Exception:  # noqa: BLE001 - not JSON is not a verdict
+                raise DetectorFailure(DETECTOR_INVALID_ANSWER) from None
+        finally:
+            await _release(response)
+        return _http_verdict(decoded)
+
+    async def _session_or_failure(self) -> Any:
+        if self._session is None:
+            try:
+                created = self._factory()
+                if inspect.isawaitable(created):
+                    created = await created
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - reported as the endpoint being unreachable
+                raise DetectorFailure(DETECTOR_UNREACHABLE) from None
+            self._session = created
+        return self._session
+
+    async def close(self) -> None:
+        session, self._session = self._session, None
+        await _close_quietly(session)
+
+
+def _http_verdict(decoded: Any) -> Verdict | None:
+    """The verdict of one of the two shapes, else a detector failure."""
+
+    if isinstance(decoded, Mapping):
+        detected = decoded.get(_WAKE_WORD_DETECTED)
+        if detected is False and set(decoded) == {_WAKE_WORD_DETECTED}:
+            return None
+        if detected is True and set(decoded) == {_WAKE_WORD_DETECTED, _WAKE_WORD_PHRASE}:
+            phrase = decoded[_WAKE_WORD_PHRASE]
+            if isinstance(phrase, str) and len(phrase) <= PHRASE_MAX_CHARS:
+                return Verdict(_phrase_or_failure(phrase))
+            raise DetectorFailure(DETECTOR_INVALID_PHRASE)
+    raise DetectorFailure(DETECTOR_INVALID_ANSWER)
+
+
+def _default_detector_session_factory() -> Any:
+    """An ``aiohttp`` session with no request timeout: the detector's wait is its own."""
+
+    if aiohttp is None:
+        raise RuntimeError("aiohttp is not installed")
+    return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+
+
+DETECTOR_SESSION_FACTORY: Callable[[], Any] = _default_detector_session_factory
+"""The shipped ``http`` detector transport, made on first use."""
+
+
+def build_detector(
+    spec: DetectorSpec, *, runner: SubprocessRunner, session_factory: Callable[[], Any]
+) -> CommandDetector | HttpDetector:
+    """The detector *spec* configures."""
+
+    if spec.kind == DETECTOR_KIND_COMMAND:
+        return CommandDetector(spec.argv, runner=runner)
+    return HttpDetector(spec.endpoint, spec.api_key, session_factory=session_factory)
+
+
+def speech_candidate(listen: ListenSettings, phrase: str) -> dict[str, Any]:
+    """The schema-2 ``speech`` candidate of a detection (R7 step 2).
+
+    It carries the detector's verdict — ``payload.wake_word`` and the phrase
+    as ``text``, never a transcription — the reserved author
+    ``voice:<speaker>``, a fresh ``message_id`` and the configured
+    destination. It is decided, never published.
+    """
+
+    author = f"{VOICE_AUTHOR_PREFIX}{listen.speaker}"
+    return {
+        "type": SPEECH_EVENT_TYPE,
+        "payload": {
+            "platform": listen.destination["platform"],
+            "channel_id": listen.destination["channel_id"],
+            "author": {"id": author, "display_name": listen.speaker},
+            "message_id": f"{author}:{uuid.uuid4().hex}",
+            "text": phrase,
+            "kind": SPEECH_KIND,
+            _WAKE_WORD_PAYLOAD: {_WAKE_WORD_DETECTED: True, _WAKE_WORD_PHRASE: phrase},
+        },
+        "metadata": {"source": MODULE_NAME, "schema_version": NORMALIZED_SCHEMA_VERSION},
+    }
+
+
+def speech_event(candidate: Mapping[str, Any], transcription: str) -> dict[str, Any]:
+    """The published ``speech`` event of an accepted candidate (R7 step 4).
+
+    The candidate's author, ``message_id``, destination and source; the
+    transcription as ``text`` and no ``wake_word``.
+    """
+
+    payload = {
+        key: value for key, value in candidate["payload"].items() if key != _WAKE_WORD_PAYLOAD
+    }
+    payload["author"] = dict(payload["author"])
+    payload["text"] = transcription
+    return {
+        "type": candidate["type"],
+        "payload": payload,
+        "metadata": dict(candidate["metadata"]),
+    }
+
+
+def listen_segment_data_bytes(data: bytes) -> int:
+    """The ``data`` size an acquired segment's header declares, checked.
+
+    The segment must be of the convention (:func:`cut_segment`'s checks) and
+    its header honest: a streaming placeholder or a size larger than the
+    bytes held is refused, so the duration read from the header is the
+    audio actually transcribed. Raises :class:`InvalidSegment`; nothing is
+    trimmed or padded.
+    """
+
+    layout = wav_data_layout(data)
+    if layout is None:
+        raise InvalidSegment("not a RIFF/WAVE body with a data chunk")
+    offset, declared = layout
+    if declared in _STREAMING_DATA_SIZES or declared > len(data) - offset:
+        raise InvalidSegment("the header does not state the data held")
+    # The format checks only: the cut copy is discarded.
+    cut_segment(data, max(1, -(-declared // BYTES_PER_SECOND)))
+    return declared
+
+
+# --------------------------------------------------------------------------- #
 # The handle
 # --------------------------------------------------------------------------- #
 
@@ -1360,8 +1835,14 @@ class AudioInputModule:
         *,
         sleeper: Sleeper,
         transport_factory: Callable[[], Any],
+        runner: SubprocessRunner = spawn_recorder,
+        detector_session_factory: Callable[[], Any] = DETECTOR_SESSION_FACTORY,
     ) -> None:
         self._actions = context.actions
+        self._bus = getattr(context, "bus", None)
+        self._triggers = getattr(context, "triggers", None)
+        self._scheduler = getattr(context, "scheduler", None)
+        self._services = getattr(context, "services", None)
         self._attachments = context.attachments
         self._clock: Callable[[], float] = context.clock
         self._supervision = getattr(context, "supervision", None)
@@ -1373,6 +1854,11 @@ class AudioInputModule:
         # ``prepare`` when listening is enabled (R7); nothing is started there.
         self._listen_source: Any | None = None
         self._listen_owner: Any | None = None
+        # The wake-word detector, built at ``prepare`` from its settings.
+        self._runner = runner
+        self._detector_session_factory = detector_session_factory
+        self._detector: CommandDetector | HttpDetector | None = None
+        self._listen_counts = {name: 0 for name in _LISTEN_COUNTS}
         self._sleeper = sleeper
         # The transcription transport: made on first use, released by close.
         self._transport_factory = transport_factory
@@ -1425,6 +1911,17 @@ class AudioInputModule:
         """The supervised-task owner the listen loop runs under, from ``prepare``."""
 
         return self._listen_owner
+
+    @property
+    def detector(self) -> CommandDetector | HttpDetector | None:
+        """The wake-word detector, built at ``prepare`` when listening."""
+
+        return self._detector
+
+    def counts(self) -> Mapping[str, int]:
+        """How the voice input's iterations settled (R7)."""
+
+        return dict(self._listen_counts)
 
     # -- lifecycle hooks ---------------------------------------------------- #
 
@@ -1527,6 +2024,11 @@ class AudioInputModule:
             ) from None
         self._listen_source = self._sources[listen.source]
         self._listen_owner = self._tasks
+        self._detector = build_detector(
+            listen.detector,
+            runner=self._runner,
+            session_factory=self._detector_session_factory,
+        )
 
     async def start_inputs(self) -> None:
         """The input phase (R7): with listening off, nothing starts.
@@ -1570,6 +2072,9 @@ class AudioInputModule:
         self._kill_all("cancelled")
         self._interrupt_transcriptions()
         await self._close_session()
+        close_detector = getattr(self._detector, "close", None)
+        if callable(close_detector):
+            await close_detector()
 
     async def _join_transcriptions(self, budget: float) -> None:
         """Wait for the transcribing calls up to *budget* on the sleeper, then interrupt them."""
@@ -1599,14 +2104,7 @@ class AudioInputModule:
 
     async def _close_session(self) -> None:
         session, self._session = self._session, None
-        close = getattr(session, "close", None)
-        if callable(close):
-            try:
-                outcome = close()
-                if inspect.isawaitable(outcome):
-                    await outcome
-            except Exception:  # noqa: BLE001 - a transport that fails to close is gone anyway
-                pass
+        await _close_quietly(session)
 
     def _kill_all(self, status: str) -> None:
         for capture in tuple(self._captures):
@@ -1639,6 +2137,254 @@ class AudioInputModule:
             raise
         except Exception:  # noqa: BLE001 - a health report must not fail prepare
             return
+
+    # -- the voice input: one iteration (R7) --------------------------------- #
+
+    async def listen_once(self) -> str:
+        """Run one iteration of listening in R7's order; return how it settled.
+
+        (1) the detector is awaited once; (2) a detection's candidate is
+        decided by the trigger engine and traced, never published; (3) only an
+        accepted candidate acquires one segment from ``listen.source`` and
+        transcribes it once; (4) a non-empty transcription is published as
+        the ``speech`` event and admitted, never submitted to the engine.
+        Returns one of the ``SETTLED_*`` values; with listening off, before
+        ``prepare`` or once closed nothing is invoked (``stopped``).
+        """
+
+        listen = self._settings.listen
+        detector = self._detector
+        if listen is None or detector is None or self._closed:
+            return SETTLED_STOPPED
+        counts = self._listen_counts
+        # (1) Verdict.
+        try:
+            verdict = await detector.wait()
+        except DetectorFailure:
+            counts[COUNT_DETECTOR_FAILURES] += 1
+            return SETTLED_DETECTOR_FAILURE
+        if verdict is None:
+            return SETTLED_NO_VERDICT
+        # (2) Candidate: decided on the verdict alone.
+        candidate = speech_candidate(listen, verdict.phrase)
+        counts[COUNT_CANDIDATES] += 1
+        decision = await self._decide(candidate)
+        if decision is None:
+            return SETTLED_DECLINED
+        # (3) Acquisition, then one transcription; the segment is a local
+        # released once transcribed, never stored or published.
+        wav = await self._acquire(listen)
+        if wav is None:
+            counts[COUNT_SOURCE_FAILURES] += 1
+            return SETTLED_SOURCE_FAILURE
+        text = await self._transcribe_segment(wav)
+        del wav
+        if text is None:
+            counts[COUNT_TRANSCRIPTION_ERRORS] += 1
+            return SETTLED_TRANSCRIPTION_ERROR
+        if not text.strip():
+            counts[COUNT_EMPTY_TRANSCRIPTIONS] += 1
+            return SETTLED_EMPTY_TRANSCRIPTION
+        # (4) Event: published and admitted under the candidate's decision.
+        await self._publish_speech(speech_event(candidate, text))
+        return SETTLED_PUBLISHED
+
+    async def _decide(self, candidate: Mapping[str, Any]) -> Any | None:
+        """The engine's decision when it accepts *candidate*, else ``None``; traced, fail-closed."""
+
+        engine = self._triggers
+        if engine is None:
+            return None
+        try:
+            decision = await engine.evaluate_async(candidate)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - an undecided candidate acquires nothing
+            return None
+        await self._trace_decision(decision)
+        return decision if getattr(decision, "accepted", False) is True else None
+
+    async def _trace_decision(self, decision: Any) -> None:
+        emit = getattr(self._supervision, "emit", None)
+        if not callable(emit) or not getattr(decision, "traceable", True):
+            return
+        event_type = (
+            TRACE_INPUT_TRIGGER_ACCEPTED if decision.accepted else TRACE_INPUT_TRIGGER_REJECTED
+        )
+        try:
+            outcome = emit(event_type, decision_trace_payload(decision))
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a lost trace changes nothing decided
+            return
+
+    async def _acquire(self, listen: ListenSettings) -> bytes | None:
+        """One segment from ``listen.source``, checked; ``None`` on a source failure.
+
+        The source is invoked once with the pre-roll and the bound in its
+        environment and read until it exits, which must be with status 0.
+        The read is bounded by a hard deadline of ``listen.max_seconds`` plus
+        ``grace_seconds`` on the sleeper: past it the source is killed and
+        abandoned, however it answers a terminate, and the outcome is a
+        source failure. The WAV it wrote must be of the convention with an
+        honest header, last at most ``listen.max_seconds`` by that header
+        and weigh at most ``max_bytes``; it is neither trimmed nor padded.
+        """
+
+        source = self._listen_source
+        environment = {
+            ENV_PRE_ROLL_SECONDS: f"{listen.pre_roll_seconds:g}",
+            ENV_MAX_SECONDS: str(listen.max_seconds),
+        }
+        begin = getattr(source, "begin", None)
+        recording = begin(environment) if callable(begin) else source
+        reader = asyncio.ensure_future(recording.read(listen.max_seconds))
+        deadline = asyncio.ensure_future(
+            self._sleeper(float(listen.max_seconds) + self._settings.grace_seconds)
+        )
+        try:
+            await asyncio.wait({reader, deadline}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            _kill_recording(recording)
+            _abandon(reader)
+            raise
+        finally:
+            _abandon(deadline)
+        if not reader.done():
+            # The deadline won: the source is killed and its read abandoned.
+            _kill_recording(recording)
+            _abandon(reader)
+            return None
+        if reader.cancelled() or reader.exception() is not None:
+            return None
+        data = reader.result()
+        if getattr(recording, "failed_exit", False) is True:
+            return None
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            return None
+        data = bytes(data)
+        if len(data) > self._settings.max_bytes:
+            return None
+        try:
+            declared = listen_segment_data_bytes(data)
+        except InvalidSegment:
+            return None
+        if declared > listen.max_seconds * BYTES_PER_SECOND:
+            return None
+        return data
+
+    async def _transcribe_segment(self, wav: bytes) -> str | None:
+        """The transcription of one acquired segment, or ``None`` on an error.
+
+        One request through the ``transcription`` settings, bounded by its
+        ``timeout_seconds`` on the sleeper; transcription disabled or found
+        unavailable at ``prepare`` sends nothing and is an error.
+        """
+
+        settings = self._settings.transcription
+        if not settings.enabled or not self._transcription_available:
+            return None
+        session = await self._session_or_none()
+        if session is None:
+            return None
+        request = asyncio.ensure_future(self._request(session, wav))
+        bound = asyncio.ensure_future(self._sleeper(settings.timeout_seconds))
+        try:
+            await asyncio.wait({request, bound}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            _abandon(request)
+            raise
+        finally:
+            _abandon(bound)
+        if not request.done():
+            _abandon(request)
+            return None
+        if request.cancelled() or request.exception() is not None:
+            return None
+        answer = request.result()
+        if answer.status != TRANSCRIPTION_OK or answer.text is None:
+            return None
+        return answer.text[: settings.max_chars]
+
+    async def _publish_speech(self, event: Mapping[str, Any]) -> None:
+        """Publish the ``speech`` event once; admit it into a shared scheduler.
+
+        Never through the engine: the candidate's decision, recorded under
+        the same ``message_id`` and destination, is the one it runs under. A
+        scheduler the context carries is admitted into here. Without one the
+        brain owns its scheduler and its bus consumer admits the published
+        copy under the decision the engine still retains for it — so
+        admitting here too would run it twice. Acquisition and transcription
+        may outlast that retention (its time-to-live, or eviction by newer
+        decisions): a decision the engine no longer holds is then honoured
+        here, by admitting directly into the scheduler the brain publishes
+        as ``(admission, runs)`` — watch-style — once the event is published,
+        and the brain's consumer, finding no decision, refuses the published
+        copy. The engine is only read (``recorded``), never asked again.
+        """
+
+        scheduler = self._scheduler
+        if scheduler is None and not self._decision_retained(event):
+            scheduler = self._published_scheduler()
+        publish = getattr(self._bus, "publish", None)
+        if callable(publish):
+            try:
+                await publish(event["type"], event["payload"], event["metadata"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a lost publication is not counted published
+                pass
+            else:
+                self._listen_counts[COUNT_PUBLISHED] += 1
+        if scheduler is None:
+            return
+        payload = event["payload"]
+        try:
+            scheduler.admit(
+                SessionKey(
+                    platform=payload["platform"],
+                    channel_id=payload["channel_id"],
+                    viewer_id=payload["author"]["id"],
+                ),
+                Work(payload=event, source_event_id=payload["message_id"], kind=WORK_KIND),
+            )
+        except Exception:  # noqa: BLE001 - a refusal is the scheduler's own traced decision
+            return
+
+    def _decision_retained(self, event: Mapping[str, Any]) -> bool:
+        """Whether the engine still retains the decision the brain's consumer will read.
+
+        An unreadable lookup counts as retained: the consumer reads the same
+        engine, so admitting here too could run the event twice.
+        """
+
+        recorded = getattr(self._triggers, "recorded", None)
+        if not callable(recorded):
+            return True
+        payload = event["payload"]
+        try:
+            decision = recorded(
+                platform=payload["platform"],
+                channel_id=payload["channel_id"],
+                source_event_id=payload["message_id"],
+            )
+        except Exception:  # noqa: BLE001 - see the docstring
+            return True
+        return decision is not None
+
+    def _published_scheduler(self) -> Any | None:
+        """The scheduler the brain publishes as ``(admission, runs)``, or ``None``."""
+
+        resolve = getattr(self._services, "resolve", None)
+        if not callable(resolve):
+            return None
+        try:
+            found = resolve(ADMISSION_SERVICE_KIND, ADMISSION_SERVICE_SCOPE)
+        except Exception:  # noqa: BLE001 - an unreadable registry admits nothing
+            return None
+        return found if callable(getattr(found, "admit", None)) else None
 
     # -- the capture (R3, R4, R10) ------------------------------------------- #
 
@@ -2014,34 +2760,13 @@ class AudioInputModule:
         return form
 
     async def _read_answer(self, response: Any) -> bytes | None:
-        """The 2xx body, or ``None`` when it exceeds the answer bound.
-
-        Read in chunks off the response's stream so an oversized (or
-        endless) answer never holds more than one chunk past the bound; a
-        response with no stream is read whole.
-        """
+        """The 2xx body, or ``None`` when it exceeds the answer bound."""
 
         limit = (
             self._settings.transcription.max_chars * _ANSWER_BYTES_PER_CHAR
             + _ANSWER_ALLOWANCE_BYTES
         )
-        stream = getattr(response, "content", None)
-        read = getattr(stream, "read", None)
-        if not callable(read):
-            body = await response.read()
-            body = bytes(body)
-            return body if len(body) <= limit else None
-        parts: list[bytes] = []
-        total = 0
-        while True:
-            chunk = await read(_ANSWER_CHUNK)
-            if not chunk:
-                break
-            parts.append(bytes(chunk))
-            total += len(chunk)
-            if total > limit:
-                return None
-        return b"".join(parts)
+        return await _read_bounded(response, limit)
 
 
 def _probe(source: Any) -> str | None:
@@ -2057,6 +2782,18 @@ def _probe(source: Any) -> str | None:
     return reason if isinstance(reason, str) and reason else None
 
 
+def _kill_recording(recording: Any) -> None:
+    """Kill *recording* now when it can be killed; a failing kill changes nothing."""
+
+    kill = getattr(recording, "kill", None)
+    if not callable(kill):
+        return
+    try:
+        kill()
+    except Exception:  # noqa: BLE001 - the read is abandoned either way
+        return
+
+
 def _abandon(task: "asyncio.Future[Any]") -> None:
     """Cancel *task* without waiting for it; its outcome is consumed when it ends."""
 
@@ -2068,6 +2805,43 @@ def _abandon(task: "asyncio.Future[Any]") -> None:
 def _consume(task: "asyncio.Future[Any]") -> None:
     if not task.cancelled():
         task.exception()
+
+
+async def _read_bounded(response: Any, limit: int) -> bytes | None:
+    """The body of *response*, or ``None`` when it exceeds *limit* bytes.
+
+    Read in chunks off the response's stream so an oversized (or endless)
+    answer never holds more than one chunk past the bound; a response with
+    no stream is read whole.
+    """
+
+    stream = getattr(response, "content", None)
+    read = getattr(stream, "read", None)
+    if not callable(read):
+        body = bytes(await response.read())
+        return body if len(body) <= limit else None
+    parts: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await read(_ANSWER_CHUNK)
+        if not chunk:
+            break
+        parts.append(bytes(chunk))
+        total += len(chunk)
+        if total > limit:
+            return None
+    return b"".join(parts)
+
+
+async def _close_quietly(session: Any) -> None:
+    close = getattr(session, "close", None)
+    if callable(close):
+        try:
+            outcome = close()
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:  # noqa: BLE001 - a transport that fails to close is gone anyway
+            pass
 
 
 async def _release(response: Any) -> None:
@@ -2150,6 +2924,8 @@ async def activate(
         sources,
         sleeper=sleeper,
         transport_factory=settings.get(_SEAM_TRANSCRIPTION_TRANSPORT, SESSION_FACTORY),
+        runner=runner,
+        detector_session_factory=settings.get(_SEAM_DETECTOR_SESSION, DETECTOR_SESSION_FACTORY),
     )
 
 
@@ -2222,6 +2998,26 @@ __all__ = [
     "BYTES_PER_SECOND",
     "CAPTURE_ACTION",
     "CHANNELS",
+    "COUNT_CANDIDATES",
+    "COUNT_DETECTOR_FAILURES",
+    "COUNT_EMPTY_TRANSCRIPTIONS",
+    "COUNT_PUBLISHED",
+    "COUNT_SOURCE_FAILURES",
+    "COUNT_TRANSCRIPTION_ERRORS",
+    "DETECTOR_SESSION_FACTORY",
+    "ENV_MAX_SECONDS",
+    "ENV_PRE_ROLL_SECONDS",
+    "PHRASE_MAX_CHARS",
+    "SETTLED_DECLINED",
+    "SETTLED_DETECTOR_FAILURE",
+    "SETTLED_EMPTY_TRANSCRIPTION",
+    "SETTLED_NO_VERDICT",
+    "SETTLED_PUBLISHED",
+    "SETTLED_SOURCE_FAILURE",
+    "SETTLED_STOPPED",
+    "SETTLED_TRANSCRIPTION_ERROR",
+    "SPEECH_KIND",
+    "WORK_KIND",
     "CONTENT_TYPE_WAV",
     "DEFAULT_LISTEN_MAX_SECONDS",
     "DEFAULT_LISTEN_PRE_ROLL_SECONDS",
@@ -2263,9 +3059,17 @@ __all__ = [
     "AudioInputModule",
     "AudioInputModuleError",
     "CaptureError",
+    "CommandDetector",
     "CommandRecording",
     "CommandSource",
+    "DetectorFailure",
     "DetectorSpec",
+    "HttpDetector",
+    "Verdict",
+    "build_detector",
+    "listen_segment_data_bytes",
+    "speech_candidate",
+    "speech_event",
     "FileSource",
     "InvalidSegment",
     "ListenSettings",

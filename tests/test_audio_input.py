@@ -32,6 +32,13 @@ failed transcription probe degrades the transcription only, value-free;
 ``required: true`` fails ``prepare`` naming ``transcription.endpoint`` with
 the transport closed.
 
+Phase 8 P13 — the listen pipeline (R7): one iteration in order — verdict,
+candidate decided before any audio, acquisition with the pre-roll and bound
+in the source's environment, one transcription, one ``speech`` event never
+submitted to the engine (AC26); the command and HTTP detector rows (AC27);
+no audio stored, written or published (AC28). Detector and source run on a
+scripted runner keyed by argv, so no listening spawn counts against AC12.
+
 Every call goes through the real executor built by ``runtime_context`` over a
 shared :class:`AttachmentStore` on the :class:`ManualClock`; the sources, the
 subprocess runner and the sleeper are injected, and time moves only on the
@@ -41,6 +48,7 @@ clock.
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import os
 import re
@@ -2172,7 +2180,9 @@ class Listening:
         return dict(self.engine.registry.hook_slots(MODULE_NAME))
 
 
-async def listening(settings: dict[str, Any], clock: ManualClock) -> Listening:
+async def listening(
+    settings: dict[str, Any], clock: ManualClock, *, triggers: dict[str, Any] | None = None
+) -> Listening:
     scheduler = RecordingScheduler()
     runtime = runtime_context(
         clock=clock,
@@ -2181,9 +2191,10 @@ async def listening(settings: dict[str, Any], clock: ManualClock) -> Listening:
         scheduler=scheduler,
     )
     loader = ModuleLoader(runtime.bus, ROOT / "modules", context=runtime, environ={})
-    activations = await loader.activate_enabled(
-        {"enabled_modules": [MODULE_NAME], "modules": {MODULE_NAME: settings}}
-    )
+    config: dict[str, Any] = {"enabled_modules": [MODULE_NAME], "modules": {MODULE_NAME: settings}}
+    if triggers is not None:
+        config["triggers"] = triggers
+    activations = await loader.activate_enabled(config)
     (activation,) = activations
     return Listening(runtime, clock, activation.handle, activations, scheduler)
 
@@ -2604,6 +2615,885 @@ async def test_p12_a_speech_event_passes_the_ownership_guard() -> None:
     published = events_of(runtime.bus, "channel.chat.message")
     assert [event["payload"]["message_id"] for event in published] == ["s-1"]
     assert runtime.supervision.snapshot()["input_ownership_rejections"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# P13: the listen pipeline — verdict, candidate, acquisition, transcription,
+# event (R7; AC26, AC27 detector rows, AC28)
+# --------------------------------------------------------------------------- #
+
+TRANSCRIPT = "hey nova what is this"
+#: Sample values of the marker-tone timeline: the marker at the instant the
+#: phrase begins, then the phrase itself.
+MARKER_SAMPLE = 0x2000
+PHRASE_SAMPLE = 0x1000
+MARKER_SECONDS = 0.1
+PHRASE_SECONDS = 1.1
+
+
+class ListenProcess:
+    """One scripted detector or source process: its stdout, then its exit status."""
+
+    def __init__(self, runner: "ListenRunner", argv: tuple[str, ...], kwargs: dict[str, Any],
+                 output: bytes, status: int) -> None:
+        self.runner = runner
+        self.argv = argv
+        self.kwargs = kwargs
+        self.pid = len(runner.processes) + 1
+        self._pending = bytes(output)
+        self._status = status
+        self.returncode: int | None = None
+        self.stdout = SimpleNamespace(read=self._read)
+
+    async def _read(self, n: int = -1) -> bytes:
+        if not self._pending or self.returncode is not None:
+            if self.returncode is None:
+                self.returncode = self._status
+            return b""
+        size = len(self._pending) if n is None or n < 0 else n
+        chunk, self._pending = self._pending[:size], self._pending[size:]
+        return chunk
+
+    def terminate(self) -> None:
+        self.runner.terminates.append(self.pid)
+        if self.returncode is None:
+            self.returncode = -15
+
+    def kill(self) -> None:
+        self.runner.kills.append(self.pid)
+        if self.returncode is None:
+            self.returncode = -9
+
+    async def wait(self) -> int:
+        if self.returncode is None:
+            self.returncode = self._status
+        return self.returncode
+
+
+class ListenRunner:
+    """The ``_subprocess_runner`` seam for listening: detector and source by argv.
+
+    A detector invocation answers the next ``(status, stdout)`` of
+    ``detections`` (exit 1 past the script); a source invocation writes the
+    next of ``segments`` — bytes, ``(status, bytes)``, or a callable of the
+    environment it was started with — past the script :meth:`synthesise`.
+    Every spawn's keyword arguments are kept, so the environment and the
+    standard input are observable.
+    """
+
+    def __init__(self, clock: ManualClock, *, detections: Any = (), segments: Any = (),
+                 phrase_at: float | None = None) -> None:
+        self.clock = clock
+        self.detections = list(detections)
+        self.segments = list(segments)
+        self.phrase_at = phrase_at
+        self.processes: list[ListenProcess] = []
+        self.detector_calls: list[dict[str, Any]] = []
+        self.source_calls: list[dict[str, Any]] = []
+        self.written: list[bytes] = []
+        self.kills: list[int] = []
+        self.terminates: list[int] = []
+
+    async def __call__(self, *argv: str, **kwargs: Any) -> ListenProcess:
+        argv_tuple = tuple(argv)
+        if list(argv_tuple) == DETECTOR_ARGV:
+            self.detector_calls.append(kwargs)
+            status, output = self.detections.pop(0) if self.detections else (1, b"")
+        elif list(argv_tuple) == RECORDER_ARGV:
+            self.source_calls.append(kwargs)
+            entry = self.segments.pop(0) if self.segments else self.synthesise
+            status = 0
+            if isinstance(entry, tuple):
+                status, entry = entry
+            output = entry(kwargs.get("env", {})) if callable(entry) else entry
+            self.written.append(output)
+        else:  # pragma: no cover - a regression spawning something else
+            raise AssertionError(f"unexpected argv {argv_tuple!r}")
+        process = ListenProcess(self, argv_tuple, kwargs, output, status)
+        self.processes.append(process)
+        return process
+
+    def synthesise(self, env: dict[str, str]) -> bytes:
+        """The window the environment asks for, cut from the reference
+        timeline on the injected clock: from ``pre_roll`` before now, for
+        ``max_seconds``, with the marker tone at the instant the phrase began."""
+
+        pre_roll = float(env["AUDIO_INPUT_PRE_ROLL_SECONDS"])
+        seconds = int(env["AUDIO_INPUT_MAX_SECONDS"])
+        start = self.clock.now - pre_roll
+        frames = seconds * 16_000
+        samples = bytearray(frames * 2)
+        if self.phrase_at is not None:
+            for value, begin, length in (
+                (MARKER_SAMPLE, self.phrase_at, MARKER_SECONDS),
+                (PHRASE_SAMPLE, self.phrase_at + MARKER_SECONDS, PHRASE_SECONDS),
+            ):
+                first = round((begin - start) * 16_000)
+                last = first + round(length * 16_000)
+                for frame in range(max(first, 0), min(last, frames)):
+                    struct.pack_into("<h", samples, frame * 2, value)
+        return wav_bytes(0)[:40] + struct.pack("<I", len(samples)) + bytes(samples)
+
+
+def segment_frames(wav: bytes, value: int) -> list[int]:
+    """The frame indexes of *wav* whose sample equals *value*."""
+
+    data = wav[44:]
+    count = len(data) // 2
+    return [index for index, (sample,) in enumerate(struct.iter_unpack("<h", data[: count * 2]))
+            if sample == value]
+
+
+class DetectorSession:
+    """The ``_detector_session`` seam: one scripted answer per request."""
+
+    def __init__(self, *answers: Any) -> None:
+        self.answers = list(answers)
+        self.requests: list[dict[str, Any]] = []
+        self.closed = 0
+
+    def __call__(self) -> "DetectorSession":
+        return self
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.requests.append({"url": url, **kwargs})
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, int):
+            return FakeBytesResponse(answer, b"")
+        return FakeBytesResponse(200, answer)
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class EngineSpy:
+    """The module's view of the shared engine, counting every evaluation.
+
+    Each ``evaluate_async`` records the candidate, its decision and what the
+    probe observed when the decision was taken (R7 order).
+    """
+
+    def __init__(self, engine: Any, probe: Any) -> None:
+        self._engine = engine
+        self._probe = probe
+        self.decided: list[tuple[dict[str, Any], Any, Any]] = []
+        self.sync_calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine, name)
+
+    def evaluate(self, *args: Any, **kwargs: Any) -> Any:
+        self.sync_calls += 1
+        return self._engine.evaluate(*args, **kwargs)
+
+    async def evaluate_async(self, event: Any, **kwargs: Any) -> Any:
+        decision = await self._engine.evaluate_async(event, **kwargs)
+        self.decided.append((event, decision, self._probe()))
+        return decision
+
+
+class Voice:
+    """A listening ``audio_input`` loaded by the real loader, prepared, spied."""
+
+    def __init__(self, h: Listening, runner: ListenRunner, transport: ScriptedTranscriptionTransport,
+                 session: DetectorSession | None) -> None:
+        self.h = h
+        self.runner = runner
+        self.transport = transport
+        self.session = session
+        self.hook_views: list[Any] = []
+        self.engine = EngineSpy(
+            h.engine, lambda: (len(runner.source_calls), len(self.transcriptions()))
+        )
+        h.handle._triggers = self.engine
+
+    @property
+    def handle(self) -> AudioInputModule:
+        return self.h.handle
+
+    def transcriptions(self) -> list[dict[str, Any]]:
+        return call_requests(self.transport)
+
+    def speech_events(self) -> list[dict[str, Any]]:
+        return [
+            event for event in events_of(self.h.runtime.bus, "channel.chat.message")
+            if event["payload"].get("kind") == "speech"
+        ]
+
+    def candidates(self) -> list[dict[str, Any]]:
+        return [event for event, _decision, _seen in self.engine.decided]
+
+    def reasons(self) -> list[str]:
+        return [decision.reason for _event, decision, _seen in self.engine.decided]
+
+
+async def voice(
+    *,
+    detections: Any = ((0, b"nova\n"),),
+    segments: Any = (),
+    answers: Any = ({"text": TRANSCRIPT},),
+    triggers: dict[str, Any] | None = None,
+    detector: Any = None,
+    session: DetectorSession | None = None,
+    phrase_at: float | None = None,
+    max_bytes: int | None = None,
+    **listen: Any,
+) -> Voice:
+    clock = ManualClock(1000.0)
+    runner = ListenRunner(clock, detections=detections, segments=segments, phrase_at=phrase_at)
+    transport = ScriptedTranscriptionTransport(PROBE_OK, *answers)
+    settings = listen_settings(runner, clock, detector=detector, **listen)  # type: ignore[arg-type]
+    settings["transcription"] = stt_settings()
+    settings["_transcription_transport"] = transport
+    if session is not None:
+        settings["_detector_session"] = session
+    if max_bytes is not None:
+        settings["max_bytes"] = max_bytes
+    h = await listening(settings, clock, triggers=triggers)
+    await h.handle.prepare()
+    v = Voice(h, runner, transport, session)
+
+    async def counting_hook(view: Any, parameters: Any) -> bool:
+        v.hook_views.append(view)
+        return await audio_input_module._wake_word_hook(view, parameters)
+
+    h.runtime.for_module(MODULE_NAME).supply_trigger_hook("wake_word", counting_hook)
+    return v
+
+
+def keyword_policy(*keywords: str) -> dict[str, Any]:
+    return {
+        MODULE_NAME: {
+            "channels": {
+                LISTEN_DESTINATION["channel_id"]: {
+                    "combination": "all_of",
+                    "rules": [{"type": "keyword", "parameters": {"keywords": list(keywords)}}],
+                }
+            }
+        }
+    }
+
+
+ACCEPT_ALL = keyword_policy("nova")
+
+
+async def test_p13_ac26_the_candidate_is_decided_before_any_audio_then_one_speech_event() -> None:
+    """AC26 (R7 order): under ``keyword{[nova]}`` the candidate — text
+    ``nova``, no transcription — decides ``accepted:keyword_match`` while the
+    source has been invoked 0 times and the transcription called 0 times;
+    then the source is invoked once with ``AUDIO_INPUT_PRE_ROLL_SECONDS=2``,
+    the transcription called once, and exactly 1 ``speech`` event is
+    published with the transcription, author ``voice:streamer``, the
+    candidate's ``message_id`` and the configured destination; it is
+    admitted once with 0 further evaluations and 0 hook invocations."""
+
+    v = await voice(triggers=keyword_policy("nova"))
+
+    settled = await v.handle.listen_once()
+
+    assert settled == "published"
+    ((candidate, decision, seen),) = v.engine.decided
+    assert decision.reason == "accepted:keyword_match"
+    assert seen == (0, 0)  # source, transcription — at decision time
+    assert candidate["payload"]["text"] == "nova"
+    assert candidate["payload"]["wake_word"] == {"detected": True, "phrase": "nova"}
+    assert TRANSCRIPT not in str(candidate)
+    (source_call,) = v.runner.source_calls
+    assert source_call["env"]["AUDIO_INPUT_PRE_ROLL_SECONDS"] == "2"
+    assert source_call["env"]["AUDIO_INPUT_MAX_SECONDS"] == "10"
+    (request,) = v.transcriptions()
+    assert request["file"] == v.runner.written[0]
+    (event,) = v.speech_events()
+    payload = event["payload"]
+    assert payload["text"] == TRANSCRIPT
+    assert payload["author"]["id"] == "voice:streamer"
+    assert payload["message_id"] == candidate["payload"]["message_id"]
+    assert payload["message_id"].startswith("voice:streamer:")
+    assert (payload["platform"], payload["channel_id"]) == ("fake", "channel-9")
+    assert payload["kind"] == "speech" and "wake_word" not in payload
+    assert event["metadata"]["source"] == MODULE_NAME
+    assert event["metadata"]["schema_version"] == 2
+    ((session_key, work),) = v.h.scheduler.admissions
+    assert work.source_event_id == payload["message_id"]
+    assert session_key.viewer_id == "voice:streamer"
+    assert work.payload["payload"]["text"] == TRANSCRIPT
+    assert len(v.engine.decided) == 1 and v.engine.sync_calls == 0
+    assert v.hook_views == []
+    accepted = events_of(v.h.runtime.bus, "input.trigger.accepted")
+    assert [event["payload"]["reason"] for event in accepted] == ["accepted:keyword_match"]
+    assert v.handle.counts() == {
+        "detector_failures": 0, "source_failures": 0, "transcription_errors": 0,
+        "empty_transcriptions": 0, "candidates": 1, "published": 1,
+    }
+
+
+async def test_p13_ac26_a_declined_candidate_acquires_and_transcribes_nothing() -> None:
+    """AC26: under ``keyword{[banana]}`` the candidate decides
+    ``rejected:keyword_no_match``; the source is invoked 0 times, the
+    transcription called 0 times and 0 events are published."""
+
+    v = await voice(triggers=keyword_policy("banana"))
+
+    assert await v.handle.listen_once() == "declined"
+
+    assert v.reasons() == ["rejected:keyword_no_match"]
+    assert v.runner.source_calls == []
+    assert v.transcriptions() == []
+    assert v.speech_events() == [] and v.h.scheduler.admissions == []
+    rejected = events_of(v.h.runtime.bus, "input.trigger.rejected")
+    assert [event["payload"]["reason"] for event in rejected] == ["rejected:keyword_no_match"]
+
+
+@pytest.mark.parametrize(
+    ("answer", "settled", "count"),
+    [
+        (500, "transcription_error", "transcription_errors"),
+        ({"no": "text"}, "transcription_error", "transcription_errors"),
+        ({"text": "   "}, "empty_transcription", "empty_transcriptions"),
+        ({"text": ""}, "empty_transcription", "empty_transcriptions"),
+    ],
+)
+async def test_p13_ac26_a_failed_or_empty_transcription_publishes_nothing(
+    answer: Any, settled: str, count: str
+) -> None:
+    """AC26: a transcription failure and an empty transcription each publish
+    0 events, admit nothing and increment their count; the segment was
+    transcribed once and not retried."""
+
+    v = await voice(answers=(answer,), triggers=ACCEPT_ALL)
+
+    assert await v.handle.listen_once() == settled
+
+    assert len(v.transcriptions()) == 1
+    assert v.speech_events() == [] and v.h.scheduler.admissions == []
+    assert v.handle.counts()[count] == 1
+    assert v.handle.counts()["published"] == 0
+
+
+async def test_p13_ac26_a_transcription_not_answered_within_its_timeout_is_an_error() -> None:
+    """R7: the one transcription is bounded by ``transcription.timeout_seconds``
+    on the injected sleeper; past it the segment is a counted error."""
+
+    v = await voice(answers=(HELD,), triggers=ACCEPT_ALL)
+    pending = asyncio.ensure_future(v.handle.listen_once())
+    await settle()
+    assert not pending.done() and v.transport.held == 1
+    v.h.clock.advance(10.0)
+    assert await finished(pending) == "transcription_error"
+    assert v.speech_events() == []
+    assert v.handle.counts()["transcription_errors"] == 1
+
+
+def _truncated(wav: bytes, keep: int) -> bytes:
+    return wav[:keep]
+
+
+SOURCE_FAILURES = {
+    # 3 s = 96 044 bytes over ``max_bytes: 95 000``, its header honest.
+    "over-max-bytes": ({"max_bytes": 95_000}, [wav_bytes(3.0)]),
+    # 8.5 s by its header with ``listen.max_seconds: 8``.
+    "over-max-seconds": ({"max_seconds": 8, "pre_roll_seconds": 2}, [wav_bytes(8.5)]),
+    # A header announcing 2 s over 1.25 s of data: it lies about its length.
+    "lying-header": ({}, [_truncated(wav_bytes(2.0), 40_044)]),
+    # A streaming placeholder: no duration can be read from the header.
+    "streaming-header": ({}, [streaming_wav(1.0)]),
+    "not-a-wav": ({}, [b"not a wav at all"]),
+    "8-khz": ({}, [wav_bytes(1.0, sample_rate=8000)]),
+    # A valid WAV from a recorder that exited 2 on its own.
+    "exit-2": ({}, [(2, wav_bytes(1.0))]),
+    # R7 "the source exits 0": a valid WAV from a source ended by a signal.
+    "killed-by-signal": ({}, [(-15, wav_bytes(1.0))]),
+    # A whole ``listen.max_seconds`` of valid audio does not excuse exit 2.
+    "exit-2-at-max-seconds": ({}, [(2, wav_bytes(10.0))]),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(SOURCE_FAILURES))
+async def test_p13_ac26_a_segment_outside_its_bounds_is_a_counted_source_failure(
+    variant: str,
+) -> None:
+    """AC26: a source WAV over ``max_bytes``, longer than ``listen.max_seconds``
+    by its header (8.5 s under 8), with a header that lies about its data,
+    outside the convention, or from a recorder that failed is a counted
+    source failure, transcribed 0 times and never trimmed into an event."""
+
+    overrides, segments = SOURCE_FAILURES[variant]
+    overrides = dict(overrides)
+    max_bytes = overrides.pop("max_bytes", None)
+    v = await voice(segments=segments, triggers=ACCEPT_ALL, max_bytes=max_bytes, **overrides)
+
+    assert await v.handle.listen_once() == "source_failure"
+
+    assert len(v.runner.source_calls) == 1
+    assert v.transcriptions() == []
+    assert v.speech_events() == [] and v.h.scheduler.admissions == []
+    assert v.handle.counts()["source_failures"] == 1
+    assert v.h.runtime.attachments.object_count == 0
+
+
+async def test_p13_ac26_an_honest_header_over_max_seconds_is_a_source_failure() -> None:
+    """AC26: a source handing over a whole 8.5 s WAV — its header honest about
+    its data — under ``listen.max_seconds: 8`` is a counted source failure by
+    the duration its header states, transcribed 0 times and never trimmed."""
+
+    clock = ManualClock(1000.0)
+    source = FakeAudioSource(wav_bytes(8.5))
+    runner = ListenRunner(clock, detections=[(0, b"nova")])
+    transport = ScriptedTranscriptionTransport(PROBE_OK, {"text": TRANSCRIPT})
+    settings = listen_settings(runner, clock, max_seconds=8)  # type: ignore[arg-type]
+    settings["_source_factory"] = lambda spec: source
+    settings["transcription"] = stt_settings()
+    settings["_transcription_transport"] = transport
+    h = await listening(settings, clock, triggers=ACCEPT_ALL)
+    await h.handle.prepare()
+
+    assert await h.handle.listen_once() == "source_failure"
+
+    assert source.reads == [8]
+    assert call_requests(transport) == []
+    assert h.handle.counts()["source_failures"] == 1
+    assert h.scheduler.admissions == []
+
+
+class _HeldSourceProcess(ListenProcess):
+    """A source that writes nothing and ignores a terminate; only a kill ends it."""
+
+    def __init__(self, runner: "ListenRunner", argv: tuple[str, ...],
+                 kwargs: dict[str, Any]) -> None:
+        super().__init__(runner, argv, kwargs, b"", 0)
+        self._ended = asyncio.get_running_loop().create_future()
+
+    async def _read(self, n: int = -1) -> bytes:
+        await asyncio.shield(self._ended)
+        return b""
+
+    def terminate(self) -> None:
+        self.runner.terminates.append(self.pid)
+
+    def kill(self) -> None:
+        super().kill()
+        if not self._ended.done():
+            self._ended.set_result(None)
+
+    async def wait(self) -> int:
+        await asyncio.shield(self._ended)
+        return self.returncode if self.returncode is not None else 0
+
+
+class _HeldSourceRunner(ListenRunner):
+    async def __call__(self, *argv: str, **kwargs: Any) -> ListenProcess:
+        if list(argv) != RECORDER_ARGV:
+            return await super().__call__(*argv, **kwargs)
+        self.source_calls.append(kwargs)
+        process = _HeldSourceProcess(self, tuple(argv), kwargs)
+        self.processes.append(process)
+        return process
+
+
+async def test_p13_r7_an_acquisition_is_killed_at_its_hard_deadline() -> None:
+    """R7 (review A1): a source that neither exits nor answers a terminate
+    cannot hold the iteration: at ``listen.max_seconds`` plus
+    ``grace_seconds`` on the injected sleeper it is killed, its read
+    abandoned, and the outcome is a counted source failure, transcribed 0
+    times."""
+
+    clock = ManualClock(1000.0)
+    runner = _HeldSourceRunner(clock, detections=[(0, b"nova")])
+    transport = ScriptedTranscriptionTransport(PROBE_OK, {"text": TRANSCRIPT})
+    settings = listen_settings(runner, clock, max_seconds=8)  # type: ignore[arg-type]
+    settings["transcription"] = stt_settings()
+    settings["_transcription_transport"] = transport
+    h = await listening(settings, clock, triggers=ACCEPT_ALL)
+    await h.handle.prepare()
+
+    pending = asyncio.ensure_future(h.handle.listen_once())
+    await settle()
+    assert len(runner.source_calls) == 1
+    clock.advance(9.9)  # 8 s + the 2 s grace not yet reached
+    await settle()
+    assert not pending.done() and runner.kills == []
+
+    clock.advance(0.1)
+    assert await finished(pending) == "source_failure"
+
+    source = runner.processes[-1]
+    assert runner.kills == [source.pid]
+    assert call_requests(transport) == []
+    assert h.handle.counts()["source_failures"] == 1
+    assert h.scheduler.admissions == []
+
+
+async def _voice_admitting_through_the_brain_service(
+    expire: Any,
+) -> tuple[Voice, RecordingScheduler, list[Any]]:
+    """A voice with no context scheduler: the brain's published one, and a
+    stand-in for the brain's bus consumer recording the decision it reads."""
+
+    v = await voice(triggers=ACCEPT_ALL)
+    v.handle._scheduler = None
+    published = RecordingScheduler()
+    v.h.runtime.services.publish("admission", "runs", published, module="brain")
+    seen: list[Any] = []
+
+    def brain_consumer(event: Any) -> None:
+        payload = event["payload"]
+        if payload.get("kind") == "speech":
+            seen.append(v.h.engine.recorded(
+                platform=payload["platform"],
+                channel_id=payload["channel_id"],
+                source_event_id=payload["message_id"],
+            ))
+
+    v.h.runtime.bus.subscribe("channel.chat.message", brain_consumer)
+
+    def segment(env: dict[str, str]) -> bytes:
+        expire(v)
+        return v.runner.synthesise(env)
+
+    v.runner.segments = [segment]
+    return v, published, seen
+
+
+def _past_the_ttl(v: Voice) -> None:
+    v.h.clock.advance(61.0)  # the harness's dedup TTL is 60 s
+
+
+def _evicted(v: Voice) -> None:
+    for index in range(8):  # the harness's dedup window holds 8
+        v.h.engine.evaluate(candidate(f"other-{index}"))
+
+
+@pytest.mark.parametrize("expire", [_past_the_ttl, _evicted], ids=["ttl", "evicted"])
+async def test_p13_r7_a_decision_expired_during_acquisition_is_still_admitted_once(
+    expire: Any,
+) -> None:
+    """R7 (review A3): "published and admitted under the candidate's
+    decision". When the engine no longer retains the accepted decision by
+    the time the transcription is published — past its time-to-live or
+    evicted — the brain's consumer finds none and refuses the copy, so the
+    module admits the event itself, once, into the scheduler the brain
+    publishes as ``(admission, runs)``, without asking the engine again."""
+
+    v, published, seen = await _voice_admitting_through_the_brain_service(expire)
+
+    assert await v.handle.listen_once() == "published"
+
+    assert seen == [None]  # the brain's consumer would refuse it
+    ((session_key, work),) = published.admissions
+    (event,) = v.speech_events()
+    assert work.source_event_id == event["payload"]["message_id"]
+    assert session_key.viewer_id == "voice:streamer"
+    assert work.payload["payload"]["text"] == TRANSCRIPT
+    assert len(v.engine.decided) == 1 and v.hook_views == []
+    assert v.h.scheduler.admissions == []
+
+
+async def test_p13_r7_a_retained_decision_is_left_to_the_brain_consumer() -> None:
+    """R7 (review A3): while the engine still retains the accepted decision,
+    the brain's consumer admits the published copy, so the module admits
+    nothing itself — the event runs once."""
+
+    v, published, seen = await _voice_admitting_through_the_brain_service(lambda v: None)
+
+    assert await v.handle.listen_once() == "published"
+
+    (decision,) = seen
+    assert decision is not None and decision.accepted
+    assert published.admissions == []
+    assert len(v.engine.decided) == 1
+
+
+async def test_p13_ac26_observed_bounds_max_seconds_8() -> None:
+    """AC26 observed bounds: with ``listen.max_seconds: 8`` the source receives
+    ``AUDIO_INPUT_MAX_SECONDS=8`` and the WAV handed to the transcription
+    lasts at most 8 s by its header."""
+
+    v = await voice(triggers=ACCEPT_ALL, max_seconds=8, phrase_at=1000.0)
+
+    assert await v.handle.listen_once() == "published"
+
+    (call,) = v.runner.source_calls
+    assert call["env"]["AUDIO_INPUT_MAX_SECONDS"] == "8"
+    (request,) = v.transcriptions()
+    assert data_chunk_size(request["file"]) <= 8 * 32_000
+    assert len(request["file"]) == 44 + data_chunk_size(request["file"])
+
+
+@pytest.mark.parametrize(
+    ("pre_roll", "phrase_before_verdict", "marker_at"),
+    [
+        (0, 0.0, 0.0),  # starts at the verdict: observed offset 0 s
+        (2, 1.5, 0.5),  # a late verdict: the marker 0.5 s in, the phrase inside
+        (1, 1.5, None),  # the same late verdict: starts after the marker
+    ],
+)
+async def test_p13_ac26_observed_bounds_the_pre_roll_window(
+    pre_roll: int, phrase_before_verdict: float, marker_at: float | None
+) -> None:
+    """AC26 observed bounds: the marker-tone source writes the window its
+    environment asks for, measured on the WAV handed to the transcription —
+    pre-roll 0 starts at the verdict; with the phrase beginning 1.5 s before
+    a late verdict, pre-roll 2 starts 2 s before it (marker 0.5 s in, the
+    phrase wholly inside) and pre-roll 1 starts 1 s before it, no marker."""
+
+    verdict_at = 1000.0
+    v = await voice(
+        triggers=ACCEPT_ALL,
+        pre_roll_seconds=pre_roll,
+        phrase_at=verdict_at - phrase_before_verdict,
+    )
+
+    assert await v.handle.listen_once() == "published"
+
+    (call,) = v.runner.source_calls
+    assert call["env"]["AUDIO_INPUT_PRE_ROLL_SECONDS"] == str(pre_roll)
+    (request,) = v.transcriptions()
+    wav = request["file"]
+    marker = segment_frames(wav, MARKER_SAMPLE)
+    phrase = segment_frames(wav, PHRASE_SAMPLE)
+    if marker_at is None:
+        assert marker == []
+        return
+    assert marker[0] / 16_000 == pytest.approx(marker_at)
+    assert len(marker) == round(MARKER_SECONDS * 16_000)
+    assert len(phrase) == round(PHRASE_SECONDS * 16_000)  # wholly inside
+
+
+async def test_p13_ac27_a_command_detection_submits_one_candidate_the_default_accepts() -> None:
+    """AC27: a command detector exiting 0 with ``hey nova`` submits exactly 1
+    candidate (``wake_word == {detected: true, phrase: "hey nova"}``, text
+    ``hey nova``) which the default policy decides ``accepted:wake_word_match``
+    through the hook; its standard input is empty (``DEVNULL``) and nothing
+    else is handed to it; the published event is never passed to the hook."""
+
+    v = await voice(detections=[(0, b"  hey nova\n")])
+
+    assert await v.handle.listen_once() == "published"
+
+    (candidate,) = v.candidates()
+    assert candidate["payload"]["wake_word"] == {"detected": True, "phrase": "hey nova"}
+    assert candidate["payload"]["text"] == "hey nova"
+    assert v.reasons() == ["accepted:wake_word_match"]
+    (call,) = v.runner.detector_calls
+    assert call["stdin"] == asyncio.subprocess.DEVNULL
+    assert "input" not in call and "env" not in call
+    (view,) = v.hook_views
+    assert view["payload"]["text"] == "hey nova"
+    (event,) = v.speech_events()
+    assert event["payload"]["text"] == TRANSCRIPT
+    assert all(TRANSCRIPT not in str(view) for view in v.hook_views)
+
+
+@pytest.mark.parametrize(
+    ("detection", "settled", "failures"),
+    [
+        ((1, b""), "no_verdict", 0),
+        ((1, b"nova"), "no_verdict", 0),
+        ((2, b"hey nova"), "detector_failure", 1),
+        ((-9, b"hey nova"), "detector_failure", 1),  # a signal
+        ((0, b"n" * 65), "detector_failure", 1),
+        ((0, b"   \n"), "detector_failure", 1),
+        ((0, b"\xff\xfe"), "detector_failure", 1),
+        ((0, b"x" * 10_000), "detector_failure", 1),
+    ],
+)
+async def test_p13_ac27_a_command_detector_without_a_verdict_submits_nothing(
+    detection: tuple[int, bytes], settled: str, failures: int
+) -> None:
+    """AC27: exit 1 (no verdict), exit 2, a signal, and exit 0 with a
+    65-character, blank, undecodable or oversized output each submit 0
+    candidates and invoke the source 0 times; all but exit 1 are counted
+    detector failures."""
+
+    v = await voice(detections=[detection])
+
+    assert await v.handle.listen_once() == settled
+
+    assert v.candidates() == []
+    assert v.runner.source_calls == [] and v.transcriptions() == []
+    assert v.handle.counts()["detector_failures"] == failures
+    assert v.handle.counts()["candidates"] == 0
+
+
+async def test_p13_ac27_an_unstartable_command_detector_is_a_failure() -> None:
+    """R7: a detector process that cannot start is a counted failure with no
+    candidate and a fixed, value-free code."""
+
+    v = await voice()
+
+    async def refuse(*argv: str, **kwargs: Any) -> Any:
+        raise FileNotFoundError(2, "detector-secret-argv cannot start")
+
+    v.handle.detector._runner = refuse  # type: ignore[union-attr]
+    # The loader imports the package itself: the class, by name.
+    with pytest.raises(Exception) as raised:
+        await v.handle.detector.wait()  # type: ignore[union-attr]
+    assert type(raised.value).__name__ == "DetectorFailure"
+    assert raised.value.code == "detector_unstartable"  # type: ignore[attr-defined]
+    assert "secret" not in str(raised.value)
+    assert await v.handle.listen_once() == "detector_failure"
+    assert v.candidates() == [] and v.handle.counts()["detector_failures"] == 1
+
+
+HTTP_DETECTOR = {"kind": "http", "endpoint": DETECTOR_ENDPOINT, "api_key": DETECTOR_KEY}
+
+
+async def test_p13_ac27_an_http_detection_submits_one_candidate_and_carries_no_audio() -> None:
+    """AC27: an HTTP detector answering ``{"detected": true, "phrase": "hey
+    nova"}`` submits 1 candidate decided ``accepted:wake_word_match``; the
+    request carries no body at all (no audio), only the bearer header."""
+
+    session = DetectorSession({"detected": True, "phrase": "hey nova"})
+    v = await voice(detector=dict(HTTP_DETECTOR), session=session)
+
+    assert await v.handle.listen_once() == "published"
+
+    assert v.reasons() == ["accepted:wake_word_match"]
+    (request,) = session.requests
+    assert request["url"] == DETECTOR_ENDPOINT
+    assert set(request) == {"url", "headers"}
+    assert request["headers"] == {"Authorization": f"Bearer {DETECTOR_KEY}"}
+    assert v.runner.detector_calls == []
+    assert len(v.speech_events()) == 1
+    assert all(TRANSCRIPT not in str(view) for view in v.hook_views)
+    await v.handle.close()
+    assert session.closed == 1
+
+
+@pytest.mark.parametrize(
+    ("answer", "settled", "failures"),
+    [
+        ({"detected": False}, "no_verdict", 0),
+        ({"detected": "yes"}, "detector_failure", 1),
+        (500, "detector_failure", 1),
+        (204, "detector_failure", 1),
+        ({"detected": True}, "detector_failure", 1),
+        ({"detected": True, "phrase": "n" * 65}, "detector_failure", 1),
+        ({"detected": True, "phrase": 5}, "detector_failure", 1),
+        ({"detected": False, "phrase": "nova"}, "detector_failure", 1),
+        (["detected"], "detector_failure", 1),
+        (b"not json", "detector_failure", 1),
+        (ConnectionRefusedError("detector-secret-host refused"), "detector_failure", 1),
+    ],
+)
+async def test_p13_ac27_an_http_answer_outside_the_two_verdicts_submits_nothing(
+    answer: Any, settled: str, failures: int
+) -> None:
+    """AC27: ``{"detected": false}`` is no verdict; ``{"detected": "yes"}``,
+    status 500, any other shape, a body that is not JSON and a refused
+    connection each submit 0 candidates, are counted and invoke no source."""
+
+    session = DetectorSession(answer)
+    v = await voice(detector=dict(HTTP_DETECTOR), session=session)
+
+    assert await v.handle.listen_once() == settled
+
+    assert v.candidates() == []
+    assert v.runner.source_calls == []
+    assert v.handle.counts()["detector_failures"] == failures
+
+
+async def test_p13_ac27_the_shipped_http_detector_session_sets_no_timeout() -> None:
+    """R7: a detector invocation is a long wait — the shipped session for an
+    ``http`` detector disables the transport's request timeout."""
+
+    session = audio_input_module.DETECTOR_SESSION_FACTORY()
+    try:
+        assert session.timeout.total is None
+        assert session.timeout.sock_read is None
+    finally:
+        await session.close()
+
+
+async def test_p13_ac28_five_accepted_candidates_store_and_write_no_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC28 (A5): after 5 accepted candidates the attachment store holds 0
+    entries, 0 files were written (the working directory is scanned), and
+    no bus record — trace, decision or ``speech`` event, what an audit
+    writer would persist — nor any candidate contains a WAV's bytes or their
+    base64; the detector received no audio and the transcription each of the
+    5 acquired WAVs exactly once, in order."""
+
+    monkeypatch.chdir(tmp_path)
+    wavs = [wav_bytes(1.0 + index / 4, fill=0x41 + index) for index in range(5)]
+    texts = [f"{TRANSCRIPT} {index}" for index in range(5)]
+    v = await voice(
+        detections=[(0, b"hey nova")] * 5,
+        segments=wavs,
+        answers=[{"text": text} for text in texts],
+    )
+
+    for _ in range(5):
+        assert await v.handle.listen_once() == "published"
+
+    assert v.h.runtime.attachments.object_count == 0
+    assert list(tmp_path.iterdir()) == []
+    assert [request["file"] for request in v.transcriptions()] == wavs
+    assert [event["payload"]["text"] for event in v.speech_events()] == texts
+    assert len(v.h.scheduler.admissions) == 5
+    records = trace_texts(v.h.runtime.bus)
+    for wav in wavs:
+        encoded = base64.b64encode(wav).decode("ascii")
+        assert all(encoded not in text for text in records)
+        assert all(encoded not in str(candidate) for candidate in v.candidates())
+        assert all(wav[44:200].decode("latin-1") not in text for text in records)
+    for candidate in [*v.candidates(), *v.speech_events()]:
+        assert not _holds_bytes(candidate)
+    for call in v.runner.detector_calls:
+        assert call["stdin"] == asyncio.subprocess.DEVNULL
+        assert "input" not in call
+    assert len(v.runner.detector_calls) == 5
+    assert len(v.hook_views) == 5
+    assert all("wake_word" in view["payload"] for view in v.hook_views)
+
+
+def _holds_bytes(value: Any) -> bool:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return True
+    if isinstance(value, dict):
+        return any(_holds_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_holds_bytes(item) for item in value)
+    return False
+
+
+async def test_p13_without_a_shared_scheduler_the_bus_copy_is_the_whole_route() -> None:
+    """R7 admission exactly once: without a scheduler on the context the
+    brain owns its scheduler and admits the published copy under the
+    candidate's recorded decision, so the module admits nothing itself; the
+    engine holds that decision under the event's own identifiers."""
+
+    v = await voice(triggers=ACCEPT_ALL)
+    v.handle._scheduler = None
+
+    assert await v.handle.listen_once() == "published"
+
+    (event,) = v.speech_events()
+    assert v.h.scheduler.admissions == []
+    payload = event["payload"]
+    recorded = v.h.engine.recorded(
+        platform=payload["platform"],
+        channel_id=payload["channel_id"],
+        source_event_id=payload["message_id"],
+    )
+    assert recorded is not None and recorded.accepted
+
+
+async def test_p13_listening_off_or_unprepared_invokes_nothing() -> None:
+    """R7: with listening off, or before ``prepare``, an iteration invokes no
+    detector and no source (``stopped``)."""
+
+    clock = ManualClock(1000.0)
+    runner = ListenRunner(clock, detections=[(0, b"nova")])
+    off = await listening(command_settings(runner, clock), clock)  # type: ignore[arg-type]
+    await off.handle.prepare()
+    assert await off.handle.listen_once() == "stopped"
+    unprepared = await listening(listen_settings(runner, clock), clock)  # type: ignore[arg-type]
+    assert await unprepared.handle.listen_once() == "stopped"
+    assert runner.processes == []
 
 
 # --------------------------------------------------------------------------- #
