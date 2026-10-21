@@ -86,6 +86,7 @@ from conftest import (
     FakeSession,
     HeldSession,
     ManualClock,
+    UnreachableSession,
     ac33_node,
     completion,
     events_of,
@@ -589,6 +590,9 @@ async def test_ac27_example_config_drives_one_correlated_run_and_clean_shutdown(
     """
 
     environ = _environment()
+    # AC33: nothing listens at the scene provider's URL; the shipped
+    # transport runs over a session that refuses the connection.
+    scene_attempts = UnreachableSession.install(monkeypatch, environ["SCENE_WEBSOCKET_URL"])
     websocket = FakeWebSocket(welcome())
     audit_lines: list[str] = []
     twitch_session = FakeTwitchSession(
@@ -629,6 +633,7 @@ async def test_ac27_example_config_drives_one_correlated_run_and_clean_shutdown(
     finally:
         stop.set()
     assert await asyncio.wait_for(task, timeout=1) == 0
+    assert scene_attempts and set(scene_attempts) == {environ["SCENE_WEBSOCKET_URL"]}
 
     assert diagnostics == []
     assert len(brain_session.post_calls) == 1
@@ -738,6 +743,9 @@ async def test_r8_refused_send_is_sanitized_leaves_no_send_fact_and_next_send_su
     """
 
     environ = _environment()
+    # AC33: nothing listens at the scene provider's URL; the shipped
+    # transport runs over a session that refuses the connection.
+    scene_attempts = UnreachableSession.install(monkeypatch, environ["SCENE_WEBSOCKET_URL"])
     websocket = FakeWebSocket(welcome())
     leaked_body = {"message": "|".join(environ.values())}
     audit_lines: list[str] = []
@@ -780,6 +788,7 @@ async def test_r8_refused_send_is_sanitized_leaves_no_send_fact_and_next_send_su
     finally:
         stop.set()
     assert await asyncio.wait_for(task, timeout=1) == 0
+    assert scene_attempts and set(scene_attempts) == {environ["SCENE_WEBSOCKET_URL"]}
 
     helix_calls = twitch_session.helix_calls
     assert [call["json"]["message"] for call in helix_calls] == ["First", "Second"]

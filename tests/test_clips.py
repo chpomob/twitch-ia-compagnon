@@ -26,6 +26,7 @@ import yaml
 
 from conftest import (
     KICK_TEST_KEY,
+    InMemoryNetwork,
     ManualClock,
     ScriptedClipService,
     events_of,
@@ -989,18 +990,21 @@ async def test_ac12_with_only_kick_required_true_fails_naming_clips_and_the_reas
 
 @pytest.mark.asyncio
 async def test_ac12_with_only_kick_required_unset_starts_with_the_action_unbound(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC12: with only kick enabled and ``required`` unset, startup completes
     with ``stream.clip.create`` declared and unbound on kick
-    (``platform_unsupported``); a call is refused with 0 requests."""
+    (``platform_unsupported``); a call is refused with 0 requests. AC33:
+    kick's listener binds on the in-memory loopback."""
 
+    loopback = InMemoryNetwork().install(monkeypatch)
     clock = ManualClock(START)
     runtime, activations, session = await loaded_with_kick(tmp_path, clock, clips={})
     coordinator = coordinator_for(runtime, activations, clock)
     report = await coordinator.start()
     try:
         assert report.status == 0, report
+        assert len(loopback.listeners) == 1
         handle = activations[1].handle
         assert handle.bound_platforms == ()
         assert handle.unbound == {"kick": REASON_PLATFORM_UNSUPPORTED}

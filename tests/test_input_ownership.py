@@ -2588,6 +2588,7 @@ def test_the_registration_names_no_vendor_and_no_platform() -> None:
 # P18: AC14 with the real modules — `users` and the bridge share the read
 # --------------------------------------------------------------------------- #
 
+from conftest import InMemoryNetwork  # noqa: E402
 from test_automation_bridge import (  # noqa: E402
     FAKE_WAIT_SECONDS,
     PRINCIPAL,
@@ -2602,13 +2603,20 @@ _USERS_SETTINGS = {"max_channels": 4, "max_users_per_channel": 8, "max_age_secon
 
 
 @pytest.mark.asyncio
-async def test_ac14_the_real_users_and_bridge_split_the_viewer_read() -> None:
+async def test_ac14_the_real_users_and_bridge_split_the_viewer_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """AC14 (R3), real modules: ``users`` and the bridge enabled with
     ``inputs: {viewers: {twitch: <bridge>}}`` prepare without an
     ``AmbiguousBindingError``; a twitch ``users.read`` reaches the bridge's
     provider and a kick one the ``users`` provider — 1 invocation each, 0 of
-    the other. The ``users`` page still reports ``observed_authors``."""
+    the other. The ``users`` page still reports ``observed_authors``.
 
+    AC33: the fake instance listens on the :class:`conftest.InMemoryNetwork`
+    loopback and the bridge's own ``aiohttp.ClientSession`` reaches it over
+    an in-memory WebSocket; the bridge and the instance code are unchanged."""
+
+    loopback = InMemoryNetwork().install(monkeypatch)
     async with FakeInstance() as fake:
         runs = _Runs(fake)
         await runs.start(
@@ -2666,8 +2674,10 @@ async def test_ac14_the_real_users_and_bridge_split_the_viewer_read() -> None:
             assert kick.result["coverage"]["kind"] == "observed_authors"
             # The kick read never reached the bridge.
             assert len(fake.requests("GetActiveViewers")) == 1
+            assert fake.connections == 1
         finally:
             await runs.stop()
+    await loopback.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -3055,18 +3065,26 @@ def test_ac5_the_bridge_settings_schema_has_no_required_key() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ac5_a_twitch_event_is_dropped_while_the_owning_bridge_is_down() -> None:
+async def test_ac5_a_twitch_event_is_dropped_while_the_owning_bridge_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """AC5 (R1, R3), end to end through the real loader and coordinator:
     the real bridge owns (``chat``, twitch) by an explicit ``inputs`` entry,
     its fake instance has been stopped, and the real ``twitch`` module is
     enabled beside it. Startup succeeds with the bridge degraded
     (``unreachable``); a chat notification driven into the twitch handler
     (P8's driver) reaches no subscriber and is counted once — the native
-    module is never a fallback."""
+    module is never a fallback.
 
+    AC33: the instance listened on the :class:`conftest.InMemoryNetwork`
+    loopback; once stopped, the bridge's connect to its URL is refused with
+    ``aiohttp.ClientConnectorError``, as a closed port refuses it."""
+
+    loopback = InMemoryNetwork().install(monkeypatch)
     async with FakeInstance() as fake:
         url = fake.url
     # The instance is stopped: nothing listens at its URL any more.
+    assert loopback.listeners == {}
 
     bridge = _Bridge()
     session = _TwitchSession([])

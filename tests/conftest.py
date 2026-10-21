@@ -35,7 +35,7 @@ seams, the Helix answers of the twitch clip and moderation endpoints
 viewer-memory directory (:func:`memory_directory`), and the Kick webhook
 edge: a fixed, test-only RSA key pair (:data:`KICK_TEST_KEY`) and a
 :class:`SignedWebhookSender` that signs deliveries with it and posts them
-through an in-process ``aiohttp`` test client, and the YouTube edge (P20): a
+through an in-process client, and the YouTube edge (P20): a
 :class:`ScriptedTokenEndpoint` issuing, refusing or losing access tokens with
 a request log, and a :class:`ScriptedLiveChatAPI` answering the broadcast
 lookup, list pages carrying ``pollingIntervalMillis`` and the insert, delete
@@ -70,7 +70,13 @@ directly), :func:`ignored` (the ignore files) and :func:`baseline_numstat`
 :class:`FakeOSProcess`, a scripted stand-in for ``asyncio.subprocess.Process``
 and ``subprocess.Popen``, and the ``fake_spawn`` fixture (a :class:`FakeOS`
 routing ``os.kill``/``os.killpg`` to the fakes) that the shipped runners'
-child-process tests start them through.
+child-process tests start them through. P15c adds :class:`InMemoryClient`, a
+socket-free ``TestClient(TestServer(app))`` that awaits the application's
+handler on a mocked request; :class:`InMemoryNetwork`, under which
+``aiohttp.web.TCPSite`` listens in memory and ``aiohttp.ClientSession``
+reaches those listeners (HTTP and WebSocket); and :class:`UnreachableSession`,
+the patched ``aiohttp.ClientSession`` of an endpoint nothing listens on,
+raising ``aiohttp.ClientConnectorError`` beneath the production transport.
 
 This file is a single point of failure for every suite that imports it; a
 change here must be reviewed against each consumer, not just the suite that
@@ -2350,8 +2356,8 @@ class SignedWebhookSender:
     timestamp + "." + raw body``, computed as ``pow(m, d, n)`` with *key*;
     the timestamp is RFC 3339 UTC read from *clock* (epoch seconds, so a
     :class:`ManualClock` built on an epoch drives it). :meth:`post` sends
-    through an in-process ``aiohttp`` test client (``TestClient``) — nothing
-    leaves the process. Every header and the body can be overridden, so a
+    through an :class:`InMemoryClient` straight to the application's handler
+    — no socket, nothing leaves the process. Every header and the body can be overridden, so a
     suite forges a bad signature, a stale timestamp or a duplicate id on
     purpose.
     """
@@ -2430,8 +2436,8 @@ class SignedWebhookSender:
         timestamp: str | None = None,
         signature: str | None = None,
     ) -> int:
-        """Post one delivery through *client* (an ``aiohttp`` ``TestClient``,
-        or a client session given a full URL as *path*); return the status."""
+        """Post one delivery through *client* (an :class:`InMemoryClient`, or
+        a client session given a full URL as *path*); return the status."""
 
         body = self.body(payload)
         headers = self.headers(
@@ -2441,9 +2447,525 @@ class SignedWebhookSender:
             timestamp=timestamp,
             signature=signature,
         )
+        if isinstance(client, InMemoryClient):
+            return (await client.request("POST", path, headers, body)).status
         async with client.post(path, data=body, headers=headers) as response:
             await response.read()
             return response.status
+
+
+# --------------------------------------------------------------------------- #
+# The in-memory HTTP edge (phase 8 P15c, AC33): no listener, no connection
+# --------------------------------------------------------------------------- #
+
+
+class InMemoryResponse:
+    """What :class:`InMemoryClient` answers: ``status``, ``headers``, ``body``.
+
+    Read like an ``aiohttp`` client response (``read``, ``text``, ``json``,
+    ``release``, ``async with``), so a suite that read a ``TestClient``
+    answer reads this one the same way.
+    """
+
+    def __init__(self, status: int, headers: Mapping[str, str], body: bytes) -> None:
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+    async def read(self) -> bytes:
+        return self.body
+
+    async def text(self) -> str:
+        return self.body.decode("utf-8")
+
+    async def json(self) -> Any:
+        return json.loads(self.body.decode("utf-8"))
+
+    def release(self) -> None:
+        return None
+
+    async def __aenter__(self) -> InMemoryResponse:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+class _Pending:
+    """An ``aiohttp``-style request call: awaitable, or entered with ``async with``."""
+
+    def __init__(self, call: Callable[[], Any]) -> None:
+        self._call = call
+
+    def __await__(self) -> Any:
+        return self._call().__await__()
+
+    async def __aenter__(self) -> Any:
+        return await self._call()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+def _body_reader(body: bytes) -> Any:
+    """A finished ``StreamReader`` holding *body*: the request content."""
+
+    from unittest import mock
+
+    from aiohttp.streams import StreamReader
+
+    reader = StreamReader(mock.Mock(_reading_paused=False), 2**16, loop=asyncio.get_running_loop())
+    if body:
+        reader.feed_data(body)
+    reader.feed_eof()
+    return reader
+
+
+class InMemoryClient:
+    """A socket-free stand-in for ``TestClient(TestServer(app))`` (AC33).
+
+    :meth:`start` runs the application's startup hooks as a runner would,
+    :meth:`close` its shutdown and cleanup hooks. :meth:`request` builds an
+    ``aiohttp.test_utils.make_mocked_request`` carrying *body* in a
+    ``StreamReader`` — with the ``Content-Length`` a client would have sent
+    — and awaits the application's own handler, its router and middlewares
+    included; an ``HTTPException`` the handler raises is answered as the
+    server would. No HTTP parser runs: :meth:`request_raw` parses raw bytes
+    with ``aiohttp.http_parser.HttpRequestParser`` first, for an assertion
+    that depends on the parsed form.
+    """
+
+    def __init__(self, app: Any, *, started: bool = False) -> None:
+        self.app = app
+        self._started = started
+        self._owns_lifecycle = not started
+        self.requests = 0
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self.app._set_loop(asyncio.get_running_loop())
+        self.app.on_startup.freeze()
+        await self.app.startup()
+        self.app.freeze()
+        self._started = True
+
+    async def close(self) -> None:
+        if not (self._started and self._owns_lifecycle):
+            return
+        self._owns_lifecycle = False
+        await self.app.shutdown()
+        await self.app.cleanup()
+
+    async def __aenter__(self) -> InMemoryClient:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str] | None = None,
+        body: bytes = b"",
+    ) -> InMemoryResponse:
+        """Hand one request to the application; its answer."""
+
+        sent = dict(headers or {})
+        if body and not any(name.lower() == "content-length" for name in sent):
+            sent["Content-Length"] = str(len(body))
+        return await self._dispatch(method, path, sent, _body_reader(body))
+
+    async def request_raw(self, raw: bytes) -> InMemoryResponse:
+        """Parse *raw* (one HTTP/1.1 request) with the server's parser, then
+        hand the parsed method, path, headers and payload to the application."""
+
+        from unittest import mock
+
+        from aiohttp.http_parser import HttpRequestParser
+
+        parser = HttpRequestParser(mock.Mock(), asyncio.get_running_loop(), 2**16)
+        messages, _upgraded, _tail = parser.feed_data(raw)
+        ((message, payload),) = messages
+        return await self._dispatch(message.method, message.path, message.headers, payload)
+
+    async def _dispatch(
+        self, method: str, path: str, headers: Mapping[str, str], payload: Any
+    ) -> InMemoryResponse:
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        await self.start()
+        self.requests += 1
+        request = make_mocked_request(
+            method,
+            path,
+            headers=headers,
+            app=self.app,
+            payload=payload,
+            client_max_size=self.app._client_max_size,
+        )
+        try:
+            response = await self.app._handle(request)
+        except web.HTTPException as refused:
+            response = refused
+        body = getattr(response, "body", None)
+        return InMemoryResponse(
+            response.status,
+            dict(response.headers),
+            bytes(body) if isinstance(body, (bytes, bytearray)) else b"",
+        )
+
+    def post(self, path: str, *, data: bytes = b"", headers: Mapping[str, str] | None = None) -> Any:
+        return _Pending(lambda: self.request("POST", path, headers, data))
+
+    def get(self, path: str, *, headers: Mapping[str, str] | None = None) -> Any:
+        return _Pending(lambda: self.request("GET", path, headers))
+
+
+def connector_error(url: str) -> Exception:
+    """The ``aiohttp.ClientConnectorError`` a refused connection to *url* raises."""
+
+    import aiohttp
+    from aiohttp.client_reqrep import ConnectionKey
+    from yarl import URL
+
+    target = URL(url)
+    key = ConnectionKey(
+        target.host or "", target.port, target.scheme in ("https", "wss"), True, None, None, None
+    )
+    return aiohttp.ClientConnectorError(
+        key, ConnectionRefusedError(errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED))
+    )
+
+
+class UnreachableSession:
+    """An ``aiohttp.ClientSession`` stand-in for an endpoint nothing listens on.
+
+    Patched over ``aiohttp.ClientSession`` (:meth:`install`), every session
+    the code under test builds is one of these: a request or a WebSocket
+    connect to one of *refused* raises ``aiohttp.ClientConnectorError``, as
+    a closed port does, and is recorded in the shared ``attempts``. Any other
+    URL is a test error, never a silent pass.
+    """
+
+    def __init__(self, refused: Sequence[str], attempts: list[str]) -> None:
+        self.refused = tuple(refused)
+        self.attempts = attempts
+        self.closed = False
+
+    @classmethod
+    def install(cls, monkeypatch: pytest.MonkeyPatch, *refused: str) -> list[str]:
+        """Patch ``aiohttp.ClientSession``; the attempts every session records."""
+
+        import aiohttp
+
+        attempts: list[str] = []
+        monkeypatch.setattr(
+            aiohttp, "ClientSession", lambda *args, **kwargs: cls(refused, attempts)
+        )
+        return attempts
+
+    def _refuse(self, url: Any) -> Any:
+        async def call() -> Any:
+            target = str(url)
+            if not any(target.startswith(prefix) for prefix in self.refused):
+                raise AssertionError(f"UnreachableSession: unexpected URL {target!r}")
+            self.attempts.append(target)
+            raise connector_error(target)
+
+        return _Pending(call)
+
+    def request(self, method: str, url: Any, **kwargs: Any) -> Any:
+        return self._refuse(url)
+
+    def get(self, url: Any, **kwargs: Any) -> Any:
+        return self._refuse(url)
+
+    def post(self, url: Any, **kwargs: Any) -> Any:
+        return self._refuse(url)
+
+    def ws_connect(self, url: Any, **kwargs: Any) -> Any:
+        return self._refuse(url)
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def __aenter__(self) -> UnreachableSession:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+
+class _MemoryTransport:
+    """The transport a memory WebSocket's ``_writer`` reports: open until the end closes."""
+
+    def __init__(self, end: MemoryWebSocket) -> None:
+        self._end = end
+
+    def is_closing(self) -> bool:
+        return self._end.closed
+
+
+class _AiohttpTypedWebSocket(MemoryWebSocket):
+    """A memory WebSocket end whose messages carry ``aiohttp.WSMsgType``.
+
+    Code that compares a message type by identity (``is aiohttp.WSMsgType.TEXT``)
+    sees the type it expects; the ``_writer`` probe a client may run before a
+    write (transport present, not closing) sees a live connection until the
+    end closes.
+    """
+
+    @property
+    def _writer(self) -> Any:
+        transport = _MemoryTransport(self)
+        return SimpleNamespace(
+            transport=transport,
+            protocol=SimpleNamespace(transport=transport),
+            _closing=self.closed,
+        )
+
+    async def receive(self, timeout: float | None = None) -> WSMessage:
+        import aiohttp
+
+        message = await super().receive(timeout)
+        return WSMessage(aiohttp.WSMsgType(int(message.type)), message.data, message.extra)
+
+
+_MEMORY_PEER: list[Any] = []
+
+
+def _memory_peer_key() -> Any:
+    """The request key a WebSocket connect hands its client end under.
+
+    A ``web.RequestKey`` where aiohttp has one (a string key warns there);
+    the plain string on the older releases ``aiohttp>=3.9`` still admits.
+    """
+
+    if not _MEMORY_PEER:
+        from aiohttp import web
+
+        name = "conftest.memory_websocket_peer"
+        request_key = getattr(web, "RequestKey", None)
+        _MEMORY_PEER.append(name if request_key is None else request_key(name, object))
+    return _MEMORY_PEER[0]
+
+
+class MemoryWebSocketResponse(_AiohttpTypedWebSocket):
+    """Patched over ``aiohttp.web.WebSocketResponse`` by :class:`InMemoryNetwork`:
+    ``prepare`` pairs this end with the client end the connect carried."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        self.prepared = asyncio.Event()
+
+    async def prepare(self, request: Any) -> MemoryWebSocketResponse:
+        peer = request.get(_memory_peer_key())
+        if peer is None:
+            raise AssertionError("MemoryWebSocketResponse: not an in-memory WebSocket connect")
+        self._attach(peer)
+        peer._attach(self)
+        peer._accepted.set()
+        return self
+
+
+class _MemoryClientWebSocket(_AiohttpTypedWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self._accepted = asyncio.Event()
+
+
+class _NominalSocket:
+    def __init__(self, address: tuple[str, int]) -> None:
+        self._address = address
+
+    def getsockname(self) -> tuple[str, int]:
+        return self._address
+
+
+class _NominalServer:
+    """What an in-memory site holds instead of an ``asyncio`` server."""
+
+    def __init__(self, address: tuple[str, int], on_close: Callable[[], None]) -> None:
+        self.sockets = [_NominalSocket(address)]
+        self._on_close = on_close
+
+    def close(self) -> None:
+        self._on_close()
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class InMemoryNetwork:
+    """A loopback held in memory: listeners bound by ``aiohttp.web.TCPSite``
+    and the ``aiohttp.ClientSession`` requests that reach them (AC33).
+
+    :meth:`install` patches ``aiohttp.web.TCPSite`` with a site that, on
+    ``start``, registers with its runner as the real one does and listens
+    on its host and port here — port ``0`` gets a nominal one — and
+    ``aiohttp.ClientSession`` with a session that routes a request to the
+    listener on the URL's host and port through :class:`InMemoryClient`, or
+    a WebSocket connect to it over an in-memory pair (``aiohttp.web.
+    WebSocketResponse`` is patched with :class:`MemoryWebSocketResponse`).
+    A URL nothing listens on raises ``aiohttp.ClientConnectorError``.
+    ``monkeypatch`` undoes every patch after the test.
+    """
+
+    FIRST_PORT = 40000
+
+    def __init__(self) -> None:
+        self.listeners: dict[tuple[str, int], Any] = {}
+        #: Every ``(host, port)`` a site was asked to bind, in order.
+        self.binds: list[tuple[str | None, int | None]] = []
+        self._next_port = self.FIRST_PORT
+        self._handlers: set[asyncio.Task[Any]] = set()
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> InMemoryNetwork:
+        import aiohttp
+        from aiohttp import web
+
+        monkeypatch.setattr(web, "TCPSite", self._site_class())
+        monkeypatch.setattr(web, "WebSocketResponse", MemoryWebSocketResponse)
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda *args, **kwargs: _NetworkSession(self))
+        return self
+
+    def _site_class(self) -> type:
+        from aiohttp.web_runner import BaseSite
+
+        network = self
+
+        class InMemorySite(BaseSite):
+            def __init__(self, runner: Any, host: str | None = None, port: int | None = None, **_: Any) -> None:
+                super().__init__(runner)
+                self._host = host or "0.0.0.0"
+                self._port = port
+
+            @property
+            def name(self) -> str:
+                return f"http://{self._host}:{self._port}"
+
+            async def start(self) -> None:
+                await super().start()
+                network.binds.append((self._host, self._port))
+                port = self._port or network._allocate()
+                key = (self._host, port)
+                if key in network.listeners:
+                    raise OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE))
+                network.listeners[key] = self._runner.app
+                self._server = _NominalServer(key, lambda: network.listeners.pop(key, None))
+
+        return InMemorySite
+
+    def _allocate(self) -> int:
+        port = self._next_port
+        self._next_port += 1
+        return port
+
+    def listener(self, url: Any) -> Any:
+        """The application listening at *url*'s host and port; refused if none."""
+
+        from yarl import URL
+
+        target = URL(str(url))
+        app = self.listeners.get((target.host or "", target.port or 0))
+        if app is None:
+            raise connector_error(str(url))
+        return app
+
+    async def connect(self, url: Any) -> MemoryWebSocket:
+        """One WebSocket connect: the listener's handler serves the server end."""
+
+        from aiohttp.test_utils import make_mocked_request
+        from yarl import URL
+
+        app = self.listener(url)
+        client = _MemoryClientWebSocket()
+        request = make_mocked_request(
+            "GET",
+            URL(str(url)).path_qs or "/",
+            headers={"Connection": "Upgrade", "Upgrade": "websocket"},
+            app=app,
+        )
+        request[_memory_peer_key()] = client
+        handler = asyncio.ensure_future(app._handle(request))
+        self._handlers.add(handler)
+        handler.add_done_callback(self._handlers.discard)
+        accepted = asyncio.ensure_future(client._accepted.wait())
+        try:
+            await asyncio.wait({accepted, handler}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            accepted.cancel()
+        if not client._accepted.is_set():
+            raise connector_error(str(url))
+        return client
+
+    async def close(self) -> None:
+        """End every handler still serving a connection."""
+
+        handlers = tuple(self._handlers)
+        for handler in handlers:
+            handler.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
+
+
+class _NetworkSession:
+    """The ``aiohttp.ClientSession`` an :class:`InMemoryNetwork` hands out."""
+
+    def __init__(self, network: InMemoryNetwork) -> None:
+        self._network = network
+        self.closed = False
+
+    def request(
+        self,
+        method: str,
+        url: Any,
+        *,
+        data: Any = None,
+        json: Any = None,
+        headers: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        from yarl import URL
+
+        async def call() -> InMemoryResponse:
+            app = self._network.listener(url)
+            body = data if data is not None else b""
+            sent = dict(headers or {})
+            if json is not None:
+                body = _json_dumps(json)
+                sent.setdefault("Content-Type", "application/json")
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            client = InMemoryClient(app, started=True)
+            return await client.request(method, URL(str(url)).path_qs, sent, bytes(body))
+
+        return _Pending(call)
+
+    def get(self, url: Any, **kwargs: Any) -> Any:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: Any, **kwargs: Any) -> Any:
+        return self.request("POST", url, **kwargs)
+
+    def ws_connect(self, url: Any, **kwargs: Any) -> Any:
+        return _Pending(lambda: self._network.connect(url))
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def __aenter__(self) -> _NetworkSession:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+
+def _json_dumps(value: Any) -> bytes:
+    return json.dumps(value).encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -2908,7 +3430,6 @@ _PHASE5_TRIALS = "test_phase5_trials.py"
 #: nodes they convert and P16 asserts it is empty. Nothing is ever added.
 AC33_PENDING: frozenset[str] = frozenset(
     {
-        "tests/test_audio_input.py::test_the_real_transport_against_a_closed_port_degrades_the_transcription",
         "tests/test_automation_bridge.py::test_ac15_phase6_a_permanently_raising_trace_keeps_the_backoff",
         "tests/test_automation_bridge.py::test_ac15_phase6_a_raising_reconcile_trace_leaves_the_owner_alive",
         "tests/test_automation_bridge.py::test_ac16_no_run_observation_is_a_success",
@@ -2986,55 +3507,15 @@ AC33_PENDING: frozenset[str] = frozenset(
         "tests/test_automation_bridge.py::test_r7b_mapped_chat_feeds_the_shared_transcript_once",
         "tests/test_automation_bridge.py::test_the_loader_activates_the_bridge_and_a_run_is_refused_not_ready",
         "tests/test_automation_bridge.py::test_without_owning_viewers_the_read_is_declared_and_never_bound",
-        "tests/test_clips.py::test_ac12_with_only_kick_required_unset_starts_with_the_action_unbound",
-        "tests/test_input_ownership.py::test_ac14_the_real_users_and_bridge_split_the_viewer_read",
-        "tests/test_input_ownership.py::test_ac5_a_twitch_event_is_dropped_while_the_owning_bridge_is_down",
         "tests/test_installation_doc.py::test_the_guides_profile_is_accepted_by_the_real_entry_point",
         "tests/test_installation_doc.py::test_the_readme_config_ui_command_runs",
-        "tests/test_integration.py::test_ac27_example_config_drives_one_correlated_run_and_clean_shutdown",
-        "tests/test_integration.py::test_r8_refused_send_is_sanitized_leaves_no_send_fact_and_next_send_succeeds",
-        "tests/test_kick.py::test_ac24_a_replay_across_the_whole_tolerance_span_is_deduplicated",
-        "tests/test_kick.py::test_ac32_an_author_id_with_a_colon_is_refused_and_counted",
-        "tests/test_kick.py::test_ac34_a_65536_byte_body_is_still_accepted",
-        "tests/test_kick.py::test_ac34_a_valid_delivery_is_published_once_and_admitted_per_policy",
-        "tests/test_kick.py::test_ac34_each_refusal_is_answered_4xx_counted_and_publishes_nothing",
-        "tests/test_kick.py::test_ac34_the_listener_runs_on_the_configured_host_and_port",
-        "tests/test_kick.py::test_ac34_the_timestamp_bound_is_inclusive_at_300_seconds_either_way",
-        "tests/test_kick.py::test_ac35_500_characters_send_one_request_and_501_send_none",
-        "tests/test_kick.py::test_ac35_a_429_blocks_sends_until_the_announced_retry_instant",
-        "tests/test_kick.py::test_ac35_a_90_second_timeout_is_sent_as_2_minutes",
-        "tests/test_kick.py::test_ac35_each_badge_satisfies_its_audience_rule",
-        "tests/test_kick.py::test_ac35_each_notice_type_maps_to_its_kind_and_is_admitted_by_kind",
-        "tests/test_kick.py::test_ac35_the_channel_account_is_the_broadcaster_by_identity",
-        "tests/test_kick.py::test_ac35_the_service_refuses_locally_with_no_request",
-        "tests/test_kick.py::test_a_channel_outside_the_configured_ones_is_refused_with_no_request",
-        "tests/test_kick.py::test_a_delivery_before_start_inputs_is_not_accepted",
-        "tests/test_kick.py::test_a_delivery_for_an_unconfigured_channel_is_ignored_and_counted",
-        "tests/test_kick.py::test_a_lost_or_5xx_send_is_external_unknown_and_never_retried",
-        "tests/test_kick.py::test_an_anonymous_gift_is_published_but_never_admitted",
-        "tests/test_kick.py::test_an_unlisted_notice_and_an_unmapped_type_are_ignored_and_counted",
-        "tests/test_kick.py::test_an_unreadable_429_blocks_for_the_bounded_default_and_is_traced",
-        "tests/test_kick.py::test_chat_owned_elsewhere_publishes_no_delivery_and_keeps_chat_write",
-        "tests/test_kick.py::test_chat_write_is_bound_on_kick_chat_and_ready_after_prepare",
-        "tests/test_kick.py::test_each_ban_answer_is_classified_after_one_request",
-        "tests/test_kick.py::test_each_other_answer_is_classified_after_one_request",
-        "tests/test_kick.py::test_owning_by_default_a_valid_delivery_is_still_published",
-        "tests/test_kick.py::test_the_companion_own_messages_are_dropped_before_anything",
-        "tests/test_kick.py::test_the_dedup_window_is_bounded_by_its_settings",
-        "tests/test_kick.py::test_the_largest_timeout_is_10080_minutes_and_is_sent",
-        "tests/test_kick.py::test_the_moderation_service_is_timeout_only_and_no_clip_or_poll_is_published",
-        "tests/test_kick.py::test_the_public_key_is_fetched_once_at_prepare_when_not_configured",
-        "tests/test_main.py::test_the_accepted_limits_bound_the_real_scheduler_memory_and_audit_queue",
         "tests/test_phase5_docs_status.py::test_ac36_the_socket_count_sees_a_local_and_a_network_socket",
         "tests/test_phase5_docs_status.py::test_ac36_the_trial_file_skips_its_eight_nodes_opening_no_socket",
-        "tests/test_profiles.py::test_ac31_the_full_pc_profile_degrades_three_modules_and_still_chats",
-        "tests/test_profiles.py::test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not_ready_too",
         "tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help",
         "tests/test_proxy_process.py::test_ac39_two_process_topology_over_loopback",
         "tests/test_proxy.py::test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it",
         "tests/test_stream_control.py::test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket",
         "tests/test_web.py::test_the_socket_guard_refuses_and_records_every_non_loopback_surface",
-        "tests/test_youtube.py::test_ac39_three_platforms_on_one_runtime",
     }
 )
 

@@ -48,7 +48,6 @@ from typing import Any
 import pytest
 import yaml
 
-from aiohttp.test_utils import TestClient, TestServer
 
 from conftest import (
     KICK_TEST_KEY,
@@ -56,6 +55,8 @@ from conftest import (
     TOKEN_REFUSED,
     TOKEN_SERVER_ERROR,
     FakeResponse,
+    InMemoryClient,
+    InMemoryNetwork,
     ManualClock,
     RecordingScheduler,
     ScriptedLiveChatAPI,
@@ -1607,7 +1608,7 @@ async def _no_delay(_seconds: float) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ac39_three_platforms_on_one_runtime() -> None:
+async def test_ac39_three_platforms_on_one_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC39: with twitch, kick and youtube enabled together (plus ``clips``
     and ``stream_control`` with polls on), ``chat.write`` is one contract
     over the three wildcard destinations with exactly 3 bindings on disjoint
@@ -1615,8 +1616,11 @@ async def test_ac39_three_platforms_on_one_runtime() -> None:
     sessions of the real scheduler; ``stream.clip.create`` is unbound for
     kick and youtube with ``platform_unsupported`` and ``stream.poll.create``
     is bound for twitch only (no poll service is published for kick or
-    youtube), a call on either platform making 0 requests."""
+    youtube), a call on either platform making 0 requests. AC33: kick's
+    listener binds on the in-memory loopback and the delivery reaches its
+    handler through an :class:`InMemoryClient`."""
 
+    InMemoryNetwork().install(monkeypatch)
     clock = ManualClock(NOW)
     registry = TriggerRegistry()
 
@@ -1684,7 +1688,7 @@ async def test_ac39_three_platforms_on_one_runtime() -> None:
         }
     )
     handles = {activation.name: activation.handle for activation in activations}
-    client: TestClient | None = None
+    client: InMemoryClient | None = None
     try:
         for name in ("twitch", "kick", "youtube", "clips", "stream_control"):
             await handles[name].prepare()
@@ -1771,8 +1775,8 @@ async def test_ac39_three_platforms_on_one_runtime() -> None:
         registry.configure("youtube", audience_policy("everyone"))
         for name in ("kick", "youtube"):
             await handles[name].start_inputs()
-        client = TestClient(TestServer(handles["kick"].build_application()))
-        await client.start_server()
+        client = InMemoryClient(handles["kick"].build_application())
+        await client.start()
         sender = SignedWebhookSender(KICK_TEST_KEY, clock)
         status = await sender.post(
             client,

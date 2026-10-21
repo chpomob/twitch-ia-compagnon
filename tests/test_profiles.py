@@ -71,6 +71,7 @@ from core.contracts import TRACE_MODULE_DEGRADED, ActionCall, Destination
 from conftest import (
     ManualClock,
     RecordingPlayerRunner,
+    UnreachableSession,
     events_of,
     wav_bytes,
 )
@@ -654,15 +655,18 @@ async def test_ac43_with_no_speech_endpoint_audio_speak_is_named_not_ready_with_
 
 
 async def test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not_ready_too(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC43 (arbiter decision 22/09): with the speech and transcription
     endpoints CONFIGURED but UNREACHABLE at ``prepare`` — a closed loopback
     port, the shipped transports, every bound on an injected clock nobody
     advances — the same not-ready naming appears: ``audio.speak`` unbound
     and named with a value-free reason, the transcription unavailable, no
-    request answered, and startup succeeds."""
+    request answered, and startup succeeds. AC33: the closed port is an
+    ``aiohttp.ClientSession`` refusing the connection beneath the shipped
+    transports."""
 
+    attempts = UnreachableSession.install(monkeypatch, "http://127.0.0.1:1/")
     config = dict(_read_yaml(PC_PROFILE))
     modules = {name: dict(settings) for name, settings in config["modules"].items()}
     modules["audio_output"]["synthesis"] = {
@@ -700,6 +704,10 @@ async def test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not
         assert reason == SYNTHESIS_PROBE_FAILED_REASON
         assert reason != SYNTHESIS_NOT_CONFIGURED_REASON
         assert edges.runner.starts == []
+        assert set(attempts) == {
+            "http://127.0.0.1:1/speech",
+            "http://127.0.0.1:1/transcriptions",
+        }
     finally:
         await started.stop()
         await edges.close()
@@ -711,7 +719,7 @@ async def test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not
 
 
 async def test_ac31_the_full_pc_profile_degrades_three_modules_and_still_chats(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC31 (R8): the full PC profile with every phase 2 endpoint on the
     closed loopback port ``127.0.0.1:1`` (speech, transcription, scene
@@ -723,8 +731,11 @@ async def test_ac31_the_full_pc_profile_degrades_three_modules_and_still_chats(
     unbound actions with a value-free reason; runs the chat scenario with 1
     send; lists none of the five phase 2 actions in its registered-ready
     view; and the brain's authorized tools are the phase 1 read actions
-    only. Nothing was played."""
+    only. Nothing was played. AC33: the closed port is an
+    ``aiohttp.ClientSession`` refusing the connection beneath the shipped
+    transports."""
 
+    attempts = UnreachableSession.install(monkeypatch, "http://127.0.0.1:1/", "ws://127.0.0.1:1")
     not_executable = tmp_path / "not-executable"
     not_executable.write_text("#!/bin/sh\n", encoding="utf-8")
     not_executable.chmod(0o644)
@@ -795,6 +806,12 @@ async def test_ac31_the_full_pc_profile_degrades_three_modules_and_still_chats(
         _assert_the_chat_scenario_ran(started, completed)
         assert _offered_tools(started.model) == PHASE1_READ_ACTIONS
         assert runner.starts == []
+        assert "ws://127.0.0.1:1" in attempts
+        assert set(attempts) <= {
+            "ws://127.0.0.1:1",
+            "http://127.0.0.1:1/speech",
+            "http://127.0.0.1:1/transcriptions",
+        }
     finally:
         await started.stop()
 

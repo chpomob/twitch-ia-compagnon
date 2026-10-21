@@ -77,6 +77,7 @@ from conftest import (
     RecordingScheduler,
     RecordingSubprocessRunner,
     ScriptedTranscriptionTransport,
+    UnreachableSession,
     events_of,
     runtime_context,
     settle,
@@ -2059,16 +2060,22 @@ async def test_a_failed_transcription_probe_degrades_the_transcription_only(fail
     assert transport.held == 0
 
 
-async def test_the_real_transport_against_a_closed_port_degrades_the_transcription() -> None:
+async def test_the_real_transport_against_a_closed_port_degrades_the_transcription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """AC29 with the shipped factory: an endpoint on the closed loopback port
     ``127.0.0.1:1`` fails the probe — bounded by ``timeout_seconds`` through
-    the sleeper seam — and degrades the transcription alone, value-free."""
+    the sleeper seam — and degrades the transcription alone, value-free.
+    AC33: the closed port is the ``aiohttp.ClientSession`` the factory builds
+    refusing the connection; the shipped transport code runs above it."""
 
+    endpoint = "http://127.0.0.1:1/v1/audio/transcriptions"
+    attempts = UnreachableSession.install(monkeypatch, endpoint)
     source = FakeAudioSource(wav_bytes(5.0))
     h = await harness(
         source,
         prepare=False,
-        transcription=stt_settings(endpoint="http://127.0.0.1:1/v1/audio/transcriptions"),
+        transcription=stt_settings(endpoint=endpoint),
     )
     await finished(asyncio.ensure_future(h.handle.prepare()))
 
@@ -2078,9 +2085,11 @@ async def test_the_real_transport_against_a_closed_port_degrades_the_transcripti
     assert_value_free(payload["reason"])
     assert CAPTURE_ACTION in h.runtime.actions.registered_ready()
     assert h.handle._session is None  # the transport was released
+    assert attempts == [endpoint]  # the probe reached the transport, and was refused
 
     observation = await h.capture(seconds=3)
     assert_captured(h, observation, "unavailable")
+    assert attempts == [endpoint]
     await h.handle.close()
 
 

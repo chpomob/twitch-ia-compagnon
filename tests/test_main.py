@@ -34,7 +34,7 @@ from core.contracts import (
 )
 from core.loader import ModuleLoader
 from core.runtime import Supervision
-from conftest import FakeResponse, FakeSession, completion, wait_until
+from conftest import FakeResponse, FakeSession, UnreachableSession, completion, wait_until
 from test_integration import (
     FakeTwitchSession,
     FakeWebSocket,
@@ -2401,6 +2401,9 @@ async def test_the_accepted_limits_bound_the_real_scheduler_memory_and_audit_que
     none of which the example's default values (4, 20, 1000) would produce."""
 
     environ = _environment()
+    # AC33: nothing listens at the scene provider's URL; the shipped
+    # transport runs over a session that refuses the connection.
+    scene_attempts = UnreachableSession.install(monkeypatch, environ["SCENE_WEBSOCKET_URL"])
     channel = environ["TWITCH_BROADCASTER_ID"]
     admission = {
         "session_queue_capacity": 1,
@@ -2526,6 +2529,7 @@ async def test_the_accepted_limits_bound_the_real_scheduler_memory_and_audit_que
         model.release.set()
         stop.set()
     assert await asyncio.wait_for(task, timeout=2) == 0
+    assert scene_attempts and set(scene_attempts) == {environ["SCENE_WEBSOCKET_URL"]}
 
     assert diagnostics == []
     assert supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 10
