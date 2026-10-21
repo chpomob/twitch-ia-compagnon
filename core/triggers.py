@@ -3,8 +3,11 @@
 The runtime asks one question at ingestion, after normalisation and after the
 chat context has been fed, and before admission, budgets and any model call:
 *does this event deserve a run?* This module answers it and nothing else. It
-opens no transport, awaits nothing and reads time and randomness only through
-injected callables.
+opens no transport and reads time and randomness only through injected
+callables. :meth:`TriggerEngine.evaluate` awaits nothing; the one thing ever
+awaited is a hooked type's hook, and only through
+:meth:`TriggerEngine.evaluate_async`, which races it against the engine's
+injected sleeper (R3, D1).
 
 Two objects carry the answer.
 
@@ -58,16 +61,24 @@ A per-call policy override is held to the same declaration a configured policy
 is: it is validated against what the event's own input module declared before
 any rule runs, so overriding resolution cannot smuggle in an undeclared trigger
 type or widen a schema the module narrowed (R1, AC2).
+
+*A hook is bounded and fail-closed* (R3). A hooked type's hook is supplied by
+the module that declared it and nobody else, awaited at most once per
+evaluation of an eligible event under its declared bound, and only a boolean
+answer enters the policy's combination: an error, a timeout or a missing hook
+vetoes the whole decision before the combination is consulted.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import math
 import random
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -115,6 +126,7 @@ __all__ = [
 ]
 
 Clock = Callable[[], float]
+Sleeper = Callable[[float], Awaitable[Any]]
 RandomSource = Any
 """Anything exposing ``random() -> float`` in ``[0, 1)``.
 
@@ -178,6 +190,13 @@ REASON_NOT_NORMALIZED = "not_normalized"
 REASON_UNAUTHENTICATED = "unauthenticated"
 REASON_SELF_AUTHORED = "self_authored"
 REASON_NO_POLICY = "no_policy"
+REASON_DECISION_PENDING = "decision_pending"
+"""A synchronous evaluation of an event whose hooked evaluation is in flight.
+
+It cannot wait for that decision, and evaluating the rules again would draw
+a second time for one event (R2), so it refuses without consulting a rule,
+recording or counting anything: the in-flight evaluation's decision is the
+one the window keeps."""
 
 DRAW_ENTRY_KEYS = ("rule", "parameter", "probability", "draw", "ordinal")
 """The closed key set of one :attr:`TriggerDecision.draws` entry (R2).
@@ -189,6 +208,15 @@ event text and no other parameter is ever part of an entry.
 
 COUNT_WILDCARD_STEPS = "wildcard_steps"
 """The engine count of pattern/text comparisons ``matches`` has taken (A2)."""
+
+HOOK_MATCH = "match"
+HOOK_NO_MATCH = "no_match"
+HOOK_ERROR = "hook_error"
+HOOK_TIMEOUT = "hook_timeout"
+HOOK_UNAVAILABLE = "hook_unavailable"
+"""The suffixes of a hooked type's reasons, ``<type>_<suffix>`` (R3).
+
+The last three are the failed outcomes: each vetoes the whole decision."""
 
 _ACCEPTED_PREFIX = "accepted"
 _REJECTED_PREFIX = "rejected"
@@ -565,6 +593,31 @@ class TriggerRegistry:
 
         return MappingProxyType(self._hooks.get(input_name, {}))
 
+    def _supply_hook(self, module: str, type_name: str, hook: Any) -> None:
+        """Fill *module*'s slot for its own hooked type *type_name* (R3, D2, D4).
+
+        Refused unless *type_name* is a hooked type in the spec *module* itself
+        registered, and unless *hook* is a coroutine function, so the engine's
+        timeout race is a real one. A refusal echoes neither the type name nor
+        the hook.
+
+        Kernel-only: *module* is trusted as given, so this is not a path a
+        module reaches through its context — the registry and the engine are
+        shared by every module. A module supplies through
+        ``ModuleContext.supply_trigger_hook`` or its scoped trigger facade,
+        both bound to the module's own name, so no module can supply, or
+        replace, another module's hook.
+        """
+
+        name = _require_text(module, "module")
+        label = f"triggers.{name}.hook"
+        slots = self._hooks.get(name)
+        if slots is None or not isinstance(type_name, str) or type_name not in slots:
+            raise ContractError(label, "names no hooked type this module declares")
+        if not inspect.iscoroutinefunction(hook):
+            raise ContractError(label, "must be a coroutine function")
+        slots[type_name] = hook
+
     def spec(self, input_name: str) -> TriggerSpec | None:
         """Return the spec declared for *input_name*, or ``None``."""
 
@@ -743,6 +796,42 @@ class _Outcome:
 
     matched: bool
     reason: str
+    #: A failed hook outcome: it never enters the combination, it rejects the
+    #: whole decision instead (R3).
+    vetoes: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingHook:
+    """An eligible hooked rule whose outcome only its hook can give (R3).
+
+    ``missed`` is the verdict of the rule's probability draw, already taken,
+    when the type declares a probability parameter.
+    """
+
+    index: int
+    declaration: TriggerTypeDeclaration
+    parameters: Mapping[str, Any]
+    missed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Pending:
+    """An event past its invariants and the dedup window, its rules evaluated
+    except for the hooks they wait on."""
+
+    key: tuple[str, str, str]
+    now: float
+    normalized: _Normalized
+    policy: TriggerPolicy
+    outcomes: list[_Outcome | _PendingHook]
+    draws: tuple[Mapping[str, Any], ...]
+
+    @property
+    def hooks(self) -> tuple[_PendingHook, ...]:
+        return tuple(
+            outcome for outcome in self.outcomes if isinstance(outcome, _PendingHook)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -784,6 +873,7 @@ class TriggerEngine:
         "_registry",
         "_companion_identities",
         "_clock",
+        "_sleeper",
         "_rng",
         "_counters",
         "_dedup_max_entries",
@@ -794,6 +884,7 @@ class TriggerEngine:
         "_source",
         "_override_sources",
         "_counts",
+        "_in_flight",
     )
 
     def __init__(
@@ -806,6 +897,7 @@ class TriggerEngine:
         clock: Clock = time.monotonic,
         rng: RandomSource | None = None,
         counters: Counters | None = None,
+        sleeper: Sleeper | None = None,
     ) -> None:
         """Build an engine over *registry* with a bounded decision window.
 
@@ -815,6 +907,10 @@ class TriggerEngine:
         ``companion_identity`` is the author identity — or identities — the
         anti-echo invariant refuses; ``clock`` and ``rng`` are injected so a
         test never sleeps and a replay never depends on wall time.
+        ``sleeper`` bounds a hook (R3, D3): omitted, it is the clock's own
+        ``sleep`` when that is callable — a test's manual clock — and
+        :func:`asyncio.sleep` otherwise, so the bound is read on the engine's
+        clock.
         """
 
         if not isinstance(registry, TriggerRegistry):
@@ -830,6 +926,12 @@ class TriggerEngine:
             dedup_ttl_seconds, "dedup_ttl_seconds"
         )
         self._clock = _validated_clock(clock, "clock")
+        if sleeper is None:
+            own = getattr(self._clock, "sleep", None)
+            sleeper = own if callable(own) else asyncio.sleep
+        elif not callable(sleeper):
+            raise ContractError("sleeper", "must be callable")
+        self._sleeper: Sleeper = sleeper
         self._rng = _validated_rng(random.Random() if rng is None else rng, "rng")
         if counters is not None and not isinstance(counters, Counters):
             raise ContractError(
@@ -853,6 +955,14 @@ class TriggerEngine:
         self._source = _Source(self._rng)
         self._override_sources: dict[int, _Source] = {}
         self._counts: dict[str, int] = {COUNT_WILDCARD_STEPS: 0}
+        # The hooked evaluations awaiting a hook, by event key: a redelivery
+        # arriving meanwhile waits for that decision instead of evaluating
+        # the rules — and drawing, and calling the hook — a second time.
+        # Resolved with ``None`` when the owning evaluation is cancelled, so a
+        # waiter evaluates afresh rather than inheriting the cancellation.
+        self._in_flight: dict[
+            tuple[str, str, str], asyncio.Future[TriggerDecision | None]
+        ] = {}
 
     @property
     def registry(self) -> TriggerRegistry:
@@ -940,6 +1050,131 @@ class TriggerEngine:
         alone, never on the content of the event.
         """
 
+        prepared = self._prepare(
+            event, context=context, policy=policy, clock=clock, rng=rng
+        )
+        if isinstance(prepared, TriggerDecision):
+            return prepared
+        if isinstance(prepared, asyncio.Future):
+            return self._pending_decision(event)
+        # A hook is only reachable where it can be bounded (D1): here every
+        # eligible hooked rule fails closed, and its hook is never called.
+        outcomes = [
+            _hook_outcome(outcome, HOOK_UNAVAILABLE)
+            if isinstance(outcome, _PendingHook)
+            else outcome
+            for outcome in prepared.outcomes
+        ]
+        return self._finish(prepared, outcomes)
+
+    async def evaluate_async(
+        self,
+        event: Mapping[str, Any],
+        *,
+        context: TriggerContext | None = None,
+        policy: TriggerPolicy | None = None,
+        clock: Clock | None = None,
+        rng: RandomSource | None = None,
+    ) -> TriggerDecision:
+        """Return the decision for *event*, awaiting its hooked rules (R3, D1).
+
+        The stages, the override checks and every non-hooked rule are exactly
+        those of :meth:`evaluate`; every rule, hooked or not, is evaluated
+        and draws before any hook is awaited, so the draws of one evaluation
+        are never interleaved with another's. Then each eligible hooked rule's
+        hook, in policy order, receives a read-only view of the event and of
+        the rule's parameters, is invoked once and is raced against the
+        engine's sleeper for the type's ``hook_timeout_seconds``. ``True``
+        matches and ``False`` does not; anything else, an exception, the
+        bound elapsing or no hook supplied is a failed outcome, and the first
+        one in policy order rejects the decision before the combination is
+        consulted. A failure never raises out of here: it is a decision,
+        recorded and counted like any other.
+
+        A redelivery of an event whose hooked evaluation is still awaiting
+        its hook waits for that evaluation's decision and returns it, exactly
+        as a recall from the dedup window would: it draws nothing and calls
+        no hook.
+        """
+
+        while True:
+            prepared = self._prepare(
+                event, context=context, policy=policy, clock=clock, rng=rng
+            )
+            if isinstance(prepared, TriggerDecision):
+                return prepared
+            if not isinstance(prepared, asyncio.Future):
+                break
+            # Shielded: cancelling this waiter must not cancel the evaluation
+            # it waits on. ``None`` means that evaluation was cancelled.
+            decided = await asyncio.shield(prepared)
+            if decided is not None:
+                return decided
+        if not prepared.hooks:
+            return self._finish(prepared, prepared.outcomes)
+        key = prepared.key
+        waiting: asyncio.Future[TriggerDecision | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._in_flight[key] = waiting
+        decision: TriggerDecision | None = None
+        try:
+            outcomes = list(prepared.outcomes)
+            for pending in prepared.hooks:
+                outcomes[pending.index] = await self._await_hook(
+                    pending, prepared.normalized.input_name, event
+                )
+            decision = self._finish(prepared, outcomes)
+            return decision
+        finally:
+            if self._in_flight.get(key) is waiting:
+                del self._in_flight[key]
+            waiting.set_result(decision)
+
+    def _supply_hook(self, module: str, type_name: str, hook: Any) -> None:
+        """Supply *module*'s hook for its own hooked type (R3, D2, D4).
+
+        Kernel-only, like :meth:`TriggerRegistry._supply_hook`, which it
+        forwards to: refused, value-free, unless the type is a hooked type of
+        *module*'s own spec and *hook* is a coroutine function. A module
+        supplies through its own context, which binds *module* to its name.
+        """
+
+        self._registry._supply_hook(module, type_name, hook)
+
+    @staticmethod
+    def _pending_decision(event: Mapping[str, Any]) -> TriggerDecision:
+        """The refusal of a synchronous call racing an in-flight evaluation."""
+
+        normalized = _normalize(event)
+        return TriggerDecision(
+            accepted=False,
+            reason=REASON_DECISION_PENDING,
+            policy_version=None,
+            source_event_id=normalized.message_id,
+            input_name=normalized.input_name,
+            platform=normalized.platform,
+            channel_id=normalized.channel_id,
+        )
+
+    def _prepare(
+        self,
+        event: Mapping[str, Any],
+        *,
+        context: TriggerContext | None,
+        policy: TriggerPolicy | None,
+        clock: Clock | None,
+        rng: RandomSource | None,
+    ) -> TriggerDecision | _Pending | asyncio.Future[TriggerDecision | None]:
+        """Run every stage but the hooks; return a decision when one is taken.
+
+        A decision is returned for an invariant rejection, a dedup recall and
+        an input with no policy; the in-flight evaluation's future for an
+        event whose hooked evaluation has not decided yet, before any rule is
+        evaluated; otherwise the evaluated rules, with each eligible hooked
+        rule left pending.
+        """
+
         clock = self._clock if clock is None else _validated_clock(clock, "clock")
         source = self._source_for(
             None if rng is None else _validated_rng(rng, "rng")
@@ -991,6 +1226,11 @@ class TriggerEngine:
             # Strictly before evaluation: the recorded decision is reproduced
             # exactly and the random source is not touched (AC3).
             return recorded
+        in_flight = self._in_flight.get(key)
+        if in_flight is not None:
+            # Likewise before evaluation: the decision is not taken yet, but
+            # it will be the one recorded, and nothing here may draw for it.
+            return in_flight
 
         resolved = (
             policy
@@ -1007,29 +1247,123 @@ class TriggerEngine:
                 platform=normalized.platform,
                 channel_id=normalized.channel_id,
             )
-        else:
-            if not isinstance(resolved, TriggerPolicy):
-                raise ContractError(
-                    "policy", f"must be a TriggerPolicy, got {type(resolved).__name__}"
-                )
-            accepted, token, draws = self._apply(
-                resolved, normalized=normalized, context=context, source=source
+            self._record(key, decision, now)
+            self._count(decision)
+            return decision
+        if not isinstance(resolved, TriggerPolicy):
+            raise ContractError(
+                "policy", f"must be a TriggerPolicy, got {type(resolved).__name__}"
             )
-            prefix = _ACCEPTED_PREFIX if accepted else _REJECTED_PREFIX
-            decision = TriggerDecision(
-                accepted=accepted,
-                reason=_bounded_reason(f"{prefix}:{token}"),
-                policy_version=resolved.version,
-                source_event_id=normalized.message_id,
-                input_name=normalized.input_name,
-                platform=normalized.platform,
-                channel_id=normalized.channel_id,
-                draws=draws,
-            )
+        outcomes, draws = self._apply(
+            resolved, normalized=normalized, context=context, source=source
+        )
+        return _Pending(
+            key=key,
+            now=now,
+            normalized=normalized,
+            policy=resolved,
+            outcomes=outcomes,
+            draws=draws,
+        )
 
-        self._record(key, decision, now)
+    def _finish(
+        self, prepared: _Pending, outcomes: Sequence[_Outcome | _PendingHook]
+    ) -> TriggerDecision:
+        """Decide from every rule's outcome, then record and count the decision.
+
+        The first failed hook outcome in policy order rejects the decision
+        before, and outside, the combination (R3).
+        """
+
+        decided = [outcome for outcome in outcomes if isinstance(outcome, _Outcome)]
+        assert len(decided) == len(outcomes), "every pending hook has an outcome"
+        veto = next((outcome for outcome in decided if outcome.vetoes), None)
+        if veto is not None:
+            accepted, token = False, veto.reason
+        else:
+            accepted, token = _combine(prepared.policy.combination, decided)
+        normalized = prepared.normalized
+        prefix = _ACCEPTED_PREFIX if accepted else _REJECTED_PREFIX
+        decision = TriggerDecision(
+            accepted=accepted,
+            reason=_bounded_reason(f"{prefix}:{token}"),
+            policy_version=prepared.policy.version,
+            source_event_id=normalized.message_id,
+            input_name=normalized.input_name,
+            platform=normalized.platform,
+            channel_id=normalized.channel_id,
+            draws=prepared.draws,
+        )
+        self._record(prepared.key, decision, prepared.now)
         self._count(decision)
         return decision
+
+    async def _await_hook(
+        self, pending: _PendingHook, input_name: str, event: Mapping[str, Any]
+    ) -> _Outcome:
+        """Invoke one hook at most once, under its bound, and read its answer.
+
+        Never raises for the hook's sake: whatever the hook does is an
+        outcome. Cancelling the evaluation itself cancels the hook and
+        propagates.
+        """
+
+        declaration = pending.declaration
+        hook = self._registry.hook_slots(input_name).get(declaration.name)
+        if hook is None:
+            return _hook_outcome(pending, HOOK_UNAVAILABLE)
+        bound = float(declaration.hook_timeout_seconds)
+        try:
+            invocation = hook(_read_only(event), _read_only(pending.parameters))
+        except Exception:
+            return _hook_outcome(pending, HOOK_ERROR)
+        # The answer is dated on the engine's clock — the bound's own domain —
+        # the moment the hook settles, so an answer given after the bound is
+        # a timeout even when the timer and the hook are released together
+        # and both are done by the time this evaluation resumes.
+        clock = self._clock
+        started = clock()
+        settled: list[float] = []
+
+        async def dated() -> Any:
+            try:
+                return await invocation
+            finally:
+                settled.append(clock())
+
+        try:
+            call = asyncio.ensure_future(dated())
+        except Exception:
+            return _hook_outcome(pending, HOOK_ERROR)
+        # Whatever the call ends with — even long after a timeout gave up on
+        # it — its result is consumed here, so nothing is left unretrieved.
+        call.add_done_callback(_consume)
+        timer = asyncio.ensure_future(self._sleeper(bound))
+        timer.add_done_callback(_consume)
+        try:
+            await asyncio.wait((call, timer), return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            call.cancel()
+            timer.cancel()
+            raise
+        if not call.done():
+            # The bound elapsed first: the hook's eventual answer is ignored.
+            call.cancel()
+            return _hook_outcome(pending, HOOK_TIMEOUT)
+        timer.cancel()
+        if settled and settled[0] - started > bound:
+            # Done, but late: released together with the timer.
+            return _hook_outcome(pending, HOOK_TIMEOUT)
+        if call.cancelled() or call.exception() is not None:
+            return _hook_outcome(pending, HOOK_ERROR)
+        answer = call.result()
+        if answer is True:
+            if pending.missed:
+                return _Outcome(False, f"{declaration.name}_probability_miss")
+            return _hook_outcome(pending, HOOK_MATCH)
+        if answer is False:
+            return _hook_outcome(pending, HOOK_NO_MATCH)
+        return _hook_outcome(pending, HOOK_ERROR)
 
     def recorded(
         self,
@@ -1105,16 +1439,17 @@ class TriggerEngine:
         normalized: _Normalized,
         context: TriggerContext,
         source: _Source,
-    ) -> tuple[bool, str, tuple[Mapping[str, Any], ...]]:
-        """Evaluate every rule of *policy* and combine the outcomes.
+    ) -> tuple[list[_Outcome | _PendingHook], tuple[Mapping[str, Any], ...]]:
+        """Evaluate every rule of *policy*, in policy order.
 
-        Also returns the ``draws`` entries of its declared probability rules,
-        in policy order.
+        Returns each rule's outcome — a :class:`_PendingHook` for an eligible
+        hooked rule — and the ``draws`` entries of its declared probability
+        rules, in policy order. Combining is the caller's.
         """
 
         spec = self._registry.spec(normalized.input_name)
         companion_name = self._registry.companion_name_for(normalized.input_name)
-        outcomes: list[_Outcome] = []
+        outcomes: list[_Outcome | _PendingHook] = []
         draws: list[Mapping[str, Any]] = []
         for index, rule in enumerate(policy.rules):
             label = f"policy.rules[{index}]"
@@ -1134,8 +1469,7 @@ class TriggerEngine:
             if draw is not None:
                 draws.append(draw)
             outcomes.append(outcome)
-        accepted, token = _combine(policy.combination, outcomes)
-        return accepted, token, tuple(draws)
+        return outcomes, tuple(draws)
 
     def _is_companion(self, author_id: str) -> bool:
         """Whether *author_id* is the companion's own identity (anti-echo).
@@ -1177,19 +1511,47 @@ class TriggerEngine:
     def _recall(
         self, key: tuple[str, str, str], now: float
     ) -> TriggerDecision | None:
-        """Return the retained decision for *key*, evicting what has expired."""
+        """Return the retained decision for *key*, evicting what has expired.
+
+        The entry's own age is checked too, so an expired decision is never
+        reproduced, whatever the window's order.
+        """
 
         self._evict_expired(now)
         entry = self._window.get(key)
-        return None if entry is None else entry.decision
+        if entry is None:
+            return None
+        if entry.timestamp < now - self._dedup_ttl_seconds:
+            del self._window[key]
+            self._counters.increment(COUNTER_DEDUP_EVICTIONS)
+            return None
+        return entry.decision
 
     def _record(
         self, key: tuple[str, str, str], decision: TriggerDecision, now: float
     ) -> None:
-        """Retain *decision* and evict until the window bounds hold."""
+        """Retain *decision* and evict until the window bounds hold.
 
-        self._window[key] = _Recorded(decision=decision, timestamp=now)
-        self._window.move_to_end(key)
+        The window is kept in timestamp order, oldest first, so both evictions
+        stay oldest-first: a hooked decision is dated when its evaluation
+        began but recorded when its hook answers, after any decision taken
+        meanwhile, so it is placed before those it predates.
+        """
+
+        window = self._window
+        later: list[tuple[str, str, str]] = []
+        if window:
+            newest = window[next(reversed(window))]
+            if newest.timestamp > now:
+                later = [
+                    other
+                    for other, entry in window.items()
+                    if entry.timestamp > now and other != key
+                ]
+        window[key] = _Recorded(decision=decision, timestamp=now)
+        window.move_to_end(key)
+        for other in later:
+            window.move_to_end(other)
         self._evict_expired(now)
         while len(self._window) > self._dedup_max_entries:
             self._window.popitem(last=False)
@@ -1339,12 +1701,14 @@ def _evaluate_rule(
     companion_name: str | None,
     index: int,
     label: str,
-) -> tuple[_Outcome, int, Mapping[str, Any] | None]:
+) -> tuple[_Outcome | _PendingHook, int, Mapping[str, Any] | None]:
     """Dispatch one rule to its evaluator.
 
     Returns the outcome, the wildcard steps it took and its ``draws`` entry,
     if any. A rule naming a type its input declared goes to
-    :func:`_evaluate_declared`; any other to its built-in evaluator.
+    :func:`_evaluate_declared`; any other to its built-in evaluator. An
+    eligible hooked rule's outcome is a :class:`_PendingHook`, which only its
+    hook can resolve.
 
     Dispatch is explicit rather than table-driven so each evaluator can take
     exactly what it is allowed to read: ``_evaluate_audience`` is never handed
@@ -1387,8 +1751,8 @@ def _evaluate_declared(
     index: int,
     *,
     label: str,
-) -> tuple[_Outcome, int, Mapping[str, Any] | None]:
-    """Evaluate a declared type's rule over the normalised event (R2).
+) -> tuple[_Outcome | _PendingHook, int, Mapping[str, Any] | None]:
+    """Evaluate a declared type's rule over the normalised event (R2, R3).
 
     Runs no module code and opens no transport: the frozen ``match`` tree is
     read over the payload and the configured parameters, nothing else. A
@@ -1398,18 +1762,17 @@ def _evaluate_declared(
     decided — so the number of draws depends on the policy alone; the rule
     then matches only when the tree matched and the draw is below the
     configured probability.
+
+    A hooked type has no tree: an event of one of its kinds is eligible for
+    its hook and is returned pending, the hook itself being awaited — if at
+    all — by the caller.
     """
 
     name = declaration.name
-    if declaration.match is None:
-        # A hooked type is evaluated only where its hook can be bounded.
-        raise ContractError(
-            f"{label}.type", "is a hooked trigger type this path cannot evaluate"
-        )
     kind_matches = normalized.kind in declaration.kinds
     matched, steps = (
         _evaluate_tree(declaration.match, parameters, normalized)
-        if kind_matches
+        if kind_matches and declaration.match is not None
         else (False, 0)
     )
 
@@ -1431,11 +1794,46 @@ def _evaluate_declared(
 
     if not kind_matches:
         return _Outcome(False, f"{name}_kind_mismatch"), steps, entry
+    if declaration.hook:
+        return _PendingHook(index, declaration, parameters, missed), steps, entry
     if not matched:
         return _Outcome(False, f"{name}_no_match"), steps, entry
     if missed:
         return _Outcome(False, f"{name}_probability_miss"), steps, entry
     return _Outcome(True, f"{name}_match"), steps, entry
+
+
+def _hook_outcome(pending: _PendingHook, suffix: str) -> _Outcome:
+    """The outcome ``<type>_<suffix>`` of a hooked rule; a failure vetoes (R3)."""
+
+    return _Outcome(
+        suffix == HOOK_MATCH,
+        f"{pending.declaration.name}_{suffix}",
+        vetoes=suffix in (HOOK_ERROR, HOOK_TIMEOUT, HOOK_UNAVAILABLE),
+    )
+
+
+def _consume(task: asyncio.Future[Any]) -> None:
+    """Retrieve a finished task's outcome so none is ever reported unretrieved."""
+
+    if not task.cancelled():
+        task.exception()
+
+
+def _read_only(value: Any) -> Any:
+    """A deep, read-only copy of *value*, for a hook to read (R3).
+
+    Mappings become :class:`~types.MappingProxyType`, lists and tuples tuples,
+    sets frozensets; anything else is shared as it is.
+    """
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _read_only(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_read_only(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(value)
+    return value
 
 
 def _evaluate_tree(

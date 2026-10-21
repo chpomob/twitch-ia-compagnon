@@ -24,6 +24,13 @@ declared probability parameter draws exactly once per evaluation, and each
 such draw is recorded in the decision's ``draws``. AC10 is the unmodified
 ``tests/test_triggers.py``.
 
+P7 holds AC9, AC11, AC12, AC13, AC14 and AC34 (R3, R2 admission): a hooked
+type's hook is supplied only by its declaring module, through its own context,
+awaited by ``evaluate_async`` at most once per eligible evaluation under its
+bound on the engine's clock, and any failed outcome vetoes the decision before
+the combination; an accepted declared decision still meets admission and the
+authorization view unchanged.
+
 P1 holds the phase-7 baseline half of AC16 (R4): each shipped ``*.example``
 profile, loaded as ``core.main`` loads it and started by the coordinator it
 builds, is driven on one fixed event sequence against the fakes of
@@ -46,6 +53,7 @@ then shows what the profile does with them.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import re
 import ssl
@@ -66,7 +74,10 @@ import pytest
 import yaml
 
 import core.main as application
+from core.actions import ActionRegistry, AuthorizationPolicy
+from core.admission import REASON_GLOBAL_PENDING_CAP, AdmissionScheduler, Work
 from core.loader import ModuleLoader, ModuleLoadError
+from core.runtime import REASON_INPUT_NOT_OWNED
 from core.contracts import (
     CHAT_FAMILY_KINDS,
     EVENT_KINDS,
@@ -82,6 +93,10 @@ from core.contracts import (
     TriggerRule,
     TriggerSpec,
     TriggerTypeDeclaration,
+    WILDCARD,
+    ActionSpec,
+    Destination,
+    SessionKey,
     input_family_of_event,
     validate_event_kind,
 )
@@ -100,6 +115,7 @@ from core.triggers import (
     BUILTIN_TRIGGER_TYPES,
     COUNT_WILDCARD_STEPS,
     DRAW_ENTRY_KEYS,
+    REASON_DECISION_PENDING,
     TriggerDecision,
     TriggerEngine,
     TriggerRegistry,
@@ -2431,3 +2447,690 @@ def test_p6_draws_shape_is_validated_and_value_free() -> None:
         "viewer secret",
     )
     _refused(lambda: TriggerDecision(**base, draws=entry), "TriggerDecision.draws")  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# P7 (R3, R2 admission): hooked types — async evaluation, the bounded hook,
+# the hard veto and supply through the module's own context; AC9, AC11, AC12,
+# AC13, AC14, AC34
+# --------------------------------------------------------------------------- #
+
+#: The hooked fixture type's bound, in seconds of the engine's clock.
+HOOK_BOUND = 0.5
+WAKE_SCHEMA = {
+    "type": "object",
+    "properties": {"phrase": {"type": "string"}},
+    "additionalProperties": False,
+}
+
+
+def _wake(**overrides: Any) -> TriggerTypeDeclaration:
+    arguments: dict[str, Any] = {
+        "name": "wake",
+        "parameter_schema": WAKE_SCHEMA,
+        "kinds": ("message",),
+        "hook": True,
+        "hook_timeout_seconds": HOOK_BOUND,
+    }
+    arguments.update(overrides)
+    return TriggerTypeDeclaration(**arguments)
+
+
+def _wake_policy(combination: str = "all_of", *rules: TriggerRule) -> TriggerPolicy:
+    if not rules:
+        rules = (TriggerRule("wake", {"phrase": "hey"}),)
+    return TriggerPolicy(rules=rules, combination=combination)
+
+
+def _wake_engine(
+    default: TriggerPolicy | None = None, **overrides: Any
+) -> tuple[TriggerEngine, RecordedRandom, ManualClock]:
+    return _declared_engine(
+        _wake(**overrides),
+        default=_wake_policy() if default is None else default,
+        generic=("keyword",),
+    )
+
+
+class Hook:
+    """A hook that records each invocation and answers as told.
+
+    ``answer`` is returned; an exception instance is raised instead; the
+    sentinel :data:`NEVER` parks the hook forever (until cancelled).
+    """
+
+    def __init__(self, answer: Any = True) -> None:
+        self.answer = answer
+        self.calls: list[tuple[Any, Any]] = []
+        self.cancelled = 0
+
+        async def hook(event: Any, parameters: Any) -> Any:
+            self.calls.append((event, parameters))
+            if self.answer is NEVER:
+                try:
+                    await asyncio.get_running_loop().create_future()
+                except asyncio.CancelledError:
+                    self.cancelled += 1
+                    raise
+            if isinstance(self.answer, BaseException):
+                raise self.answer
+            return self.answer
+
+        self.hook = hook
+
+
+NEVER = object()
+
+
+class _Ownership:
+    """An ownership table naming one owner for every pair, or none."""
+
+    def __init__(self, owner: str | None = None) -> None:
+        self._owner = owner
+
+    def owner(self, family: str, platform: str) -> str | None:
+        return self._owner
+
+    def is_set_none(self, family: str, platform: str) -> bool:
+        return False
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        return ()
+
+    def excluded(self, family: str) -> frozenset[str]:
+        return frozenset()
+
+
+def _supply(engine: TriggerEngine, module: str, type_name: str, hook: Any) -> None:
+    """Supply *module*'s hook the way a module does: through its own context."""
+
+    runtime_context(triggers=engine).for_module(module).supply_trigger_hook(
+        type_name, hook
+    )
+
+
+async def test_p7_ac11_each_hook_answer_decides_and_is_retained() -> None:
+    """AC11 (R3): ``True``, ``False``, ``1``, ``"yes"``, ``None`` and a
+    raise decide ``accepted:wake_match``, ``rejected:wake_no_match`` and four
+    ``rejected:wake_hook_error``; each is counted as a trigger decision and
+    retained in the dedup window."""
+
+    engine, _, _ = _wake_engine()
+    hook = Hook()
+    _supply(engine, INPUT, "wake", hook.hook)
+    answers = [True, False, 1, "yes", None, RuntimeError("viewer secret")]
+    decisions = []
+    for index, answer in enumerate(answers):
+        hook.answer = answer
+        decisions.append(await engine.evaluate_async(_event(f"h{index}")))
+
+    assert [decision.reason for decision in decisions] == [
+        "accepted:wake_match",
+        "rejected:wake_no_match",
+        *["rejected:wake_hook_error"] * 4,
+    ]
+    assert len(hook.calls) == 6
+    # Counted: every rejection is one trigger rejection, the acceptance none.
+    assert engine.counters.get("trigger_rejections") == 5
+    assert engine.window_size == 6
+    for index, decision in enumerate(decisions):
+        assert engine.recorded(
+            platform="twitch", channel_id="channel-1", source_event_id=f"h{index}"
+        ) is decision
+    assert "viewer secret" not in repr(decisions)
+
+
+async def test_p7_the_hook_reads_a_deep_read_only_view() -> None:
+    """R3: the hook receives a read-only, deep-frozen view of the event and of
+    the rule's parameters; writing through it fails and is a hook error."""
+
+    engine, _, _ = _wake_engine()
+    seen: list[tuple[Any, Any]] = []
+
+    async def hook(event: Any, parameters: Any) -> bool:
+        seen.append((event, parameters))
+        event["payload"]["badge"]["tier"] = "forged"
+        return True
+
+    _supply(engine, INPUT, "wake", hook)
+    event = _event("v1", tags=["a", {"b": 1}])
+    decision = await engine.evaluate_async(event)
+    assert decision.reason == "rejected:wake_hook_error"
+    (view, parameters), = seen
+    assert isinstance(view, types.MappingProxyType)
+    assert isinstance(view["payload"]["badge"], types.MappingProxyType)
+    assert isinstance(view["payload"]["tags"][1], types.MappingProxyType)
+    assert view["payload"]["tags"][0] == "a"
+    assert dict(parameters) == {"phrase": "hey"}
+    with pytest.raises(TypeError):
+        parameters["phrase"] = "x"  # type: ignore[index]
+    assert event["payload"]["badge"]["tier"] == "gold"
+
+
+async def test_p7_ac12_a_hook_that_never_returns_times_out_on_the_bound() -> None:
+    """AC12 (R3): with a 0.5 s bound, a never-returning hook decides
+    ``rejected:wake_hook_timeout`` once the engine's ManualClock has advanced
+    exactly 0.5 s (no epsilon), the hook is cancelled, and a following event of
+    the same input is evaluated normally."""
+
+    engine, _, clock = _wake_engine()
+    hook = Hook(NEVER)
+    _supply(engine, INPUT, "wake", hook.hook)
+
+    pending = asyncio.ensure_future(engine.evaluate_async(_event("t1")))
+    await settle()
+    assert not pending.done()
+    assert len(hook.calls) == 1
+    clock.advance(HOOK_BOUND - 0.25)
+    await settle()
+    assert not pending.done()
+    clock.advance(0.25)
+    await settle()
+    assert pending.done()
+    decision = pending.result()
+    assert decision.reason == "rejected:wake_hook_timeout"
+    assert hook.cancelled == 1
+    assert engine.recorded(
+        platform="twitch", channel_id="channel-1", source_event_id="t1"
+    ) is decision
+
+    hook.answer = True
+    following = await engine.evaluate_async(_event("t2"))
+    assert following.reason == "accepted:wake_match"
+    assert len(hook.calls) == 2
+
+
+async def test_p7_a_timed_out_hook_answering_late_is_ignored_and_retrieved() -> None:
+    """R3: a hook that swallows its cancellation and raises later changes no
+    decision, and its exception is consumed (no "never retrieved")."""
+
+    engine, _, clock = _wake_engine()
+    loop = asyncio.get_running_loop()
+    reported: list[Mapping[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    release = loop.create_future()
+
+    async def stubborn(event: Any, parameters: Any) -> bool:
+        while True:
+            try:
+                await asyncio.shield(release)
+                break
+            except asyncio.CancelledError:
+                continue
+        raise RuntimeError("late")
+
+    _supply(engine, INPUT, "wake", stubborn)
+    pending = asyncio.ensure_future(engine.evaluate_async(_event("late1")))
+    await settle()
+    clock.advance(HOOK_BOUND)
+    await settle()
+    decision = pending.result()
+    assert decision.reason == "rejected:wake_hook_timeout"
+    release.set_result(None)
+    await settle()
+    assert engine.recorded(
+        platform="twitch", channel_id="channel-1", source_event_id="late1"
+    ) is decision
+    del pending
+    gc.collect()
+    loop.set_exception_handler(previous)
+    assert [context.get("message") for context in reported] == []
+
+
+async def test_p7_ac12_a_bound_of_0_or_10_5_is_refused_at_load(tmp_path: Path) -> None:
+    """AC12 (R3), load half (reuses P3/P4): ``hook_timeout_seconds`` of 0 and
+    10.5 are refused at construction and at load, naming the field."""
+
+    for timeout in (0, 10.5):
+        _refused(
+            lambda: _wake(hook_timeout_seconds=timeout),
+            "TriggerTypeDeclaration.hook_timeout_seconds",
+        )
+        root = tmp_path / str(timeout).replace(".", "_")
+        root.mkdir()
+        await _refused_at_load(
+            root,
+            _with_type(match=None, hook=True, hook_timeout_seconds=timeout),
+            f"{_DECLARED_AT}.hook_timeout_seconds",
+        )
+
+
+async def test_p7_ac13_the_hook_runs_only_for_an_eligible_event() -> None:
+    """AC13 (R3): 0 invocations for an invariant-rejected event, a dedup
+    redelivery, an event of a kind outside ``kinds`` and an event of another
+    input; 1 for an eligible event."""
+
+    engine, _, _ = _wake_engine()
+    engine.registry.register(SECOND_INPUT, _second_spec())
+    hook = Hook(True)
+    _supply(engine, INPUT, "wake", hook.hook)
+
+    eligible = await engine.evaluate_async(_event("e1"))
+    assert eligible.reason == "accepted:wake_match"
+    assert len(hook.calls) == 1
+
+    self_authored = await engine.evaluate_async(_event("e2", author=COMPANION))
+    redelivery = await engine.evaluate_async(_event("e1"))
+    other_kind = await engine.evaluate_async(_event("e3", kind="cue"))
+    other_input = await engine.evaluate_async(_second_message("e4"))
+    assert self_authored.reason == "self_authored"
+    assert redelivery is eligible
+    assert other_kind.reason == "rejected:wake_kind_mismatch"
+    assert other_input.reason == "accepted:keyword_match"
+    assert len(hook.calls) == 1
+    # The other input cannot name the type at all (R2 scoping).
+    with pytest.raises(ContractError):
+        await engine.evaluate_async(_second_message("e5"), policy=_wake_policy())
+    assert len(hook.calls) == 1
+
+
+async def test_p7_ac14_only_the_declaring_module_supplies_its_hook(
+    tmp_path: Path,
+) -> None:
+    """AC14 (R3, D4): a second module supplying the first module's hooked
+    type — through its own context or the engine — is refused, value-free, and
+    the type then decides ``rejected:wake_hook_unavailable``; with no hook at
+    all the decision is the same. A non-coroutine hook is refused too."""
+
+    engine, _, _ = _wake_engine()
+    engine.registry.register(SECOND_INPUT, _second_spec())
+    context = runtime_context(triggers=engine)
+    intruder = Hook(True)
+
+    second = context.for_module(SECOND_INPUT)
+    with pytest.raises(ContractError) as caught:
+        second.supply_trigger_hook("wake", intruder.hook)
+    assert caught.value.field == f"triggers.{SECOND_INPUT}.hook"
+    # The shared engine and registry offer no public supply naming a module:
+    # a module reaching them through its context cannot fill another's slot.
+    assert not hasattr(engine, "supply_hook")
+    assert not hasattr(engine.registry, "supply_hook")
+    owned = context.for_module(SECOND_INPUT, ownership=_Ownership())
+    with pytest.raises(ContractError):
+        owned.triggers.supply_hook("wake", intruder.hook)
+    assert dict(engine.registry.hook_slots(INPUT)) == {"wake": None}
+
+    refused_decision = await engine.evaluate_async(_event("u1"))
+    assert refused_decision.reason == "rejected:wake_hook_unavailable"
+    assert intruder.calls == []
+
+    fresh, _, _ = _wake_engine()
+    assert (await fresh.evaluate_async(_event("u1"))).reason == (
+        "rejected:wake_hook_unavailable"
+    )
+
+    own = context.for_module(INPUT)
+
+    def not_a_coroutine(event: Any, parameters: Any) -> bool:
+        return True
+
+    with pytest.raises(ContractError) as caught:
+        own.supply_trigger_hook("wake", not_a_coroutine)
+    assert caught.value.field == f"triggers.{INPUT}.hook"
+    with pytest.raises(ContractError) as caught:
+        own.supply_trigger_hook("not-declared-sentinel", intruder.hook)
+    assert "not-declared-sentinel" not in str(caught.value)
+
+    supplied = Hook(True)
+    own.supply_trigger_hook("wake", supplied.hook)
+    assert (await engine.evaluate_async(_event("u2"))).reason == "accepted:wake_match"
+    assert len(supplied.calls) == 1
+
+
+async def test_p7_ac34_a_failed_hook_vetoes_whatever_the_combination() -> None:
+    """AC34 (R3): under ``none_of[wake]`` a raising hook, a never-returning
+    one and no hook decide ``hook_error``, ``hook_timeout`` and
+    ``hook_unavailable``; under ``any_of[keyword{hi}, wake]`` an event with
+    text ``hi`` and a raising hook decides ``hook_error``, and so does the same
+    policy as the module's default. 0 events are admitted."""
+
+    scheduler = AdmissionScheduler(
+        _never_run,
+        session_queue_capacity=8,
+        global_pending_capacity=8,
+        max_sessions=8,
+        workers=1,
+        total_run_seconds=10.0,
+        wait_seconds=10.0,
+        clock=ManualClock(),
+    )
+    decisions: list[TriggerDecision] = []
+
+    none_of = _wake_policy("none_of")
+    engine, _, clock = _wake_engine()
+    decisions.append(await engine.evaluate_async(_event("n0"), policy=none_of))
+    hook = Hook(RuntimeError("boom"))
+    _supply(engine, INPUT, "wake", hook.hook)
+    decisions.append(await engine.evaluate_async(_event("n1"), policy=none_of))
+    hook.answer = NEVER
+    pending = asyncio.ensure_future(engine.evaluate_async(_event("n2"), policy=none_of))
+    await settle()
+    clock.advance(HOOK_BOUND)
+    await settle()
+    decisions.append(pending.result())
+    assert [decision.reason for decision in decisions] == [
+        "rejected:wake_hook_unavailable",
+        "rejected:wake_hook_error",
+        "rejected:wake_hook_timeout",
+    ]
+    # Sanity: the same policy with a ``False`` answer is accepted, so the
+    # rejections above are the veto, not the combination.
+    hook.answer = False
+    assert (await engine.evaluate_async(_event("n3"), policy=none_of)).accepted
+
+    any_of = _wake_policy(
+        "any_of",
+        TriggerRule("keyword", {"keywords": ["hi"]}),
+        TriggerRule("wake", {"phrase": "hey"}),
+    )
+    hook.answer = RuntimeError("boom")
+    configured = await engine.evaluate_async(_event("a1", text="hi"), policy=any_of)
+    assert configured.reason == "rejected:wake_hook_error"
+    decisions.append(configured)
+
+    default_engine, _, _ = _wake_engine(default=any_of)
+    _supply(default_engine, INPUT, "wake", hook.hook)
+    by_default = await default_engine.evaluate_async(_event("a1", text="hi"))
+    assert by_default.reason == "rejected:wake_hook_error"
+    decisions.append(by_default)
+
+    admitted = [
+        scheduler.admit(SessionKey("twitch", "channel-1", "viewer-1"), Work({}, d.source_event_id))
+        for d in decisions
+        if d.accepted
+    ]
+    assert admitted == []
+    assert scheduler.pending == 0
+    await scheduler.aclose()
+
+
+async def _never_run(context: Any) -> Any:  # pragma: no cover - never admitted
+    raise AssertionError("no run is admitted")
+
+
+def test_p7_d1_synchronous_evaluate_never_calls_the_hook() -> None:
+    """D1 (R3): the synchronous ``evaluate`` on a hooked policy decides
+    ``rejected:wake_hook_unavailable`` without calling the supplied hook, and
+    the decision is recorded; a kind outside ``kinds`` still decides
+    ``kind_mismatch``."""
+
+    engine, _, _ = _wake_engine()
+    hook = Hook(True)
+    _supply(engine, INPUT, "wake", hook.hook)
+    decision = engine.evaluate(_event("s1"))
+    assert decision.reason == "rejected:wake_hook_unavailable"
+    assert engine.window_size == 1
+    assert engine.evaluate(_event("s2", kind="cue")).reason == (
+        "rejected:wake_kind_mismatch"
+    )
+    assert hook.calls == []
+
+
+async def test_p7_a_hooked_probability_type_draws_once_and_can_miss() -> None:
+    """R2, R3: a hooked type with a probability parameter draws once per
+    evaluation, before the hook is awaited; a ``True`` answer whose draw
+    missed decides ``probability_miss``."""
+
+    declaration = _wake(
+        parameter_schema=LUCKY_SCHEMA, probability_parameter="p"
+    )
+    engine, rng, _ = _declared_engine(
+        declaration, default=_policy("wake", p=0.5), values=(0.9, 0.1), generic=("keyword",)
+    )
+    hook = Hook(True)
+    _supply(engine, INPUT, "wake", hook.hook)
+    missed = await engine.evaluate_async(_event("p1"))
+    hit = await engine.evaluate_async(_event("p2"))
+    assert [missed.reason, hit.reason] == [
+        "rejected:wake_probability_miss",
+        "accepted:wake_match",
+    ]
+    assert rng.ordinal == 2
+    assert [entry["draw"] for entry in (*missed.draws, *hit.draws)] == [0.9, 0.1]
+
+
+async def test_p7_the_owned_facade_guards_evaluate_async() -> None:
+    """R3: ``_OwnedTriggers.evaluate_async`` applies the ownership guard of
+    ``evaluate`` — a non-owned input is refused unread, its hook never called —
+    and forwards an owned event to the engine."""
+
+    engine, _, _ = _wake_engine()
+    hook = Hook(True)
+    _supply(engine, INPUT, "wake", hook.hook)
+    context = runtime_context(triggers=engine)
+
+    refused = context.for_module(INPUT, ownership=_Ownership("someone-else"), declared=True)
+    decision = await refused.triggers.evaluate_async(_event("o1"))
+    assert decision.reason == REASON_INPUT_NOT_OWNED
+    assert hook.calls == []
+
+    owned = context.for_module(INPUT, ownership=_Ownership(INPUT), declared=True)
+    assert (await owned.triggers.evaluate_async(_event("o2"))).reason == "accepted:wake_match"
+    assert len(hook.calls) == 1
+
+
+class GatedHook:
+    """A hook parked, per message id, until the test opens its gate."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.gates: dict[str, asyncio.Future[bool]] = {}
+
+    async def hook(self, event: Any, parameters: Any) -> bool:
+        message_id = event["payload"]["message_id"]
+        self.calls.append(message_id)
+        gate = asyncio.get_running_loop().create_future()
+        self.gates[message_id] = gate
+        return await gate
+
+    def open(self, message_id: str, answer: bool = True) -> None:
+        self.gates.pop(message_id).set_result(answer)
+
+
+async def _settle() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def test_p7_the_owned_facade_hands_out_no_kernel_supply() -> None:
+    """R3, D4: neither the scoped facade nor the shared registry it exposes
+    offers a supply naming a module, and the facade forwards no private
+    engine member, so the context-bound supply is the only module path."""
+
+    engine, _, _ = _wake_engine()
+    engine.registry.register(SECOND_INPUT, _second_spec())
+    owned = runtime_context(triggers=engine).for_module(
+        SECOND_INPUT, ownership=_Ownership(SECOND_INPUT), declared=True
+    )
+    with pytest.raises(AttributeError):
+        owned.triggers._supply_hook
+    with pytest.raises(AttributeError):
+        owned.triggers._registry
+    assert not hasattr(owned.triggers.registry, "supply_hook")
+    assert dict(engine.registry.hook_slots(INPUT)) == {"wake": None}
+
+
+async def test_p7_a_concurrent_redelivery_waits_for_the_one_decision() -> None:
+    """R2, R3: a redelivery arriving while the first evaluation awaits its
+    hook reuses that evaluation's decision — the hook is called once and the
+    rule draws once — and a synchronous evaluation meanwhile refuses with
+    ``decision_pending``, drawing nothing and recording nothing."""
+
+    declaration = _wake(parameter_schema=LUCKY_SCHEMA, probability_parameter="p")
+    engine, rng, _ = _declared_engine(
+        declaration, default=_policy("wake", p=0.5), values=(0.1, 0.9), generic=("keyword",)
+    )
+    hook = GatedHook()
+    _supply(engine, INPUT, "wake", hook.hook)
+
+    first = asyncio.ensure_future(engine.evaluate_async(_event("c1")))
+    await _settle()
+    second = asyncio.ensure_future(engine.evaluate_async(_event("c1")))
+    await _settle()
+    pending = engine.evaluate(_event("c1"))
+    assert pending.reason == REASON_DECISION_PENDING
+    assert not pending.accepted
+    assert engine.window_size == 0
+    assert hook.calls == ["c1"]
+    assert rng.ordinal == 1
+
+    hook.open("c1")
+    decided, again = await asyncio.gather(first, second)
+    assert decided is again
+    assert decided.reason == "accepted:wake_match"
+    assert hook.calls == ["c1"]
+    assert rng.ordinal == 1
+    assert engine.window_size == 1
+    assert engine.counters.get("trigger_rejections") == 0
+
+
+async def test_p7_a_cancelled_evaluation_releases_its_waiter() -> None:
+    """R3: cancelling the evaluation a redelivery waits on lets the waiter
+    evaluate afresh rather than inherit the cancellation."""
+
+    engine, _, _ = _wake_engine()
+    hook = GatedHook()
+    _supply(engine, INPUT, "wake", hook.hook)
+
+    first = asyncio.ensure_future(engine.evaluate_async(_event("k1")))
+    await _settle()
+    second = asyncio.ensure_future(engine.evaluate_async(_event("k1")))
+    await _settle()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await _settle()
+    assert hook.calls == ["k1", "k1"]
+    hook.open("k1", False)
+    assert (await second).reason == "rejected:wake_no_match"
+
+
+async def test_p7_an_answer_released_with_the_timer_after_the_bound_is_late() -> None:
+    """R3: a hook that answers after ``hook_timeout_seconds`` on the engine's
+    clock times out even when one clock step releases the hook and the timer
+    together, so both are done when the evaluation resumes."""
+
+    engine, _, clock = _wake_engine()
+
+    async def slow(event: Any, parameters: Any) -> bool:
+        await clock.sleep(HOOK_BOUND * 2)
+        return True
+
+    _supply(engine, INPUT, "wake", slow)
+    evaluation = asyncio.ensure_future(engine.evaluate_async(_event("t1")))
+    await _settle()
+    clock.advance(HOOK_BOUND * 2)
+    assert (await evaluation).reason == "rejected:wake_hook_timeout"
+
+    async def prompt(event: Any, parameters: Any) -> bool:
+        await clock.sleep(HOOK_BOUND)
+        return True
+
+    _supply(engine, INPUT, "wake", prompt)
+    evaluation = asyncio.ensure_future(engine.evaluate_async(_event("t2")))
+    await _settle()
+    clock.advance(HOOK_BOUND)
+    assert (await evaluation).reason == "accepted:wake_match"
+
+
+async def test_p7_out_of_order_hook_answers_still_expire_in_time() -> None:
+    """R6: a decision dated before one recorded ahead of it — its hook
+    answered later — is still evicted at its own time-to-live, and an expired
+    decision is never recalled."""
+
+    base, rng, clock = _wake_engine()
+    engine = TriggerEngine(
+        base.registry,
+        dedup_max_entries=512,
+        dedup_ttl_seconds=1.0,
+        companion_identity=COMPANION,
+        clock=clock,
+        rng=rng,
+    )
+    hook = GatedHook()
+    _supply(engine, INPUT, "wake", hook.hook)
+
+    early = asyncio.ensure_future(engine.evaluate_async(_event("a")))
+    await _settle()
+    clock.advance(0.1)
+    late = asyncio.ensure_future(engine.evaluate_async(_event("b")))
+    await _settle()
+    hook.open("b")
+    await late
+    clock.advance(0.1)
+    hook.open("a")
+    await early
+    assert engine.window_size == 2
+
+    clock.advance(0.85)  # 1.05 after "a" began, 0.95 after "b"
+    redelivered = asyncio.ensure_future(engine.evaluate_async(_event("a")))
+    await _settle()
+    assert hook.calls == ["a", "b", "a"]
+    hook.open("a", False)
+    assert (await redelivered).reason == "rejected:wake_no_match"
+    assert engine.recorded(
+        platform="twitch", channel_id="channel-1", source_event_id="b"
+    ) is not None
+
+
+def test_p7_ac9_an_accepted_declared_decision_grants_nothing() -> None:
+    """AC9 (R2): an accepted declared-type decision followed by a full
+    scheduler leaves the event not admitted with the scheduler's own refusal;
+    with a granting-rule-free authorization configuration the run is offered
+    0 writes, read from the existing authorization view."""
+
+    engine, _, _ = _declared_engine(_badge(), default=_gold())
+    decision = engine.evaluate(_event("g1"))
+    assert decision.reason == "accepted:badge_tier_match"
+
+    scheduler = AdmissionScheduler(
+        _never_run,
+        session_queue_capacity=1,
+        global_pending_capacity=1,
+        max_sessions=8,
+        workers=1,
+        total_run_seconds=10.0,
+        wait_seconds=10.0,
+        clock=ManualClock(),
+    )
+    filler = scheduler.admit(SessionKey("twitch", "channel-1", "viewer-0"), Work({}, "filler"))
+    assert filler.accepted
+    result = scheduler.admit(
+        SessionKey("twitch", "channel-1", "viewer-1"), Work({}, decision.source_event_id)
+    )
+    assert not result.accepted
+    assert result.reason == REASON_GLOBAL_PENDING_CAP
+
+    write = ActionSpec(
+        name="chat.send",
+        version=1,
+        description="Send one message to one channel.",
+        argument_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        result_schema={"type": "object"},
+        nature="write",
+        required_permissions=("chat.write",),
+        supported_destinations=(Destination("twitch", WILDCARD, "chat"),),
+        timeout_seconds=1.0,
+        idempotency="key",
+    )
+
+    class Provider:
+        async def invoke(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+            raise AssertionError("never called")
+
+    provider = Provider()
+
+    actions = ActionRegistry(authorization=AuthorizationPolicy())
+    actions.declare(write, module="writer")
+    actions.bind(write.name, provider, module="writer", provider_name="writer")
+    actions.mark_ready("writer")
+    assert tuple(actions.registered_ready()) == ("chat.send",)
+    offered = actions.authorized(principal="operator:companion")
+    assert [s for s in offered.values() if s.nature == "write"] == []
+    assert len(offered) == 0

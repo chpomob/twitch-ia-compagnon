@@ -1449,6 +1449,23 @@ class _OwnedTriggers:
         pair = self._guard.refused_pair(event)
         if pair is None:
             return self._engine.evaluate(event, **kwargs)
+        return self._not_owned(event, pair)
+
+    async def evaluate_async(self, event: Mapping[str, Any], **kwargs: Any) -> Any:
+        """:meth:`evaluate`'s guard in front of the engine's hooked path (R3)."""
+
+        pair = self._guard.refused_pair(event)
+        if pair is None:
+            return await self._engine.evaluate_async(event, **kwargs)
+        return self._not_owned(event, pair)
+
+    def supply_hook(self, type_name: str, hook: Any) -> None:
+        """Supply a hook for this module's own hooked type, and no other (D4)."""
+
+        self._engine._supply_hook(self._guard.module, type_name, hook)
+
+    @staticmethod
+    def _not_owned(event: Mapping[str, Any], pair: tuple[str, str]) -> TriggerDecision:
         payload = event.get("payload")
         metadata = event.get("metadata")
         payload = payload if isinstance(payload, Mapping) else {}
@@ -1464,6 +1481,10 @@ class _OwnedTriggers:
         )
 
     def __getattr__(self, name: str) -> Any:
+        # The engine's private members — its kernel-only hook supply among
+        # them — are not part of what a module is handed (R3, D4).
+        if name.startswith("_"):
+            raise AttributeError(name)
         return getattr(self._engine, name)
 
 
@@ -1738,6 +1759,22 @@ class ModuleContext:
     @property
     def rng(self) -> RandomSource:
         return self._runtime.rng
+
+    def supply_trigger_hook(self, type_name: str, hook: Any) -> None:
+        """Supply the hook of a hooked trigger type this module declares (R3, D4).
+
+        The module is this context's own, never an argument, so a module can
+        fill only the slots of the types its own manifest declared; the engine
+        refuses, value-free, any other type and any hook that is not a
+        coroutine function.
+        """
+
+        engine = self._runtime.triggers
+        if engine is None:
+            raise RuntimeContextError(
+                "runtime context: field 'triggers': is required to supply a trigger hook"
+            )
+        engine._supply_hook(self.module, type_name, hook)
 
 
 # --------------------------------------------------------------------------- #
