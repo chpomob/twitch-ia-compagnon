@@ -704,6 +704,8 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
         "audience",
         "keyword",
         "event_kind",
+        # Phase 8 R5 (plan P8): the declared channel-points type.
+        "reward",
     ]
     for module_name, action_names in DECLARED_ACTIONS.items():
         assert isinstance(manifests[module_name]["actions"], list), module_name

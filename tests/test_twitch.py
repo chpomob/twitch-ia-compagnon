@@ -58,6 +58,7 @@ from modules.twitch import (
     HELIX_CLIPS_URL,
     HELIX_MODERATION_BANS_URL,
     HELIX_MODERATION_CHAT_URL,
+    LISTABLE_KINDS,
     MANIFEST_PATH,
     NOTICE_KINDS,
     PLATFORM,
@@ -186,18 +187,30 @@ def manifest() -> dict[str, Any]:
 
 
 def manifest_trigger_spec() -> TriggerSpec:
-    """The trigger declaration of the real manifest, built by public contracts."""
+    """The trigger declaration of the real manifest, built by public contracts.
+
+    Phase 8 R5 (plan P8): a declared type (``reward``) carries its ``kinds``
+    and ``match`` rule, and the manifest's field catalog comes along, so the
+    spec is the one the loader builds.
+    """
 
     declared = manifest()["triggers"]
     default = declared["default_policy"]
     return TriggerSpec(
         types=tuple(
             TriggerTypeDeclaration(
-                name=entry["name"], parameter_schema=entry["parameter_schema"]
+                name=entry["name"],
+                parameter_schema=entry["parameter_schema"],
+                **(
+                    {"kinds": tuple(entry["kinds"]), "match": entry["match"]}
+                    if "match" in entry
+                    else {}
+                ),
             )
             for entry in declared["types"]
         ),
         combinations=tuple(declared["combinations"]),
+        fields=declared.get("fields", {}),
         default_policy=TriggerPolicy(
             rules=tuple(
                 TriggerRule(type=rule["type"], parameters=rule["parameters"])
@@ -366,6 +379,12 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
 
     Extended by phase 5 R2 (plan P8): the manifest gains ``input_families``,
     declaring exactly (``chat``, twitch) with ``default: true``.
+
+    Extended by phase 8 R5 (plan P8), superseding the six-kind enum and the
+    four-type list: ``notices.kinds`` also accepts ``reward`` (not a platform
+    notice, so ``NOTICE_KINDS`` keeps its six), the types gain the declared
+    ``reward`` type and the triggers a field catalog; everything else is
+    unchanged.
     """
 
     from core.runtime import RUNTIME_API
@@ -390,19 +409,46 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     notices = schema["properties"]["notices"]
     assert notices["type"] == "object"
     assert set(notices["properties"]) == {"kinds"}
-    assert notices["properties"]["kinds"]["items"]["enum"] == list(NOTICE_KINDS)
-    assert notices["properties"]["kinds"]["items"]["enum"] == [
+    assert notices["properties"]["kinds"]["items"]["enum"] == list(LISTABLE_KINDS)
+    assert list(NOTICE_KINDS) == [
         "sub", "resub", "sub_gift", "community_sub_gift", "raid", "follow",
     ]
+    assert notices["properties"]["kinds"]["items"]["enum"] == [*NOTICE_KINDS, "reward"]
     assert manifest["settings_validator"] == "validate_settings"
     assert callable(validate_settings)
     assert manifest["credentials"] == ["client_id", "client_secret", "access_token"]
 
     triggers = manifest["triggers"]
     declared = {declaration["name"]: declaration for declaration in triggers["types"]}
-    assert set(declared) == {"probability", "audience", "keyword", "event_kind"}
+    assert set(declared) == {"probability", "audience", "keyword", "event_kind", "reward"}
     for declaration in declared.values():
         assert declaration["parameter_schema"]["type"] == "object"
+    assert declared["reward"] == {
+        "name": "reward",
+        "kinds": ["reward"],
+        "parameter_schema": {
+            "type": "object",
+            "properties": {
+                "reward_ids": {"type": "array", "items": {"type": "string"}},
+                "min_cost": {"type": "integer", "minimum": 0},
+                "max_cost": {"type": "integer", "minimum": 0},
+            },
+            "required": ["reward_ids"],
+            "additionalProperties": False,
+        },
+        "match": {
+            "all": [
+                {"in": [{"field": "reward.id"}, {"param": "reward_ids"}]},
+                {"gte": [{"field": "reward.cost"}, {"param": "min_cost"}]},
+                {"lte": [{"field": "reward.cost"}, {"param": "max_cost"}]},
+            ]
+        },
+    }
+    assert triggers["fields"] == {
+        "reward.id": "string",
+        "reward.title": "string",
+        "reward.cost": "integer",
+    }
     assert declared["event_kind"]["parameter_schema"] == {
         "type": "object",
         "properties": {
@@ -3012,6 +3058,357 @@ def test_settings_hook_refuses_an_invalid_notices_setting(notices: Any, field: s
     assert validate_settings({**SETTINGS, "notices": {"kinds": list(NOTICE_KINDS)}}) == []
     assert validate_settings({**SETTINGS, "notices": {}}) == []
 
+
+
+# --------------------------------------------------------------------------- #
+# Channel points (phase 8 R5; plan P8)
+# --------------------------------------------------------------------------- #
+
+
+REWARD_SUBSCRIPTION = "channel.channel_points_custom_reward_redemption.add"
+
+
+def redemption(
+    redemption_id: str | None = "redemption-1",
+    *,
+    user_id: str = "viewer-9",
+    user_input: str = "  hello  ",
+    reward: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A redemption notification in the recorded EventSub shape."""
+
+    event: dict[str, Any] = {
+        "broadcaster_user_id": SETTINGS["broadcaster_id"],
+        "broadcaster_user_login": "broadcaster",
+        "broadcaster_user_name": "Broadcaster",
+        "user_id": user_id,
+        "user_login": "redeemer",
+        "user_name": "Redeemer",
+        "user_input": user_input,
+        "status": "unfulfilled",
+        "reward": (
+            {"id": "r1", "title": "Hydrate", "cost": 500, "prompt": "Drink water"}
+            if reward is None
+            else reward
+        ),
+        "redeemed_at": "2026-10-21T12:00:00.000000000Z",
+    }
+    if redemption_id is not None:
+        event["id"] = redemption_id
+    return {
+        "metadata": {
+            "message_type": "notification",
+            "message_id": f"envelope-{redemption_id}",
+            "subscription_type": REWARD_SUBSCRIPTION,
+        },
+        "payload": {
+            "subscription": {"type": REWARD_SUBSCRIPTION, "version": "1"},
+            "event": event,
+        },
+    }
+
+
+def reward_policy(**parameters: Any) -> TriggerPolicy:
+    return TriggerPolicy(
+        rules=(TriggerRule(type="reward", parameters=parameters),),
+        combination="all_of",
+    )
+
+
+def trigger_reasons(bus: EventBus) -> list[str]:
+    return [
+        event["payload"]["reason"]
+        for event in bus.list_events()
+        if event["type"] in ("input.trigger.accepted", "input.trigger.rejected")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ac17_reward_subscription_is_requested_only_when_listed() -> None:
+    """AC17 (R5): with ``notices.kinds`` unset the fake EventSub records 0
+    reward subscriptions; with ``[reward]`` exactly 1, of the redemption
+    type, version ``1``, conditioned on the configured broadcaster."""
+
+    unset = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, _ = await activate_notices(unset, module_context(), None)
+    await handle.close()
+    assert [r for r in subscription_requests(unset) if r["type"] == REWARD_SUBSCRIPTION] == []
+
+    other = FakeSession(
+        [FakeWebSocket(welcome("two"))],
+        subscriptions=[accepted_subscription() for _ in range(3)],
+    )
+    handle, _ = await activate_notices(other, module_context(), ["raid", "follow"])
+    await handle.close()
+    assert [r for r in subscription_requests(other) if r["type"] == REWARD_SUBSCRIPTION] == []
+
+    listed = FakeSession(
+        [FakeWebSocket(welcome("three"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, diagnostics = await activate_notices(listed, module_context(), ["reward"])
+    await handle.close()
+    requests = subscription_requests(listed)
+    assert [r["type"] for r in requests] == ["channel.chat.message", REWARD_SUBSCRIPTION]
+    (reward,) = [r for r in requests if r["type"] == REWARD_SUBSCRIPTION]
+    assert reward == {
+        "type": REWARD_SUBSCRIPTION,
+        "version": "1",
+        "condition": {"broadcaster_user_id": SETTINGS["broadcaster_id"]},
+        "transport": {"method": "websocket", "session_id": "three"},
+    }
+    assert diagnostics == []
+
+
+@pytest.mark.asyncio
+async def test_ac18_a_refused_reward_subscription_degrades_reward_and_chat_continues() -> None:
+    """AC18 (R5): a refused reward subscription yields exactly 1
+    ``module.degraded`` naming ``reward``, value-free; chat messages are
+    still published and admitted."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    websocket = FakeWebSocket(welcome("one"))
+    session = FakeSession(
+        [websocket],
+        subscriptions=[
+            accepted_subscription(),
+            FakeResponse(403, {"message": "missing channel:read:redemptions"}),
+        ],
+    )
+    handle, diagnostics = await activate_notices(session, context, ["reward"])
+    try:
+        (degraded,) = events_of(context.bus, TRACE_MODULE_DEGRADED)
+        assert degraded["payload"]["module"] == "twitch"
+        assert degraded["payload"]["capabilities"] == ["reward"]
+        assert degraded["payload"]["reason"] == "reward subscription rejected (status 403)"
+        assert diagnostics == ["twitch reward subscription: rejected (status 403)"]
+        shown = repr(degraded["payload"])
+        for name in ("client_id", "client_secret", "access_token", "broadcaster_id"):
+            assert SETTINGS[name] not in shown, name
+
+        websocket.feed(notification("after-1", "Hello Companion"))
+        await wait_until(lambda: len(scheduler.admissions) == 1)
+        (event,) = chat_events(context.bus)
+        assert event["payload"]["message_id"] == "after-1"
+        assert len(events_of(context.bus, TRACE_MODULE_DEGRADED)) == 1
+    finally:
+        await handle.close()
+
+
+class StalledResponse(FakeResponse):
+    """A subscription answer whose body never arrives."""
+
+    async def json(self) -> Any:
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_reward_subscription_degrades_reward_and_chat_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5: a reward subscription that never answers is bounded locally — it
+    degrades ``reward`` alone, well before the startup deadline, and chat
+    messages are still published and admitted."""
+
+    import modules.twitch as twitch
+
+    monkeypatch.setattr(twitch, "_OPTIONAL_SUBSCRIPTION_TIMEOUT_SECONDS", 0.01)
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    websocket = FakeWebSocket(welcome("one"))
+    stalled = StalledResponse(202, None)
+    session = FakeSession([websocket], subscriptions=[accepted_subscription(), stalled])
+    handle, diagnostics = await asyncio.wait_for(
+        activate_notices(session, context, ["reward"]), timeout=5
+    )
+    try:
+        (degraded,) = events_of(context.bus, TRACE_MODULE_DEGRADED)
+        assert degraded["payload"]["capabilities"] == ["reward"]
+        assert degraded["payload"]["reason"] == "reward subscription timed out"
+        assert diagnostics == ["twitch reward subscription: timed out"]
+        assert stalled.release_calls == 1
+
+        websocket.feed(notification("after-1", "Hello Companion"))
+        await wait_until(lambda: len(scheduler.admissions) == 1)
+        (event,) = chat_events(context.bus)
+        assert event["payload"]["message_id"] == "after-1"
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_reward_subscription_degrades_reward_and_chat_continues() -> None:
+    """R5: a revoked redemption subscription degrades ``reward`` only, as a
+    refused one does; the socket keeps delivering chat."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler)
+    websocket = FakeWebSocket(welcome("one"))
+    session = FakeSession(
+        [websocket], subscriptions=[accepted_subscription() for _ in range(2)]
+    )
+    handle, _ = await activate_notices(session, context, ["reward"])
+    try:
+        websocket.feed(
+            {
+                "metadata": {"message_type": "revocation"},
+                "payload": {
+                    "subscription": {
+                        "type": REWARD_SUBSCRIPTION,
+                        "status": "authorization_revoked",
+                    }
+                },
+            }
+        )
+        websocket.feed(notification("after-1", "Hello Companion"))
+        await wait_until(lambda: len(scheduler.admissions) == 1)
+        (degraded,) = events_of(context.bus, TRACE_MODULE_DEGRADED)
+        assert degraded["payload"]["capabilities"] == ["reward"]
+        assert degraded["payload"]["reason"] == "reward subscription revoked"
+        assert websocket.close_calls == 0
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac19_a_redemption_normalizes_to_one_reward_event() -> None:
+    """AC19 (R5): a recorded-shape redemption normalizes to kind ``reward``,
+    text the trimmed viewer input — else the reward title — and
+    ``payload.reward == {id, title, cost}``; it is decided, published and
+    admitted like a message, and the same redemption twice is 1 decision."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler, policy=reward_policy(reward_ids=["r1"]))
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, diagnostics = await activate_notices(session, context, ["reward"])
+    try:
+        await _ingest(handle, redemption("redemption-1"))
+        await _ingest(handle, redemption("redemption-1"))
+
+        (event,) = chat_events(context.bus)
+        payload = event["payload"]
+        assert payload["kind"] == "reward"
+        assert payload["text"] == "hello"
+        assert payload["reward"] == {"id": "r1", "title": "Hydrate", "cost": 500}
+        assert payload["message_id"] == "redemption-1"
+        assert payload["author"] == {"id": "viewer-9", "display_name": "Redeemer"}
+        assert event["metadata"]["schema_version"] == 2
+        assert trigger_reasons(context.bus) == ["accepted:reward_match"]
+        ((session_key, work),) = scheduler.admissions
+        assert session_key == SessionKey("twitch", SETTINGS["broadcaster_id"], "viewer-9")
+        assert work.source_event_id == "redemption-1"
+        # A redemption is no platform notice: nothing is counted as ignored.
+        assert handle.counts == {"invalid": 0, "notices_ignored": 0}
+        assert diagnostics == []
+
+        await _ingest(handle, redemption("redemption-2", user_input=""))
+        assert chat_events(context.bus)[-1]["payload"]["text"] == "Hydrate"
+        await _ingest(handle, redemption("redemption-3", user_input="   "))
+        assert chat_events(context.bus)[-1]["payload"]["text"] == "Hydrate"
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_ac19_malformed_redemptions_publish_nothing_and_are_counted() -> None:
+    """AC19 (R5): no redemption id, no reward id, a string cost — and a
+    boolean one — or a user id containing ``:`` publish 0 events, draw no
+    decision, admit nothing and each add 1 to ``counts["invalid"]``."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler, policy=reward_policy(reward_ids=["r1"]))
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, _ = await activate_notices(session, context, ["reward"])
+    try:
+        before = handle.counts["invalid"]
+        await _ingest(handle, redemption(None))
+        await _ingest(handle, redemption("m-2", reward={"title": "Hydrate", "cost": 500}))
+        await _ingest(
+            handle,
+            redemption("m-3", reward={"id": "r1", "title": "Hydrate", "cost": "500"}),
+        )
+        await _ingest(handle, redemption("m-4", user_id="a:b"))
+
+        assert chat_events(context.bus) == []
+        assert trigger_reasons(context.bus) == []
+        assert scheduler.admissions == []
+        assert context.chat.read("twitch", SETTINGS["broadcaster_id"], limit=10) == ()
+        assert handle.counts["invalid"] == before + 4
+
+        await _ingest(
+            handle,
+            redemption("m-5", reward={"id": "r1", "title": "Hydrate", "cost": True}),
+        )
+        assert chat_events(context.bus) == []
+        assert handle.counts["invalid"] == before + 5
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_redemption_is_ignored() -> None:
+    """R5: without ``reward`` listed a redemption is never published (it is
+    not subscribed to; a stray one is only counted as ignored)."""
+
+    context = module_context()
+    session = FakeSession([FakeWebSocket(welcome("one"))])
+    handle, _ = await activate_notices(session, context, None)
+    try:
+        await _ingest(handle, redemption("stray-1"))
+        assert chat_events(context.bus) == []
+        assert handle.counts == {"invalid": 0, "notices_ignored": 1}
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parameters", "reward_id", "cost", "accepted"),
+    [
+        ({"reward_ids": ["r1"], "min_cost": 100, "max_cost": 1000}, "r1", 500, True),
+        ({"reward_ids": ["r1"], "min_cost": 100, "max_cost": 1000}, "r1", 50, False),
+        ({"reward_ids": ["r1"], "min_cost": 100, "max_cost": 1000}, "r1", 2000, False),
+        ({"reward_ids": ["r1"], "min_cost": 100, "max_cost": 1000}, "r2", 500, False),
+        ({"reward_ids": ["r1"]}, "r1", 0, True),
+        ({"reward_ids": ["r1"]}, "r1", 100_000, True),
+    ],
+)
+async def test_ac20_the_reward_type_selects_on_reward_id_and_cost_bounds(
+    parameters: dict[str, Any], reward_id: str, cost: int, accepted: bool
+) -> None:
+    """AC20 (R5): ``reward{reward_ids: [r1], min_cost: 100, max_cost: 1000}``
+    accepts cost 500 on ``r1`` and rejects 50 and 2000 on ``r1`` and 500 on
+    ``r2``; ``reward{reward_ids: [r1]}`` (absent bounds are true) accepts
+    ``r1`` at cost 0 and 100 000. A rejection is never admitted."""
+
+    scheduler = RecordingScheduler()
+    context = module_context(scheduler=scheduler, policy=reward_policy(**parameters))
+    session = FakeSession(
+        [FakeWebSocket(welcome("one"))],
+        subscriptions=[accepted_subscription() for _ in range(2)],
+    )
+    handle, _ = await activate_notices(session, context, ["reward"])
+    try:
+        await _ingest(
+            handle,
+            redemption(
+                "row-1", reward={"id": reward_id, "title": "Hydrate", "cost": cost}
+            ),
+        )
+        (event,) = chat_events(context.bus)
+        assert event["payload"]["reward"]["cost"] == cost
+        expected = "accepted:reward_match" if accepted else "rejected:reward_no_match"
+        assert trigger_reasons(context.bus) == [expected]
+        assert len(scheduler.admissions) == (1 if accepted else 0)
+    finally:
+        await handle.close()
 
 
 # --------------------------------------------------------------------------- #

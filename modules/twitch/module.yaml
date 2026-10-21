@@ -88,7 +88,11 @@ settings_schema:
         rejected follow subscription degrades `follow` only and chat
         continues. A listed notice is fed to the chat context,
         trigger-evaluated and admitted like a message; an unlisted or other
-        notice type is ignored and counted.
+        notice type is ignored and counted. `reward` (phase 8 R5) is not a
+        platform notice: it adds the channel-points redemption subscription,
+        which needs the redemption-read scope for the broadcaster — a
+        rejected one degrades `reward` only and chat continues — and each
+        redemption is a `reward` event the `reward` trigger type selects on.
       properties:
         kinds:
           title: Kinds
@@ -103,6 +107,7 @@ settings_schema:
               - community_sub_gift
               - raid
               - follow
+              - reward
       additionalProperties: false
   required:
     - client_id
@@ -195,6 +200,46 @@ triggers:
         required:
           - kinds
         additionalProperties: false
+    # A channel-points redemption (phase 8 R5): matches a `reward` event whose
+    # reward is listed and whose cost lies within the bounds given; an absent
+    # bound is no bound (R2). Declared, evaluated by the kernel: no module
+    # code runs for it, and it grants nothing.
+    - name: reward
+      kinds:
+        - reward
+      parameter_schema:
+        type: object
+        properties:
+          reward_ids:
+            type: array
+            items:
+              type: string
+          min_cost:
+            type: integer
+            minimum: 0
+          max_cost:
+            type: integer
+            minimum: 0
+        required:
+          - reward_ids
+        additionalProperties: false
+      match:
+        all:
+          - in:
+              - field: reward.id
+              - param: reward_ids
+          - gte:
+              - field: reward.cost
+              - param: min_cost
+          - lte:
+              - field: reward.cost
+              - param: max_cost
+  # The payload fields this input emits beyond the canonical ones (phase 8
+  # A4), so a declared type may only read what a redemption carries.
+  fields:
+    reward.id: string
+    reward.title: string
+    reward.cost: integer
   combinations:
     - all_of
     - any_of

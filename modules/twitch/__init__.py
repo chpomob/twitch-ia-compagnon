@@ -92,6 +92,18 @@ decided or admitted. Any platform author identifier containing ``:`` is
 refused before anything happens and counted in ``counts["invalid"]``: the
 reserved identities contain one, so no viewer can hold them.
 
+**Channel points** (phase 8 R5). ``reward`` in ``notices.kinds`` adds one
+redemption subscription (version 1, conditioned on the broadcaster); it is
+not a platform notice and never joins :data:`NOTICE_KINDS`. A rejected or
+unanswered one is one ``module.degraded`` naming the ``reward`` capability,
+and chat continues. A redemption is a ``reward`` event — its identifier the
+redemption's, its author the redeeming viewer, its text the trimmed viewer
+input or else the reward title, ``payload.reward`` the reward's ``id``,
+``title`` and ``cost`` — decided, published and admitted like a message, so
+the manifest's declared ``reward`` type selects on it. A redemption lacking
+its identifier, its reward identifier or an integer cost publishes nothing
+and is counted in ``counts["invalid"]``. Nothing is fulfilled or refunded.
+
 **Polls** (R7). ``activate`` publishes a poll service under ``(poll, twitch)``
 in the runtime's service registry — only when the context carries one
 (``context.services.available``); a context built without a registry
@@ -143,7 +155,12 @@ from core.contracts import (
 from core.lifecycle import request_cancellation
 from core.runtime import OwnedInputs
 from core.timestamps import parse_instant
-from core.triggers import NORMALIZED_SCHEMA_VERSION, TriggerContext, TrustedClaim
+from core.triggers import (
+    NORMALIZED_SCHEMA_VERSION,
+    TriggerContext,
+    TrustedClaim,
+    decision_trace_payload,
+)
 
 try:  # Keep the module importable for transport-injected contract tests.
     import aiohttp
@@ -203,6 +220,7 @@ publication is refused by the executor before any request leaves (F1).
 _CHAT_EVENT = "channel.chat.message"
 _NOTIFICATION_EVENT = "channel.chat.notification"
 _FOLLOW_EVENT = "channel.follow"
+_REWARD_EVENT = "channel.channel_points_custom_reward_redemption.add"
 _CHAT_SEND_EVENT = "channel.chat.send"
 _CHAT_SCOPE = "chat"
 # The input family this module ingests (phase 5 R2), as its manifest declares.
@@ -210,6 +228,10 @@ _CHAT_FAMILY = "chat"
 _ROUTE_ACTION = CHAT_WRITE_ACTION
 _ROUTE_COMPATIBILITY = _CHAT_SEND_EVENT
 _CHAT_SEND_TIMEOUT_SECONDS = 10.0
+# How long an optional subscription (follow, reward) may go unanswered before
+# it degrades its capability, well inside the coordinator's startup deadline
+# so a stalled request never cancels startup and takes chat down with it (R5).
+_OPTIONAL_SUBSCRIPTION_TIMEOUT_SECONDS = 10.0
 _STATUS_REFUSED = "refused"
 _NON_RETRYABLE_CLOSE_CODES = {4001, 4003}
 
@@ -272,6 +294,14 @@ FOLLOW_NOTICE_KIND = "follow"
 rejected follow subscription degrades (R1)."""
 
 NOTICE_KINDS: tuple[str, ...] = CHAT_NOTICE_KINDS + (FOLLOW_NOTICE_KIND,)
+"""Every platform notice kind this module maps."""
+
+REWARD_KIND = "reward"
+"""The kind of a channel-points redemption event, the ``notices.kinds`` entry
+that selects its subscription, and the capability a rejected one degrades
+(phase 8 R5). A redemption is not a platform notice (A1)."""
+
+LISTABLE_KINDS: tuple[str, ...] = NOTICE_KINDS + (REWARD_KIND,)
 """Every kind ``notices.kinds`` may list."""
 
 ANONYMOUS_AUTHOR = "system:anonymous"
@@ -353,6 +383,10 @@ class _RecoveryRefused(TwitchModuleError):
         self.reason = reason
 
 
+class _InvalidRedemption(ValueError):
+    """A redemption lacking a field its ``reward`` event requires (R5)."""
+
+
 class _KeepaliveExpired(Exception):
     """No frame arrived within the welcome's keepalive plus the margin (F10)."""
 
@@ -401,7 +435,7 @@ def _validate_notices(notices: Any) -> list[str]:
     if (
         isinstance(kinds, str)
         or not isinstance(kinds, (list, tuple))
-        or any(kind not in NOTICE_KINDS for kind in kinds)
+        or any(kind not in LISTABLE_KINDS for kind in kinds)
     ):
         return [
             _setting_diagnostic(
@@ -446,6 +480,8 @@ class _Notification:
     community notice, published as ``payload.kind`` (plan decision 2).
     ``anonymous`` marks a notice the platform attributes to no one: its author
     is :data:`ANONYMOUS_AUTHOR`, and it is never decided or admitted.
+    ``reward`` is a redemption's ``{id, title, cost}``, published as
+    ``payload.reward`` (phase 8 R5).
     """
 
     channel_id: str
@@ -457,6 +493,7 @@ class _Notification:
     roles_attested: bool = False
     kind: str = EVENT_KIND_DEFAULT
     anonymous: bool = False
+    reward: Mapping[str, Any] | None = None
 
     def event(self) -> dict[str, Any]:
         """The schema-version-2 bus event this notification normalises to."""
@@ -479,6 +516,8 @@ class _Notification:
         if self.kind != EVENT_KIND_DEFAULT:
             # Only a notice carries a kind: a message keeps the phase 2 shape.
             payload["kind"] = self.kind
+        if self.reward is not None:
+            payload["reward"] = dict(self.reward)
         return {
             "type": _CHAT_EVENT,
             "payload": payload,
@@ -1991,7 +2030,8 @@ class TwitchModule:
         chat-notification kind is listed; follows iff ``follow`` is. Chat
         messages and notifications share the chat scopes, so either refused
         fails the subscription; a refused follow subscription (it needs the
-        moderator follower-read scope) degrades ``follow`` only.
+        moderator follower-read scope) degrades ``follow`` only; redemptions
+        iff ``reward`` is listed, a refusal degrading ``reward`` only (R5).
         """
 
         chat_condition = {
@@ -2015,10 +2055,25 @@ class TwitchModule:
                         "moderator_user_id": self._settings.bot_user_id,
                     },
                     label="twitch follow subscription",
+                    timeout=_OPTIONAL_SUBSCRIPTION_TIMEOUT_SECONDS,
                 )
             except _SubscriptionRefused as failure:
                 await self._report_degraded(
                     f"follow subscription {failure.detail}", FOLLOW_NOTICE_KIND
+                )
+        if REWARD_KIND in kinds:
+            try:
+                await self._create_subscription(
+                    session_id,
+                    _REWARD_EVENT,
+                    "1",
+                    {"broadcaster_user_id": self._settings.broadcaster_id},
+                    label="twitch reward subscription",
+                    timeout=_OPTIONAL_SUBSCRIPTION_TIMEOUT_SECONDS,
+                )
+            except _SubscriptionRefused as failure:
+                await self._report_degraded(
+                    f"reward subscription {failure.detail}", REWARD_KIND
                 )
 
     async def _create_subscription(
@@ -2029,14 +2084,23 @@ class TwitchModule:
         condition: Mapping[str, str],
         *,
         label: str = "twitch subscription",
+        timeout: float | None = None,
     ) -> None:
+        """Request one subscription; ``timeout`` bounds the request and its body.
+
+        An optional subscription passes ``timeout`` so an unanswered request
+        raises :class:`_SubscriptionRefused` ("timed out") and degrades its
+        capability alone; chat's own subscription stays unbounded here.
+        """
+
         request_body = {
             "type": subscription_type,
             "version": version,
             "condition": dict(condition),
             "transport": {"method": "websocket", "session_id": session_id},
         }
-        try:
+
+        async def request() -> tuple[int | None, Any]:
             response = await _resolve(
                 self._session.post(
                     EVENTSUB_SUBSCRIPTIONS_URL,
@@ -2044,9 +2108,20 @@ class TwitchModule:
                     json=request_body,
                 )
             )
-            status, body = await _read_response(response)
+            return await _read_response(response)
+
+        try:
+            if timeout is None:
+                status, body = await request()
+            else:
+                status, body = await asyncio.wait_for(request(), timeout=timeout)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            self._diagnose(f"{label}: timed out")
+            raise _SubscriptionRefused(
+                "twitch subscription timed out", "timed out"
+            ) from None
         except Exception:
             self._diagnose(f"{label}: request failed")
             raise _SubscriptionRefused(
@@ -2331,11 +2406,10 @@ class TwitchModule:
                         # Only notices lose their source: chat continues (R1).
                         # The reason names the subscription, so a second
                         # revocation is not deduplicated into the first.
-                        source = (
-                            "follow"
-                            if revoked == (FOLLOW_NOTICE_KIND,)
-                            else "chat notification"
-                        )
+                        source = {
+                            (FOLLOW_NOTICE_KIND,): "follow",
+                            (REWARD_KIND,): "reward",
+                        }.get(revoked, "chat notification")
                         await self._report_degraded(
                             f"{source} subscription revoked", *revoked
                         )
@@ -2372,12 +2446,18 @@ class TwitchModule:
         A community notice takes the same route (plan decision 2): an ignored
         one is only counted, an anonymous one is fed and published but never
         decided or admitted (decision 3). An author identifier containing
-        ``:`` is refused before anything else and counted (R6).
+        ``:`` is refused before anything else and counted (R6). So is a
+        malformed redemption (phase 8 R5): it publishes nothing.
         """
 
-        notification = _normalize_notification(
-            envelope, self._notice_kinds
-        )
+        try:
+            notification = _normalize_notification(
+                envelope, self._notice_kinds
+            )
+        except _InvalidRedemption:
+            self._counts[COUNT_INVALID] += 1
+            self._diagnose("twitch redemption: malformed data")
+            return
         if notification is None:
             # A notice type this module does not map, or a kind not listed.
             self._counts[COUNT_NOTICES_IGNORED] += 1
@@ -2507,16 +2587,8 @@ class TwitchModule:
             if decision.accepted
             else TRACE_INPUT_TRIGGER_REJECTED
         )
-        payload = {
-            "source_event_id": decision.source_event_id,
-            "input": decision.input_name,
-            "platform": decision.platform,
-            "channel_id": decision.channel_id,
-            "policy_version": decision.policy_version,
-            "reason": decision.reason,
-        }
         try:
-            await self._supervision.emit(event_type, payload)
+            await self._supervision.emit(event_type, decision_trace_payload(decision))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2798,6 +2870,8 @@ def _normalize_notification(
         return _normalize_chat_notice(event, notice_kinds)
     if kind_of_subscription == _FOLLOW_EVENT:
         return _normalize_follow(event, metadata, notice_kinds)
+    if kind_of_subscription == _REWARD_EVENT:
+        return _normalize_redemption(event, notice_kinds)
     if kind_of_subscription != _CHAT_EVENT:
         raise ValueError
 
@@ -2906,14 +2980,57 @@ def _normalize_follow(
     )
 
 
+def _normalize_redemption(
+    event: Mapping[str, Any], notice_kinds: frozenset[str]
+) -> _Notification | None:
+    """A redemption event as a ``reward`` event, or ``None`` (phase 8 R5).
+
+    The author is the redeeming viewer; the text is the trimmed viewer input
+    when there is one, else the reward title. Raises
+    :class:`_InvalidRedemption` when the channel, the redemption identifier,
+    the reward identifier, the reward title or an integer cost (a boolean is
+    not one) is missing: such a redemption publishes nothing.
+    """
+
+    if REWARD_KIND not in notice_kinds:
+        return None
+    reward = event.get("reward")
+    try:
+        if not isinstance(reward, Mapping):
+            raise ValueError
+        channel_id = _required_string(event, "broadcaster_user_id")
+        redemption_id = _required_string(event, "id")
+        reward_id = _required_string(reward, "id")
+        title = _required_string(reward, "title", allow_empty=True)
+    except ValueError:
+        raise _InvalidRedemption from None
+    cost = reward.get("cost")
+    if not isinstance(cost, int) or isinstance(cost, bool):
+        raise _InvalidRedemption
+    user_input = event.get("user_input")
+    text = user_input.strip() if isinstance(user_input, str) else ""
+    author_id = _optional_string(event.get("user_id"))
+    return _Notification(
+        channel_id=channel_id,
+        author_id=author_id,
+        author_name=_optional_string(event.get("user_name")),
+        message_id=redemption_id,
+        text=text or title,
+        claims=_trusted_claims({}, author_id, channel_id),
+        roles_attested=author_id is not None and author_id == channel_id,
+        kind=REWARD_KIND,
+        reward={"id": reward_id, "title": title, "cost": cost},
+    )
+
+
 def _revoked_notice_kinds(
     envelope: Mapping[str, Any], notice_kinds: frozenset[str]
 ) -> tuple[str, ...]:
     """The listed notice kinds a revocation removes, in declaration order.
 
-    Empty unless the revoked subscription is the chat-notification or the
-    follow one: a revoked chat subscription, or one the envelope does not
-    name, still stops reception.
+    Empty unless the revoked subscription is the chat-notification, the
+    follow or the reward one: a revoked chat subscription, or one the
+    envelope does not name, still stops reception.
     """
 
     payload = envelope.get("payload")
@@ -2925,6 +3042,8 @@ def _revoked_notice_kinds(
         return tuple(kind for kind in CHAT_NOTICE_KINDS if kind in notice_kinds)
     if revoked_type == _FOLLOW_EVENT and FOLLOW_NOTICE_KIND in notice_kinds:
         return (FOLLOW_NOTICE_KIND,)
+    if revoked_type == _REWARD_EVENT and REWARD_KIND in notice_kinds:
+        return (REWARD_KIND,)
     return ()
 
 
