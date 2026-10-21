@@ -1,0 +1,239 @@
+# The operator's own button: the `operator` input — manifest v2 (phase 8 R6).
+#
+# What this file declares, the runtime validates at discovery and acts on at
+# activation. It declares shapes only: no action and no grant live here. The
+# module publishes one `manual` event per accepted press of a configured
+# button, from a local page, the shipped press command or an overlay page; a
+# press is decided by this module's trigger policy and an accepted one is
+# admitted like any other input's event. No platform name appears here: the
+# channel a press answers on is the configured `destination`.
+
+name: operator
+manifest_version: 2
+# The runtime contract this module is built against, compared at load against
+# `core.runtime.RUNTIME_API`.
+runtime_api: 2
+
+# A press enters as the one normalised chat event shape every input builds,
+# with `payload.kind: manual`.
+produces:
+  - channel.chat.message
+consumes: []
+middleware: false
+
+# The input role: the listener opens in `start_inputs` (after the readiness
+# barrier) and closes in `stop_inputs`; no press produces an event outside
+# that span.
+lifecycle:
+  roles:
+    - input
+
+# The shapes are checked by the declared hook, one value-free diagnostic per
+# field, before any listener opens: at least one surface, a token of at
+# least 32 characters, a non-empty `prompt_text` per button, and a loopback
+# bind address unless `allow_non_loopback` says otherwise (never a wildcard).
+settings_schema:
+  title: Operator settings
+  type: object
+  properties:
+    buttons:
+      title: Buttons
+      type: array
+      description: >-
+        The configured buttons, 1 to 32 entries; each id is distinct.
+      items:
+        title: Button
+        type: object
+        properties:
+          id:
+            title: Id
+            type: string
+            description: >-
+              The button identifier a press names: 1 to 64 letters, digits,
+              `-` or `_`.
+          label:
+            title: Label
+            type: string
+            description: The text the pages show, and the author's display name.
+          prompt_text:
+            title: Prompt text
+            type: string
+            description: >-
+              The text a press carries, non-empty and at most 500 characters.
+          cooldown_seconds:
+            title: Cooldown seconds
+            default: 2
+            type: integer
+            minimum: 0
+            maximum: 3600
+            description: >-
+              The time after an accepted press of this button during which a
+              new press of it is refused. Default 2.
+          rect:
+            title: Rectangle
+            type: object
+            description: >-
+              Where the overlay page places this button over its image, in
+              percent of the image; a button without one is not shown there.
+            properties:
+              x:
+                title: X
+                type: number
+                minimum: 0
+                maximum: 100
+              y:
+                title: Y
+                type: number
+                minimum: 0
+                maximum: 100
+              w:
+                title: Width
+                type: number
+                minimum: 0
+                maximum: 100
+              h:
+                title: Height
+                type: number
+                minimum: 0
+                maximum: 100
+    destination:
+      title: Destination
+      type: object
+      description: The channel a press's run answers on.
+      properties:
+        platform:
+          title: Platform
+          type: string
+        channel_id:
+          title: Channel id
+          type: string
+    surfaces:
+      title: Surfaces
+      type: object
+      description: >-
+        Which surfaces may press; every one is disabled unless enabled here,
+        and at least one must be.
+      properties:
+        page:
+          title: Page
+          default: false
+          type: boolean
+          description: The local page listing the buttons. Default false.
+        hotkey:
+          title: Hotkey
+          default: false
+          type: boolean
+          description: >-
+            The shipped press command, bound to a key by the operator.
+            Default false.
+        overlay:
+          title: Overlay
+          default: false
+          type: boolean
+          description: >-
+            The overlay page for a browser source, its buttons placed over
+            an image. Default false.
+    listen:
+      title: Listen
+      type: object
+      description: Where the input's listener binds.
+      properties:
+        host:
+          title: Host
+          default: 127.0.0.1
+          type: string
+          description: >-
+            The bind address; a non-loopback one needs `allow_non_loopback`.
+            A wildcard address (`0.0.0.0`, `::`) is refused: bind the address
+            requests reach. Default `127.0.0.1`.
+        port:
+          title: Port
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: The bind port.
+        allow_non_loopback:
+          title: Allow non-loopback
+          default: false
+          type: boolean
+          description: >-
+            Whether a bind address other than loopback is accepted.
+            Default false.
+    token:
+      title: Token
+      type: string
+      description: >-
+        The access token every request carries, at least 32 characters,
+        resolved from an environment reference; never logged, never echoed.
+    overlay:
+      title: Overlay
+      type: object
+      description: What the overlay page shows.
+      properties:
+        image:
+          title: Image
+          type: string
+          description: >-
+            The URL of the image the overlay page shows behind its buttons;
+            absent, the buttons are shown on a transparent page.
+settings_validator: validate_settings
+
+# The token is a credential: its accepted value — literal or resolved from
+# `${NAME}` — is redacted from every supervision trace and lost-trace
+# diagnostic before this module is activated.
+credentials:
+  - token
+
+# A press is trigger-evaluated with this module's policy (phase 8 R6).
+triggers:
+  types:
+    # Selects on the normalised event's kind; a press is always `manual`.
+    - name: event_kind
+      parameter_schema:
+        type: object
+        properties:
+          kinds:
+            type: array
+            items:
+              type: string
+              enum:
+                - manual
+        required:
+          - kinds
+        additionalProperties: false
+    # A press of one of the listed buttons, from any surface (R6). Declared,
+    # evaluated by the kernel: no module code runs for it, and it grants
+    # nothing.
+    - name: button
+      kinds:
+        - manual
+      parameter_schema:
+        type: object
+        properties:
+          button_ids:
+            type: array
+            items:
+              type: string
+        required:
+          - button_ids
+        additionalProperties: false
+      match:
+        in:
+          - field: button.id
+          - param: button_ids
+  # The payload fields this input emits beyond the canonical ones (phase 8
+  # A4), so a declared type may only read what a press carries.
+  fields:
+    button.id: string
+    button.surface: string
+  combinations:
+    - all_of
+    - any_of
+    - none_of
+  default_policy:
+    combination: all_of
+    rules:
+      - type: event_kind
+        parameters:
+          kinds:
+            - manual

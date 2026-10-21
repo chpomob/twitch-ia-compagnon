@@ -114,6 +114,8 @@ MODULE_NAMES = (
     "streamerbot",
     # Phase 7 R1, R9 (plan P1): web knowledge, the 19th manifest.
     "web",
+    # Phase 8 R6 (plan P9, allowlisted): the operator's button, the 20th.
+    "operator",
 )
 ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 
@@ -413,6 +415,17 @@ EXPECTED_MANIFESTS = {
         "lifecycle": {"roles": []},
         "settings_validator": "validate_settings",
     },
+    # Phase 8 R6 (plan P9): an input publishing the `manual` chat event.
+    "operator": {
+        "name": "operator",
+        "manifest_version": 2,
+        "runtime_api": RUNTIME_API,
+        "produces": ["channel.chat.message"],
+        "consumes": [],
+        "middleware": False,
+        "lifecycle": {"roles": ["input"]},
+        "settings_validator": "validate_settings",
+    },
 }
 # The declarations each manifest carries beyond the routing keys (R1, R5,
 # R8): only the chat input — and, from phase 3's R6, the watch input —
@@ -455,6 +468,8 @@ DECLARATION_KEYS = {
     "streamerbot": {"triggers", "actions", "credentials", "input_families"},
     # Phase 7 R1 (plan P1): its two read actions and its optional Brave key.
     "web": {"actions", "credentials"},
+    # Phase 8 R6 (plan P9): its `event_kind` and `button` types and its token.
+    "operator": {"triggers", "credentials"},
 }
 #: The manifests that declare actions, and the names each declares.
 DECLARED_ACTIONS = {
@@ -495,6 +510,8 @@ SECRET_SETTINGS = {
     "streamerbot": ("password",),
     # Phase 7 R1 (plan P1): the optional Brave key, required by `provider: brave`.
     "web": ("brave_api_key",),
+    # Phase 8 R6 (plan P9): the operator input's access token.
+    "operator": ("token",),
 }
 #: The optional credentials shipped unconfigured — empty, never a literal —
 #: with the speech and transcription endpoints they go with (AC43).
@@ -654,7 +671,8 @@ def test_manifests_are_unique_and_have_coherent_capabilities() -> None:
     names = [manifest["name"] for manifest in manifests.values()]
     assert len(names) == len(set(names))
     assert set(names) == set(MODULE_NAMES)
-    assert len(names) == 19
+    # Phase 8 R6 (plan P9, allowlisted): 19 → 20 with `operator`.
+    assert len(names) == 20
     assert set(EXPECTED_MANIFESTS) == set(MODULE_NAMES)
 
     for module_name, expected in EXPECTED_MANIFESTS.items():

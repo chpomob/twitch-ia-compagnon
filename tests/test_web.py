@@ -652,10 +652,11 @@ async def test_the_socket_guard_refuses_and_records_every_non_loopback_surface(
 
 def test_ac1_the_shipped_manifests_discover_19_modules_with_web() -> None:
     """AC1: loading the shipped manifests discovers 19 modules, ``web`` among
-    them, declaring exactly ``web.search`` and ``web.read``."""
+    them, declaring exactly ``web.search`` and ``web.read``. Phase 8 P9 ships
+    ``operator``, so the shipped count is now 20."""
 
     discovered = ModuleLoader(EventBus(), str(ROOT / "modules"))._discover()
-    assert len(discovered) == 19
+    assert len(discovered) == 20
     assert MODULE_NAME in discovered
     declaration = discovered[MODULE_NAME].declaration
     assert declaration is not None and declaration.is_v2

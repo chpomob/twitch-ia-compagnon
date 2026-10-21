@@ -3788,7 +3788,7 @@ class ConfigUI:
         key layout is refused as stale, exactly as Save refuses it, before
         any of its positional names is parsed: read against the current key
         order they would name other keys, and the verdict would be about a
-        draft the operator never edited (gate-3 N2).
+        draft the user never edited (gate-3 N2).
         """
 
         fields = _form_fields(request)
@@ -3953,7 +3953,7 @@ class ConfigUI:
     ) -> WriteResult:
         """Replace the overlay with *draft* and log the operation, never a value.
 
-        A path can carry an operator-chosen key (a channel identifier); the
+        A path can carry a user-chosen key (a channel identifier); the
         logged page and paths, message and record fields alike, pass the
         redaction guard with the draft's credential literals included (R8).
         """

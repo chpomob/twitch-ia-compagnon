@@ -114,7 +114,8 @@ UNSET_DIAGNOSTIC = "modules.twitch.access_token: environment reference is unreso
 #: P10: ``viewer_memory``, 13; P14: ``moderation``, 14; P16: ``watch``, 15;
 #: P18: ``kick``, 16; P20: ``youtube``, 17), and phase 5's automation bridge
 #: (R10, plan P12, allowlisted: 17 → 18), and phase 7's web knowledge (R1, R9,
-#: plan P1, allowlisted: 18 → 19).
+#: plan P1, allowlisted: 18 → 19), and phase 8's operator input (R6, plan P9,
+#: allowlisted: 19 → 20).
 SHIPPED_MANIFESTS = (
     "twitch",
     "brain",
@@ -135,6 +136,7 @@ SHIPPED_MANIFESTS = (
     "youtube",
     "streamerbot",
     "web",
+    "operator",
 )
 #: The three package-data lines phase 2 adds (R9, AC33).
 PHASE2_PACKAGE_DATA = ("modules.audio_output", "modules.audio_input", "modules.stream_control")
@@ -1089,7 +1091,8 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     ``clips``, ``viewer_memory``, ``moderation``, ``watch``, ``kick`` and
     ``youtube`` — superseded by phase 5's R10 (plan step P12, AC41,
     allowlisted): 18 with the automation bridge — superseded by phase 7's R1,
-    R9 (plan step P1, allowlisted): 19 with ``web`` — and the installed console
+    R9 (plan step P1, allowlisted): 19 with ``web`` — superseded by phase 8's
+    R6 (plan step P9, allowlisted): 20 with ``operator`` — and the installed console
     script answers ``--help`` with status 0.
 
     The checkout is installed from a pristine copy of its sources: pip
@@ -1169,7 +1172,7 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     assert report["core"].startswith(installed + os.sep), report
     assert report["modules_directory"] == str((target / "modules").resolve()), report
     assert report["manifests"] == sorted(SHIPPED_MANIFESTS), report
-    assert len(report["manifests"]) == 19
+    assert len(report["manifests"]) == 20
     assert set(report["manifests"]) == set(MODULE_NAMES)
 
     launcher = target / "bin" / CONSOLE_SCRIPT
@@ -1218,7 +1221,8 @@ def test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency() -> 
     3's R8 adds ``clips`` (P9), ``viewer_memory`` (P10), ``moderation``
     (P14), ``watch`` (P16), ``kick`` (P18) and ``youtube`` (P20); phase 5's
     R10 (plan step P12, AC41, allowlisted) adds ``streamerbot``: 18; phase
-    7's R1, R9 (plan step P1, allowlisted) adds ``web``: 19. The
+    7's R1, R9 (plan step P1, allowlisted) adds ``web``: 19; phase 8's R6
+    (plan step P9, allowlisted) adds ``operator``: 20. The
     runtime dependency list is still exactly ``aiohttp`` and ``PyYAML``
     (unchanged)."""
 
@@ -1230,9 +1234,9 @@ def test_pyproject_ships_the_three_phase_2_manifests_and_no_new_dependency() -> 
         child.name for child in (ROOT / "modules").iterdir() if (child / "module.yaml").is_file()
     )
     assert shipped == sorted(SHIPPED_MANIFESTS) == sorted(MODULE_NAMES)
-    assert len(shipped) == 19
+    assert len(shipped) == 20
     module_lines = sorted(key for key in package_data if key.startswith("modules."))
-    assert len(module_lines) == 19
+    assert len(module_lines) == 20
     assert module_lines == sorted(f"modules.{name}" for name in shipped)
     for name in module_lines:
         assert package_data[name] == ["module.yaml"], name

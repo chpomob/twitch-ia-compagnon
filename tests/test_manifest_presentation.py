@@ -145,6 +145,8 @@ PRESENTED = (
     "clips",
     "kick",
     "moderation",
+    # Phase 8 R6 (plan P9): the operator's button.
+    "operator",
     "proxy",
     "stream_control",
     # Phase 5 R6 (plan P12, AC23): the automation bridge.
@@ -243,10 +245,11 @@ def test_presented_covers_every_shipped_manifest() -> None:
     """AC12: the title and default checks run over all shipped manifests —
     18 since phase 5 R10 (plan P12, AC23) ships the automation bridge
     (allowlisted: 17 → 18), and 19 since phase 7 R1, R9 (plan P1) ships
-    ``web`` (allowlisted: 18 → 19)."""
+    ``web`` (allowlisted: 18 → 19), and 20 since phase 8 R6 (plan P9) ships
+    ``operator`` (allowlisted: 19 → 20)."""
 
     shipped = _shipped_manifests()
-    assert len(shipped) == 19
+    assert len(shipped) == 20
     assert len(PRESENTED) == len(set(PRESENTED))
     assert set(PRESENTED) == shipped
 

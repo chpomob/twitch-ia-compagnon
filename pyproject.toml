@@ -56,6 +56,7 @@ modules = ["*/module.yaml"]
 "modules.youtube" = ["module.yaml"]
 "modules.streamerbot" = ["module.yaml"]
 "modules.web" = ["module.yaml"]
+"modules.operator" = ["module.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
