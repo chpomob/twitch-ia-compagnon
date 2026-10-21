@@ -129,6 +129,27 @@ otherwise the brain owns the scheduler and its bus consumer admits the
 published copy under the candidate's recorded decision. Each settlement is
 counted (:meth:`AudioInputModule.counts`).
 
+**The listen loop** (R7 lifecycle, supervision, restart). ``start_inputs``
+spawns the loop as one task of the module's supervised registry (the owner
+``prepare`` resolved); its first act is one detector invocation, and one
+iteration runs at a time, so at most one detector, one acquisition and one
+transcription are in flight. Between iterations it waits on the injected
+sleeper: 1 s after a productive settlement (a declined candidate or a
+published event), which also resets the unproductive run ``n`` to 0, and
+``min(retry_seconds × 2^(n−1), 300)`` after the n-th unproductive one in a
+row (no verdict, a detector, source or transcription failure, an empty
+transcription). ``stop_inputs`` stops it for good: the loop is cancelled, an
+invocation in flight is terminated and is not a failure, an acquisition in
+flight is killed with its partial output discarded, and no invocation starts
+afterwards; ``prepare`` starts nothing, so a startup that never reaches
+``start_inputs`` invokes nothing. *Health* has two states and starts
+``healthy``: a detector failure while ``healthy`` degrades it with exactly one
+``module.degraded`` of the value-free reason ``wake_word_detector_failed``,
+the first verdict (a detection or an exit 1) while ``degraded`` restores it
+with exactly one ``module.ready``, and nothing else reports — source and
+transcription outcomes never change the state. A detector held pending is
+never timed out by the companion.
+
 Lifecycle: the manifest declares the ``input`` role, so ``start_inputs`` and
 ``stop_inputs`` are phases of the handle — no-ops while listening is off — beside
 ``prepare``, ``drain`` and ``close``. ``prepare`` probes each source — a
@@ -391,6 +412,21 @@ _LISTEN_COUNTS = (
     COUNT_CANDIDATES,
     COUNT_PUBLISHED,
 )
+
+#: The restart scheduler (R7): after a productive settlement — a declined
+#: candidate or a published event — the next invocation waits 1 s and the
+#: unproductive run restarts at 0; after the n-th unproductive one in a row it
+#: waits ``min(retry_seconds × 2^(n−1), 300)``.
+LISTEN_PRODUCTIVE_DELAY_SECONDS = 1.0
+LISTEN_BACKOFF_MAX_SECONDS = 300.0
+_PRODUCTIVE_SETTLEMENTS = frozenset({SETTLED_DECLINED, SETTLED_PUBLISHED})
+# 2^16 × the 1 s minimum already passes the cap: the exponent stops growing there.
+_BACKOFF_MAX_EXPONENT = 16
+
+#: The voice input's two health states and the one value-free reason (R7).
+LISTEN_HEALTHY = "healthy"
+LISTEN_DEGRADED = "degraded"
+WAKE_WORD_DETECTOR_FAILED = "wake_word_detector_failed"
 
 #: The injection seams: read from *settings*, never from a configuration file.
 _SEAM_SOURCE_FACTORY = "_source_factory"
@@ -1671,6 +1707,19 @@ DETECTOR_SESSION_FACTORY: Callable[[], Any] = _default_detector_session_factory
 """The shipped ``http`` detector transport, made on first use."""
 
 
+def listen_backoff_seconds(retry_seconds: float, unproductive: int) -> float:
+    """The wait before the next detector invocation (R7's restart scheduler).
+
+    *unproductive* is how many unproductive settlements ran in a row, the
+    last one included; 0 means the last settlement was productive (1 s).
+    """
+
+    if unproductive <= 0:
+        return LISTEN_PRODUCTIVE_DELAY_SECONDS
+    exponent = min(unproductive - 1, _BACKOFF_MAX_EXPONENT)
+    return min(float(retry_seconds) * 2.0**exponent, LISTEN_BACKOFF_MAX_SECONDS)
+
+
 def build_detector(
     spec: DetectorSpec, *, runner: SubprocessRunner, session_factory: Callable[[], Any]
 ) -> CommandDetector | HttpDetector:
@@ -1859,6 +1908,12 @@ class AudioInputModule:
         self._detector_session_factory = detector_session_factory
         self._detector: CommandDetector | HttpDetector | None = None
         self._listen_counts = {name: 0 for name in _LISTEN_COUNTS}
+        # The listen loop (R7): one supervised task from ``start_inputs`` to
+        # ``stop_inputs``, the acquisition it holds, and its two-state health.
+        self._listen_task: Any | None = None
+        self._listen_stopping = False
+        self._listen_recording: Any | None = None
+        self._listen_health = LISTEN_HEALTHY
         self._sleeper = sleeper
         # The transcription transport: made on first use, released by close.
         self._transport_factory = transport_factory
@@ -1922,6 +1977,12 @@ class AudioInputModule:
         """How the voice input's iterations settled (R7)."""
 
         return dict(self._listen_counts)
+
+    @property
+    def listen_health(self) -> str:
+        """The voice input's health: ``healthy`` or ``degraded`` (R7)."""
+
+        return self._listen_health
 
     # -- lifecycle hooks ---------------------------------------------------- #
 
@@ -2031,14 +2092,56 @@ class AudioInputModule:
         )
 
     async def start_inputs(self) -> None:
-        """The input phase (R7): with listening off, nothing starts.
+        """The input phase (R7): start the listen loop, whose first act is the detector.
 
-        The listen loop is not run by this step; this phase starts no task,
-        no detector and no source.
+        The loop runs as one task of the module's supervised registry,
+        resolved at ``prepare``; a second call, a call after ``stop_inputs``
+        or ``close``, or one with listening off (or never prepared) starts
+        nothing.
         """
 
+        owner = self._listen_owner
+        if (
+            owner is None
+            or self._detector is None
+            or self._listen_task is not None
+            or self._listen_stopping
+            or self._closed
+        ):
+            return
+        self._listen_task = owner.spawn(self._listen_loop(), name=f"{MODULE_NAME}-listen")
+
     async def stop_inputs(self) -> None:
-        """The end of the input phase: with nothing started, nothing stops."""
+        """End the input phase: no detector invocation starts after this.
+
+        The loop is cancelled; an invocation in flight is terminated (a
+        ``command`` detector's process killed, an ``http`` detector's
+        request and session closed) and is not a detector failure; an
+        acquisition in flight is killed, its partial output discarded, and a
+        segment not yet transcribed is released with the loop's frame. The
+        state is resolved in ``finally``, so a stop cut short by the
+        coordinator still leaves no process running.
+        """
+
+        await self._stop_listening()
+
+    async def _stop_listening(self) -> None:
+        self._listen_stopping = True
+        task, self._listen_task = self._listen_task, None
+        try:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            _kill_recording(self._listen_recording)
+            self._listen_recording = None
+            detector = self._detector
+            terminate = getattr(detector, "terminate", None)
+            if callable(terminate):
+                terminate()
+            close_detector = getattr(detector, "close", None)
+            if callable(close_detector):
+                await close_detector()
 
     async def drain(self, deadline_seconds: float) -> None:
         """Kill every running recorder; let the transcriptions end within the deadline.
@@ -2071,10 +2174,10 @@ class AudioInputModule:
             self._actions.mark_not_ready()
         self._kill_all("cancelled")
         self._interrupt_transcriptions()
-        await self._close_session()
-        close_detector = getattr(self._detector, "close", None)
-        if callable(close_detector):
-            await close_detector()
+        try:
+            await self._stop_listening()
+        finally:
+            await self._close_session()
 
     async def _join_transcriptions(self, budget: float) -> None:
         """Wait for the transcribing calls up to *budget* on the sleeper, then interrupt them."""
@@ -2125,6 +2228,19 @@ class AudioInputModule:
             except Exception:  # noqa: BLE001 - the call's record stands regardless
                 pass
 
+    async def _report_ready(self) -> None:
+        ready = getattr(self._supervision, "ready", None)
+        if not callable(ready):
+            return
+        try:
+            outcome = ready()
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a lost health report changes nothing listened
+            return
+
     async def _report_degraded(self, reason: str, capabilities: Sequence[str]) -> None:
         degraded = getattr(self._supervision, "degraded", None)
         if not callable(degraded):
@@ -2154,15 +2270,21 @@ class AudioInputModule:
 
         listen = self._settings.listen
         detector = self._detector
-        if listen is None or detector is None or self._closed:
+        if listen is None or detector is None or self._closed or self._listen_stopping:
             return SETTLED_STOPPED
         counts = self._listen_counts
-        # (1) Verdict.
+        # (1) Verdict. A detector ended by ``stop_inputs`` is not a failure.
         try:
             verdict = await detector.wait()
         except DetectorFailure:
+            if self._listen_stopping or self._closed:
+                return SETTLED_STOPPED
             counts[COUNT_DETECTOR_FAILURES] += 1
+            await self._listen_health_after(failed=True)
             return SETTLED_DETECTOR_FAILURE
+        if self._listen_stopping or self._closed:
+            return SETTLED_STOPPED
+        await self._listen_health_after(failed=False)
         if verdict is None:
             return SETTLED_NO_VERDICT
         # (2) Candidate: decided on the verdict alone.
@@ -2188,6 +2310,47 @@ class AudioInputModule:
         # (4) Event: published and admitted under the candidate's decision.
         await self._publish_speech(speech_event(candidate, text))
         return SETTLED_PUBLISHED
+
+    async def _listen_loop(self) -> None:
+        """Iterate until stopped, waiting on the sleeper between iterations (R7).
+
+        After a productive settlement (a declined candidate, a published
+        event) the wait is 1 s and the unproductive run is reset; after
+        each unproductive one (no verdict, a detector, source or
+        transcription failure, an empty transcription) it grows as
+        :func:`listen_backoff_seconds`. One iteration at a time, so at most
+        one detector, one acquisition and one transcription are in flight.
+        """
+
+        listen = self._settings.listen
+        if listen is None:
+            return
+        unproductive = 0
+        while not self._listen_stopping and not self._closed:
+            settled = await self.listen_once()
+            if settled == SETTLED_STOPPED or self._listen_stopping:
+                return
+            if settled in _PRODUCTIVE_SETTLEMENTS:
+                unproductive = 0
+            else:
+                unproductive += 1
+            await self._sleeper(listen_backoff_seconds(listen.retry_seconds, unproductive))
+
+    async def _listen_health_after(self, *, failed: bool) -> None:
+        """The two-state health after a settled detector invocation (R7).
+
+        A failure while ``healthy`` degrades it with one value-free
+        ``module.degraded``; a verdict while ``degraded`` restores it with one
+        ``module.ready``. Anything else reports nothing; source and
+        transcription outcomes never reach here.
+        """
+
+        if failed and self._listen_health == LISTEN_HEALTHY:
+            self._listen_health = LISTEN_DEGRADED
+            await self._report_degraded(WAKE_WORD_DETECTOR_FAILED, [])
+        elif not failed and self._listen_health == LISTEN_DEGRADED:
+            self._listen_health = LISTEN_HEALTHY
+            await self._report_ready()
 
     async def _decide(self, candidate: Mapping[str, Any]) -> Any | None:
         """The engine's decision when it accepts *candidate*, else ``None``; traced, fail-closed."""
@@ -2240,6 +2403,8 @@ class AudioInputModule:
         }
         begin = getattr(source, "begin", None)
         recording = begin(environment) if callable(begin) else source
+        # Held for ``stop_inputs``, which kills it however the loop unwinds.
+        self._listen_recording = recording
         reader = asyncio.ensure_future(recording.read(listen.max_seconds))
         deadline = asyncio.ensure_future(
             self._sleeper(float(listen.max_seconds) + self._settings.grace_seconds)
@@ -2252,6 +2417,7 @@ class AudioInputModule:
             raise
         finally:
             _abandon(deadline)
+            self._listen_recording = None
         if not reader.done():
             # The deadline won: the source is killed and its read abandoned.
             _kill_recording(recording)

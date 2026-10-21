@@ -66,7 +66,7 @@ from core.actions import ERROR_INVALID_ARGUMENTS, ERROR_TIMED_OUT, ActionExecuto
 from core.attachments import AttachmentExpired, AttachmentStore
 from core.contracts import COUNTER_ACTION_TIMEOUTS, ActionCall, ActionObservation, Destination
 from core.lifecycle import PhaseCoordinator
-from core.loader import ModuleLoader, ModuleLoadError
+from core.loader import ModuleActivation, ModuleLoader, ModuleLoadError
 from core.runtime import ModuleContext, RuntimeContext
 from core.triggers import TriggerRegistry
 from conftest import (
@@ -2287,8 +2287,13 @@ async def test_p12_ac25_without_listening_nothing_is_invoked_over_60_seconds(lis
 async def test_p12_prepare_resolves_the_source_and_owner_and_starts_nothing() -> None:
     """R7 lifecycle: with listening enabled, ``prepare`` resolves
     ``listen.source``, registers the module's supervised-task registry as
-    the loop's owner and supplies the hook; it starts no process and no
-    task, and ``start_inputs``/``stop_inputs`` start nothing in this step."""
+    the loop's owner and supplies the hook; it starts no process and no task.
+
+    P14 (R7 lifecycle, AC37) supersedes "``start_inputs``/``stop_inputs``
+    start nothing in this step": ``start_inputs`` now spawns the listen loop
+    as one task of that owner, and a ``stop_inputs`` reached before the
+    loop's first turn cancels it with 0 processes started. The loop's first
+    detector invocation is AC37's own test below."""
 
     clock = ManualClock(1000.0)
     runner = CallTrackingRunner()
@@ -2308,6 +2313,7 @@ async def test_p12_prepare_resolves_the_source_and_owner_and_starts_nothing() ->
     assert runner.spawn_count == 0
     assert h.handle.listen_owner.active == 0
     await h.handle.start_inputs()
+    assert h.handle.listen_owner.active == 1
     await h.handle.stop_inputs()
     assert runner.spawn_count == 0
     assert h.handle.listen_owner.active == 0
@@ -2689,6 +2695,8 @@ class ListenRunner:
         self.phrase_at = phrase_at
         self.processes: list[ListenProcess] = []
         self.detector_calls: list[dict[str, Any]] = []
+        #: The injected clock's reading at each detector invocation (P14).
+        self.detector_times: list[float] = []
         self.source_calls: list[dict[str, Any]] = []
         self.written: list[bytes] = []
         self.kills: list[int] = []
@@ -2698,6 +2706,7 @@ class ListenRunner:
         argv_tuple = tuple(argv)
         if list(argv_tuple) == DETECTOR_ARGV:
             self.detector_calls.append(kwargs)
+            self.detector_times.append(self.clock.now)
             status, output = self.detections.pop(0) if self.detections else (1, b"")
         elif list(argv_tuple) == RECORDER_ARGV:
             self.source_calls.append(kwargs)
@@ -2839,10 +2848,12 @@ async def voice(
     session: DetectorSession | None = None,
     phrase_at: float | None = None,
     max_bytes: int | None = None,
+    runner_class: type[ListenRunner] = ListenRunner,
+    prepare: bool = True,
     **listen: Any,
 ) -> Voice:
     clock = ManualClock(1000.0)
-    runner = ListenRunner(clock, detections=detections, segments=segments, phrase_at=phrase_at)
+    runner = runner_class(clock, detections=detections, segments=segments, phrase_at=phrase_at)
     transport = ScriptedTranscriptionTransport(PROBE_OK, *answers)
     settings = listen_settings(runner, clock, detector=detector, **listen)  # type: ignore[arg-type]
     settings["transcription"] = stt_settings()
@@ -2852,7 +2863,8 @@ async def voice(
     if max_bytes is not None:
         settings["max_bytes"] = max_bytes
     h = await listening(settings, clock, triggers=triggers)
-    await h.handle.prepare()
+    if prepare:
+        await h.handle.prepare()
     v = Voice(h, runner, transport, session)
 
     async def counting_hook(view: Any, parameters: Any) -> bool:
@@ -3494,6 +3506,493 @@ async def test_p13_listening_off_or_unprepared_invokes_nothing() -> None:
     unprepared = await listening(listen_settings(runner, clock), clock)  # type: ignore[arg-type]
     assert await unprepared.handle.listen_once() == "stopped"
     assert runner.processes == []
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8 R7 (plan P14): the listen loop — lifecycle, restart, health
+# --------------------------------------------------------------------------- #
+
+T0 = 1000.0
+DETECTED = (0, b"nova")
+FAILED = (2, b"")
+NO_VERDICT = (1, b"")
+WAKE_WORD_FAILED = "wake_word_detector_failed"
+
+
+class PendingRunner(ListenRunner):
+    """Past its script a detector invocation is held pending until killed;
+    with ``held_sources`` every source invocation is held likewise."""
+
+    held_sources = False
+
+    async def __call__(self, *argv: str, **kwargs: Any) -> ListenProcess:
+        held = (
+            (list(argv) == DETECTOR_ARGV and not self.detections)
+            or (list(argv) == RECORDER_ARGV and self.held_sources)
+        )
+        if not held:
+            return await super().__call__(*argv, **kwargs)
+        if list(argv) == DETECTOR_ARGV:
+            self.detector_calls.append(kwargs)
+            self.detector_times.append(self.clock.now)
+        else:
+            self.source_calls.append(kwargs)
+        process = _HeldSourceProcess(self, tuple(argv), kwargs)
+        self.processes.append(process)
+        return process
+
+
+class HeldSourceRunner(PendingRunner):
+    held_sources = True
+
+
+def health(v: Voice) -> list[tuple[str, str | None]]:
+    """``audio_input``'s health reports on the bus, in order."""
+
+    return [
+        (event["type"], event["payload"].get("reason"))
+        for event in v.h.runtime.bus.list_events()
+        if event["type"] in ("module.ready", "module.degraded")
+        and event["payload"].get("module") == MODULE_NAME
+    ]
+
+
+async def started(**kwargs: Any) -> tuple[Voice, int]:
+    """A prepared voice whose loop ``start_inputs`` started at ``T0``; the
+    number of health reports made before the loop ran."""
+
+    v = await voice(**kwargs)
+    before = len(health(v))
+    await v.handle.start_inputs()
+    await settle()
+    return v, before
+
+
+async def run_for(v: Voice, seconds: float) -> None:
+    """Advance the clock *seconds*, stopping at each parked deadline."""
+
+    clock = v.h.clock
+    end = clock.now + seconds
+    await settle()
+    while (due := clock.next_deadline()) is not None and due <= end:
+        advance_to(clock, due)
+        await settle()
+    advance_to(clock, end)
+    await settle()
+
+
+def offsets(v: Voice) -> list[float]:
+    return [round(at - T0, 6) for at in v.runner.detector_times]
+
+
+async def test_p14_ac26_the_loop_publishes_in_detection_order_and_stops() -> None:
+    """AC26 ordering tail (R7): detecting on every invocation under an
+    accepting policy with each transcription held, the detector is invoked
+    exactly once until the first ``speech`` event is published; releasing
+    each transcription and advancing 1 s after each publication, the 3
+    events are published in detection order and the detector is invoked 4
+    times (the 4th pending); after ``stop_inputs`` 0 invocations start."""
+
+    v, _ = await started(
+        detections=[DETECTED] * 3, answers=(HELD, HELD, HELD), triggers=ACCEPT_ALL,
+        runner_class=PendingRunner,
+    )
+    for index in range(3):
+        assert len(v.runner.detector_calls) == index + 1
+        assert v.transport.held == 1 and len(v.speech_events()) == index
+        await run_for(v, 5.0)  # held: no second invocation, however long
+        assert len(v.runner.detector_calls) == index + 1
+        v.transport.release({"text": f"{TRANSCRIPT} {index}"})
+        await settle()
+        assert len(v.speech_events()) == index + 1
+        assert len(v.runner.detector_calls) == index + 1
+        v.h.clock.advance(1.0)
+        await settle()
+
+    assert len(v.runner.detector_calls) == 4
+    events = v.speech_events()
+    assert [event["payload"]["text"] for event in events] == [
+        f"{TRANSCRIPT} {index}" for index in range(3)
+    ]
+    assert [event["payload"]["message_id"] for event in events] == [
+        candidate["payload"]["message_id"] for candidate in v.candidates()
+    ]
+    pending = v.runner.processes[-1]
+    assert pending.argv == tuple(DETECTOR_ARGV) and pending.returncode is None
+
+    await v.handle.stop_inputs()
+    assert pending.pid in v.runner.kills
+    await run_for(v, 600.0)
+    assert len(v.runner.detector_calls) == 4
+    assert v.handle.listen_owner.active == 0
+
+
+async def test_p14_ac37_nothing_before_start_inputs_then_one_detector_invocation() -> None:
+    """AC37 (R7): after ``prepare`` and before ``start_inputs`` the runner
+    records 0 invocations and 0 processes, the engine 0 candidates, the
+    transcription 0 calls and the bus 0 ``speech`` events — over 600 s of
+    the clock; after ``start_inputs``, exactly 1 detector invocation and 0
+    source invocations, the loop a task of the module's owner."""
+
+    v = await voice(detections=[], triggers=ACCEPT_ALL, runner_class=PendingRunner)
+    await run_for(v, 600.0)
+    assert v.runner.processes == [] and v.runner.detector_calls == []
+    assert v.runner.source_calls == []
+    assert v.candidates() == [] and v.transcriptions() == [] and v.speech_events() == []
+    assert v.handle.listen_owner.active == 0
+
+    await v.handle.start_inputs()
+    await v.handle.start_inputs()  # one loop only
+    await settle()
+
+    assert len(v.runner.detector_calls) == 1
+    assert v.runner.source_calls == []
+    assert v.handle.listen_owner.active == 1
+    await v.handle.stop_inputs()
+    assert v.handle.listen_owner.active == 0
+
+
+async def test_p14_ac37_a_failed_startup_invokes_nothing_for_audio_input() -> None:
+    """AC37 (R7): in a startup whose other enabled module fails ``prepare``,
+    ``start_inputs`` is never reached and ``audio_input`` records 0
+    invocations and 0 processes, over 600 s of the clock."""
+
+    v = await voice(detections=[DETECTED], triggers=ACCEPT_ALL, prepare=False)
+
+    async def refuse() -> None:
+        raise RuntimeError("other module cannot prepare")
+
+    broken = ModuleActivation(
+        name="other",
+        manifest={"name": "other", "lifecycle": {"roles": ["input"]}},
+        handle=SimpleNamespace(prepare=refuse),
+    )
+    coordinator = PhaseCoordinator(
+        [*v.h.activations, broken], tasks=v.h.runtime.tasks, reporter=lambda line: None
+    )
+    assert (await coordinator.start()).status != 0
+    await run_for(v, 600.0)
+
+    assert v.runner.processes == [] and v.runner.detector_calls == []
+    assert v.candidates() == [] and v.transcriptions() == []
+    assert v.handle.listen_owner is None or v.handle.listen_owner.active == 0
+    await coordinator.stop()
+    assert v.runner.processes == []
+
+
+async def test_p14_ac37_stop_inputs_terminates_an_in_flight_detector() -> None:
+    """AC37 (R7): ``stop_inputs`` terminates a detector invocation in flight
+    (the runner records its kill); it is not a detector failure, 0
+    candidates follow, nothing is reported, and 600 s start 0 invocations."""
+
+    v, before = await started(detections=[], triggers=ACCEPT_ALL, runner_class=PendingRunner)
+    (detector,) = v.runner.processes
+
+    await v.handle.stop_inputs()
+
+    assert v.runner.kills == [detector.pid]
+    await run_for(v, 600.0)
+    assert len(v.runner.detector_calls) == 1
+    assert v.candidates() == []
+    assert v.handle.counts()["detector_failures"] == 0
+    assert v.handle.listen_health == "healthy"
+    assert health(v)[before:] == []
+    await v.handle.start_inputs()  # a stopped input never restarts
+    await run_for(v, 600.0)
+    assert len(v.runner.detector_calls) == 1
+
+
+async def test_p14_ac37_stop_inputs_terminates_an_in_flight_acquisition() -> None:
+    """AC37 (R7): ``stop_inputs`` kills an acquisition in flight, its
+    partial WAV discarded: 0 transcriptions follow, nothing is published,
+    and 600 s start 0 further detector invocations."""
+
+    v, _ = await started(
+        detections=[DETECTED], triggers=ACCEPT_ALL, runner_class=HeldSourceRunner
+    )
+    assert len(v.runner.source_calls) == 1
+    source = v.runner.processes[-1]
+    assert source.argv == tuple(RECORDER_ARGV)
+
+    await v.handle.stop_inputs()
+
+    assert source.pid in v.runner.kills
+    await run_for(v, 600.0)
+    assert v.transcriptions() == [] and v.speech_events() == []
+    assert len(v.runner.detector_calls) == 1
+    assert v.handle.counts()["source_failures"] == 0
+    assert v.h.scheduler.admissions == []
+
+
+async def test_p14_ac37_close_without_stop_inputs_still_ends_the_loop() -> None:
+    """R7: a ``close`` reached without ``stop_inputs`` kills the detector in
+    flight all the same; no invocation starts afterwards."""
+
+    v, _ = await started(detections=[], triggers=ACCEPT_ALL, runner_class=PendingRunner)
+    (detector,) = v.runner.processes
+    await v.handle.close()
+    assert v.runner.kills == [detector.pid]
+    await run_for(v, 600.0)
+    assert len(v.runner.detector_calls) == 1
+
+
+async def test_p14_ac38_no_verdict_backs_off_to_17_invocations_in_an_hour() -> None:
+    """AC38 (R7): ``retry_seconds: 5`` and a detector exiting 1 every time:
+    over 3 600 s exactly 17 invocations, at 0, 5, 15, 35, 75, 155 and 315 s,
+    then every 300 s; 0 candidates, sources, transcriptions and events — and
+    an exit 1 from ``healthy`` reports nothing."""
+
+    v, before = await started(detections=[], retry_seconds=5)
+    v.runner.detections = [NO_VERDICT] * 100
+
+    await run_for(v, 3600.0)
+
+    assert offsets(v) == [0, 5, 15, 35, 75, 155, 315] + [315 + 300 * k for k in range(1, 11)]
+    assert len(v.runner.detector_calls) == 17
+    assert v.candidates() == [] and v.runner.source_calls == []
+    assert v.transcriptions() == [] and v.speech_events() == []
+    assert health(v)[before:] == []
+    assert v.handle.counts()["detector_failures"] == 0
+
+
+@pytest.mark.parametrize(("policy", "acquired"), [("nova", 4), ("banana", 0)])
+async def test_p14_ac38_four_detections_in_an_hour_acquire_four_segments(
+    policy: str, acquired: int
+) -> None:
+    """AC38 (R7): a detector detecting on exactly 4 of its invocations over
+    3 600 s makes 4 source invocations and 4 transcription calls under an
+    accepting policy, 0 of either under a declining one."""
+
+    v, _ = await started(
+        detections=[NO_VERDICT, DETECTED, NO_VERDICT, DETECTED, DETECTED, NO_VERDICT, DETECTED]
+        + [NO_VERDICT] * 100,
+        answers=[{"text": TRANSCRIPT}] * 4,
+        triggers=keyword_policy(policy),
+    )
+
+    await run_for(v, 3600.0)
+
+    assert v.handle.counts()["candidates"] == 4
+    assert len(v.runner.source_calls) == acquired
+    assert len(v.transcriptions()) == acquired
+    assert len(v.speech_events()) == acquired
+
+
+async def test_p14_ac38_a_transcription_error_is_not_retried_and_backs_off() -> None:
+    """AC38 (R7): a transcription error is followed by no second
+    transcription of that segment and by no detector invocation before 5 s."""
+
+    v, _ = await started(detections=[DETECTED], answers=(500,), triggers=ACCEPT_ALL)
+    assert len(v.transcriptions()) == 1
+
+    advance_to(v.h.clock, T0 + 4.9)
+    await settle()
+    assert len(v.runner.detector_calls) == 1 and len(v.transcriptions()) == 1
+    advance_to(v.h.clock, T0 + 5.0)
+    await settle()
+    assert len(v.runner.detector_calls) == 2
+    assert len(v.transcriptions()) == 1  # the 2nd invocation returned no verdict
+    assert v.handle.counts()["transcription_errors"] == 1
+
+
+@pytest.mark.parametrize(
+    ("row", "settings", "delays"),
+    [
+        ("(a) transcription error", {"answers": (500, 500)}, [5.0, 10.0]),
+        ("(b) empty transcription", {"answers": ({"text": ""}, {"text": " "})}, [5.0, 10.0]),
+        ("(c) published", {"answers": ({"text": TRANSCRIPT},) * 2}, [1.0, 1.0]),
+        ("(c) declined", {"triggers": keyword_policy("banana")}, [1.0, 1.0]),
+        ("detector exit 2", {"detections": [FAILED] * 3}, [5.0, 10.0]),
+        ("source failure", {"segments": [(2, wav_bytes(1.0))] * 3}, [5.0, 10.0]),
+        (
+            "http connection refused",
+            {
+                "detector": HTTP_DETECTOR,
+                "session": DetectorSession(*[ConnectionRefusedError()] * 3),
+            },
+            [5.0, 10.0],
+        ),
+    ],
+)
+async def test_p14_ac39_each_settlement_waits_its_delay_on_the_sleeper(
+    row: str, settings: dict[str, Any], delays: list[float]
+) -> None:
+    """AC39 (R7): with ``retry_seconds: 5`` and a detector detecting on every
+    invocation under an accepting policy, (a) a transcription error: 0
+    invocations at 4.9 s, 1 at 5 s, and after a second consecutive error 0
+    at 9.9 s, 1 at 10 s; (b) an empty transcription likewise; (c) a published
+    event, and a declined candidate: 0 at 0.9 s and 1 at 1 s. A detector
+    failure (exit 2), a source failure and an HTTP detector whose endpoint
+    refuses the connection back off the same way."""
+
+    arguments: dict[str, Any] = {
+        "detections": [DETECTED] * 3, "triggers": ACCEPT_ALL, "retry_seconds": 5, **settings,
+    }
+    if "session" in arguments:
+        arguments["session"] = DetectorSession(*[ConnectionRefusedError()] * 3)
+    v, _ = await started(**arguments)
+
+    def invocations() -> int:
+        if v.session is not None:
+            return len(v.session.requests)
+        return len(v.runner.detector_calls)
+
+    assert invocations() == 1
+    for index, delay in enumerate(delays):
+        base = v.h.clock.now
+        advance_to(v.h.clock, base + delay - 0.1)
+        await settle()
+        assert invocations() == index + 1, row
+        advance_to(v.h.clock, base + delay)
+        await settle()
+        assert invocations() == index + 2, row
+    await v.handle.stop_inputs()
+
+
+async def test_p14_ac39_a_productive_settlement_resets_the_backoff() -> None:
+    """AC39 (R7): two transcription errors (5 s, then 10 s), a published
+    event (1 s), then a transcription error is again followed by 5 s, not
+    20 s."""
+
+    v, _ = await started(
+        detections=[DETECTED] * 5,
+        answers=(500, 500, {"text": TRANSCRIPT}, 500),
+        triggers=ACCEPT_ALL,
+        retry_seconds=5,
+    )
+    await run_for(v, 40.0)
+    assert offsets(v)[:5] == [0, 5, 15, 16, 21]
+    assert len(v.speech_events()) == 1
+
+
+async def test_p14_ac39_twenty_failures_are_capped_and_degrade_once() -> None:
+    """AC39 (R7): over 20 consecutive detector failures no two invocations
+    are more than 300 s apart, and exactly 1 ``module.degraded`` with reason
+    ``wake_word_detector_failed`` and no configured value is reported."""
+
+    v, before = await started(
+        detections=[FAILED] * 20, runner_class=PendingRunner, retry_seconds=5
+    )
+    await run_for(v, 5000.0)
+
+    times = offsets(v)
+    assert len(times) == 21  # the 21st pending
+    gaps = [later - earlier for earlier, later in zip(times, times[1:])]
+    assert max(gaps) == 300 and gaps[:7] == [5, 10, 20, 40, 80, 160, 300]
+    assert v.handle.counts()["detector_failures"] == 20
+    assert health(v)[before:] == [("module.degraded", WAKE_WORD_FAILED)]
+    assert v.handle.listen_health == "degraded"
+    (degraded,) = [
+        event for event in events_of(v.h.runtime.bus, "module.degraded")
+        if event["payload"].get("reason") == WAKE_WORD_FAILED
+    ]
+    text = str(degraded)
+    assert all(part not in text for part in DETECTOR_ARGV[1:])
+    assert "secret" not in text
+    await v.handle.stop_inputs()
+
+
+@pytest.mark.parametrize(
+    ("verdict", "extra"),
+    [
+        ("exit 1", {}),
+        ("detected", {"answers": ({"text": TRANSCRIPT},)}),
+        ("detected, source failure", {"segments": [(2, wav_bytes(1.0))]}),
+        ("detected, transcription error", {"answers": (500,)}),
+    ],
+)
+async def test_p14_ac39_recovery_reports_each_transition_once(
+    verdict: str, extra: dict[str, Any]
+) -> None:
+    """AC39 recovery (R7): 3 failures, 1 verdict, 2 failures report exactly
+    ``module.degraded`` (at the 1st failure), ``module.ready`` (at the
+    verdict) and ``module.degraded`` (at the 1st failure of the second run)
+    — none at the other failures. A detected verdict in place of the exit 1
+    reports the same, and a run ending in a source failure or a
+    transcription error after its verdict adds none."""
+
+    middle = NO_VERDICT if verdict == "exit 1" else DETECTED
+    v, before = await started(
+        detections=[FAILED] * 3 + [middle] + [FAILED] * 2,
+        triggers=ACCEPT_ALL,
+        runner_class=PendingRunner,
+        retry_seconds=5,
+        **extra,
+    )
+    degraded = ("module.degraded", WAKE_WORD_FAILED)
+    ready = ("module.ready", None)
+    expected = [[degraded]] * 3 + [[degraded, ready]] + [[degraded, ready, degraded]] * 2
+    for index, reports in enumerate(expected):
+        assert len(v.runner.detector_calls) == index + 1, verdict
+        assert health(v)[before:] == reports, (verdict, index)
+        due = v.h.clock.next_deadline()
+        assert due is not None
+        advance_to(v.h.clock, due)
+        await settle()
+    assert len(v.runner.detector_calls) == 7  # the 7th pending
+    assert health(v)[before:] == [degraded, ready, degraded]
+    await v.handle.stop_inputs()
+
+
+async def test_p14_ac39_the_health_stream_through_the_coordinator() -> None:
+    """AC39 recovery (R7), started by the real coordinator with the health
+    observer: the coordinator's startup ``module.ready`` comes first and no
+    report of its own falls between the loop's — the stream is exactly
+    ready (startup), degraded, ready, degraded."""
+
+    v = await voice(
+        detections=[FAILED] * 3 + [NO_VERDICT] + [FAILED] * 2,
+        runner_class=PendingRunner,
+        retry_seconds=5,
+        prepare=False,
+    )
+    coordinator = PhaseCoordinator(
+        v.h.activations,
+        tasks=v.h.runtime.tasks,
+        reporter=lambda line: None,
+        observer=v.h.runtime.health.observe_phase,
+    )
+    assert (await coordinator.start()).status == 0
+    await settle()
+    for _ in range(6):
+        due = v.h.clock.next_deadline()
+        assert due is not None
+        advance_to(v.h.clock, due)
+        await settle()
+
+    assert len(v.runner.detector_calls) == 7
+    reports = health(v)
+    degraded = ("module.degraded", WAKE_WORD_FAILED)
+    ready = ("module.ready", None)
+    # The coordinator's one startup report, then the loop's three, nothing between.
+    assert reports == [ready, degraded, ready, degraded], reports
+    assert (await coordinator.stop()).status == 0
+    assert v.runner.processes[-1].pid in v.runner.kills
+
+
+async def test_p14_ac39_a_detector_pending_an_hour_is_neither_terminated_nor_counted() -> None:
+    """AC39 (R7): a detector invocation held pending for 3 600 s of the clock
+    is neither terminated nor counted a failure, and reports nothing."""
+
+    v, before = await started(detections=[], runner_class=PendingRunner)
+    await run_for(v, 3600.0)
+
+    (detector,) = v.runner.processes
+    assert detector.returncode is None
+    assert v.runner.kills == [] and v.runner.terminates == []
+    assert v.handle.counts()["detector_failures"] == 0
+    assert health(v)[before:] == []
+    await v.handle.stop_inputs()
+
+
+def test_p14_the_backoff_formula_pins_the_exponent() -> None:
+    """R7: ``min(retry_seconds × 2^(n−1), 300)``; 1 s after a productive
+    settlement; no overflow however long the run."""
+
+    backoff = audio_input_module.listen_backoff_seconds
+    assert [backoff(5, n) for n in range(0, 9)] == [1, 5, 10, 20, 40, 80, 160, 300, 300]
+    assert backoff(1, 1) == 1 and backoff(300, 1) == 300
+    assert backoff(1, 10_000) == 300
 
 
 # --------------------------------------------------------------------------- #
