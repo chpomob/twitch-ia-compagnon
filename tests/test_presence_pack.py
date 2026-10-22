@@ -21,12 +21,15 @@ watch channel of the ``<platform>/<channel_id>`` shape.
 from __future__ import annotations
 
 import copy
+import functools
 import itertools
 import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import yaml
 
@@ -508,9 +511,20 @@ async def start_presence(tmp_path: Path, model: ScriptedModel) -> Presence:
         "moderation": {"_sleeper": clock.sleep},
         "watch": {"_sleeper": clock.sleep},
     }
-    runtime, activations, activation_diagnostics = await _activate_example(
-        environ, PRESENCE_PROFILE, seams
-    )
+    # The runtime runs on the same clock: its deadlines (the executor's call
+    # timer, the run budget, every module's ``clock() >= expiry``) are read
+    # off it, so a loaded machine cannot expire a call in wall time and turn
+    # a run ``timeout`` (P17F4). Only ``core.main``'s own clock reference and
+    # the executor it builds are pointed at it; nothing else is patched.
+    runtime_time = SimpleNamespace(monotonic=clock)
+    executor = functools.partial(application.ActionExecutor, sleeper=clock.sleep)
+    with patch.object(application, "time", runtime_time), patch.object(
+        application, "ActionExecutor", executor
+    ):
+        runtime, activations, activation_diagnostics = await _activate_example(
+            environ, PRESENCE_PROFILE, seams
+        )
+    assert runtime.clock is clock and runtime.context.executor._sleep == clock.sleep
     diagnostics.extend(activation_diagnostics)
     coordinator = application._coordinator(activations, runtime, diagnostics.append)
     report = await coordinator.start()

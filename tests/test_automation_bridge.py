@@ -1276,16 +1276,24 @@ async def test_fake_instance_stop_ends_the_connection() -> None:
 async def test_fake_instance_stop_right_after_a_connect_ends_the_connection() -> None:
     """A stop before the handler first ran still closes the server end.
 
-    ``asyncio.timeout`` bounds the stop in this task: ``wait_for`` would run
-    it in a new one, which lets the handler start first and hides the race."""
+    A timer that cancels this task bounds the stop in this task: ``wait_for``
+    would run it in a new one, which lets the handler start first and hides
+    the race. Only 3.10 asyncio is used: a loop timer and ``Task.cancel``."""
 
     fake = FakeInstance()
     await fake.start()
     async with aiohttp.ClientSession() as session:
         client = await session.ws_connect(fake.url)
         assert fake.connections == 0
-        async with asyncio.timeout(FAKE_WAIT_SECONDS):
+        task = asyncio.current_task()
+        assert task is not None
+        deadline = asyncio.get_running_loop().call_later(FAKE_WAIT_SECONDS, task.cancel)
+        try:
             await fake.stop()
+        except asyncio.CancelledError:
+            pytest.fail(f"stop did not end within {FAKE_WAIT_SECONDS}s")
+        finally:
+            deadline.cancel()
         await client.close()
     assert not fake._handlers
 
