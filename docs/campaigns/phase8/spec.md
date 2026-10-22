@@ -619,6 +619,27 @@ criterion is renumbered to sit beside its requirement.
   unchanged. Away from these three, a fake must be made faithful enough to carry an existing assertion;
   an assertion is never dropped to fit a fake, and a node that cannot be carried by a fake is reported
   instead of converted.
+
+### Amendment A3 (2026-10-21) — five more allowlisted nodes, and why they are constants
+
+The restoration produced an assertion-AST comparison of 13 changed existing functions: 8 already
+allowlisted, 0 of the three A2 nodes, and **5 outside every list**. Each of the five differs from its
+baseline by exactly one constant that a phase-8 requirement changed, so restoring the base value would
+make the test assert something the product no longer does. They are therefore allowlisted on the same
+terms as the eight — constants only, nothing loosened:
+
+- `tests/test_audio_input.py::test_prepare_starts_no_task_and_spawns_nothing` — now also asserts
+  `hasattr(start_inputs)`: the module gained an input role (R7).
+- `tests/test_audio_input.py::test_the_loader_discovers_the_manifest_and_prepare_binds_the_declared_spec` —
+  the declared roles are now `{"input"}`, because the module produces events (R7).
+- `tests/test_contracts.py::test_platform_notice_kinds_exclude_message_and_watch_tick` — the vocabulary
+  gained `reward`, `manual`, `speech` and `timer` (R4).
+- `tests/test_twitch.py::test_manifest_declares_twitch_source_and_sink` — the manifest declares the
+  `reward` kind and the listable kinds it now produces (R5).
+- `tests/test_web.py::test_ac1_the_shipped_manifests_discover_19_modules_with_web` — the shipped module
+  count is 21, not 19, because `operator` and `timer` ship (R6, R8).
+
+With A3 the count outside the allowlist and A2 is **zero**, which is what the closing criterion asks.
 - AC34 (R3): With a hooked fixture type `<t>` under the policy `{combination: none_of, rules: [<t>]}`,
   a hook that raises decides `rejected:<t>_hook_error`, a hook that never returns decides
   `rejected:<t>_hook_timeout` once the bound has elapsed on the ManualClock, and no hook supplied
