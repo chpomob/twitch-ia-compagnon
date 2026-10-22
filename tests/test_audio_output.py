@@ -1152,6 +1152,13 @@ async def test_the_subprocess_runner_feeds_a_real_player_its_stdin(fake_spawn: F
     await runner.close_stdin(process)
     assert accepted == len(body)
     assert await runner.wait(process) == 0
+    _the_fake_player_was_fed_on_stdin_and_reaped(fake_spawn)
+
+
+def _the_fake_player_was_fed_on_stdin_and_reaped(fake_spawn: FakeOS) -> None:
+    """AC33: the runner spawned the player argv in its own session, stdin a
+    pipe, and reaped the 0 it exited with."""
+
     (fake,) = fake_spawn.spawned
     assert fake.argv == tuple(PLAYER_ARGV)
     assert fake.options["stdin"] is asyncio.subprocess.PIPE

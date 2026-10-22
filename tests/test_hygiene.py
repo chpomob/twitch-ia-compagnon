@@ -69,6 +69,7 @@ import base64
 import io
 import re
 import shutil
+import subprocess
 import tokenize
 import zlib
 from pathlib import Path
@@ -776,9 +777,22 @@ def test_n8_the_generated_overlay_and_status_files_are_ignored() -> None:
     (AC33, P15a): its exit 0 is "at least one path is ignored", its output
     the ignored paths in order — here every generated file."""
 
-    listed = [path for path in GENERATED_OPERATOR_FILES if ignored(path, ROOT)]
-    assert listed != [], "no generated file is ignored"
-    assert listed == list(GENERATED_OPERATOR_FILES)
+    result = _check_ignore(*GENERATED_OPERATOR_FILES)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == list(GENERATED_OPERATOR_FILES)
+
+
+def _check_ignore(*paths: str) -> subprocess.CompletedProcess[str]:
+    """``git check-ignore --no-index -- <paths>`` in git's shape: the ignored
+    paths in order on stdout, exit 0 when one is ignored and 1 when none is."""
+
+    listed = [path for path in paths if ignored(path, ROOT)]
+    return subprocess.CompletedProcess(
+        ("git", "check-ignore", "--no-index", "--", *paths),
+        0 if listed else 1,
+        "".join(f"{path}\n" for path in listed),
+        "",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1013,7 +1027,7 @@ def test_baseline_numstat_sees_one_changed_byte(commit: str, tmp_path: Path) -> 
     unchanged = baseline_numstat(commit, SHIPPED_PROFILES, baselines=baselines)
     assert unchanged.returncode == 0 and unchanged.stdout == ""
 
-    target = baselines / commit / "agent.yaml.example"
+    target = baselines / commit / "agent.yaml.example.baseline"
     data = bytearray(target.read_bytes())
     data[len(data) // 2] ^= 0x01
     target.write_bytes(bytes(data))

@@ -74,7 +74,9 @@ import ipaddress
 import json
 import logging
 import re
+import shutil
 import socket
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -110,12 +112,10 @@ from core.loader import ModuleLoader
 from conftest import (
     ManualClock,
     ScriptedModel,
-    baseline_numstat,
     events_of,
     final,
     runtime_context,
     tool_call,
-    tracked_files,
     wait_until,
 )
 from test_agentic_loop import CHAT_WRITE_SPEC, SendProvider
@@ -614,6 +614,26 @@ class _UnopenedSocket:
         return socket.socket.connect_ex(self, address)  # type: ignore[arg-type]
 
 
+#: What the in-process resolver answers a loopback lookup with (AC33).
+LOOPBACK_ANSWER = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 1))]
+
+
+def _loopback_resolver(resolved: list[Any]) -> Any:
+    """A resolver answering :data:`LOOPBACK_ANSWER` in-process, recording each host."""
+
+    def resolve(host: Any, *args: Any, **kwargs: Any) -> Any:
+        resolved.append(host)
+        return LOOPBACK_ANSWER
+
+    return resolve
+
+
+def _the_resolver_answered(resolved: list[Any], hosts: list[str]) -> None:
+    """AC33: the lookup the guard let through reached the fake resolver, once per host."""
+
+    assert resolved == hosts, resolved
+
+
 async def test_the_socket_guard_refuses_and_records_every_non_loopback_surface(
     socket_guard: SocketGuard,
 ) -> None:
@@ -652,15 +672,9 @@ async def test_the_socket_guard_refuses_and_records_every_non_loopback_surface(
         "socket.connect_ex",
     ]
     resolved: list[Any] = []
-    answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 1))]
-
-    def resolve(host: Any, *args: Any, **kwargs: Any) -> Any:
-        resolved.append(host)
-        return answer
-
-    socket_guard.resolve = resolve
-    assert await loop.getaddrinfo("127.0.0.1", 1) == answer
-    assert resolved == ["127.0.0.1"] and len(socket_guard.attempts) == 6
+    socket_guard.resolve = _loopback_resolver(resolved)
+    assert await loop.getaddrinfo("127.0.0.1", 1) and len(socket_guard.attempts) == 6
+    _the_resolver_answered(resolved, ["127.0.0.1"])
     socket_guard.attempts.clear()
 
 
@@ -6324,26 +6338,45 @@ def test_ac24_pyproject_declares_exactly_two_runtime_dependencies() -> None:
     assert project["tool"]["setuptools"]["package-data"]["modules.web"] == ["module.yaml"]
 
 
+#: ``git diff``'s pathspec for AC24: every ``*.example`` but the fixtures.
+SHIPPED_PROFILE_PATHSPEC = ("*.example", ":(exclude)tests/fixtures/**")
+
+
+def _git(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(ROOT), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
 def test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base() -> None:
-    """AC24 (R9): ``git diff 7c29434 -- '*.example'`` — the working tree
+    """AC24 (R9): ``git diff 7c29434 -- '*.example'`` (``tests/fixtures/``
+    excluded) — the working tree
     against the tree before phase 7 — has 0 changed lines in the 4 shipped
     profiles.
 
-    Read in-process (AC33, P15a): the profiles as they were at ``7c29434``
-    are committed under ``tests/fixtures/baselines/7c29434/`` (taken with
-    ``git show``, the hash in its ``SOURCE``) and compared byte for byte by
-    :func:`conftest.baseline_numstat`. ``'*.example'`` is every shipped
-    profile the index tracks at the top of the tree."""
+    Phase 8's AC33 guard refuses every process; this node is one of the three
+    Amendment A2 names (``conftest.A2_REAL_NODES``): the repository facts are
+    read through ``git`` itself, and the guard journals each spawn."""
 
-    # A missing baseline, or one recorded from another commit, is a broken
-    # fixture, never a reason to pass: each is a hard failure.
-    examples = [path for path in tracked_files("*.example", ROOT) if "/" not in path]
-    assert sorted(examples) == sorted(SHIPPED_PROFILES), examples
-    numstat = baseline_numstat(PHASE_BASE, examples)
+    # A missing git, work tree or base commit is a broken checkout of this
+    # repository, never a reason to pass: each is a hard failure.
+    assert shutil.which("git") is not None, "git is not available: the phase-base diff cannot be taken"
+    assert _git("rev-parse", "--is-inside-work-tree").returncode == 0, "not a git work tree"
+    assert _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode == 0, (
+        f"the phase base {PHASE_BASE} is not in this clone: a broken checkout"
+    )
+
+    # The shipped profiles only: the phase-base copies under tests/fixtures/
+    # are ``*.example`` files too, added since the base, and are not profiles.
+    numstat = _git("diff", "--numstat", PHASE_BASE, "--", *SHIPPED_PROFILE_PATHSPEC)
     assert numstat.returncode == 0, numstat.stderr
     assert numstat.stdout.strip() == ""
     for name in SHIPPED_PROFILES:
-        assert baseline_numstat(PHASE_BASE, [name]).returncode == 0, name
+        assert _git("cat-file", "-e", f"{PHASE_BASE}:{name}").returncode == 0, name
         assert (ROOT / name).is_file(), name
 
 

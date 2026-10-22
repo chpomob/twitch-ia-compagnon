@@ -2899,6 +2899,12 @@ async def test_close_while_connected_closes_the_socket() -> None:
 # -- The default factory over the installed client framing ----------------- #
 
 
+def _dialed_once(endpoints: WebSocketEndpoints, url: str) -> None:
+    """AC33: the shipped factory dialed the in-memory endpoint exactly once."""
+
+    assert endpoints.attempts == [url]
+
+
 @pytest.mark.asyncio
 async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket(
     monkeypatch: pytest.MonkeyPatch,
@@ -2945,7 +2951,7 @@ async def test_the_default_factory_frames_the_protocol_over_a_real_loopback_sock
     peer = ScenePeer()
     h = await websocket_harness(peer, url=url, factory=False)
     try:
-        assert endpoints.attempts == [url]
+        _dialed_once(endpoints, url)
         assert SCENE_ACTION in h.runtime.actions.registered_ready()
         frames = [json.loads(text) for text in received]
         assert frames[0] == {

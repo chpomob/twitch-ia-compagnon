@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -486,6 +487,31 @@ def run_cli_in_process(
     return (fired[0] if fired else status), deadlines, fired, left
 
 
+def _completed(
+    capsys, returncode: int, deadlines: list[float], fired: list[int], left: list[Any],
+    *, fired_on: bool,
+) -> subprocess.CompletedProcess[str]:
+    """The in-process CLI run reported as the child process was: its exit
+    status and what it printed. The run armed exactly one 0.3 s deadline,
+    which fired (with status 1) exactly when *fired_on*, and left no
+    non-daemon thread behind — what "the process exits" stands for (AC33)."""
+
+    assert deadlines == [0.3]
+    assert fired == ([1] if fired_on else [])
+    assert left == []
+    captured = capsys.readouterr()
+    return subprocess.CompletedProcess(["core.main", "--config", "unused"], returncode, captured.out, captured.err)
+
+
+def _no_failure(report: Any) -> None:
+    assert not report.failures
+
+
+def _bounded_by_module(report: Any) -> None:
+    assert report.status == 1
+    assert report.failures == ("module 'brain': phase 'close' timed out",)
+
+
 @pytest.mark.parametrize("blocked", [True, False])
 def test_cli_process_exits_with_synchronous_audit_writer(
     blocked: bool, monkeypatch, capsys
@@ -528,18 +554,14 @@ def test_cli_process_exits_with_synchronous_audit_writer(
             lambda _message: None,
         )
         report = await coordinator.stop()
-        assert not report.failures
+        _no_failure(report)
         print("cleanup completed", flush=True)
         return 0
 
-    returncode, deadlines, fired, left = run_cli_in_process(monkeypatch, run, exited.set)
-    result = capsys.readouterr()
-    assert returncode == (1 if blocked else 0)
-    assert result.out == "cleanup completed\n"
-    assert result.err == ""
-    assert deadlines == [0.3]
-    assert fired == ([1] if blocked else [])
-    assert left == []
+    result = _completed(capsys, *run_cli_in_process(monkeypatch, run, exited.set), fired_on=blocked)
+    assert result.returncode == (1 if blocked else 0)
+    assert result.stdout == "cleanup completed\n"
+    assert result.stderr == ""
 
 
 def test_cli_deadline_covers_cancellation_resistant_task(monkeypatch, capsys) -> None:
@@ -591,8 +613,7 @@ def test_cli_deadline_covers_cancellation_resistant_task(monkeypatch, capsys) ->
             lambda _message: None,
         )
         report = await coordinator.stop()
-        assert report.status == 1
-        assert report.failures == ("module 'brain': phase 'close' timed out",)
+        _bounded_by_module(report)
         print("cleanup bounded", flush=True)
         return 1
 
@@ -603,18 +624,13 @@ def test_cli_deadline_covers_cancellation_resistant_task(monkeypatch, capsys) ->
     fallback.daemon = True
     fallback.start()
     try:
-        returncode, deadlines, fired, left = run_cli_in_process(
-            monkeypatch, run, process_exit
-        )
+        ran = run_cli_in_process(monkeypatch, run, process_exit)
     finally:
         fallback.cancel()
-    result = capsys.readouterr()
-    assert returncode == 1
-    assert result.out == "cleanup bounded\n"
-    assert result.err == ""
-    assert deadlines == [0.3]
-    assert fired == [1]
-    assert left == []
+    result = _completed(capsys, *ran, fired_on=True)
+    assert result.returncode == 1
+    assert result.stdout == "cleanup bounded\n"
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize("close_mode", ["normal", "blocked", "error"])

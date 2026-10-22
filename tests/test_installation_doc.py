@@ -30,12 +30,15 @@ the guide's eight values, not on whatever the developer happens to have exported
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import importlib.metadata
 import importlib.util
 import json
+import io
 import re
 import shlex
+import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -134,10 +137,21 @@ def test_the_guides_profile_is_accepted_by_the_real_entry_point(
     for name, value in {**VALUES, "NO_COLOR": "1"}.items():
         monkeypatch.setenv(name, value)
 
-    status = application.main(["--config", str(config), "--check-config"])
+    completed = _completed(capsys, application.main, ["--config", str(config), "--check-config"])
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout == "" and completed.stderr == ""
+
+
+def _completed(
+    capsys: pytest.CaptureFixture[str], entry: Any, argv: list[str]
+) -> subprocess.CompletedProcess[str]:
+    """*entry* run in-process with *argv*, reported as the child process was:
+    its exit status and what it wrote to each stream."""
+
+    capsys.readouterr()
+    status = _exit_status(entry, argv)
     captured = capsys.readouterr()
-    assert status == 0, captured.out + captured.err
-    assert captured.out == "" and captured.err == ""
+    return subprocess.CompletedProcess(argv, status, captured.out, captured.err)
 
 
 @pytest.mark.parametrize("guide", GUIDES, ids=lambda path: path.name)
@@ -309,9 +323,9 @@ def _exit_status(entry: Any, argv: list[str]) -> int:
     return code if isinstance(code, int) else 1
 
 
-def _run_with_help(command: str, capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
+def _run_with_help(command: str) -> subprocess.CompletedProcess[str]:
     """Run *command* as printed, its arguments replaced by ``--help``: its
-    exit status and what it printed.
+    exit status and what it printed to each stream.
 
     The command is everything before its first option. Phase 8 (R9, AC33,
     plan P15e): it runs in-process, not in a child interpreter. ``python -m
@@ -325,7 +339,6 @@ def _run_with_help(command: str, capsys: pytest.CaptureFixture[str]) -> tuple[in
         (index for index, word in enumerate(words) if word.startswith("--")), len(words)
     )
     program = words[:first_option]
-    capsys.readouterr()
     if program[0] in ("python", "python3"):
         assert program[1] == "-m" and len(program) == 3, program
         try:
@@ -333,12 +346,16 @@ def _run_with_help(command: str, capsys: pytest.CaptureFixture[str]) -> tuple[in
         except (ImportError, ValueError):
             spec = None
         if spec is None:
-            return 1, ""
+            return subprocess.CompletedProcess(
+                [*program, "--help"], 1, "", f"No module named {program[2]}\n"
+            )
         entry = importlib.import_module(program[2]).main
     else:
         entry = _console_script(program[0])
-    status = _exit_status(entry, ["--help"])
-    return status, capsys.readouterr().out
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        status = _exit_status(entry, ["--help"])
+    return subprocess.CompletedProcess([*program, "--help"], status, out.getvalue(), err.getvalue())
 
 
 def _console_script(name: str) -> Any:
@@ -352,7 +369,20 @@ def _console_script(name: str) -> Any:
     return found[0].load()
 
 
-def test_the_readme_config_ui_command_runs(capsys: pytest.CaptureFixture[str]) -> None:
+def _the_console_script_answers_help_alike() -> None:
+    """AC33: the ``[project.scripts]`` console script for the same entry
+    point, resolved through the installed distribution, answers ``--help``."""
+
+    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "scripts"
+    ]
+    (script,) = [name for name, target in scripts.items() if target == "core.config_ui:main"]
+    completed = _run_with_help(f"{script} --config {README_PROFILE_NAME}")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "usage:" in completed.stdout and "--config" in completed.stdout
+
+
+def test_the_readme_config_ui_command_runs() -> None:
     """The README's configuration-UI command runs, as printed (F16, R8).
 
     Executed exactly as printed with its arguments replaced by ``--help``: it
@@ -364,20 +394,13 @@ def test_the_readme_config_ui_command_runs(capsys: pytest.CaptureFixture[str]) -
 
     command = _readme_config_ui_command()
     assert command.endswith(f"--config {README_PROFILE_NAME}")
-    status, output = _run_with_help(command, capsys)
-    assert status == 0, output
-    assert "usage:" in output
-    assert "--config" in output
+    completed = _run_with_help(command)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "usage:" in completed.stdout
+    assert "--config" in completed.stdout
 
-    assert _run_with_help(PRE_FIX_README_COMMAND, capsys)[0] != 0
-
-    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
-        "scripts"
-    ]
-    (script,) = [name for name, target in scripts.items() if target == "core.config_ui:main"]
-    status, output = _run_with_help(f"{script} --config {README_PROFILE_NAME}", capsys)
-    assert status == 0, output
-    assert "usage:" in output and "--config" in output
+    assert _run_with_help(PRE_FIX_README_COMMAND).returncode != 0
+    _the_console_script_answers_help_alike()
 
 
 # --------------------------------------------------------------------------- #

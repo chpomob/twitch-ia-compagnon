@@ -86,6 +86,7 @@ from conftest import (
     HeldSession,
     ManualClock,
     UnreachableSession,
+    the_endpoint_was_refused,
     completion,
     events_of,
     runtime_context as build_context,
@@ -609,7 +610,7 @@ async def test_ac27_example_config_drives_one_correlated_run_and_clean_shutdown(
     finally:
         stop.set()
     assert await asyncio.wait_for(task, timeout=1) == 0
-    assert scene_attempts and set(scene_attempts) == {environ["SCENE_WEBSOCKET_URL"]}
+    the_endpoint_was_refused(scene_attempts, environ["SCENE_WEBSOCKET_URL"])
 
     assert diagnostics == []
     assert len(brain_session.post_calls) == 1
@@ -764,7 +765,7 @@ async def test_r8_refused_send_is_sanitized_leaves_no_send_fact_and_next_send_su
     finally:
         stop.set()
     assert await asyncio.wait_for(task, timeout=1) == 0
-    assert scene_attempts and set(scene_attempts) == {environ["SCENE_WEBSOCKET_URL"]}
+    the_endpoint_was_refused(scene_attempts, environ["SCENE_WEBSOCKET_URL"])
 
     helix_calls = twitch_session.helix_calls
     assert [call["json"]["message"] for call in helix_calls] == ["First", "Second"]

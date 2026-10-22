@@ -989,6 +989,12 @@ async def test_ac12_with_only_kick_required_true_fails_naming_clips_and_the_reas
 
 
 @pytest.mark.asyncio
+def _kick_listens_in_memory(loopback: InMemoryNetwork) -> None:
+    """AC33: kick's one listener is bound on the in-memory loopback."""
+
+    assert len(loopback.listeners) == 1
+
+
 async def test_ac12_with_only_kick_required_unset_starts_with_the_action_unbound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1004,7 +1010,7 @@ async def test_ac12_with_only_kick_required_unset_starts_with_the_action_unbound
     report = await coordinator.start()
     try:
         assert report.status == 0, report
-        assert len(loopback.listeners) == 1
+        _kick_listens_in_memory(loopback)
         handle = activations[1].handle
         assert handle.bound_platforms == ()
         assert handle.unbound == {"kick": REASON_PLATFORM_UNSUPPORTED}

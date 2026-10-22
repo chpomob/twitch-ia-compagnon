@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
@@ -2007,6 +2008,24 @@ def importable_from(entry: str) -> set[str]:
     return imported
 
 
+def _run_module_entry(
+    capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> subprocess.CompletedProcess[str]:
+    """``python -X importtime -m modules.viewer_memory <argv>`` answered
+    in-process, in the child's shape: the entry's exit status, its stdout,
+    and its stderr followed by one ``import time: … | <module>`` line per
+    module the entry imports (:func:`importable_from`)."""
+
+    capsys.readouterr()
+    returncode = memory_command(argv)
+    captured = capsys.readouterr()
+    trace = "".join(
+        f"import time: 0 | 0 | {name}\n"
+        for name in sorted(importable_from("modules.viewer_memory.__main__"))
+    )
+    return subprocess.CompletedProcess(argv, returncode, captured.out, captured.err + trace)
+
+
 def test_ac19_cli_the_module_entry_runs_without_a_network_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2023,13 +2042,12 @@ def test_ac19_cli_the_module_entry_runs_without_a_network_client(
     config = command_config(tmp_path, directory)
     monkeypatch.delenv("TWITCH_CLIENT_SECRET", raising=False)
 
-    returncode = memory_command(["stats", "--config", str(config)])
-    completed = capsys.readouterr()
+    completed = _run_module_entry(capsys, ["stats", "--config", str(config)])
 
-    assert returncode == 0, completed.err
+    assert completed.returncode == 0, completed.stderr
     expected = sum(path.stat().st_size for path in paths)
-    assert completed.out == f"files=3 bytes={expected}\n"
-    imported = importable_from("modules.viewer_memory.__main__")
+    assert completed.stdout == f"files=3 bytes={expected}\n"
+    imported = {line.rsplit("|", 1)[-1].strip() for line in completed.stderr.splitlines()}
     assert not {name for name in imported if name.split(".")[0] == "aiohttp"}
     assert "yaml" in imported
 

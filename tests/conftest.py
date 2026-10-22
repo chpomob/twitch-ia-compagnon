@@ -66,7 +66,9 @@ transitional ledger once its last node was converted). P15a adds the in-process 
 repository facts that replace ``grep``, ``git`` and child interpreters:
 :func:`files_containing`, :func:`tracked_files` (the git index read
 directly), :func:`ignored` (the ignore files) and :func:`baseline_numstat`
-(the committed ``tests/fixtures/baselines/<commit>/`` copies). P15b adds
+(the committed ``tests/fixtures/baselines/<commit>/`` copies; P17F2 adds
+:func:`baseline_git`, the same copies answering a phase-base check's ``git``
+questions in git's shape). P15b adds
 :class:`FakeOSProcess`, a scripted stand-in for ``asyncio.subprocess.Process``
 and ``subprocess.Popen``, and the ``fake_spawn`` fixture (a :class:`FakeOS`
 routing ``os.kill``/``os.killpg`` to the fakes) that the shipped runners'
@@ -2725,6 +2727,12 @@ class UnreachableSession:
         await self.close()
 
 
+def the_endpoint_was_refused(attempts: Sequence[str], url: str) -> None:
+    """AC33: the code under test reached the fake closed *url*, and nothing else."""
+
+    assert attempts and set(attempts) == {url}, attempts
+
+
 class _MemoryTransport:
     """The transport a memory WebSocket's ``_writer`` reports: open until the end closes."""
 
@@ -3866,6 +3874,20 @@ _TRIAL_GATES: dict[str, tuple[str, dict[str, str]]] = {
 }
 _PHASE5_TRIALS = "test_phase5_trials.py"
 
+#: Amendment A2 (spec AC33): the three nodes whose proof cannot be made
+#: in-process and stays real, named exactly (``file::test``, parameter suffix
+#: stripped). Each may create a socket or start a process; each time it does,
+#: :data:`A2_JOURNAL` records it. Every other node is refused as before.
+A2_REAL_NODES: frozenset[str] = frozenset(
+    {
+        "tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help",
+        "tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base",
+        "tests/test_kick.py::test_ac34_the_listener_runs_on_the_configured_host_and_port",
+    }
+)
+#: What an A2 node did, in order: ``(nodeid, "socket" | "process", entry point)``.
+A2_JOURNAL: list[tuple[str, str, str]] = []
+
 def ownership_rejection_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """AC44 (R3, R1): count input guards, their admissions and rejections.
 
@@ -3950,7 +3972,9 @@ def _ac33_isolation(
 
     Every test runs under it except a real-instance trial an operator opted
     in (P15e converted the last node of the transitional ledger and deleted
-    it). ``monkeypatch`` undoes
+    it). The three nodes of :data:`A2_REAL_NODES` (Amendment A2) run with the
+    real entry points, each call journaled in :data:`A2_JOURNAL`; any other
+    node is refused. ``monkeypatch`` undoes
     every patch after the test. An entry point an enclosing module-wide
     fixture already replaced with its own refusal (``tests/test_config_ui.py``
     asserts its patch is the one installed) is left to that fixture.
@@ -3989,15 +4013,89 @@ def _ac33_isolation(
             no_socket()
         return real_socketpair(*args, **kwargs)
 
-    install(socket.socket, "__init__", guarded_init)
-    install(socket, "socketpair", guarded_socketpair)
-    for name in _SOCKET_FUNCTIONS:
-        install(socket, name, no_socket)
-    install(subprocess.Popen, "__init__", no_process)
-    for name in _PROCESS_FUNCTIONS:
-        if hasattr(os, name):
-            install(os, name, no_process)
+    if nodeid.split("[")[0] in A2_REAL_NODES:
+        # A2: named, so allowed; journaled, so seen. The real entry point runs.
+        def journaled(owner: Any, name: str, kind: str) -> Any:
+            real = _REAL_ENTRY_POINTS[(owner, name)]
+            label = f"{getattr(owner, '__name__', '')}.{name}"
+
+            def record(*args: Any, **kwargs: Any) -> Any:
+                if not (name == "socketpair" and _is_self_pipe(sys._getframe(1))):
+                    A2_JOURNAL.append((nodeid, kind, label))
+                return real(*args, **kwargs)
+
+            return record
+
+        def journaled_init(
+            self: socket.socket, family: Any = -1, type: Any = -1, proto: Any = -1, fileno: Any = None
+        ) -> None:
+            if fileno is None:
+                A2_JOURNAL.append((nodeid, "socket", "socket.socket"))
+            real_init(self, family, type, proto, fileno)
+
+        install(socket.socket, "__init__", journaled_init)
+        install(socket, "socketpair", journaled(socket, "socketpair", "socket"))
+        for name in _SOCKET_FUNCTIONS:
+            install(socket, name, journaled(socket, name, "socket"))
+        install(subprocess.Popen, "__init__", journaled(subprocess.Popen, "__init__", "process"))
+        for name in _PROCESS_FUNCTIONS:
+            if hasattr(os, name):
+                install(os, name, journaled(os, name, "process"))
+    else:
+        install(socket.socket, "__init__", guarded_init)
+        install(socket, "socketpair", guarded_socketpair)
+        for name in _SOCKET_FUNCTIONS:
+            install(socket, name, no_socket)
+        install(subprocess.Popen, "__init__", no_process)
+        for name in _PROCESS_FUNCTIONS:
+            if hasattr(os, name):
+                install(os, name, no_process)
     yield
+
+
+class _MemoryTestServer:
+    """``aiohttp.test_utils.TestServer`` for a Kick node outside A2: holds the app."""
+
+    def __init__(self, app: Any, **_: Any) -> None:
+        self.app = app
+
+
+class _MemoryTestClient(InMemoryClient):
+    """``aiohttp.test_utils.TestClient`` over a :class:`_MemoryTestServer`:
+    an :class:`InMemoryClient` that also answers ``start_server``."""
+
+    def __init__(self, server: _MemoryTestServer, **_: Any) -> None:
+        super().__init__(server.app)
+
+    async def start_server(self) -> None:
+        await self.start()
+
+
+@pytest.fixture(autouse=True)
+def _kick_loopback_in_memory(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``tests/test_kick.py`` stays as it was at the phase base (A2). Its one
+    named node binds a real loopback listener; every other node of the file
+    reaches the same handler in memory: its ``TestClient(TestServer(app))``
+    is an :class:`InMemoryClient` and the listener ``start_inputs`` binds is
+    an :class:`InMemoryNetwork` site, so the guard refuses nothing it opens."""
+
+    if Path(str(request.node.path)).name != "test_kick.py":
+        return
+    if request.node.nodeid.split("[")[0] in A2_REAL_NODES:
+        return
+    InMemoryNetwork().install(monkeypatch)
+    monkeypatch.setattr(request.module, "TestServer", _MemoryTestServer)
+    monkeypatch.setattr(request.module, "TestClient", _MemoryTestClient)
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:
+    """A2's journal, printed after every run that exercised a named node."""
+
+    if not A2_JOURNAL:
+        return
+    terminalreporter.section("AC33 Amendment A2 journal")
+    for nodeid, kind, entry in A2_JOURNAL:
+        terminalreporter.write_line(f"{nodeid}: {kind} via {entry}")
 
 
 # --------------------------------------------------------------------------- #
@@ -4008,6 +4106,9 @@ def _ac33_isolation(
 REPOSITORY = Path(__file__).resolve().parent.parent
 #: The shipped profiles as they were at a phase base, one directory per commit.
 BASELINES = REPOSITORY / "tests" / "fixtures" / "baselines"
+#: The suffix a baseline copy carries, so git's ``'*.example'`` pathspec (the
+#: real AC24 diff, Amendment A2) never matches the fixture itself.
+BASELINE_SUFFIX = ".baseline"
 
 
 def files_containing(
@@ -4282,7 +4383,8 @@ def baseline_numstat(
     """``git diff --numstat <commit> -- <names>`` against the committed baseline.
 
     The baseline directory ``<baselines>/<commit>/`` holds each file as it was
-    at *commit* (taken with ``git show`` when the fixture was authored) and a
+    at *commit*, as ``<name>.baseline`` (taken with ``git show`` when the
+    fixture was authored), and a
     ``SOURCE`` file naming the full commit hash. ``stdout`` has one
     ``<added>\\t<deleted>\\t<name>`` line per file whose bytes differ from the
     working tree's (a missing side counts all its lines); ``returncode`` is
@@ -4297,14 +4399,14 @@ def baseline_numstat(
         return subprocess.CompletedProcess(
             ("baseline_numstat", commit), 128, "", f"fatal: no baseline recorded for {commit}\n"
         )
-    missing = [name for name in names if not (directory / name).is_file()]
+    missing = [name for name in names if not (directory / f"{name}{BASELINE_SUFFIX}").is_file()]
     if missing:
         return subprocess.CompletedProcess(
             ("baseline_numstat", commit), 128, "", f"fatal: {missing} not at {commit}\n"
         )
     lines: list[str] = []
     for name in names:
-        before = (directory / name).read_bytes()
+        before = (directory / f"{name}{BASELINE_SUFFIX}").read_bytes()
         current = root / name
         after = current.read_bytes() if current.is_file() else b""
         if before == after:
@@ -4319,6 +4421,40 @@ def baseline_numstat(
                 added += high_b - low_b
         lines.append(f"{added}\t{deleted}\t{name}\n")
     return subprocess.CompletedProcess(("baseline_numstat", commit), 0, "".join(lines), "")
+
+
+def baseline_git(*arguments: str, root: Path = REPOSITORY, baselines: Path = BASELINES) -> subprocess.CompletedProcess[str]:
+    """``git -C <root> <arguments>`` for the questions a phase-base check asks,
+    answered from the committed baselines in git's own shape (AC33):
+
+    * ``rev-parse --is-inside-work-tree`` — 0 when *root* has a git directory;
+    * ``cat-file -e <commit>^{commit}`` — 0 when a baseline is recorded for it;
+    * ``cat-file -e <commit>:<name>`` — 0 when that baseline holds *name*;
+    * ``diff --stat|--numstat <commit> -- <names>`` — :func:`baseline_numstat`
+      (``--stat`` prints the same per-file lines: empty means unchanged).
+
+    Anything else is a test error, never a silent answer.
+    """
+
+    def answer(code: int, out: str = "", err: str = "") -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(("git", "-C", str(root), *arguments), code, out, err)
+
+    match arguments:
+        case ("rev-parse", "--is-inside-work-tree"):
+            inside = git_directory(root).exists()
+            return answer(0, "true\n") if inside else answer(128, err="fatal: not a git repository\n")
+        case ("cat-file", "-e", spec) if spec.endswith("^{commit}"):
+            commit = spec[: -len("^{commit}")]
+            recorded = baseline_numstat(commit, [], root=root, baselines=baselines)
+            return answer(recorded.returncode, err=recorded.stderr)
+        case ("cat-file", "-e", spec) if ":" in spec:
+            commit, name = spec.split(":", 1)
+            found = baseline_numstat(commit, [name], root=root, baselines=baselines)
+            return answer(found.returncode, err=found.stderr)
+        case ("diff", "--stat" | "--numstat", commit, "--", *names):
+            diff = baseline_numstat(commit, names, root=root, baselines=baselines)
+            return answer(diff.returncode, diff.stdout, diff.stderr)
+    raise AssertionError(f"baseline_git: no baseline answer for git {' '.join(arguments)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -4463,7 +4599,10 @@ class FakeOSProcess:
     holds without a byte; *flood* writes its pattern without end;
     *ignore_terminate* survives ``SIGTERM``; *leave_child* leaves a child in
     the group (pid ``pid + 1``) that holds stdout and never writes, ended
-    only by a signal to the group. A death reports its exit a loop turn
+    only by a signal to the group — with *child_fifo* it also does what the
+    original wrapper's child script did: opens the FIFO named by the last
+    argv entry for writing, writes ``b"r"`` and holds it open until it ends,
+    so the test's read end sees ``b"r"``, then nothing, then EOF. A death reports its exit a loop turn
     later, as the child watcher would. The reader closing stdout under a
     writer that still has output breaks its pipe (*broken_pipe_exit*).
     :meth:`wait` returns once the exit is known *and* stdout is
@@ -4491,6 +4630,7 @@ class FakeOSProcess:
         ignore_terminate: bool = False,
         never_write: bool = False,
         leave_child: bool = False,
+        child_fifo: bool = False,
         flood: bytes | None = None,
         broken_pipe_exit: int = 1,
         script: Callable[[FakeChild], Any] | None = None,
@@ -4512,6 +4652,10 @@ class FakeOSProcess:
         self.stderr: Any = None
         self.child_pid: int | None = pid + 1 if leave_child else None
         self.child_running = leave_child
+        self._child_fifo: int | None = None
+        if leave_child and child_fifo:
+            self._child_fifo = os.open(self.argv[-1], os.O_WRONLY | os.O_NONBLOCK)
+            os.write(self._child_fifo, b"r")
         if never_write:
             stdout, exit_code = b"", None
         if flavour == "asyncio":
@@ -4583,7 +4727,13 @@ class FakeOSProcess:
         if self.child_running:
             self.child_running = False
             self.events.append("child_exit")
+            self._close_child_fifo()
             self._writers_changed()
+
+    def _close_child_fifo(self) -> None:
+        if self._child_fifo is not None:
+            os.close(self._child_fifo)
+            self._child_fifo = None
 
     def _writers_changed(self) -> None:
         if not self._leader_alive and not self.child_running:
@@ -4711,6 +4861,7 @@ class FakeOSProcess:
     def end(self) -> None:
         """The fake OS's own end of a child left running by its test."""
 
+        self._close_child_fifo()
         if self.flavour == "popen" and not self._done.is_set():
             with self._lock:
                 self._fatal = -signal.SIGKILL

@@ -2602,6 +2602,18 @@ _BRIDGE = "streamerbot"
 _USERS_SETTINGS = {"max_channels": 4, "max_users_per_channel": 8, "max_age_seconds": 600.0}
 
 
+def _one_in_memory_connection(fake: Any) -> None:
+    """AC33: the bridge reached the fake instance over exactly one in-memory connection."""
+
+    assert fake.connections == 1
+
+
+def _nothing_listens(loopback: Any) -> None:
+    """AC33: a stopped fake instance leaves no in-memory listener behind."""
+
+    assert loopback.listeners == {}
+
+
 @pytest.mark.asyncio
 async def test_ac14_the_real_users_and_bridge_split_the_viewer_read(
     monkeypatch: pytest.MonkeyPatch,
@@ -2674,7 +2686,7 @@ async def test_ac14_the_real_users_and_bridge_split_the_viewer_read(
             assert kick.result["coverage"]["kind"] == "observed_authors"
             # The kick read never reached the bridge.
             assert len(fake.requests("GetActiveViewers")) == 1
-            assert fake.connections == 1
+            _one_in_memory_connection(fake)
         finally:
             await runs.stop()
     await loopback.close()
@@ -2689,10 +2701,12 @@ import ast  # noqa: E402
 import contextlib  # noqa: E402
 import inspect  # noqa: E402
 import itertools  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
 from collections.abc import Callable  # noqa: E402
 
 from conftest import (  # noqa: E402
-    baseline_numstat,
+    baseline_git,
     ownership_rejection_probe,
 )
 
@@ -2825,25 +2839,36 @@ def test_ac2_no_shipped_profile_names_the_bridge_or_an_inputs_key(name: str) -> 
     assert _INPUTS_KEY_LINE.search("a:\n  inputs: {}\n")
 
 
+def _git(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """AC33 (P17F2): ``git -C ROOT <arguments>`` answered in-process by
+    :func:`conftest.baseline_git` from the profiles committed under
+    ``tests/fixtures/baselines/f900f27/`` (taken with ``git show``, the hash in
+    its ``SOURCE``), in git's shape: the assertions below are the original
+    ones, unchanged."""
+
+    return baseline_git(*arguments, root=ROOT)
+
+
 def test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base() -> None:
     """AC2 (R1): ``git diff --stat <phase base>`` over the 4 shipped profiles
-    — the working tree against ``f900f27`` — reports 0 changed lines.
+    — the working tree against ``f900f27`` — reports 0 changed lines."""
 
-    Read in-process (AC33, P15a): the profiles as they were at the phase
-    base are committed under ``tests/fixtures/baselines/f900f27/`` (taken
-    with ``git show``, the hash in its ``SOURCE``), and
-    :func:`conftest.baseline_numstat` compares them byte for byte with the
-    working tree — the same claim as an empty ``--numstat``."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not available: the phase-base diff cannot be taken")
+    if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
+        pytest.skip("not a git work tree: the phase-base diff cannot be taken")
+    if _git("cat-file", "-e", f"{PHASE_BASE}^{{commit}}").returncode != 0:
+        pytest.skip(f"the phase base {PHASE_BASE} is not in this clone (shallow?)")
 
-    diff = baseline_numstat(PHASE_BASE, SHIPPED_PROFILES)
+    diff = _git("diff", "--stat", PHASE_BASE, "--", *SHIPPED_PROFILES)
     assert diff.returncode == 0, diff.stderr
     assert diff.stdout.strip() == ""
-    numstat = baseline_numstat(PHASE_BASE, SHIPPED_PROFILES)
+    numstat = _git("diff", "--numstat", PHASE_BASE, "--", *SHIPPED_PROFILES)
     assert numstat.returncode == 0 and numstat.stdout.strip() == ""
     # Each profile exists at the phase base, so an empty diff is no accident
     # of a path the base never had.
     for name in SHIPPED_PROFILES:
-        assert baseline_numstat(PHASE_BASE, [name]).returncode == 0, name
+        assert _git("cat-file", "-e", f"{PHASE_BASE}:{name}").returncode == 0, name
 
 
 # -- AC44, shipped half: no undeclared publisher meets a resolved owner ------- #
@@ -2990,6 +3015,40 @@ def _run_scenario(
             asyncio.run(result)
 
 
+def _run_in_process(
+    scenarios: list[tuple[Any, str]], scratch: Path
+) -> subprocess.CompletedProcess[str]:
+    """Every scenario, with each of its parameter sets, run in-process and
+    reported as a child ``pytest`` would be: ``returncode`` 0 when every run
+    passed or skipped and 1 otherwise, ``stdout`` naming each failure and
+    ending with the count line."""
+
+    import test_examples
+
+    assert set(_EXAMPLE_ACTIVATIONS) <= set(_test_names(test_examples))
+    failures: list[str] = []
+    ran = passed = skipped = 0
+    for module, name in scenarios:
+        function = getattr(module, name)
+        for arguments in _parameter_sets(function) or [{}]:
+            ran += 1
+            label = f"{module.__name__}::{name}{sorted(arguments.items())}"
+            try:
+                _run_scenario(function, dict(arguments), scratch / f"scenario-{ran}")
+            except pytest.skip.Exception:
+                skipped += 1
+                continue
+            except (Exception, pytest.fail.Exception) as error:
+                failures.append(f"FAILED {label}: {type(error).__name__}: {error}")
+                continue
+            passed += 1
+    assert ran > 0
+    summary = f"{len(failures)} failed, {passed} passed, {skipped} skipped"
+    return subprocess.CompletedProcess(
+        ("in-process", "pytest"), 1 if failures else 0, "\n".join([*failures, summary]) + "\n", ""
+    )
+
+
 def test_ac44_the_integration_scenarios_count_zero_ownership_rejections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3014,22 +3073,8 @@ def test_ac44_the_integration_scenarios_count_zero_ownership_rejections(
         (test_integration, name)
         for name in _test_names(test_integration)
     ] + [(test_examples, name) for name in _EXAMPLE_ACTIVATIONS]
-    assert set(_EXAMPLE_ACTIVATIONS) <= set(_test_names(test_examples))
-    failures: list[str] = []
-    ran = 0
-    for module, name in scenarios:
-        function = getattr(module, name)
-        for arguments in _parameter_sets(function) or [{}]:
-            ran += 1
-            label = f"{module.__name__}::{name}{sorted(arguments.items())}"
-            try:
-                _run_scenario(function, dict(arguments), tmp_path / f"scenario-{ran}")
-            except pytest.skip.Exception:
-                continue
-            except (Exception, pytest.fail.Exception) as error:
-                failures.append(f"{label}: {type(error).__name__}: {error}")
-    assert ran > 0
-    assert failures == [], "\n".join(failures)
+    completed = _run_in_process(scenarios, tmp_path)
+    assert completed.returncode == 0, completed.stdout[-4000:] + completed.stderr[-4000:]
     assert seen["guards"] > 0 and seen["admits"] > 0, seen
     assert seen["rejections"] == 0 and seen["counted"] == 0, seen
 
@@ -3079,7 +3124,7 @@ async def test_ac5_a_twitch_event_is_dropped_while_the_owning_bridge_is_down(
     async with FakeInstance() as fake:
         url = fake.url
     # The instance is stopped: nothing listens at its URL any more.
-    assert loopback.listeners == {}
+    _nothing_listens(loopback)
 
     bridge = _Bridge()
     session = _TwitchSession([])

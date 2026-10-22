@@ -322,6 +322,7 @@ from conftest import (
     ManualClock,
     MemorySites,
     MemoryWebSocketPair,
+    WSMessage,
     WSMsgType,
     events_of,
     png_bytes,
@@ -1287,6 +1288,74 @@ UPGRADE_REQUEST = (
 )
 
 
+class _MemoryClientConnection:
+    """The client side of a :class:`MemoryHTTPConnection`, read like the
+    ``aiohttp`` client WebSocket the original test held (AC33).
+
+    Entering sends the opening handshake to the runner's own server protocol
+    and checks the listener upgraded it through the gate. ``send_str`` and
+    ``send_bytes`` write masked RFC 6455 frames; ``receive`` parses the next
+    frame the listener wrote into a :class:`conftest.WSMessage` — a close
+    frame's ``data`` is its code and ``extra`` its reason, as ``aiohttp``
+    reports them, and it sets ``close_code``. ``closed`` holds once the close
+    frame arrived and the listener closed the connection.
+    """
+
+    def __init__(self, sites: MemorySites, accepted: list[Any], host: str, port: int) -> None:
+        self._sites = sites
+        self._accepted = accepted
+        self._address = (host, port)
+        self._read = 0
+        self._close_received = False
+        self.close_code: int | None = None
+        self.connection: Any = None
+
+    async def __aenter__(self) -> _MemoryClientConnection:
+        self.connection = self._sites.connect(*self._address)
+        self.connection.send(UPGRADE_REQUEST)
+        await wait_until(lambda: bool(self.connection.head()) and bool(self._accepted))
+        _upgraded_through_the_gate(self.connection, self._accepted)
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def send_str(self, text: str) -> None:
+        self.connection.send(ws_frame(1, text.encode("utf-8")))
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.connection.send(ws_frame(2, data))
+
+    async def receive(self) -> Any:
+        await wait_until(lambda: len(self.connection.frames()) > self._read)
+        opcode, payload = self.connection.frames()[self._read]
+        self._read += 1
+        kind = WSMsgType(opcode)
+        if kind == WSMsgType.CLOSE:
+            self._close_received = True
+            self.close_code = int.from_bytes(payload[:2], "big")
+            return WSMessage(kind, self.close_code, payload[2:].decode("utf-8"))
+        if kind == WSMsgType.TEXT:
+            return WSMessage(kind, payload.decode("utf-8"))
+        return WSMessage(kind, payload)
+
+    @property
+    def closed(self) -> bool:
+        return self._close_received and self.connection.closed
+
+
+def _upgraded_through_the_gate(connection: Any, accepted: list[Any]) -> None:
+    """AC33: the listener answered 101, and the WebSocket it accepted reads
+    through the frame-size gate fronting the bounded ``WebSocketReader``."""
+
+    assert connection.head().startswith(b"HTTP/1.1 101 "), connection.head()
+    (ws,) = accepted
+    assert ws._max_msg_size == 4096 and ws.gate_installed
+    gate = connection.protocol._payload_parser
+    assert type(gate).__name__ == "_FrameSizeGate"
+    assert type(gate._inner).__name__ == "WebSocketReader"
+
+
 async def test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1333,32 +1402,21 @@ async def test_the_real_listener_cuts_an_oversized_binary_frame_before_the_modul
             await original(connection, data)
 
         module._on_binary = spy  # type: ignore[method-assign]
-        connection = sites.connect("127.0.0.1", 8765)
-        connection.send(UPGRADE_REQUEST)
-        await wait_until(lambda: bool(connection.head()) and bool(accepted))
-        assert connection.head().startswith(b"HTTP/1.1 101 "), connection.head()
-        (ws,) = accepted
-        assert ws._max_msg_size == 4096 and ws.gate_installed
-        gate = connection.protocol._payload_parser
-        assert type(gate).__name__ == "_FrameSizeGate"
-        assert type(gate._inner).__name__ == "WebSocketReader"
+        async with _MemoryClientConnection(sites, accepted, "127.0.0.1", 8765) as ws:
+            text = json.dumps({"v": 1, "type": FRAME_PING, "id": "x" * 2900})
+            assert 2048 < len(text.encode("utf-8")) < 4096
+            await ws.send_str(text)
+            message = await ws.receive()
+            assert message.type == WSMsgType.TEXT
+            assert json.loads(message.data)["code"] == PROXY_ERROR_UNKNOWN_SESSION
 
-        text = json.dumps({"v": 1, "type": FRAME_PING, "id": "x" * 2900})
-        assert 2048 < len(text.encode("utf-8")) < 4096
-        connection.send(ws_frame(1, text.encode("utf-8")))
-        await wait_until(lambda: len(connection.frames()) >= 1)
-        ((opcode, payload),) = connection.frames()
-        assert opcode == WSMsgType.TEXT
-        assert json.loads(payload)["code"] == PROXY_ERROR_UNKNOWN_SESSION
-
-        connection.send(ws_frame(2, b"\x00" * 3000))
-        # No ``error`` text frame precedes the close: the payload was
-        # never read, so the module had nothing to answer.
-        await wait_until(lambda: len(connection.frames()) >= 2)
-        opcode, payload = connection.frames()[1]
-        assert opcode == WSMsgType.CLOSE, connection.frames()
-        assert int.from_bytes(payload[:2], "big") == 1009
-        await wait_until(lambda: connection.closed)
+            await ws.send_bytes(b"\x00" * 3000)
+            # No ``error`` text frame precedes the close: the payload was
+            # never read, so the module had nothing to answer.
+            message = await ws.receive()
+            assert message.type == WSMsgType.CLOSE and message.data == 1009, message
+            await wait_until(lambda: ws.closed)
+            assert ws.close_code == 1009
         assert binary_frames == []
         await wait_until(lambda: not module._connections)
         assert not any("gate did not install" in d for d in brain.diagnostics), brain.diagnostics

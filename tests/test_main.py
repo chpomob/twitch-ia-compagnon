@@ -34,7 +34,14 @@ from core.contracts import (
 )
 from core.loader import ModuleLoader
 from core.runtime import Supervision
-from conftest import FakeResponse, FakeSession, UnreachableSession, completion, wait_until
+from conftest import (
+    FakeResponse,
+    FakeSession,
+    UnreachableSession,
+    completion,
+    the_endpoint_was_refused,
+    wait_until,
+)
 from test_integration import (
     FakeTwitchSession,
     FakeWebSocket,
@@ -2529,7 +2536,7 @@ async def test_the_accepted_limits_bound_the_real_scheduler_memory_and_audit_que
         model.release.set()
         stop.set()
     assert await asyncio.wait_for(task, timeout=2) == 0
-    assert scene_attempts and set(scene_attempts) == {environ["SCENE_WEBSOCKET_URL"]}
+    the_endpoint_was_refused(scene_attempts, environ["SCENE_WEBSOCKET_URL"])
 
     assert diagnostics == []
     assert supervision.snapshot()[COUNTER_AUDIT_RECORD_LOSSES] == 10

@@ -82,6 +82,7 @@ import logging
 import math
 import re
 import socket
+import subprocess
 import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -4690,24 +4691,16 @@ def test_r10_the_guide_names_every_setting_the_manifest_declares() -> None:
             assert f"| `{name}` |" in text, name
 
 
-def test_ac37_the_status_guard_runs_unmarked_and_the_trial_file_keeps_eight_nodes() -> None:
-    """AC37 (R8): the status test carries no ``xfail`` any more and holds on
-    the repository; the trial file still collects exactly its 8 nodes."""
+def _collect_only(relative: str) -> subprocess.CompletedProcess[str]:
+    """``pytest --collect-only -q <relative>`` answered in-process (AC33, P15a),
+    in its shape: one ``<file>::<test>`` line per node, then the count line;
+    ``returncode`` 0. The module imports, and its source defines its nodes as
+    top-level functions none of which is parametrized and no test class, so
+    each is one node — anything else is a test error here, never a guess."""
 
-    status_test = docs_status.test_ac37_readme_and_index_state_the_bridge_not_delivered
-    assert not getattr(status_test, "pytestmark", [])
-    assert not docs_status.RECORD.exists()
-    for path in docs_status.STATUS_FILES:
-        assert docs_status.states_not_delivered(docs_status.read(path)), path
-    for path in (GUIDE, GUIDE_FR):
-        assert docs_status.states_not_delivered(path.read_text(encoding="utf-8")), path
-    assert docs_status.every_claim(docs_status.tracked_markdown()) == []
-
-    # ``pytest --collect-only`` read in-process (AC33, P15a): the module
-    # imports, and its source defines its nodes as top-level functions none
-    # of which is parametrized and no test class, so each is one node.
-    trials = importlib.import_module("test_phase5_trials")
-    tree = ast.parse((ROOT / "tests" / "test_phase5_trials.py").read_text(encoding="utf-8"))
+    path = ROOT / relative
+    trials = importlib.import_module(path.stem)
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     assert not [
         node.name
         for node in tree.body
@@ -4725,8 +4718,28 @@ def test_ac37_the_status_guard_runs_unmarked_and_the_trial_file_keeps_eight_node
         if "parametrize" in "".join(ast.unparse(decorator) for decorator in function.decorator_list)
     ]
     nodes = [
-        f"tests/test_phase5_trials.py::{function.name}"
+        f"{relative}::{function.name}"
         for function in functions
         if callable(getattr(trials, function.name, None))
     ]
-    assert len(nodes) == 8, nodes
+    stdout = "".join(f"{node}\n" for node in nodes) + f"\n{len(nodes)} tests collected\n"
+    return subprocess.CompletedProcess(("pytest", "--collect-only", relative), 0, stdout, "")
+
+
+def test_ac37_the_status_guard_runs_unmarked_and_the_trial_file_keeps_eight_nodes() -> None:
+    """AC37 (R8): the status test carries no ``xfail`` any more and holds on
+    the repository; the trial file still collects exactly its 8 nodes."""
+
+    status_test = docs_status.test_ac37_readme_and_index_state_the_bridge_not_delivered
+    assert not getattr(status_test, "pytestmark", [])
+    assert not docs_status.RECORD.exists()
+    for path in docs_status.STATUS_FILES:
+        assert docs_status.states_not_delivered(docs_status.read(path)), path
+    for path in (GUIDE, GUIDE_FR):
+        assert docs_status.states_not_delivered(path.read_text(encoding="utf-8")), path
+    assert docs_status.every_claim(docs_status.tracked_markdown()) == []
+
+    collected = _collect_only("tests/test_phase5_trials.py")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    nodes = [line for line in collected.stdout.splitlines() if "::" in line]
+    assert len(nodes) == 8, collected.stdout

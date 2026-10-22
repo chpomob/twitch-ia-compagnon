@@ -362,6 +362,37 @@ def assert_sanitized(diagnostics: list[str]) -> None:
     assert SETTINGS["access_token"] not in rendered
 
 
+def _the_reward_type_and_its_fields(triggers: dict[str, Any], declared: dict[str, Any]) -> None:
+    """Phase 8 R5 (plan P8): the declared ``reward`` type and the fields it reads."""
+
+    assert declared["reward"] == {
+        "name": "reward",
+        "kinds": ["reward"],
+        "parameter_schema": {
+            "type": "object",
+            "properties": {
+                "reward_ids": {"type": "array", "items": {"type": "string"}},
+                "min_cost": {"type": "integer", "minimum": 0},
+                "max_cost": {"type": "integer", "minimum": 0},
+            },
+            "required": ["reward_ids"],
+            "additionalProperties": False,
+        },
+        "match": {
+            "all": [
+                {"in": [{"field": "reward.id"}, {"param": "reward_ids"}]},
+                {"gte": [{"field": "reward.cost"}, {"param": "min_cost"}]},
+                {"lte": [{"field": "reward.cost"}, {"param": "max_cost"}]},
+            ]
+        },
+    }
+    assert triggers["fields"] == {
+        "reward.id": "string",
+        "reward.title": "string",
+        "reward.cost": "integer",
+    }
+
+
 def test_manifest_declares_twitch_source_and_sink() -> None:
     """R7/R1/R5: the manifest is v2 — the former 4-key equality is superseded.
 
@@ -410,10 +441,9 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     assert notices["type"] == "object"
     assert set(notices["properties"]) == {"kinds"}
     assert notices["properties"]["kinds"]["items"]["enum"] == list(LISTABLE_KINDS)
-    assert list(NOTICE_KINDS) == [
-        "sub", "resub", "sub_gift", "community_sub_gift", "raid", "follow",
+    assert notices["properties"]["kinds"]["items"]["enum"] == [
+        "sub", "resub", "sub_gift", "community_sub_gift", "raid", "follow", "reward",
     ]
-    assert notices["properties"]["kinds"]["items"]["enum"] == [*NOTICE_KINDS, "reward"]
     assert manifest["settings_validator"] == "validate_settings"
     assert callable(validate_settings)
     assert manifest["credentials"] == ["client_id", "client_secret", "access_token"]
@@ -423,32 +453,7 @@ def test_manifest_declares_twitch_source_and_sink() -> None:
     assert set(declared) == {"probability", "audience", "keyword", "event_kind", "reward"}
     for declaration in declared.values():
         assert declaration["parameter_schema"]["type"] == "object"
-    assert declared["reward"] == {
-        "name": "reward",
-        "kinds": ["reward"],
-        "parameter_schema": {
-            "type": "object",
-            "properties": {
-                "reward_ids": {"type": "array", "items": {"type": "string"}},
-                "min_cost": {"type": "integer", "minimum": 0},
-                "max_cost": {"type": "integer", "minimum": 0},
-            },
-            "required": ["reward_ids"],
-            "additionalProperties": False,
-        },
-        "match": {
-            "all": [
-                {"in": [{"field": "reward.id"}, {"param": "reward_ids"}]},
-                {"gte": [{"field": "reward.cost"}, {"param": "min_cost"}]},
-                {"lte": [{"field": "reward.cost"}, {"param": "max_cost"}]},
-            ]
-        },
-    }
-    assert triggers["fields"] == {
-        "reward.id": "string",
-        "reward.title": "string",
-        "reward.cost": "integer",
-    }
+    _the_reward_type_and_its_fields(triggers, declared)
     assert declared["event_kind"]["parameter_schema"] == {
         "type": "object",
         "properties": {

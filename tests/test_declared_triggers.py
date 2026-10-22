@@ -3479,11 +3479,13 @@ def test_p15_the_readme_lists_each_family_as_proven_against_fakes_only() -> None
 SUMMARY = ROOT / "docs" / "campaigns" / "phase8" / "summary.md"
 TRIAL_RECORD = ROOT / "docs" / "campaigns" / "phase8" / "trial-record.md"
 TRIAL_FAMILIES = ("Channel points", "Button", "Voice", "Timer")
-FIDELITY_LOST = frozenset({"fake-OS only", "in-process topology", "no real install"})
+FIDELITY_LOST = frozenset(
+    {"fake-OS only", "in-process topology", "no real install", "none: real, named by A2"}
+)
 _COMMIT = re.compile(r"`[0-9a-f]{7,40}`")
 _TEST_ID = re.compile(r"`(tests/[\w/]+\.py)::(test_\w+)`")
 _CONVERSION_ROW = re.compile(
-    r"^\| `(tests/[\w/]+\.py::test_\w+)` \| (P15[a-e]) \| `([0-9a-f]{7,40})` \| ([^|]+) \|$",
+    r"^\| `(tests/[\w/]+\.py::test_\w+)` \| (P15[a-e]|A2) \| `([0-9a-f]{7,40})` \| ([^|]+) \|$",
     re.MULTILINE,
 )
 
@@ -3540,7 +3542,11 @@ def test_p16_the_summary_lists_each_converted_node_with_its_fidelity_lost() -> N
     assert len(nodes) == len(set(nodes)) == len(AC33_PROBE)
     assert set(nodes) == AC33_PROBE
     assert {loss.strip() for _, _, _, loss in rows} <= FIDELITY_LOST
-    assert {step for _, step, _, _ in rows} == {"P15a", "P15b", "P15c", "P15d", "P15e"}
+    assert {step for _, step, _, _ in rows} == {"P15a", "P15b", "P15c", "P15d", "P15e", "A2"}
+    # Amendment A2 (P17F2): exactly the guard's three named nodes stay real.
+    real = {node for node, step, _, loss in rows if step == "A2" or "A2" in loss}
+    assert real == conftest.A2_REAL_NODES
+    assert all(loss.strip() == "none: real, named by A2" for node, step, _, loss in rows if step == "A2")
 
 
 def test_ac33_the_whole_suite_runs_under_the_guard(request: pytest.FixtureRequest) -> None:
@@ -3609,6 +3615,18 @@ _OTHER_GUARD_REFUSALS = frozenset(
             "test_the_socket_guard_refuses_and_records_every_non_loopback_surface",
             "loop.create_connection",
         ),
+    }
+)
+
+
+#: Amendment A2 (P17F2): ``tests/test_kick.py`` is restored to its phase-base
+#: bytes, so its ``TestServer`` calls stay. Pinned exactly: the named node
+#: reaches them for real, and every other node of the file reaches them in
+#: memory (``conftest._kick_loopback_in_memory``).
+_A2_KICK_CALLS = frozenset(
+    {
+        ("tests/test_kick.py", "start_harness", "TestServer"),
+        ("tests/test_kick.py", "test_a_delivery_before_start_inputs_is_not_accepted", "TestServer"),
     }
 )
 
@@ -3686,11 +3704,13 @@ def test_ac33_no_test_reaches_a_real_spawn_or_socket() -> None:
     ``create_subprocess_exec``, ``os.system``, ``TCPSite``, ``TestServer`` or
     ``create_connection``, except the guard and its fakes
     (``tests/conftest.py``), the guard's own ``pytest.raises`` self-tests
-    (``tests/test_ac33_isolation.py``) and the two other guards' refusal
-    self-tests pinned in :data:`_OTHER_GUARD_REFUSALS`."""
+    (``tests/test_ac33_isolation.py``), the two other guards' refusal
+    self-tests pinned in :data:`_OTHER_GUARD_REFUSALS` and the restored Kick
+    file's calls pinned in :data:`_A2_KICK_CALLS` (Amendment A2)."""
 
     offenders: list[str] = []
     other_guards: set[tuple[str, str, str]] = set()
+    kick: set[tuple[str, str, str]] = set()
     for path in sorted((ROOT / "tests").rglob("*.py")):
         relative = path.relative_to(ROOT).as_posix()
         if relative == _GUARD_FILE:
@@ -3701,6 +3721,10 @@ def test_ac33_no_test_reaches_a_real_spawn_or_socket() -> None:
             if inside and (relative, function, call) in _OTHER_GUARD_REFUSALS:
                 other_guards.add((relative, function, call))
                 continue
+            if (relative, function, call) in _A2_KICK_CALLS:
+                kick.add((relative, function, call))
+                continue
             offenders.append(f"{relative}:{line}: {call}")
     assert offenders == []
     assert other_guards == _OTHER_GUARD_REFUSALS
+    assert kick == _A2_KICK_CALLS

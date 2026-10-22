@@ -110,6 +110,17 @@ def no_socket_creation() -> Iterator[None]:
     assert _SOCKET_ATTEMPTS["count"] == 0, "a test other than the self-test created a socket"
 
 
+def _the_suite_guard_runs_beside_this_patch(request: pytest.FixtureRequest) -> None:
+    """AC33: the suite's guard runs on the node, leaves the socket entry
+    points to this module's patch and still refuses a process."""
+
+    assert "_ac33_isolation" in request.fixturenames
+    assert socket.socket.__init__ is _refuse
+    assert all(getattr(socket, name) is _refuse for name in ("socketpair", "create_connection"))
+    with pytest.raises(AssertionError, match=f"^AC33: {re.escape(request.node.nodeid)} started a process$"):
+        subprocess.run(["true"])
+
+
 def test_ac5_the_socket_patch_is_effective(request: pytest.FixtureRequest) -> None:
     """The fixture self-test; its own attempts are removed from the counter.
 
@@ -118,11 +129,7 @@ def test_ac5_the_socket_patch_is_effective(request: pytest.FixtureRequest) -> No
     points to this module's patch (``_refuse`` is the one installed) and still
     refuses a process for it."""
 
-    assert "_ac33_isolation" in request.fixturenames
-    assert socket.socket.__init__ is _refuse
-    assert all(getattr(socket, name) is _refuse for name in ("socketpair", "create_connection"))
-    with pytest.raises(AssertionError, match=f"^AC33: {re.escape(request.node.nodeid)} started a process$"):
-        subprocess.run(["true"])
+    _the_suite_guard_runs_beside_this_patch(request)
     before = _SOCKET_ATTEMPTS["count"]
     try:
         with pytest.raises(AssertionError, match="socket created"):
@@ -4218,7 +4225,12 @@ def test_ac30_the_launch_argv_runs_without_a_shell(
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
     arguments = json.loads(seen.read_text(encoding="utf-8"))
     assert arguments[2:] == [";echo x", "$HOME", "a b"]
-    # The literal argv reached the launch as a list, with no shell between.
+    _the_literal_argv_reached_the_launch_without_a_shell(fake_spawn)
+
+
+def _the_literal_argv_reached_the_launch_without_a_shell(fake_spawn: FakeOS) -> None:
+    """AC33: the literal argv reached the fake launch as a list, with no shell between."""
+
     (child,) = fake_spawn.spawned
     assert child.args[-3:] == [";echo x", "$HOME", "a b"]
     assert child.options["shell"] is False
@@ -4295,7 +4307,12 @@ def test_ac31_a_child_ignoring_terminate_is_killed_after_the_bounded_wait(
     ]
     assert first.returncode == -signal.SIGKILL
     assert ui.child is children[1] and children[1].poll() is None
-    # The terminate reached the child and was ignored; the kill ended it.
+    _the_terminate_was_ignored_and_the_kill_ended_it(fake_spawn)
+
+
+def _the_terminate_was_ignored_and_the_kill_ended_it(fake_spawn: FakeOS) -> None:
+    """AC33: the terminate reached the first fake child and was ignored; the kill ended it."""
+
     (fake, _second) = fake_spawn.spawned
     assert fake.events[:5] == [
         "terminate",
@@ -4458,9 +4475,15 @@ def test_d9_draining_continues_after_acceptance(
 
     ui = _apply_ui(tmp_path, launched, fake_spawn, body)
     assert ui.apply().outcome == config_ui.APPLY_ACCEPTED
-    assert not marker.exists()
+    _the_script_waits_for_acceptance(marker)
     ui.child.resume()
     assert _bounded_until(marker.exists)
+
+
+def _the_script_waits_for_acceptance(marker: Path) -> None:
+    """AC33: the fake child's script had not run past its hold at acceptance."""
+
+    assert not marker.exists()
 
 
 def test_d9_a_refused_report_carries_the_last_line_within_2_kib(

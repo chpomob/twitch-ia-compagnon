@@ -58,6 +58,7 @@ import asyncio
 import base64
 import json
 import os
+import signal
 import shutil
 import sys
 from collections.abc import Callable, Mapping
@@ -133,8 +134,8 @@ API_KEY = "loopback-api-key"
 AGENT_STATUS = "agent.status"
 OBSERVATION_TRACE = "brain.run.observation"
 READY_LINE = "ready"
-#: What a killed runtime returns in place of a status.
-KILLED = "killed"
+#: What a killed runtime returns: the status of a process ended by ``SIGKILL``.
+KILLED = -signal.SIGKILL
 
 #: What the gated program tells the gate once its PNG is on stdout.
 HELPER_DONE = b"D"
@@ -457,14 +458,30 @@ class CaptureGate:
         assert list(argv) == self.gated_argv, argv
         capture = GatedCapture(list(argv), self._png)
         await self.starts.put(capture)
-        code, data = await capture.outcome
+        try:
+            code, data = await capture.outcome
+        except asyncio.CancelledError:
+            # The agent running the program was killed: the program dies with it.
+            capture.abandon()
+            raise
         assert len(data) <= limit
         return code, data
 
-    async def acknowledged(self) -> GatedCapture:
-        """The next capture-start acknowledgement, bounded."""
+    async def acknowledged(self) -> tuple[GatedCapture, GatedCapture]:
+        """The next capture-start acknowledgement, bounded: the ``(reader,
+        writer)`` ends of the program's report channel, which are one
+        :class:`GatedCapture` here."""
 
-        return await asyncio.wait_for(self.starts.get(), WAIT_SECONDS)
+        capture = await asyncio.wait_for(self.starts.get(), WAIT_SECONDS)
+        return capture, capture
+
+    @staticmethod
+    async def release(reader: GatedCapture, writer: GatedCapture, *, byte: bool) -> bytes:
+        """End one gated capture and return what the program sent before it
+        exited (:meth:`GatedCapture.release`)."""
+
+        assert reader is writer
+        return writer.release(byte=byte)
 
 
 # --------------------------------------------------------------------------- #
@@ -526,7 +543,7 @@ class Runtime:
         self._ready = asyncio.Event()
         self._changed = asyncio.Event()
 
-    def report(self, line: str) -> None:
+    def diagnose(self, line: str) -> None:
         self.diagnostics.append(line)
         self._changed.set()
 
@@ -541,7 +558,7 @@ class Runtime:
                 self._stop,
                 environ=self.environ,
                 ready_reporter=self.ready_reporter,
-                diagnostic_reporter=self.report,
+                diagnostic_reporter=self.diagnose,
             )
         )
 
@@ -552,7 +569,7 @@ class Runtime:
             {waiter, self.task}, timeout=WAIT_SECONDS, return_when=asyncio.FIRST_COMPLETED
         )
         waiter.cancel()
-        assert self._ready.is_set(), self.describe()
+        assert self._ready.is_set(), self.report()
 
     async def diagnostic(self, needle: str) -> str:
         async def found() -> str:
@@ -585,7 +602,7 @@ class Runtime:
         self.pair.drop()
         self.task.cancel()
 
-    async def exited(self) -> int | str:
+    async def exited(self) -> int:
         assert self.task is not None
         try:
             return await asyncio.wait_for(asyncio.shield(self.task), WAIT_SECONDS)
@@ -594,7 +611,7 @@ class Runtime:
                 return KILLED
             raise
 
-    async def terminate(self) -> int | str:
+    async def terminate(self) -> int:
         self._stop.set()
         return await self.exited()
 
@@ -610,7 +627,7 @@ class Runtime:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
 
-    def describe(self) -> str:
+    def report(self) -> str:
         return f"[{self.name} diagnostics]\n" + "\n".join(self.diagnostics)
 
 
@@ -703,6 +720,25 @@ async def _dial_with_wrong_token(listener: Listener) -> tuple[dict[str, Any], in
 # --------------------------------------------------------------------------- #
 
 
+def _listening_on_loopback_without_tls(listener: Listener) -> None:
+    """AC33: the proxy's listener was opened on the configured loopback port, no TLS."""
+
+    assert listener.listening["host"] == LOOPBACK and listener.listening["port"] == PROXY_PORT
+    assert listener.listening["ssl_context"] is None
+
+
+def _the_link_was_lost_abruptly(agent: Runtime) -> None:
+    """AC33: the killed agent's link ended with no close handshake (1006), as a killed process's does."""
+
+    assert agent.pair is not None and agent.pair.server.close_code == WS_ABNORMAL_CLOSURE
+
+
+def _every_request_went_to_the_model_endpoint(model: Any) -> None:
+    """AC33: the fake model answered requests addressed to the profile's endpoint only."""
+
+    assert model.urls == {MODEL_ENDPOINT}
+
+
 async def test_ac39_two_process_topology_over_loopback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -739,7 +775,7 @@ async def test_ac39_two_process_topology_over_loopback(
     gate = CaptureGate([sys.executable, str(helper_path), str(png_path)], png)
     listener = Listener()
     runtimes: list[Runtime] = []
-    gated: GatedCapture | None = None
+    gated: tuple[GatedCapture, GatedCapture] | None = None
 
     try:
         brain_profile = _brain_profile(
@@ -779,7 +815,7 @@ async def test_ac39_two_process_topology_over_loopback(
                 "brain": {"_session_factory": lambda: model},
                 "proxy": {
                     "_server_factory": listener.factory,
-                    "diagnostic_reporter": brain.report,
+                    "diagnostic_reporter": brain.diagnose,
                 },
             }
 
@@ -788,7 +824,7 @@ async def test_ac39_two_process_topology_over_loopback(
                 "capture": {"_subprocess_runner": gate.runner},
                 "agent_link": {
                     "_connector": lambda url, **kwargs: runtime.connect(listener),
-                    "diagnostic_reporter": runtime.report,
+                    "diagnostic_reporter": runtime.diagnose,
                 },
             }
 
@@ -803,16 +839,15 @@ async def test_ac39_two_process_topology_over_loopback(
         # -- the brain: ready once both probes are answered ---------------- #
         await brain.start()
         await brain.ready()
-        assert len(model.probes) == 2, brain.describe()
-        assert listener.listening["host"] == LOOPBACK and listener.listening["port"] == PROXY_PORT
-        assert listener.listening["ssl_context"] is None
+        assert len(model.probes) == 2, brain.report()
+        _listening_on_loopback_without_tls(listener)
 
         # -- invalid token: auth_failed in the agent's diagnostics, 4401 --- #
         await intruder.start()
         await intruder.ready()
         refused = await intruder.diagnostic(PROXY_ERROR_AUTH_FAILED)
         assert WRONG_TOKEN not in refused and PAIRING_TOKEN not in refused
-        assert await intruder.terminate() == 0, intruder.describe()
+        assert await intruder.terminate() == 0, intruder.report()
         error, close_code = await _dial_with_wrong_token(listener)
         assert error["type"] == FRAME_ERROR and error["code"] == PROXY_ERROR_AUTH_FAILED
         assert error["id"] == "nonce-intruder"
@@ -843,19 +878,16 @@ async def test_ac39_two_process_topology_over_loopback(
         gated_second = await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         assert _current_message_id(gated_second) == MESSAGE_GATED
         gated = await gate.acknowledged()
-        assert model.requests.empty(), [
-            (_current_message_id(body), len(_tool_messages(body)), body["messages"][-1])
-            for body in model.requests._queue  # type: ignore[attr-defined]
-        ]
+        assert model.requests.empty()
         assert agent.alive
         agent.kill()
-        gated.abandon()
-        assert await agent.exited() == KILLED
-        assert agent.pair is not None and agent.pair.server.close_code == WS_ABNORMAL_CLOSURE
-        killed, gated = gated, None
+        assert await agent.exited() == -signal.SIGKILL
+        _the_link_was_lost_abruptly(agent)
+        reader, writer = gated
+        gated = None
         # What the abandoned program sent before it died is the proof the
         # capture had not completed before the kill.
-        assert killed.release(byte=False) == b""
+        assert await CaptureGate.release(reader, writer, byte=False) == b""
         gated_third = await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         assert _current_message_id(gated_third) == MESSAGE_GATED
         disconnected = _tool_envelope(gated_third, 1)
@@ -881,24 +913,26 @@ async def test_ac39_two_process_topology_over_loopback(
         assert _current_message_id(again_gated_first) == f"{MESSAGE_GATED}#2"
         await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         gated = await gate.acknowledged()
-        released, gated = gated, None
-        assert released.release(byte=True) == HELPER_DONE
+        reader, writer = gated
+        gated = None
+        assert await CaptureGate.release(reader, writer, byte=True) == HELPER_DONE
         again_gated_third = await asyncio.wait_for(model.requests.get(), WAIT_SECONDS)
         assert _current_message_id(again_gated_third) == f"{MESSAGE_GATED}#2"
-        released_result = _tool_envelope(again_gated_third, 1)
-        assert released_result["status"] == "success", released_result
-        assert released_result["result"]["source"] == SOURCE_GATED
+        released = _tool_envelope(again_gated_third, 1)
+        assert released["status"] == "success", released
+        assert released["result"]["source"] == SOURCE_GATED
         assert _image_parts(again_gated_third) == [png]
 
         # -- both return 0 on their stop ----------------------------------- #
-        assert await restarted.terminate() == 0, restarted.describe()
-        assert await brain.terminate() == 0, brain.describe()
+        assert await restarted.terminate() == 0, restarted.report()
+        assert await brain.terminate() == 0, brain.report()
         assert model.unscripted == []
         assert model.requests.empty()
-        assert model.urls == {MODEL_ENDPOINT}
+        _every_request_went_to_the_model_endpoint(model)
     finally:
         if gated is not None:
-            gated.release(byte=False)
+            reader, writer = gated
+            await CaptureGate.release(reader, writer, byte=False)
         for runtime in runtimes:
             await runtime.reap()
         await listener.settle()

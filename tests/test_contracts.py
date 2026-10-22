@@ -530,8 +530,9 @@ def test_platform_notice_kinds_exclude_message_and_watch_tick() -> None:
     ten minus the same three, and none of the appended four."""
 
     assert len(PLATFORM_NOTICE_KINDS) == 7
-    assert set(PLATFORM_NOTICE_KINDS) == set(EVENT_KINDS[:10]) - {"message", "watch_tick", "cue"}
-    assert not set(PLATFORM_NOTICE_KINDS) & set(EVENT_KINDS[10:])
+    assert set(PLATFORM_NOTICE_KINDS) == EVENT_KIND_SET - {
+        "message", "watch_tick", "cue", "reward", "manual", "speech", "timer",
+    }
     assert "cue" not in PLATFORM_NOTICE_KINDS
     assert PLATFORM_NOTICE_KINDS == (
         "sub",

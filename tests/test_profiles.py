@@ -11,12 +11,15 @@ The checks the example suite (``tests/test_examples.py``) does not make:
   to the local ``capture`` provider, and a brain profile enabling both fails
   preparation with the ambiguity diagnostic naming the action and both
   providers (AC41);
-* the distribution's package data, read as the build backend reads it,
-  ships exactly the shipped manifests, ``modules_directory: builtin``
-  discovers them (phase 2's R9, AC33: 8 → 11, allowlisted; 21 today) and the
-  console script answers ``--help`` (AC43) — in-process since phase 8's R9
-  (AC33, plan P15e), which superseded the ``pip install`` into an empty
-  target. A wrong manifest set or a missing script is a failure;
+* the built distribution installs into an empty target with
+  ``pip install --no-deps`` and, from a directory outside the checkout,
+  ``modules_directory: builtin`` discovers exactly the 11 shipped manifests
+  (phase 2's R9, AC33: 8 → 11, allowlisted) and the console script answers
+  ``--help`` (AC43). That test skips only when ``pip`` is unavailable,
+  naming that reason; a build backend that is not importable, an install
+  error or a wrong manifest count is a failure. It is one of phase 8's
+  three Amendment A2 nodes: the AC33 guard lets it spawn, by name, and
+  journals it;
 * phase 2 (R8, R9): the server profile binds its five allowlisted device
   actions to the ``proxy`` provider and ``stream.poll.create`` to
   ``stream_control`` with no ambiguity (AC32); ``--check-config`` passes
@@ -35,23 +38,24 @@ The checks the example suite (``tests/test_examples.py``) does not make:
   temporary variant of it with an oversized or malformed presence setting
   (AC2) or watch setting (AC30).
 
-No positive-duration sleep: the checks run on fakes. No process is started
-(phase 8 R9, AC33).
+No positive-duration sleep: the checks run on fakes, the install test on
+subprocesses that terminate on their own.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
-import fnmatch
-import importlib.metadata
 import importlib.util
 import inspect
+import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
-import warnings
+import textwrap
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -65,8 +69,6 @@ import pytest
 import yaml
 
 import core.main as application
-from core.bus import EventBus
-from core.loader import ModuleLoader
 from core.contracts import TRACE_MODULE_DEGRADED, ActionCall, Destination
 from conftest import (
     ManualClock,
@@ -654,6 +656,17 @@ async def test_ac43_with_no_speech_endpoint_audio_speak_is_named_not_ready_with_
         await edges.close()
 
 
+def _the_closed_port_was_reached(
+    attempts: list[str], allowed: set[str], *, required: set[str] | None = None
+) -> None:
+    """AC33: the fake closed port is what the shipped transports reached —
+    every *required* URL at least once, nothing outside *allowed* (all of
+    *allowed* when *required* is not given)."""
+
+    assert required is not None or set(attempts) == allowed, attempts
+    assert required is None or required <= set(attempts) <= allowed, attempts
+
+
 async def test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not_ready_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -704,10 +717,9 @@ async def test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not
         assert reason == SYNTHESIS_PROBE_FAILED_REASON
         assert reason != SYNTHESIS_NOT_CONFIGURED_REASON
         assert edges.runner.starts == []
-        assert set(attempts) == {
-            "http://127.0.0.1:1/speech",
-            "http://127.0.0.1:1/transcriptions",
-        }
+        _the_closed_port_was_reached(
+            attempts, {"http://127.0.0.1:1/speech", "http://127.0.0.1:1/transcriptions"}
+        )
     finally:
         await started.stop()
         await edges.close()
@@ -806,12 +818,11 @@ async def test_ac31_the_full_pc_profile_degrades_three_modules_and_still_chats(
         _assert_the_chat_scenario_ran(started, completed)
         assert _offered_tools(started.model) == PHASE1_READ_ACTIONS
         assert runner.starts == []
-        assert "ws://127.0.0.1:1" in attempts
-        assert set(attempts) <= {
-            "ws://127.0.0.1:1",
-            "http://127.0.0.1:1/speech",
-            "http://127.0.0.1:1/transcriptions",
-        }
+        _the_closed_port_was_reached(
+            attempts,
+            {"ws://127.0.0.1:1", "http://127.0.0.1:1/speech", "http://127.0.0.1:1/transcriptions"},
+            required={"ws://127.0.0.1:1"},
+        )
     finally:
         await started.stop()
 
@@ -969,87 +980,141 @@ async def test_capture_and_proxy_together_fail_preparation_with_the_ambiguity_di
 # --------------------------------------------------------------------------- #
 
 
-def _setuptools_table() -> dict[str, Any]:
-    """The ``[tool.setuptools]`` table the build backend builds the
-    distribution from.
+def _pip_available() -> tuple[bool, str]:
+    """Whether ``<sys.executable> -m pip`` answers ``--version``."""
 
-    Read through ``setuptools.config.pyprojecttoml.read_configuration`` —
-    the backend's own reader, without expansion — and checked equal to the
-    table ``tomllib`` reads from the same file. A backend that cannot be
-    imported is a failure, never a fallback: the ``test`` extra of
-    ``pyproject.toml`` declares ``setuptools>=69`` for this.
-    """
-
-    if importlib.util.find_spec("setuptools") is None:
-        pytest.fail(
-            "the build backend `setuptools` is not importable: install the `test` "
-            "extra of pyproject.toml (it declares setuptools>=69)"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
         )
-    # Before 3.12 setuptools' distutils shim turns itself off once anything
-    # looked ``pip`` up (``tests/test_installation_doc.py`` does), and its
-    # first import then fails; the stdlib ``distutils`` those versions carry
-    # serves the read as well. 3.12+ has no stdlib copy and no such switch.
-    with pytest.MonkeyPatch.context() as patch, warnings.catch_warnings():
-        if sys.version_info < (3, 12):
-            patch.setenv("SETUPTOOLS_USE_DISTUTILS", "stdlib")
-            warnings.simplefilter("ignore")
-        from setuptools.config.pyprojecttoml import read_configuration
-
-    pyproject = ROOT / "pyproject.toml"
-    table = tomllib.loads(pyproject.read_text(encoding="utf-8"))["tool"]["setuptools"]
-    read = read_configuration(str(pyproject), expand=False)["tool"]["setuptools"]
-    assert read["package-data"] == table["package-data"]
-    assert read["packages"] == table["packages"]
-    return dict(read)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if completed.returncode != 0:
+        return False, (completed.stderr or completed.stdout).strip()
+    return True, completed.stdout.strip()
 
 
-def _packages(include: list[str]) -> list[str]:
-    """The packages ``packages.find`` selects under the checkout: every
-    directory with an ``__init__.py``, reached through packages only, whose
-    dotted name an *include* pattern matches."""
+def _subprocess_environment(target: Path) -> dict[str, str]:
+    """A process environment seeing the installed target and not the checkout."""
 
-    found: list[str] = []
-
-    def walk(directory: Path, prefix: str) -> None:
-        for child in sorted(directory.iterdir()):
-            if not child.is_dir() or not (child / "__init__.py").is_file():
-                continue
-            name = f"{prefix}{child.name}"
-            if child.name == "__pycache__" or not name.replace(".", "_").isidentifier():
-                continue
-            if any(fnmatch.fnmatchcase(name, pattern) for pattern in include):
-                found.append(name)
-            walk(child, f"{name}.")
-
-    walk(ROOT, "")
-    return found
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("PYTHONPATH", "PYTHONSAFEPATH")
+    }
+    environment["PYTHONPATH"] = str(target)
+    # pip must not reach an index: nothing is downloaded (the backend comes
+    # from the test environment, dependencies are skipped) and the version
+    # self-check is a network request too.
+    environment["PIP_NO_INDEX"] = "1"
+    environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    return environment
 
 
-def _packaged_manifests() -> dict[str, set[Path]]:
-    """Every ``module.yaml`` the distribution ships, by the package-data key
-    whose glob selects it, resolved against the package's directory."""
+DISCOVERY_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import os
+    import site
+    import sys
 
-    table = _setuptools_table()
-    package_data: dict[str, list[str]] = table["package-data"]
-    packages = _packages(table["packages"]["find"]["include"])
-    shipped: dict[str, set[Path]] = {}
-    for key, globs in package_data.items():
-        if key not in packages:
-            pytest.fail(f"package-data names {key}, which packages.find does not ship")
-        directory = ROOT.joinpath(*key.split("."))
-        shipped[key] = {
-            path.resolve()
-            for pattern in globs
-            for path in directory.glob(pattern)
-            if path.name == "module.yaml"
-        }
-    return shipped
+    excluded = [os.path.realpath(entry) for entry in sys.argv[1:-1]]
+    # The interpreter's own environment stays whatever its location: a
+    # virtualenv created inside the checkout (``.venv``) has its
+    # site-packages under an excluded root, and the target is installed
+    # with ``--no-deps``, so its dependencies come from there.
+    preserved = [
+        os.path.realpath(entry)
+        for entry in (
+            sys.prefix,
+            sys.exec_prefix,
+            sys.base_prefix,
+            sys.base_exec_prefix,
+            *site.getsitepackages(),
+            site.getusersitepackages(),
+        )
+    ]
+
+    def is_under(real, roots):
+        return any(real == root or real.startswith(root + os.sep) for root in roots)
+
+    def is_excluded(entry):
+        real = os.path.realpath(entry or os.getcwd())
+        return is_under(real, excluded) and not is_under(real, preserved)
+
+    # The checkout (and its copy) is dropped from the path wherever it
+    # appears — the empty entry (the working directory) is kept, since that
+    # directory is neither — so what is imported is what was installed.
+    sys.path[:] = [entry for entry in sys.path if not is_excluded(entry)]
+
+    import core.main as application
+    from core.bus import EventBus
+    from core.loader import ModuleLoader
+
+    config_path = sys.argv[-1]
+    config = application.load_config(config_path)
+    loader = ModuleLoader(EventBus(), config["modules_directory"])
+    print(json.dumps({
+        "core": os.path.realpath(application.__file__),
+        "modules_directory": os.path.realpath(config["modules_directory"]),
+        "manifests": sorted(loader._discover()),
+    }))
+    """
+)
+
+
+#: What a pristine copy of the checkout leaves out: build artefacts an earlier
+#: build left in the tree (``build/``, ``*.egg-info`` with its recorded
+#: ``SOURCES.txt``), which setuptools would otherwise ship again whatever the
+#: package-data globs name — the very defect this test guards — plus the
+#: test tree, the environments and the VCS data, none of which is packaged.
+_NOT_COPIED = ("tests", "build", "__pycache__")
+
+
+def _ignore_unpackaged(directory: str, names: list[str]) -> set[str]:
+    return {
+        name
+        for name in names
+        if name in _NOT_COPIED or name.startswith(".") or name.endswith(".egg-info")
+    }
+
+
+def _pristine_checkout(destination: Path) -> Path:
+    """The checkout's sources copied to *destination*, without build artefacts."""
+
+    shutil.copytree(ROOT, destination, ignore=_ignore_unpackaged)
+    assert (destination / "pyproject.toml").is_file()
+    assert sorted(
+        child.name for child in (destination / "modules").iterdir()
+        if (child / "module.yaml").is_file()
+    ) == sorted(SHIPPED_MANIFESTS)
+    assert not (destination / "build").exists()
+    assert not list(destination.glob("*.egg-info"))
+    return destination
+
+
+def _run_outside_the_checkout(
+    argv: list[str], *, cwd: Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    assert not str(cwd.resolve()).startswith(str(ROOT.resolve()))
+    return subprocess.run(
+        argv, cwd=str(cwd), env=environment, capture_output=True, text=True, timeout=300, check=False
+    )
 
 
 def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
 ) -> None:
-    """AC43 (R8), AC33 (R9): the distribution ships exactly the shipped
+    """AC43 (R8), AC33 (R9): ``pip install --no-deps --no-build-isolation
+    --target <empty dir> <checkout>`` — one command, network-free because
+    the build backend is imported from the test environment — then, from a
+    directory outside the checkout with only the target on ``PYTHONPATH``
+    and the checkout removed from ``sys.path``, a configuration with
+    ``modules_directory: builtin`` discovers exactly the shipped
     manifests — 17 was phase 3's final value, AC40 (R8), pinned by plan step P23
     (allowlisted): phase 2's 11 (its three superseded phase 1's 8) plus
     ``clips``, ``viewer_memory``, ``moderation``, ``watch``, ``kick`` and
@@ -1057,38 +1122,69 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     allowlisted): 18 with the automation bridge — superseded by phase 7's R1,
     R9 (plan step P1, allowlisted): 19 with ``web`` — superseded by phase 8's
     R6 (plan step P9, allowlisted): 20 with ``operator`` — superseded by phase
-    8's R8 (plan step P11, allowlisted): 21 with ``timer`` — a configuration
-    with ``modules_directory: builtin`` discovers them, and the console script
-    answers ``--help`` with status 0.
+    8's R8 (plan step P11, allowlisted): 21 with ``timer`` — and the installed
+    console script answers ``--help`` with status 0.
 
-    Phase 8's R9 (AC33, plan P15e, allowlisted) supersedes the ``pip install
-    --target`` into an empty directory and the child interpreters run from
-    there: no test starts a process. Two in-process checks replace them. The
-    package data is read as the build backend reads it (``[tool.setuptools]``
-    of ``pyproject.toml``) and every glob is resolved against its package —
-    the packaged manifests are exactly the shipped ones, each per-module line
-    selecting its own, so a build ships them whatever an earlier build left
-    in the tree (P6) — and the builtin directory discovers exactly those.
-    The console script is the one the installed distribution's entry points
-    name, called with ``--help``. What is lost (a real install) is recorded
-    as fake-only in the phase summary (D8).
+    Phase 8's AC33 guard refuses every process and socket; this node is one
+    of the three Amendment A2 names (``conftest.A2_REAL_NODES``): it installs
+    for real, spawning ``pip`` and child interpreters on purpose, and the
+    guard journals each spawn.
+
+    The checkout is installed from a pristine copy of its sources: pip
+    builds in the source tree, and the ``build/`` directory and the
+    ``*.egg-info`` it leaves behind would ship the manifests of an earlier
+    build whatever the package-data globs name, which is the defect this
+    test guards (P6) — and would litter the working tree.
+
+    The test skips only when ``pip`` is unavailable, naming that reason. A
+    build backend that cannot be imported (the ``test`` extra of
+    ``pyproject.toml`` declares ``setuptools>=69`` for this), an install
+    error, a wrong manifest count or a failing launcher is a failure.
     """
 
-    shipped = _packaged_manifests()
-    manifests = {
-        ROOT / "modules" / name / "module.yaml": name for name in SHIPPED_MANIFESTS
-    }
-    packaged = set().union(*shipped.values())
-    if packaged != {path.resolve() for path in manifests}:
-        pytest.fail(f"the package data ships {sorted(map(str, packaged))}")
-    for name in SHIPPED_MANIFESTS:
-        own = (ROOT / "modules" / name / "module.yaml").resolve()
-        assert shipped[f"modules.{name}"] == {own}, name
-    assert sorted(manifests.values()) == sorted(SHIPPED_MANIFESTS)
-    assert len(packaged) == 21
-    assert set(manifests.values()) == set(MODULE_NAMES)
+    available, detail = _pip_available()
+    if not available:
+        pytest.skip(f"pip is unavailable for {sys.executable}: {detail}")
 
-    config_path = tmp_path / "builtin.yaml"
+    if importlib.util.find_spec("setuptools") is None:
+        pytest.fail(
+            "the build backend `setuptools` is not importable: install the `test` "
+            "extra of pyproject.toml (it declares setuptools>=69), since the "
+            "distribution is built without build isolation"
+        )
+
+    target = tmp_path / "target"
+    target.mkdir()
+    assert list(target.iterdir()) == []
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    checkout = _pristine_checkout(tmp_path / "checkout")
+    environment = _subprocess_environment(target)
+
+    install = _run_outside_the_checkout(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--no-build-isolation",
+            "--target",
+            str(target),
+            str(checkout),
+        ],
+        cwd=elsewhere,
+        environment=environment,
+    )
+    if install.returncode != 0:
+        pytest.fail(
+            "pip install of the checkout failed (the build backend comes from the "
+            "test environment: the `test` extra declares setuptools>=69):\n"
+            + install.stdout[-2000:]
+            + install.stderr[-4000:]
+        )
+
+    config_path = elsewhere / "builtin.yaml"
     config_path.write_text(
         yaml.safe_dump(
             {
@@ -1099,53 +1195,51 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
         ),
         encoding="utf-8",
     )
-    config = application.load_config(config_path)
-    directory = Path(config["modules_directory"]).resolve()
-    assert directory == (ROOT / "modules").resolve(), directory
-    discovered = sorted(ModuleLoader(EventBus(), str(directory))._discover())
-    assert discovered == sorted(SHIPPED_MANIFESTS)
-    assert {directory / name / "module.yaml" for name in discovered} == packaged
+    # Neither the checkout nor its copy may be what the subprocess imports.
+    discovery = _run_outside_the_checkout(
+        [sys.executable, "-c", DISCOVERY_SCRIPT, str(ROOT), str(checkout), str(config_path)],
+        cwd=elsewhere,
+        environment=environment,
+    )
+    assert discovery.returncode == 0, discovery.stderr
+    report = json.loads(discovery.stdout.strip().splitlines()[-1])
+    installed = str(target.resolve())
+    assert report["core"].startswith(installed + os.sep), report
+    assert report["modules_directory"] == str((target / "modules").resolve()), report
+    assert report["manifests"] == sorted(SHIPPED_MANIFESTS), report
+    assert len(report["manifests"]) == 21
+    assert set(report["manifests"]) == set(MODULE_NAMES)
 
-    scripts = [
-        point
-        for point in importlib.metadata.entry_points(group="console_scripts")
-        if point.name == CONSOLE_SCRIPT
-    ]
-    if len(scripts) != 1:
-        pytest.fail(f"{CONSOLE_SCRIPT}: the installed distribution names no console script")
-    (script,) = scripts
-    assert script.value == "core.main:main"
-    capsys.readouterr()
-    with pytest.raises(SystemExit) as exited:
-        script.load()(["--help"])
-    help_output = capsys.readouterr().out
-    assert exited.value.code == 0, help_output
-    assert "--check-config" in help_output
-    assert "--config" in help_output
+    launcher = target / "bin" / CONSOLE_SCRIPT
+    assert launcher.is_file(), sorted(str(p.relative_to(target)) for p in target.rglob("*"))
+    # The launcher is not on PATH: it is run through the interpreter from the
+    # installed console-script entry point.
+    help_run = _run_outside_the_checkout(
+        [sys.executable, str(launcher), "--help"], cwd=elsewhere, environment=environment
+    )
+    assert help_run.returncode == 0, help_run.stderr
+    assert "--check-config" in help_run.stdout
+    assert "--config" in help_run.stdout
 
 
-def test_install_test_never_skips_and_fails_loudly() -> None:
-    """AC43: the install test cannot turn a wrong count into a pass.
-
-    Supersedes ``test_install_test_skips_only_when_pip_is_unavailable``
-    (phase 8 R9, AC33, plan P15e): the install test no longer runs ``pip``,
-    so the one skip it had (``pip`` unavailable) is gone with it. It now has
-    no skip at all — no ``skipif``, no ``xfail``, no import-or-skip — and a
-    package-data glob outside the shipped packages, a wrong manifest set or
-    a missing console script is a failure, and so is a build backend that
-    cannot be imported (no fallback to a raw TOML read)."""
+def test_install_test_skips_only_when_pip_is_unavailable() -> None:
+    """AC43: the install test has exactly one skip, guarded by the ``pip``
+    probe and naming pip; no ``skipif``, no ``xfail`` and no other skip can
+    turn a missing backend, an install error or a wrong count into a pass."""
 
     source = inspect.getsource(
         test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     )
-    assert "pytest.skip(" not in source
+    skips = [line.strip() for line in source.splitlines() if "pytest.skip(" in line]
+    assert len(skips) == 1
+    assert "pip is unavailable" in skips[0]
     assert "skipif" not in source and "xfail" not in source
     assert "importorskip" not in source
     assert source.count("pytest.fail(") >= 2
-    assert "pytest.fail(" in inspect.getsource(_packaged_manifests)
-    backend = inspect.getsource(_setuptools_table)
-    assert 'find_spec("setuptools")' in backend and "pytest.fail(" in backend
-    assert "is not None" not in backend
+    # The skip is decided by the pip probe alone.
+    skip_index = source.index("pytest.skip(")
+    assert "_pip_available()" in source[:skip_index]
+    assert "find_spec(\"setuptools\")" in source[skip_index:]
 
 
 # --------------------------------------------------------------------------- #

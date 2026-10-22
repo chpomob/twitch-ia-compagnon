@@ -4,7 +4,9 @@
 socket or starting a process raises, except the event loop's own wakeup pair.
 These tests run under it, so each refusal below is the guard's, and the
 ``asyncio.run`` that succeeds proves the self-pipe exception holds on this
-interpreter. The transitional ledger is gone (P15e converted its last node
+interpreter. The three nodes Amendment A2 names (``conftest.A2_REAL_NODES``)
+run with the real entry points, each call journaled; the A2 tests below check
+the list, the journal and the negative control. The transitional ledger is gone (P15e converted its last node
 and deleted it): :func:`test_the_guard_has_no_ledger` checks no ledger symbol
 or branch is left, and :data:`AC33_PROBE` stays as the probe's list committed
 at ``7782e5f``, the record of the conversion. The real-instance trials
@@ -346,6 +348,85 @@ def test_the_probe_list_is_the_committed_record() -> None:
     assert len({entry.split("::")[0] for entry in AC33_PROBE}) == 24
     assert all("[" not in entry for entry in AC33_PROBE)
     assert all(entry.startswith("tests/test_") and "::" in entry for entry in AC33_PROBE)
+
+
+# --------------------------------------------------------------------------- #
+# Amendment A2 (P17F2): three nodes named, real and journaled
+# --------------------------------------------------------------------------- #
+
+#: The three node IDs Amendment A2 names, as the spec writes them.
+A2_NAMED = frozenset(
+    {
+        "tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help",
+        "tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base",
+        "tests/test_kick.py::test_ac34_the_listener_runs_on_the_configured_host_and_port",
+    }
+)
+
+
+def test_a2_the_guard_names_exactly_the_three_nodes() -> None:
+    """The guard's list holds exactly A2's three node IDs, each a test its
+    file defines."""
+
+    assert conftest.A2_REAL_NODES == A2_NAMED
+    for node in conftest.A2_REAL_NODES:
+        relative, name = node.split("::")
+        tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+        assert any(
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name
+            for item in tree.body
+        ), node
+
+
+def test_a2_an_unlisted_node_is_refused_a_socket_and_a_process(
+    request: pytest.FixtureRequest,
+) -> None:
+    """A2's negative control, executed: this node is not named, so a socket
+    and a process are both refused, and the journal records nothing for it."""
+
+    assert request.node.nodeid not in conftest.A2_REAL_NODES
+    before = list(conftest.A2_JOURNAL)
+    with pytest.raises(AssertionError) as refused:
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    assert str(refused.value) == _socket_refused(request)
+    with pytest.raises(AssertionError) as refused:
+        subprocess.run(["true"])
+    assert str(refused.value) == _process_refused(request)
+    assert conftest.A2_JOURNAL == before
+
+
+def test_a2_a_named_node_runs_the_real_entry_point_and_is_journaled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard, entered for a named node, installs journaling wrappers
+    that run the real entry points: a call is journaled with its node, then
+    reaches the real function (here ``os.execv`` with an arity it refuses,
+    so nothing starts). For an unlisted node the same call is refused and
+    nothing is journaled."""
+
+    guard = conftest._ac33_isolation._get_wrapped_function()
+    named = "tests/test_kick.py::test_ac34_the_listener_runs_on_the_configured_host_and_port"
+    for nodeid, journaled in ((named, True), ("tests/test_x.py::test_unlisted", False)):
+        node = type("Node", (), {"nodeid": nodeid, "path": ROOT / nodeid.split("::")[0], "name": "n"})()
+        fake_request = type("Request", (), {"node": node, "module": None})()
+        with pytest.MonkeyPatch.context() as inner:
+            # This node's own guard is lifted for the inner one to install.
+            for (owner, name), real in conftest._REAL_ENTRY_POINTS.items():
+                monkeypatch.setattr(owner, name, real)
+            run = guard(fake_request, inner)
+            next(run)
+            before = len(conftest.A2_JOURNAL)
+            if journaled:
+                with pytest.raises(TypeError):
+                    os.execv(*(None,) * 7)
+                assert conftest.A2_JOURNAL[before:] == [(named, "process", "os.execv")]
+                del conftest.A2_JOURNAL[before:]
+            else:
+                with pytest.raises(AssertionError, match=f"^AC33: {nodeid} started a process$"):
+                    os.execv(*(None,) * 7)
+                assert len(conftest.A2_JOURNAL) == before
+            with pytest.raises(StopIteration):
+                next(run)
 
 
 # --------------------------------------------------------------------------- #

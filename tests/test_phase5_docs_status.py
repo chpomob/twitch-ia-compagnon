@@ -33,9 +33,10 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import importlib.util
 import socket
+import subprocess
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -281,16 +282,26 @@ COUNTED_FUNCTIONS = (
 GUARD_REFUSAL = re.compile(r"^AC33: \S+ created a socket$")
 
 
+class _Unopened:
+    """What a counted socket attempt hands back once the guard refused it:
+    closable, holding no descriptor."""
+
+    def close(self) -> None:
+        return None
+
+
 class SocketCount:
     """Every socket a call attempts, counted in-process under the guard.
 
     Phase 8 (R9, AC33, plan P15e) supersedes the child interpreter that
     counted sockets with real ones: no node may create a socket at all, so
-    each entry point the guard installed is wrapped, and every attempt is
+    each entry point the guard installed is wrapped and every attempt is
     counted — ``nodes``, every socket attempted; ``network``, the non-local
-    ones — and must end in the guard's own refusal (``refusals``). An attempt
-    the guard let through would be a socket created: it is counted in
-    ``created`` and the count is wrong whatever the call did with it.
+    ones. Each attempt must end in the guard's own refusal (``refusals``);
+    the caller is then handed an unopened stand-in (no descriptor), so a
+    node that only opens and closes a socket runs on, as it did when the
+    socket was real. An attempt the guard let through would be a socket
+    created: it is counted in ``created``.
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -304,7 +315,10 @@ class SocketCount:
             sock: socket.socket, family: Any = -1, type: Any = -1, proto: Any = -1, fileno: Any = None
         ) -> None:
             remote = fileno is None and family in (-1, socket.AF_INET, socket.AF_INET6)
-            self._attempt("socket", remote, lambda: guarded_init(sock, family, type, proto, fileno))
+            if self._attempt("socket", remote, lambda: guarded_init(sock, family, type, proto, fileno)) is _REFUSED:
+                # Never initialised: its descriptor is -1, so closing it closes nothing.
+                sock._io_refs = 0  # type: ignore[attr-defined]
+                sock._closed = False  # type: ignore[attr-defined]
 
         monkeypatch.setattr(socket.socket, "__init__", init)
         for name, remote in COUNTED_FUNCTIONS:
@@ -312,7 +326,10 @@ class SocketCount:
 
     def _counting(self, name: str, guarded: Callable[..., Any], remote: bool) -> Callable[..., Any]:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            return self._attempt(name, remote, lambda: guarded(*args, **kwargs))
+            result = self._attempt(name, remote, lambda: guarded(*args, **kwargs))
+            if result is not _REFUSED:
+                return result
+            return (_Unopened(), _Unopened()) if name == "socketpair" else _Unopened()
 
         return wrapper
 
@@ -323,82 +340,95 @@ class SocketCount:
         try:
             result = call()
         except AssertionError as refused:
-            if GUARD_REFUSAL.match(str(refused)):
-                self.refusals.append(name)
-            raise
+            if not GUARD_REFUSAL.match(str(refused)):
+                raise
+            self.refusals.append(name)
+            return _REFUSED
         self.created.append(name)
         return result
 
 
-@dataclass
-class TrialRun:
-    """The in-process run of a trial file: its nodes' outcomes and socket count."""
-
-    collected: list[str]
-    skipped: dict[str, str]
-    other: dict[str, str]
-    count: SocketCount
+#: What :meth:`SocketCount._attempt` returns for an attempt the guard refused.
+_REFUSED = object()
 
 
-def counted_run(module: Any, monkeypatch: pytest.MonkeyPatch) -> TrialRun:
-    """Call every ``test_*`` node of *module* in-process, with no trial
-    variable in the environment, under a :class:`SocketCount`."""
+def counted_run(path: str | Path) -> subprocess.CompletedProcess[str]:
+    """Run the test file at *path* in-process under a :class:`SocketCount`,
+    with no trial variable in the environment, reported as the child
+    interpreter reported it: ``pytest -q -rs`` lines (one ``SKIPPED`` line
+    per skipped node, then the count line) and the
+    ``PHASE5-SOCKETS nodes=<n> network=<n>`` line; ``returncode`` 0 unless a
+    node failed. Every counted attempt was the guard's refusal: no socket was
+    created to be counted (phase 8 R9, AC33)."""
 
-    for name in list(os.environ):
-        if name.startswith("PHASE5_TRIAL"):
-            monkeypatch.delenv(name)
-    count = SocketCount(monkeypatch)
-    collected = sorted(name for name in vars(module) if name.startswith("test_"))
-    skipped: dict[str, str] = {}
-    other: dict[str, str] = {}
-    for name in collected:
-        try:
-            getattr(module, name)()
-        except pytest.skip.Exception as skip:
-            skipped[name] = str(skip.msg)
-        except BaseException as exc:  # noqa: BLE001 - every other outcome is reported
-            other[name] = f"{type(exc).__name__}: {exc}"
-        else:
-            other[name] = "passed"
-    return TrialRun(collected, skipped, other, count)
+    target = Path(path) if Path(path).is_absolute() else REPOSITORY / path
+    shown = target.relative_to(REPOSITORY) if target.is_relative_to(REPOSITORY) else target
+    outcomes: dict[str, int] = {}
+    lines: list[str] = []
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        for name in list(os.environ):
+            if name.startswith("PHASE5_TRIAL"):
+                monkeypatch.delenv(name)
+        spec = importlib.util.spec_from_file_location(f"_counted_{target.stem}", target)
+        assert spec is not None and spec.loader is not None, target
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        count = SocketCount(monkeypatch)
+        for name in sorted(name for name in vars(module) if name.startswith("test_")):
+            try:
+                getattr(module, name)()
+            except pytest.skip.Exception as skip:
+                outcomes["skipped"] = outcomes.get("skipped", 0) + 1
+                lines.append(f"SKIPPED [1] {shown}::{name}: {skip.msg}")
+            except BaseException as exc:  # noqa: BLE001 - every other outcome is reported
+                outcomes["failed"] = outcomes.get("failed", 0) + 1
+                lines.append(f"FAILED {shown}::{name} - {type(exc).__name__}: {exc}")
+            else:
+                outcomes["passed"] = outcomes.get("passed", 0) + 1
+    assert count.refusals == count.nodes and count.created == [], (count.nodes, count.created)
+    summary = ", ".join(f"{number} {outcome}" for outcome, number in sorted(outcomes.items()))
+    lines.append(f"{summary} in 0.00s")
+    lines.append(f"PHASE5-SOCKETS nodes={len(count.nodes)} network={len(count.network)}")
+    return subprocess.CompletedProcess(
+        ("counted_run", str(shown)), 1 if "failed" in outcomes else 0, "\n".join(lines) + "\n", ""
+    )
 
 
-def test_ac36_the_socket_count_sees_a_local_and_a_network_socket(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ac36_the_socket_count_sees_a_local_and_a_network_socket(tmp_path: Path) -> None:
     """The counter is not blind: a node creating a socket pair and a network
-    socket is counted in both windows, and each attempt is the guard's
-    refusal (phase 8 R9, AC33: no socket is created to be counted)."""
+    socket is counted in both windows (phase 8 R9, AC33: each attempt is the
+    guard's refusal, counted, and no socket is created)."""
 
-    def opens() -> None:
-        for end in socket.socketpair():
-            end.close()
+    probe = tmp_path / "test_socket_probe.py"
+    probe.write_text(
+        "import socket\n\n\n"
+        "def test_opens() -> None:\n"
+        "    for end in socket.socketpair():\n"
+        "        end.close()\n"
+        "    socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()\n",
+        encoding="utf-8",
+    )
+    run = counted_run(probe)
+    assert run.returncode == 0, run.stdout + run.stderr
+    (line,) = [text for text in run.stdout.splitlines() if text.startswith("PHASE5-SOCKETS ")]
+    counts = dict(field.split("=") for field in line.split()[1:])
+    assert int(counts["nodes"]) >= 2 and int(counts["network"]) == 1, line
 
-    def connects() -> None:
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
 
-    count = SocketCount(monkeypatch)
-    for node in (opens, connects):
-        with pytest.raises(AssertionError, match=GUARD_REFUSAL.pattern):
-            node()
-    assert len(count.nodes) >= 2 and len(count.network) == 1, count.nodes
-    assert count.refusals == count.nodes and count.created == []
-
-
-def test_ac36_the_trial_file_skips_its_eight_nodes_opening_no_socket(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ac36_the_trial_file_skips_its_eight_nodes_opening_no_socket() -> None:
     """AC36: with every trial variable unset, the file collects 8 nodes, all
     skipped, each reason naming its node's variables, and 0 sockets open."""
 
     import test_phase5_trials as trials
 
-    run = counted_run(trials, monkeypatch)
-    assert (run.count.nodes, run.count.network, run.count.refusals) == ([], [], [])
-    assert len(run.collected) == 8 and sorted(run.skipped) == run.collected, run.other
-    assert run.other == {}
-    reasons = [f"SKIPPED {name}: {reason}" for name, reason in run.skipped.items()]
-    assert len(reasons) == 8
+    run = counted_run("tests/test_phase5_trials.py")
+    output = run.stdout
+    assert run.returncode == 0, output + run.stderr
+    assert "PHASE5-SOCKETS nodes=0 network=0" in output.splitlines(), output
+    assert re.search(r"^8 skipped in ", output, re.MULTILINE), output
+    assert not re.search(r"\b(passed|failed|error|errors|xfailed|xpassed)\b", output), output
+    reasons = [line for line in output.splitlines() if line.startswith("SKIPPED ")]
+    assert len(reasons) == 8, output
     assert sorted(trials.QUESTIONS) == list(QUESTIONS)
     assert sorted(trials.NODES.values()) == list(QUESTIONS)
     for question, (_, variables) in trials.QUESTIONS.items():

@@ -50,7 +50,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import os
 import re
+import select
 import signal
 import struct
 import sys
@@ -927,6 +929,18 @@ async def test_without_a_rule_the_capture_is_refused_before_the_provider() -> No
     assert_nothing_stored(h)
 
 
+async def _listening_off_inputs_start_nothing(h: Any, runner: CallTrackingRunner) -> None:
+    """Phase 8 R7 (AC25): with listening off, ``start_inputs`` and
+    ``stop_inputs`` start 0 tasks and spawn nothing."""
+
+    await h.handle.start_inputs()
+    await settle()
+    assert h.context.tasks.active == 0
+    assert runner.spawn_count == 0
+    await h.handle.stop_inputs()
+    assert h.context.tasks.active == 0
+
+
 async def test_prepare_starts_no_task_and_spawns_nothing() -> None:
     """AC12: 0 supervised tasks and 0 spawns after activation and
     ``prepare``; a spawn happens only inside a call, and the call leaves no
@@ -943,12 +957,8 @@ async def test_prepare_starts_no_task_and_spawns_nothing() -> None:
     await h.handle.prepare()
     assert h.context.tasks.active == 0
     assert runner.spawn_count == 0
-    await h.handle.start_inputs()
-    await settle()
-    assert h.context.tasks.active == 0
-    assert runner.spawn_count == 0
-    await h.handle.stop_inputs()
-    assert h.context.tasks.active == 0
+    assert hasattr(h.handle, "start_inputs")
+    await _listening_off_inputs_start_nothing(h, runner)
 
     observation = await h.capture(seconds=1)
     assert observation.status == "success", observation.error
@@ -1362,6 +1372,43 @@ def fake_recorders(monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS, **script
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn(**script))
 
 
+def _the_fake_recorder_ran_in_its_own_session_and_was_reaped(fake_spawn: FakeOS) -> None:
+    """AC33: the shipped runner spawned the configured argv in a session of its own and reaped it."""
+
+    (fake,) = fake_spawn.spawned
+    assert fake.argv == tuple(RECORDER_ARGV)
+    assert fake.options["start_new_session"] is True
+    assert fake.reaped
+
+
+def _the_fake_group_was_killed(fake_spawn: FakeOS, *, leader_status: int = -signal.SIGKILL) -> None:
+    """AC33: the deadline's kill reached the fake's whole process group."""
+
+    (fake,) = fake_spawn.spawned
+    assert f"os.killpg:{signal.SIGKILL}" in fake.events
+    assert fake.returncode == leader_status
+
+
+def _the_fake_ignored_sigterm_and_the_closed_pipe_ended_it(fake_spawn: FakeOS) -> None:
+    """AC33: SIGTERM reached the group and was ignored; the closed pipe ended it."""
+
+    (fake,) = fake_spawn.spawned
+    assert fake.events.index(f"os.killpg:{signal.SIGTERM}") < fake.events.index("close_stdout")
+    assert fake.events.index("close_stdout") < fake.events.index("wait")
+
+
+async def _readable(fd: int) -> None:
+    """Return once *fd* is readable, failing (never hanging) after 5 s."""
+
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    loop.add_reader(fd, lambda: ready.done() or ready.set_result(None))
+    try:
+        await asyncio.wait_for(ready, 5.0)
+    finally:
+        loop.remove_reader(fd)
+
+
 async def test_the_shipped_runner_records_a_real_process(
     monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
 ) -> None:
@@ -1379,10 +1426,7 @@ async def test_the_shipped_runner_records_a_real_process(
     assert observation.result["size"] == 96_044
     (process,) = processes
     assert process.returncode is not None
-    (fake,) = fake_spawn.spawned
-    assert fake.argv == tuple(RECORDER_ARGV)
-    assert fake.options["start_new_session"] is True
-    assert fake.reaped
+    _the_fake_recorder_ran_in_its_own_session_and_was_reaped(fake_spawn)
 
 
 async def test_the_shipped_runner_kills_a_silent_real_recorder_at_the_deadline(
@@ -1416,9 +1460,7 @@ async def test_the_shipped_runner_kills_a_silent_real_recorder_at_the_deadline(
     assert process.returncode is not None and process.returncode < 0
     assert_failure(observation, "error", ERROR_CAPTURE_TIMED_OUT)
     assert_nothing_stored(h)
-    (fake,) = fake_spawn.spawned
-    assert f"os.killpg:{signal.SIGKILL}" in fake.events
-    assert fake.returncode == -signal.SIGKILL
+    _the_fake_group_was_killed(fake_spawn)
 
 
 async def test_the_shipped_runner_is_not_held_by_a_fast_recorder_after_its_segment(
@@ -1445,48 +1487,56 @@ async def test_the_shipped_runner_is_not_held_by_a_fast_recorder_after_its_segme
     assert observation.result["size"] == 32_044
     (process,) = processes
     assert process.returncode is not None
-    (fake,) = fake_spawn.spawned
-    # SIGTERM reached the group and was ignored; the closed pipe ended it.
-    assert fake.events.index(f"os.killpg:{signal.SIGTERM}") < fake.events.index("close_stdout")
-    assert fake.events.index("close_stdout") < fake.events.index("wait")
+    _the_fake_ignored_sigterm_and_the_closed_pipe_ended_it(fake_spawn)
 
 
 async def test_the_shipped_runner_kills_a_child_left_by_an_exited_wrapper(
-    monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_spawn: FakeOS
 ) -> None:
     """A wrapper that exits while its recording child still holds stdout is
     reaped first; the kill at the deadline still reaches the child through
-    the process group."""
+    the process group. AC33: the wrapper is a fake leaving a child in its
+    group that holds the FIFO ``alive`` open as the original child script did
+    (``b"r"`` on start, EOF once it ends)."""
 
-    fake_recorders(monkeypatch, fake_spawn, leave_child=True)
-    processes: list[Any] = []
-    spawned = asyncio.Event()
-    h = await harness(
-        settings=real_settings(RECORDER_ARGV, real_runner(processes, spawned)),
-        start=90.0,
-    )
-    h.deadline = DEADLINE
+    fake_recorders(monkeypatch, fake_spawn, leave_child=True, child_fifo=True)
+    alive = tmp_path / "alive"
+    os.mkfifo(alive)
+    fd = os.open(alive, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        processes: list[Any] = []
+        spawned = asyncio.Event()
+        h = await harness(
+            settings=real_settings(
+                [*RECORDER_ARGV, str(alive)],
+                real_runner(processes, spawned),
+            ),
+            start=90.0,
+        )
+        h.deadline = DEADLINE
 
-    task = h.start(seconds=10)
-    await asyncio.wait_for(spawned.wait(), 5.0)
-    (process,) = processes
-    (fake,) = fake_spawn.spawned
-    assert fake.child_pid is not None and not fake_spawn.is_gone(fake.child_pid)
-    # ``wait()`` would park until the child closes stdout: the exit is
-    # observed on ``returncode``.
-    await wait_until(lambda: process.returncode is not None, turns=200_000)
-    assert process.returncode == 0
-    assert not fake_spawn.is_gone(fake.child_pid)  # the child still runs
-    assert not task.done()
+        task = h.start(seconds=10)
+        await asyncio.wait_for(spawned.wait(), 5.0)
+        (process,) = processes
+        await _readable(fd)
+        assert os.read(fd, 1) == b"r"
+        # ``wait()`` would park until the child closes stdout: the exit is
+        # observed on ``returncode``.
+        await wait_until(lambda: process.returncode is not None, turns=200_000)
+        assert process.returncode == 0
+        assert select.select([fd], [], [], 0)[0] == []  # the child still runs
+        assert not task.done()
 
-    advance_to(h.clock, DEADLINE)
-    observation = await finished(task)
+        advance_to(h.clock, DEADLINE)
+        observation = await finished(task)
 
-    assert_failure(observation, "error", ERROR_CAPTURE_TIMED_OUT)
-    assert_nothing_stored(h)
-    await spin()
-    assert fake_spawn.is_gone(fake.child_pid)  # the child ended with the group
-    assert f"os.killpg:{signal.SIGKILL}" in fake.events
+        assert_failure(observation, "error", ERROR_CAPTURE_TIMED_OUT)
+        assert_nothing_stored(h)
+        await _readable(fd)
+        assert os.read(fd, 1) == b""  # the child ended with the group
+    finally:
+        os.close(fd)
+    _the_fake_group_was_killed(fake_spawn, leader_status=0)
 
 
 async def test_negative_a_runner_forgetting_killpg_fails_the_wrapper_test(
@@ -2060,6 +2110,12 @@ async def test_a_failed_transcription_probe_degrades_the_transcription_only(fail
     assert transport.held == 0
 
 
+def _refused_once(attempts: list[str], endpoint: str) -> None:
+    """AC33: the shipped transport reached the fake closed port exactly once."""
+
+    assert attempts == [endpoint], attempts
+
+
 async def test_the_real_transport_against_a_closed_port_degrades_the_transcription(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2085,11 +2141,11 @@ async def test_the_real_transport_against_a_closed_port_degrades_the_transcripti
     assert_value_free(payload["reason"])
     assert CAPTURE_ACTION in h.runtime.actions.registered_ready()
     assert h.handle._session is None  # the transport was released
-    assert attempts == [endpoint]  # the probe reached the transport, and was refused
+    _refused_once(attempts, endpoint)  # the probe reached the transport, and was refused
 
     observation = await h.capture(seconds=3)
     assert_captured(h, observation, "unavailable")
-    assert attempts == [endpoint]
+    _refused_once(attempts, endpoint)
     await h.handle.close()
 
 

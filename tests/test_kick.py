@@ -19,12 +19,9 @@ bound on ``kick/*/chat`` only, beside twitch's binding, and no clip or poll
 service is published for kick.
 
 Every delivery is signed by :class:`conftest.SignedWebhookSender` with the
-test-only :data:`conftest.KICK_TEST_KEY` and posted through a
-:class:`conftest.InMemoryClient` straight to the module's handler; the
-listener ``start_inputs`` binds is a ``TCPSite`` on the
-:class:`conftest.InMemoryNetwork` loopback (AC33: no socket). The wall clock
-is a :class:`conftest.ManualClock` set on an epoch instant, so nothing sleeps
-and nothing leaves the process.
+test-only :data:`conftest.KICK_TEST_KEY` and posted through an in-process
+``aiohttp`` test client; the wall clock is a :class:`conftest.ManualClock`
+set on an epoch instant, so nothing sleeps and nothing leaves the process.
 """
 
 from __future__ import annotations
@@ -38,11 +35,11 @@ from typing import Any
 import aiohttp
 import pytest
 import yaml
+from aiohttp.test_utils import TestClient, TestServer
+
 from conftest import (
     KICK_TEST_KEY,
     FakeResponse,
-    InMemoryClient,
-    InMemoryNetwork,
     ManualClock,
     RecordingScheduler,
     SignedWebhookSender,
@@ -68,8 +65,6 @@ from core.triggers import TriggerRegistry
 from modules.brain import _message_of_work
 from modules.kick import (
     CHAT_URL,
-    REFUSAL_STATUS,
-    REFUSED_BAD_SIGNATURE,
     CHAT_WRITE_ACTION,
     DEFAULT_RATE_LIMIT_SECONDS,
     MAX_BODY_BYTES,
@@ -106,13 +101,6 @@ BASE_SETTINGS: dict[str, Any] = {
     "channels": [CHANNEL],
     "companion_name": COMPANION,
 }
-
-
-@pytest.fixture(autouse=True)
-def loopback(monkeypatch: pytest.MonkeyPatch) -> InMemoryNetwork:
-    """The listener ``start_inputs`` binds listens here, in memory (AC33)."""
-
-    return InMemoryNetwork().install(monkeypatch)
 
 
 def chat_body(
@@ -201,7 +189,7 @@ class Harness:
     chat: ChatContext
     clock: ManualClock
     sender: SignedWebhookSender
-    client: InMemoryClient
+    client: TestClient
     diagnostics: list[str]
     session: PublicKeySession
 
@@ -225,8 +213,8 @@ async def start_harness(
     **overrides: Any,
 ) -> Harness:
     """Activate ``kick`` through the real loader, prepare it, start its
-    inputs (listener on the in-memory loopback, port 0) and open an
-    :class:`InMemoryClient` on another application of the same handler."""
+    inputs (listener on loopback, port 0) and open a test client on an
+    in-process server of the same handler."""
 
     clock = ManualClock(NOW)
     registry = TriggerRegistry()
@@ -255,8 +243,8 @@ async def start_harness(
         registry.configure("kick", policy)
     await module.prepare()
     await module.start_inputs()
-    client = InMemoryClient(module.build_application())
-    await client.start()
+    client = TestClient(TestServer(module.build_application()))
+    await client.start_server()
     return Harness(
         runtime,
         module,
@@ -497,23 +485,17 @@ async def test_ac34_a_65536_byte_body_is_still_accepted() -> None:
         await harness.close()
 
 
-async def test_ac34_the_listener_runs_on_the_configured_host_and_port(
-    loopback: InMemoryNetwork,
-) -> None:
+async def test_ac34_the_listener_runs_on_the_configured_host_and_port() -> None:
     """Loopback and port 0: the bound port is resolved, a signed delivery
-    posted to it through a client session is published, and ``stop_inputs``
-    unbinds it. AC33: the site binds on the in-memory loopback and the
-    session is its ``aiohttp.ClientSession``; the module's runner, site
-    registration and handler are the shipped ones."""
+    posted to it over a real socket is published, and ``stop_inputs``
+    unbinds it."""
 
     harness = await start_harness()
     try:
-        assert loopback.binds == [("127.0.0.1", 0)]
         address = harness.module.address
         assert address is not None
         host, port = address
         assert host == "127.0.0.1" and port > 0
-        assert set(loopback.listeners) == {(host, port)}
         async with aiohttp.ClientSession() as http:
             status = await harness.sender.post(
                 http, CHAT, chat_body(f"over the wire {COMPANION}"),
@@ -524,7 +506,6 @@ async def test_ac34_the_listener_runs_on_the_configured_host_and_port(
 
         await harness.module.stop_inputs()
         assert harness.module.address is None
-        assert loopback.listeners == {}
         async with aiohttp.ClientSession() as http:
             with pytest.raises(aiohttp.ClientConnectionError):
                 await harness.sender.post(
@@ -543,67 +524,11 @@ async def test_a_delivery_before_start_inputs_is_not_accepted() -> None:
         {},
     )
     await module.prepare()
-    async with InMemoryClient(module.build_application()) as client:
+    async with TestClient(TestServer(module.build_application())) as client:
         sender = SignedWebhookSender(KICK_TEST_KEY, clock)
         assert await sender.post(client, CHAT, chat_body(COMPANION)) == 503
     assert events_of(runtime.bus, "channel.chat.message") == []
     await module.close()
-
-
-async def test_ac33_a_wrong_signature_is_still_refused_over_the_in_memory_client() -> None:
-    """AC33 negative check: a delivery whose signature covers other content
-    is answered the bad-signature status (401) over :class:`InMemoryClient`,
-    counted once and published nowhere — the client hands the handler the
-    request, it never bypasses the verification."""
-
-    harness = await start_harness()
-    try:
-        forged = SignedWebhookSender(KICK_TEST_KEY, harness.clock)
-        signature = forged.sign("another-id", forged.timestamp(), b"{}")
-        status = await harness.post(CHAT, chat_body(f"hi {COMPANION}"), signature=signature)
-        assert status == REFUSAL_STATUS[REFUSED_BAD_SIGNATURE] == 401
-        assert harness.module.counts[REFUSED_BAD_SIGNATURE] == 1
-        assert harness.events() == [] and harness.scheduler.admissions == []
-        assert harness.client.requests == 1
-    finally:
-        await harness.close()
-
-
-def raw_delivery(sender: SignedWebhookSender, body: bytes, *, message_id: str) -> bytes:
-    """One signed delivery as the bytes a platform writes on the wire."""
-
-    headers = {"Host": "127.0.0.1:8080", **sender.headers(CHAT, body, message_id=message_id)}
-    headers["Content-Length"] = str(len(body))
-    head = "".join(f"{name}: {value}\r\n" for name, value in headers.items())
-    return f"POST /webhooks/kick HTTP/1.1\r\n{head}\r\n".encode("ascii") + body
-
-
-async def test_ac33_the_parsed_wire_form_keeps_the_headers_and_the_declared_length() -> None:
-    """AC33, the parser ``InMemoryClient.request`` skips: a delivery written
-    as raw HTTP/1.1 bytes and parsed by ``aiohttp``'s ``HttpRequestParser``
-    reaches the handler with its signed headers intact (200, published
-    once), and a 65537-byte body is refused on its parsed ``Content-Length``
-    (413, ``too_large``) as it was over a real listener."""
-
-    harness = await start_harness()
-    try:
-        body = SignedWebhookSender.body(chat_body(f"wire {COMPANION}"))
-        response = await harness.client.request_raw(
-            raw_delivery(harness.sender, body, message_id="wire-1")
-        )
-        assert response.status == 200
-        assert len(harness.events()) == 1
-
-        encoded = SignedWebhookSender.body(chat_body(f"{COMPANION}!", message_id="wire-big"))
-        large = encoded[:-1] + b" " * (MAX_BODY_BYTES + 1 - len(encoded)) + b"}"
-        response = await harness.client.request_raw(
-            raw_delivery(harness.sender, large, message_id="wire-2")
-        )
-        assert response.status == 413
-        assert harness.module.counts["too_large"] == 1
-        assert len(harness.events()) == 1
-    finally:
-        await harness.close()
 
 
 # -- the public key: configured, or fetched once at prepare --------------------- #

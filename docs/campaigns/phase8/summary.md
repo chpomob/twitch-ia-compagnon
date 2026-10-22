@@ -66,7 +66,8 @@ A trigger only decides candidacy; nothing here grants an action.
 loop's own wakeup pair) and process spawning (`subprocess.Popen`, which `run` and asyncio's
 `create_subprocess_*` reach, `os.system`/`popen`/`posix_spawn*`/`fork*`/`exec*`) raise for every
 test. Its only unpatched exit is a real-instance trial node an operator opted in; the default run
-opts none in. The transitional ledger is gone (P15e). P16 checks that every collected item uses the
+opts none in. The three nodes Amendment A2 names run with the real entry points, each call
+journaled (see below). The transitional ledger is gone (P15e). P16 checks that every collected item uses the
 fixture, that 0 items would run unpatched, and that an `ast` scan of `tests/` finds no call to
 `Popen`, `create_subprocess_exec`, `os.system`, `TCPSite`, `TestServer` or `create_connection`
 outside the guard's own refusal tests.
@@ -76,7 +77,7 @@ outside the guard's own refusal tests.
 One full run under the guard at the evidence head, with the CI command
 `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`:
 
-**4,813 passed, 20 skipped** (the 20 skips are the opt-in real-instance trials of
+**4,821 passed, 20 skipped** (P17F2 head; the 20 skips are the opt-in real-instance trials of
 `test_phase2_trials.py`, `test_phase3_trials.py` and `test_phase5_trials.py`; no test is xfailed).
 The phase's floor was 3,124 passed / 18 skipped.
 
@@ -99,6 +100,42 @@ Fidelity lost, per conversion kind:
   instead of a real `pip install` and console-script process.
 
 No real-process stage was added to CI (D8).
+
+**Amendment A2 (P17F2).** The closing gate found that converting every node lost the guarantee
+three of them existed for. Those three are no longer converted: they run for real and are named in
+`tests/conftest.py::A2_REAL_NODES`, the guard's one list of nodes allowed a socket or a process, and
+each socket or spawn they make is journaled in `A2_JOURNAL` (printed as the run's "AC33 Amendment A2
+journal" section). Their rows below read **A2**. Every other node is still refused, and
+`tests/test_ac33_isolation.py` executes that negative control.
+
+- `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help`
+  installs with `pip` into an empty target again and asserts the installed layout,
+  `report["core"].startswith(installed + os.sep)`, the installed `modules_directory` and
+  `launcher.is_file()`; `test_install_test_skips_only_when_pip_is_unavailable` is restored under its
+  own name (the P15e replacement `test_install_test_never_skips_and_fails_loudly` is gone).
+- `tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base`
+  reads `git` again, with its work-tree and base-commit existence assertions. Its diff covers the
+  shipped profiles only (`'*.example'` with `':(exclude)tests/fixtures/**'`, P17F3), and the committed
+  baseline copies exist only as `<file>.baseline` (P17F3 removed the stale `*.example` duplicates).
+- `tests/test_kick.py` is byte-identical to `7782e5f`. Its named node binds the real loopback
+  listener; the file's other nodes reach the same handler in memory through the conftest fixture
+  `_kick_loopback_in_memory` (their `TestClient(TestServer(app))` is an `InMemoryClient`, the listener
+  an `InMemoryNetwork` site), so the file is not edited and the guard refuses nothing they open.
+
+P17F2 also put the original assertion sequence back in every other converted test: where a fake
+carries the conversion, it now yields the original observations (exit status, stdout/stderr, signal,
+ordering, counts), and any check added for the fake's own fidelity lives in a named helper.
+
+The assertion-AST comparison against `7782e5f` (each `test_*` function's ordered `ast.Assert` dumps,
+no locations) finds 13 changed existing functions: the 8 allowlisted ones, none of the three A2 nodes,
+and 5 outside both. Each of the 5 differs by one expected constant the phase's own requirements changed,
+so its phase-7 assertion is false on this tree; they are not conversions and were left as they are:
+
+- `tests/test_audio_input.py::test_prepare_starts_no_task_and_spawns_nothing` — `hasattr(h.handle, "start_inputs")` (R7: `audio_input` is an input).
+- `tests/test_audio_input.py::test_the_loader_discovers_the_manifest_and_prepare_binds_the_declared_spec` — `roles == frozenset({"input"})` (R7).
+- `tests/test_contracts.py::test_platform_notice_kinds_exclude_message_and_watch_tick` — the excluded set gains the appended kinds (R4).
+- `tests/test_twitch.py::test_manifest_declares_twitch_source_and_sink` — `reward` among the declared types, `LISTABLE_KINDS` (R5).
+- `tests/test_web.py::test_ac1_the_shipped_manifests_discover_19_modules_with_web` — 19 → 21 (R6, R8).
 
 | Node | Step | Commit | Fidelity lost |
 |---|---|---|---|
@@ -225,7 +262,7 @@ No real-process stage was added to CI (D8).
 | `tests/test_kick.py::test_ac34_a_65536_byte_body_is_still_accepted` | P15c | `4b549f5` | in-process topology |
 | `tests/test_kick.py::test_ac34_a_valid_delivery_is_published_once_and_admitted_per_policy` | P15c | `4b549f5` | in-process topology |
 | `tests/test_kick.py::test_ac34_each_refusal_is_answered_4xx_counted_and_publishes_nothing` | P15c | `4b549f5` | in-process topology |
-| `tests/test_kick.py::test_ac34_the_listener_runs_on_the_configured_host_and_port` | P15c | `4b549f5` | in-process topology |
+| `tests/test_kick.py::test_ac34_the_listener_runs_on_the_configured_host_and_port` | A2 | `0e7a2ab` | none: real, named by A2 |
 | `tests/test_kick.py::test_ac34_the_timestamp_bound_is_inclusive_at_300_seconds_either_way` | P15c | `4b549f5` | in-process topology |
 | `tests/test_kick.py::test_ac35_500_characters_send_one_request_and_501_send_none` | P15c | `4b549f5` | in-process topology |
 | `tests/test_kick.py::test_ac35_a_429_blocks_sends_until_the_announced_retry_instant` | P15c | `4b549f5` | in-process topology |
@@ -254,7 +291,7 @@ No real-process stage was added to CI (D8).
 | `tests/test_phase5_docs_status.py::test_ac37_the_exclusion_covers_only_the_campaign_papers` | P15a | `4465d74` | fake-OS only |
 | `tests/test_profiles.py::test_ac31_the_full_pc_profile_degrades_three_modules_and_still_chats` | P15c | `4b549f5` | in-process topology |
 | `tests/test_profiles.py::test_ac43_with_an_unreachable_speech_endpoint_audio_speak_is_named_not_ready_too` | P15c | `4b549f5` | in-process topology |
-| `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help` | P15e | `0633b8e` | no real install |
+| `tests/test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help` | A2 | `0e7a2ab` | none: real, named by A2 |
 | `tests/test_proxy.py::test_ac31_the_proxy_and_the_agent_link_name_no_platform` | P15a | `4465d74` | fake-OS only |
 | `tests/test_proxy.py::test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it` | P15e | `0633b8e` | in-process topology |
 | `tests/test_proxy_process.py::test_ac39_two_process_topology_over_loopback` | P15e | `0633b8e` | in-process topology |
@@ -263,6 +300,6 @@ No real-process stage was added to CI (D8).
 | `tests/test_stream_control.py::test_the_default_factory_frames_the_protocol_over_a_real_loopback_socket` | P15e | `0633b8e` | in-process topology |
 | `tests/test_users.py::test_module_names_no_platform` | P15a | `4465d74` | fake-OS only |
 | `tests/test_viewer_memory.py::test_ac19_cli_the_module_entry_runs_without_a_network_client` | P15a | `4465d74` | fake-OS only |
-| `tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base` | P15a | `4465d74` | fake-OS only |
+| `tests/test_web.py::test_ac24_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base` | A2 | `0e7a2ab` | none: real, named by A2 |
 | `tests/test_web.py::test_the_socket_guard_refuses_and_records_every_non_loopback_surface` | P15e | `0633b8e` | in-process topology |
 | `tests/test_youtube.py::test_ac39_three_platforms_on_one_runtime` | P15c | `4b549f5` | in-process topology |

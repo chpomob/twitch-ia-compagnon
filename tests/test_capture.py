@@ -545,6 +545,12 @@ async def test_command_exiting_non_zero_is_capture_failed_and_oversize_output_is
         assert_nothing_retained(context)
     finally:
         await handle.close()
+    _the_oversized_fake_was_killed(fake_spawn)
+
+
+def _the_oversized_fake_was_killed(fake_spawn: FakeOS) -> None:
+    """AC33: the program writing past ``max_bytes`` was killed with its group."""
+
     oversized = fake_spawn.spawned[-1]
     assert f"os.killpg:{signal.SIGKILL}" in oversized.events
 
@@ -568,6 +574,13 @@ async def test_run_command_reads_bounded_stdout_and_kills_a_flooding_child(
     )
     assert 100 < len(output) < 1_000_000
     assert status is not None
+    _the_flooding_fake_was_killed_not_drained(fake_spawn, status)
+
+
+def _the_flooding_fake_was_killed_not_drained(fake_spawn: FakeOS, status: int | None) -> None:
+    """AC33: the flooding child, in a session of its own, was killed before
+    its pipe was closed and awaited, and its status is that kill's."""
+
     flooding = fake_spawn.spawned[-1]
     assert flooding.options["start_new_session"] is True
     assert flooding.events[:3] == [f"os.killpg:{signal.SIGKILL}", "close_stdout", "wait"]
@@ -804,6 +817,19 @@ async def test_a_group_that_cannot_be_signalled_falls_back_to_killing_the_proces
 # the OS, not a kill the OS was seen to deliver.
 
 
+def _reporting(spawn: Any, reported: "asyncio.Future[int]") -> Any:
+    """*spawn*, reporting the pid of the program the wrapper leaves behind
+    once it starts — what the original program sent over loopback."""
+
+    async def spawning(*argv: str, **options: Any) -> Any:
+        process = await spawn(*argv, **options)
+        if not reported.done():
+            reported.set_result(process.child_pid)
+        return process
+
+    return spawning
+
+
 @pytest.mark.parametrize("ending", ["wait", "exit 0"], ids=["wrapper-waits", "wrapper-returns"])
 @pytest.mark.parametrize("interruption", ["timeout", "cancellation"])
 async def test_a_shell_script_s_background_capture_program_is_terminated_and_reaped_promptly(
@@ -817,22 +843,30 @@ async def test_a_shell_script_s_background_capture_program_is_terminated_and_rea
     arrives at once, not when the program would have let go of the pipe;
     (c) no zombie of ours survives — the wrapper was reaped."""
 
-    spawn = fake_spawn(leave_child=True, exit_code=None if ending == "wait" else 0)
+    # The fake OS answers what /proc and a pidfd answered: whether a pid is
+    # gone, and which children of ours are unreaped zombies.
+    _is_gone, zombie_children = fake_spawn.is_gone, fake_spawn.zombie_children
+    reported: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+    spawn = _reporting(
+        fake_spawn(leave_child=True, exit_code=None if ending == "wait" else 0), reported
+    )
     clock = ManualClock()
     source = CommandSource(
         SourceSpec("tool", "command", argv=("/opt/capture/wrapper.sh",), command_timeout_seconds=2.0),
         runner=functools.partial(run_command, spawn=spawn),
         sleeper=clock.sleep,
     )
+    program_pid: int | None = None
     pending = asyncio.ensure_future(source.read(max_bytes=4096))
     try:
-        await wait_until(lambda: fake_spawn.spawned)
-        (wrapper,) = fake_spawn.spawned
-        program_pid = wrapper.child_pid
-        assert program_pid is not None
+        done, _ = await asyncio.wait(
+            {reported, pending}, return_when=asyncio.FIRST_COMPLETED, timeout=15.0
+        )
+        assert reported in done, "the capture program never started"
+        program_pid = reported.result()
         await settle()
         assert not pending.done()
-        assert not fake_spawn.is_gone(program_pid)
+        assert not _is_gone(program_pid)
 
         started = time.monotonic()
         if interruption == "timeout":
@@ -849,8 +883,8 @@ async def test_a_shell_script_s_background_capture_program_is_terminated_and_rea
             assert pending.cancelled()
 
         await settle()
-        assert fake_spawn.is_gone(program_pid)
-        assert fake_spawn.zombie_children() == []
+        assert _is_gone(program_pid)
+        assert zombie_children() == []
     finally:
         if not pending.done():
             pending.cancel()
@@ -871,14 +905,15 @@ async def test_run_command_kills_the_whole_process_group_of_a_wrapper_script(
         exit_code=None,
         stdout=lambda process: f"{process.child_pid:>10}".encode() + b"z" * 4096,
     )
+    _is_gone, zombie_children = fake_spawn.is_gone, fake_spawn.zombie_children
     status, output = await asyncio.wait_for(
         run_command(["/opt/capture/wrapper.sh"], limit=100, spawn=spawn), timeout=15.0
     )
     assert status is not None
     grandchild = int(output[:10])
     await settle()
-    assert fake_spawn.is_gone(grandchild)
-    assert fake_spawn.zombie_children() == []
+    assert _is_gone(grandchild)
+    assert zombie_children() == []
 
 
 # --------------------------------------------------------------------------- #
