@@ -67,6 +67,12 @@ from core.actions import ANY_ACTION
 from core.bus import EventBus
 from core.config_ui import locations
 from core.config_ui.i18n import StringTable
+from core.config_ui.launcher import (
+    LauncherError,
+    LauncherSeams,
+    launcher_directories,
+    write_launcher,
+)
 from core.config_ui.wizard import CredentialStore, WizardState, WizardStateError, state_path
 from core.contracts import (
     INPUT_OWNER_NONE,
@@ -171,6 +177,8 @@ class UISettings:
     launch_argv: tuple[str, ...] = ()
     #: ``--config`` was absent and :attr:`config` is the A2 default location.
     default_location: bool = False
+    #: ``--install-launcher``: write the OS launcher and exit (R1, A3).
+    install_launcher: bool = False
 
     @classmethod
     def from_argv(cls, argv: Sequence[str]) -> UISettings:
@@ -202,6 +210,7 @@ class UISettings:
             status_file=None if parsed.status_file is None else Path(parsed.status_file),
             launch_argv=tuple(launch),
             default_location=default_location,
+            install_launcher=parsed.install_launcher,
         )
 
     # Every path below is in its one canonical form (``core.overlay.
@@ -288,6 +297,11 @@ def _parser() -> argparse.ArgumentParser:
         help="extra accepted host name for a wildcard bind (repeatable)",
     )
     parser.add_argument("--status-file", help="status record path (default: <config>.status.json)")
+    parser.add_argument(
+        "--install-launcher",
+        action="store_true",
+        help="write the per-user OS launcher for this interpreter, print its path and exit",
+    )
     return parser
 
 
@@ -6359,12 +6373,43 @@ def release_instance(ui: ConfigUI, platform: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _install_launcher(settings: UISettings, seams: LauncherSeams) -> int:
+    """Write the OS launcher, print its path; 0, or 2 on a refusal (R1, A3).
+
+    ``--config`` reaches the launcher only when it was given, in its
+    canonical form (:attr:`UISettings.base_path`: ``~`` and variables
+    expanded, made absolute, links resolved), so the launcher opens the
+    very file this launch would have.
+    """
+
+    platform = seams.platform if seams.platform is not None else locations.running_platform()
+    directories = (
+        seams.directories if seams.directories is not None else launcher_directories(os.environ)
+    )
+    executable = seams.executable if seams.executable is not None else sys.executable
+    try:
+        config = None if settings.default_location else settings.base_path
+    except OverlayError as exc:
+        print(f"config_ui: path_not_canonical: {exc}", file=sys.stderr)
+        return 2
+    try:
+        path = write_launcher(
+            platform, directories=directories, executable=executable, config=config
+        )
+    except LauncherError as exc:
+        print(f"config_ui: {exc}", file=sys.stderr)
+        return 2
+    print(f"Launcher: {path}", flush=True)
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     opener: Callable[[str], object] | None = None,
     serve: Callable[[ConfigUI, UISettings], None] | None = None,
     instance: InstanceSeams | None = None,
+    launcher: LauncherSeams | None = None,
 ) -> int:
     """Run the configuration UI; return the process exit status.
 
@@ -6375,6 +6420,8 @@ def main(
     record is judged and this launch's own published (:func:`claim_instance`,
     over the *instance* seams); a launch that finds an instance it does not
     replace serves nothing, and a clean exit removes the record (R1).
+    ``--install-launcher`` writes the OS launcher over the *launcher* seams
+    and exits before any startup check, instance record or serve (R1, A3).
     """
 
     if opener is None:
@@ -6386,6 +6433,8 @@ def main(
         settings = UISettings.from_argv(sys.argv[1:] if argv is None else argv)
     except SystemExit as exit_:
         return exit_.code if isinstance(exit_.code, int) else 2
+    if settings.install_launcher:
+        return _install_launcher(settings, LauncherSeams() if launcher is None else launcher)
     problems = startup_checks(settings)
     if problems:
         for problem in problems:

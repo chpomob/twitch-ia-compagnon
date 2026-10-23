@@ -26,6 +26,10 @@ P8 (R1): the instance record, the ``/instance`` route and the second launch
 (AC31 with a fake opener, serve, liveness test, probe and clock; AC4's
 ``/instance`` row). The probe fake answers through the first instance's own
 ``ConfigUI.handle``, so the token check it passes is the route's.
+
+P9 (R1, A3): the OS launcher writer and ``--install-launcher`` (AC27), with
+the platform forced and every launcher directory redirected, so each
+platform's format is written and checked on any host.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import sys
@@ -54,7 +59,7 @@ import yaml
 import core.config_ui as config_ui
 from conftest import baseline_numstat
 from core import main as application
-from core.config_ui import i18n, locations, wizard
+from core.config_ui import i18n, launcher, locations, wizard
 from core.config_ui.i18n import StringTable, StringTableError
 from core.config_ui.locations import (
     PRODUCT,
@@ -2985,3 +2990,228 @@ def test_ac31_a_peer_that_keeps_sending_is_bounded_by_the_whole_attempt(
         probe()
     assert len(peer.chunks) > 990
     assert peer.timeouts[-1] <= 0.5
+
+
+# --------------------------------------------------------------------------- #
+# P9 (R1, A3): the OS launcher and ``--install-launcher`` (AC27)
+# --------------------------------------------------------------------------- #
+
+LAUNCHER_PLATFORMS = [("linux", ".desktop"), ("win32", ".cmd"), ("darwin", ".command")]
+LAUNCHER_TOKEN = "launcher-token-3b9e1f-never-written"
+LAUNCHER_CREDENTIAL = "launcher-credential-5c2d8a-never-written"
+
+
+def _launcher_seams(directory: Path, platform: str) -> Any:
+    """Every platform's launcher directory redirected to *directory*."""
+
+    return config_ui.LauncherSeams(
+        platform=platform,
+        directories={name: directory for name in (locations.LINUX, locations.WINDOWS, locations.MACOS)},
+    )
+
+
+def _install(directory: Path, platform: str, *argv: str) -> tuple[int, _Calls, _Calls]:
+    serve, opener = _Serving(), _Calls()
+    status = config_ui.main(
+        ["--install-launcher", *argv],
+        opener=opener,
+        serve=serve,
+        launcher=_launcher_seams(directory, platform),
+    )
+    return status, serve, opener
+
+
+@pytest.mark.parametrize(("platform", "suffix"), LAUNCHER_PLATFORMS)
+def test_ac27_install_launcher_writes_one_launcher_and_serves_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    platform: str,
+    suffix: str,
+) -> None:
+    """AC27 (R1): with the platform forced and its launcher directory
+    redirected, ``main(["--install-launcher"])`` writes exactly 1 launcher of
+    the platform's suffix naming ``sys.executable`` and ``-m core.config_ui``,
+    with no ``--config``, 0 occurrences of the access token and of a stored
+    credential value, not group- or world-writable; ``serve`` and the opener
+    are called 0 times, no other file is created or changed (no instance
+    record), and the exit status is 0. Running it again replaces it (1 file)."""
+
+    _stored_profile(monkeypatch, tmp_path, {"TWITCH_ACCESS_TOKEN": LAUNCHER_CREDENTIAL})
+    monkeypatch.setattr(config_ui.secrets, "token_urlsafe", lambda size=None: LAUNCHER_TOKEN)
+    directory = tmp_path / "launchers"
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    for attempt in range(2):
+        status, serve, opener = _install(directory, platform)
+        assert (status, serve.calls, opener.calls) == (0, [], [])
+        (written,) = list(directory.iterdir())
+        assert written.name == PRODUCT + suffix
+        text = written.read_text(encoding="utf-8")
+        assert sys.executable in text
+        assert "-m core.config_ui" in text
+        assert "--config" not in text
+        assert LAUNCHER_TOKEN not in text
+        assert LAUNCHER_CREDENTIAL not in text
+        assert config_ui.launcher.MARKER in text
+        mode = stat.S_IMODE(written.stat().st_mode)
+        assert mode & (stat.S_IWGRP | stat.S_IWOTH) == 0
+        assert mode == (0o644 if suffix == ".cmd" else 0o755)
+        captured = capsys.readouterr()
+        assert captured.out == f"Launcher: {written}\n"
+        assert LAUNCHER_TOKEN not in captured.out + captured.err
+        others = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+        assert written in others
+        del others[written]
+        assert others == before
+
+
+@pytest.mark.parametrize(("platform", "suffix"), LAUNCHER_PLATFORMS)
+def test_ac27_a_foreign_file_at_the_launcher_path_is_left_byte_identical(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], platform: str, suffix: str
+) -> None:
+    """AC27 (R1): a pre-existing file without the marker line at the
+    launcher's path is left byte-identical, the exit status is non-zero, and
+    the refusal quotes none of its content."""
+
+    directory = tmp_path / "launchers"
+    directory.mkdir()
+    foreign = directory / (PRODUCT + suffix)
+    content = f"#!/bin/sh\n# not ours\necho {COLLIDED_CONTENT}\n".encode()
+    foreign.write_bytes(content)
+    status, serve, opener = _install(directory, platform)
+    assert status != 0
+    assert (serve.calls, opener.calls) == ([], [])
+    assert foreign.read_bytes() == content
+    assert list(directory.iterdir()) == [foreign]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(foreign) in captured.err
+    assert COLLIDED_CONTENT not in captured.err
+
+
+def test_ac27_a_marker_in_the_content_but_not_as_its_line_is_foreign(tmp_path: Path) -> None:
+    directory = tmp_path / "launchers"
+    directory.mkdir()
+    foreign = directory / (PRODUCT + ".desktop")
+    content = f"Comment=see {config_ui.launcher.MARKER}\n".encode()
+    foreign.write_bytes(content)
+    assert _install(directory, "linux")[0] != 0
+    assert foreign.read_bytes() == content
+
+
+def test_ac27_a_link_at_the_launcher_path_is_refused(tmp_path: Path) -> None:
+    """A symbolic link is not a launcher this option wrote, even when its
+    target carries the marker line: neither is replaced."""
+
+    directory = tmp_path / "launchers"
+    assert _install(directory, "linux")[0] == 0
+    written = directory / (PRODUCT + ".desktop")
+    target = tmp_path / "target.desktop"
+    target.write_bytes(written.read_bytes())
+    written.unlink()
+    written.symlink_to(target)
+    assert _install(directory, "linux")[0] != 0
+    assert written.is_symlink()
+    assert target.read_bytes() == written.read_bytes()
+
+
+def _desktop_exec(text: str) -> list[str]:
+    """The ``Exec=`` arguments, decoded as the desktop-entry rules read them:
+    string-value unescaping, then field-code ``%%``, then the quoting rule."""
+
+    (line,) = [line for line in text.splitlines() if line.startswith("Exec=")]
+    value = line[len("Exec="):].replace("\\\\", "\\").replace("%%", "%")
+    return shlex.split(value)
+
+
+def test_r1_a_given_config_with_spaces_is_quoted_in_each_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 (risk: paths with spaces): ``--config`` reaches each launcher made
+    absolute and quoted so it reads back as one argument, with ``%`` kept."""
+
+    monkeypatch.chdir(tmp_path)
+    folder = tmp_path / "Application Support" / "100% mine"
+    folder.mkdir(parents=True)
+    profile = folder / "my profile.yaml"
+    executable = str(tmp_path / "Python Install" / "python")
+    expected = [executable, "-m", "core.config_ui", "--config", str(profile)]
+    relative = os.path.relpath(profile)
+
+    linux = launcher.render_launcher("linux", executable, profile)
+    assert _desktop_exec(linux) == expected
+    macos = launcher.render_launcher("darwin", executable, profile)
+    (command,) = [line for line in macos.splitlines() if line.startswith("exec ")]
+    assert shlex.split(command) == ["exec", *expected]
+    windows = launcher.render_launcher("win32", executable, profile)
+    assert windows.endswith("\r\n")
+    assert f'"{executable}" -m core.config_ui --config "{str(profile).replace("%", "%%")}"' in windows
+
+    # Through main: the relative --config is made absolute.
+    directory = tmp_path / "launchers"
+    status, serve, _ = _install(directory, "linux", "--config", relative)
+    assert (status, serve.calls) == (0, [])
+    written = directory / (PRODUCT + ".desktop")
+    assert _desktop_exec(written.read_text(encoding="utf-8"))[1:] == expected[1:]
+    assert _desktop_exec(written.read_text(encoding="utf-8"))[0] == sys.executable
+
+
+def test_r1_a_given_config_reaches_the_launcher_canonical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1: ``--config`` reaches the launcher as the launch would open it:
+    ``~`` expanded and links resolved, never joined onto the working
+    directory as written."""
+
+    home = tmp_path / "home"
+    real = home / "real"
+    real.mkdir(parents=True)
+    (home / "link").symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    directory = tmp_path / "launchers"
+    status, serve, _ = _install(directory, "linux", "--config", "~/link/profile.yaml")
+    assert (status, serve.calls) == (0, [])
+    written = directory / (PRODUCT + ".desktop")
+    exec_line = _desktop_exec(written.read_text(encoding="utf-8"))
+    assert exec_line[-2:] == ["--config", str(real.resolve() / "profile.yaml")]
+
+
+def test_r1_the_windows_launcher_selects_the_utf8_code_page() -> None:
+    """R1: the ``.cmd`` file is UTF-8 and switches cmd to code page 65001
+    before its command line, so a non-ASCII path reads back unchanged."""
+
+    executable = "C:\\Users\\Andr\u00e9\\python.exe"
+    lines = launcher.render_launcher("win32", executable).split("\r\n")
+    command = next(index for index, line in enumerate(lines) if "core.config_ui" in line)
+    assert lines.index("chcp 65001 >nul") < command
+    assert executable in lines[command]
+
+
+def test_r1_a_control_character_or_a_quote_in_an_argument_is_refused() -> None:
+    with pytest.raises(launcher.LauncherError):
+        launcher.render_launcher("linux", "/usr/bin/python", "/a\nb.yaml")
+    with pytest.raises(launcher.LauncherError):
+        launcher.render_launcher("win32", 'C:\\a"b\\python.exe')
+
+
+def test_a3_the_default_launcher_directories(tmp_path: Path) -> None:
+    """A3: ``$XDG_DATA_HOME/applications`` (else ``~/.local/share/
+    applications``), the Start Menu programs folder under ``%APPDATA%``, and
+    ``~/Applications``; the file is named after the product."""
+
+    home = tmp_path / "home"
+    environ = {"HOME": str(home), "XDG_DATA_HOME": str(tmp_path / "data"), "APPDATA": str(tmp_path / "roaming")}
+    directories = launcher.launcher_directories(environ)
+    assert directories[locations.LINUX] == tmp_path / "data" / "applications"
+    assert directories[locations.WINDOWS] == (
+        tmp_path / "roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    )
+    assert directories[locations.MACOS] == home / "Applications"
+    for relative in ("", "data"):
+        fallback = launcher.launcher_directories({"HOME": str(home), "XDG_DATA_HOME": relative})
+        assert fallback[locations.LINUX] == home / ".local" / "share" / "applications"
+    assert launcher.launcher_path("darwin", directories) == home / "Applications" / (PRODUCT + ".command")
+    assert launcher.platform_name("win32") == locations.WINDOWS
+    assert launcher.platform_name("darwin") == locations.MACOS
+    assert launcher.platform_name("linux") == locations.LINUX
