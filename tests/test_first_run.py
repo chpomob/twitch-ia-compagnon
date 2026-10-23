@@ -10,15 +10,23 @@ half), with the AST collector of the string keys ``wizard.py`` and
 
 P4 (plan DD5): the four ready-made profiles and their generator (R3; AC7's
 data half, AC8, AC10), validated against the shipped manifests themselves.
+
+P5 (A1, A7, R4): the credential store and the wizard state file (AC11's
+storage half, AC30's state-file clause), with the platform and environment
+forced, so the Windows branch runs on any host.
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import hashlib
+import io
 import json
+import os
 import re
 import shutil
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -1076,3 +1084,504 @@ def test_the_profiles_name_no_other_platform_nor_vendor() -> None:
     for path in sorted(PROFILES.glob("*.json")):
         text = path.read_text(encoding="utf-8")
         assert not re.search(r"\b(kick|youtube|openai|anthropic|gemini)\b", text, re.I), path
+
+
+# --------------------------------------------------------------------------- #
+# P5: the credential store (A1, R4) and the wizard state file (A7)
+# --------------------------------------------------------------------------- #
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX modes and owners")
+
+
+def _wizard_profile(directory: Path, profile_id: str = "chat_qa", name: str = "profile.yaml"):
+    """A generated profile written at ``directory/name``, and its document."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    document = _generated(profile_id)
+    path = directory / name
+    path.write_text(wizard.render_profile_yaml(document), encoding="utf-8")
+    return path, document
+
+
+def _linux(tmp_path: Path) -> dict[str, str]:
+    return {"XDG_CONFIG_HOME": str(tmp_path / "xdg"), "HOME": str(tmp_path / "home")}
+
+
+def _files_holding(roots: list[Path], value: str) -> list[Path]:
+    needle = value.encode()
+    return [
+        path
+        for root in roots
+        if root.exists()
+        for path in root.rglob("*")
+        if path.is_file() and needle in path.read_bytes()
+    ]
+
+
+class _OpenSpy:
+    """Every path opened through ``open``, ``io.open`` or ``os.open``."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.opened: list[str] = []
+        self.modes: dict[str, int] = {}
+        for owner, name in ((builtins, "open"), (io, "open"), (os, "open")):
+            monkeypatch.setattr(owner, name, self._wrap(getattr(owner, name), owner is os))
+
+    def _wrap(self, real, low_level: bool):
+        def spy(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)):
+                key = os.path.abspath(os.fsdecode(file))
+                self.opened.append(key)
+                if low_level and len(args) >= 2:
+                    self.modes[key] = args[1]
+            return real(file, *args, **kwargs)
+
+        return spy
+
+    def touched(self, path: Path) -> bool:
+        return os.path.abspath(path) in self.opened
+
+
+@posix_only
+def test_ac11_the_credential_file_is_owner_only_under_the_per_user_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC11 (storage half, A1): the file is ``profile.yaml.credentials.json``
+    in the per-user directory (created 0700), mode ``0o600``, and holds the
+    value under its reference name and no profile content: only the names
+    the profile lists under ``secrets``. Its temporary is created 0600 at
+    ``os.open`` and no temporary is left behind."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    environ = _linux(tmp_path)
+    state = wizard.WizardState(profile)
+    store = wizard.CredentialStore(profile, "linux", environ)
+    directory = tmp_path / "xdg" / PRODUCT
+    assert store.directory == directory and not directory.exists()
+    assert store.path == directory / "profile.yaml.credentials.json"
+    assert store.location_reason == wizard.LOCATION_OWNER_ONLY
+
+    spy = _OpenSpy(monkeypatch)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) is None
+    monkeypatch.undo()
+
+    assert stat.S_IMODE(directory.stat().st_mode) & 0o077 == 0
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    temporaries = [key for key in spy.modes if key != os.path.abspath(store.path)]
+    assert temporaries and all(spy.modes[key] == 0o600 for key in temporaries)
+    assert sorted(path.name for path in directory.iterdir()) == [store.path.name]
+
+    names = [reference[2:-1] for reference in document["secrets"]]
+    assert "TWITCH_ACCESS_TOKEN" in names and "MODEL_API_KEY" in names
+    stored = json.loads(store.path.read_text(encoding="utf-8"))
+    assert stored == {name: FIXTURE_CREDENTIALS[name] for name in names}
+    assert stored["TWITCH_ACCESS_TOKEN"] == "tok-XYZ-fixture-access-token"
+    # Not a resolved profile: none of its keys, none of its parameter values.
+    text = store.path.read_text(encoding="utf-8")
+    for word in ("modules", "enabled_modules", "secrets", "Nova", FIXTURE_IDENTITIES["bot_user_id"]):
+        assert word not in text
+    # A collected value the profile does not list is not stored.
+    assert FIXTURE_CREDENTIALS["TRANSCRIPTION_API_KEY"] not in text
+    assert state.owns(store.path)
+    assert sorted(store.values()) == sorted(stored.values())
+    assert store.read(state) == stored
+    for value in FIXTURE_CREDENTIALS.values():
+        assert value not in profile.read_text(encoding="utf-8")
+
+
+def test_ac11_a_yaml_and_a_yml_get_two_files_and_the_other_is_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC11 (A1): two profiles of one directory, ``a.yaml`` and ``a.yml``,
+    map to 2 distinct credential files, and writing one leaves the other
+    byte-identical and unopened."""
+
+    environ = _linux(tmp_path)
+    first, document = _wizard_profile(tmp_path / "profiles", name="a.yaml")
+    second, _ = _wizard_profile(tmp_path / "profiles", name="a.yml")
+    store_a = wizard.CredentialStore(first, "linux", environ)
+    store_b = wizard.CredentialStore(second, "linux", environ)
+    assert store_a.path != store_b.path
+    assert {store_a.path.name, store_b.path.name} == {
+        "a.yaml.credentials.json", "a.yml.credentials.json",
+    }
+
+    assert store_a.write(FIXTURE_CREDENTIALS, document["secrets"], wizard.WizardState(first)) is None
+    before = store_a.path.read_bytes()
+    other = dict(FIXTURE_CREDENTIALS, TWITCH_ACCESS_TOKEN="tok-other-profile")
+    spy = _OpenSpy(monkeypatch)
+    assert store_b.write(other, document["secrets"], wizard.WizardState(second)) is None
+    monkeypatch.undo()
+    assert not spy.touched(store_a.path)
+    assert store_a.path.read_bytes() == before
+    assert json.loads(store_b.path.read_text())["TWITCH_ACCESS_TOKEN"] == "tok-other-profile"
+    assert len(list(store_a.path.parent.glob("*.credentials.json"))) == 2
+
+
+def test_ac11_windows_stores_under_local_appdata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC11 (A1): with the platform forced to Windows and
+    ``LOCALAPPDATA=<tmp>``, the file is under ``<tmp>/twitch-ia-compagnon/``
+    and the store names why; no POSIX owner check runs (``os.getuid`` is
+    absent on Windows)."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    local = tmp_path / "local"
+    local.mkdir()
+    monkeypatch.delattr(os, "getuid", raising=False)
+    store = wizard.CredentialStore(profile, "windows", {"LOCALAPPDATA": str(local)})
+    state = wizard.WizardState(profile)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) is None
+    assert store.path == local / PRODUCT / "profile.yaml.credentials.json"
+    assert store.path.is_file()
+    assert store.directory == local / PRODUCT
+    assert store.location_reason == wizard.LOCATION_LOCAL_APPDATA
+    assert json.loads(store.path.read_text())["TWITCH_ACCESS_TOKEN"] == (
+        FIXTURE_CREDENTIALS["TWITCH_ACCESS_TOKEN"]
+    )
+
+
+@posix_only
+@pytest.mark.parametrize("mode", [0o720, 0o702, 0o777])
+def test_ac11_a_group_or_other_writable_directory_is_refused(
+    tmp_path: Path, mode: int
+) -> None:
+    """AC11 (A1): the per-user directory made group- or other-writable →
+    a value-free refusal naming the directory, no credential file, and no
+    file in the profile's or the per-user directory holds the value."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    directory = tmp_path / "xdg" / PRODUCT
+    directory.mkdir(parents=True)
+    directory.chmod(mode)
+    try:
+        store = wizard.CredentialStore(profile, "linux", _linux(tmp_path))
+        state = wizard.WizardState(profile)
+        refusal = store.write(FIXTURE_CREDENTIALS, document["secrets"], state)
+        assert refusal == wizard.Refusal(wizard.REFUSAL_SHARED, directory)
+        assert not store.path.exists()
+        assert list(directory.iterdir()) == []
+        assert store.values() == ()
+        assert state.written == {}
+        for value in FIXTURE_CREDENTIALS.values():
+            assert _files_holding([tmp_path / "profiles", directory], value) == []
+            assert value not in repr(refusal)
+        assert store.read(state) == refusal
+    finally:
+        directory.chmod(0o700)
+
+
+@posix_only
+def test_a1_a_directory_owned_by_another_user_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1: a per-user directory not owned by the user is refused (the owner
+    is compared with ``os.stat``), and nothing is written."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    store = wizard.CredentialStore(profile, "linux", _linux(tmp_path))
+    real = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real + 1)
+    refusal = store.write(FIXTURE_CREDENTIALS, document["secrets"], wizard.WizardState(profile))
+    assert refusal == wizard.Refusal(wizard.REFUSAL_NOT_OWNED, store.directory)
+    assert not store.path.exists()
+
+
+@pytest.mark.parametrize("local", [None, "", "missing"])
+def test_ac11_windows_without_local_appdata_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local: str | None
+) -> None:
+    """AC11 (A1): on Windows, ``LOCALAPPDATA`` unset (or empty, or not an
+    existing directory) → refused; no credential file, no directory created,
+    and no file in the profile's directory or under the tmp tree holds the
+    value."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    monkeypatch.delattr(os, "getuid", raising=False)
+    environ = {"APPDATA": str(tmp_path / "roaming")}
+    if local is not None:
+        environ["LOCALAPPDATA"] = str(tmp_path / local) if local else ""
+    store = wizard.CredentialStore(profile, "windows", environ)
+    state = wizard.WizardState(profile)
+    refusal = store.write(FIXTURE_CREDENTIALS, document["secrets"], state)
+    if local == "missing":
+        assert refusal == wizard.Refusal(wizard.REFUSAL_UNAVAILABLE, tmp_path / "missing")
+        assert not (tmp_path / "missing").exists()
+    else:
+        assert refusal == wizard.Refusal(wizard.REFUSAL_NO_DIRECTORY, None)
+        assert store.path is None
+    for value in FIXTURE_CREDENTIALS.values():
+        assert _files_holding([tmp_path], value) == []
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["profiles"]
+    assert store.read(state) == refusal
+
+
+def test_ac11_an_unrecorded_credential_file_is_neither_read_nor_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC11 (A1, A7): a credential file of that name whose digest the
+    profile's state does not record (another profile's, same file name) is
+    left byte-identical and is never opened; the refusal names its path."""
+
+    environ = _linux(tmp_path)
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    store = wizard.CredentialStore(profile, "linux", environ)
+    assert store.check_directory() is None
+    foreign = b'{"TWITCH_ACCESS_TOKEN": "someone-elses-token"}\n'
+    store.path.write_bytes(foreign)
+    state = wizard.WizardState(profile)
+
+    spy = _OpenSpy(monkeypatch)
+    refused = wizard.Refusal(wizard.REFUSAL_NOT_WRITTEN, store.path)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) == refused
+    assert store.read(state) == refused
+    assert not state.owns(store.path)
+    monkeypatch.undo()
+
+    assert not spy.touched(store.path)
+    assert store.path.read_bytes() == foreign
+    assert store.values() == ()
+    assert sorted(path.name for path in store.path.parent.iterdir()) == [store.path.name]
+
+
+def test_a7_a_credential_file_changed_since_written_is_not_replaced(tmp_path: Path) -> None:
+    """A7: a file the wizard wrote is replaced again while unchanged; once
+    changed by another writer it is neither replaced nor read."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    store = wizard.CredentialStore(profile, "linux", _linux(tmp_path))
+    state = wizard.WizardState(profile)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) is None
+    renewed = dict(FIXTURE_CREDENTIALS, TWITCH_ACCESS_TOKEN="tok-renewed")
+    assert store.write(renewed, document["secrets"], state) is None
+    assert store.read(state)["TWITCH_ACCESS_TOKEN"] == "tok-renewed"
+
+    edited = store.path.read_bytes().replace(b"tok-renewed", b"tok-by-hand")
+    store.path.write_bytes(edited)
+    changed = wizard.Refusal(wizard.REFUSAL_CHANGED, store.path)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) == changed
+    assert store.read(state) == changed
+    assert store.path.read_bytes() == edited
+
+
+def test_r4_a_failed_replace_leaves_no_temporary_and_no_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: the file is replaced atomically — when publication (``os.link``,
+    ``os.rename`` or ``os.replace``) fails the temporary is removed, so no
+    file holds the value, and an existing file is left as it was."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    store = wizard.CredentialStore(profile, "linux", _linux(tmp_path))
+
+    def failing(source, target):
+        raise OSError("publication failed")
+
+    for name in ("replace", "link", "rename"):
+        monkeypatch.setattr(os, name, failing)
+    with pytest.raises(OSError):
+        store.write(FIXTURE_CREDENTIALS, document["secrets"], wizard.WizardState(profile))
+    monkeypatch.undo()
+    assert list(store.directory.iterdir()) == []
+    assert _files_holding([tmp_path], FIXTURE_CREDENTIALS["TWITCH_ACCESS_TOKEN"]) == []
+
+    state = wizard.WizardState(profile)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) is None
+    before = store.path.read_bytes()
+    monkeypatch.setattr(os, "replace", failing)
+    renewed = dict(FIXTURE_CREDENTIALS, TWITCH_ACCESS_TOKEN="tok-renewed")
+    with pytest.raises(OSError):
+        store.write(renewed, document["secrets"], state)
+    monkeypatch.undo()
+    assert sorted(path.name for path in store.directory.iterdir()) == [store.path.name]
+    assert store.path.read_bytes() == before
+
+
+def test_a1_a_file_created_after_the_ownership_check_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1, A7: two profiles named ``profile.yaml`` in different directories
+    share one credential file. When the other profile's wizard creates it
+    between this wizard's ownership check and its publication, the file is
+    published exclusively: the other's bytes stay, nothing is recorded, no
+    temporary is left, and the refusal names the path."""
+
+    environ = _linux(tmp_path)
+    first, document = _wizard_profile(tmp_path / "one")
+    second, _ = _wizard_profile(tmp_path / "two")
+    store = wizard.CredentialStore(first, "linux", environ)
+    assert store.path == wizard.CredentialStore(second, "linux", environ).path
+    foreign = b'{"TWITCH_ACCESS_TOKEN": "the-other-profiles-token"}\n'
+    lexists = os.path.lexists
+
+    def racing(path):
+        absent = not lexists(path)
+        if absent and os.path.abspath(path) == os.path.abspath(store.path):
+            store.path.write_bytes(foreign)
+        return not absent
+
+    monkeypatch.setattr(os.path, "lexists", racing)
+    state = wizard.WizardState(first)
+    refusal = store.write(FIXTURE_CREDENTIALS, document["secrets"], state)
+    monkeypatch.undo()
+    assert refusal == wizard.Refusal(wizard.REFUSAL_NOT_WRITTEN, store.path)
+    assert store.path.read_bytes() == foreign
+    assert state.written == {} and store.values() == ()
+    assert sorted(path.name for path in store.directory.iterdir()) == [store.path.name]
+
+
+@posix_only
+def test_a1_concurrent_wizards_check_and_replace_one_at_a_time(tmp_path: Path) -> None:
+    """A1: the ownership check and the replacement hold an exclusive lock on
+    the credential directory: while another holder has it, a write waits,
+    and it completes once the lock is released."""
+
+    import fcntl
+    import threading
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    store = wizard.CredentialStore(profile, "linux", _linux(tmp_path))
+    assert store.check_directory() is None
+    state = wizard.WizardState(profile)
+    results: list[Any] = []
+    descriptor = os.open(store.directory, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        writer = threading.Thread(
+            target=lambda: results.append(
+                store.write(FIXTURE_CREDENTIALS, document["secrets"], state)
+            )
+        )
+        writer.start()
+        writer.join(0.3)
+        assert writer.is_alive() and not store.path.exists()
+    finally:
+        os.close(descriptor)
+    writer.join(5)
+    assert results == [None] and state.owns(store.path)
+
+
+@posix_only
+def test_a7_the_state_file_is_owner_only_and_persists_only_screen_one(tmp_path: Path) -> None:
+    """A7: ``<base>.wizard.json`` beside the profile, mode 0600, replaced
+    atomically; it keeps the profile choice, its non-secret parameters, the
+    language, the written digests and ``completed``, and a restart resumes
+    screen 1's pass only — every later success is for this process alone."""
+
+    profile, _ = _wizard_profile(tmp_path / "profiles")
+    state = wizard.WizardState(profile)
+    assert state.path == tmp_path / "profiles" / "profile.yaml.wizard.json"
+    assert wizard.state_path(profile) == state.path
+    assert not state.exists and not state.path.exists()
+
+    state.profile = "chat_qa"
+    state.parameters = dict(FIXTURE_PARAMETERS["chat_qa"])
+    state.language = "fr"
+    for screen in wizard.SCREEN_NUMBERS[:4]:
+        state.pass_screen(screen)
+    state.record(profile)
+    state.save()
+    assert stat.S_IMODE(state.path.stat().st_mode) == 0o600
+    assert sorted(path.name for path in state.path.parent.iterdir()) == [
+        "profile.yaml", "profile.yaml.wizard.json",
+    ]
+    persisted = json.loads(state.path.read_text(encoding="utf-8"))
+    assert persisted["passed"] == [1] and persisted["completed"] is False
+
+    again = wizard.WizardState(profile)
+    assert again.exists
+    assert (again.profile, again.parameters, again.language) == (
+        "chat_qa", FIXTURE_PARAMETERS["chat_qa"], "fr",
+    )
+    assert [again.passed(screen) for screen in wizard.SCREEN_NUMBERS] == [
+        True, False, False, False, False,
+    ]
+    assert again.owns(profile) and not again.completed
+
+    again.pass_screen(2)
+    again.pass_screen(3)
+    again.invalidate(2)
+    assert [again.passed(screen) for screen in wizard.SCREEN_NUMBERS] == [
+        True, False, False, False, False,
+    ]
+    again.completed = True
+    again.save()
+    assert wizard.WizardState(profile).completed is True
+
+
+def test_a7_owns_only_while_the_bytes_hash_to_the_recorded_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A7: ``owns(path)`` is true only while the file's bytes hash to the
+    digest recorded at write time; a path with no record is never opened."""
+
+    profile, _ = _wizard_profile(tmp_path / "profiles")
+    state = wizard.WizardState(profile)
+    spy = _OpenSpy(monkeypatch)
+    assert not state.owns(profile)
+    monkeypatch.undo()
+    assert not spy.touched(profile)
+
+    state.record(profile)
+    assert state.written == {
+        str(profile.absolute()): hashlib.sha256(profile.read_bytes()).hexdigest()
+    }
+    assert state.owns(profile)
+    profile.write_text(profile.read_text() + "# edited by hand\n", encoding="utf-8")
+    assert not state.owns(profile)
+    profile.unlink()
+    assert not state.owns(profile)
+
+
+def test_ac30_the_state_file_never_holds_a_stored_or_submitted_value(tmp_path: Path) -> None:
+    """AC30 (state-file clause, A7): after screen 4's files are written and
+    recorded, the state file contains no stored credential value; a save that
+    would carry a stored or a submitted value — plain or JSON-escaped — is
+    refused, and the file on disk is left as it was."""
+
+    profile, document = _wizard_profile(tmp_path / "profiles")
+    store = wizard.CredentialStore(profile, "linux", _linux(tmp_path))
+    state = wizard.WizardState(profile)
+    state.profile = "chat_qa"
+    state.parameters = dict(FIXTURE_PARAMETERS["chat_qa"])
+    state.pass_screen(1)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) is None
+    state.record(profile)
+    submitted = ['tok-"quoted"\\submitted', "tok-XYZ-fixture-access-token"]
+    state.save(store, submitted)
+    saved = state.path.read_bytes()
+    for value in [*FIXTURE_CREDENTIALS.values(), *submitted]:
+        assert value.encode() not in saved
+        assert json.dumps(value)[1:-1].encode() not in saved
+    assert str(store.path.absolute()) in json.loads(saved)["written"]
+
+    state.parameters["companion_name"] = FIXTURE_CREDENTIALS["TWITCH_ACCESS_TOKEN"]
+    with pytest.raises(wizard.WizardStateError, match="credential value") as raised:
+        state.save(store)
+    assert FIXTURE_CREDENTIALS["TWITCH_ACCESS_TOKEN"] not in str(raised.value)
+    state.parameters["companion_name"] = submitted[0]
+    with pytest.raises(wizard.WizardStateError, match="credential value"):
+        state.save(store, submitted)
+    assert state.path.read_bytes() == saved
+    assert sorted(path.name for path in state.path.parent.iterdir()) == [
+        "profile.yaml", "profile.yaml.wizard.json",
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"not json",
+        b"[]",
+        b'{"format": 2}',
+        b'{"format": 1, "passed": [2]}',
+        b'{"format": 1, "token": "x"}',
+        b'{"format": 1, "completed": "yes"}',
+    ],
+)
+def test_a7_a_malformed_state_file_is_refused(tmp_path: Path, content: bytes) -> None:
+    profile, _ = _wizard_profile(tmp_path / "profiles")
+    wizard.state_path(profile).write_bytes(content)
+    with pytest.raises(wizard.WizardStateError):
+        wizard.WizardState(profile)

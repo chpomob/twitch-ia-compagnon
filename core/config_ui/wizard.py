@@ -24,19 +24,40 @@ a literal credential in the mapping stays refused.
 A platform input with every trigger off is expressed as a configured policy
 that never matches (a ``probability`` rule of 0): no input declares an
 explicit "off" policy, and the input stays connected.
+
+:class:`CredentialStore` keeps the collected values in the per-user
+credential file (A1, R4) and :class:`WizardState` keeps the wizard's
+progress beside the profile (A7); both replace their file atomically from a
+temporary created owner-only, and the state records the digest of every file
+the wizard wrote, so only those files are ever read back or replaced. The
+credential file's ownership check and replacement hold a lock on its
+directory, and a file absent at the check is published exclusively, so a
+concurrent wizard never overwrites one it did not see.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
 import json
+import os
 import re
-from collections.abc import Collection, Mapping, Sequence
+import secrets as _secrets
+import stat
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from core.config_ui import locations
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
 
 #: The shipped profiles directory (package data).
 PROFILES_DIRECTORY = Path(__file__).resolve().parent / "profiles"
@@ -531,3 +552,424 @@ def render_profile_yaml(document: Mapping[str, Any]) -> str:
     return header + yaml.safe_dump(
         dict(document), sort_keys=False, allow_unicode=True, default_flow_style=False
     )
+
+
+# --------------------------------------------------------------------------- #
+# The wizard's own files: the credential store (A1, R4) and the state (A7)
+# --------------------------------------------------------------------------- #
+
+#: The suffix appended to a profile's full file name to name its state file.
+STATE_SUFFIX = ".wizard.json"
+
+#: The state file format this module reads and writes.
+STATE_FORMAT = 1
+
+#: The only screen whose pass outlives its process (its inputs are
+#: non-secret); every later screen is passed again after a restart (A7).
+PERSISTED_SCREEN = 1
+
+#: The five screens, in order (R5).
+SCREEN_NUMBERS = (1, 2, 3, 4, 5)
+
+#: Why the store uses its directory, as a value-free token screen 4 names
+#: with the directory (A1): an owner-only directory on POSIX, the per-user
+#: local application data the operating system restricts on Windows.
+LOCATION_OWNER_ONLY = "owner_only_directory"
+LOCATION_LOCAL_APPDATA = "local_appdata"
+
+#: The refusal reasons (value-free tokens; screen 4 translates them).
+REFUSAL_NO_DIRECTORY = "credential_directory_unset"
+REFUSAL_UNAVAILABLE = "credential_directory_unavailable"
+REFUSAL_NOT_OWNED = "credential_directory_not_owned"
+REFUSAL_SHARED = "credential_directory_shared"
+REFUSAL_NOT_WRITTEN = "file_not_written_by_wizard"
+REFUSAL_CHANGED = "file_changed_outside_wizard"
+
+_STATE_KEYS = frozenset(
+    {"format", "profile", "parameters", "language", "passed", "written", "completed"}
+)
+
+
+class WizardStateError(ValueError):
+    """A state file is malformed, or a save would hold a credential value.
+
+    The message names the file or the field, never a value.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class Refusal:
+    """Why the store neither read nor wrote: a value-free reason token and
+    the directory or file it concerns (``None`` when the platform names no
+    directory at all)."""
+
+    reason: str
+    path: Path | None
+
+
+def file_digest(data: bytes) -> str:
+    """The digest the state records for a file's bytes."""
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def state_path(profile_path: str | Path) -> Path:
+    """``<base>.wizard.json``: the base file's full name with the suffix
+    appended, as the status record's default is formed (A7)."""
+
+    path = Path(profile_path)
+    return path.with_name(path.name + STATE_SUFFIX)
+
+
+def _key(path: str | Path) -> str:
+    return os.fspath(Path(path).absolute())
+
+
+def _replace_owner_only(path: Path, data: bytes, *, exclusive: bool = False) -> bool:
+    """Write *data* to *path* atomically: a temporary beside it created with
+    mode 0600 at ``os.open`` (no window where it is wider), then
+    ``os.replace``. On any failure the temporary is removed.
+
+    With *exclusive* the file is published only if *path* is still absent
+    (``os.link`` on POSIX, ``os.rename`` on Windows, both refusing an
+    existing target) and ``False`` is returned, nothing replaced, when it is
+    not. A POSIX filesystem without hard links falls back to ``os.replace``:
+    the caller holds :func:`_directory_lock`, so no wizard wrote it since.
+    """
+
+    temporary = path.with_name(f".{path.name}.{_secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not exclusive:
+            os.replace(temporary, path)
+        elif os.name == "nt":
+            os.rename(temporary, path)
+        else:
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                raise
+            except OSError:
+                os.replace(temporary, path)
+            else:
+                os.unlink(temporary)
+    except FileExistsError:
+        _discard(temporary)
+        return False
+    except BaseException:
+        _discard(temporary)
+        raise
+    return True
+
+
+def _discard(temporary: Path) -> None:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+
+
+@contextlib.contextmanager
+def _directory_lock(directory: Path) -> Iterator[None]:
+    """Hold an exclusive ``flock`` on *directory* itself, so concurrent
+    wizards check a credential file's ownership and replace it one at a
+    time and no lock file is left beside the credentials. Where ``flock``
+    is unavailable (Windows) nothing is held: exclusive publication still
+    keeps a second wizard from overwriting a file it did not see."""
+
+    if fcntl is None:
+        yield
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+class WizardState:
+    """The wizard's progress for one profile, in ``<base>.wizard.json`` (A7).
+
+    It holds the profile choice and its non-secret parameters, the language,
+    the digest of each file screen 4 wrote, and ``completed``. Screen passes
+    are kept for the current process only: :meth:`save` persists screen 1's
+    pass and no other, so a restart resumes the inputs, never a success. The
+    file is replaced atomically, owner read/write only on POSIX, and never
+    holds a credential value (:meth:`save` refuses one).
+    """
+
+    def __init__(self, profile_path: str | Path) -> None:
+        self.path = state_path(profile_path)
+        self.profile: str | None = None
+        self.parameters: dict[str, Any] = {}
+        self.language: str | None = None
+        self.completed = False
+        self.written: dict[str, str] = {}
+        self._passed: set[int] = set()
+        self.exists = self.path.exists()
+        if self.exists:
+            self._load()
+
+    def _load(self) -> None:
+        label = f"wizard state {os.fspath(self.path)!r}"
+        try:
+            data = json.loads(self.path.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            raise WizardStateError(f"{label}: is not readable JSON") from None
+        if not isinstance(data, Mapping) or not set(data) <= _STATE_KEYS:
+            raise WizardStateError(f"{label}: is not a wizard state object")
+        if data.get("format") != STATE_FORMAT:
+            raise WizardStateError(f"{label}: field 'format' must be {STATE_FORMAT}")
+        profile, language = data.get("profile"), data.get("language")
+        parameters, written = data.get("parameters", {}), data.get("written", {})
+        passed, completed = data.get("passed", []), data.get("completed", False)
+        if not all(value is None or isinstance(value, str) for value in (profile, language)):
+            raise WizardStateError(f"{label}: fields 'profile' and 'language' must be strings")
+        if not isinstance(parameters, Mapping):
+            raise WizardStateError(f"{label}: field 'parameters' must be an object")
+        if not isinstance(written, Mapping) or not all(
+            isinstance(digest, str) for digest in written.values()
+        ):
+            raise WizardStateError(f"{label}: field 'written' must map paths to digests")
+        if passed not in ([], [PERSISTED_SCREEN]):
+            raise WizardStateError(f"{label}: field 'passed' may only record screen 1")
+        if not isinstance(completed, bool):
+            raise WizardStateError(f"{label}: field 'completed' must be a boolean")
+        self.profile, self.language = profile, language
+        self.parameters = copy.deepcopy(dict(parameters))
+        self.written = dict(written)
+        self._passed = set(passed)
+        self.completed = completed
+
+    # -- passes (this process only, beyond screen 1) ------------------------ #
+
+    def passed(self, screen: int) -> bool:
+        return screen in self._passed
+
+    def pass_screen(self, screen: int) -> None:
+        if screen not in SCREEN_NUMBERS:
+            raise ValueError(f"unknown screen {screen!r}")
+        self._passed.add(screen)
+
+    def invalidate(self, screen: int) -> None:
+        """Forget the pass of *screen* and of every later screen (R5)."""
+
+        self._passed = {passed for passed in self._passed if passed < screen}
+
+    # -- ownership ---------------------------------------------------------- #
+
+    def record(self, path: str | Path) -> None:
+        """Record the digest of the bytes *path* holds now (screen 4 wrote it)."""
+
+        with open(path, "rb") as handle:
+            self.written[_key(path)] = file_digest(handle.read())
+
+    def owns(self, path: str | Path) -> bool:
+        """True only while *path*'s bytes hash to the digest recorded for it.
+
+        A path the state records no digest for is never opened.
+        """
+
+        recorded = self.written.get(_key(path))
+        if recorded is None:
+            return False
+        try:
+            with open(path, "rb") as handle:
+                return file_digest(handle.read()) == recorded
+        except OSError:
+            return False
+
+    # -- persistence -------------------------------------------------------- #
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "format": STATE_FORMAT,
+            "profile": self.profile,
+            "parameters": copy.deepcopy(self.parameters),
+            "language": self.language,
+            "passed": [PERSISTED_SCREEN] if PERSISTED_SCREEN in self._passed else [],
+            "written": dict(sorted(self.written.items())),
+            "completed": self.completed,
+        }
+
+    def save(
+        self, store: CredentialStore | None = None, submitted: Collection[str] = ()
+    ) -> None:
+        """Replace the state file atomically (0600 on POSIX).
+
+        Refused, with nothing written, when the bytes would contain one of
+        *store*'s values or a *submitted* credential value, in plain or
+        JSON-escaped form.
+        """
+
+        data = (json.dumps(self.document(), indent=2, ensure_ascii=False) + "\n").encode()
+        held = set(submitted) | (set(store.values()) if store is not None else set())
+        for value in held:
+            if not value:
+                continue
+            forms = {value, json.dumps(value, ensure_ascii=False)[1:-1], json.dumps(value)[1:-1]}
+            if any(form.encode() in data for form in forms):
+                raise WizardStateError(
+                    f"wizard state {os.fspath(self.path)!r}: would hold a credential value"
+                )
+        _replace_owner_only(self.path, data)
+        self.exists = True
+
+
+class CredentialStore:
+    """The per-user credential file of one profile (A1, R4).
+
+    The file is ``<profile-file-name>.credentials.json`` in the per-user
+    credential directory and holds only ``{NAME: value}`` for the names the
+    profile lists under ``secrets``. Where the platform restricts nothing — on
+    POSIX a directory not owned by the user or writable by group or others,
+    on Windows ``LOCALAPPDATA`` unset or not an existing directory — nothing
+    is written and a :class:`Refusal` says why. An existing file is read or
+    replaced only while the profile's :class:`WizardState` owns it; otherwise
+    it is neither opened nor written, and the refusal names its path.
+    """
+
+    def __init__(
+        self, profile_path: str | Path, platform: str, environ: Mapping[str, str]
+    ) -> None:
+        self.platform = platform
+        self.environ = dict(environ)
+        self.directory = locations.credential_directory(platform, environ)
+        self.path = (
+            None
+            if self.directory is None
+            else self.directory / locations.credential_file_name(profile_path)
+        )
+        self._values: dict[str, str] = {}
+
+    @property
+    def location_reason(self) -> str:
+        """Why this directory (a token screen 4 names with it, A1)."""
+
+        return LOCATION_LOCAL_APPDATA if self.platform == locations.WINDOWS else LOCATION_OWNER_ONLY
+
+    def values(self) -> tuple[str, ...]:
+        """The values this store wrote or read in this process."""
+
+        return tuple(self._values.values())
+
+    def check_directory(self) -> Refusal | None:
+        """Make sure the directory exists and the platform restricts it.
+
+        On POSIX it is created 0700 if absent, then must be a directory owned
+        by the user and writable by neither group nor others; on Windows
+        ``LOCALAPPDATA`` must name an existing directory (no ACL is read or
+        rewritten: the product claims no more than the platform gives).
+        """
+
+        if self.platform == locations.WINDOWS:
+            local = self.environ.get("LOCALAPPDATA")
+            if not local:
+                return Refusal(REFUSAL_NO_DIRECTORY, None)
+            if not Path(local).is_dir():
+                return Refusal(REFUSAL_UNAVAILABLE, Path(local))
+            assert self.directory is not None
+            try:
+                self.directory.mkdir(exist_ok=True)
+            except OSError:
+                return Refusal(REFUSAL_UNAVAILABLE, self.directory)
+            if not self.directory.is_dir():
+                return Refusal(REFUSAL_UNAVAILABLE, self.directory)
+            return None
+
+        assert self.directory is not None
+        try:
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            status = os.stat(self.directory)
+        except OSError:
+            return Refusal(REFUSAL_UNAVAILABLE, self.directory)
+        if not stat.S_ISDIR(status.st_mode):
+            return Refusal(REFUSAL_UNAVAILABLE, self.directory)
+        if status.st_uid != os.getuid():
+            return Refusal(REFUSAL_NOT_OWNED, self.directory)
+        if status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return Refusal(REFUSAL_SHARED, self.directory)
+        return None
+
+    def _ownership(self, state: WizardState) -> Refusal | None:
+        assert self.path is not None
+        if _key(self.path) not in state.written:
+            return Refusal(REFUSAL_NOT_WRITTEN, self.path)
+        if not state.owns(self.path):
+            return Refusal(REFUSAL_CHANGED, self.path)
+        return None
+
+    def write(
+        self, values: Mapping[str, str], secrets: Collection[str], state: WizardState
+    ) -> Refusal | None:
+        """Replace the file with *values* for the names *secrets* lists.
+
+        *secrets* is the profile's ``secrets`` list (``${NAME}`` references,
+        or bare names). On success the digest is recorded in *state* (the
+        caller saves it) and ``None`` is returned; otherwise the refusal, with
+        nothing written anywhere.
+        """
+
+        names = {
+            entry[2:-1] if entry.startswith("${") and entry.endswith("}") else entry
+            for entry in secrets
+        }
+        held = {name: values[name] for name in sorted(names) if name in values}
+        if not all(isinstance(value, str) for value in held.values()):
+            raise TypeError("credential values must be strings")
+        refusal = self.check_directory()
+        if refusal is not None:
+            return refusal
+        assert self.path is not None and self.directory is not None
+        data = (json.dumps(held, indent=2, ensure_ascii=False) + "\n").encode()
+        # Two profiles of one file name in different directories share this
+        # path: the check and the replacement are one step for every wizard,
+        # and a file absent at the check is only ever created, never replaced.
+        with _directory_lock(self.directory):
+            absent = not os.path.lexists(self.path)
+            refusal = None if absent else self._ownership(state)
+            if refusal is not None:
+                return refusal
+            if not _replace_owner_only(self.path, data, exclusive=absent):
+                return Refusal(REFUSAL_NOT_WRITTEN, self.path)
+        state.written[_key(self.path)] = file_digest(data)
+        self._values = held
+        return None
+
+    def read(self, state: WizardState) -> dict[str, str] | Refusal:
+        """The stored ``{NAME: value}``, read only while *state* owns the file.
+
+        An absent file holds nothing (``{}``); a file the state does not own
+        is never opened and the refusal names it.
+        """
+
+        refusal = self.check_directory()
+        if refusal is not None:
+            return refusal
+        assert self.path is not None
+        if not os.path.lexists(self.path):
+            return {}
+        recorded = state.written.get(_key(self.path))
+        if recorded is None:
+            return Refusal(REFUSAL_NOT_WRITTEN, self.path)
+        # One read: the bytes hashed are the bytes parsed.
+        try:
+            with open(self.path, "rb") as handle:
+                raw = handle.read()
+            if file_digest(raw) != recorded:
+                return Refusal(REFUSAL_CHANGED, self.path)
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return Refusal(REFUSAL_CHANGED, self.path)
+        if not isinstance(data, Mapping) or not all(
+            isinstance(name, str) and isinstance(value, str) for name, value in data.items()
+        ):
+            return Refusal(REFUSAL_CHANGED, self.path)
+        self._values = dict(data)
+        return dict(data)
