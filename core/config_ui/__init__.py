@@ -2,7 +2,8 @@
 
 ``python -m core.config_ui --config PATH`` serves a local-only HTML page that
 edits the managed overlay file merged over the untouched base configuration
-(R2, R6). It is never a remote administration channel: it binds a loopback
+(R2, R6). Without ``--config`` the per-user default profile is used (phase 9
+A2), and the access URL lands on the first-run wizard until it is finished. It is never a remote administration channel: it binds a loopback
 address unless ``--allow-non-loopback`` is given, every request must carry an
 accepted ``Host`` (A8) and a session derived from the access token printed
 once at startup, and every state-changing request must be a POST with an
@@ -40,6 +41,7 @@ import os
 import re
 import secrets
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -47,6 +49,7 @@ import tempfile
 import threading
 import time
 import weakref
+import webbrowser
 from contextlib import suppress
 from contextvars import ContextVar
 from collections import OrderedDict
@@ -62,6 +65,8 @@ import yaml
 
 from core.actions import ANY_ACTION
 from core.bus import EventBus
+from core.config_ui import locations
+from core.config_ui.wizard import WizardState, WizardStateError, state_path
 from core.contracts import (
     INPUT_OWNER_NONE,
     ContractError,
@@ -99,6 +104,7 @@ from core.overlay import (
     canonical_overlay_path,
     canonical_path,
     deep_merge,
+    default_feed_path,
     default_status_path,
     on_disk_digest,
     read_base,
@@ -122,6 +128,7 @@ __all__ = [
     "WriteResult",
     "accepted_authorities",
     "default_launch_argv",
+    "landing_target",
     "main",
     "process_alive",
     "read_status",
@@ -138,6 +145,9 @@ DEFAULT_PORT = 8765
 
 _PROG = "python -m core.config_ui"
 
+#: The instance record's suffix, appended to the base file's full name (R1).
+INSTANCE_SUFFIX = ".instance.json"
+
 
 # ---------------------------------------------------------------------------
 # Settings and startup checks (R1, R6, A1, A5)
@@ -148,6 +158,7 @@ _PROG = "python -m core.config_ui"
 class UISettings:
     """The UI's command line, parsed once at startup."""
 
+    #: The base profile: ``--config``, or the A2 default when it is absent.
     config: Path
     overlay: Path | None = None
     host: str = DEFAULT_HOST
@@ -156,6 +167,8 @@ class UISettings:
     allowed_hosts: tuple[str, ...] = ()
     status_file: Path | None = None
     launch_argv: tuple[str, ...] = ()
+    #: ``--config`` was absent and :attr:`config` is the A2 default location.
+    default_location: bool = False
 
     @classmethod
     def from_argv(cls, argv: Sequence[str]) -> UISettings:
@@ -172,8 +185,13 @@ class UISettings:
         else:
             head, launch = arguments, []
         parsed = _parser().parse_args(head)
+        default_location = parsed.config is None
         return cls(
-            config=Path(parsed.config),
+            config=(
+                locations.default_profile_path(locations.running_platform(), os.environ)
+                if default_location
+                else Path(parsed.config)
+            ),
             overlay=None if parsed.overlay is None else Path(parsed.overlay),
             host=parsed.host,
             port=parsed.port,
@@ -181,6 +199,7 @@ class UISettings:
             allowed_hosts=tuple(parsed.allowed_hosts),
             status_file=None if parsed.status_file is None else Path(parsed.status_file),
             launch_argv=tuple(launch),
+            default_location=default_location,
         )
 
     # Every path below is in its one canonical form (``core.overlay.
@@ -213,13 +232,43 @@ class UISettings:
             return canonical_path(self.status_file)
         return canonical_path(default_status_path(self.config))
 
+    @property
+    def wizard_path(self) -> Path:
+        """The wizard state file ``<base>.wizard.json``, canonical (A7)."""
+
+        return canonical_path(state_path(self.config))
+
+    @property
+    def credential_path(self) -> Path | None:
+        """``<profile-file-name>.credentials.json`` in the per-user credential
+        directory, canonical (A1); ``None`` where the platform names none."""
+
+        directory = locations.credential_directory(locations.running_platform(), os.environ)
+        if directory is None:
+            return None
+        return canonical_path(directory / locations.credential_file_name(self.config))
+
+    @property
+    def instance_path(self) -> Path:
+        """The instance record ``<base>.instance.json``, canonical (R1)."""
+
+        return canonical_path(self.config.with_name(self.config.name + INSTANCE_SUFFIX))
+
+    @property
+    def feed_path(self) -> Path:
+        """The supervision feed ``<base>.feed.jsonl``, canonical (DD9)."""
+
+        return canonical_path(default_feed_path(self.config))
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=_PROG,
         description="Local configuration UI (arguments after -- launch the main process).",
     )
-    parser.add_argument("--config", required=True, help="base configuration file")
+    parser.add_argument(
+        "--config", help="base configuration file (default: the per-user profile)"
+    )
     parser.add_argument("--overlay", help="managed overlay file (default: derived from --config)")
     parser.add_argument("--host", default=DEFAULT_HOST, help="bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="bind port (default: 8765)")
@@ -283,7 +332,54 @@ def startup_checks(settings: UISettings) -> list[str]:
             f"status_path_collision: status file {status} collides with the "
             f"{collision} file {named}"
         )
+    try:
+        added = [
+            ("wizard_state", "wizard state", settings.wizard_path),
+            ("credential", "credential", settings.credential_path),
+            ("instance", "instance record", settings.instance_path),
+            ("feed", "feed", settings.feed_path),
+        ]
+    except OverlayError as exc:
+        problems.append(f"path_not_canonical: {exc}")
+        return problems
+    # Each file this phase adds beside the profile is checked against the
+    # configuration files, the status record and the ones checked before it,
+    # so a collision is reported once. Only paths are named, never content.
+    against: list[tuple[str, Path | None]] = [
+        ("base", base), ("overlay", overlay), ("status", status),
+    ]
+    for token, role, path in added:
+        if path is None:
+            continue
+        for other, named in against:
+            if named is not None and same_file(path, named):
+                problems.append(
+                    f"{token}_path_collision: {role} file {path} collides with the "
+                    f"{other} file {named}"
+                )
+        against.append((role, path))
     return problems
+
+
+#: Where the access URL lands (R1, A7): the wizard, the console, the editor.
+LANDING_WIZARD = "/wizard"
+LANDING_CONSOLE = "/console"
+LANDING_EDITOR = "/"
+
+
+def landing_target(settings: UISettings, state: WizardState | None) -> str:
+    """The page the access URL redirects to (R1).
+
+    The wizard on a first run (the base profile does not exist) or while the
+    wizard state file says it is unfinished; otherwise the console at the A2
+    default location and the editor when ``--config`` was given.
+    """
+
+    if not settings.base_path.exists():
+        return LANDING_WIZARD
+    if state is not None and state.exists and not state.completed:
+        return LANDING_WIZARD
+    return LANDING_CONSOLE if settings.default_location else LANDING_EDITOR
 
 
 # ---------------------------------------------------------------------------
@@ -1818,6 +1914,8 @@ def _write_guard(session: _Session, view: ConfigView) -> str:
 #: The field naming the page a form was posted from, so Check answers with
 #: that page's view of the diagnostics (R5).
 PAGE_FIELD = "page"
+#: The editor base page's one link to the console (plan DD7).
+CONSOLE_LINK = '<p><a href="/console">Console</a></p>'
 CORE_PAGE = "/core"
 
 #: Posts the enclosing form, unsaved edits included, to Check (R5).
@@ -2716,6 +2814,9 @@ class ConfigUI:
         )
         #: The last Apply's report, shown on the pages (R7).
         self.last_apply: ApplyReport | None = None
+        #: Called once by :func:`serve` when the listener accepts connections,
+        #: off the event loop; :func:`main` sets it to open the browser (A3).
+        self.on_listening: Callable[[], object] | None = None
         _LOG_REDACTION.sources.add(self)
         self.routes: dict[str, tuple[frozenset[str], Handler]] = {
             "/": (frozenset({"GET"}), self._base_page),
@@ -2883,7 +2984,7 @@ class ConfigUI:
             return UIResponse(
                 status=303,
                 headers=(
-                    ("Location", "/"),
+                    ("Location", self._landing()),
                     (
                         "Set-Cookie",
                         f"{SESSION_COOKIE}={session_id}; HttpOnly; SameSite=Strict; Path=/",
@@ -2914,6 +3015,18 @@ class ConfigUI:
             with self._mutation_lock:
                 return handler(request, session)
         return handler(request, session)
+
+    def _landing(self) -> str:
+        """:func:`landing_target` over the wizard state file read now. A state
+        file that cannot be read is not a finished one: the wizard reports it."""
+
+        try:
+            # The canonical base, so the state read is the file startup
+            # checked as settings.wizard_path ("~" and references expanded).
+            state = WizardState(self.settings.base_path)
+        except WizardStateError:
+            return LANDING_WIZARD
+        return landing_target(self.settings, state)
 
     # -- the status record (R7, R4) --------------------------------------------
 
@@ -3035,6 +3148,7 @@ class ConfigUI:
             f"{''.join(rows)}</table>{missing_note}</section>"
             '<section id="actions-bar">'
             '<p><a href="/core">Core settings</a></p>'
+            f"{CONSOLE_LINK}"
             f'<form method="post" action="/check">{_csrf_field(session)}{_layout_field(view)}{_page_field("/")}'
             '<button type="submit">Check</button></form>'
             f'<form method="post" action="/apply">{_csrf_field(session)}{_page_field("/")}'
@@ -5574,9 +5688,30 @@ def serve(ui: ConfigUI, settings: UISettings) -> None:
 
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     app.router.add_route("*", "/{tail:.*}", catch_all)
-    try:
+
+    async def run() -> None:
         # access_log=None: the access URL's query carries the token (AC2).
-        web.run_app(app, host=settings.host, port=settings.port, print=None, access_log=None)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        try:
+            await web.TCPSite(runner, settings.host, settings.port).start()
+            # Only now is anything listening; the hook runs on its own thread
+            # so a blocking browser opener never holds the loop.
+            if ui.on_listening is not None:
+                threading.Thread(target=ui.on_listening, name="config-ui-opener", daemon=True).start()
+            stopped = asyncio.Event()
+            if os.name != "nt":
+                # As aiohttp's run_app did: SIGTERM ends serving through the
+                # finally clauses, so the supervised child is still closed.
+                asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopped.set)
+            await stopped.wait()
+        finally:
+            await runner.cleanup()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
@@ -5586,8 +5721,24 @@ def serve(ui: ConfigUI, settings: UISettings) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the configuration UI; return the process exit status."""
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    opener: Callable[[str], object] | None = None,
+    serve: Callable[[ConfigUI, UISettings], None] | None = None,
+) -> int:
+    """Run the configuration UI; return the process exit status.
+
+    *opener* receives the access URL once (A3; default ``webbrowser.open``),
+    from :attr:`ConfigUI.on_listening` once *serve* is listening, and *serve*
+    serves the UI (default: this module's :func:`serve`); both are looked up
+    when called, never captured at import.
+    """
+
+    if opener is None:
+        opener = webbrowser.open
+    if serve is None:
+        serve = globals()["serve"]
 
     try:
         settings = UISettings.from_argv(sys.argv[1:] if argv is None else argv)
@@ -5598,9 +5749,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         for problem in problems:
             print(f"config_ui: {problem}", file=sys.stderr)
         return 2
+    if settings.default_location:
+        # Only the A2 default's directory is created; a --config run creates
+        # nothing (A2: every existing behaviour is unchanged).
+        directory = settings.base_path.parent
+        try:
+            if not directory.exists():
+                directory.mkdir(mode=0o700, parents=True)
+                if os.name != "nt":
+                    os.chmod(directory, 0o700)
+        except OSError as exc:
+            print(
+                f"config_ui: profile directory {directory} cannot be created: {exc.strerror}",
+                file=sys.stderr,
+            )
+            return 2
     ui = ConfigUI(settings)
     print(f"Configuration UI: {ui.access_url}", flush=True)
     logger.info("configuration UI serving on %s", ui.access_authority)
+
+    def open_browser() -> None:
+        try:
+            opener(ui.access_url)
+        except Exception:
+            # The printed URL is the fallback; the URL carries the token, so
+            # neither it nor the failure's text (which may quote it) is logged.
+            logger.warning("the browser could not be opened: use the printed access URL")
+
+    ui.on_listening = open_browser
     try:
         serve(ui, settings)
     finally:

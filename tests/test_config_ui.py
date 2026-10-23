@@ -746,10 +746,20 @@ def test_the_launch_argv_is_split_at_the_first_double_dash() -> None:
 
 
 def test_a_missing_config_or_bad_port_exits_non_zero(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Phase 9 R1 (plan P6, allowlisted) makes a no-argument start valid: it
+    uses the A2 default location. The superseded ``main([]) != 0`` becomes a
+    no-argument start whose default is invalid — the status record set to the
+    default ``<base>.wizard.json`` — which still exits non-zero, unserved."""
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(config_ui, "serve", _fail)
-    assert main([]) != 0
+    wizard_state = tmp_path / "twitch-ia-compagnon" / "profile.yaml.wizard.json"
+    assert main(["--status-file", str(wizard_state)]) != 0
+    assert "wizard_state_path_collision" in capsys.readouterr().err
+    assert not (tmp_path / "twitch-ia-compagnon").exists()
     assert main(["--config", "c.yaml", "--port", "0"]) != 0
     assert main(["--config", "c.yaml", "--port", "70000"]) != 0
     capsys.readouterr()

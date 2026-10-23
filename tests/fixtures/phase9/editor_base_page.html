@@ -1,0 +1,23 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="csrf-token" content="pinned-0003"><title>Configuration</title><style>
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0 auto; max-width: 60rem; padding: 1rem; line-height: 1.4; }
+table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+th, td { border-bottom: 1px solid #8884; padding: 0.3rem 0.5rem; text-align: left; vertical-align: top; }
+section { margin: 1.5rem 0; }
+.read-only { border-left: 4px solid #c90; padding-left: 0.75rem; }
+.reason, .origin, .kind { color: #777; font-size: 0.9em; }
+.diagnostics { color: #b00; }
+form.inline { display: inline; margin: 0; }
+code { font-family: ui-monospace, monospace; }
+fieldset { margin: 0.5rem 0; }
+.field, .notice { margin: 0.5rem 0; }
+.help, .meta { margin: 0.2rem 0; color: #777; font-size: 0.9em; }
+.not-editable { border-left: 4px solid #c90; padding-left: 0.75rem; }
+.required { color: #b00; text-decoration: none; }
+textarea { width: 100%; font-family: ui-monospace, monospace; }
+</style></head><body><h1>Configuration</h1><p class="local-only" id="local-only">This configuration UI is local-only: it edits the configuration files of this machine and is never a remote administration channel.</p><section id="running"><h2>Running process</h2><table><tr><th>Status record</th><td id="record-status" data-record="absent">no status record</td></tr><tr><th>Disk and running process</th><td id="drift" data-drift="unknown">unknown</td></tr><tr><th>Supervision</th><td id="supervision">no running process is known</td></tr></table></section><section id="origin"><h2>Configuration origin</h2><table><tr><th>Base file</th><td id="base-path"><code>{ROOT}/config.yaml</code></td></tr><tr><th>Overlay file</th><td id="overlay-path"><code>{ROOT}/config.local.yaml</code> <span id="overlay-state">(absent)</span></td></tr></table><h3>Referenced environment variables</h3><table id="variables"><tr><th>Variable</th><th>State</th></tr><tr data-variable="XMOD_TOKEN" data-state="unset"><td><code>${XMOD_TOKEN}</code></td><td>unset</td></tr></table></section><section id="modules"><h2>Modules</h2><table><tr><th>Module</th><th>Enabled</th><th>Readiness</th></tr><tr data-module="xmod" data-enabled="true"><td><a href="/module/xmod">xmod</a></td><td>enabled<form class="inline" method="post" action="/save"><input type="hidden" name="csrf_token" value="pinned-0003"><input type="hidden" name="fingerprint" value="absent"><input type="hidden" name="layout" value="b621da53b667a6b25237175d2e72a7d76ff93d7f2c70dcfa70d81a05b5986e4a"><input type="hidden" name="page" value="/"><input type="hidden" name="enabled_modules.xmod" value="false"><button type="submit">Disable</button></form></td><td class="readiness"><span class="check">not checked yet</span><br><span class="running">no running process is known</span></td></tr></table></section><section id="actions-bar"><p><a href="/core">Core settings</a></p><form method="post" action="/check"><input type="hidden" name="csrf_token" value="pinned-0003"><input type="hidden" name="layout" value="b621da53b667a6b25237175d2e72a7d76ff93d7f2c70dcfa70d81a05b5986e4a"><input type="hidden" name="page" value="/"><button type="submit">Check</button></form><form method="post" action="/apply"><input type="hidden" name="csrf_token" value="pinned-0003"><input type="hidden" name="page" value="/"><button type="submit">Apply (restart the main process)</button></form></section><script>
+document.addEventListener("submit", function (event) {
+  var buttons = event.target.querySelectorAll("button");
+  for (var i = 0; i < buttons.length; i++) { buttons[i].disabled = true; }
+});
+</script></body></html>

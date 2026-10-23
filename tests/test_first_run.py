@@ -14,6 +14,13 @@ data half, AC8, AC10), validated against the shipped manifests themselves.
 P5 (A1, A7, R4): the credential store and the wizard state file (AC11's
 storage half, AC30's state-file clause), with the platform and environment
 forced, so the Windows branch runs on any host.
+
+P6 (R1): ``--config`` optional (AC1), the startup collisions of the added
+files (AC1), the landing routing (AC2's routing half: the redirect and its
+session cookie; P12 and P13 follow it to the pages) and the injected browser
+opener (AC3). The editor's pre-phase markup is the fixture
+``tests/fixtures/phase9/editor_base_page.html``, captured from the code before
+P6 changed any render.
 """
 
 from __future__ import annotations
@@ -25,15 +32,20 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import sys
+import webbrowser
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
+import core.config_ui as config_ui
 from conftest import baseline_numstat
 from core import main as application
 from core.config_ui import i18n, locations, wizard
@@ -1585,3 +1597,403 @@ def test_a7_a_malformed_state_file_is_refused(tmp_path: Path, content: bytes) ->
     wizard.state_path(profile).write_bytes(content)
     with pytest.raises(wizard.WizardStateError):
         wizard.WizardState(profile)
+
+
+# --------------------------------------------------------------------------- #
+# P6 (R1): `--config` optional, the extended startup collisions, the landing
+# routing (AC2's routing half) and the browser opener (A3)
+# --------------------------------------------------------------------------- #
+
+EDITOR_FIXTURE = ROOT / "tests" / "fixtures" / "phase9" / "editor_base_page.html"
+#: Stands for the run's temporary directory in the captured editor page.
+ROOT_PLACEHOLDER = "{ROOT}"
+EDITOR_MODULE = (
+    "name: xmod\nmanifest_version: 2\nruntime_api: 2\nproduces: []\nconsumes: []\n"
+    "middleware: false\nsettings_schema:\n  type: object\n  properties:\n"
+    "    token:\n      type: string\n    channel:\n      type: string\n"
+    "credentials: [token]\n"
+)
+EDITOR_BASE = (
+    "modules_directory: ./mods\nenabled_modules: [xmod]\n"
+    "secrets: ['${XMOD_TOKEN}']\nmodules:\n  xmod:\n    token: ${XMOD_TOKEN}\n    channel: fixture\n"
+)
+
+
+@contextmanager
+def _pinned_secrets() -> Iterator[None]:
+    """Tokens, nonces and field keys pinned, so one fixture renders one page."""
+
+    counter = iter(range(1, 1_000_000))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(secrets, "token_urlsafe", lambda n=32: f"pinned-{next(counter):04d}")
+        patch.setattr(secrets, "token_hex", lambda n=32: "ab" * n)
+        patch.setattr(secrets, "token_bytes", lambda n=32: b"\x01" * n)
+        yield
+
+
+def _editor_fixture(root: Path) -> Path:
+    (root / "mods" / "xmod").mkdir(parents=True)
+    (root / "mods" / "xmod" / "module.yaml").write_text(EDITOR_MODULE, encoding="utf-8")
+    base = root / "config.yaml"
+    base.write_text(EDITOR_BASE, encoding="utf-8")
+    return base
+
+
+def _editor_page(root: Path) -> tuple[str, Any]:
+    """The editor's base page for the fixed fixture, reached through the
+    access URL with ``--config``; the temporary directory is replaced by
+    :data:`ROOT_PLACEHOLDER`. Returns the page and the access-URL response."""
+
+    base = _editor_fixture(root)
+    with _pinned_secrets():
+        ui = config_ui.ConfigUI(
+            config_ui.UISettings.from_argv(["--config", str(base)]), environ={}
+        )
+        landing = ui.handle(_ui_request("GET", "/", query={"token": ui.token}))
+        cookie = dict(landing.headers)["Set-Cookie"].split(";")[0]
+        page = ui.handle(_ui_request("GET", "/", headers={"cookie": cookie}))
+    assert page.status == 200
+    return page.body.decode("utf-8").replace(str(root.resolve()), ROOT_PLACEHOLDER), landing
+
+
+def _ui_request(
+    method: str, path: str, *, query: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    return config_ui.UIRequest(
+        method=method, path=path, query=query or {},
+        headers={"host": "127.0.0.1:8765", **(headers or {})}, body=b"",
+    )
+
+
+#: Written to a colliding file; no diagnostic may quote it.
+COLLIDED_CONTENT = "fixture-content-7f3a9c-never-quoted"
+
+
+def _default_environment(monkeypatch: pytest.MonkeyPatch, root: Path) -> Path:
+    """Point A2 at *root*; return the default profile path (not created)."""
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root))
+    monkeypatch.setenv("HOME", str(root))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    return root / PRODUCT / "profile.yaml"
+
+
+class _Calls:
+    """A fake ``serve`` or opener: records its arguments, optionally raises."""
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.error = error
+
+    def __call__(self, *args: Any) -> None:
+        self.calls.append(args)
+        if self.error is not None:
+            raise self.error
+
+
+class _Serving(_Calls):
+    """A fake ``serve`` that is listening at once: it runs the UI's
+    ``on_listening`` hook, as the real :func:`config_ui.serve` does once its
+    listener accepts connections."""
+
+    def __call__(self, *args: Any) -> None:
+        super().__call__(*args)
+        ui = args[0]
+        assert ui.on_listening is not None
+        ui.on_listening()
+
+
+def test_ac1_no_config_resolves_the_a2_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = _default_environment(monkeypatch, tmp_path)
+    settings = config_ui.UISettings.from_argv([])
+    assert settings.config == profile == tmp_path / PRODUCT / "profile.yaml"
+    assert settings.default_location is True
+    assert config_ui.startup_checks(settings) == []
+    assert config_ui.UISettings.from_argv(["--config", "c.yaml"]).default_location is False
+
+    exposed = config_ui.UISettings.from_argv(["--host", "0.0.0.0"])
+    assert config_ui.startup_checks(exposed) == [
+        "refusing to bind non-loopback host 0.0.0.0: the configuration UI is local-only; "
+        "pass --allow-non-loopback to override"
+    ]
+
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    fallback = config_ui.UISettings.from_argv([])
+    assert fallback.config == tmp_path / ".config" / PRODUCT / "profile.yaml"
+    assert config_ui.startup_checks(fallback) == []
+
+
+def test_ac1_the_added_paths_are_canonical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = _default_environment(monkeypatch, tmp_path)
+    settings = config_ui.UISettings.from_argv([])
+    assert settings.wizard_path == profile.with_name("profile.yaml.wizard.json")
+    assert settings.instance_path == profile.with_name("profile.yaml.instance.json")
+    assert settings.feed_path == profile.with_name("profile.yaml.feed.jsonl")
+    assert settings.credential_path == tmp_path / PRODUCT / "profile.yaml.credentials.json"
+
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    given = config_ui.UISettings.from_argv(["--config", str(tmp_path / "link" / "a.yml")])
+    assert given.wizard_path == tmp_path / "real" / "a.yml.wizard.json"
+    assert given.instance_path == tmp_path / "real" / "a.yml.instance.json"
+    assert given.credential_path == tmp_path / PRODUCT / "a.yml.credentials.json"
+
+    monkeypatch.setattr(locations, "running_platform", lambda: locations.WINDOWS)
+    assert config_ui.UISettings.from_argv([]).credential_path is None
+
+
+_ADDED_FILES = {
+    "wizard": ("wizard_state", "wizard state", lambda root: root / PRODUCT / "profile.yaml.wizard.json"),
+    "instance": ("instance", "instance record", lambda root: root / PRODUCT / "profile.yaml.instance.json"),
+    "credential": ("credential", "credential", lambda root: root / PRODUCT / "profile.yaml.credentials.json"),
+}
+
+
+@pytest.mark.parametrize("option, collided", [("--status-file", "status"), ("--overlay", "overlay")])
+@pytest.mark.parametrize("added", sorted(_ADDED_FILES))
+def test_ac1_an_added_file_colliding_refuses_to_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+    collided: str,
+    added: str,
+) -> None:
+    _default_environment(monkeypatch, tmp_path)
+    token, role, locate = _ADDED_FILES[added]
+    target = locate(tmp_path)
+    target.parent.mkdir()
+    target.write_text(COLLIDED_CONTENT, encoding="utf-8")
+
+    (problem,) = config_ui.startup_checks(config_ui.UISettings.from_argv([option, str(target)]))
+    assert problem == (
+        f"{token}_path_collision: {role} file {target} collides with the {collided} file {target}"
+    )
+    assert COLLIDED_CONTENT not in problem
+
+    serve, opener = _Calls(), _Calls()
+    assert config_ui.main([option, str(target)], serve=serve, opener=opener) != 0
+    captured = capsys.readouterr()
+    assert f"{token}_path_collision" in captured.err
+    assert COLLIDED_CONTENT not in captured.out + captured.err
+    assert serve.calls == [] and opener.calls == []
+    assert target.read_text(encoding="utf-8") == COLLIDED_CONTENT
+
+
+def test_r1_the_feed_and_the_added_files_collide_once_each(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = _default_environment(monkeypatch, tmp_path)
+    feed = profile.with_name("profile.yaml.feed.jsonl")
+    (problem,) = config_ui.startup_checks(config_ui.UISettings.from_argv(["--status-file", str(feed)]))
+    assert problem == f"feed_path_collision: feed file {feed} collides with the status file {feed}"
+
+    # The credential file named after a base whose directory is the
+    # credential directory and whose name ends like the wizard state's:
+    # every added file is checked against the ones before it.
+    base = tmp_path / PRODUCT / "x.yaml"
+    monkeypatch.setattr(locations, "CREDENTIAL_SUFFIX", ".wizard.json")
+    (problem,) = config_ui.startup_checks(config_ui.UISettings.from_argv(["--config", str(base)]))
+    wizard_state = tmp_path / PRODUCT / "x.yaml.wizard.json"
+    assert problem == (
+        f"credential_path_collision: credential file {wizard_state} collides with the "
+        f"wizard state file {wizard_state}"
+    )
+
+
+def _access(ui: Any) -> tuple[Any, str]:
+    """GET the access URL; return the response and its session cookie pair."""
+
+    response = ui.handle(_ui_request("GET", "/", query={"token": ui.token}))
+    assert response.status == 303
+    cookie = dict(response.headers)["Set-Cookie"]
+    assert cookie.startswith(f"{config_ui.SESSION_COOKIE}=")
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    pair = cookie.split(";")[0]
+    assert ui._session(_ui_request("GET", "/", headers={"cookie": pair})) is not None
+    return response, pair
+
+
+def _location(ui: Any) -> str:
+    return dict(_access(ui)[0].headers)["Location"]
+
+
+def test_ac2_first_run_lands_on_the_wizard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = _default_environment(monkeypatch, tmp_path)
+    ui = config_ui.ConfigUI(config_ui.UISettings.from_argv([]), environ={})
+    assert not profile.exists()
+    assert _location(ui) == config_ui.LANDING_WIZARD == "/wizard"
+    # A2: with --config, a path that does not exist is also a first run.
+    given = config_ui.ConfigUI(
+        config_ui.UISettings.from_argv(["--config", str(tmp_path / "absent.yaml")]), environ={}
+    )
+    assert _location(given) == "/wizard"
+
+
+def test_ac2_an_unfinished_wizard_lands_on_the_wizard_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = _default_environment(monkeypatch, tmp_path)
+    profile.parent.mkdir()
+    profile.write_text("enabled_modules: []\n", encoding="utf-8")
+    state = wizard.WizardState(profile)
+    state.profile = "silent"
+    state.save()
+    ui = config_ui.ConfigUI(config_ui.UISettings.from_argv([]), environ={})
+    assert _location(ui) == "/wizard"
+    # The same over --config: unfinished wins over the editor too.
+    given = config_ui.ConfigUI(config_ui.UISettings.from_argv(["--config", str(profile)]), environ={})
+    assert _location(given) == "/wizard"
+
+    state.completed = True
+    state.save()
+    assert _location(ui) == "/console"
+    assert _location(given) == "/"
+
+    wizard.state_path(profile).write_bytes(b"not json")
+    assert _location(ui) == "/wizard"
+
+
+def test_ac2_an_unfinished_wizard_is_found_through_a_home_relative_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state read is the canonical ``settings.wizard_path``: ``~`` is
+    expanded, never looked up as a literal directory."""
+
+    _default_environment(monkeypatch, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    profile = tmp_path / "home.yaml"
+    profile.write_text("enabled_modules: []\n", encoding="utf-8")
+    state = wizard.WizardState(profile)
+    state.profile = "silent"
+    state.save()
+    settings = config_ui.UISettings.from_argv(["--config", "~/home.yaml"])
+    assert settings.wizard_path == state.path.resolve()
+    assert _location(config_ui.ConfigUI(settings, environ={})) == "/wizard"
+
+
+def test_ac2_a_profile_at_the_default_location_lands_on_the_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = _default_environment(monkeypatch, tmp_path)
+    profile.parent.mkdir()
+    profile.write_text("enabled_modules: []\n", encoding="utf-8")
+    settings = config_ui.UISettings.from_argv([])
+    assert config_ui.landing_target(settings, None) == "/console"
+    ui = config_ui.ConfigUI(settings, environ={})
+    assert _location(ui) == config_ui.LANDING_CONSOLE == "/console"
+
+
+def test_ac2_config_lands_on_the_unchanged_editor_with_one_console_link(tmp_path: Path) -> None:
+    """The editor's markup equals the page captured from the pre-phase code
+    (P6, before any render changed) except for DD7's one added link."""
+
+    page, landing = _editor_page(tmp_path)
+    assert dict(landing.headers)["Location"] == "/"
+    assert page.count(config_ui.CONSOLE_LINK) == 1
+    assert page.count("<a ") == EDITOR_FIXTURE.read_text(encoding="utf-8").count("<a ") + 1
+    assert page.replace(config_ui.CONSOLE_LINK, "", 1) == EDITOR_FIXTURE.read_text(encoding="utf-8")
+
+
+def _no_token_logged(caplog: pytest.LogCaptureFixture, token: str) -> None:
+    for record in caplog.records:
+        assert token not in record.getMessage()
+        assert token not in repr(record.args)
+
+
+def test_ac3_the_access_url_is_opened_once_and_printed_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    profile = _default_environment(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    serve, opener = _Serving(), _Calls()
+    assert config_ui.main([], opener=opener, serve=serve) == 0
+    ((ui, settings),) = serve.calls
+    assert settings.config == profile
+    assert opener.calls == [(ui.access_url,)]
+    out = capsys.readouterr().out
+    assert out.count(ui.access_url) == 1
+    _no_token_logged(caplog, ui.token)
+    # The default profile's directory is created owner-only; the profile is not.
+    assert stat.S_IMODE(profile.parent.stat().st_mode) == 0o700
+    assert not profile.exists()
+
+
+def test_ac3_the_browser_is_opened_only_once_serve_is_listening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``main`` never calls the opener itself: a serve that has not reached
+    its listener has opened nothing, and its hook opens the URL once."""
+
+    _default_environment(monkeypatch, tmp_path)
+    serve, opener = _Calls(), _Calls()
+    assert config_ui.main([], opener=opener, serve=serve) == 0
+    ((ui, _settings),) = serve.calls
+    assert opener.calls == []
+    assert ui.on_listening is not None
+    ui.on_listening()
+    assert opener.calls == [(ui.access_url,)]
+    capsys.readouterr()
+
+
+def test_ac3_a_raising_opener_leaves_the_printed_url_and_exit_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _default_environment(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    serve = _Serving()
+    error = _Calls(OSError("no browser for http://127.0.0.1:8765/?token=leak"))
+    assert config_ui.main([], opener=error, serve=serve) == 0
+    ((ui, _settings),) = serve.calls
+    assert error.calls == [(ui.access_url,)]
+    assert capsys.readouterr().out.count(ui.access_url) == 1
+    _no_token_logged(caplog, ui.token)
+    assert not any("leak" in record.getMessage() for record in caplog.records)
+    assert any("browser could not be opened" in record.getMessage() for record in caplog.records)
+
+
+def test_a2_a_config_run_creates_no_default_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _default_environment(monkeypatch, tmp_path / "xdg")
+    base = _editor_fixture(tmp_path)
+    serve, opener = _Serving(), _Calls()
+    assert config_ui.main(["--config", str(base)], opener=opener, serve=serve) == 0
+    assert len(serve.calls) == 1 and len(opener.calls) == 1
+    assert not (tmp_path / "xdg").exists()
+    capsys.readouterr()
+
+
+def test_a3_the_default_opener_is_refused_by_the_ac33_guard_and_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The existing ``main([...])`` tests reach the real ``webbrowser.open``:
+    every Linux path of it starts a process, which the suite's guard refuses
+    (AC33); ``main`` swallows the failure and still serves. The browser
+    registry is reset and ``BROWSER`` named so a process start is certain."""
+
+    for name in ("DISPLAY", "WAYLAND_DISPLAY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("BROWSER", "fixture-browser")
+    monkeypatch.setattr(webbrowser, "_tryorder", None)
+    monkeypatch.setattr(webbrowser, "_browsers", {})
+    caplog.set_level("DEBUG")
+    base = _editor_fixture(tmp_path)
+    serve = _Serving()
+    assert config_ui.main(["--config", str(base)], serve=serve) == 0
+    ((ui, _settings),) = serve.calls
+    assert capsys.readouterr().out.count(ui.access_url) == 1
+    assert any("browser could not be opened" in record.getMessage() for record in caplog.records)
+    _no_token_logged(caplog, ui.token)
