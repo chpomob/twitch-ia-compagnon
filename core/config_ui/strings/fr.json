@@ -1,0 +1,13 @@
+{
+  "language.name": "Français",
+  "reason.unknown": "Le compagnon a refusé pour une raison qu'il ne sait pas encore expliquer : {token}.",
+  "detail.disclosure": "Afficher le détail brut",
+  "profile.chat_qa.name": "Questions du chat",
+  "profile.chat_qa.description": "Répond à un message du chat qui mentionne le nom du compagnon.",
+  "profile.channel_points.name": "Points de chaîne",
+  "profile.channel_points.description": "Réagit quand un spectateur échange une récompense personnalisée que vous choisissez.",
+  "profile.spoken_keyword.name": "Mot-clé parlé",
+  "profile.spoken_keyword.description": "Écoute votre micro et répond quand vous prononcez le mot d'éveil.",
+  "profile.silent.name": "Silencieux",
+  "profile.silent.description": "Se connecte au chat de votre chaîne mais ne répond jamais : tous les déclencheurs sont désactivés."
+}

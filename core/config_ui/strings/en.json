@@ -1,0 +1,13 @@
+{
+  "language.name": "English",
+  "reason.unknown": "The companion refused this for a reason it has no sentence for yet: {token}.",
+  "detail.disclosure": "Show the raw detail",
+  "profile.chat_qa.name": "Chat Q&A",
+  "profile.chat_qa.description": "Answers a chat message that mentions the companion's name.",
+  "profile.channel_points.name": "Channel points",
+  "profile.channel_points.description": "Reacts when a viewer redeems one custom reward you choose.",
+  "profile.spoken_keyword.name": "Spoken keyword",
+  "profile.spoken_keyword.description": "Listens to your microphone and answers when you say the wake word.",
+  "profile.silent.name": "Silent",
+  "profile.silent.description": "Connects to your channel's chat but never answers: every trigger is off."
+}
