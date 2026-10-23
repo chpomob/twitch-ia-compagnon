@@ -1,0 +1,121 @@
+{
+  "format": 1,
+  "id": "silent",
+  "order": 4,
+  "name_key": "profile.silent.name",
+  "description_key": "profile.silent.description",
+  "note": "The platform input stays connected; no input declares an explicit 'off' policy, so 'every trigger off' is a configured policy that never matches (probability 0).",
+  "model_needed": false,
+  "parameters": [],
+  "identities": [
+    "broadcaster_id",
+    "bot_user_id"
+  ],
+  "credentials": [
+    {
+      "name": "TWITCH_CLIENT_ID",
+      "module": "twitch",
+      "setting": "client_id",
+      "screen": "platform"
+    },
+    {
+      "name": "TWITCH_CLIENT_SECRET",
+      "module": "twitch",
+      "setting": "client_secret",
+      "screen": "platform"
+    },
+    {
+      "name": "TWITCH_ACCESS_TOKEN",
+      "module": "twitch",
+      "setting": "access_token",
+      "screen": "platform"
+    }
+  ],
+  "platform": {
+    "module": "twitch",
+    "scopes": [
+      "user:read:chat"
+    ],
+    "validation_endpoint": "https://id.twitch.tv/oauth2/validate",
+    "reward_list_endpoint": "https://api.twitch.tv/helix/channel_points/custom_rewards"
+  },
+  "dry_run": {
+    "event_kind": "message",
+    "expected_outcome": "not_triggered"
+  },
+  "template": {
+    "modules_directory": "builtin",
+    "enabled_modules": [
+      "twitch"
+    ],
+    "modules": {
+      "twitch": {
+        "client_id": "$credential:TWITCH_CLIENT_ID",
+        "client_secret": "$credential:TWITCH_CLIENT_SECRET",
+        "access_token": "$credential:TWITCH_ACCESS_TOKEN",
+        "broadcaster_id": "$identity:broadcaster_id",
+        "bot_user_id": "$identity:bot_user_id",
+        "companion_name": "Companion"
+      }
+    },
+    "triggers": {
+      "twitch": {
+        "channels": {
+          "$identity:broadcaster_id": {
+            "combination": "all_of",
+            "rules": [
+              {
+                "type": "probability",
+                "parameters": {
+                  "probability": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "limits": {
+      "bus_history": {
+        "max_events": 1000,
+        "max_bytes": 4194304,
+        "max_age_seconds": 600
+      },
+      "observation_queue": {
+        "max_records": 1000,
+        "max_bytes": 4194304
+      },
+      "dedup": {
+        "max_entries": 4096,
+        "ttl_seconds": 600
+      },
+      "attachments": {
+        "max_object_bytes": 1048576,
+        "max_objects": 256,
+        "max_total_bytes": 67108864,
+        "max_bytes_per_run": 8388608,
+        "ttl_seconds": 900
+      },
+      "conversation_memory": {
+        "max_sessions": 64,
+        "max_exchanges": 20,
+        "max_bytes": 65536,
+        "max_age_seconds": 3600
+      },
+      "chat_context": {
+        "max_messages": 50,
+        "max_bytes": 65536,
+        "max_age_seconds": 900,
+        "max_channels": 8
+      },
+      "admission": {
+        "session_queue_capacity": 4,
+        "global_pending_capacity": 64,
+        "max_sessions": 32,
+        "workers": 4,
+        "wait_seconds": 30,
+        "total_run_seconds": 60
+      }
+    }
+  }
+}

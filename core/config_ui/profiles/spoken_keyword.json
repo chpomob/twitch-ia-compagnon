@@ -1,0 +1,313 @@
+{
+  "format": 1,
+  "id": "spoken_keyword",
+  "order": 3,
+  "name_key": "profile.spoken_keyword.name",
+  "description_key": "profile.spoken_keyword.description",
+  "note": "The chat input stays connected with its trigger off: no input declares an explicit 'off' policy, so it is a configured policy that never matches (probability 0). Only the wake word on the voice input starts a run.",
+  "model_needed": true,
+  "parameters": [
+    {
+      "name": "wake_word",
+      "kind": "text",
+      "screen": "choice"
+    },
+    {
+      "name": "recorder",
+      "kind": "argv",
+      "screen": "choice"
+    },
+    {
+      "name": "detector",
+      "kind": "detector",
+      "screen": "choice"
+    },
+    {
+      "name": "transcription_endpoint",
+      "kind": "text",
+      "screen": "choice"
+    },
+    {
+      "name": "transcription_model",
+      "kind": "text",
+      "screen": "choice"
+    },
+    {
+      "name": "model_endpoint",
+      "kind": "text",
+      "screen": "model"
+    },
+    {
+      "name": "model_name",
+      "kind": "text",
+      "screen": "model"
+    }
+  ],
+  "identities": [
+    "broadcaster_id",
+    "bot_user_id"
+  ],
+  "credentials": [
+    {
+      "name": "TWITCH_CLIENT_ID",
+      "module": "twitch",
+      "setting": "client_id",
+      "screen": "platform"
+    },
+    {
+      "name": "TWITCH_CLIENT_SECRET",
+      "module": "twitch",
+      "setting": "client_secret",
+      "screen": "platform"
+    },
+    {
+      "name": "TWITCH_ACCESS_TOKEN",
+      "module": "twitch",
+      "setting": "access_token",
+      "screen": "platform"
+    },
+    {
+      "name": "TRANSCRIPTION_API_KEY",
+      "module": "audio_input",
+      "setting": "transcription.api_key",
+      "screen": "choice"
+    },
+    {
+      "name": "WAKE_WORD_DETECTOR_API_KEY",
+      "module": "audio_input",
+      "setting": "wake_word.detector.api_key",
+      "screen": "choice",
+      "parameter": "detector"
+    },
+    {
+      "name": "MODEL_API_KEY",
+      "module": "brain",
+      "setting": "api_key",
+      "screen": "model"
+    }
+  ],
+  "platform": {
+    "module": "twitch",
+    "scopes": [
+      "user:read:chat",
+      "user:write:chat"
+    ],
+    "validation_endpoint": "https://id.twitch.tv/oauth2/validate",
+    "reward_list_endpoint": "https://api.twitch.tv/helix/channel_points/custom_rewards"
+  },
+  "dry_run": {
+    "event_kind": "speech",
+    "expected_outcome": "completed"
+  },
+  "template": {
+    "modules_directory": "builtin",
+    "enabled_modules": [
+      "twitch",
+      "chat_context",
+      "audio_input",
+      "brain"
+    ],
+    "modules": {
+      "twitch": {
+        "client_id": "$credential:TWITCH_CLIENT_ID",
+        "client_secret": "$credential:TWITCH_CLIENT_SECRET",
+        "access_token": "$credential:TWITCH_ACCESS_TOKEN",
+        "broadcaster_id": "$identity:broadcaster_id",
+        "bot_user_id": "$identity:bot_user_id",
+        "companion_name": "Companion"
+      },
+      "chat_context": {},
+      "audio_input": {
+        "sources": {
+          "microphone": {
+            "kind": "command",
+            "argv": "$parameter:recorder"
+          }
+        },
+        "default_source": "microphone",
+        "transcription": {
+          "enabled": true,
+          "endpoint": "$parameter:transcription_endpoint",
+          "model": "$parameter:transcription_model",
+          "api_key": "$credential:TRANSCRIPTION_API_KEY"
+        },
+        "listen": {
+          "enabled": true,
+          "source": "microphone",
+          "destination": {
+            "platform": "twitch",
+            "channel_id": "$identity:broadcaster_id"
+          }
+        },
+        "wake_word": {
+          "detector": "$parameter:detector"
+        }
+      },
+      "brain": {
+        "endpoint": "$parameter:model_endpoint",
+        "model": "$parameter:model_name",
+        "api_key": "$credential:MODEL_API_KEY",
+        "admission": {
+          "session_queue_capacity": 4,
+          "global_pending_capacity": 64,
+          "max_sessions": 32,
+          "workers": 4,
+          "wait_seconds": 30,
+          "total_run_seconds": 60
+        },
+        "budget": {
+          "model_turns": 5,
+          "model_call_seconds": 30,
+          "action_seconds": 10,
+          "max_tokens": 8192,
+          "max_observation_bytes": 5242880,
+          "max_action_calls": 6,
+          "max_repeated_actions": 2,
+          "delivery_reserve_seconds": 10
+        },
+        "conversation_memory": {
+          "max_sessions": 64,
+          "max_exchanges": 20,
+          "max_bytes": 65536,
+          "max_age_seconds": 3600
+        },
+        "fallback": {
+          "enabled": true,
+          "text": "I could not answer in time."
+        },
+        "capabilities": {
+          "required": [
+            "structured_output"
+          ]
+        },
+        "delivery": {
+          "mode": "fixed",
+          "actions": [
+            {
+              "action": "chat.write",
+              "text_argument": "text"
+            }
+          ]
+        }
+      }
+    },
+    "actions": [
+      {
+        "rule_id": "brain-reads-chat",
+        "action_name": "chat.read",
+        "destination": {
+          "platform": "twitch",
+          "channel_id": "$identity:broadcaster_id",
+          "scope": "chat"
+        },
+        "principals": [
+          "brain"
+        ],
+        "natures": [
+          "read"
+        ],
+        "granted_permissions": [
+          "chat.read"
+        ]
+      },
+      {
+        "rule_id": "brain-delivers-chat-replies",
+        "action_name": "chat.write",
+        "destination": {
+          "platform": "twitch",
+          "channel_id": "$identity:broadcaster_id",
+          "scope": "chat"
+        },
+        "principals": [
+          "brain"
+        ],
+        "natures": [
+          "write"
+        ],
+        "granted_permissions": [
+          "chat.write"
+        ]
+      }
+    ],
+    "triggers": {
+      "twitch": {
+        "channels": {
+          "$identity:broadcaster_id": {
+            "combination": "all_of",
+            "rules": [
+              {
+                "type": "probability",
+                "parameters": {
+                  "probability": 0
+                }
+              }
+            ]
+          }
+        }
+      },
+      "audio_input": {
+        "channels": {
+          "$identity:broadcaster_id": {
+            "combination": "all_of",
+            "rules": [
+              {
+                "type": "wake_word",
+                "parameters": {}
+              },
+              {
+                "type": "keyword",
+                "parameters": {
+                  "keywords": [
+                    "$parameter:wake_word"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "limits": {
+      "bus_history": {
+        "max_events": 1000,
+        "max_bytes": 4194304,
+        "max_age_seconds": 600
+      },
+      "observation_queue": {
+        "max_records": 1000,
+        "max_bytes": 4194304
+      },
+      "dedup": {
+        "max_entries": 4096,
+        "ttl_seconds": 600
+      },
+      "attachments": {
+        "max_object_bytes": 1048576,
+        "max_objects": 256,
+        "max_total_bytes": 67108864,
+        "max_bytes_per_run": 8388608,
+        "ttl_seconds": 900
+      },
+      "conversation_memory": {
+        "max_sessions": 64,
+        "max_exchanges": 20,
+        "max_bytes": 65536,
+        "max_age_seconds": 3600
+      },
+      "chat_context": {
+        "max_messages": 50,
+        "max_bytes": 65536,
+        "max_age_seconds": 900,
+        "max_channels": 8
+      },
+      "admission": {
+        "session_queue_capacity": 4,
+        "global_pending_capacity": 64,
+        "max_sessions": 32,
+        "workers": 4,
+        "wait_seconds": 30,
+        "total_run_seconds": 60
+      }
+    }
+  }
+}

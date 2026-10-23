@@ -7,6 +7,9 @@ platform-named bytes phase 9 places under ``core/`` (flagged out-of-list).
 P3 (plan DD4): the string table and its loader (R2; AC5, AC6's discovery
 half), with the AST collector of the string keys ``wizard.py`` and
 ``console.py`` reference, run again by P12–P15 as keys appear.
+
+P4 (plan DD5): the four ready-made profiles and their generator (R3; AC7's
+data half, AC8, AC10), validated against the shipped manifests themselves.
 """
 
 from __future__ import annotations
@@ -18,10 +21,14 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
-from core.config_ui import i18n, locations
+from conftest import baseline_numstat
+from core import main as application
+from core.config_ui import i18n, locations, wizard
 from core.config_ui.i18n import StringTable, StringTableError
 from core.config_ui.locations import (
     PRODUCT,
@@ -501,3 +508,571 @@ def test_unknown_reason_names_the_token(language: str) -> None:
     sentence = StringTable.load().unknown_reason(language, "zz_unknown")
     assert "zz_unknown" in sentence
     assert sentence.replace("zz_unknown", "").strip()
+
+
+# --------------------------------------------------------------------------- #
+# R3 (plan DD5): the four ready-made profiles — AC7's data half, AC8, AC10
+# --------------------------------------------------------------------------- #
+
+PROFILES = CONFIG_UI / "profiles"
+MODULES = ROOT / "modules"
+
+#: AC7: the four profiles, in the order the choice screen offers them.
+PROFILE_ORDER = ("chat_qa", "channel_points", "spoken_keyword", "silent")
+
+#: The broadcaster and bot identities, as the platform's validation answer
+#: hands them over (P10): parameters of the generator, never typed.
+FIXTURE_IDENTITIES = {"broadcaster_id": "41245072", "bot_user_id": "90210417"}
+
+#: The stored credentials, by reference name: none may reach a profile file.
+FIXTURE_CREDENTIALS = {
+    "TWITCH_CLIENT_ID": "fixture-client-id-q8r",
+    "TWITCH_CLIENT_SECRET": "fixture-client-secret-k2v",
+    "TWITCH_ACCESS_TOKEN": "tok-XYZ-fixture-access-token",
+    "MODEL_API_KEY": "fixture-model-key-77w",
+    "TRANSCRIPTION_API_KEY": "fixture-transcription-key-3jd",
+}
+
+_MODEL = {"model_endpoint": "https://model.invalid/v1", "model_name": "fixture-model"}
+
+#: The streamer's answers per profile (R3: companion name; reward; wake word,
+#: detector and transcription settings; none).
+FIXTURE_PARAMETERS: dict[str, dict[str, Any]] = {
+    "chat_qa": {"companion_name": "Nova", **_MODEL},
+    "channel_points": {"reward_id": "5f1c0d7e-reward-fixture", **_MODEL},
+    "spoken_keyword": {
+        "wake_word": "hey nova",
+        "recorder": ["recorder", "--wav", "-"],
+        "detector": {"kind": "command", "argv": ["detector", "--phrase", "hey nova"]},
+        "transcription_endpoint": "https://transcription.invalid/v1",
+        "transcription_model": "fixture-transcriber",
+        **_MODEL,
+    },
+    "silent": {},
+}
+
+#: The four shipped ``*.example`` profiles as they are at ``cb0f5b1``
+#: (SHA-256 of ``git show cb0f5b1:<file>``, taken when this test was written).
+EXAMPLES_AT_CB0F5B1 = {
+    "config.yaml.example": "6589ef82efdddc191e768c06bd6aca26d3d5e7a3a495bb75bed822d35fddd65a",
+    "config.server.yaml.example": "ae6ea176b28cae5a0e720d7150ad263dae7539fb1a66dee9546587b737990aa5",
+    "agent.yaml.example": "32805b564f01cf719240b9a72f588f9577885fef410ee95fe9acb69a07fbab69",
+    "presence.yaml.example": "427a78b166ab657dfe22dde8f1ff18deb6521bc576945819de046beae997425d",
+}
+
+_REFERENCE = re.compile(r"\$\{([^}]*)\}")
+
+
+def _manifests() -> dict[str, dict[str, Any]]:
+    """The shipped manifests, read from the real ``modules/`` directory."""
+
+    manifests = {}
+    for path in sorted(MODULES.glob("*/module.yaml")):
+        manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+        manifests[manifest["name"]] = manifest
+    return manifests
+
+
+def _trigger_types(manifest: dict[str, Any]) -> set[str]:
+    return {entry["name"] for entry in (manifest.get("triggers") or {}).get("types", [])}
+
+
+def _declared_event_kinds(manifests: dict[str, dict[str, Any]]) -> set[str]:
+    """Every event kind a shipped manifest declares: a declared type's
+    ``kinds`` and the ``event_kind`` type's enumeration."""
+
+    kinds: set[str] = set()
+    for manifest in manifests.values():
+        for entry in (manifest.get("triggers") or {}).get("types", []):
+            kinds.update(entry.get("kinds", []))
+            if entry["name"] == "event_kind":
+                schema = entry["parameter_schema"]["properties"]["kinds"]["items"]
+                kinds.update(schema.get("enum", []))
+    return kinds
+
+
+def _value_at(document: Any, dotted: str) -> Any:
+    for key in dotted.split("."):
+        if not isinstance(document, dict) or key not in document:
+            return None
+        document = document[key]
+    return document
+
+
+def _profiles() -> dict[str, wizard.Profile]:
+    return {profile.id: profile for profile in wizard.load_profiles()}
+
+
+def _generated(profile_id: str) -> dict[str, Any]:
+    profile = _profiles()[profile_id]
+    return wizard.generate_profile(
+        profile, FIXTURE_PARAMETERS[profile_id], dict(FIXTURE_IDENTITIES)
+    )
+
+
+def _write(tmp_path: Path, profile_id: str) -> Path:
+    path = tmp_path / f"{profile_id}.yaml"
+    path.write_text(wizard.render_profile_yaml(_generated(profile_id)), encoding="utf-8")
+    return path
+
+
+def _stored_credentials(profile_id: str) -> dict[str, str]:
+    return {
+        credential.name: FIXTURE_CREDENTIALS[credential.name]
+        for credential in _profiles()[profile_id].credentials
+        if credential.parameter is None
+    }
+
+
+def test_ac7_four_profiles_load_in_the_stated_order() -> None:
+    """AC7 (data half): exactly 4 profiles, chat Q&A, channel points, spoken
+    keyword, silent, from the shipped package-data directory."""
+
+    profiles = wizard.load_profiles()
+    assert tuple(profile.id for profile in profiles) == PROFILE_ORDER
+    assert wizard.load_profiles(PROFILES) == profiles
+    assert sorted(path.name for path in PROFILES.iterdir()) == sorted(
+        f"{name}.json" for name in PROFILE_ORDER
+    )
+
+
+@pytest.mark.parametrize("language", ["en", "fr"])
+def test_ac7_each_profile_names_and_describes_itself_in_both_languages(language: str) -> None:
+    """AC7 (data half): each profile's name and description keys are in the
+    string table, with a non-empty sentence, in English and in French."""
+
+    table = StringTable.load()
+    for profile in wizard.load_profiles():
+        assert profile.name_key == f"profile.{profile.id}.name"
+        assert profile.description_key == f"profile.{profile.id}.description"
+        for key in (profile.name_key, profile.description_key):
+            assert table.sentence(language, key).strip(), (profile.id, key)
+
+
+def test_r3_each_profile_declares_its_parameters_and_data() -> None:
+    """R3: the parameters the streamer supplies (companion name; reward;
+    wake word, detector and transcription settings; none — the model screen's
+    endpoint and model aside), the identities taken from the validation
+    answer, the scopes, the endpoints and the dry run's event and outcome."""
+
+    profiles = _profiles()
+    choice = {
+        profile_id: [p.name for p in profile.parameters if p.screen != "model"]
+        for profile_id, profile in profiles.items()
+    }
+    assert choice == {
+        "chat_qa": ["companion_name"],
+        "channel_points": ["reward_id"],
+        "spoken_keyword": [
+            "wake_word", "recorder", "detector", "transcription_endpoint", "transcription_model",
+        ],
+        "silent": [],
+    }
+    assert profiles["channel_points"].parameter("reward_id").source == "reward_list"
+    for profile_id, profile in profiles.items():
+        model = [p.name for p in profile.parameters if p.screen == "model"]
+        assert profile.model_needed is (profile_id != "silent")
+        assert model == (["model_endpoint", "model_name"] if profile.model_needed else [])
+        assert profile.identities == ("broadcaster_id", "bot_user_id")
+        assert profile.platform_module in _manifests()
+        assert profile.validation_endpoint.startswith("https://")
+        assert profile.reward_list_endpoint.startswith("https://")
+        assert "user:read:chat" in profile.scopes
+    assert "channel:read:redemptions" in profiles["channel_points"].scopes
+    assert "channel:read:redemptions" not in profiles["chat_qa"].scopes
+    assert {
+        profile_id: (profile.dry_run_event_kind, profile.dry_run_outcome)
+        for profile_id, profile in profiles.items()
+    } == {
+        "chat_qa": ("message", "completed"),
+        "channel_points": ("reward", "completed"),
+        "spoken_keyword": ("speech", "completed"),
+        "silent": ("message", "not_triggered"),
+    }
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_ORDER)
+def test_r3_credentials_are_exactly_the_enabled_manifests_declared_ones(profile_id: str) -> None:
+    """R3: the profile's credential references fill exactly the settings
+    the enabled modules' manifests declare as credentials and the template
+    sets; any other declared credential setting is absent. An optional
+    (parameter) credential is written only when supplied, so it is listed
+    apart: the spoken keyword's HTTP detector key."""
+
+    manifests = _manifests()
+    document = _generated(profile_id)
+    expected: set[tuple[str, str]] = set()
+    for module in document["enabled_modules"]:
+        settings = document["modules"].get(module, {})
+        for setting in manifests[module].get("credentials", []):
+            value = _value_at(settings, setting)
+            if value is None:
+                continue
+            assert isinstance(value, str) and _REFERENCE.fullmatch(value), (module, setting)
+            expected.add((module, setting))
+    credentials = _profiles()[profile_id].credentials
+    declared = {(item.module, item.setting) for item in credentials if item.parameter is None}
+    assert declared == expected
+    optional = {(item.module, item.setting) for item in credentials if item.parameter is not None}
+    assert optional == (
+        {("audio_input", "wake_word.detector.api_key")} if profile_id == "spoken_keyword" else set()
+    )
+    # Every module whose manifest *requires* a credential setting has it.
+    for module in document["enabled_modules"]:
+        required = set(manifests[module]["settings_schema"].get("required", []))
+        for setting in set(manifests[module].get("credentials", [])) & required:
+            assert (module, setting) in declared, (module, setting)
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_ORDER)
+async def test_ac8_a_generated_profile_is_reference_only_and_passes_check_config(
+    profile_id: str, tmp_path: Path
+) -> None:
+    """AC8 (R3, R4): generated with fixture parameters into tmp, the file
+    holds 0 fixture credential values, every ``${NAME}`` it holds is listed
+    under ``secrets``, and ``check_config`` with the stored credentials as
+    environment returns 0 with 0 diagnostics (the autouse AC33 guard fails
+    the test on any socket)."""
+
+    path = _write(tmp_path, profile_id)
+    text = path.read_text(encoding="utf-8")
+    for value in FIXTURE_CREDENTIALS.values():
+        assert value not in text
+    document = yaml.safe_load(text)
+    references = set(_REFERENCE.findall(text))
+    assert references, profile_id
+    assert references == {
+        credential.name
+        for credential in _profiles()[profile_id].credentials
+        if credential.parameter is None
+    }
+    assert {f"${{{name}}}" for name in references} <= set(document["secrets"])
+    assert document == _generated(profile_id)
+    assert document["modules_directory"] == "builtin"
+
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        path,
+        environ=_stored_credentials(profile_id),
+        diagnostic_reporter=diagnostics.append,
+    )
+    assert (status, diagnostics) == (0, [])
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_ORDER)
+def test_identities_and_parameters_reach_the_document(profile_id: str) -> None:
+    """The identities from the validation answer fill the platform settings
+    and the served channel; each parameter fills its slot, typed as given."""
+
+    document = _generated(profile_id)
+    platform = document["modules"][_profiles()[profile_id].platform_module]
+    assert platform["broadcaster_id"] == FIXTURE_IDENTITIES["broadcaster_id"]
+    assert platform["bot_user_id"] == FIXTURE_IDENTITIES["bot_user_id"]
+    for channels in (entry["channels"] for entry in document.get("triggers", {}).values()):
+        assert list(channels) == [FIXTURE_IDENTITIES["broadcaster_id"]]
+    for rule in document.get("actions", []):
+        assert rule["destination"]["channel_id"] == FIXTURE_IDENTITIES["broadcaster_id"]
+    text = json.dumps(document)
+    assert "$parameter:" not in text and "$identity:" not in text and "$credential:" not in text
+    if profile_id == "chat_qa":
+        assert platform["companion_name"] == "Nova"
+    if profile_id == "channel_points":
+        rule = document["triggers"]["twitch"]["channels"]["41245072"]["rules"][0]
+        assert rule == {"type": "reward", "parameters": {"reward_ids": ["5f1c0d7e-reward-fixture"]}}
+        assert platform["notices"] == {"kinds": ["reward"]}
+    if profile_id == "spoken_keyword":
+        audio = document["modules"]["audio_input"]
+        assert audio["wake_word"]["detector"] == FIXTURE_PARAMETERS["spoken_keyword"]["detector"]
+        assert audio["sources"]["microphone"]["argv"] == ["recorder", "--wav", "-"]
+        assert audio["listen"]["destination"] == {"platform": "twitch", "channel_id": "41245072"}
+        rules = document["triggers"]["audio_input"]["channels"]["41245072"]["rules"]
+        assert rules == [
+            {"type": "wake_word", "parameters": {}},
+            {"type": "keyword", "parameters": {"keywords": ["hey nova"]}},
+        ]
+
+
+def test_r3_silent_connects_the_input_with_every_trigger_off() -> None:
+    """R3: silent enables the platform input and no model module, and its
+    every configured policy is one that never matches (no input declares an
+    explicit "off": a probability-0 rule is the configured off)."""
+
+    document = _generated("silent")
+    manifests = _manifests()
+    assert document["enabled_modules"] == ["twitch"]
+    assert "input" in manifests["twitch"]["lifecycle"]["roles"]
+    assert "brain" not in document["modules"] and "actions" not in document
+    never = {"combination": "all_of", "rules": [{"type": "probability", "parameters": {"probability": 0}}]}
+    inputs = [name for name in document["enabled_modules"] if manifests[name].get("triggers")]
+    assert sorted(document["triggers"]) == sorted(inputs)
+    for entry in document["triggers"].values():
+        assert list(entry["channels"].values()) == [never]
+    # Spoken keyword keeps its chat input connected with the same off policy.
+    assert _generated("spoken_keyword")["triggers"]["twitch"]["channels"]["41245072"] == never
+
+
+def test_ac10_the_shipped_examples_are_byte_identical_to_cb0f5b1() -> None:
+    """AC10: the 4 ``*.example`` profiles are byte-identical to ``cb0f5b1``,
+    read in-process (no ``git``): against the digests of that commit's bytes
+    and against the committed phase-8 baseline copies, which hold the same
+    bytes."""
+
+    assert sorted(EXAMPLES_AT_CB0F5B1) == sorted(path.name for path in ROOT.glob("*.example"))
+    for name, digest in EXAMPLES_AT_CB0F5B1.items():
+        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
+    numstat = baseline_numstat("f900f27", tuple(EXAMPLES_AT_CB0F5B1))
+    assert (numstat.returncode, numstat.stdout) == (0, "")
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_ORDER)
+def test_ac10_a_generated_profile_uses_only_shipped_declarations(profile_id: str) -> None:
+    """AC10: ``enabled_modules`` is a subset of the 21 shipped manifests'
+    names, and 0 action names, trigger types or event kinds are not
+    declared by a shipped manifest."""
+
+    manifests = _manifests()
+    assert len(manifests) == 21
+    document = _generated(profile_id)
+    enabled = document["enabled_modules"]
+    assert set(enabled) <= set(manifests)
+    assert set(document["modules"]) <= set(enabled)
+
+    declared_actions = {
+        action["name"] for manifest in manifests.values() for action in manifest.get("actions", [])
+    }
+    used_actions = {rule["action_name"] for rule in document.get("actions", [])}
+    brain = document["modules"].get("brain")
+    if brain is not None:
+        used_actions |= {entry["action"] for entry in brain["delivery"]["actions"]}
+    assert used_actions <= declared_actions
+    enabled_actions = {
+        action["name"] for name in enabled for action in manifests[name].get("actions", [])
+    }
+    assert used_actions <= enabled_actions
+
+    for input_name, entry in document.get("triggers", {}).items():
+        assert input_name in enabled
+        types = {rule["type"] for policy in entry["channels"].values() for rule in policy["rules"]}
+        assert types <= _trigger_types(manifests[input_name]), input_name
+
+    kinds = {_profiles()[profile_id].dry_run_event_kind}
+    for settings in document["modules"].values():
+        kinds.update((settings.get("notices") or {}).get("kinds", []))
+    assert kinds <= _declared_event_kinds(manifests)
+
+
+def test_render_profile_yaml_round_trips_in_block_style() -> None:
+    document = _generated("chat_qa")
+    text = wizard.render_profile_yaml(document)
+    assert yaml.safe_load(text) == document
+    assert list(yaml.safe_load(text)) == list(document)
+    # Block style: no flow sequence (an empty mapping is the only flow node).
+    assert text.startswith("# ") and "[" not in text
+
+
+def test_the_loaded_template_is_never_shared_with_a_generated_document() -> None:
+    profile = _profiles()["chat_qa"]
+    first = wizard.generate_profile(profile, FIXTURE_PARAMETERS["chat_qa"], FIXTURE_IDENTITIES)
+    first["modules"]["twitch"]["companion_name"] = "changed"
+    first["limits"]["admission"]["workers"] = 99
+    second = wizard.generate_profile(profile, FIXTURE_PARAMETERS["chat_qa"], FIXTURE_IDENTITIES)
+    assert second["modules"]["twitch"]["companion_name"] == "Nova"
+    assert second["limits"]["admission"]["workers"] == 4
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "parameters", "identities", "named"),
+    [
+        ("chat_qa", {"companion_name": "${HOME}", **_MODEL}, FIXTURE_IDENTITIES, "companion_name"),
+        ("chat_qa", {"companion_name": "  ", **_MODEL}, FIXTURE_IDENTITIES, "companion_name"),
+        ("chat_qa", {**_MODEL}, FIXTURE_IDENTITIES, "companion_name"),
+        ("chat_qa", {"companion_name": "Nova", "extra": "x", **_MODEL}, FIXTURE_IDENTITIES, "not declare"),
+        ("silent", {}, {"broadcaster_id": "41245072"}, "bot_user_id"),
+        ("silent", {}, {**FIXTURE_IDENTITIES, "bot_user_id": "${TOKEN}"}, "bot_user_id"),
+        (
+            "spoken_keyword",
+            {
+                **FIXTURE_PARAMETERS["spoken_keyword"],
+                "detector": {"kind": "http", "endpoint": "https://d.invalid", "api_key": "k-123"},
+            },
+            FIXTURE_IDENTITIES,
+            "detector",
+        ),
+        (
+            "spoken_keyword",
+            {**FIXTURE_PARAMETERS["spoken_keyword"], "recorder": []},
+            FIXTURE_IDENTITIES,
+            "recorder",
+        ),
+    ],
+)
+def test_generation_refuses_references_credentials_and_undeclared_inputs(
+    profile_id: str, parameters: dict[str, Any], identities: dict[str, str], named: str
+) -> None:
+    """A supplied value carrying ``${`` (the loader would resolve it), a
+    credential inside a parameter, a missing or undeclared input: refused,
+    the message naming the declared input (an undeclared name is typed input:
+    never echoed) and never echoing a value."""
+
+    with pytest.raises(wizard.ProfileError) as refused:
+        wizard.generate_profile(_profiles()[profile_id], parameters, identities)
+    message = str(refused.value)
+    assert named in message
+    for value in ("${HOME}", "${TOKEN}", "k-123", "extra"):
+        assert value not in message
+
+
+#: An HTTP detector that needs its bearer key, supplied apart as a credential.
+_HTTP_DETECTOR = {"kind": "http", "endpoint": "https://detector.invalid/wake"}
+
+
+async def test_an_http_detector_key_is_a_supplied_credential_reference(tmp_path: Path) -> None:
+    """The detector's optional ``api_key`` is collected apart: named among the
+    supplied credentials, it is written into the detector as its reference
+    only, listed under ``secrets``, and ``check_config`` passes with it stored
+    (the autouse AC33 guard fails the test on any socket). Not named, the
+    detector carries no key and ``secrets`` does not list it."""
+
+    profile = _profiles()["spoken_keyword"]
+    parameters = {**FIXTURE_PARAMETERS["spoken_keyword"], "detector": dict(_HTTP_DETECTOR)}
+    document = wizard.generate_profile(
+        profile, parameters, FIXTURE_IDENTITIES, credentials=["WAKE_WORD_DETECTOR_API_KEY"]
+    )
+    detector = document["modules"]["audio_input"]["wake_word"]["detector"]
+    assert detector == {**_HTTP_DETECTOR, "api_key": "${WAKE_WORD_DETECTOR_API_KEY}"}
+    assert "${WAKE_WORD_DETECTOR_API_KEY}" in document["secrets"]
+    assert parameters["detector"] == _HTTP_DETECTOR
+
+    without = wizard.generate_profile(profile, parameters, FIXTURE_IDENTITIES)
+    assert "api_key" not in without["modules"]["audio_input"]["wake_word"]["detector"]
+    assert "${WAKE_WORD_DETECTOR_API_KEY}" not in without["secrets"]
+
+    path = tmp_path / "spoken_keyword.yaml"
+    path.write_text(wizard.render_profile_yaml(document), encoding="utf-8")
+    assert "detector-key-value" not in path.read_text(encoding="utf-8")
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        path,
+        environ={
+            **_stored_credentials("spoken_keyword"),
+            "WAKE_WORD_DETECTOR_API_KEY": "detector-key-value",
+        },
+        diagnostic_reporter=diagnostics.append,
+    )
+    assert (status, diagnostics) == (0, [])
+
+
+@pytest.mark.parametrize(
+    "names", [["MODEL_API_KEY"], ["NOT_A_CREDENTIAL"], "WAKE_WORD_DETECTOR_API_KEY"]
+)
+def test_only_an_optional_credential_may_be_supplied_by_name(names: Any) -> None:
+    """An always-written credential, an unknown name or a bare string is
+    refused, the message never echoing the typed name."""
+
+    with pytest.raises(wizard.ProfileError) as refused:
+        wizard.generate_profile(
+            _profiles()["spoken_keyword"],
+            FIXTURE_PARAMETERS["spoken_keyword"],
+            FIXTURE_IDENTITIES,
+            credentials=names,
+        )
+    assert "NOT_A_CREDENTIAL" not in str(refused.value)
+
+
+async def test_a_malformed_detector_is_left_to_check_config(tmp_path: Path) -> None:
+    """Phase 8 R7's schema is the module's: the generator passes a detector
+    of an unknown kind through, and ``--check-config`` refuses it with exit 2
+    naming the field (what AC16 provokes)."""
+
+    parameters = {**FIXTURE_PARAMETERS["spoken_keyword"], "detector": {"kind": "telepathy"}}
+    document = wizard.generate_profile(_profiles()["spoken_keyword"], parameters, FIXTURE_IDENTITIES)
+    path = tmp_path / "spoken_keyword.yaml"
+    path.write_text(wizard.render_profile_yaml(document), encoding="utf-8")
+    diagnostics: list[str] = []
+    status = await application.check_config(
+        path, environ=_stored_credentials("spoken_keyword"), diagnostic_reporter=diagnostics.append
+    )
+    assert status == 2
+    assert any("wake_word.detector.kind" in line for line in diagnostics), diagnostics
+
+
+def _profile_tree(tmp_path: Path, mutate) -> Path:
+    directory = tmp_path / "profiles"
+    shutil.copytree(PROFILES, directory)
+    path = directory / "chat_qa.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    mutate(data, directory)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return directory
+
+
+def _rename(data: dict[str, Any], directory: Path) -> None:
+    data["template"]["modules"]["twitch"]["companion_name"] = "$parameter:nickname"
+
+
+def _unused(data: dict[str, Any], directory: Path) -> None:
+    data["parameters"].append({"name": "unused", "kind": "text", "screen": "choice"})
+
+
+def _literal_reference(data: dict[str, Any], directory: Path) -> None:
+    data["template"]["modules"]["brain"]["endpoint"] = "${MODEL_ENDPOINT}"
+
+
+def _declared_secrets(data: dict[str, Any], directory: Path) -> None:
+    data["template"]["secrets"] = []
+
+
+def _misplaced_credential(data: dict[str, Any], directory: Path) -> None:
+    data["credentials"][0]["setting"] = "client_secret"
+
+
+def _misplaced_parameter_credential(data: dict[str, Any], directory: Path) -> None:
+    data["credentials"].append(
+        {
+            "name": "COMPANION_KEY",
+            "module": "twitch",
+            "setting": "companion_name.api_key",
+            "screen": "choice",
+            "parameter": "companion_name",
+        }
+    )
+
+
+def _duplicate_order(data: dict[str, Any], directory: Path) -> None:
+    data["order"] = 2
+
+
+def _wrong_id(data: dict[str, Any], directory: Path) -> None:
+    data["id"] = "other"
+
+
+def _unknown_slot(data: dict[str, Any], directory: Path) -> None:
+    data["template"]["modules"]["twitch"]["bot_user_id"] = "$secret:x"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "named"),
+    [
+        (_rename, "undeclared parameter slots nickname"),
+        (_unused, "unused by the template: unused"),
+        (_literal_reference, "reference outside a credential slot"),
+        (_declared_secrets, "template.secrets"),
+        (_misplaced_credential, "does not fill modules.twitch.client_secret"),
+        (_misplaced_parameter_credential, "inside a mapping parameter"),
+        (_duplicate_order, "'order' repeats"),
+        (_wrong_id, "'id' must be the file name"),
+        (_unknown_slot, "unknown slot"),
+    ],
+)
+def test_load_profiles_refuses_a_malformed_profile(tmp_path: Path, mutate, named: str) -> None:
+    with pytest.raises(wizard.ProfileError, match=re.escape(named)):
+        wizard.load_profiles(_profile_tree(tmp_path, mutate))
+
+
+def test_the_profiles_name_no_other_platform_nor_vendor() -> None:
+    """AC39 still scans the profiles directory for the two other platforms;
+    the vendor words are refused there too (plan DD1, DD2)."""
+
+    for path in sorted(PROFILES.glob("*.json")):
+        text = path.read_text(encoding="utf-8")
+        assert not re.search(r"\b(kick|youtube|openai|anthropic|gemini)\b", text, re.I), path

@@ -1,0 +1,240 @@
+{
+  "format": 1,
+  "id": "channel_points",
+  "order": 2,
+  "name_key": "profile.channel_points.name",
+  "description_key": "profile.channel_points.description",
+  "model_needed": true,
+  "parameters": [
+    {
+      "name": "reward_id",
+      "kind": "text",
+      "screen": "platform",
+      "source": "reward_list"
+    },
+    {
+      "name": "model_endpoint",
+      "kind": "text",
+      "screen": "model"
+    },
+    {
+      "name": "model_name",
+      "kind": "text",
+      "screen": "model"
+    }
+  ],
+  "identities": [
+    "broadcaster_id",
+    "bot_user_id"
+  ],
+  "credentials": [
+    {
+      "name": "TWITCH_CLIENT_ID",
+      "module": "twitch",
+      "setting": "client_id",
+      "screen": "platform"
+    },
+    {
+      "name": "TWITCH_CLIENT_SECRET",
+      "module": "twitch",
+      "setting": "client_secret",
+      "screen": "platform"
+    },
+    {
+      "name": "TWITCH_ACCESS_TOKEN",
+      "module": "twitch",
+      "setting": "access_token",
+      "screen": "platform"
+    },
+    {
+      "name": "MODEL_API_KEY",
+      "module": "brain",
+      "setting": "api_key",
+      "screen": "model"
+    }
+  ],
+  "platform": {
+    "module": "twitch",
+    "scopes": [
+      "user:read:chat",
+      "user:write:chat",
+      "channel:read:redemptions"
+    ],
+    "validation_endpoint": "https://id.twitch.tv/oauth2/validate",
+    "reward_list_endpoint": "https://api.twitch.tv/helix/channel_points/custom_rewards"
+  },
+  "dry_run": {
+    "event_kind": "reward",
+    "expected_outcome": "completed"
+  },
+  "template": {
+    "modules_directory": "builtin",
+    "enabled_modules": [
+      "twitch",
+      "chat_context",
+      "brain"
+    ],
+    "modules": {
+      "twitch": {
+        "client_id": "$credential:TWITCH_CLIENT_ID",
+        "client_secret": "$credential:TWITCH_CLIENT_SECRET",
+        "access_token": "$credential:TWITCH_ACCESS_TOKEN",
+        "broadcaster_id": "$identity:broadcaster_id",
+        "bot_user_id": "$identity:bot_user_id",
+        "companion_name": "Companion",
+        "notices": {
+          "kinds": [
+            "reward"
+          ]
+        }
+      },
+      "chat_context": {},
+      "brain": {
+        "endpoint": "$parameter:model_endpoint",
+        "model": "$parameter:model_name",
+        "api_key": "$credential:MODEL_API_KEY",
+        "admission": {
+          "session_queue_capacity": 4,
+          "global_pending_capacity": 64,
+          "max_sessions": 32,
+          "workers": 4,
+          "wait_seconds": 30,
+          "total_run_seconds": 60
+        },
+        "budget": {
+          "model_turns": 5,
+          "model_call_seconds": 30,
+          "action_seconds": 10,
+          "max_tokens": 8192,
+          "max_observation_bytes": 5242880,
+          "max_action_calls": 6,
+          "max_repeated_actions": 2,
+          "delivery_reserve_seconds": 10
+        },
+        "conversation_memory": {
+          "max_sessions": 64,
+          "max_exchanges": 20,
+          "max_bytes": 65536,
+          "max_age_seconds": 3600
+        },
+        "fallback": {
+          "enabled": true,
+          "text": "I could not answer in time."
+        },
+        "capabilities": {
+          "required": [
+            "structured_output"
+          ]
+        },
+        "delivery": {
+          "mode": "fixed",
+          "actions": [
+            {
+              "action": "chat.write",
+              "text_argument": "text"
+            }
+          ]
+        }
+      }
+    },
+    "actions": [
+      {
+        "rule_id": "brain-reads-chat",
+        "action_name": "chat.read",
+        "destination": {
+          "platform": "twitch",
+          "channel_id": "$identity:broadcaster_id",
+          "scope": "chat"
+        },
+        "principals": [
+          "brain"
+        ],
+        "natures": [
+          "read"
+        ],
+        "granted_permissions": [
+          "chat.read"
+        ]
+      },
+      {
+        "rule_id": "brain-delivers-chat-replies",
+        "action_name": "chat.write",
+        "destination": {
+          "platform": "twitch",
+          "channel_id": "$identity:broadcaster_id",
+          "scope": "chat"
+        },
+        "principals": [
+          "brain"
+        ],
+        "natures": [
+          "write"
+        ],
+        "granted_permissions": [
+          "chat.write"
+        ]
+      }
+    ],
+    "triggers": {
+      "twitch": {
+        "channels": {
+          "$identity:broadcaster_id": {
+            "combination": "all_of",
+            "rules": [
+              {
+                "type": "reward",
+                "parameters": {
+                  "reward_ids": [
+                    "$parameter:reward_id"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "limits": {
+      "bus_history": {
+        "max_events": 1000,
+        "max_bytes": 4194304,
+        "max_age_seconds": 600
+      },
+      "observation_queue": {
+        "max_records": 1000,
+        "max_bytes": 4194304
+      },
+      "dedup": {
+        "max_entries": 4096,
+        "ttl_seconds": 600
+      },
+      "attachments": {
+        "max_object_bytes": 1048576,
+        "max_objects": 256,
+        "max_total_bytes": 67108864,
+        "max_bytes_per_run": 8388608,
+        "ttl_seconds": 900
+      },
+      "conversation_memory": {
+        "max_sessions": 64,
+        "max_exchanges": 20,
+        "max_bytes": 65536,
+        "max_age_seconds": 3600
+      },
+      "chat_context": {
+        "max_messages": 50,
+        "max_bytes": 65536,
+        "max_age_seconds": 900,
+        "max_channels": 8
+      },
+      "admission": {
+        "session_queue_capacity": 4,
+        "global_pending_capacity": 64,
+        "max_sessions": 32,
+        "workers": 4,
+        "wait_seconds": 30,
+        "total_run_seconds": 60
+      }
+    }
+  }
+}
