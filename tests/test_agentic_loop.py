@@ -1934,6 +1934,55 @@ async def test_ac31_the_scenario_on_the_fake_platform_matches_twitch_call_for_ca
         await fake.close()
 
 
+#: The only paths under ``core/`` the platform scans skip (phase 9 plan DD1,
+#: an out-of-list adaptation flagged for operator ratification): the product
+#: name constant module, the profile data and the string tables. A path ending
+#: in ``/`` is a directory, skipped with everything under it.
+PLATFORM_SCAN_EXEMPT = frozenset(
+    {"core/config_ui/locations.py", "core/config_ui/profiles/", "core/config_ui/strings/"}
+)
+
+
+def platform_scan_exempt(relative: str) -> bool:
+    """Whether the ``root``-relative POSIX path *relative* is DD1-exempt."""
+
+    return any(
+        relative == path or (path.endswith("/") and relative.startswith(path))
+        for path in PLATFORM_SCAN_EXEMPT
+    )
+
+
+def core_twitch_scan(root: Path) -> tuple[list[str], list[Path]]:
+    """AC31's ``grep -r twitch`` over ``<root>/core`` minus the DD1 exemption:
+    the matching lines (case-sensitive substring, as before) and the files
+    read."""
+
+    read = sorted(
+        path
+        for path in (root / "core").rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and not platform_scan_exempt(path.relative_to(root).as_posix())
+    )
+    if not read:
+        return [], []
+    completed = files_containing(read, "twitch")
+    assert completed.returncode in (0, 1), completed.stderr
+    return [line for line in completed.stdout.splitlines() if line], read
+
+
+def test_the_platform_scan_exemption_is_exactly_the_three_dd1_paths() -> None:
+    """DD1: the exemption is pinned to the three paths phase 9 creates, all
+    under ``core/config_ui/``; growing it is a weakening of AC31's guard."""
+
+    assert PLATFORM_SCAN_EXEMPT == {
+        "core/config_ui/locations.py",
+        "core/config_ui/profiles/",
+        "core/config_ui/strings/",
+    }
+    assert all(path.startswith("core/config_ui/") for path in PLATFORM_SCAN_EXEMPT)
+
+
 @pytest.mark.parametrize(
     "directory",
     ["core", "modules/brain", "modules/chat_context", "modules/users", "modules/capture"],
@@ -1943,8 +1992,23 @@ def test_ac31_the_core_and_the_neutral_modules_name_no_platform(directory: str) 
     ``modules/chat_context``, ``modules/users`` and ``modules/capture``
     matches 0 lines — the platform is a runtime value of the destination
     and of the event, never a name in the neutral code (``modules/proxy``
-    and ``modules/agent_link`` join this grep when they exist)."""
+    and ``modules/agent_link`` join this grep when they exist).
 
+    Phase 9 (plan DD1, flagged out-of-list): over ``core/`` the scan skips
+    exactly :data:`PLATFORM_SCAN_EXEMPT` and still reads every other file."""
+
+    if directory == "core":
+        matches, read = core_twitch_scan(ROOT)
+        everything = {
+            path
+            for path in (ROOT / "core").rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+        }
+        skipped = everything - set(read)
+        assert all(platform_scan_exempt(path.relative_to(ROOT).as_posix()) for path in skipped)
+        assert {ROOT / "core" / "main.py", ROOT / "core" / "config_ui" / "__init__.py"} <= set(read)
+        assert matches == [], "\n".join(matches)
+        return
     completed = files_containing(ROOT / directory, "twitch")
     matches = [line for line in completed.stdout.splitlines() if line]
     assert completed.returncode in (0, 1), completed.stderr

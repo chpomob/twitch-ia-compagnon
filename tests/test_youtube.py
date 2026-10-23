@@ -1847,20 +1847,76 @@ _PLATFORM_OR_VENDOR_WORD = re.compile(
 )
 
 
-def test_the_broad_core_scan_names_no_platform_or_vendor() -> None:
-    """P27F3 (gate F7): the phase 3 request's broad case-insensitive word scan
-    of ``core/`` — every platform and model vendor — finds 0 occurrences;
-    those names belong in modules and the README, never in the core."""
+#: The only paths under ``core/`` the broad scan skips (phase 9 plan DD1, an
+#: out-of-list adaptation flagged for operator ratification): the product name
+#: constant module, the profile data and the string tables. A path ending in
+#: ``/`` is a directory, skipped with everything under it. AC39's scan above
+#: skips nothing.
+BROAD_SCAN_EXEMPT = frozenset(
+    {"core/config_ui/locations.py", "core/config_ui/profiles/", "core/config_ui/strings/"}
+)
 
+
+def broad_scan_exempt(relative: str) -> bool:
+    """Whether the ``root``-relative POSIX path *relative* is DD1-exempt."""
+
+    return any(
+        relative == path or (path.endswith("/") and relative.startswith(path))
+        for path in BROAD_SCAN_EXEMPT
+    )
+
+
+def broad_core_scan(root: Path) -> tuple[list[str], list[Path]]:
+    """The broad case-insensitive word scan of ``<root>/core`` minus the DD1
+    exemption: the ``<POSIX path>:<line number>`` hits and the files read."""
+
+    read = sorted(
+        path
+        for path in (root / "core").rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and not broad_scan_exempt(path.relative_to(root).as_posix())
+    )
     hits = [
-        f"{path.relative_to(ROOT)}:{number}"
-        for path in sorted((ROOT / "core").rglob("*"))
-        if path.is_file() and "__pycache__" not in path.parts
+        f"{path.relative_to(root).as_posix()}:{number}"
+        for path in read
         for number, line in enumerate(
             path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
         )
         if _PLATFORM_OR_VENDOR_WORD.search(line)
     ]
+    return hits, read
+
+
+def test_the_broad_scan_exemption_is_exactly_the_three_dd1_paths() -> None:
+    """DD1: the exemption is pinned to the three paths phase 9 creates, all
+    under ``core/config_ui/``; growing it is a weakening of the broad scan."""
+
+    assert BROAD_SCAN_EXEMPT == {
+        "core/config_ui/locations.py",
+        "core/config_ui/profiles/",
+        "core/config_ui/strings/",
+    }
+    assert all(path.startswith("core/config_ui/") for path in BROAD_SCAN_EXEMPT)
+
+
+def test_the_broad_core_scan_names_no_platform_or_vendor() -> None:
+    """P27F3 (gate F7): the phase 3 request's broad case-insensitive word scan
+    of ``core/`` — every platform and model vendor — finds 0 occurrences;
+    those names belong in modules and the README, never in the core.
+
+    Phase 9 (plan DD1, flagged out-of-list): the scan skips exactly
+    :data:`BROAD_SCAN_EXEMPT` and still reads every other file under ``core/``."""
+
+    hits, read = broad_core_scan(ROOT)
+    everything = {
+        path
+        for path in (ROOT / "core").rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    skipped = everything - set(read)
+    assert all(broad_scan_exempt(path.relative_to(ROOT).as_posix()) for path in skipped)
+    assert {ROOT / "core" / "main.py", ROOT / "core" / "config_ui" / "__init__.py"} <= set(read)
     assert hits == []
     assert _PLATFORM_OR_VENDOR_WORD.search("the Twitch AI companion")
     assert _PLATFORM_OR_VENDOR_WORD.search("OpenAI") and _PLATFORM_OR_VENDOR_WORD.search("gemini")
