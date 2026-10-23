@@ -24,6 +24,13 @@ matters in the first fifteen minutes: *« est-ce qu'il m'a compris, et est-ce qu
   trial with a written record**, like the real-instance trials — not a test that pretends to measure
   human speed.
 
+  **Amendment A1 (2026-10-22).** Installing the product without a terminal *is* packaging, and packaging is
+  explicitly another phase. The criterion therefore starts **once the package is installed**: from a
+  working install, to a first run, under fifteen minutes, without a terminal and without YAML. The
+  operator trial must **record how the install itself was done** and how long it took, so the remaining
+  gap is visible in the record rather than hidden inside a redefined promise. Phase 10 owns the
+  terminal-free installation.
+
 - **2 — One surface, not a new one.** The wizard and the console are part of the existing local web
   application (`core/config_ui`): same binding rules (loopback, token, CSRF, origin checks), same
   redaction rules, no second server and no second token. The UI never renders a secret value, today or
