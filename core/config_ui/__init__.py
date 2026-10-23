@@ -54,7 +54,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from collections import OrderedDict
 from datetime import datetime, timezone
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,7 +66,7 @@ import yaml
 from core.actions import ANY_ACTION
 from core.bus import EventBus
 from core.config_ui import locations
-from core.config_ui.wizard import WizardState, WizardStateError, state_path
+from core.config_ui.wizard import CredentialStore, WizardState, WizardStateError, state_path
 from core.contracts import (
     INPUT_OWNER_NONE,
     ContractError,
@@ -99,6 +99,7 @@ from core.main import (
     check_config,
 )
 from core.overlay import (
+    FEED_FILE_VARIABLE,
     STATUS_FILE_VARIABLE,
     OverlayError,
     canonical_overlay_path,
@@ -2751,6 +2752,55 @@ def _cookie(headers: Mapping[str, str], name: str) -> str | None:
     return None
 
 
+def _stored_credentials(settings: UISettings) -> dict[str, str]:
+    """The ``{NAME: value}`` the profile's credential file holds (A1, R4).
+
+    Empty unless the store is usable for this profile: the platform names a
+    credential directory, the profile's wizard state file exists and loads,
+    the credential file exists, and the state owns it byte for byte. Nothing
+    is created or opened before each of those holds, so a profile without a
+    wizard state leaves the per-user directory untouched.
+    """
+
+    store = CredentialStore(settings.config, locations.running_platform(), os.environ)
+    if store.path is None or not os.path.lexists(state_path(settings.base_path)):
+        return {}
+    if not os.path.lexists(store.path):
+        return {}
+    try:
+        state = WizardState(settings.base_path)
+    except WizardStateError:
+        return {}
+    values = store.read(state)
+    return values if isinstance(values, dict) else {}
+
+
+class _LaunchEnviron(Mapping[str, str]):
+    """The environment a UI-launched main process is given (R4, DD9).
+
+    The UI's current environment (stored credentials included) plus
+    :data:`FEED_FILE_VARIABLE` naming the feed path, read at each launch so a
+    refreshed environment reaches the next one. The access token is never
+    part of it.
+    """
+
+    def __init__(self, environ: Callable[[], Mapping[str, str]], feed_path: Path) -> None:
+        self._environ = environ
+        self._feed = os.fspath(feed_path)
+
+    def __getitem__(self, name: str) -> str:
+        if name == FEED_FILE_VARIABLE:
+            return self._feed
+        return self._environ()[name]
+
+    def __iter__(self) -> Iterator[str]:
+        yield from (name for name in self._environ() if name != FEED_FILE_VARIABLE)
+        yield FEED_FILE_VARIABLE
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
 class ConfigUI:
     """The socket-free request core of the configuration UI (R1, D2).
 
@@ -2772,11 +2822,19 @@ class ConfigUI:
         supervisor: Supervisor | None = None,
     ) -> None:
         self.settings = settings
-        #: The UI process's own environment: "set/unset" is judged here, the
-        #: environment a UI-launched main process inherits (A3).
-        self.environ: Mapping[str, str] = os.environ if environ is None else environ
-        #: The secret set of the last configuration snapshot (R8).
-        self.secret_values: frozenset[str] = frozenset()
+        inherited: Mapping[str, str] = os.environ if environ is None else environ
+        stored = _stored_credentials(settings)
+        #: The UI process's own environment overlaid with the stored
+        #: credentials (the stored value wins for the names it holds): "set/
+        #: unset" is judged here, and Check, Apply and a UI-launched main
+        #: process are given it (A3, R4). Without a usable credential file it
+        #: is the given environment itself.
+        self.environ: Mapping[str, str] = {**inherited, **stored} if stored else inherited
+        #: The secret set of the last configuration snapshot (R8), seeded
+        #: with the stored values and their redaction forms (R4).
+        self.secret_values: frozenset[str] = frozenset(
+            form for value in stored.values() if value for form in _redaction_forms(value)
+        )
         self._secrets_lock = threading.Lock()
         self.token = secrets.token_urlsafe(32)
         #: Keys the opaque field names of :func:`_field_name` (R8).
@@ -2808,7 +2866,11 @@ class ConfigUI:
         self.probe: Probe = process_alive if probe is None else probe
         #: Stops and starts the main process this UI launched (R7, A4).
         self.supervisor = (
-            Supervisor(default_launch_argv(settings), self.status_path)
+            Supervisor(
+                default_launch_argv(settings),
+                self.status_path,
+                environ=_LaunchEnviron(lambda: self.environ, settings.feed_path),
+            )
             if supervisor is None
             else supervisor
         )

@@ -1997,3 +1997,173 @@ def test_a3_the_default_opener_is_refused_by_the_ac33_guard_and_swallowed(
     assert capsys.readouterr().out.count(ui.access_url) == 1
     assert any("browser could not be opened" in record.getMessage() for record in caplog.records)
     _no_token_logged(caplog, ui.token)
+
+
+# --------------------------------------------------------------------------- #
+# P7 (R4): stored credentials join the secret set and every launched
+# environment (AC12)
+# --------------------------------------------------------------------------- #
+
+STORED_MODULE = EDITOR_MODULE
+STORED_BASE = (
+    "modules_directory: ./mods\nenabled_modules: [xmod]\n"
+    "secrets: ['${TWITCH_ACCESS_TOKEN}']\nmodules:\n  xmod:\n"
+    "    token: ${TWITCH_ACCESS_TOKEN}\n    channel: fixture\n"
+)
+
+
+def _stored_profile(
+    monkeypatch: pytest.MonkeyPatch, root: Path, values: dict[str, str]
+) -> Path:
+    """A finished wizard's profile whose credential file holds *values*,
+    under a per-user directory pointed at *root*."""
+
+    _default_environment(monkeypatch, root / "xdg")
+    (root / "mods" / "xmod").mkdir(parents=True)
+    (root / "mods" / "xmod" / "module.yaml").write_text(STORED_MODULE, encoding="utf-8")
+    base = root / "profile.yaml"
+    base.write_text(STORED_BASE, encoding="utf-8")
+    state = wizard.WizardState(base)
+    store = wizard.CredentialStore(base, locations.running_platform(), os.environ)
+    assert store.write(values, ["${TWITCH_ACCESS_TOKEN}"], state) is None
+    state.completed = True
+    state.save(store)
+    return base
+
+
+class _ExitedChild:
+    """A fake child that exited 1 with *stderr* on a real pipe (no process)."""
+
+    pid = 424242
+
+    def __init__(self, stderr: bytes) -> None:
+        read, write = os.pipe()
+        os.write(write, stderr)
+        os.close(write)
+        self.stderr = os.fdopen(read, "rb")
+
+    def poll(self) -> int:
+        return 1
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 1
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+
+@posix_only
+def test_ac12_the_kept_credential_reaches_every_environment_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC12 (R4): the stored value wins over the inherited one in the
+    environment given to the supervisor's ``popen`` (with the feed path and
+    never the access token), to ``check_config`` through Check and Apply,
+    and to the dry run (P11/P12 hand it ``ui.environ``); the editor shows the
+    credential as set; a log record and an Apply stderr tail carrying the
+    stored value render it redacted."""
+
+    base = _stored_profile(monkeypatch, tmp_path, {"TWITCH_ACCESS_TOKEN": "stored"})
+    settings = config_ui.UISettings.from_argv(["--config", str(base)])
+    ui = config_ui.ConfigUI(settings, environ={"TWITCH_ACCESS_TOKEN": "inherited", "KEEP": "1"})
+    try:
+        # The environment every seam is given: the dry run's included.
+        assert ui.environ["TWITCH_ACCESS_TOKEN"] == "stored"
+        assert ui.environ["KEEP"] == "1"
+        assert "stored" in ui.secret_values
+
+        checked: list[dict[str, str]] = []
+
+        async def fake_check_config(base_path: Any, *, environ: Any, **options: Any) -> int:
+            checked.append(dict(environ))
+            return 0
+
+        monkeypatch.setattr(config_ui, "check_config", fake_check_config)
+        assert ui.check().passed
+
+        launched: list[dict[str, str]] = []
+
+        def popen(argv: list[str], **options: Any) -> _ExitedChild:
+            launched.append(dict(options["env"]))
+            return _ExitedChild(b"Traceback (most recent call last):\ntoken=stored\n")
+
+        ui.supervisor.popen = popen
+        report = ui.apply()
+        ui.supervisor.stop()
+        capsys.readouterr()
+
+        assert len(checked) == 2
+        assert all(environ["TWITCH_ACCESS_TOKEN"] == "stored" for environ in checked)
+        (env,) = launched
+        assert env["TWITCH_ACCESS_TOKEN"] == "stored" and env["KEEP"] == "1"
+        assert env[config_ui.FEED_FILE_VARIABLE] == str(settings.feed_path)
+        assert env[config_ui.STATUS_FILE_VARIABLE] == str(ui.status_path)
+        assert sum(ui.token in value for value in env.values()) == 0
+
+        assert report.outcome == config_ui.APPLY_REFUSED and report.exit_status == 1
+        assert "stored" not in report.stderr_tail
+        assert config_ui.REDACTED in report.stderr_tail
+
+        with caplog.at_level("DEBUG", logger="core.config_ui"):
+            config_ui.logger.warning("the child wrote %s", "token=stored")
+        (record,) = [r for r in caplog.records if r.getMessage().startswith("the child wrote")]
+        assert "stored" not in record.getMessage()
+        assert config_ui.REDACTED in record.getMessage()
+
+        _, cookie = _access(ui)
+        page = ui.handle(_ui_request("GET", "/core", headers={"cookie": cookie}))
+        assert page.status == 200
+        body = page.body.decode("utf-8")
+        assert '<code>${TWITCH_ACCESS_TOKEN}</code> (set)' in body
+        assert "stored" not in body and "inherited" not in body
+    finally:
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+@posix_only
+def test_ac12_a_kept_credential_alone_counts_as_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: with nothing inherited, the stored value is what makes the
+    referenced credential set."""
+
+    base = _stored_profile(monkeypatch, tmp_path, {"TWITCH_ACCESS_TOKEN": "stored"})
+    ui = config_ui.ConfigUI(config_ui.UISettings.from_argv(["--config", str(base)]), environ={})
+    try:
+        assert dict(ui.environ) == {"TWITCH_ACCESS_TOKEN": "stored"}
+        assert ui.view().references == {"TWITCH_ACCESS_TOKEN": True}
+    finally:
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+def test_r4_without_a_usable_credential_file_the_environment_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge is a no-op when the store is not usable for the profile: no
+    wizard state, or a credential file the state does not own. The given
+    environment is kept as the same object and the secret set starts empty;
+    the per-user directory is not created."""
+
+    _default_environment(monkeypatch, tmp_path / "xdg")
+    base = _editor_fixture(tmp_path)
+    settings = config_ui.UISettings.from_argv(["--config", str(base)])
+    environ = {"TWITCH_ACCESS_TOKEN": "inherited"}
+    ui = config_ui.ConfigUI(settings, environ=environ)
+    assert ui.environ is environ and ui.secret_values == frozenset()
+    assert not (tmp_path / "xdg").exists()
+
+    # A credential file the state records no digest for is never read.
+    wizard.WizardState(base).save()
+    directory = tmp_path / "xdg" / PRODUCT
+    directory.mkdir(parents=True, mode=0o700)
+    (directory / "config.yaml.credentials.json").write_text(
+        '{"TWITCH_ACCESS_TOKEN": "foreign"}', encoding="utf-8"
+    )
+    other = config_ui.ConfigUI(settings, environ=environ)
+    assert other.environ is environ and other.secret_values == frozenset()
