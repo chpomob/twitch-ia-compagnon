@@ -21,6 +21,11 @@ session cookie; P12 and P13 follow it to the pages) and the injected browser
 opener (AC3). The editor's pre-phase markup is the fixture
 ``tests/fixtures/phase9/editor_base_page.html``, captured from the code before
 P6 changed any render.
+
+P8 (R1): the instance record, the ``/instance`` route and the second launch
+(AC31 with a fake opener, serve, liveness test, probe and clock; AC4's
+``/instance`` row). The probe fake answers through the first instance's own
+``ConfigUI.handle``, so the token check it passes is the route's.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import secrets
 import shutil
 import stat
 import sys
+import threading
 import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -2167,3 +2173,815 @@ def test_r4_without_a_usable_credential_file_the_environment_is_kept(
     )
     other = config_ui.ConfigUI(settings, environ=environ)
     assert other.environ is environ and other.secret_values == frozenset()
+
+
+# --------------------------------------------------------------------------- #
+# P8 (R1): the instance record, the `/instance` route and the second launch
+# (AC31, AC4's `/instance` row)
+# --------------------------------------------------------------------------- #
+
+#: The English table, for the report sentences the launch must print.
+_EN = StringTable.load()
+
+
+def _say(key: str, **values: object) -> str:
+    return _EN.sentence("en", key, **values)
+
+
+class _Clock:
+    """A manual monotonic clock; ``sleep`` advances it (no real wait)."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        assert seconds > 0
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _Probe:
+    """A fake ``/instance`` probe on the manual clock. *answer(index, port,
+    url, timeout)* returns ``(status, body)`` or raises; every attempt is
+    recorded with its start time on the clock."""
+
+    def __init__(self, clock: _Clock, answer: Any) -> None:
+        self.clock = clock
+        self.answer = answer
+        self.attempts: list[tuple[float, int, str, float]] = []
+        self.bodies: list[bytes] = []
+
+    def __call__(self, port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        self.attempts.append((self.clock.now, port, url, timeout))
+        status, body = self.answer(len(self.attempts) - 1, port, url, timeout)
+        self.bodies.append(body)
+        return status, body
+
+
+def _through(ui: Any) -> Any:
+    """An answer that GETs ``/instance`` on *ui* with the URL's token, on the
+    probed port, exactly as the production probe asks for it."""
+
+    def answer(index: int, port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        token = config_ui._url_token(url)
+        response = ui.handle(
+            config_ui.UIRequest(
+                method="GET", path="/instance", query={} if token is None else {"token": token},
+                headers={"host": f"127.0.0.1:{port}"}, body=b"",
+            )
+        )
+        return response.status, response.body
+
+    return answer
+
+
+def _timed_out(clock: _Clock) -> Any:
+    def answer(index: int, port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        clock.now += timeout
+        raise TimeoutError("timed out")
+
+    return answer
+
+
+def _refused(index: int, port: int, url: str, timeout: float) -> tuple[int, bytes]:
+    raise ConnectionRefusedError("refused")
+
+
+def _answering(marker: str, version: str) -> Any:
+    def answer(index: int, port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        return 200, json.dumps({"marker": marker, "version": version}).encode("utf-8")
+
+    return answer
+
+
+def _seams(
+    clock: _Clock, probe: _Probe | None = None, *, live: bool = True, **overrides: Any
+) -> Any:
+    def unexpected(port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        raise AssertionError("no probe expected")
+
+    return config_ui.InstanceSeams(
+        liveness=lambda pid: live,
+        probe=unexpected if probe is None else probe,
+        clock=clock,
+        sleep=clock.sleep,
+        **overrides,
+    )
+
+
+def _instance_profile(monkeypatch: pytest.MonkeyPatch, root: Path) -> Path:
+    """The A2 default profile under *root*, its directory created; returns
+    the instance record's path."""
+
+    profile = _default_environment(monkeypatch, root)
+    profile.parent.mkdir(mode=0o700)
+    return profile.with_name(profile.name + config_ui.INSTANCE_SUFFIX)
+
+
+def _first_instance(record: Path, *argv: str, platform: str = "linux") -> tuple[Any, bytes]:
+    """A first UI (not served) and the record it would publish, written
+    under *record*; returns the UI and the record's bytes."""
+
+    first = config_ui.ConfigUI(config_ui.UISettings.from_argv(list(argv)), environ={})
+    content = config_ui.instance_document(first, platform)
+    descriptor = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(content)
+    return first, content
+
+
+class _Recording(_Serving):
+    """A listening fake ``serve`` that records the instance record's bytes
+    and mode while it serves, and runs *during* (if any) at that moment."""
+
+    def __init__(self, record: Path, during: Any = None) -> None:
+        super().__init__()
+        self.record = record
+        self.during = during
+        self.seen: list[tuple[bytes, int]] = []
+
+    def __call__(self, *args: Any) -> None:
+        super().__call__(*args)
+        self.seen.append((self.record.read_bytes(), stat.S_IMODE(self.record.stat().st_mode)))
+        if self.during is not None:
+            self.during(*args)
+
+
+def _no_token_anywhere(
+    token: str, caplog: pytest.LogCaptureFixture, captured: Any, *, out: bool = False
+) -> None:
+    """The token in no log record and no diagnostic (standard error); with
+    *out*, not on standard output either."""
+
+    _no_token_logged(caplog, token)
+    assert token not in captured.err
+    if out:
+        assert token not in captured.out
+
+
+def test_ac4_instance_route_guards_and_answer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4, ``/instance`` row: a wrong Host, a wrong method and a missing or
+    wrong token are refused with the existing statuses (the token refusal is
+    the access URL's), with 0 sessions and 0 marker bytes; a good GET answers
+    200 with exactly the marker and the version and creates 0 sessions. 0
+    checker, supervisor or file-write calls are recorded."""
+
+    _default_environment(monkeypatch, tmp_path)
+    calls: list[str] = []
+
+    class _Watched:
+        def __getattr__(self, name: str) -> Any:
+            calls.append(name)
+            return lambda *args, **kwargs: None
+
+    ui = config_ui.ConfigUI(
+        config_ui.UISettings.from_argv([]), environ={},
+        checker=lambda *args, **kwargs: calls.append("checker"),  # type: ignore[arg-type,return-value]
+        supervisor=_Watched(),  # type: ignore[arg-type]
+    )
+    before = sorted(tmp_path.rglob("*"))
+    marker = ui.instance_marker.encode("utf-8")
+    assert len(ui.instance_marker) == 32 and int(ui.instance_marker, 16) >= 0
+    assert ui.instance_marker not in ui.token
+    wrong_token_status = ui.handle(_ui_request("GET", "/", query={"token": "x" * 43})).status
+    assert wrong_token_status == 401
+    sessions = len(ui._sessions)
+    assert sessions == 0
+
+    refused = [
+        (403, _ui_request("GET", "/instance", query={"token": ui.token}, headers={"host": "evil.example:8765"})),
+        (403, config_ui.UIRequest(method="GET", path="/instance", query={"token": ui.token}, headers={})),
+        (403, _ui_request("POST", "/instance", query={"token": ui.token}, headers={"host": "evil.example:8765"})),
+        (405, _ui_request("POST", "/instance", query={"token": ui.token})),
+        (405, _ui_request("PUT", "/instance", query={"token": ui.token})),
+        (405, _ui_request("DELETE", "/instance", query={"token": ui.token})),
+        (wrong_token_status, _ui_request("GET", "/instance")),
+        (wrong_token_status, _ui_request("GET", "/instance", query={"token": ""})),
+        (wrong_token_status, _ui_request("GET", "/instance", query={"token": ui.token[:-1]})),
+        (wrong_token_status, _ui_request("GET", "/instance", query={"token": "x" * 43})),
+    ]
+    for status, request in refused:
+        response = ui.handle(request)
+        assert response.status == status, request
+        assert marker not in response.body
+        assert not any(name == "Set-Cookie" for name, _ in response.headers)
+        assert len(ui._sessions) == 0
+
+    good = ui.handle(_ui_request("GET", "/instance", query={"token": ui.token}))
+    assert good.status == 200
+    assert good.content_type == "application/json"
+    assert json.loads(good.body) == {"marker": ui.instance_marker, "version": product_version()}
+    assert ui.token.encode("utf-8") not in good.body
+    assert not any(name == "Set-Cookie" for name, _ in good.headers)
+    assert len(ui._sessions) == 0
+    # A session cookie does not stand in for the token.
+    _response, cookie = _access(ui)
+    with_cookie = ui.handle(_ui_request("GET", "/instance", headers={"cookie": cookie}))
+    assert with_cookie.status == wrong_token_status and marker not in with_cookie.body
+    assert calls == []
+    assert sorted(tmp_path.rglob("*")) == before
+    config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+def test_ac31_the_instance_keys_exist_in_both_languages() -> None:
+    """R2: every sentence the launch prints is a string-table key present in
+    English and French, and every ``instance.*`` key is used."""
+
+    keys, _dynamic = referenced_keys([CONFIG_UI / "__init__.py"])
+    files = _string_files()
+    for code, sentences in files.items():
+        assert sorted(keys - sentences.keys()) == [], code
+    shipped = {key for key in files["en"] if key.startswith("instance.")}
+    assert {key for key in keys if key.startswith("instance.")} == shipped
+    assert len(shipped) >= 10
+
+
+@posix_only
+def test_ac31_a_confirmed_instance_of_this_version_is_opened_not_served(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    first, content = _first_instance(record)
+    clock = _Clock()
+    probe = _Probe(clock, _through(first))
+    serve, opener = _Serving(), _Calls()
+    assert config_ui.main([], opener=opener, serve=serve, instance=_seams(clock, probe)) == 0
+    assert serve.calls == []
+    assert opener.calls == [(first.access_url,)]
+    captured = capsys.readouterr()
+    line = _say("instance.already_running", url=first.access_url)
+    assert captured.out.count(line) == 1 and captured.out.count(first.access_url) == 1
+    assert [(port, url) for _start, port, url, _timeout in probe.attempts] == [(8765, first.access_url)]
+    assert record.read_bytes() == content
+    _no_token_anywhere(first.token, caplog, captured)
+    # The probe's answer is the marker and the version only.
+    assert all(first.token.encode("utf-8") not in body for body in probe.bodies)
+    config_ui._LOG_REDACTION.sources.discard(first)
+
+
+@posix_only
+def test_ac31_a_slow_first_attempt_then_a_confirming_one_within_ten_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    first, _content = _first_instance(record)
+    clock = _Clock()
+    start = clock.now
+    slow, through = _timed_out(clock), _through(first)
+
+    def answer(index: int, port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        return (slow if index < 3 else through)(index, port, url, timeout)
+
+    probe = _Probe(clock, answer)
+    serve, opener = _Serving(), _Calls()
+    assert config_ui.main([], opener=opener, serve=serve, instance=_seams(clock, probe)) == 0
+    assert serve.calls == [] and opener.calls == [(first.access_url,)]
+    assert len(probe.attempts) == 4
+    assert all(timeout <= 2.0 for *_rest, timeout in probe.attempts)
+    assert all(started - start < 10.0 for started, *_rest in probe.attempts)
+    assert capsys.readouterr().out.count(_say("instance.already_running", url=first.access_url)) == 1
+    config_ui._LOG_REDACTION.sources.discard(first)
+
+
+@posix_only
+def test_ac31_the_recorded_port_wins_over_the_asked_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    first, _content = _first_instance(record, "--port", "8766")
+    clock = _Clock()
+    probe = _Probe(clock, _through(first))
+    serve, opener = _Serving(), _Calls()
+    assert config_ui.main(["--port", "8765"], opener=opener, serve=serve, instance=_seams(clock, probe)) == 0
+    assert serve.calls == []
+    assert opener.calls == [(first.access_url,)]
+    assert first.access_url.startswith("http://127.0.0.1:8766/?token=")
+    assert {port for _start, port, _url, _timeout in probe.attempts} == {8766}
+    capsys.readouterr()
+    config_ui._LOG_REDACTION.sources.discard(first)
+
+
+@posix_only
+def test_ac31_a_raising_opener_still_serves_nothing_and_prints_the_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    first, _content = _first_instance(record)
+    clock = _Clock()
+    serve = _Serving()
+    opener = _Calls(OSError(f"no browser for {first.access_url}"))
+    status = config_ui.main([], opener=opener, serve=serve, instance=_seams(clock, _Probe(clock, _through(first))))
+    assert status == 0
+    assert serve.calls == [] and opener.calls == [(first.access_url,)]
+    captured = capsys.readouterr()
+    assert captured.out.count(_say("instance.already_running", url=first.access_url)) == 1
+    _no_token_anywhere(first.token, caplog, captured)
+    assert any("browser could not be opened" in r.getMessage() for r in caplog.records)
+    config_ui._LOG_REDACTION.sources.discard(first)
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["refused", "timeout", "wrong_token", "mixed"])
+def test_ac31_an_unconfirmed_live_record_is_reported_and_kept(
+    mode: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A slow UI is not a dead one: no attempt confirms within 10 s → the
+    record is reported (its path, the port fact, a cause and a next action,
+    0 URLs), kept byte-identical, and nothing is served or opened."""
+
+    record = _instance_profile(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    first, content = _first_instance(record)
+    stranger = config_ui.ConfigUI(config_ui.UISettings.from_argv([]), environ={})
+    clock = _Clock()
+    start = clock.now
+    timed_out = _timed_out(clock)
+    # The wrong-token status: the first UI's port held by a UI whose token differs.
+    wrong_token = _through(stranger)
+    answers = {
+        "refused": _refused,
+        "timeout": timed_out,
+        "wrong_token": wrong_token,
+        "mixed": lambda index, *rest: (_refused, timed_out, wrong_token)[index % 3](index, *rest),
+    }
+    probe = _Probe(clock, answers[mode])
+    serve, opener = _Serving(), _Calls()
+    status = config_ui.main([], opener=opener, serve=serve, instance=_seams(clock, probe))
+    assert status != 0
+    assert serve.calls == [] and opener.calls == []
+    assert record.read_bytes() == content
+    assert len(probe.attempts) > 1
+    starts = [started for started, *_rest in probe.attempts]
+    assert all(timeout <= 2.0 for *_rest, timeout in probe.attempts)
+    assert all(started - start < 10.0 for started in starts)
+    assert all(later - earlier >= 0.5 for earlier, later in zip(starts, starts[1:]))
+    if mode == "refused":
+        # Every 0.5 s from the first: 0, 0.5, …, 9.5.
+        assert len(probe.attempts) == 20
+    captured = capsys.readouterr()
+    report = captured.out + captured.err
+    assert _say("instance.record_exists", path=record.resolve()) in report
+    fact = "instance.port.silent" if mode in ("refused", "timeout") else "instance.port.unauthenticated"
+    assert _say(fact, port=8765) in report
+    assert _say("instance.not_confirmed.cause") in report
+    assert _say("instance.not_confirmed.next", pid=first_pid(content)) in report
+    assert "http://" not in report and "?token=" not in report
+    _no_token_anywhere(first.token, caplog, captured, out=True)
+    assert all(first.token.encode("utf-8") not in body for body in probe.bodies)
+    for ui in (first, stranger):
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+def first_pid(content: bytes) -> int:
+    pid = json.loads(content)["pid"]
+    assert isinstance(pid, int)
+    return pid
+
+
+def _truncated(content: bytes) -> bytes:
+    return content[: len(content) // 2]
+
+
+def _missing_marker(content: bytes) -> bytes:
+    document = json.loads(content)
+    del document["marker"]
+    return json.dumps(document).encode("utf-8")
+
+
+@posix_only
+@pytest.mark.parametrize("case", ["a_not_live", "b_reused_pid", "c_truncated", "d_missing_field"])
+def test_ac31_a_stale_record_is_replaced_and_this_launch_serves(
+    case: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    first, content = _first_instance(record)
+    if case == "c_truncated":
+        record.write_bytes(_truncated(content))
+    elif case == "d_missing_field":
+        record.write_bytes(_missing_marker(content))
+    clock = _Clock()
+    probe = _Probe(clock, _answering("f" * 32, product_version()))
+    seams = _seams(clock, probe, live=case != "a_not_live")
+    serve, opener = _Recording(record), _Calls()
+    assert config_ui.main([], opener=opener, serve=serve, instance=seams) == 0
+    ((ui, _settings),) = serve.calls
+    assert opener.calls == [(ui.access_url,)]
+    assert all(first.access_url not in call for call in opener.calls)
+    ((published, mode),) = serve.seen
+    assert mode == 0o600
+    assert json.loads(published) == {
+        "pid": os.getpid(), "port": 8765, "marker": ui.instance_marker, "access_url": ui.access_url,
+    }
+    assert len(probe.attempts) == (1 if case == "b_reused_pid" else 0)
+    captured = capsys.readouterr()
+    assert (captured.out + captured.err).count(_say("instance.stale")) == 1
+    assert first.access_url not in captured.out + captured.err
+    _no_token_anywhere(ui.token, caplog, captured)
+    # A clean exit removed this instance's record; nothing was left aside.
+    assert not record.exists()
+    assert sorted(path.name for path in record.parent.iterdir()) == []
+    config_ui._LOG_REDACTION.sources.discard(first)
+
+
+@posix_only
+def test_ac31_the_published_record_is_owner_only_and_no_secret_leaves_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The record is mode 0600 from publication and holds the token only in
+    its access URL: no other file, log record, diagnostic, the supervised
+    child's environment, the status record nor ``/instance`` carries it; a
+    clean exit removes it."""
+
+    record = _instance_profile(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    holders: list[list[Path]] = []
+
+    def during(ui: Any, settings: Any) -> None:
+        holders.append([path for path in _files_holding([tmp_path], ui.token)])
+        environ = dict(ui.supervisor._environ)
+        assert all(ui.token not in value for value in environ.values())
+        assert all(ui.token not in name for name in environ)
+        response = ui.handle(_ui_request("GET", "/instance", query={"token": ui.token}))
+        assert response.status == 200 and ui.token.encode("utf-8") not in response.body
+        assert not settings.status_path.exists() or ui.token not in settings.status_path.read_text()
+
+    serve, opener = _Recording(record, during), _Calls()
+    clock = _Clock()
+    assert config_ui.main([], opener=opener, serve=serve, instance=_seams(clock)) == 0
+    ((ui, _settings),) = serve.calls
+    ((published, mode),) = serve.seen
+    assert mode == 0o600
+    assert holders == [[record]]
+    assert ui.token in published.decode("utf-8")
+    captured = capsys.readouterr()
+    assert captured.out.count(ui.access_url) == 1
+    _no_token_anywhere(ui.token, caplog, captured)
+    assert not record.exists()
+
+
+def test_ac31_a_clean_exit_keeps_a_record_that_is_no_longer_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    foreign = b'{"marker": "another", "pid": 1, "port": 8765}\n'
+
+    def during(ui: Any, settings: Any) -> None:
+        record.unlink()
+        record.write_bytes(foreign)
+
+    clock = _Clock()
+    assert config_ui.main([], opener=_Calls(), serve=_Recording(record, during), instance=_seams(clock)) == 0
+    assert record.read_bytes() == foreign
+    assert sorted(path.name for path in record.parent.iterdir()) == [record.name]
+    capsys.readouterr()
+
+
+def test_ac31_a_record_removed_while_read_is_no_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Plan risk: a record that disappears between the judgement and its
+    removal (a clean exit elsewhere) is no record, never a crash."""
+
+    record = _instance_profile(monkeypatch, tmp_path)
+    record.write_bytes(b"{truncated")
+    real_rename = os.rename
+    gone: list[bool] = []
+
+    def vanishing(source: Any, target: Any) -> None:
+        if Path(source) == record.resolve() and not gone:
+            gone.append(True)
+            os.unlink(source)
+        real_rename(source, target)
+
+    monkeypatch.setattr(os, "rename", vanishing)
+    serve = _Recording(record)
+    clock = _Clock()
+    assert config_ui.main([], opener=_Calls(), serve=serve, instance=_seams(clock)) == 0
+    assert gone == [True] and len(serve.calls) == 1
+    captured = capsys.readouterr()
+    assert _say("instance.stale") not in captured.err
+
+
+@pytest.mark.parametrize("platform", ["windows", "freebsd"])
+def test_ac31_a_non_posix_record_holds_no_token_and_a_live_one_is_not_probed(
+    platform: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    second: dict[str, Any] = {}
+
+    def during(ui: Any, settings: Any) -> None:
+        capsys.readouterr()  # the first launch's own access URL line
+        content = record.read_bytes()
+        assert _files_holding([tmp_path], ui.token) == []
+        clock = _Clock()
+        probe = _Probe(clock, _through(ui))
+        serve, opener = _Serving(), _Calls()
+        status = config_ui.main(
+            [], opener=opener, serve=serve, instance=_seams(clock, probe, platform=platform)
+        )
+        second.update(
+            status=status, serve=serve.calls, opener=opener.calls, attempts=probe.attempts,
+            kept=record.read_bytes() == content, captured=capsys.readouterr(),
+        )
+
+    serve = _Recording(record, during)
+    clock = _Clock()
+    assert config_ui.main([], opener=_Calls(), serve=serve, instance=_seams(clock, platform=platform)) == 0
+    ((ui, _settings),) = serve.calls
+    ((published, _mode),) = serve.seen
+    document = json.loads(published)
+    assert document == {"pid": os.getpid(), "port": 8765, "marker": ui.instance_marker}
+    assert ui.token not in published.decode("utf-8")
+
+    assert second["status"] != 0
+    assert second["serve"] == [] and second["opener"] == [] and second["attempts"] == []
+    assert second["kept"] is True
+    captured = second["captured"]
+    report = captured.out + captured.err
+    assert report.count(_say("instance.unconfirmable", pid=os.getpid())) == 1
+    assert "running but not answering" in report
+    assert _say("instance.record_exists", path=record.resolve()) in report
+    assert _say("instance.unconfirmable.next", port=8765, pid=os.getpid()) in report
+    assert ui.token not in report and "http://" not in report
+    _no_token_logged(caplog, ui.token)
+    capsys.readouterr()
+    assert not record.exists()
+
+
+def test_ac31_a_non_posix_record_whose_pid_is_not_live_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    first, _content = _first_instance(record, platform="windows")
+    clock = _Clock()
+    serve = _Recording(record)
+    seams = _seams(clock, live=False, platform="windows")
+    assert config_ui.main([], opener=_Calls(), serve=serve, instance=seams) == 0
+    ((ui, _settings),) = serve.calls
+    ((published, _mode),) = serve.seen
+    assert json.loads(published)["marker"] == ui.instance_marker
+    assert capsys.readouterr().err.count(_say("instance.stale")) == 1
+    config_ui._LOG_REDACTION.sources.discard(first)
+
+
+@posix_only
+def test_ac31_another_version_is_reported_and_never_opened(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    record = _instance_profile(monkeypatch, tmp_path)
+    caplog.set_level("DEBUG")
+    first, content = _first_instance(record)
+    clock = _Clock()
+    other = "999.0-fixture"
+    assert other != product_version()
+    probe = _Probe(clock, _answering(first.instance_marker, other))
+    serve, opener = _Serving(), _Calls()
+    status = config_ui.main([], opener=opener, serve=serve, instance=_seams(clock, probe))
+    assert status != 0
+    assert serve.calls == [] and opener.calls == []
+    assert record.read_bytes() == content
+    captured = capsys.readouterr()
+    assert _say("instance.version_mismatch", running=other, own=product_version()) in captured.out
+    assert _say("instance.version_mismatch.next", url=first.access_url) in captured.out
+    _no_token_anywhere(first.token, caplog, captured)
+    config_ui._LOG_REDACTION.sources.discard(first)
+
+
+@pytest.mark.parametrize(
+    "failure", [OSError(5, "injected"), PermissionError(1, "hard links unsupported")]
+)
+def test_ac31_a_failed_publication_leaves_no_record_and_serves_nothing(
+    failure: OSError,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failure between the temporary write and the publication (or a file
+    system without hard links) leaves no file under the record's name, no
+    temporary file, and refuses to serve rather than replace."""
+
+    record = _instance_profile(monkeypatch, tmp_path)
+    written: list[bytes] = []
+
+    def failing(temp: Path, target: Path) -> None:
+        written.append(temp.read_bytes())
+        raise failure
+
+    clock = _Clock()
+    serve, opener = _Serving(), _Calls()
+    status = config_ui.main([], opener=opener, serve=serve, instance=_seams(clock, publish=failing))
+    assert status != 0
+    assert serve.calls == [] and opener.calls == []
+    assert len(written) == 1 and b'"marker"' in written[0]
+    assert not record.exists()
+    assert list(record.parent.iterdir()) == []
+    captured = capsys.readouterr()
+    assert _say("instance.unusable", path=record.resolve()) in captured.err
+    assert "injected" not in captured.err and "hard links" not in captured.err
+    assert "http://" not in captured.out + captured.err
+
+
+@posix_only
+def test_ac31_two_launches_racing_serve_once_and_the_loser_opens_the_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The loser of the no-replace publication re-reads the record and
+    behaves as a second launch: 1 ``serve`` (the winner's), and 1 opener call
+    from the loser with the winner's URL."""
+
+    record = _instance_profile(monkeypatch, tmp_path)
+    serving, finish = threading.Event(), threading.Event()
+    winner: dict[str, Any] = {}
+
+    def winner_serve(ui: Any, settings: Any) -> None:
+        winner.setdefault("served", []).append(ui)
+        serving.set()
+        assert finish.wait(30)
+
+    def run_winner() -> None:
+        try:
+            winner["status"] = config_ui.main(
+                [], opener=_Calls(), serve=winner_serve, instance=_seams(_Clock())
+            )
+        except BaseException as error:  # pragma: no cover - surfaced below
+            winner["error"] = error
+            serving.set()
+
+    thread = threading.Thread(target=run_winner, name="fixture-winner")
+
+    def racing_publish(temp: Path, target: Path) -> None:
+        # The winner judges, publishes and serves between this launch's
+        # temporary write and its publication.
+        thread.start()
+        assert serving.wait(30)
+        config_ui._no_replace_rename(temp, target)
+
+    def through_winner(index: int, port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        return _through(winner["served"][0])(index, port, url, timeout)
+
+    clock = _Clock()
+    probe = _Probe(clock, through_winner)
+    serve, opener = _Serving(), _Calls()
+    try:
+        status = config_ui.main(
+            [], opener=opener, serve=serve, instance=_seams(clock, probe, publish=racing_publish)
+        )
+    finally:
+        finish.set()
+        thread.join(30)
+    assert "error" not in winner
+    (winning,) = winner["served"]
+    assert status == 0 and winner["status"] == 0
+    assert serve.calls == []
+    assert opener.calls == [(winning.access_url,)]
+    assert not record.exists()
+    assert list(record.parent.iterdir()) == []
+    capsys.readouterr()
+
+
+@posix_only
+def test_ac31_a_removal_holds_the_name_against_a_publication(tmp_path: Path) -> None:
+    """While a removal has renamed the record aside, a publication waits for
+    it: the record it puts back is never replaced and the publication loses,
+    so two launches never both hold a published record."""
+
+    record = tmp_path / "profile.instance.json"
+    live = b'{"marker": "live"}\n'
+    record.write_bytes(live)
+    outcome: dict[str, Any] = {}
+
+    def publish() -> None:
+        outcome["published"] = config_ui._publish_instance(
+            record, b'{"marker": "third"}\n', "fixture-third", config_ui._no_replace_rename
+        )
+
+    publisher = threading.Thread(target=publish, name="fixture-third")
+
+    def stale_judged(found: bytes) -> bool:
+        # The name is vacated here: a publication must not take it.
+        assert not record.exists()
+        publisher.start()
+        publisher.join(0.2)
+        outcome["waited"] = publisher.is_alive() and not record.exists()
+        return False
+
+    aside = record.with_name(f".{record.name}.fixture.stale")
+    assert config_ui._remove_instance_if(record, aside, stale_judged) is False
+    publisher.join(30)
+    assert outcome == {"waited": True, "published": False}
+    assert record.read_bytes() == live
+    assert sorted(path.name for path in tmp_path.iterdir()) == [record.name]
+
+
+def test_ac31_windows_liveness_never_signals_the_recorded_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows ``os.kill`` terminates the process: liveness is queried."""
+
+    queried: list[int] = []
+
+    def refuse_kill(*args: object) -> None:  # pragma: no cover - the failure itself
+        raise AssertionError(f"os.kill{args}")
+
+    def query(pid: int) -> bool:
+        queried.append(pid)
+        return True
+
+    monkeypatch.setattr(os, "kill", refuse_kill)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(config_ui, "_windows_process_alive", query)
+    assert config_ui.process_alive(4242, None) is True
+    assert queried == [4242]
+
+
+class _TricklingPeer:
+    """A fake connection for the production probe: it answers *chunks* one
+    per ``recv``, each taking *step* seconds of the fake clock."""
+
+    def __init__(self, clock: list[float], chunks: list[bytes], step: float) -> None:
+        self.clock, self.chunks, self.step = clock, list(chunks), step
+        self.sent = b""
+        self.timeouts: list[float] = []
+
+    def __enter__(self) -> "_TricklingPeer":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+
+    def sendall(self, data: bytes) -> None:
+        self.sent += data
+
+    def recv(self, _size: int) -> bytes:
+        self.clock[0] += self.step
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+def _production_probe(
+    monkeypatch: pytest.MonkeyPatch, chunks: list[bytes], step: float
+) -> tuple[_TricklingPeer, Any]:
+    import socket
+
+    clock = [100.0]
+    peer = _TricklingPeer(clock, chunks, step)
+    monkeypatch.setattr(config_ui.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(socket, "create_connection", lambda address, timeout: peer)
+    url = "http://127.0.0.1:8765/?token=" + "a" * 43
+    return peer, lambda: config_ui._probe_instance(8765, url, 2.0)
+
+
+def test_ac31_the_production_probe_reads_one_answer_within_its_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b'{"marker": "m", "version": "v"}'
+    answer = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+    peer, probe = _production_probe(monkeypatch, [answer[:20], answer[20:]], 0.1)
+    assert probe() == (200, body)
+    assert peer.sent.startswith(b"GET /instance?token=" + b"a" * 43 + b" HTTP/1.1\r\n")
+    assert all(0 < timeout <= 2.0 for timeout in peer.timeouts)
+
+
+def test_ac31_a_peer_that_keeps_sending_is_bounded_by_the_whole_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each byte arrives within any per-operation timeout, yet the attempt
+    ends once its 2 s have elapsed in total (R1)."""
+
+    peer, probe = _production_probe(monkeypatch, [b"HTTP/1.1 200 OK\r\n"] + [b"X: y\r\n"] * 1000, 0.5)
+    with pytest.raises(TimeoutError):
+        probe()
+    assert len(peer.chunks) > 990
+    assert peer.timeouts[-1] <= 0.5

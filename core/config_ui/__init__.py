@@ -50,7 +50,7 @@ import threading
 import time
 import weakref
 import webbrowser
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -66,6 +66,7 @@ import yaml
 from core.actions import ANY_ACTION
 from core.bus import EventBus
 from core.config_ui import locations
+from core.config_ui.i18n import StringTable
 from core.config_ui.wizard import CredentialStore, WizardState, WizardStateError, state_path
 from core.contracts import (
     INPUT_OWNER_NONE,
@@ -1115,11 +1116,14 @@ def process_alive(pid: int, child: ChildHandle | None) -> bool:
 
     The UI's own child handle is authoritative for its child; any other pid
     is probed with signal 0: "no such process" is dead, success or
-    "permission denied" is alive.
+    "permission denied" is alive. On Windows, where ``os.kill`` terminates
+    the process, it is queried instead (:func:`_windows_process_alive`).
     """
 
     if child is not None and child.pid == pid:
         return child.poll() is None
+    if sys.platform == "win32":
+        return _windows_process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1127,6 +1131,31 @@ def process_alive(pid: int, child: ChildHandle | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _windows_process_alive(pid: int) -> bool:
+    """Whether *pid* is live on Windows, without signalling it: a handle is
+    opened for query and waited on for zero time. A process that cannot be
+    opened for lack of rights is alive; any other refusal is dead."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    synchronize, query_limited_information = 0x00100000, 0x00001000
+    access_denied, wait_timeout = 5, 0x00000102
+    handle = kernel32.OpenProcess(synchronize | query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == access_denied
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 @dataclass(frozen=True)
@@ -2711,6 +2740,9 @@ class _Session:
 
 Handler = Callable[[UIRequest, _Session], UIResponse]
 
+#: The GET-only, token-authenticated route a second launch probes (R1).
+INSTANCE_ROUTE = "/instance"
+
 #: Paths whose requests change state: POST only, Origin- and CSRF-checked.
 STATE_CHANGING_PATHS = frozenset({"/save", "/remove", "/check", "/apply"})
 
@@ -2837,6 +2869,11 @@ class ConfigUI:
         )
         self._secrets_lock = threading.Lock()
         self.token = secrets.token_urlsafe(32)
+        #: This serving process's instance marker (R1): 128 random bits,
+        #: distinct from the token, answered by ``/instance`` and written to
+        #: the instance record, so a second launch can tell this UI from
+        #: another program holding a reused pid or port.
+        self.instance_marker = secrets.token_hex(16)
         #: Keys the opaque field names of :func:`_field_name` (R8).
         self.field_key = secrets.token_bytes(32)
         self.authorities = accepted_authorities(
@@ -2888,6 +2925,7 @@ class ConfigUI:
             "/remove": (frozenset({"POST"}), self._remove_endpoint),
             "/check": (frozenset({"POST"}), self._check_endpoint),
             "/apply": (frozenset({"POST"}), self._apply_endpoint),
+            INSTANCE_ROUTE: (frozenset({"GET"}), self._instance_endpoint),
         }
 
     def __repr__(self) -> str:
@@ -3039,6 +3077,17 @@ class ConfigUI:
         host = request.headers.get("host")
         if host is None or _normalize_authority(host) not in self.authorities:
             return _text(403, _FORBIDDEN)
+        if request.path == INSTANCE_ROUTE:
+            # An authenticated route, not a session exception (R1): Host,
+            # method, then the access token exactly as the access URL checks
+            # it; no session is created.
+            methods, handler = self.routes[INSTANCE_ROUTE]
+            if method not in methods:
+                return _text(405, "405 Method Not Allowed", (("Allow", ", ".join(sorted(methods))),))
+            presented = request.query.get("token")
+            if presented is None or not _equal(presented, self.token):
+                return _text(401, _UNAUTHORIZED)
+            return handler(request, None)
         if method == "GET" and request.path == "/" and "token" in request.query:
             if not _equal(request.query["token"], self.token):
                 return _text(401, _UNAUTHORIZED)
@@ -3077,6 +3126,17 @@ class ConfigUI:
             with self._mutation_lock:
                 return handler(request, session)
         return handler(request, session)
+
+    def _instance_endpoint(self, request: UIRequest, session: _Session | None) -> UIResponse:
+        """``/instance`` (R1): the instance marker and the product version,
+        nothing else; reached only through the token check of :meth:`_guarded`."""
+
+        document = {"marker": self.instance_marker, "version": locations.product_version()}
+        return UIResponse(
+            status=200,
+            body=json.dumps(document, sort_keys=True).encode("utf-8"),
+            content_type="application/json",
+        )
 
     def _landing(self) -> str:
         """:func:`landing_target` over the wizard state file read now. A state
@@ -5779,6 +5839,522 @@ def serve(ui: ConfigUI, settings: UISettings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The instance record and the second launch (R1)
+# ---------------------------------------------------------------------------
+
+#: One probe attempt's bound, the retry period and the total bound (R1).
+PROBE_ATTEMPT_SECONDS = 2.0
+PROBE_RETRY_SECONDS = 0.5
+PROBE_TOTAL_SECONDS = 10.0
+#: A record larger than this is not one a UI wrote: it is incomplete.
+INSTANCE_MAX_BYTES = 64 * 1024
+#: Stale removals and lost publications one launch goes through before it
+#: reports the record unusable instead of looping.
+INSTANCE_MAX_ROUNDS = 8
+#: The exit status of a launch that found an instance it does not open.
+EXIT_INSTANCE = 1
+
+#: ``probe(port, url, timeout)`` → ``(status, body)`` of one GET of
+#: ``/instance`` carrying the token of *url*; raises ``OSError`` when nothing
+#: answers within *timeout* seconds.
+InstanceProbe = Callable[[int, str, float], tuple[int, bytes]]
+
+
+def _url_token(url: str) -> str | None:
+    """The access token an access URL carries, or ``None``."""
+
+    from urllib.parse import urlsplit
+
+    try:
+        query = urlsplit(url).query
+    except ValueError:
+        return None
+    token = dict(parse_qsl(query)).get("token")
+    return token or None
+
+
+#: What a probe receives at most beyond the record-sized body: the headers.
+PROBE_HEADER_BYTES = 64 * 1024
+
+
+class _ReceivedAnswer:
+    """The bytes one probe received, as the socket ``HTTPResponse`` parses."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def makefile(self, *_args: object, **_kwargs: object) -> Any:
+        import io
+
+        return io.BytesIO(self._data)
+
+
+def _probe_instance(port: int, url: str, timeout: float) -> tuple[int, bytes]:
+    """The production probe: one GET of ``/instance`` on the recorded port of
+    the recorded access URL's loopback host, with its token (R1). The HTTP
+    client is built here only, never in a test (AC33).
+
+    *timeout* bounds the whole exchange, not each socket operation: every
+    step is given only what is left of it, and a peer still sending when it
+    elapses is no answer (``TimeoutError``)."""
+
+    import http.client
+    import socket
+    from urllib.parse import quote, urlsplit
+
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the probe's bound elapsed")
+        return left
+
+    host = urlsplit(url).hostname or DEFAULT_HOST
+    authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    target = f"{INSTANCE_ROUTE}?token={quote(_url_token(url) or '', safe='')}"
+    request = f"GET {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    received = bytearray()
+    with socket.create_connection((host, port), timeout=remaining()) as connection:
+        connection.settimeout(remaining())
+        connection.sendall(request.encode("ascii"))
+        while len(received) <= INSTANCE_MAX_BYTES + PROBE_HEADER_BYTES:
+            connection.settimeout(remaining())
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            received += chunk
+    response = http.client.HTTPResponse(_ReceivedAnswer(bytes(received)))  # type: ignore[arg-type]
+    try:
+        response.begin()
+        return response.status, response.read(INSTANCE_MAX_BYTES)
+    except http.client.HTTPException as exc:
+        # A malformed answer is no answer; the URL is never in the message.
+        raise OSError(type(exc).__name__) from None
+    finally:
+        response.close()
+
+
+def _no_replace_rename(source: Path, target: Path) -> None:
+    """Give *source* the name *target*, raising ``FileExistsError`` when
+    *target* exists (R1): a hard link then the removal of *source* on POSIX,
+    a rename (which never replaces there) on Windows."""
+
+    if os.name == "nt":
+        os.rename(source, target)
+        return
+    os.link(source, target)
+    with suppress(FileNotFoundError):
+        os.unlink(source)
+
+
+@dataclass(frozen=True)
+class InstanceSeams:
+    """What a launch's instance judgement uses beyond the record (R1); tests
+    replace them, production keeps every default. Each default is looked up
+    when called, never captured at import.
+
+    ``liveness(pid)``: whether *pid* is live (:func:`process_alive`).
+    ``probe``: an :data:`InstanceProbe`. ``clock``/``sleep``: monotonic
+    seconds and a wait. ``platform``: the platform name (``None``: the
+    running one); it decides whether the token is persisted. ``publish(temp,
+    record)``: the no-replace step that gives the written temporary file the
+    record's name, raising ``FileExistsError`` when the name is taken.
+    """
+
+    liveness: Callable[[int], bool] = lambda pid: process_alive(pid, None)
+    probe: InstanceProbe = lambda port, url, timeout: _probe_instance(port, url, timeout)
+    clock: Callable[[], float] = lambda: time.monotonic()
+    sleep: Callable[[float], None] = lambda seconds: time.sleep(seconds)
+    platform: str | None = None
+    publish: Callable[[Path, Path], None] = lambda temp, record: _no_replace_rename(temp, record)
+
+
+@dataclass(frozen=True)
+class InstanceRecord:
+    """A complete instance record (R1). Its access URL carries the token, so
+    it is never in the representation."""
+
+    pid: int
+    port: int
+    marker: str
+    access_url: str | None = field(default=None, repr=False)
+
+
+def _persists_token(platform: str) -> bool:
+    """Only where the record's mode restricts it to its owner (POSIX)."""
+
+    return platform in (locations.LINUX, locations.MACOS)
+
+
+def instance_document(ui: ConfigUI, platform: str) -> bytes:
+    """The record *ui* publishes: pid, port, marker and, only on POSIX, the
+    access URL (R1)."""
+
+    document: dict[str, Any] = {
+        "pid": os.getpid(),
+        "port": ui.settings.port,
+        "marker": ui.instance_marker,
+    }
+    if _persists_token(platform):
+        document["access_url"] = ui.access_url
+    return (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+
+
+def parse_instance_record(raw: bytes, platform: str) -> InstanceRecord | None:
+    """The record *raw* holds, or ``None`` when it is incomplete: it does not
+    parse, or a field its platform requires is missing or of the wrong type."""
+
+    if len(raw) > INSTANCE_MAX_BYTES:
+        return None
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    pid, port, marker = document.get("pid"), document.get("port"), document.get("marker")
+    if not (_is_integer(pid) and 0 < pid <= PID_MAX):
+        return None
+    if not (_is_integer(port) and 0 < port < 65536):
+        return None
+    if not isinstance(marker, str) or not marker:
+        return None
+    access_url = None
+    if _persists_token(platform):
+        access_url = document.get("access_url")
+        if not isinstance(access_url, str) or _url_token(access_url) is None:
+            return None
+    return InstanceRecord(pid=pid, port=port, marker=marker, access_url=access_url)
+
+
+def _read_instance(path: Path) -> bytes | None:
+    """The record's bytes, or ``None`` when there is none (a record removed
+    while it is read is no record)."""
+
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(INSTANCE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+
+
+@contextmanager
+def _instance_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+    """Hold the lock that serializes changes to the record's name (R1).
+
+    A removal holds it exclusively, from renaming the record aside to
+    putting it back, so no publication can take the name it vacates; a
+    publication holds it shared (concurrent no-replace publications decide
+    among themselves). On POSIX the lock is on the record's directory, so
+    nothing is added to it; on Windows it is on a file in the temporary
+    directory named after the record's path.
+    """
+
+    if os.name == "nt":
+        digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:32]
+        target = Path(tempfile.gettempdir()) / f"config-ui-instance-{digest}.lock"
+        descriptor = os.open(target, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            _windows_lock(descriptor, exclusive)
+            yield
+        finally:
+            os.close(descriptor)  # closing releases the lock
+        return
+    import fcntl
+
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(descriptor)  # closing releases the lock
+
+
+def _windows_lock(descriptor: int, exclusive: bool) -> None:
+    """Block until the first byte of *descriptor*'s file is locked."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_void_p),
+            ("InternalHigh", ctypes.c_void_p),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LockFileEx.restype = wintypes.BOOL
+    kernel32.LockFileEx.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(_Overlapped),
+    )
+    lockfile_exclusive_lock = 0x00000002
+    overlapped = _Overlapped()
+    handle = msvcrt.get_osfhandle(descriptor)
+    flags = lockfile_exclusive_lock if exclusive else 0
+    if not kernel32.LockFileEx(handle, flags, 0, 1, 0, ctypes.byref(overlapped)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _remove_instance_if(path: Path, aside: Path, matches: Callable[[bytes], bool]) -> bool:
+    """Remove the record only while its bytes satisfy *matches* (R1).
+
+    It is renamed to the launch-unique *aside* first, so the bytes judged are
+    the bytes deleted; a record that no longer matches is put back with a
+    no-replace rename (a newer record under the name is never replaced).
+    The whole step holds :func:`_instance_lock` exclusively, so no other
+    launch publishes under the name while it is vacated and the record is
+    always put back. Returns whether a record was removed.
+    """
+
+    with _instance_lock(path, exclusive=True):
+        try:
+            os.rename(path, aside)
+        except FileNotFoundError:
+            return False
+        try:
+            raw: bytes | None = aside.read_bytes()
+        except OSError:
+            raw = None
+        if raw is not None and matches(raw):
+            os.unlink(aside)
+            return True
+        with suppress(FileExistsError):
+            _no_replace_rename(aside, path)
+        return False
+
+
+def _publish_instance(
+    path: Path, content: bytes, unique: str, publish: Callable[[Path, Path], None]
+) -> bool:
+    """Write *content* to a temporary file beside *path* (0600 from its
+    creation on POSIX) and publish it under *path* without replacing (R1).
+
+    Returns ``False`` when another record holds the name; any other
+    ``OSError`` (a file system without hard links included) propagates. The
+    temporary file never outlives the call.
+    """
+
+    temp = path.with_name(f".{path.name}.{unique}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temp, flags, 0o600)
+    try:
+        try:
+            view = memoryview(content)
+            while view:
+                view = view[os.write(descriptor, view) :]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            # Shared: never while a removal has vacated the name.
+            with _instance_lock(path, exclusive=False):
+                publish(temp, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        with suppress(OSError):
+            os.unlink(temp)
+
+
+def _instance_answer(status: int, body: bytes) -> tuple[str, str] | None:
+    """``(marker, version)`` of an authenticated ``/instance`` answer."""
+
+    if status != 200:
+        return None
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    marker, version = document.get("marker"), document.get("version")
+    if not isinstance(marker, str) or not isinstance(version, str):
+        return None
+    return marker, version
+
+
+#: What the probe observed of the recorded port when nothing confirmed.
+PORT_UNAUTHENTICATED = "unauthenticated"
+PORT_SILENT = "silent"
+
+
+def _probe_record(record: InstanceRecord, seams: InstanceSeams) -> tuple[str, str] | str:
+    """Probe the recorded port until an authenticated answer (returned as
+    ``(marker, version)``) or the total bound (R1): each attempt is bounded
+    to 2 s, the next starts 0.5 s after the last began, and none starts 10 s
+    or more after the first. Without an answer, returns the port fact."""
+
+    assert record.access_url is not None
+    answered = False
+    first = seams.clock()
+    while True:
+        started = seams.clock()
+        remaining = PROBE_TOTAL_SECONDS - (started - first)
+        if remaining <= 0:
+            break
+        try:
+            status, body = seams.probe(
+                record.port, record.access_url, min(PROBE_ATTEMPT_SECONDS, remaining)
+            )
+        except (OSError, ValueError):
+            pass
+        else:
+            answer = _instance_answer(status, body)
+            if answer is not None:
+                return answer
+            answered = True
+        wake = started + PROBE_RETRY_SECONDS
+        if wake - first >= PROBE_TOTAL_SECONDS:
+            break
+        delay = wake - seams.clock()
+        if delay > 0:
+            seams.sleep(delay)
+    return PORT_UNAUTHENTICATED if answered else PORT_SILENT
+
+
+class _SecondLaunch(Exception):
+    """The launch ends here with :attr:`status` (R1): nothing is served."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+def _instance_sentences(settings: UISettings) -> Callable[..., str]:
+    """``_t(key, **values)`` over the string table, in the profile's language
+    (the wizard state's, defaulting to English: R2)."""
+
+    table = StringTable.load()
+    try:
+        language = WizardState(settings.base_path).language
+    except WizardStateError:
+        language = None
+    chosen = table.language_or_default(language)
+
+    def _t(key: str, **values: object) -> str:
+        return table.sentence(chosen, key, **values)
+
+    return _t
+
+
+def claim_instance(
+    ui: ConfigUI, seams: InstanceSeams, opener: Callable[[str], object]
+) -> int | None:
+    """Judge the instance record and publish this launch's own (R1).
+
+    Returns ``None`` once this launch's record is published (it may serve),
+    else the exit status of a launch that serves nothing: 0 when a confirmed
+    instance of this version was handed to *opener*, non-zero for every
+    report. Reports come from the string table and carry no access URL,
+    except the two that hand the user the confirmed instance's.
+    """
+
+    settings = ui.settings
+    path = settings.instance_path
+    platform = seams.platform if seams.platform is not None else locations.running_platform()
+    unique = f"{os.getpid()}-{secrets.token_hex(8)}"
+    aside = path.with_name(f".{path.name}.{unique}.stale")
+    _t = _instance_sentences(settings)
+
+    def report(*lines: str, stream: Any = None) -> None:
+        print("\n".join(lines), file=sys.stderr if stream is None else stream, flush=True)
+
+    def unusable() -> int:
+        report(_t("instance.unusable", path=path), _t("instance.unusable.next"))
+        return EXIT_INSTANCE
+
+    def judge(raw: bytes) -> None:
+        """Return when the record is stale; raise :class:`_SecondLaunch`
+        when it names an instance this launch does not replace."""
+
+        record = parse_instance_record(raw, platform)
+        if record is None or not seams.liveness(record.pid):
+            return
+        exists = _t("instance.record_exists", path=path)
+        if not _persists_token(platform):
+            report(
+                exists,
+                _t("instance.unconfirmable", pid=record.pid),
+                _t("instance.unconfirmable.next", port=record.port, pid=record.pid),
+            )
+            raise _SecondLaunch(EXIT_INSTANCE)
+        outcome = _probe_record(record, seams)
+        if isinstance(outcome, tuple):
+            marker, version = outcome
+            if marker != record.marker:
+                return
+            own = locations.product_version()
+            assert record.access_url is not None
+            if version == own:
+                # Standard output, as A3's single print: a print is no log.
+                report(_t("instance.already_running", url=record.access_url), stream=sys.stdout)
+                try:
+                    opener(record.access_url)
+                except Exception:
+                    logger.warning("the browser could not be opened: use the printed access URL")
+                raise _SecondLaunch(0)
+            report(
+                _t("instance.version_mismatch", running=version, own=own),
+                _t("instance.version_mismatch.next", url=record.access_url),
+                stream=sys.stdout,
+            )
+            raise _SecondLaunch(EXIT_INSTANCE)
+        report(
+            exists,
+            _t("instance.port.unauthenticated", port=record.port)
+            if outcome == PORT_UNAUTHENTICATED
+            else _t("instance.port.silent", port=record.port),
+            _t("instance.not_confirmed.cause"),
+            _t("instance.not_confirmed.next", pid=record.pid),
+        )
+        raise _SecondLaunch(EXIT_INSTANCE)
+
+    content = instance_document(ui, platform)
+    try:
+        for _round in range(INSTANCE_MAX_ROUNDS):
+            raw = _read_instance(path)
+            if raw is not None:
+                judge(raw)
+                if _remove_instance_if(path, aside, lambda found: found == raw):
+                    report(_t("instance.stale"))
+                # Removed or put back: read the name again either way.
+                continue
+            if _publish_instance(path, content, unique, seams.publish):
+                return None
+            # Lost the publication: the winner's record is judged next.
+    except _SecondLaunch as ended:
+        return ended.status
+    except OSError:
+        return unusable()
+    return unusable()
+
+
+def release_instance(ui: ConfigUI, platform: str | None = None) -> None:
+    """Remove the instance record on a clean exit, only while it still holds
+    this instance's marker (R1)."""
+
+    platform = platform if platform is not None else locations.running_platform()
+    path = ui.settings.instance_path
+    aside = path.with_name(f".{path.name}.{os.getpid()}-{secrets.token_hex(8)}.exit")
+
+    def ours(raw: bytes) -> bool:
+        record = parse_instance_record(raw, platform)
+        return record is not None and record.marker == ui.instance_marker
+
+    try:
+        _remove_instance_if(path, aside, ours)
+    except OSError:
+        logger.warning("the instance record could not be removed on exit")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -5788,13 +6364,17 @@ def main(
     *,
     opener: Callable[[str], object] | None = None,
     serve: Callable[[ConfigUI, UISettings], None] | None = None,
+    instance: InstanceSeams | None = None,
 ) -> int:
     """Run the configuration UI; return the process exit status.
 
     *opener* receives the access URL once (A3; default ``webbrowser.open``),
     from :attr:`ConfigUI.on_listening` once *serve* is listening, and *serve*
     serves the UI (default: this module's :func:`serve`); both are looked up
-    when called, never captured at import.
+    when called, never captured at import. Before serving, the instance
+    record is judged and this launch's own published (:func:`claim_instance`,
+    over the *instance* seams); a launch that finds an instance it does not
+    replace serves nothing, and a clean exit removes the record (R1).
     """
 
     if opener is None:
@@ -5827,6 +6407,11 @@ def main(
             )
             return 2
     ui = ConfigUI(settings)
+    seams = InstanceSeams() if instance is None else instance
+    ended = claim_instance(ui, seams, opener)
+    if ended is not None:
+        ui.supervisor.close()
+        return ended
     print(f"Configuration UI: {ui.access_url}", flush=True)
     logger.info("configuration UI serving on %s", ui.access_authority)
 
@@ -5842,5 +6427,8 @@ def main(
     try:
         serve(ui, settings)
     finally:
-        ui.supervisor.close()
+        try:
+            ui.supervisor.close()
+        finally:
+            release_instance(ui, seams.platform)
     return 0

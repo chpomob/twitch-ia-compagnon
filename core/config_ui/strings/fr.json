@@ -9,5 +9,18 @@
   "profile.spoken_keyword.name": "Mot-clé parlé",
   "profile.spoken_keyword.description": "Écoute votre micro et répond quand vous prononcez le mot d'éveil.",
   "profile.silent.name": "Silencieux",
-  "profile.silent.description": "Se connecte au chat de votre chaîne mais ne répond jamais : tous les déclencheurs sont désactivés."
+  "profile.silent.description": "Se connecte au chat de votre chaîne mais ne répond jamais : tous les déclencheurs sont désactivés.",
+  "instance.already_running": "Le compagnon tourne déjà pour ce profil ; ouverture : {url}",
+  "instance.version_mismatch": "Une autre version du compagnon tourne déjà pour ce profil : la version {running} tourne, et ce lancement est la version {own}. Rien n'a été ouvert.",
+  "instance.version_mismatch.next": "Fermez la fenêtre du compagnon en cours et relancez, ou ouvrez celui qui tourne à la main à l'adresse {url}",
+  "instance.record_exists": "Un fichier d'instance existe pour ce profil : {path}",
+  "instance.port.unauthenticated": "Son port enregistré {port} répond, mais la vérification avec le jeton d'accès du fichier n'a pas réussi.",
+  "instance.port.silent": "Son port enregistré {port} n'a pas répondu en 10 secondes.",
+  "instance.not_confirmed.cause": "Le compagnon qui a écrit ce fichier est peut-être encore en train de démarrer ou de s'arrêter, ou un autre programme utilise ce port : ce lancement n'a rien démarré.",
+  "instance.not_confirmed.next": "Utilisez la fenêtre du compagnon si elle est ouverte ; sinon attendez et relancez, et si ce rapport se répète, fermez le programme du processus {pid} ou redémarrez l'ordinateur.",
+  "instance.unconfirmable": "Son processus {pid} tourne mais ne répond pas à ce lancement : cette plateforme ne peut pas confirmer qu'il s'agit du compagnon, donc ce lancement n'a rien démarré.",
+  "instance.unconfirmable.next": "Utilisez la fenêtre du compagnon si elle est ouverte, sur 127.0.0.1 port {port} ; sinon fermez le programme du processus {pid} ou redémarrez l'ordinateur.",
+  "instance.stale": "Une instance précédente du compagnon ne s'est pas arrêtée proprement ; son fichier d'instance a été supprimé.",
+  "instance.unusable": "Le fichier d'instance {path} n'a pas pu être lu ou écrit : le compagnon n'a pas démarré.",
+  "instance.unusable.next": "Gardez le profil sur un disque local où vous pouvez écrire, puis relancez."
 }

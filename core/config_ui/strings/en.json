@@ -9,5 +9,18 @@
   "profile.spoken_keyword.name": "Spoken keyword",
   "profile.spoken_keyword.description": "Listens to your microphone and answers when you say the wake word.",
   "profile.silent.name": "Silent",
-  "profile.silent.description": "Connects to your channel's chat but never answers: every trigger is off."
+  "profile.silent.description": "Connects to your channel's chat but never answers: every trigger is off.",
+  "instance.already_running": "The companion is already running for this profile; opening it: {url}",
+  "instance.version_mismatch": "Another version of the companion is already running for this profile: version {running} is running, and this launch is version {own}. Nothing was opened.",
+  "instance.version_mismatch.next": "Close the running companion window and launch again, or open the running one manually at {url}",
+  "instance.record_exists": "An instance record exists for this profile: {path}",
+  "instance.port.unauthenticated": "Its recorded port {port} answers, but the check with the record's access token did not succeed.",
+  "instance.port.silent": "Its recorded port {port} did not answer within 10 seconds.",
+  "instance.not_confirmed.cause": "The companion that wrote the record may still be starting or stopping, or another program now uses that port, so this launch started nothing.",
+  "instance.not_confirmed.next": "Use the companion window if one is open; otherwise wait and launch again, and if this report repeats, close the program holding process {pid} or restart the computer.",
+  "instance.unconfirmable": "Its process {pid} is running but not answering to this launch: this platform cannot confirm that it is the companion, so this launch started nothing.",
+  "instance.unconfirmable.next": "Use the companion window if one is open, on 127.0.0.1 port {port}; otherwise close the program holding process {pid} or restart the computer.",
+  "instance.stale": "An earlier instance of the companion did not stop cleanly; its instance record was removed.",
+  "instance.unusable": "The instance record {path} could not be read or written, so the companion did not start.",
+  "instance.unusable.next": "Keep the profile on a local disk you can write to, then launch again."
 }

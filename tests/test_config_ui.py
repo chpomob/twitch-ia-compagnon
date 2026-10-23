@@ -5057,7 +5057,13 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     ui_log: _Collector,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC35 (R8), with AC2's "the token is in no log record" over the whole capture."""
+    """AC35 (R8), with AC2's "the token is in no log record" over the whole capture.
+
+    Phase 9 R1 (route-set allowlist entry, plan P8): the route set gains the
+    token-authenticated ``/instance``, which the sweep drives (refused without
+    the token, answered with it) and whose JSON answer joins the audited
+    content types; the final exact set is P15's.
+    """
 
     environ = _sweep_environ()
     assert {"TWITCH_BROADCASTER_ID", "TWITCH_CLIENT_SECRET", "OPENAI_API_KEY", "PROXY_PAIRING_TOKEN"} <= set(environ)
@@ -5074,6 +5080,10 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
         sweep.get("/", None, token=ui.token)
         for path in ("/", "/core", f"{MODULE_PAGE_PREFIX}twitch"):
             assert sweep.get(path, None).status == 401
+        assert sweep.get("/instance", None).status == 401
+        assert sweep.get("/instance", None, token="x" * 43).status == 401
+        instance = sweep.get("/instance", None, token=ui.token)
+        assert instance.status == 200 and ui.token.encode("utf-8") not in instance.body
         cookie, csrf = _login(ui)
         tokens += [ui.token, cookie.split("=", 1)[1], csrf]
         pages = _sweep_pages(sweep, cookie)
@@ -5185,10 +5195,17 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
             assert token not in text
     assert len(collected) > 100
 
-    # Every route the UI serves was driven (there is no JSON endpoint: every
-    # route answers HTML or text, and a new one must join this sweep).
-    assert set(ui.routes) == {"/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply"}
-    assert {response.content_type.split(";")[0] for _, response, _ in audited} <= {"text/html", "text/plain"}
+    # Every route the UI serves was driven (the one JSON endpoint is R1's
+    # ``/instance``; every other route answers HTML or text, and a new one
+    # must join this sweep).
+    assert set(ui.routes) == {
+        "/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply", "/instance",
+    }
+    json_answers = [label for label, response, _ in audited if response.content_type == "application/json"]
+    assert json_answers and set(json_answers) == {"GET /instance"}
+    assert {response.content_type.split(";")[0] for _, response, _ in audited} <= {
+        "text/html", "text/plain", "application/json",
+    }
 
     # AC36: no response makes the browser load, run or submit anything from
     # another host.
