@@ -1,0 +1,75 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "R5 permits regeneration only for an unchanged file written by the current wizard pass: \"a file it did write and that is unchanged since is replaced when screen 4 is passed again\". AC28 verifies external changes are preserved: \"If instead the profile is modified on disk by another writer after screen 4 (1 byte appended), re-passing screen 4 refuses, the modified file is byte-identical afterwards, and the cause names the editor as the next action.\""
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "AC21 explicitly requires \"exactly 5 items (one per feed entry: arrived, run started, run completed, rejection, degraded) newest first, i.e. the degraded entry first and the arrived entry last\"."
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "R1 specifies the entry mechanism: \"`--install-launcher` writes the A3 launcher for the running platform (owner-writable, pointing at the running interpreter and module, carrying no token, no secret and no `--config` unless one was given), prints its path and exits without serving; an existing launcher at that path is replaced only if it is one this option wrote (recognisable marker line), otherwise refused.\" The separate installation-scope conflict is N1."
+    },
+    {
+      "id": "S4",
+      "status": "RESOLVED",
+      "evidence": "AC25 now withholds approval \"while \\\"elapsed minutes\\\" does not equal first-run time minus trial start (to the minute, ±1), or while \\\"elapsed minutes\\\" is 15 or more\" and requires ordered timestamps and \"terminal/YAML touched\" equal to \"no\". The narrowed start of that clock is separately assessed in N1."
+    },
+    {
+      "id": "S5",
+      "status": "RESOLVED",
+      "evidence": "AC16 explicitly scopes the prohibition: \"0 of the routes this phase adds (wizard, console, feed, start, stop, revoke, language) accept YAML content; the existing editor's routes are unchanged (AC2).\""
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "N1",
+      "severity": "blocker",
+      "section": "A3b; R8; AC25",
+      "summary": "The specification changes the binding installation criterion by allowing terminal-based installation before the timed trial.",
+      "evidence": "Brief decision 1 requires that the streamer \"installs and gets a first run in under fifteen minutes, without opening a terminal\". A3b instead says, \"That step may be performed by someone other than the streamer before the trial (e.g. the operator)\" and explicitly acknowledges, \"This narrows brief D1\". R8 and AC25 measure from the launcher click, so their gate can pass without satisfying the binding decision."
+    },
+    {
+      "id": "N2",
+      "severity": "blocker",
+      "section": "R5; AC9; brief decision 3",
+      "summary": "The dry-run contract allows wizard success without the recorded run required by the brief.",
+      "evidence": "Brief decision 3 requires that \"the dry run produces one recorded run from a fake event\", and the brief also says \"each profile's dry run is recorded\". AC9 instead requires \"silent with a fake chat message → 0 runs, 1 rejection with its reason, 0 model requests, and the screen reports success\". For channel points and spoken keyword, AC9 specifies only \"1 run\", without the successful completion required explicitly for chat Q&A; R5 merely says \"the outcome is shown\"."
+    },
+    {
+      "id": "N3",
+      "severity": "major",
+      "section": "A2; A7; R5; AC16; AC28",
+      "summary": "Restarting after screen 4 can permanently skip an unfinished or failed wizard.",
+      "evidence": "R5 orders screen 4 so that \"the generated profile and credential file are written\" before \"it passes `--check-config`\", while AC16 expressly exercises a check returning exit 2. A7 ends the pass when \"the UI process exits\" and forbids rerunning the wizard over an existing profile. AC28 confirms, \"A new `ConfigUI` instance over the same directory lands the access URL on the console, not the wizard.\" Consequently, file existence can replace observed check and dry-run success after interruption."
+    },
+    {
+      "id": "N4",
+      "severity": "major",
+      "section": "A3; R1; AC3; AC27; existing UI entry point",
+      "summary": "The behavior of clicking the launcher while the UI is already running is unspecified.",
+      "evidence": "A3 promises, \"Repeat launches go through a per-user OS launcher\", but AC27's \"Running it again replaces the file (1 file afterwards)\" tests repeat installation. The existing UI generates a fresh token with \"self.token = secrets.token_urlsafe(32)\" and binds the configured host and port in `serve`; startup checks do not establish that the port is free. No requirement defines reuse, authenticated navigation, or refusal on a second UI launch, leaving a normal launcher action liable to encounter a port collision and an unusable new access URL."
+    },
+    {
+      "id": "N5",
+      "severity": "major",
+      "section": "R2; R7; AC22",
+      "summary": "Mandatory raw stderr display conflicts with the console's complete bilingual string-table requirement.",
+      "evidence": "R2 says, \"Every user-visible sentence of the wizard, the console, the plain-language causes and next actions, and the four profiles' names and descriptions comes from a string table with one data file per language.\" R7 simultaneously requires that a runtime exiting during startup \"shows its redacted stderr tail and the next action\". The existing `_report_tail` redacts and truncates text but does not translate it, so arbitrary English runtime diagnostics remain a required untranslated console surface."
+    }
+  ],
+  "sound_enough_to_plan_from": false,
+  "summary": "The five challenged clauses now contain explicit corrections. Binding installation and recorded-run decisions still fail to survive, and restart, repeated-launch and bilingual error behavior need resolution. The guard requirements, dependency and socket constraints, identifier sequences, and targeted existing-test adaptations are otherwise retained.",
+  "read_files": [
+    "docs/campaigns/phase9/spec.md",
+    "docs/campaigns/phase9/brief.md",
+    "core/config_ui/__init__.py",
+    "docs/design-v2.md"
+  ]
+}

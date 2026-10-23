@@ -1,0 +1,139 @@
+{
+  "verdict": "APPROVE",
+  "findings": [
+    {
+      "id": "D1",
+      "status": "RESOLVED",
+      "evidence": "A1: \"Each entry is keyed by one of the `${NAME}` references the operator's configuration (the profile) lists under `secrets`, and holds exactly what the environment variable of that name would hold — the real value, where the product already requires one, as the wizard validated it; it is never a resolved profile (no profile content with its references substituted) and never holds anything but those named entries.\" This explicitly permits credential values while excluding resolved profile content."
+    },
+    {
+      "id": "D2",
+      "status": "RESOLVED",
+      "evidence": "A1: \"One credential file per profile, in a per-user directory on every platform.\" This is explicit rather than inferred from the naming convention."
+    },
+    {
+      "id": "D3",
+      "status": "RESOLVED",
+      "evidence": "R1: \"Atomic publication means a serving UI only ever publishes a complete record, so an incomplete one can only be what a crash left behind: it is stale, removed as every stale record is (below), never taken as a serving UI and never a crash of this launch.\" AC31 covers truncated and missing-field records."
+    },
+    {
+      "id": "D4",
+      "status": "RESOLVED",
+      "evidence": "A1: \"The product does not rewrite or inspect ACLs and claims no more than the platform gives; screen 4 says, in plain language (string table), which directory it used and why.\" Windows credentials use the OS-restricted LOCALAPPDATA directory; absence of that usable platform location prevents credential persistence."
+    },
+    {
+      "id": "D5",
+      "status": "RESOLVED",
+      "evidence": "R1: \"A live pid alone never confirms a serving UI: a pid may have been reused by another program, and the liveness test cannot tell.\" Without a persisted token on Windows, no authenticated probe is attempted; a live-pid record remains unconfirmed, is retained, and prevents another server from starting. AC31 asserts that limitation."
+    },
+    {
+      "id": "D6",
+      "status": "RESOLVED",
+      "evidence": "R1: \"When the versions differ, the launch never opens an instance of a different version: the opener is not called, nothing is served, the record is kept byte-identical, and it prints a plain-language report naming both versions (the running one and its own) with the next action from the string table — close the running companion window and launch again, or open the running one manually at the URL the report prints — and exits non-zero.\" AC31 tests this branch."
+    },
+    {
+      "id": "E1",
+      "status": "RESOLVED",
+      "evidence": "A1: \"Where the platform gives no per-user restriction — on Linux or macOS a directory not owned by the user or writable by group or others, on Windows `%LOCALAPPDATA%` unset or not an existing directory — the wizard writes no credential file and no collected value anywhere, and screen 4 says so (string table) and stays closed.\" The preceding directory definition covers Linux, macOS and Windows, including profiles supplied through --config."
+    },
+    {
+      "id": "E2",
+      "status": "RESOLVED",
+      "evidence": "A1: \"The file is named from the profile's file name (its full name, suffix included) and documented: `<profile-file-name>.credentials.json` (`profile.yaml.credentials.json` at the A2 default; the guide names it, AC24), so two profiles in one directory — `a.yaml` and `a.yml` included — never map to one file; it is the file R1's startup collision set, and AC1, name by that path.\" AC11 explicitly requires two distinct files for that collision pair."
+    },
+    {
+      "id": "E3",
+      "status": "RESOLVED",
+      "evidence": "A1: \"Its name has the form of its siblings' (`<base>.wizard.json`, `<base>.instance.json`) but not their place, on purpose: the state file and the instance record carry no secret and belong beside the profile in its directory, while the credential file belongs to one profile yet lives in the one per-user directory every profile shares, because that is where the platform restricts access.\" The different notation and placement are intentional."
+    },
+    {
+      "id": "E4",
+      "status": "RESOLVED",
+      "evidence": "R5 explicitly says \"the generated profile is always written, and the credential file is written where A1 allows it (R4) and never elsewhere — where A1 refuses, screen 4 says so and stays closed\". R4 also states: \"The values the wizard collects are written only to the A1 credential file in the per-user credential directory (mode 0600 on POSIX, the OS-restricted `%LOCALAPPDATA%` on Windows; replaced atomically; never inside the profile or the overlay); where A1 refuses, it is not written and no collected value is written anywhere.\" Profile generation does not authorize fallback secret storage or advancement after refusal."
+    },
+    {
+      "id": "E5",
+      "status": "RESOLVED",
+      "evidence": "R8: \"The phase's fifteen-minute claim — from a working install to a first run in under fifteen minutes, without a terminal and without YAML (Amendment A1) — rests on that record only, and holds only when the elapsed time is under 15 minutes, and only for the platform the record names (a first run on one platform is never claimed from an observation on another).\" AC24 requires guide locations for all three platforms; R8 requires the trial machine's platform and version, and AC25 rejects a record without a named supported platform."
+    },
+    {
+      "id": "S1",
+      "status": "RESOLVED",
+      "evidence": "AC11's cross-directory case is decided and should remain. A1 says: \"Since profiles in different directories may share a file name, the file is read, used and replaced only for the profile whose wizard state file (A7) records its digest; for any other profile it is neither read nor written, and screen 4 refuses with a plain-language cause naming the file by its path.\" AC11's untouched-and-unread assertion implements that decision."
+    },
+    {
+      "id": "S2",
+      "status": "RESOLVED",
+      "evidence": "R1 states: \"The token is persisted only where the specification can guarantee owner-only access.\" Its following justification explicitly scopes that guarantee to POSIX mode 0600 for a record beside an arbitrary profile. The phrase \"cannot be restricted to its owner\" must be read within that specified mechanism, rather than as a general claim that Windows lacks ACLs; the required no-token behavior is unambiguous."
+    },
+    {
+      "id": "S3",
+      "status": "RESOLVED",
+      "evidence": "AC28 now counts \"exactly 1 profile file in the directory and 1 credential file in the per-user credential directory\". It no longer assumes those files occupy the same directory."
+    },
+    {
+      "id": "S4",
+      "status": "RESOLVED",
+      "evidence": "The two Windows folders are an explicit consequence of E1, not a contradiction with the brief. A2 puts the default profile under APPDATA; A1 puts credentials under LOCALAPPDATA and explains their separate placement. The brief specifies neither directory."
+    },
+    {
+      "id": "W1",
+      "status": "RESOLVED",
+      "evidence": "R5 enforces advancement server-side against success recorded for the current inputs and invalidates subsequent screens after a change; AC13 exercises every adjacent screen pair. A7 and AC30 require fresh validation after restart, including another check and dry run; silent explicitly substitutes a not-needed model step with zero requests."
+    },
+    {
+      "id": "W2",
+      "status": "RESOLVED",
+      "evidence": "R3 and AC8 require all four generated profiles to pass check_config with exit 0, zero diagnostics and no sockets. AC9 and AC29 require their dry-run behavior and returned records; silent records a not-triggered outcome with its rejection reason and zero model requests, without inventing an admitted scheduler run."
+    },
+    {
+      "id": "W3",
+      "status": "RESOLVED",
+      "evidence": "R4 covers stored and submitted secrets in every response, form, redirect, link, log, report, stderr tail and feed. R1 separately excludes the access token from pages, probe responses, logs, diagnostics, runtime environment and status records. AC11, AC12, AC31, AC32 and the expanded existing secret-sweep route assertion provide corresponding checks; the authorized access URL print and browser handoff remain explicit exceptions."
+    },
+    {
+      "id": "W4",
+      "status": "RESOLVED",
+      "evidence": "R1 and AC27 specify launcher installation and ownership-marker replacement. R1 and AC31 distinguish authenticated matching marker, another marker, incomplete record, dead pid, bounded failed probes, version mismatch and the Windows limitation; atomic no-replace publication arbitrates competing launches. The instance marker is distinct from the access token, and /instance requires that same access token without creating a session."
+    },
+    {
+      "id": "W5",
+      "status": "RESOLVED",
+      "evidence": "R7 and AC22 route Start and Stop through the existing Supervisor and limit Stop to its own child. A6 and AC23 revoke through the managed overlay and existing supervised restart, preserving the base profile and default-deny authorization; no control widens grants or runtime policy."
+    },
+    {
+      "id": "W6",
+      "status": "RESOLVED",
+      "evidence": "R2 requires all new wizard and console product sentences, causes, next actions and profile descriptions to come from matching English/French tables; AC5 checks keys and placeholders, AC6 verifies a third language by data, and AC20 covers runtime reasons. R7 and AC32 require a translated startup-failure cause and disclosure label; untranslated raw stderr is explicitly quoted data behind a closed disclosure. The existing editor remains outside this migration as the brief requires."
+    },
+    {
+      "id": "W7",
+      "status": "RESOLVED",
+      "evidence": "R8 and AC26 keep runtime dependencies exactly aiohttp and PyYAML and retain the existing socket guard with no new exemptions or process-spawning nodes. Validators, browser opener, instance probe, dry run and supervisor are exercised through fakes; the existing socket-free Check machinery in core/config_ui/__init__.py supplies the relevant implementation precedent."
+    },
+    {
+      "id": "W8",
+      "status": "RESOLVED",
+      "evidence": "The existing test that AC26 forces to change is no longer omitted: targets includes tests/test_profiles.py and explicitly names adaptation of its installed-distribution node. AC26 and the allowlist discussion preserve its 21-manifest assertion and existing A2 exemption while adding byte-identical installed strings/profile checks."
+    },
+    {
+      "id": "W9",
+      "status": "RESOLVED",
+      "evidence": "The new requirements run R1–R8 and acceptance criteria AC1–AC32 without duplicate or missing numbers. A3b is an explicitly named insertion; references to existing AC33 and AC35 concern inherited guards/tests rather than missing new criteria. The brief's Amendment A1 and the spec's credential assumption A1 remain distinguishable by their qualified names."
+    },
+    {
+      "id": "W10",
+      "status": "RESOLVED",
+      "evidence": "The eight brief decisions remain represented: audience and recorded timing, one guarded UI, observed validation, exactly four profiles, existing supervisor, read-only wizard YAML, bilingual data-driven strings, and unchanged dependency/socket constraints. A3b, R8 and AC25 preserve Amendment A1's post-install clock, install method/duration record and Phase 10 boundary. Nothing requires changing the design-v2 contracts for triggering, admission, authorization or confirmed outcomes."
+    }
+  ],
+  "new_findings": [],
+  "sound_enough_to_plan_from": true,
+  "summary": "D1–D6 and E1–E5 are resolved, and the four smaller items leave no planning blocker. The whole-document pass preserves all eight brief decisions and Amendment A1, with explicit Windows limitations and the required existing-test target present. The specification is sound enough to plan from; no files were edited and no tests were run.",
+  "read_files": [
+    "docs/campaigns/phase9/spec.md",
+    "docs/campaigns/phase9/brief.md",
+    "core/config_ui/__init__.py",
+    "docs/design-v2.md"
+  ]
+}

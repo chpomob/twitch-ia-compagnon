@@ -1,0 +1,75 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "A1",
+      "status": "RESOLVED",
+      "evidence": "R8: \"from a working install to a first run in under fifteen minutes, without a terminal and without YAML (Amendment A1)\"; AC25: \"The phase gate refuses an approval whose record omits the install method, the install duration or the elapsed minutes from trial start to first run\". Installation is outside the timed interval and remains visible in the record."
+    },
+    {
+      "id": "A2",
+      "status": "RESOLVED",
+      "evidence": "R5: \"A screen 5 whose dry run does not produce a recorded run cannot be completed\"; AC29: \"for silent the outcome is \"not triggered\" with the rejection's reason token\". AC9 additionally requires \"0 runs, 1 rejection with its reason, 0 model requests\": the silent record honestly documents rejection, without inventing admitted work."
+    },
+    {
+      "id": "A3",
+      "status": "RESOLVED",
+      "evidence": "R1: \"When the base profile does not exist, or the wizard state file says the wizard is unfinished (A7), the access URL's landing is the wizard\". This decides both entry states despite A2's narrower definition of first run; AC30(d) requires \"every wizard route answers without a wizard screen (a redirect to the console)\", making \"never reappears\" decidable."
+    },
+    {
+      "id": "A4",
+      "status": "RESOLVED",
+      "evidence": "AC31: \"a second `main([])` while a first instance's record names a live pid calls `serve` 0 times, calls the opener exactly 1 time with the recorded access URL\"; it also requires \"the opener receives the 8766 URL\" when the requested port differs. The intended second-launch behavior is explicit, although record safety has the additional gaps below."
+    },
+    {
+      "id": "A5",
+      "status": "RESOLVED",
+      "evidence": "R7: \"The cause never quotes the raw detail, and the raw detail never replaces the cause\"; AC32 places the tail \"only inside one disclosure element closed by default\" with \"the credential value replaced by the redaction marker\". The required French cause and next action remain outside that untranslated, optional detail."
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "N1",
+      "severity": "major",
+      "section": "R1 startup checks; A7 wizard state; AC19",
+      "summary": "The new persistent files lack collision rules protecting them from configurable runtime and editor paths.",
+      "evidence": "R1 preserves only \"path canonicalisation, overlay/status collisions\", while AC19 rejects a feed path resolving to \"the base, overlay or status file\". Neither includes the wizard state or instance record: an explicit overlay/status path can alias either new file and overwrite progress or instance ownership; require canonical, file-identity collision checks covering all generated files before writes or serving."
+    },
+    {
+      "id": "N2",
+      "severity": "major",
+      "section": "R1 instance-record lifecycle; AC31",
+      "summary": "Instance recovery is undefined for incomplete records and can mistake a reused live PID for the serving UI.",
+      "evidence": "R1 says a record is \"created exclusively\" and a losing launch \"re-reads the record and behaves as a second launch\", but supplies no outcome for an empty, malformed or incompletely published record. It also trusts \"the liveness test the status record already uses\"; `process_alive` probes unrelated PIDs with `os.kill(pid, 0)`, so PID reuse can reopen a dead instance's URL indefinitely; specify complete publication, bounded recovery and verification of the serving instance's identity."
+    },
+    {
+      "id": "N3",
+      "severity": "minor",
+      "section": "R1 access-token persistence; R4; AC31",
+      "summary": "Acceptable owner-only access-token persistence needs an explicit prohibition on inclusion in runtime status records.",
+      "evidence": "R1 explicitly requires \"owner read/write only on POSIX, created exclusively, removed at clean exit\"; A3 says \"never logs it\", and D2 forbids rendering a secret. However, no sentence explicitly excludes the persisted access URL/token from status records, and R4's secret-set extension concerns collected credentials; add that exclusion and token-specific assertions covering both launches and record-read failures."
+    },
+    {
+      "id": "N4",
+      "severity": "major",
+      "section": "AC26; targets; test migration scope",
+      "summary": "The installed-distribution acceptance check requires an existing test adaptation that the target list omits.",
+      "evidence": "AC26 requires \"its package data ships the 2 string files and the 4 profiles (the installed-distribution test finds them)\" and \"0 new process-spawning nodes\". The listed test targets are only `test_first_run.py`, `test_console.py`, `test_config_ui.py` and `test_docs_bilingual.py`; identify and target the existing installed-distribution test that must gain these assertions while retaining its existing process exemption."
+    },
+    {
+      "id": "N5",
+      "severity": "minor",
+      "section": "READ directive",
+      "summary": "The mandatory brief reference is a nonportable scratch path rather than the authoritative repository document.",
+      "evidence": "\"READ: /home/chpo/.hermes/cache/scratch/adversarial-spec-write-ut7sa__m/brief.md\" cannot reliably lead another reader to the brief carrying Amendment A1. This is a source-traceability problem, rather than merely cosmetic; point it at `docs/campaigns/phase9/brief.md`."
+    }
+  ],
+  "sound_enough_to_plan_from": false,
+  "summary": "All five prior findings are resolved, including honest silent-profile records, unfinished-wizard re-entry and completed-route redirects. The observed-success gates, four checked profiles with recorded dry runs, guarded supervisor controls, bilingual surfaces, dependency and socket limits, all eight brief decisions and Amendment A1 remain specified, with contiguous requirement and acceptance identifiers. Planning should wait for explicit file-collision and instance-recovery rules, the token-status exclusion, the distribution-test target and the authoritative brief reference.",
+  "read_files": [
+    "docs/campaigns/phase9/spec.md",
+    "docs/campaigns/phase9/brief.md",
+    "core/config_ui/__init__.py",
+    "docs/design-v2.md"
+  ]
+}
