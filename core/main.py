@@ -63,7 +63,9 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -84,11 +86,19 @@ from .attachments import AttachmentStore
 from .bus import EventBus
 from .context import ChatContext
 from .contracts import (
+    _INPUT_EVENT_TYPE,
+    EVENT_KIND_DEFAULT,
+    REDACTION_PLACEHOLDER,
+    TRACE_ACTION_COMPLETED,
+    TRACE_ACTION_STARTED,
+    TRACE_CHANNEL_CHAT_SENT,
+    TRACE_EVENT_TYPES,
     TRACE_MODULE_DEGRADED,
     TRACE_MODULE_READY,
     Counters,
     Destination,
     WILDCARD,
+    mask_known,
 )
 from .lifecycle import (
     DEFAULT_CANCEL_GRACE_SECONDS,
@@ -118,12 +128,14 @@ from .loader import (
     resolve_input_ownership,
 )
 from .overlay import (
+    FEED_FILE_VARIABLE,
     STATUS_FILE_VARIABLE,
     OverlayError,
     canonical_digest,
     canonical_overlay_path,
     canonical_path,
     deep_merge,
+    feed_path_collision,
     read_base,
     read_overlay,
     status_path_collision,
@@ -694,6 +706,24 @@ async def run(
             report_diagnostic(collision)
             return 2
 
+    # R6: the feed path, when the variable names one, is refused the same way
+    # and at the same point when it is a configuration file or the status
+    # record, so the feed's rewrites can never replace either.
+    feed_variable = (os.environ if environ is None else environ).get(
+        FEED_FILE_VARIABLE
+    )
+    feed_path: Path | None = None
+    if feed_variable:
+        try:
+            feed_path = canonical_path(feed_variable)
+            collision = _feed_collision(feed_path, config_path, overlay, status_path)
+        except Exception:
+            report_diagnostic("feed_path_collision: feed file could not be checked")
+            return 2
+        if collision is not None:
+            report_diagnostic(collision)
+            return 2
+
     try:
         if status_path:
             unresolved, config = _load_documents(
@@ -716,6 +746,7 @@ async def run(
     owned_stop_event = stop_event is None
     stop = asyncio.Event() if stop_event is None else stop_event
     remove_signal_handlers: Callable[[], None] = lambda: None
+    feed: _FeedPublisher | None = None
 
     if owned_stop_event:
         try:
@@ -732,6 +763,20 @@ async def run(
             return 1
 
         loader: ModuleLoader | None = None
+        if feed_path:
+            # Subscribed before any module is activated, so the startup's
+            # health facts are in the feed. The secrets are read at each
+            # entry: the loader learns the declared credentials only once it
+            # has accepted the enabled modules' settings.
+            feed = _FeedPublisher(
+                feed_path,
+                secrets=lambda: (
+                    *(config.get(SECRETS_KEY) or ()),
+                    *(() if loader is None else loader.redacted_values),
+                ),
+                report=report_diagnostic,
+            )
+            feed.attach(runtime.bus)
         # R4: one finite global startup deadline for the whole startup. It is
         # established here, before the first enabled module is validated or
         # activated, so a validator or an activation hook that never returns
@@ -814,6 +859,9 @@ async def run(
             report_diagnostic("readiness: could not be reported")
             return 1
 
+        if feed:
+            feed.runtime_fact(FEED_RUNTIME_STARTED)
+
         if status_path:
             publisher = _StatusPublisher(
                 status_path,
@@ -834,13 +882,21 @@ async def run(
         except asyncio.CancelledError:
             # Cancellation is not the normal signal path, but embedded callers
             # still receive the same cleanup guarantee before it propagates.
+            if feed:
+                feed.runtime_fact(FEED_RUNTIME_STOPPING)
             await coordinator.stop()
             raise
 
+        if feed:
+            feed.runtime_fact(FEED_RUNTIME_STOPPING)
         report = await coordinator.stop()
         return 1 if report.failures else 0
     finally:
         remove_signal_handlers()
+        if feed:
+            # The last entries, the stopped modules' among them, are written
+            # before this returns.
+            feed.close()
 
 
 def _utc_timestamp() -> str:
@@ -887,6 +943,30 @@ def _status_collision(
     named = base if collision == "base" else overlay_path
     return (
         "status_path_collision: status file collides with the "
+        f"{collision} file {os.fspath(named)}"
+    )
+
+
+def _feed_collision(
+    feed_path: Path,
+    config_path: str | os.PathLike[str],
+    overlay: str | os.PathLike[str] | None,
+    status_path: Path | None,
+) -> str | None:
+    """The diagnostic for a feed path naming a file it must never replace.
+
+    The same paths :func:`_status_collision` compares, plus the status record
+    path this process writes, when it writes one (R6, AC19).
+    """
+
+    base = canonical_path(config_path)
+    overlay_path = _overlay_read_path(config_path, overlay)
+    collision = feed_path_collision(feed_path, base, overlay_path, status_path)
+    if collision is None:
+        return None
+    named = {"base": base, "overlay": overlay_path, "status": status_path}[collision]
+    return (
+        "feed_path_collision: feed file collides with the "
         f"{collision} file {os.fspath(named)}"
     )
 
@@ -1033,6 +1113,263 @@ def _status_handler(
         _publish_status(publisher, report)
 
     return handle
+
+
+#: The two runtime facts the feed records that no bus event carries (R6).
+FEED_RUNTIME_STARTED = "runtime.started"
+FEED_RUNTIME_STOPPING = "runtime.stopping"
+#: The feed's bounds (R6, DD9): retained entries, bytes of one serialised
+#: entry, and characters of a platform event's text excerpt.
+FEED_MAX_ENTRIES = 200
+FEED_MAX_ENTRY_BYTES = 1024
+FEED_EXCERPT_CHARACTERS = 80
+#: How long closing the feed waits for its writer thread's last write.
+FEED_CLOSE_SECONDS = 2.0
+#: The supervision facts the feed subscribes to, besides the platform event:
+#: the whole trace vocabulary but an action starting and a message sent, which
+#: are deliveries in progress rather than facts the console reports (R6).
+_FEED_TRACES = tuple(
+    event_type
+    for event_type in TRACE_EVENT_TYPES
+    if event_type not in (TRACE_ACTION_STARTED, TRACE_CHANNEL_CHAT_SENT)
+)
+#: The payload fields an entry copies from a trace, when present and scalar:
+#: the correlation and reason tokens the console reads, never free text.
+_FEED_FIELDS = (
+    "module",
+    "input",
+    "action",
+    "run_id",
+    "platform",
+    "kind",
+    "status",
+    "reason",
+    "error_code",
+)
+#: Only a refused action is a supervision fact; a completed one is not.
+_FEED_REFUSED = "refused"
+#: Last in every chain: the feed sees the event as published, never reorders
+#: it, and runs after every handler that may stop or replace it.
+_FEED_ORDER = sys.maxsize
+
+
+class _FeedPublisher:
+    """The bounded, redacted supervision feed the console reads (R6, DD9).
+
+    The bus handler only builds an entry and appends it to an in-memory ring
+    of :data:`FEED_MAX_ENTRIES`: it is synchronous, awaits nothing and never
+    raises, so the feed can neither delay nor fail a publication. A
+    dedicated writer thread, off the runtime's event loop, rewrites the whole
+    file from the ring atomically whenever entries were added, one write at
+    a time; a slow or stalled write therefore never holds up the bus. A
+    write failure is reported once, value-free, and later writes are still
+    attempted.
+
+    Every entry is redacted against the runtime's known secrets before it is
+    bounded, so a truncation can never leave a secret's prefix behind: the
+    text excerpt is cut from the redacted text and the serialised entry is
+    cut, on character boundaries, until it fits :data:`FEED_MAX_ENTRY_BYTES`.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        secrets: Callable[[], Sequence[str]],
+        report: Reporter,
+        writer: Callable[[Path, str], None] | None = None,
+        close_timeout: float = FEED_CLOSE_SECONDS,
+    ) -> None:
+        self._path = path
+        self._secrets = secrets
+        self._report = report
+        # Resolved at construction, like the status publisher's writer.
+        self._writer = _write_status_record if writer is None else writer
+        self._close_timeout = close_timeout
+        self._entries: deque[str] = deque(maxlen=FEED_MAX_ENTRIES)
+        self._sequence = 0
+        # Read and written only by the writer thread: the sequence last
+        # written, and the one last attempted, so a failing write is retried
+        # on the next entry rather than in a loop.
+        self._written = 0
+        self._attempted = 0
+        self._failed = False
+        # Guards the ring, the sequence and the closing flag. It is never held
+        # across a write, so the handler waits at most for a snapshot.
+        self._condition = threading.Condition()
+        self._closing = False
+        self._thread: threading.Thread | None = None
+
+    @property
+    def entries(self) -> tuple[str, ...]:
+        """The retained serialised entries, oldest first."""
+
+        with self._condition:
+            return tuple(self._entries)
+
+    def attach(self, bus: Any) -> None:
+        """Subscribe last to every supervision fact and start the writer."""
+
+        bus.subscribe(_INPUT_EVENT_TYPE, self.handle, order=_FEED_ORDER)
+        for event_type in _FEED_TRACES:
+            bus.subscribe(event_type, self.handle, order=_FEED_ORDER)
+        # A daemon: a write stalled past the close's bound cannot keep the
+        # process alive.
+        self._thread = threading.Thread(
+            target=self._write_loop, name="feed-writer", daemon=True
+        )
+        self._thread.start()
+
+    def handle(self, event: Mapping[str, Any]) -> None:
+        """The bus handler: append the event's entry, if it is a fact."""
+
+        try:
+            fields = _feed_fields(event)
+            if fields is not None:
+                self._append(fields)
+        except Exception:
+            return
+
+    def runtime_fact(self, fact: str) -> None:
+        """Append a runtime fact no bus event carries (started, stopping)."""
+
+        try:
+            self._append({"fact": fact})
+        except Exception:
+            return
+
+    def close(self) -> None:
+        """Write what is not written yet, then stop the writer.
+
+        Bounded by the close timeout: a writer still stalled once it has
+        passed is abandoned, reported once, value-free, and left to the
+        daemon thread.
+        """
+
+        thread = self._thread
+        self._thread = None
+        if thread is None:
+            # Never attached: there is no writer thread, so this one writes.
+            self._flush()
+            return
+        with self._condition:
+            self._closing = True
+            self._condition.notify()
+        thread.join(self._close_timeout)
+        if thread.is_alive():
+            self._report("feed: could not be written before shutdown")
+
+    def _append(self, fields: dict[str, Any]) -> None:
+        # Built outside the lock; the sequence advances only once the entry
+        # exists, so an entry that cannot be built leaves no gap and nothing
+        # to write. Every append runs on the event loop's thread.
+        sequence = self._sequence + 1
+        entry = {"seq": sequence, "at": _utc_timestamp(), **fields}
+        bounded = _bounded_feed_entry(entry, tuple(self._secrets()))
+        with self._condition:
+            self._entries.append(bounded)
+            self._sequence = sequence
+            self._condition.notify()
+
+    def _write_loop(self) -> None:
+        while True:
+            with self._condition:
+                while self._attempted == self._sequence and not self._closing:
+                    self._condition.wait()
+                closing = self._closing
+            self._flush()
+            if closing:
+                return
+
+    def _flush(self) -> None:
+        with self._condition:
+            if self._written == self._sequence:
+                return
+            sequence = self._sequence
+            text = "".join(entry + "\n" for entry in self._entries)
+        self._attempted = sequence
+        try:
+            self._writer(self._path, text)
+        except Exception:
+            if not self._failed:
+                self._failed = True
+                self._report("feed: could not be written")
+            return
+        self._written = sequence
+
+
+def _feed_fields(event: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The entry fields of *event*, or ``None`` when it is not a fact."""
+
+    event_type = event.get("type")
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    if event_type == _INPUT_EVENT_TYPE:
+        author = payload.get("author")
+        text = payload.get("text")
+        return {
+            "fact": event_type,
+            "kind": payload.get("kind") or EVENT_KIND_DEFAULT,
+            "platform": payload.get("platform"),
+            "author": author.get("display_name") if isinstance(author, Mapping) else None,
+            "excerpt": text if isinstance(text, str) else None,
+        }
+    if event_type not in _FEED_TRACES:
+        return None
+    if event_type == TRACE_ACTION_COMPLETED and payload.get("status") != _FEED_REFUSED:
+        return None
+    fields: dict[str, Any] = {"fact": event_type}
+    for name in _FEED_FIELDS:
+        value = payload.get(name)
+        if isinstance(value, (str, int, float, bool)):
+            fields[name] = value
+    return fields
+
+
+def _bounded_feed_entry(entry: dict[str, Any], secrets: Sequence[str]) -> str:
+    """*entry* redacted, then bounded, then serialised (R6).
+
+    Every text is masked of every known secret first; only then is the
+    excerpt cut to :data:`FEED_EXCERPT_CHARACTERS` and, while the serialised
+    entry exceeds :data:`FEED_MAX_ENTRY_BYTES`, the longest text halved on
+    character boundaries. An entry that still does not fit keeps only its
+    sequence, time and fact.
+    """
+
+    known = [secret for secret in secrets if isinstance(secret, str) and secret]
+    redacted: dict[str, Any] = {}
+    for key, value in entry.items():
+        if isinstance(value, str) and known:
+            value = mask_known(value, known, marker=REDACTION_PLACEHOLDER)
+        redacted[key] = value
+    excerpt = redacted.get("excerpt")
+    if isinstance(excerpt, str):
+        redacted["excerpt"] = excerpt[:FEED_EXCERPT_CHARACTERS]
+    text = _feed_json(redacted)
+    while len(text.encode("utf-8")) > FEED_MAX_ENTRY_BYTES:
+        longest = max(
+            (key for key, value in redacted.items() if isinstance(value, str) and value),
+            key=lambda key: len(redacted[key]),
+            default=None,
+        )
+        if longest is None or longest in ("at", "fact"):
+            redacted = {
+                "seq": entry["seq"],
+                "at": entry["at"],
+                "fact": redacted.get("fact"),
+                "truncated": True,
+            }
+            return _feed_json(redacted)
+        value = redacted[longest]
+        redacted[longest] = value[: len(value) // 2]
+        redacted["truncated"] = True
+        text = _feed_json(redacted)
+    return text
+
+
+def _feed_json(entry: Mapping[str, Any]) -> str:
+    return json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
 
 
 async def check_config(

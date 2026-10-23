@@ -4,7 +4,8 @@ The operator's base configuration file is never rewritten: edits go to an
 overlay file merged over it. This module is the one implementation of that
 rule, used by ``core.main`` and by the configuration UI alike, so both always
 agree on the overlay path (A1), the merge precedence (R2), the digest of the
-on-disk configuration and the status-path collision check (A5, R7).
+on-disk configuration and the status- and feed-path collision checks (A5, R7,
+R6).
 
 It names no module and imports only the standard library and ``yaml``; in
 particular it never imports ``core.main``, which maps :class:`OverlayError` to
@@ -27,11 +28,14 @@ import yaml
 
 #: Environment variable carrying the status record path (D4, A5).
 STATUS_FILE_VARIABLE = "TWITCH_IA_COMPAGNON_STATUS_FILE"
+#: Environment variable carrying the supervision feed path (R6, DD9).
+FEED_FILE_VARIABLE = "TWITCH_IA_COMPAGNON_FEED_FILE"
 
 _EXAMPLE_SUFFIX = ".example"
 _YAML_SUFFIXES = (".yaml", ".yml")
 _OVERLAY_SUFFIX = ".local.yaml"
 _STATUS_SUFFIX = ".status.json"
+_FEED_SUFFIX = ".feed.jsonl"
 #: Marks, on the walk's stack, the end of one link's target: the link is resolved.
 _LINK_DONE = object()
 
@@ -370,3 +374,32 @@ def default_status_path(base: str | os.PathLike[str]) -> Path:
 
     path = Path(base)
     return path.with_name(path.name + _STATUS_SUFFIX)
+
+
+def feed_path_collision(
+    feed: str | os.PathLike[str],
+    base: str | os.PathLike[str],
+    overlay: str | os.PathLike[str] | None,
+    status: str | os.PathLike[str] | None,
+) -> str | None:
+    """Name the file the feed path resolves to, if any (R6, AC19).
+
+    ``base``, ``overlay`` or ``status``: the feed is rewritten wholesale, so
+    it may never be a configuration file nor the status record. The decision
+    is :func:`same_file` identity, exactly as for the status path.
+    """
+
+    if same_file(feed, base):
+        return "base"
+    if overlay is not None and same_file(feed, overlay):
+        return "overlay"
+    if status is not None and same_file(feed, status):
+        return "status"
+    return None
+
+
+def default_feed_path(base: str | os.PathLike[str]) -> Path:
+    """The base file's full name with ``.feed.jsonl`` appended (DD9)."""
+
+    path = Path(base)
+    return path.with_name(path.name + _FEED_SUFFIX)
