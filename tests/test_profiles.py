@@ -1209,6 +1209,21 @@ def test_installed_distribution_discovers_the_shipped_manifests_and_answers_help
     assert report["manifests"] == sorted(SHIPPED_MANIFESTS), report
     assert len(report["manifests"]) == 21
     assert set(report["manifests"]) == set(MODULE_NAMES)
+    # AC26 (R8): the wizard's string tables and its four ready-made profiles
+    # travel with the ``core.config_ui`` package, byte for byte.
+    shipped = [
+        Path("core", "config_ui", "strings", "en.json"),
+        Path("core", "config_ui", "strings", "fr.json"),
+    ] + [
+        Path("core", "config_ui", "profiles", name)
+        for name in ("channel_points.json", "chat_qa.json", "silent.json", "spoken_keyword.json")
+    ]
+    assert sorted(p.name for p in (ROOT / "core" / "config_ui" / "profiles").iterdir()) == sorted(
+        path.name for path in shipped[2:]
+    )
+    for relative in shipped:
+        assert (target / relative).is_file(), relative
+        assert (target / relative).read_bytes() == (ROOT / relative).read_bytes(), relative
 
     launcher = target / "bin" / CONSOLE_SCRIPT
     assert launcher.is_file(), sorted(str(p.relative_to(target)) for p in target.rglob("*"))

@@ -49,6 +49,11 @@ HMAC), the language choice (AC6, AC7), screen 4's refusals, check and
 read-only view (AC16, AC11's response sweep), the failure pages (AC17),
 regeneration of the wizard's own files (AC28), screen 5's record (AC29) and
 the re-entry after a restart (AC30).
+
+P16 (R8): the package data of the string tables and the profiles, and the
+runtime dependency set, read from ``pyproject.toml`` in process (AC26's
+pyproject half; the installed-distribution node in ``test_profiles.py``
+asserts the shipped bytes).
 """
 
 from __future__ import annotations
@@ -75,6 +80,11 @@ from typing import Any
 
 import pytest
 import yaml
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - the 3.10 floor reads through the backport
+    import tomli as tomllib
 
 import core.config_ui as config_ui
 from conftest import (
@@ -5350,3 +5360,26 @@ def test_ac11_a_variable_in_the_config_path_reloads_the_stored_credentials(
     assert settings.credential_path == store.path.resolve()
     names = [reference[2:-1] for reference in document["secrets"]]
     assert config_ui._stored_credentials(settings) == {name: FIXTURE_CREDENTIALS[name] for name in names}
+
+
+# --------------------------------------------------------------------------- #
+# P16 (R8): the package data and the dependency set (AC26)
+# --------------------------------------------------------------------------- #
+
+
+def test_ac26_pyproject_ships_the_strings_and_profiles_with_two_dependencies() -> None:
+    """AC26 (R8): the runtime dependencies are exactly ``aiohttp`` and
+    ``PyYAML``, and the package data has a ``core.config_ui`` line of exactly
+    ``strings/*.json`` and ``profiles/*``. Read in process; nothing spawned."""
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    names = [
+        re.match(r"[A-Za-z0-9_.-]+", requirement).group(0)
+        for requirement in project["project"]["dependencies"]
+    ]
+    assert names == ["aiohttp", "PyYAML"]
+    package_data = project["tool"]["setuptools"]["package-data"]
+    assert package_data["core.config_ui"] == ["strings/*.json", "profiles/*"]
+    assert any(
+        pattern == "core*" for pattern in project["tool"]["setuptools"]["packages"]["find"]["include"]
+    )

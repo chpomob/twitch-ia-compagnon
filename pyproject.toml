@@ -58,6 +58,8 @@ modules = ["*/module.yaml"]
 "modules.web" = ["module.yaml"]
 "modules.operator" = ["module.yaml"]
 "modules.timer" = ["module.yaml"]
+# The first-run wizard's string tables and ready-made profiles (phase 9, R8).
+"core.config_ui" = ["strings/*.json", "profiles/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
