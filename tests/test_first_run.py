@@ -35,6 +35,11 @@ P10 (R5 screens 2–3, D3): the platform, reward-list and model validators
 (AC14, AC15, AC17's validator half) behind fake transports on the manual
 clock, their failure map swept for traces, class names and submitted values,
 and the production transport against a fake ``aiohttp`` session.
+
+P11 (R5 screen 5, DD6): ``core.main.dry_run`` over each generated profile
+with a fake model answering ``"bonjour"`` (AC9, AC29's record half): the run
+id read back against the scheduler's record and the feed's run entries, the
+platform's sessions inert and never asked anything, no process started.
 """
 
 from __future__ import annotations
@@ -63,8 +68,16 @@ import pytest
 import yaml
 
 import core.config_ui as config_ui
-from conftest import baseline_numstat
+from conftest import (
+    FakeResponse,
+    FakeSession,
+    HeldSession,
+    ManualClock,
+    baseline_numstat,
+    final,
+)
 from core import main as application
+from core.admission import AdmissionScheduler
 from core.config_ui import i18n, launcher, locations, wizard
 from core.config_ui.i18n import StringTable, StringTableError
 from core.config_ui.locations import (
@@ -75,6 +88,7 @@ from core.config_ui.locations import (
     default_profile_path,
     product_version,
 )
+from core.overlay import FEED_FILE_VARIABLE
 from test_agentic_loop import PLATFORM_SCAN_EXEMPT, core_twitch_scan
 from test_youtube import BROAD_SCAN_EXEMPT, broad_core_scan
 
@@ -3807,3 +3821,396 @@ async def test_the_production_transport_maps_client_failures_and_bounds_the_body
         assert SUBMITTED_TOKEN not in str(caught.value)
         assert SUBMITTED_ENDPOINT not in str(caught.value)
         assert caught.value.__cause__ is None
+
+
+# --------------------------------------------------------------------------- #
+# P11 (R5 screen 5, DD6): the dry-run entry and its run record (AC9, AC29)
+# --------------------------------------------------------------------------- #
+
+#: The fake model's one answer (AC9).
+DRY_RUN_ANSWER = "bonjour"
+DRY_RUN_VIEWER = {"id": "viewer-dry-1", "display_name": "Viewer"}
+
+
+def _dry_event(
+    source: str, text: str, *, kind: str | None = None, **extra: Any
+) -> dict[str, Any]:
+    """A schema-2 input event as the input module would publish it."""
+
+    payload: dict[str, Any] = {
+        "platform": "twitch",
+        "channel_id": FIXTURE_IDENTITIES["broadcaster_id"],
+        "author": dict(DRY_RUN_VIEWER),
+        "message_id": f"dry-{secrets.token_hex(4)}",
+        "text": text,
+    }
+    if kind is not None:
+        payload["kind"] = kind
+    payload.update(extra)
+    return {
+        "type": "channel.chat.message",
+        "payload": payload,
+        "metadata": {"source": source, "schema_version": 2},
+    }
+
+
+def _mention() -> dict[str, Any]:
+    return _dry_event("twitch", "Nova, tu es là ?")
+
+
+def _redemption(reward_id: str) -> dict[str, Any]:
+    return _dry_event(
+        "twitch", "Ask", kind="reward", reward={"id": reward_id, "title": "Ask", "cost": 100}
+    )
+
+
+def _speech() -> dict[str, Any]:
+    """The speech candidate after the wake-word decision: the verdict the
+    hooked type reads, and a fake transcript as the text (no process)."""
+
+    event = _dry_event(
+        "audio_input",
+        "hey nova quelle heure est-il",
+        kind="speech",
+        wake_word={"detected": True, "phrase": "hey nova"},
+    )
+    event["payload"]["author"] = {"id": "voice:streamer", "display_name": "streamer"}
+    return event
+
+
+class _Spied:
+    """What a dry run touched: the inert sessions, the scheduler records it
+    read, and every process start attempted."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.sessions: list[Any] = []
+        self.refused: list[str] = []
+        self.records: dict[str, Any] = {}
+        self.processes = 0
+        spied = self
+
+        class Inert(application._InertSession):
+            def __init__(self) -> None:
+                super().__init__()
+                spied.sessions.append(self)
+
+            def __getattr__(self, name: str) -> Any:
+                spied.refused.append(name)
+                return super().__getattr__(name)
+
+        monkeypatch.setattr(application, "_InertSession", Inert)
+        real_record = AdmissionScheduler.run_record
+
+        def run_record(scheduler: Any, run_id: str) -> Any:
+            record = real_record(scheduler, run_id)
+            if record is not None:
+                spied.records[run_id] = record
+            return record
+
+        monkeypatch.setattr(AdmissionScheduler, "run_record", run_record)
+
+        async def no_process(*args: Any, **kwargs: Any) -> Any:
+            spied.processes += 1
+            raise AssertionError("a dry run started a process")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", no_process)
+        monkeypatch.setattr(asyncio, "create_subprocess_shell", no_process)
+
+
+def _feed(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+async def _dry(
+    tmp_path: Path,
+    profile_id: str,
+    event: dict[str, Any],
+    model: FakeSession | None,
+    **kwargs: Any,
+) -> tuple[application.DryRunRecord, list[dict[str, Any]]]:
+    path = _write(tmp_path, profile_id)
+    feed = tmp_path / f"{profile_id}.feed.jsonl"
+    feed.unlink(missing_ok=True)
+    environ = {**_stored_credentials(profile_id), FEED_FILE_VARIABLE: str(feed)}
+    record = await application.dry_run(
+        path,
+        event,
+        environ=environ,
+        model_transport=None if model is None else (lambda: model),
+        **kwargs,
+    )
+    return record, _feed(feed)
+
+
+def _facts(feed: list[dict[str, Any]], fact: str) -> list[dict[str, Any]]:
+    return [entry for entry in feed if entry.get("fact") == fact]
+
+
+def _assert_one_completed_run(
+    record: application.DryRunRecord,
+    feed: list[dict[str, Any]],
+    spied: _Spied,
+    event: dict[str, Any],
+    model: FakeSession,
+) -> None:
+    """AC9 + AC29: one run started and completed with success, its id the
+    scheduler record's and the feed's, the answer held, nothing sent."""
+
+    started = _facts(feed, "brain.run.started")
+    completed = _facts(feed, "brain.run.completed")
+    assert len(started) == 1 and len(completed) == 1, feed
+    assert completed[0]["status"] == "success"
+    assert record.run_id and record.run_id == started[0]["run_id"] == completed[0]["run_id"]
+    assert list(spied.records) == [record.run_id]
+    scheduler_record = spied.records[record.run_id]
+    assert scheduler_record.status == "success" and scheduler_record.reason == "completed"
+    assert (record.outcome, record.reason) == ("completed", "success")
+    assert record.origin == "dry_run"
+    assert dict(record.event) == {
+        "input": event["metadata"]["source"],
+        "kind": event["payload"].get("kind", "message"),
+        "message_id": event["payload"]["message_id"],
+    }
+    assert record.answer == DRY_RUN_ANSWER
+    # 1 model request, 0 messages to the platform: the platform's sessions
+    # are inert and never asked anything, no send is traced.
+    assert len(model.post_calls) == 1
+    assert spied.sessions and all(session.closed for session in spied.sessions)
+    assert spied.refused == []
+    assert _facts(feed, "channel.chat.sent") == []
+    assert spied.processes == 0
+
+
+def _assert_not_triggered(
+    record: application.DryRunRecord,
+    feed: list[dict[str, Any]],
+    spied: _Spied,
+    event: dict[str, Any],
+) -> None:
+    rejected = _facts(feed, "input.trigger.rejected")
+    assert len(rejected) == 1 and rejected[0]["reason"], feed
+    assert _facts(feed, "brain.run.started") == []
+    assert _facts(feed, "brain.admission.accepted") == []
+    assert spied.records == {}
+    assert record.outcome == "not_triggered"
+    assert record.reason == rejected[0]["reason"]
+    assert record.run_id.startswith("dry_run-") and record.origin == "dry_run"
+    assert record.event["message_id"] == event["payload"]["message_id"]
+    assert record.answer is None
+    assert spied.refused == [] and spied.processes == 0
+
+
+def _bonjour() -> FakeSession:
+    return FakeSession(FakeResponse(200, final(DRY_RUN_ANSWER)))
+
+
+async def test_ac9_chat_qa_mention_runs_once_and_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC9, AC29: a chat message mentioning the companion name → exactly 1
+    run started and 1 completed with success, answer ``bonjour`` held by the
+    recording provider, 0 messages to the platform; the run id is the
+    scheduler record's and the feed's."""
+
+    spied = _Spied(monkeypatch)
+    model = _bonjour()
+    event = _mention()
+    record, feed = await _dry(tmp_path, "chat_qa", event, model)
+    _assert_one_completed_run(record, feed, spied, event, model)
+    assert len(_facts(feed, "input.trigger.accepted")) == 1
+
+
+async def test_ac9_chat_qa_without_the_name_is_one_rejection_and_no_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC9: a message not mentioning the name → 0 runs, 1 trigger rejection
+    with its reason, 0 model requests."""
+
+    spied = _Spied(monkeypatch)
+    model = _bonjour()
+    event = _dry_event("twitch", "salut tout le monde")
+    record, feed = await _dry(tmp_path, "chat_qa", event, model)
+    _assert_not_triggered(record, feed, spied, event)
+    assert model.post_calls == []
+
+
+async def test_ac9_channel_points_runs_only_for_the_picked_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC9, AC29: a redemption of the picked reward id → 1 run; another
+    reward id → 0 runs."""
+
+    spied = _Spied(monkeypatch)
+    model = _bonjour()
+    event = _redemption(FIXTURE_PARAMETERS["channel_points"]["reward_id"])
+    record, feed = await _dry(tmp_path, "channel_points", event, model)
+    _assert_one_completed_run(record, feed, spied, event, model)
+
+    spied = _Spied(monkeypatch)
+    model = _bonjour()
+    event = _redemption("another-reward-id")
+    record, feed = await _dry(tmp_path, "channel_points", event, model)
+    _assert_not_triggered(record, feed, spied, event)
+    assert model.post_calls == []
+
+
+async def test_ac9_spoken_keyword_wake_word_runs_once_without_a_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC9, AC29: the speech event carrying the wake word, fed after the
+    wake-word decision through the hooked type with a fake transcript → 1
+    run; no detector, recorder or transcription process is started."""
+
+    spied = _Spied(monkeypatch)
+    model = _bonjour()
+    event = _speech()
+    record, feed = await _dry(tmp_path, "spoken_keyword", event, model)
+    _assert_one_completed_run(record, feed, spied, event, model)
+    accepted = _facts(feed, "input.trigger.accepted")
+    assert [entry.get("input") for entry in accepted] == ["audio_input"]
+
+
+async def test_ac9_silent_records_not_triggered_with_zero_model_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC9, AC29: silent with a chat message (even naming the companion) →
+    0 runs, 1 rejection with its reason, 0 model requests, and a record whose
+    outcome is ``not_triggered`` with the rejection's reason token."""
+
+    spied = _Spied(monkeypatch)
+    model = _bonjour()
+    event = _dry_event("twitch", "Companion, bonjour ?")
+    record, feed = await _dry(tmp_path, "silent", event, model)
+    _assert_not_triggered(record, feed, spied, event)
+    assert model.post_calls == [] and model.probe_calls == []
+    assert record.outcome == _profiles()["silent"].dry_run_outcome
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_ORDER)
+async def test_ac29_each_profile_records_its_expected_outcome(
+    profile_id: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC29 (record half): for each of the 4 profiles the record carries a
+    non-empty run id, the profile's expected outcome and origin
+    ``dry_run`` naming the event it drove."""
+
+    _Spied(monkeypatch)
+    event = {
+        "chat_qa": _mention,
+        "channel_points": lambda: _redemption(FIXTURE_PARAMETERS["channel_points"]["reward_id"]),
+        "spoken_keyword": _speech,
+        "silent": lambda: _dry_event("twitch", "hello"),
+    }[profile_id]()
+    record, _feed_entries = await _dry(tmp_path, profile_id, event, _bonjour())
+    assert record.run_id
+    assert record.outcome == _profiles()[profile_id].dry_run_outcome
+    assert record.origin == application.DRY_RUN_ORIGIN
+    assert record.event["message_id"] == event["payload"]["message_id"]
+
+
+async def test_r5_a_dry_run_past_its_bound_returns_no_record_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5: a model holding its answer holds the run; once the injected
+    clock reaches the bound the dry run raises ``timed_out`` (no record) and
+    the runtime is closed — the inert sessions are closed. The answer is
+    released right after the clock moved, so it may land, but past the
+    bound: it never makes a record (and the brain's own model-call bound is
+    not waited out in real time)."""
+
+    spied = _Spied(monkeypatch)
+    clock = ManualClock()
+    model = HeldSession(FakeResponse(200, final(DRY_RUN_ANSWER)))
+
+    async def advance() -> None:
+        await model.entered.wait()
+        clock.advance(application.DRY_RUN_TIMEOUT_SECONDS)
+        model.release.set()
+
+    advancing = asyncio.ensure_future(advance())
+    with pytest.raises(application.DryRunError) as caught:
+        await _dry(tmp_path, "chat_qa", _mention(), model, clock=clock)
+    await advancing
+    assert caught.value.reason == application.DRY_RUN_TIMED_OUT
+    assert spied.sessions and all(session.closed for session in spied.sessions)
+    assert spied.refused == []
+
+
+async def test_r4_the_held_answer_is_redacted_of_every_known_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: an answer echoing a stored credential reaches the record masked."""
+
+    _Spied(monkeypatch)
+    token = FIXTURE_CREDENTIALS["TWITCH_ACCESS_TOKEN"]
+    model = FakeSession(FakeResponse(200, final(f"bonjour {token}")))
+    record, feed = await _dry(tmp_path, "chat_qa", _mention(), model)
+    assert record.outcome == "completed"
+    assert record.answer is not None and record.answer.startswith("bonjour ")
+    assert token not in record.answer
+    assert all(token not in json.dumps(entry) for entry in feed)
+
+
+@pytest.mark.parametrize(
+    "event",
+    [None, {}, {"type": "other", "payload": {}, "metadata": {}}],
+)
+async def test_r5_a_malformed_event_is_refused_before_anything_runs(
+    event: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spied = _Spied(monkeypatch)
+    with pytest.raises(application.DryRunError) as caught:
+        await _dry(tmp_path, "chat_qa", event, _bonjour())
+    assert caught.value.reason == application.DRY_RUN_INVALID_EVENT
+    assert spied.sessions == []
+
+
+async def test_r6_a_feed_naming_the_status_record_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R6: the feed's rewrites never replace the status record the
+    environment names; the dry run refuses before anything runs."""
+
+    spied = _Spied(monkeypatch)
+    path = _write(tmp_path, "chat_qa")
+    shared = tmp_path / "shared.jsonl"
+    environ = {
+        **_stored_credentials("chat_qa"),
+        FEED_FILE_VARIABLE: str(shared),
+        config_ui.STATUS_FILE_VARIABLE: str(shared),
+    }
+    with pytest.raises(application.DryRunError) as caught:
+        await application.dry_run(path, _mention(), environ=environ)
+    assert caught.value.reason == application.DRY_RUN_FEED_COLLISION
+    assert spied.sessions == []
+    assert not shared.exists()
+
+
+async def test_r5_a_refused_profile_is_no_record(tmp_path: Path) -> None:
+    path = tmp_path / "broken.yaml"
+    path.write_text("modules_directory: [\n", encoding="utf-8")
+    with pytest.raises(application.DryRunError) as caught:
+        await application.dry_run(path, _mention(), environ={})
+    assert caught.value.reason == application.DRY_RUN_CONFIGURATION_REFUSED
+
+
+def test_dd6_the_dry_run_names_no_module() -> None:
+    """DD1/DD6: the dry run identifies the platform module from manifest
+    input ownership and the run owner from its declared consumption; the
+    entry point gains no module name."""
+
+    source = Path(application.__file__).read_text(encoding="utf-8")
+    start = source.index("# The dry run (phase 9 R5 screen 5, DD6)")
+    end = source.index("def main(argv")
+    block = source[start:end]
+    for name in _manifests():
+        assert f'"{name}"' not in block and f"'{name}'" not in block, name
+
+
+def test_dd6_the_command_line_is_unchanged() -> None:
+    """``core.main``'s command line has no dry-run option (P11)."""
+
+    with pytest.raises(SystemExit):
+        application.main(["--config", "x.yaml", "--dry-run"])

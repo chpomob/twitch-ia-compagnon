@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import importlib.util
 import json
@@ -66,8 +67,8 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -78,10 +79,12 @@ from .actions import (
     ANY_ACTION,
     ANY_PRINCIPAL,
     ActionExecutor,
+    ActionInvocation,
     ActionRegistry,
     AuthorizationPolicy,
     AuthorizationRule,
 )
+from .admission import REASON_COMPLETED, RUN_LIFECYCLE_TRACES
 from .attachments import AttachmentStore
 from .bus import EventBus
 from .context import ChatContext
@@ -93,8 +96,12 @@ from .contracts import (
     TRACE_ACTION_STARTED,
     TRACE_CHANNEL_CHAT_SENT,
     TRACE_EVENT_TYPES,
+    TRACE_INPUT_TRIGGER_ACCEPTED,
+    TRACE_INPUT_TRIGGER_REJECTED,
     TRACE_MODULE_DEGRADED,
     TRACE_MODULE_READY,
+    ActionCall,
+    ActionObservation,
     Counters,
     Destination,
     WILDCARD,
@@ -106,6 +113,7 @@ from .lifecycle import (
     DEFAULT_HOOK_TIMEOUT_SECONDS,
     DEFAULT_SHUTDOWN_DEADLINE_SECONDS,
     DEFAULT_STARTUP_DEADLINE_SECONDS,
+    ROLE_INPUT,
     PhaseCoordinator,
     ProcessWatchdog,
     SupervisedTasks,
@@ -147,7 +155,13 @@ from .runtime import (
     ServiceRegistry,
     Supervision,
 )
-from .triggers import TriggerEngine, TriggerRegistry
+from .triggers import (
+    TriggerContext,
+    TriggerEngine,
+    TriggerRegistry,
+    TrustedClaim,
+    decision_trace_payload,
+)
 
 
 class ConfigurationError(RuntimeError):
@@ -1514,6 +1528,564 @@ async def _validate_enabled(
     return []
 
 
+# --------------------------------------------------------------------------- #
+# The dry run (phase 9 R5 screen 5, DD6)
+# --------------------------------------------------------------------------- #
+
+#: The origin every dry-run record carries (R5).
+DRY_RUN_ORIGIN = "dry_run"
+#: The dry run's own bound, in seconds, on the injected clock (R5).
+DRY_RUN_TIMEOUT_SECONDS = 60.0
+#: The outcome of a dry run whose fake event the trigger rejected (R5, A4).
+DRY_RUN_NOT_TRIGGERED = "not_triggered"
+#: The outcome of a dry run whose triggered run completed with a success.
+DRY_RUN_COMPLETED = "completed"
+#: The value-free reasons a dry run produced no record.
+DRY_RUN_CONFIGURATION_REFUSED = "configuration_refused"
+DRY_RUN_FEED_COLLISION = "feed_path_collision"
+DRY_RUN_INVALID_EVENT = "invalid_event"
+DRY_RUN_STARTUP_FAILED = "startup_failed"
+DRY_RUN_EVALUATION_FAILED = "evaluation_failed"
+DRY_RUN_NO_RECORD = "no_record"
+DRY_RUN_TIMED_OUT = "timed_out"
+
+#: The network seam a module may accept among its private settings (DD6).
+_SESSION_SEAM = "_session_factory"
+#: The family whose owner is the platform module of the fake event (DD6).
+_PLATFORM_FAMILY = "chat"
+#: The service key under which the run owner publishes its scheduler: the
+#: one producers that admit their own work resolve (``(admission, runs)``).
+_ADMISSION_SERVICE = ("admission", "runs")
+#: The provider name every recording binding carries.
+_RECORDING_PROVIDER = "dry_run.recording"
+#: The status a run that completed with no error carries.
+_SUCCESS = "success"
+#: How often, in real seconds, the dry run looks at the injected clock.
+_DRY_RUN_LOOK_SECONDS = 0.05
+
+
+class DryRunError(RuntimeError):
+    """The dry run produced no record; ``reason`` is a value-free token."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"dry run: {reason}")
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class DryRunRecord:
+    """The run record one dry run returns (R5 screen 5, AC29).
+
+    ``run_id`` is the run the admission scheduler recorded for the fake event
+    when the trigger accepted it; when it rejected it, it is an identifier
+    minted for this dry run, so the record still names one run that never
+    started. ``outcome`` is :data:`DRY_RUN_COMPLETED` for a run the scheduler
+    recorded as completed with a success, else the record's terminal status
+    (or its reason when the run did not complete); for a rejection it is
+    :data:`DRY_RUN_NOT_TRIGGERED` and ``reason`` is the rejection's token.
+    For a run, ``reason`` is the scheduler record's status. ``origin`` is
+    always :data:`DRY_RUN_ORIGIN` and ``event`` names the fake event driven:
+    its input, kind and source event id. ``answer`` is the delivery text the
+    recording provider held instead of sending it, when there was one.
+    """
+
+    run_id: str
+    outcome: str
+    reason: str
+    origin: str
+    event: Mapping[str, str]
+    answer: str | None = None
+
+
+class _InertSession:
+    """A socket-free stand-in for a module's network session (DD6).
+
+    It opens nothing and answers nothing: every request method refuses, and
+    ``close`` is the only call that succeeds. A dry run never prepares the
+    platform module's transport, so nothing should ever reach one.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise ConnectionRefusedError("dry run: no transport")
+
+        return refuse
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _RecordingProvider:
+    """Bound in place of each action the platform module provides (DD6).
+
+    It holds every call it is handed and sends nothing: the observation is a
+    success whose result is the least value the action's declared
+    ``result_schema`` accepts (:func:`_recorded_value`), so the executor
+    validates it as it would a provider's, and 0 messages reach a channel.
+    """
+
+    name = _RECORDING_PROVIDER
+
+    def __init__(self) -> None:
+        self.calls: list[ActionCall] = []
+
+    async def invoke(self, invocation: ActionInvocation) -> ActionObservation:
+        call = invocation.call
+        self.calls.append(call)
+        result = _recorded_value(invocation.spec.result_schema, call.destination)
+        return ActionObservation(
+            status=_SUCCESS,
+            provenance={"provider": _RECORDING_PROVIDER, "recorded": True},
+            result=result if isinstance(result, Mapping) else {},
+        )
+
+    def answer(self, registry: ActionRegistry, run_id: str) -> str | None:
+        """The delivery text the run proposed, read by the action's own
+        declared ``text_argument``."""
+
+        specs = registry.discovered()
+        for call in reversed(self.calls):
+            spec = specs.get(call.action_name)
+            delivery = getattr(spec, "delivery", None)
+            argument = delivery.get("text_argument") if delivery else None
+            if call.run_id == run_id and isinstance(argument, str):
+                text = call.arguments.get(argument)
+                if isinstance(text, str):
+                    return text
+        return None
+
+
+class _DryRunHandle:
+    """An activated handle as the dry run drives it (DD6).
+
+    No input produces during a dry run — the fake event is the only one — so
+    ``start_inputs`` is a no-op for every input module. The platform module
+    is not prepared either: its ``prepare`` would authenticate over its
+    transport, so the recording providers are bound and the module marked
+    ready in its place. Every other hook is the module's own.
+    """
+
+    def __init__(self, handle: Any, prepare: Callable[[], Awaitable[None]] | None) -> None:
+        self._handle = handle
+        self._prepare = prepare
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "prepare" and self._prepare is not None:
+            return self._prepare
+        if name == "start_inputs":
+            return self._start_inputs
+        return getattr(self._handle, name)
+
+    async def _start_inputs(self) -> None:
+        return None
+
+
+async def dry_run(
+    config_path: str | os.PathLike[str],
+    event: Mapping[str, Any],
+    *,
+    environ: Mapping[str, str] | None,
+    model_transport: Callable[[], Any] | None = None,
+    clock: Callable[[], float] | None = None,
+    timeout: float = DRY_RUN_TIMEOUT_SECONDS,
+) -> DryRunRecord:
+    """Drive one fake *event* through the profile with fake platform edges (DD6).
+
+    The profile is loaded and validated exactly as :func:`check_config` does
+    and the runtime assembled with :func:`_assemble_runtime`. Every enabled
+    module is activated; each whose own settings hook accepts the
+    ``_session_factory`` seam is handed an inert, socket-free session — the
+    module consuming the platform's input events (the run owner) the
+    injected *model_transport* instead, or its own real transport when none
+    is injected. The platform module — the owner of the event's (``chat``,
+    platform) pair, read from the manifests — is not prepared: a recording
+    provider is bound in place of each action its manifest declares. No
+    input module starts producing.
+
+    *event* is a schema-version-2 input event (``type``, ``payload``,
+    ``metadata``). It is decided by the context's trigger engine under the
+    profile's resolved policy, the decision traced as the input would trace
+    it; when accepted it is published, so the run owner's scheduler records a
+    run, and the record's run id and outcome are that run's. When rejected
+    the record says :data:`DRY_RUN_NOT_TRIGGERED` with the rejection's
+    reason and no model request is made.
+
+    Bounded by *timeout* on *clock* (the runtime's clock when omitted); the
+    runtime is always closed. Raises :class:`DryRunError` with a value-free
+    reason when no record could be produced.
+    """
+
+    environment = os.environ if environ is None else environ
+    if not isinstance(event, Mapping):
+        raise DryRunError(DRY_RUN_INVALID_EVENT)
+    payload = event.get("payload")
+    metadata = event.get("metadata")
+    if (
+        event.get("type") != _INPUT_EVENT_TYPE
+        or not isinstance(payload, Mapping)
+        or not isinstance(metadata, Mapping)
+        or not _is_text(payload.get("platform"))
+        or not _is_text(payload.get("message_id"))
+    ):
+        raise DryRunError(DRY_RUN_INVALID_EVENT)
+
+    # The feed is refused when it names a configuration file or the status
+    # record the environment names, so its rewrites never replace either (R6).
+    feed_variable = environment.get(FEED_FILE_VARIABLE)
+    status_variable = environment.get(STATUS_FILE_VARIABLE)
+    feed_path: Path | None = None
+    if feed_variable:
+        try:
+            feed_path = canonical_path(feed_variable)
+            status_path = canonical_path(status_variable) if status_variable else None
+            collision = _feed_collision(feed_path, config_path, None, status_path)
+        except Exception:
+            raise DryRunError(DRY_RUN_FEED_COLLISION) from None
+        if collision is not None:
+            raise DryRunError(DRY_RUN_FEED_COLLISION)
+
+    try:
+        config = load_config(config_path, environ=environ)
+    except Exception:
+        raise DryRunError(DRY_RUN_CONFIGURATION_REFUSED) from None
+    try:
+        runtime = _assemble_runtime(config)
+    except Exception:
+        raise DryRunError(DRY_RUN_STARTUP_FAILED) from None
+    bound_clock = runtime.clock if clock is None else clock
+    started = bound_clock()
+
+    loader = ModuleLoader(runtime.bus, config["modules_directory"])
+    loader.context = runtime.context
+    loader.environ = environment
+    loader.clock = runtime.clock
+    loader.late_reporter = _discard
+    _seam_sessions(loader, model_transport)
+
+    feed: _FeedPublisher | None = None
+    if feed_path:
+        feed = _FeedPublisher(
+            feed_path,
+            secrets=lambda: (
+                *(config.get(SECRETS_KEY) or ()),
+                *loader.redacted_values,
+            ),
+            report=_discard,
+        )
+        feed.attach(runtime.bus)
+
+    # The coordinator the body builds, held here so the runtime is closed
+    # whatever ends the body: an answer, a failure or the bound.
+    driving: dict[str, PhaseCoordinator] = {}
+    recorder = _RecordingProvider()
+    body = asyncio.ensure_future(
+        _drive_dry_run(runtime, loader, config, event, recorder, driving)
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        real_deadline = loop.time() + timeout
+        # The bound holds on both clocks: the injected one, looked at while
+        # the run is pending, and the loop's, so a real stall ends too.
+        while not body.done():
+            remaining = real_deadline - loop.time()
+            if remaining <= 0 or bound_clock() - started >= timeout:
+                body.cancel()
+                with contextlib.suppress(BaseException):
+                    await body
+                raise DryRunError(DRY_RUN_TIMED_OUT)
+            await asyncio.wait({body}, timeout=min(_DRY_RUN_LOOK_SECONDS, remaining))
+        record = body.result()
+        if bound_clock() - started >= timeout:
+            raise DryRunError(DRY_RUN_TIMED_OUT)
+        return record
+    except DryRunError:
+        raise
+    except asyncio.CancelledError:
+        # The body's cancellation is awaited before the handles are collected
+        # below, so an activation the loader keeps while cancelling is closed.
+        body.cancel()
+        with contextlib.suppress(BaseException):
+            await body
+        raise
+    except Exception:
+        raise DryRunError(DRY_RUN_NO_RECORD) from None
+    finally:
+        coordinator = driving.get("coordinator") or _coordinator(
+            list(getattr(loader, "activations", None) or ()),
+            runtime,
+            _discard,
+            drain_deadline_seconds=0.0,
+        )
+        try:
+            await coordinator.stop()
+            await _late_diagnostics(
+                loader, deadline_at=runtime.clock() + _SHUTDOWN_DEADLINE_SECONDS
+            )
+        finally:
+            if feed:
+                feed.close()
+
+
+async def _drive_dry_run(
+    runtime: _Runtime,
+    loader: ModuleLoader,
+    config: Mapping[str, Any],
+    event: Mapping[str, Any],
+    recorder: _RecordingProvider,
+    driving: dict[str, PhaseCoordinator],
+) -> DryRunRecord:
+    """Activate, start, decide, publish and read the run record (DD6)."""
+
+    try:
+        activations = await loader.activate_enabled(
+            config, deadline_at=runtime.clock() + _STARTUP_DEADLINE_SECONDS
+        )
+    except Exception:
+        raise DryRunError(DRY_RUN_STARTUP_FAILED) from None
+
+    payload = event["payload"]
+    platform_module = loader.input_ownership.owner(_PLATFORM_FAMILY, payload["platform"])
+    registry = runtime.context.actions
+
+    def recording_prepare(name: str, manifest: Mapping[str, Any]) -> Callable[[], Awaitable[None]]:
+        async def prepare() -> None:
+            declared = registry.discovered()
+            for entry in manifest.get("actions") or ():
+                action = entry.get("name") if isinstance(entry, Mapping) else None
+                if action in declared:
+                    registry.bind(
+                        action, recorder, module=name, provider_name=_RECORDING_PROVIDER
+                    )
+            registry.mark_ready(name)
+
+        return prepare
+
+    driven = []
+    for activation in activations:
+        prepare = None
+        if activation.name == platform_module:
+            prepare = recording_prepare(activation.name, activation.manifest)
+        elif ROLE_INPUT not in (activation.roles or ()):
+            driven.append(activation)
+            continue
+        driven.append(
+            replace(activation, handle=_DryRunHandle(activation.handle, prepare))
+        )
+    coordinator = _coordinator(driven, runtime, _discard, drain_deadline_seconds=0.0)
+    # The caller stops this coordinator, whatever happens from here on.
+    driving["coordinator"] = coordinator
+    startup = await coordinator.start(
+        deadline_at=runtime.clock() + _STARTUP_DEADLINE_SECONDS
+    )
+    if startup.status != 0:
+        raise DryRunError(DRY_RUN_STARTUP_FAILED)
+
+    message_id = payload["message_id"]
+    named = MappingProxyType(
+        {
+            "input": str(event["metadata"].get("source")),
+            "kind": str(payload.get("kind") or EVENT_KIND_DEFAULT),
+            "message_id": message_id,
+        }
+    )
+    engine = runtime.context.triggers
+    if engine is None:
+        raise DryRunError(DRY_RUN_EVALUATION_FAILED)
+    try:
+        decision = await engine.evaluate_async(
+            event, context=TriggerContext(_attested_claims(payload.get("author")))
+        )
+    except Exception:
+        raise DryRunError(DRY_RUN_EVALUATION_FAILED) from None
+    if decision.traceable:
+        await runtime.context.supervision.emit(
+            TRACE_INPUT_TRIGGER_ACCEPTED if decision.accepted else TRACE_INPUT_TRIGGER_REJECTED,
+            decision_trace_payload(decision),
+        )
+    if not decision.accepted:
+        return DryRunRecord(
+            run_id=f"{DRY_RUN_ORIGIN}-{os.urandom(8).hex()}",
+            outcome=DRY_RUN_NOT_TRIGGERED,
+            reason=decision.reason,
+            origin=DRY_RUN_ORIGIN,
+            event=named,
+        )
+
+    # Subscribed before the publication to the scheduler's run lifecycle:
+    # the run started for this source event names its run id, and the
+    # scheduler writes that run's record before its completion is traced.
+    # An event nothing runs is waited for until the bound: no record.
+    runs: dict[str, str] = {}
+    completed = asyncio.Event()
+
+    def on_lifecycle(trace: Mapping[str, Any]) -> None:
+        traced = trace.get("payload")
+        if not isinstance(traced, Mapping) or not _is_text(traced.get("run_id")):
+            return
+        if traced.get("source_event_id") == message_id:
+            runs.setdefault("run_id", traced["run_id"])
+        if traced["run_id"] == runs.get("run_id") and "status" in traced:
+            completed.set()
+
+    for trace_type in sorted(RUN_LIFECYCLE_TRACES):
+        runtime.bus.subscribe(trace_type, on_lifecycle)
+    await runtime.bus.publish(_INPUT_EVENT_TYPE, payload, event["metadata"])
+    await completed.wait()
+    run_id = runs["run_id"]
+    scheduler = runtime.context.services.resolve(*_ADMISSION_SERVICE)
+    record = scheduler.run_record(run_id) if scheduler is not None else None
+    if record is None:
+        raise DryRunError(DRY_RUN_NO_RECORD)
+    if record.reason == REASON_COMPLETED and record.status == _SUCCESS:
+        outcome = DRY_RUN_COMPLETED
+    elif record.reason == REASON_COMPLETED:
+        outcome = record.status
+    else:
+        outcome = record.reason
+    return DryRunRecord(
+        run_id=record.run_id,
+        outcome=outcome,
+        reason=record.status,
+        origin=DRY_RUN_ORIGIN,
+        event=named,
+        answer=_redacted_answer(recorder.answer(registry, record.run_id), config, loader),
+    )
+
+
+def _seam_sessions(loader: ModuleLoader, model_transport: Callable[[], Any] | None) -> None:
+    """Hand each module that accepts it a ``_session_factory`` seam (DD6).
+
+    Whether a module accepts the seam is its own settings hook's word: the
+    settings are validated with the seam first and, when refused, validated
+    again as configured, so a module without the seam keeps exactly its own
+    diagnostics. The module consuming the platform input events — the run
+    owner — receives *model_transport* (or nothing: its real transport);
+    every other one an inert session.
+    """
+
+    validate = loader._validate_settings
+    activate = loader._activate
+    seamed: dict[str, Callable[[], Any]] = {}
+
+    def factory_for(name: str) -> Callable[[], Any] | None:
+        discovered = getattr(loader, "discovered", {}) or {}
+        manifest = discovered[name].manifest if name in discovered else {}
+        if _INPUT_EVENT_TYPE in (manifest.get("consumes") or ()):
+            return model_transport
+        return _InertSession
+
+    async def validate_with_seam(
+        name: str, declaration: Any, entry_point: Any, settings: Any
+    ) -> list[str]:
+        factory = factory_for(name)
+        if factory is not None and isinstance(settings, Mapping):
+            seamed_settings = {**settings, _SESSION_SEAM: factory}
+            if not await validate(name, declaration, entry_point, seamed_settings):
+                seamed[name] = factory
+                return []
+        return await validate(name, declaration, entry_point, settings)
+
+    async def activate_with_seam(
+        name: str,
+        declaration: Any,
+        activate_hook: Any,
+        settings: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+    ) -> Any:
+        if name in seamed:
+            settings = {**settings, _SESSION_SEAM: seamed[name]}
+        return await activate(name, declaration, activate_hook, settings, manifest)
+
+    loader._validate_settings = validate_with_seam  # type: ignore[method-assign]
+    loader._activate = activate_with_seam  # type: ignore[method-assign]
+
+
+def _redacted_answer(
+    answer: str | None, config: Mapping[str, Any], loader: ModuleLoader
+) -> str | None:
+    """*answer* masked of every known secret, as every trace is (R4)."""
+
+    if answer is None:
+        return None
+    known = [
+        secret
+        for secret in (*(config.get(SECRETS_KEY) or ()), *loader.redacted_values)
+        if isinstance(secret, str) and secret
+    ]
+    return mask_known(answer, known, marker=REDACTION_PLACEHOLDER) if known else answer
+
+
+def _recorded_value(schema: Any, destination: Destination, name: str | None = None) -> Any:
+    """The least value *schema* accepts, for a call that was only recorded.
+
+    Read from the core schema subset alone: a ``default`` or the first
+    ``enum`` entry when there is one; an object holds its required
+    properties; a string named after a :class:`Destination` field is the
+    call's own destination's, any other string the recording provider's
+    name, cut or padded to its length bounds; a number its minimum or 0.
+    """
+
+    if not isinstance(schema, Mapping):
+        return None
+    if "default" in schema:
+        return copy.deepcopy(schema["default"])
+    if isinstance(schema.get("enum"), (list, tuple)) and schema["enum"]:
+        return copy.deepcopy(schema["enum"][0])
+    kind = schema.get("type")
+    if isinstance(kind, (list, tuple)):
+        kind = next((entry for entry in kind if entry != "null"), "null")
+    if kind == "object":
+        properties = schema.get("properties") or {}
+        return {
+            key: _recorded_value(properties.get(key, {}), destination, key)
+            for key in schema.get("required") or ()
+            if isinstance(key, str)
+        }
+    if kind == "array":
+        return []
+    if kind == "string":
+        value = getattr(destination, name, None) if name in ("platform", "channel_id", "scope") else None
+        text = value if isinstance(value, str) and value else _RECORDING_PROVIDER
+        maximum = schema.get("maxLength")
+        if isinstance(maximum, int):
+            text = text[:maximum]
+        minimum = schema.get("minLength")
+        if isinstance(minimum, int):
+            text = text.ljust(minimum, "_")
+        return text
+    if kind in ("integer", "number"):
+        minimum = schema.get("minimum")
+        return minimum if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) else 0
+    if kind == "boolean":
+        return False
+    return None
+
+
+def _attested_claims(author: Any) -> tuple[TrustedClaim, ...]:
+    """The author's roles as provenance-tagged claims, as the event carries
+    them; none without a provenance."""
+
+    if not isinstance(author, Mapping):
+        return ()
+    roles = author.get("roles")
+    provenance = author.get("roles_provenance")
+    if not _is_text(provenance) or not isinstance(roles, (list, tuple)):
+        return ()
+    return tuple(TrustedClaim(role, provenance=provenance) for role in roles if _is_text(role))
+
+
+def _discard(message: str) -> None:
+    """The dry run reports nothing: its record is its whole answer."""
+
+    del message
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Execute the application behind a hard process shutdown deadline.
 
@@ -1717,12 +2289,17 @@ def _coordinator(
     activations: Sequence[ModuleActivation],
     runtime: _Runtime,
     reporter: Reporter,
+    *,
+    drain_deadline_seconds: float = _DRAIN_DEADLINE_SECONDS,
 ) -> PhaseCoordinator:
     """The coordinator driving *activations*, each on the route it declared.
 
     The coordinator reports every diagnostic through *reporter* as it happens,
     so a caller only reads the status of the report it returns. One global
     startup deadline and one global shutdown deadline cover both routes.
+    A dry run, whose record is read before it stops, drains nothing
+    (*drain_deadline_seconds* 0): a run still in flight then has outlived the
+    dry run's bound and is ended ``cancelled`` at close.
     """
 
     versioned, legacy = _split_routes(activations)
@@ -1732,7 +2309,7 @@ def _coordinator(
         startup_deadline_seconds=_STARTUP_DEADLINE_SECONDS,
         shutdown_deadline_seconds=_SHUTDOWN_DEADLINE_SECONDS,
         hook_timeout_seconds=_CLOSE_TIMEOUT_SECONDS,
-        drain_deadline_seconds=_DRAIN_DEADLINE_SECONDS,
+        drain_deadline_seconds=drain_deadline_seconds,
         cancel_grace_seconds=_CANCEL_TIMEOUT_SECONDS,
         clock=runtime.clock,
         tasks=runtime.tasks,
