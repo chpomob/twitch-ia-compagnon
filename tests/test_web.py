@@ -1697,27 +1697,92 @@ def test_p3f1_a_start_tag_longer_than_a_feed_is_read_by_its_name() -> None:
     ],
     ids=["unquoted-attributes", "quoted-attributes"],
 )
-def test_p3f1_one_huge_construct_still_reaches_the_deadline(body: bytes) -> None:
+def test_p3f1_one_huge_construct_still_reaches_the_deadline(
+    body: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Fix round: one 8 MB start tag of millions of attributes is a single
     construct the parser buffers across feeds. The
     walk still stops soon after its deadline expires — not after parsing
     every attribute — and without it the whole page takes a few seconds,
-    not the quadratic re-reads of one growing buffer."""
+    not the quadratic re-reads of one growing buffer.
+
+    P19F1: the deadline expires on its first read made while the parser
+    walks the construct, not after a wall-clock budget a fast interpreter
+    never reaches; the abandoned walk is measured against the whole one."""
 
     import modules.web as web
 
     start = time.monotonic()
     assert extract_text(body, "text/html").text == "x"
-    assert time.monotonic() - start < 6
+    whole = time.monotonic() - start
+    assert whole < 6
 
-    deadline = time.monotonic() + 0.2
-    token = web._EXTRACTION_EXPIRED.set(lambda: time.monotonic() >= deadline)
+    walking = [False]
+    goahead = web._TextParser.goahead
+
+    def walked(self: Any, end: Any) -> Any:
+        walking[0] = True
+        try:
+            return goahead(self, end)
+        finally:
+            walking[0] = False
+
+    monkeypatch.setattr(web._TextParser, "goahead", walked)
+    reads: list[bool] = []
+
+    def expired() -> bool:
+        reads.append(walking[0])
+        return walking[0]
+
+    token = web._EXTRACTION_EXPIRED.set(expired)
+    start = time.monotonic()
     try:
         with pytest.raises(web.ExtractionAbandoned):
             extract_text(body, "text/html")
     finally:
         web._EXTRACTION_EXPIRED.reset(token)
-    assert time.monotonic() - deadline < 0.8
+    abandoned = time.monotonic() - start
+    assert reads.count(True) == 1 and reads[-1] is True, reads
+    assert abandoned < whole / 4, (abandoned, whole)
+
+
+class ExpiresOnRead:
+    """A deadline that expires on its *at*-th read and counts its reads:
+    where the walk stopped does not depend on how fast the machine is."""
+
+    def __init__(self, at: int) -> None:
+        self.at = at
+        self.reads = 0
+
+    def __call__(self) -> bool:
+        self.reads += 1
+        return self.reads >= self.at
+
+
+def hold_the_walk_past_its_deadline(monkeypatch: pytest.MonkeyPatch, after: int = 1000) -> None:
+    """Hold a worker thread's walk at its *after*-th deadline check until
+    the deadline it runs under has expired, then let the check run: the
+    walk outlasts the call's real-clock bound however fast the machine,
+    and the check it was held at — inside the walk — is the one that
+    must abandon it."""
+
+    import modules.web as web
+
+    check = web._check_deadline
+    main = threading.get_ident()
+    checks = [0]
+
+    def held() -> None:
+        if threading.get_ident() != main:
+            checks[0] += 1
+            expired = web._EXTRACTION_EXPIRED.get()
+            if checks[0] == after and expired is not None:
+                limit = time.monotonic() + 5
+                while not expired() and time.monotonic() < limit:
+                    threading.Event().wait(0.01)
+        check()
+
+    monkeypatch.setattr(web, "_check_deadline", held)
 
 
 def test_r3_a_utf8_byte_order_mark_is_not_text() -> None:
@@ -3026,6 +3091,8 @@ async def test_p3f1_the_deadline_bounds_extraction_on_the_real_clock(
             stopped.set()
 
     monkeypatch.setattr(web, "extract_text", watched)
+    # P19F1: the parse outlasts the bound however fast the interpreter.
+    hold_the_walk_past_its_deadline(monkeypatch)
     rig = await read_rig(
         max_response_bytes=8388608, request_timeout_seconds=1, cache_ttl_seconds=0
     )
@@ -4272,19 +4339,29 @@ def test_p12f4_the_search_for_a_tag_end_stops_soon_after_its_deadline(body: byte
 
     import modules.web as web
 
-    parser = web._TextParser()
-    parser.rawdata = body.decode("ascii")
-    deadline = time.monotonic() + 0.05
-    token = web._EXTRACTION_EXPIRED.set(lambda: time.monotonic() >= deadline)
+    def search() -> int:
+        parser = web._TextParser()
+        parser.rawdata = body.decode("ascii")
+        if body.startswith(b"</"):
+            return parser.parse_endtag(0)
+        return parser.check_for_whole_start_tag(0)
+
+    start = time.monotonic()
+    assert search() == -1
+    whole = time.monotonic() - start
+
+    # P19F1: a deadline already expired, not a budget a fast machine beats.
+    expired = ExpiresOnRead(1)
+    token = web._EXTRACTION_EXPIRED.set(expired)
+    start = time.monotonic()
     try:
         with pytest.raises(web.ExtractionAbandoned):
-            if body.startswith(b"</"):
-                parser.parse_endtag(0)
-            else:
-                parser.check_for_whole_start_tag(0)
+            search()
     finally:
         web._EXTRACTION_EXPIRED.reset(token)
-    assert time.monotonic() - deadline < 0.05
+    abandoned = time.monotonic() - start
+    assert expired.reads == 1
+    assert abandoned < whole / 4, (abandoned, whole)
 
 
 def test_p12f4_the_stepped_tag_end_matches_the_standard_parser() -> None:
@@ -4518,7 +4595,9 @@ async def test_p12f4_a_search_stored_past_its_deadline_is_timed_out_on_the_injec
     assert rig.handle._cache.stats().entries == 1
 
 
-async def test_p12f4_a_6_mb_search_answer_times_out_at_1s_on_the_real_clock() -> None:
+async def test_p12f4_a_6_mb_search_answer_times_out_at_1s_on_the_real_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Gate P12F4 N1: a correctly shaped 6,000,058-byte answer whose one
     snippet is two million ``<p>`` used to succeed after 3.57 s, parsed on
     the event loop after the fetch's timer was cancelled. The JSON, each
@@ -4541,6 +4620,8 @@ async def test_p12f4_a_6_mb_search_answer_times_out_at_1s_on_the_real_clock() ->
         finally:
             stopped.set()
 
+    # P19F1: the snippet's parse outlasts the bound however fast the interpreter.
+    hold_the_walk_past_its_deadline(monkeypatch)
     rig = await search_rig(max_response_bytes=8388608, request_timeout_seconds=1)
     rig.handle._sleeper = None
     answer = json.dumps(
@@ -4589,14 +4670,18 @@ def test_p12f4_the_json_walk_stops_soon_after_its_deadline_inside_one_value(
 
     import modules.web as web
 
-    deadline = time.monotonic() + 0.05
-    token = web._EXTRACTION_EXPIRED.set(lambda: time.monotonic() >= deadline)
+    # P19F1: the deadline expires on its 100th read, not after a budget a
+    # fast machine beats. A walk that looked at it only as each value
+    # begins reads it a handful of times and never expires; one that looks
+    # before each scalar stops at the 100th of millions.
+    expired = ExpiresOnRead(100)
+    token = web._EXTRACTION_EXPIRED.set(expired)
     try:
         with pytest.raises(web.ExtractionAbandoned):
             web._json_answer(document.encode("utf-8"))
     finally:
         web._EXTRACTION_EXPIRED.reset(token)
-    assert time.monotonic() - deadline < 0.05
+    assert expired.reads == 100
 
 
 def test_p12f4_the_stepped_json_decoder_matches_the_standard_one() -> None:
@@ -4629,13 +4714,17 @@ def test_p12f4_the_stepped_json_decoder_matches_the_standard_one() -> None:
         assert json.dumps(answer) == json.dumps(expected), document
 
 
-async def test_p12f4_a_timed_out_scalar_answer_leaves_no_walk_running() -> None:
+async def test_p12f4_a_timed_out_scalar_answer_leaves_no_walk_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Gate P12F4 review A1: an 8,000,001-byte answer of four million
     numbers parses for longer than the 1 s bound. The call times out at
     about 1 s, and the walk on its worker thread stops soon after — it
     does not run on through the array, holding a thread the in-flight
     count no longer covers."""
 
+    # P19F1: the walk outlasts the bound however fast the interpreter.
+    hold_the_walk_past_its_deadline(monkeypatch)
     rig = await search_rig(max_response_bytes=8388608, request_timeout_seconds=1)
     rig.handle._sleeper = None
     answer = ('{"query":{"search":' + ",".join(["0"] * 4_000_000).join("[]") + "}}").encode()
