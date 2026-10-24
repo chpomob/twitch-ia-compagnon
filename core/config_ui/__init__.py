@@ -35,7 +35,12 @@ The console (``/console``) and its feed poll (``/feed``) are routes of the
 same table too (phase 9 R7): :mod:`core.config_ui.console` reads the
 runtime's supervision feed and renders the runtime state, each enabled
 module, the feed newest first and the configured grants in the chosen
-language, every value through :func:`esc`.
+language, every value through :func:`esc`. Start (``/start``) and Stop
+(``/stop``) are state-changing routes of the same table: Start launches
+through :meth:`Supervisor.start` only when no live process holds the status
+record, Stop stops only the child this UI launched, and a child that exits
+during startup is shown as a translated cause beside its redacted raw
+stderr tail, behind a closed disclosure.
 """
 
 from __future__ import annotations
@@ -2781,7 +2786,9 @@ Handler = Callable[[UIRequest, _Session], UIResponse]
 INSTANCE_ROUTE = "/instance"
 
 #: Paths whose requests change state: POST only, Origin- and CSRF-checked.
-STATE_CHANGING_PATHS = frozenset({"/save", "/remove", "/check", "/apply", LANGUAGE_ROUTE})
+STATE_CHANGING_PATHS = frozenset(
+    {"/save", "/remove", "/check", "/apply", LANGUAGE_ROUTE, console.START_ROUTE, console.STOP_ROUTE}
+)
 
 #: Every discovered module's page lives under this prefix (R4b).
 MODULE_PAGE_PREFIX = "/module/"
@@ -2982,6 +2989,8 @@ class ConfigUI:
             LANGUAGE_ROUTE: (frozenset({"POST"}), self._language_endpoint),
             LANDING_CONSOLE: (frozenset({"GET"}), self._console_page),
             console.FEED_ROUTE: (frozenset({"GET"}), self._feed_endpoint),
+            console.START_ROUTE: (frozenset({"POST"}), self._start_endpoint),
+            console.STOP_ROUTE: (frozenset({"POST"}), self._stop_endpoint),
         }
 
     def __repr__(self) -> str:
@@ -3297,12 +3306,20 @@ class ConfigUI:
 
     def _console_page(self, request: UIRequest, session: _Session) -> UIResponse:
         """``/console`` (R7): the runtime state from the status record and
-        the supervisor's child, each enabled module, the feed newest first,
-        the configured grants and the editor link, in the chosen language.
-        While the wizard is unfinished it is the landing page instead (A7)."""
+        the supervisor's child, its Start or Stop control, each enabled
+        module, the feed newest first, the configured grants and the editor
+        link, in the chosen language. While the wizard is unfinished it is
+        the landing page instead (A7)."""
 
         if self._wizard_open():
             return UIResponse(status=303, headers=(("Location", LANDING_WIZARD),))
+        return self._console_response(session)
+
+    def _console_response(
+        self, session: _Session, outcome: console.RuntimeOutcome | None = None
+    ) -> UIResponse:
+        """The console page, with *outcome* (a Start or Stop report) first."""
+
         view = self.view()
         running = self.running_state()
         feed = console.read_feed(self.settings.feed_path)
@@ -3313,16 +3330,117 @@ class ConfigUI:
         wizard = self.wizard
         language = wizard.language
         body = console.render_console(
-            console.runtime_state(alive=running.alive, supervised=running.supervised),
+            console.runtime_state(
+                alive=running.alive, supervised=running.supervised, starting=self._child_alive()
+            ),
             feed,
             health,
             console.grants_of(view.rules(), any_action=ANY_ACTION),
             language,
             wizard.table,
             escape=esc,
+            csrf_field=_csrf_field(session),
+            outcome=outcome,
         )
-        title = wizard.table.sentence(language, "console.title")
+        if outcome is None:
+            title = wizard.table.sentence(language, "console.title")
+        else:
+            title = console.outcome_title(outcome, language, wizard.table)
         return _page(title, session, body, language=language)
+
+    def _start_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``POST /start`` (R7): :meth:`start_runtime`, then the console with
+        its report. While the wizard is unfinished nothing is started: the
+        wizard is the landing page (A7)."""
+
+        if self._wizard_open():
+            return UIResponse(status=303, headers=(("Location", LANDING_WIZARD),))
+        return self._console_response(session, self.start_runtime())
+
+    def _stop_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``POST /stop`` (R7): :meth:`stop_runtime`, then the console with its report."""
+
+        if self._wizard_open():
+            return UIResponse(status=303, headers=(("Location", LANDING_WIZARD),))
+        return self._console_response(session, self.stop_runtime())
+
+    def start_runtime(self) -> console.RuntimeOutcome:
+        """Launch the profile through :meth:`Supervisor.start` (R7).
+
+        Only when no live process holds the status record: a live record of
+        another pid is "another instance is running", one of this UI's child
+        (or a child of this UI still starting) is "already running", and
+        neither starts anything. A launched child is watched within the
+        Apply window: ready, still silent, or exited during startup — then
+        its exit status and its redacted, bounded stderr tail are the raw
+        detail, and the cause is chosen from the outcome alone. Runs under
+        the mutation lock (a state-changing route), so it never races Apply.
+        """
+
+        # A fresh snapshot: the configured secrets join the redaction set
+        # before any tail is read (R4).
+        self.view()
+        running = self.running_state()
+        if running.alive:
+            outcome = console.START_RUNNING_HERE if running.supervised else console.START_ANOTHER_INSTANCE
+            report = console.RuntimeOutcome(console.ACTION_START, outcome)
+        elif self._child_alive():
+            report = console.RuntimeOutcome(console.ACTION_START, console.START_RUNNING_HERE)
+        else:
+            report = self._launch()
+        logger.info(
+            "runtime start %s: base %s, status file %s",
+            report.outcome,
+            os.fspath(self.base_path),
+            os.fspath(self.status_path),
+            extra={"config_ui_operation": "start", "config_ui_outcome": report.outcome},
+        )
+        return report
+
+    def _child_alive(self) -> bool:
+        """Whether this UI's child is still alive, whatever its status record says."""
+
+        child = self.child
+        return child is not None and child.poll() is None
+
+    def _launch(self) -> console.RuntimeOutcome:
+        start = console.ACTION_START
+        try:
+            child = self.supervisor.start()
+        except SupervisorClosed:
+            return console.RuntimeOutcome(start, console.START_CLOSING)
+        except OSError as exc:
+            return console.RuntimeOutcome(
+                start, console.START_LAUNCH_FAILED, raw_detail=_report_tail(str(exc), self.secret_values)
+            )
+        watched = self.supervisor.await_startup(child, None, self.secret_values)
+        if watched.outcome == APPLY_ACCEPTED:
+            return console.RuntimeOutcome(start, console.START_STARTED)
+        if watched.outcome == APPLY_UNKNOWN:
+            return console.RuntimeOutcome(start, console.START_UNCONFIRMED)
+        return console.RuntimeOutcome(
+            start, console.START_EXITED, exit_status=watched.exit_status, raw_detail=watched.stderr_tail
+        )
+
+    def stop_runtime(self) -> console.RuntimeOutcome:
+        """Stop the child this UI launched, and only it (R7, A4): with no
+        such child, :meth:`Supervisor.stop` is never called."""
+
+        stop = console.ACTION_STOP
+        if self.child is None:
+            outcome = console.STOP_NOT_OURS if self.running_state().alive else console.STOP_NOTHING
+            report = console.RuntimeOutcome(stop, outcome)
+        elif self.supervisor.stop():
+            report = console.RuntimeOutcome(stop, console.STOP_STOPPED)
+        else:
+            report = console.RuntimeOutcome(stop, console.STOP_UNCONFIRMED)
+        logger.info(
+            "runtime stop %s: status file %s",
+            report.outcome,
+            os.fspath(self.status_path),
+            extra={"config_ui_operation": "stop", "config_ui_outcome": report.outcome},
+        )
+        return report
 
     def _feed_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
         """``/feed?after=<sequence>&at=<time>`` (R7): the feed entries past the
@@ -5671,6 +5789,19 @@ class Supervisor:
                 APPLY_REFUSED,
                 diagnostics=(f"the launch command could not be started: {reason}",),
             )
+        return self.await_startup(child, digest, secret_values)
+
+    def await_startup(
+        self, child: Any, digest: str | None, secret_values: Iterable[str] = ()
+    ) -> ApplyReport:
+        """Poll the status path within the window for *child*, just started (R7).
+
+        Accepted: a usable record of this child, ``ready``, with *digest*
+        (any digest when *digest* is ``None``). Refused: the child exited;
+        its status and redacted stderr tail are reported. Unknown: the
+        window elapsed. An unusable record never counts.
+        """
+
         drain = self._drain
         deadline = self.clock() + self.apply_window
         while True:
@@ -5682,7 +5813,11 @@ class Supervisor:
                     tail = _report_tail(drain.tail(DRAIN_TAIL_BYTES), secret_values)
                 return ApplyReport(APPLY_REFUSED, exit_status=returncode, stderr_tail=tail)
             record = read_status(self.status_path).record
-            if record is not None and record.pid == child.pid and record.digest == digest:
+            if (
+                record is not None
+                and record.pid == child.pid
+                and (digest is None or record.digest == digest)
+            ):
                 # A usable record's state is always ``ready`` (the reader
                 # refuses every other value).
                 return ApplyReport(APPLY_ACCEPTED)

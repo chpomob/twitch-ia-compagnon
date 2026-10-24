@@ -674,12 +674,12 @@ def _write_feed(path: Path, entries: list[dict[str, Any]], tail: str = "") -> No
     path.write_text("".join(json.dumps(entry) + "\n" for entry in entries) + tail, encoding="utf-8")
 
 
-def _write_status(path: Path, modules: dict[str, str]) -> None:
+def _write_status(path: Path, modules: dict[str, str], *, pid: int = STATUS_PID) -> None:
     path.write_text(
         json.dumps(
             {
                 "version": 1,
-                "pid": STATUS_PID,
+                "pid": pid,
                 "started_at": "2026-10-24T08:00:00Z",
                 "published_at": "2026-10-24T08:00:01Z",
                 "sequence": 1,
@@ -821,6 +821,9 @@ def test_the_console_names_the_three_runtime_states(tmp_path: Path) -> None:
     ui.child = SimpleNamespace(pid=STATUS_PID, poll=lambda: None)
     assert state() == console.STATE_RUNNING_HERE
     ui.probe = lambda pid, child: False
+    # The record is dead but this UI's child is alive (still starting): Stop stays offered.
+    assert state() == console.STATE_RUNNING_HERE
+    ui.child = SimpleNamespace(pid=STATUS_PID, poll=lambda: 0)
     assert state() == console.STATE_NOT_RUNNING
 
 
@@ -1197,3 +1200,393 @@ def test_the_console_redacts_the_secret_set_in_every_feed_value(tmp_path: Path) 
         assert response.status == 200
         assert SECRET.encode("utf-8") not in response.body
         assert config_ui.REDACTED.encode("utf-8") in response.body
+
+
+# --------------------------------------------------------------------------- #
+# P14: Start and Stop through the supervisor, with the cause / raw-detail
+# split (R7, R4, R2; AC22, AC32)
+# --------------------------------------------------------------------------- #
+
+from urllib.parse import quote  # noqa: E402
+
+import test_first_run as first_run  # noqa: E402
+from conftest import FakeChild, FakeOS, ManualClock  # noqa: E402
+
+#: A stored credential value (screen 4's), with characters whose HTML, JSON
+#: and URL forms differ from the raw text.
+STORED = "stored&cred\"9f2e<x>"
+STORED_NAME = "TWITCH_ACCESS_TOKEN"
+TRACEBACK = "Traceback (most recent call last):"
+CRASH_TAIL = (
+    f"loading the profile with {STORED}\n"
+    f"{TRACEBACK}\n"
+    '  File "core/main.py", line 12, in <module>\n'
+    "RuntimeError: the platform refused the credential\n"
+)
+
+
+def _encoded_forms(value: str) -> set[str]:
+    """The value raw, HTML-escaped, JSON-escaped and URL-encoded."""
+
+    return {*config_ui._redaction_forms(value), quote(value, safe=""), quote(value)}
+
+
+class _Launches:
+    """The UI's own supervisor, its launches faked (no process is spawned)
+    and its startup window on the manual clock; every ``start`` and ``stop``
+    call is counted, with whether the mutation lock was held."""
+
+    def __init__(self, ui: config_ui.ConfigUI, fake_spawn: FakeOS, script: Any) -> None:
+        supervisor = ui.supervisor
+        clock = ManualClock()
+        fake_spawn.clock = clock
+
+        def wait(interval: float) -> None:
+            fake_spawn.settle()
+            clock.advance(interval)
+
+        supervisor.popen = fake_spawn.popen(lambda child: self.script(child))
+        supervisor.clock, supervisor.wait = clock, wait
+        supervisor.stop_grace = 0.5
+        self.script = script
+        self.fake_spawn = fake_spawn
+        self.starts: list[Any] = []
+        self.stops: list[Any] = []
+        self.locked: list[bool] = []
+        real_start, real_stop = supervisor.start, supervisor.stop
+
+        def start() -> Any:
+            self.locked.append(ui._mutation_lock.locked())
+            child = real_start()
+            self.starts.append(child)
+            return child
+
+        def stop() -> bool:
+            self.locked.append(ui._mutation_lock.locked())
+            self.stops.append(supervisor.child)
+            return real_stop()
+
+        supervisor.start = start  # type: ignore[method-assign]
+        supervisor.stop = stop  # type: ignore[method-assign]
+
+
+def _ready(child: FakeChild) -> None:
+    """The child publishes a usable, ready status record of its own pid, then runs."""
+
+    status = Path(child.env[STATUS_FILE_VARIABLE])
+    _write_status(status.with_name(status.name + ".tmp"), {"audio_output": "ready"}, pid=child.pid)
+    os.replace(status.with_name(status.name + ".tmp"), status)
+    child.hold()
+
+
+def _crash(child: FakeChild) -> None:
+    child.write_stderr(CRASH_TAIL.replace(STORED, child.env[STORED_NAME]))
+    child.exit(1)
+
+
+def _silent_crash(child: FakeChild) -> None:
+    child.exit(1)
+
+
+def _silent(child: FakeChild) -> None:
+    """The child runs without ever publishing a status record."""
+
+    child.hold()
+
+
+@pytest.fixture
+def p14(tmp_path: Path, fake_spawn: FakeOS) -> SimpleNamespace:
+    """A console UI with a stored credential (screen 4's path) and its
+    supervisor's launches faked."""
+
+    base = _profile(tmp_path)
+    ui = _ui(base)
+    ui._credentials_stored({STORED_NAME: STORED})
+    launches = _Launches(ui, fake_spawn, _ready)
+    cookie, csrf = _login(ui)
+    yield SimpleNamespace(ui=ui, launches=launches, cookie=cookie, csrf=csrf, status=ui.status_path)
+    ui.supervisor.stop_grace = 0.5
+    ui.supervisor.stop()
+
+
+def _press(p14: SimpleNamespace, route: str) -> config_ui.UIResponse:
+    return p14.ui.handle(
+        _ui_request(
+            "POST",
+            route,
+            headers={"cookie": p14.cookie, "content-type": "application/x-www-form-urlencoded"},
+            body=f"csrf_token={p14.csrf}".encode("utf-8"),
+        )
+    )
+
+
+def _outcome(body: str) -> tuple[str, str]:
+    found = re.search(r'id="runtime-outcome" data-action="([a-z]+)" data-outcome="([a-z_]+)"', body)
+    assert found, body
+    return found.group(1), found.group(2)
+
+
+def _cause_markup(body: str) -> str:
+    found = re.search(r'<div id="outcome-cause">(.*?)</div>', body, re.S)
+    assert found, body
+    return found.group(1)
+
+
+def _expected_cause(language: str, cause: str, following: str) -> str:
+    return (
+        f'<p class="cause">{html_escape(TABLE.sentence(language, cause))}</p>'
+        f'<p class="next">{html_escape(TABLE.sentence(language, following))}</p>'
+    )
+
+
+# -- AC22: Start and Stop through the supervisor ------------------------------ #
+
+
+def test_ac22_start_with_no_live_record_launches_the_profile_once(p14: SimpleNamespace) -> None:
+    """AC22 (R7): Start with no live status record calls ``start`` exactly
+    once, with the profile's launch argv and the feed path (and the stored
+    credential, R4) in the environment; the child comes up ready."""
+
+    response = _press(p14, "/start")
+
+    assert response.status == 200
+    body = response.body.decode("utf-8")
+    assert _outcome(body) == (console.ACTION_START, console.START_STARTED)
+    assert _cause_markup(body) == _expected_cause("en", "console.start.started", "console.start.started.next")
+    assert len(p14.launches.starts) == 1
+    (spawned,) = p14.launches.fake_spawn.spawned
+    assert list(spawned.argv) == list(config_ui.default_launch_argv(p14.ui.settings))
+    environment = spawned.options["env"]
+    assert environment[FEED_FILE_VARIABLE] == os.fspath(p14.ui.settings.feed_path)
+    assert environment[STATUS_FILE_VARIABLE] == os.fspath(p14.status)
+    assert environment[STORED_NAME] == STORED
+    assert spawned.options["shell"] is False
+    # The page now runs under this UI, and offers Stop, not Start.
+    assert f'data-state="{console.STATE_RUNNING_HERE}"' in body
+    assert 'action="/stop"' in body and 'action="/start"' not in body
+    # A second Start while it runs launches nothing.
+    again = _press(p14, "/start").body.decode("utf-8")
+    assert _outcome(again) == (console.ACTION_START, console.START_RUNNING_HERE)
+    assert len(p14.launches.starts) == 1
+    # Start and Stop share the mutation lock with Apply (plan P14 risk).
+    assert config_ui.STATE_CHANGING_PATHS >= {console.START_ROUTE, console.STOP_ROUTE}
+    assert p14.launches.locked == [True]
+
+
+def test_ac22_a_live_record_of_another_pid_starts_nothing(p14: SimpleNamespace) -> None:
+    """AC22 (R7): a usable status record naming a live pid this UI did not
+    launch → ``start`` 0 times, "another instance is running"; Stop then
+    stops nothing either."""
+
+    _write_status(p14.status, {"audio_output": "ready"})
+    p14.ui.probe = lambda pid, child: pid == STATUS_PID
+
+    response = _press(p14, "/start")
+
+    assert response.status == 200
+    body = response.body.decode("utf-8")
+    assert _outcome(body) == (console.ACTION_START, console.START_ANOTHER_INSTANCE)
+    assert _cause_markup(body) == _expected_cause(
+        "en", "console.start.another_instance", "console.start.another_instance.next"
+    )
+    assert "Another instance is running" in TABLE.sentence("en", "console.start.another_instance")
+    assert p14.launches.starts == [] and p14.launches.fake_spawn.spawned == []
+    assert f'data-state="{console.STATE_UNSUPERVISED}"' in body
+    assert 'action="/start"' not in body and 'action="/stop"' not in body
+
+    stopped = _press(p14, "/stop").body.decode("utf-8")
+    assert _outcome(stopped) == (console.ACTION_STOP, console.STOP_NOT_OURS)
+    assert p14.launches.stops == []
+
+
+def test_ac22_stop_stops_only_the_child_this_ui_launched(p14: SimpleNamespace) -> None:
+    """AC22 (R7): Stop with no child of this UI calls ``stop`` 0 times;
+    after a Start it calls it exactly once, on that child."""
+
+    nothing = _press(p14, "/stop")
+    assert nothing.status == 200
+    assert _outcome(nothing.body.decode("utf-8")) == (console.ACTION_STOP, console.STOP_NOTHING)
+    assert p14.launches.stops == []
+
+    _press(p14, "/start")
+    (child,) = p14.launches.starts
+    stopped = _press(p14, "/stop").body.decode("utf-8")
+
+    assert _outcome(stopped) == (console.ACTION_STOP, console.STOP_STOPPED)
+    assert _cause_markup(stopped) == _expected_cause("en", "console.stop.stopped", "console.stop.stopped.next")
+    assert p14.launches.stops == [child]
+    assert child.returncode is not None and p14.ui.child is None
+    assert p14.launches.locked == [True, True]
+    # Nothing is left to stop: the next Stop calls nothing.
+    assert _outcome(_press(p14, "/stop").body.decode("utf-8"))[1] == console.STOP_NOTHING
+    assert len(p14.launches.stops) == 1
+
+
+def test_ac22_a_child_still_starting_is_offered_stop(p14: SimpleNamespace) -> None:
+    """R7: a child that stays alive without publishing a usable status
+    record is "not reported ready yet", and the console offers Stop (the
+    next action the cause names), not Start; Stop then stops that child."""
+
+    p14.launches.script = _silent
+
+    body = _press(p14, "/start").body.decode("utf-8")
+
+    assert _outcome(body) == (console.ACTION_START, console.START_UNCONFIRMED)
+    assert f'data-state="{console.STATE_RUNNING_HERE}"' in body
+    assert 'action="/stop"' in body and 'action="/start"' not in body
+    (child,) = p14.launches.starts
+    page = _get(p14.ui, "/console", p14.cookie).body.decode("utf-8")
+    assert 'action="/stop"' in page and 'action="/start"' not in page
+
+    stopped = _press(p14, "/stop").body.decode("utf-8")
+
+    assert _outcome(stopped) == (console.ACTION_STOP, console.STOP_STOPPED)
+    assert p14.launches.stops == [child] and child.returncode is not None
+    assert f'data-state="{console.STATE_NOT_RUNNING}"' in stopped
+    assert 'action="/start"' in stopped and 'action="/stop"' not in stopped
+
+
+def test_ac22_start_and_stop_are_behind_the_existing_guards(p14: SimpleNamespace) -> None:
+    """``/start`` and ``/stop`` are CSRF-guarded POSTs behind the existing
+    chain: a refused request reaches no supervisor call."""
+
+    ui, cookie = p14.ui, p14.cookie
+    form = {"cookie": cookie, "content-type": "application/x-www-form-urlencoded"}
+    for route in ("/start", "/stop"):
+        refused = [
+            ui.handle(_ui_request("POST", route, headers=form, body=f"csrf_token={p14.csrf}".encode(), host="evil.example")),
+            ui.handle(_ui_request("POST", route, body=f"csrf_token={p14.csrf}".encode())),
+            ui.handle(_ui_request("GET", route, headers={"cookie": cookie})),
+            ui.handle(_ui_request("POST", route, headers=form, body=b"csrf_token=wrong")),
+            ui.handle(_ui_request("POST", route, headers=form)),
+            ui.handle(
+                _ui_request(
+                    "POST", route, headers={**form, "origin": "http://evil.example"},
+                    body=f"csrf_token={p14.csrf}".encode(),
+                )
+            ),
+        ]
+        assert [response.status for response in refused] == [403, 401, 405, 403, 403, 403]
+    assert p14.launches.starts == [] and p14.launches.stops == []
+
+
+# -- AC32 (and AC22's last clause): a child exiting during startup ------------ #
+
+
+@pytest.mark.parametrize("language", ["en", "fr"])
+def test_ac32_a_child_exiting_during_startup_shows_the_cause_and_the_closed_raw_detail(
+    p14: SimpleNamespace, language: str
+) -> None:
+    """AC32 (R2, R4, R7): the cause is the table's sentence and next action
+    in the chosen language, outside any disclosure, with 0 characters of the
+    tail; the tail is only inside one ``<details>`` with no ``open``
+    attribute and the table's label, the stored credential replaced by the
+    redaction marker and in none of its encoded forms anywhere."""
+
+    if language != "en":
+        _choose(p14.ui, p14.cookie, p14.csrf, language)
+    p14.launches.script = _crash
+
+    response = _press(p14, "/start")
+
+    assert response.status == 200
+    body = response.body.decode("utf-8")
+    assert len(p14.launches.starts) == 1
+    assert _outcome(body) == (console.ACTION_START, console.START_EXITED)
+    # (a) The cause: the table's sentences in the chosen language, alone.
+    cause = _cause_markup(body)
+    assert cause == _expected_cause(language, "console.start.exited", "console.start.exited.next")
+    if language == "fr":
+        assert TABLE.sentence("fr", "console.start.exited") != TABLE.sentence("en", "console.start.exited")
+    fragments = [line.strip() for line in CRASH_TAIL.splitlines()]
+    fragments += [TRACEBACK, "Traceback", "RuntimeError", "core/main.py", "line 12", config_ui.REDACTED]
+    for fragment in fragments:
+        assert fragment not in cause and html_escape(fragment) not in cause, fragment
+    assert body.index('id="outcome-cause"') < body.index("<details")
+    # (b) The raw detail: one closed disclosure, labelled from the table.
+    disclosures = re.findall(r"<details\b[^>]*>", body)
+    assert disclosures == ['<details id="raw-detail">']
+    detail = re.search(r'<details id="raw-detail"><summary>([^<]*)</summary><pre>(.*?)</pre></details>', body, re.S)
+    assert detail is not None
+    assert detail.group(1) == html_escape(TABLE.sentence(language, "detail.disclosure"))
+    raw = detail.group(2)
+    assert TRACEBACK in raw and "RuntimeError: the platform refused the credential" in raw
+    assert config_ui.REDACTED in raw
+    # The tail is nowhere else: the Traceback line appears once, inside it.
+    outside = body.replace(detail.group(0), "")
+    assert TRACEBACK not in outside and "RuntimeError" not in outside
+    assert 'id="exit-status" data-status="1"' in body
+    # The credential, in every encoded form, is in no part of the response.
+    for form in _encoded_forms(STORED):
+        assert form not in body, form
+        assert form.encode("utf-8") not in response.body
+    for _name, value in response.headers:
+        assert all(form not in value for form in _encoded_forms(STORED))
+
+
+def test_ac32_an_empty_tail_still_renders_the_cause_and_no_disclosure(p14: SimpleNamespace) -> None:
+    """AC32 (R7): a start failure with an empty stderr tail still renders
+    the cause and next action; there is no raw detail to disclose."""
+
+    p14.launches.script = _silent_crash
+
+    body = _press(p14, "/start").body.decode("utf-8")
+
+    assert _outcome(body) == (console.ACTION_START, console.START_EXITED)
+    assert _cause_markup(body) == _expected_cause("en", "console.start.exited", "console.start.exited.next")
+    assert "<details" not in body
+    assert 'id="exit-status" data-status="1"' in body
+    # The console afterwards: not running, Start offered again.
+    assert f'data-state="{console.STATE_NOT_RUNNING}"' in body and 'action="/start"' in body
+
+
+def test_ac32_the_cause_is_chosen_from_the_outcome_never_from_the_tail() -> None:
+    """Plan P14 risk: the cause interpolates nothing tail-derived — two
+    outcomes differing only in their raw detail render the same cause."""
+
+    for language in ("en", "fr"):
+        rendered = [
+            console.render_outcome(
+                console.RuntimeOutcome(console.ACTION_START, console.START_EXITED, 1, detail), language, TABLE
+            )
+            for detail in ("", CRASH_TAIL, "{status} {module} " + TRACEBACK)
+        ]
+        causes = {_cause_markup(markup) for markup in rendered}
+        assert len(causes) == 1
+        assert "<details" not in rendered[0] and rendered[1].count("<details") == 1
+        assert " open" not in re.findall(r"<details\b[^>]*>", rendered[1])[0]
+
+
+def test_ac32_no_wizard_response_renders_a_raw_detail_disclosure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC32 (AC17 stands): over every failure of screens 2 and 3 and a full
+    pass, no wizard response holds a ``<details>`` disclosure; Start while
+    the wizard is unfinished starts nothing and lands on the wizard."""
+
+    first_run._default_environment(monkeypatch, tmp_path / "xdg")
+    run = first_run._Flow(tmp_path)
+    try:
+        assert first_run._passed(run.choice("chat_qa"))
+        for answer, _token in first_run.PLATFORM_OUTCOMES.values():
+            run.platform.default = answer
+            run.platform.tokens.clear()
+            run.platform_screen()
+        run.platform.default = None
+        run.platform.accept(first_run.TOK_A)
+        assert first_run._passed(run.platform_screen())
+        for answer, _token in first_run.MODEL_OUTCOMES.values():
+            run.model.answer = answer
+            run.model_screen()
+        start = run.post("/start", {})
+        assert start.status == 303 and dict(start.headers)["Location"] == "/wizard"
+        assert run.starts == 0
+        run.model.answer = first_run._json(200, first_run._COMPLETION)
+        assert first_run._passed(run.model_screen())
+        assert first_run._passed(run.screen(4)) and first_run._passed(run.screen(5))
+        wizard_bodies = [text for label, text in run.bodies() if "/wizard" in label]
+        assert len(wizard_bodies) > 10
+        for text in wizard_bodies:
+            assert "<details" not in text
+    finally:
+        run.close()

@@ -5093,6 +5093,14 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     rendered over a feed whose excerpt, degraded cause and reason carry every
     secret-set canary — so the secret sweep covers them and the poll's JSON
     answer joins the audited content types.
+
+    Phase 9 R7 (same allowlist entry, plan P14): the set gains the console's
+    ``/start`` and ``/stop`` (POST, CSRF), both driven by the sweep over the
+    supervised profile — refused without a session or CSRF token, a start
+    whose child exits during startup with a secret-set canary in its stderr
+    (the redacted tail behind the closed disclosure), a start that comes up
+    ready, its stop, and a stop with nothing to stop — so the secret sweep
+    covers them too.
     """
 
     environ = _sweep_environ()
@@ -5221,6 +5229,22 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     assert "config error near" in report.stderr_tail and config_ui.REDACTED in report.stderr_tail
     assert refused.status == 200
     reports.append(report)
+
+    # Start and Stop (plan P14): refused without a session or CSRF token;
+    # a child exiting during startup (the refuse flag still set) shows its
+    # cause and, behind the closed disclosure, the redacted tail.
+    assert sweep.record("POST /start (no session)", _post(ui, "/start", "", csrf)).status == 401
+    assert sweep.record("POST /stop (no csrf)", _post(ui, "/stop", cookie, None)).status == 403
+    exited = sweep.record("POST /start (exited)", _post(ui, "/start", cookie, csrf))
+    assert exited.status == 200 and b'data-outcome="exited"' in exited.body
+    assert b"<details" in exited.body and config_ui.REDACTED.encode("utf-8") in exited.body
+    (base.parent / "refuse.flag").unlink()
+    started = sweep.record("POST /start (started)", _post(ui, "/start", cookie, csrf))
+    assert started.status == 200 and b'data-outcome="started"' in started.body
+    stopped = sweep.record("POST /stop (stopped)", _post(ui, "/stop", cookie, csrf))
+    assert stopped.status == 200 and b'data-outcome="stopped"' in stopped.body
+    nothing = sweep.record("POST /stop (nothing)", _post(ui, "/stop", cookie, csrf))
+    assert nothing.status == 200 and b'data-outcome="nothing"' in nothing.body
     _sweep_pages(sweep, cookie)
     collected += sweep.texts()
     audited += [(label, response, frozenset(ui.authorities)) for label, response in sweep.responses]
@@ -5253,10 +5277,11 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     # must join this sweep).
     assert set(ui.routes) == {
         "/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply", "/instance",
-        "/wizard", "/language", "/console", "/feed",
+        "/wizard", "/language", "/console", "/feed", "/start", "/stop",
     }
     driven = {label for label, _response, _accepted in audited}
     assert {"GET /wizard", "POST /language", "GET /console", "GET /feed"} <= driven
+    assert {"POST /start (exited)", "POST /start (started)", "POST /stop (stopped)"} <= driven
     json_answers = [label for label, response, _ in audited if response.content_type == "application/json"]
     assert json_answers and set(json_answers) == {"GET /instance", "GET /feed"}
     assert {response.content_type.split(";")[0] for _, response, _ in audited} <= {

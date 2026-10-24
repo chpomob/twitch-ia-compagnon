@@ -12,7 +12,10 @@ caller's escape, which redacts the UI's secret set (R4).
 P2) with a bounded read, tolerating a missing or partly written file;
 :func:`reason_sentence` maps every reason token the runtime emits to a
 plain-language sentence, and an unknown token to the generic sentence naming
-it, never to an empty line. This module opens no socket and writes no file.
+it, never to an empty line. :func:`render_outcome` shows what a Start or
+Stop came to: the cause, a table sentence chosen from the outcome alone, and
+the raw detail, the redacted stderr tail, behind a closed disclosure. This
+module opens no socket and writes no file.
 """
 
 from __future__ import annotations
@@ -81,6 +84,30 @@ FEED_CURSOR_AT_MAX = 64
 
 #: How often the page polls the feed, in milliseconds.
 POLL_INTERVAL_MS = 2000
+
+#: The console's two state-changing routes (R7): CSRF-guarded POSTs.
+START_ROUTE = "/start"
+STOP_ROUTE = "/stop"
+
+#: What a Start can come to (R7). The cause sentence is chosen from this
+#: token alone — from the exit status and the startup phase, never from the
+#: child's output — so it can quote nothing of the raw detail.
+START_STARTED = "started"
+START_UNCONFIRMED = "unconfirmed"
+START_EXITED = "exited"
+START_LAUNCH_FAILED = "launch_failed"
+START_CLOSING = "closing"
+START_ANOTHER_INSTANCE = "another_instance"
+START_RUNNING_HERE = "running_here"
+
+#: What a Stop can come to (R7).
+STOP_STOPPED = "stopped"
+STOP_UNCONFIRMED = "unconfirmed"
+STOP_NOT_OURS = "not_ours"
+STOP_NOTHING = "nothing"
+
+ACTION_START = "start"
+ACTION_STOP = "stop"
 
 Escape = Callable[[Any], str]
 
@@ -291,13 +318,15 @@ def reason_sentence(token: Any, language: str, table: StringTable) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def runtime_state(*, alive: bool, supervised: bool) -> str:
+def runtime_state(*, alive: bool, supervised: bool, starting: bool = False) -> str:
     """The console's runtime state from the status record and the child (R7):
     a live record whose pid is this UI's child is running here; a live one
-    with another pid is another process this UI does not supervise."""
+    with another pid is another process this UI does not supervise. With no
+    live record, a child of this UI still alive (*starting*: it has not
+    published a usable record yet) is running here too, so Stop is offered."""
 
     if not alive:
-        return STATE_NOT_RUNNING
+        return STATE_RUNNING_HERE if starting else STATE_NOT_RUNNING
     return STATE_RUNNING_HERE if supervised else STATE_UNSUPERVISED
 
 
@@ -575,6 +604,136 @@ def _grants_markup(grants: Sequence[Grant], language: str, table: StringTable, e
     )
 
 
+@dataclass(frozen=True)
+class RuntimeOutcome:
+    """What one Start or Stop came to, as the console reports it (R7).
+
+    *raw_detail* is the child's bounded stderr tail (or the launch error),
+    already redacted by the caller: quoted data, never translated, shown
+    only behind the closed disclosure. It never chooses the cause.
+    """
+
+    action: str
+    outcome: str
+    exit_status: int | None = None
+    raw_detail: str = ""
+
+
+def _outcome_sentences(outcome: RuntimeOutcome, language: str, table: StringTable) -> tuple[str, str]:
+    """The cause and the next action of *outcome*: table sentences chosen by
+    its action and outcome tokens only, with no placeholder."""
+
+    if outcome.action == ACTION_STOP:
+        sentences = {
+            STOP_STOPPED: (
+                table.sentence(language, "console.stop.stopped"),
+                table.sentence(language, "console.stop.stopped.next"),
+            ),
+            STOP_UNCONFIRMED: (
+                table.sentence(language, "console.stop.unconfirmed"),
+                table.sentence(language, "console.stop.unconfirmed.next"),
+            ),
+            STOP_NOT_OURS: (
+                table.sentence(language, "console.stop.not_ours"),
+                table.sentence(language, "console.stop.not_ours.next"),
+            ),
+            STOP_NOTHING: (
+                table.sentence(language, "console.stop.nothing"),
+                table.sentence(language, "console.stop.nothing.next"),
+            ),
+        }
+        return sentences.get(outcome.outcome, sentences[STOP_NOTHING])
+    sentences = {
+        START_STARTED: (
+            table.sentence(language, "console.start.started"),
+            table.sentence(language, "console.start.started.next"),
+        ),
+        START_UNCONFIRMED: (
+            table.sentence(language, "console.start.unconfirmed"),
+            table.sentence(language, "console.start.unconfirmed.next"),
+        ),
+        START_EXITED: (
+            table.sentence(language, "console.start.exited"),
+            table.sentence(language, "console.start.exited.next"),
+        ),
+        START_LAUNCH_FAILED: (
+            table.sentence(language, "console.start.launch_failed"),
+            table.sentence(language, "console.start.launch_failed.next"),
+        ),
+        START_CLOSING: (
+            table.sentence(language, "console.start.closing"),
+            table.sentence(language, "console.start.closing.next"),
+        ),
+        START_ANOTHER_INSTANCE: (
+            table.sentence(language, "console.start.another_instance"),
+            table.sentence(language, "console.start.another_instance.next"),
+        ),
+        START_RUNNING_HERE: (
+            table.sentence(language, "console.start.running_here"),
+            table.sentence(language, "console.start.running_here.next"),
+        ),
+    }
+    return sentences.get(outcome.outcome, sentences[START_EXITED])
+
+
+def outcome_title(outcome: RuntimeOutcome, language: str, table: StringTable) -> str:
+    """The page title of a Start or Stop answer."""
+
+    if outcome.action == ACTION_STOP:
+        return table.sentence(language, "console.stop.title")
+    return table.sentence(language, "console.start.title")
+
+
+def render_outcome(
+    outcome: RuntimeOutcome, language: str, table: StringTable, *, escape: Escape = _plain_escape
+) -> str:
+    """A Start or Stop outcome's two surfaces (R7, AC32).
+
+    The **cause** — the table's sentence and next action in *language* — is
+    always shown, outside any disclosure, and holds nothing of the raw
+    detail. The **raw detail** — the redacted stderr tail, untranslated —
+    is shown only inside one ``<details>`` element, closed by default, its
+    label from the table; with no detail there is no disclosure.
+    """
+
+    language = table.language_or_default(language)
+    cause, following = _outcome_sentences(outcome, language, table)
+    parts = [
+        f'<section id="runtime-outcome" data-action="{escape(outcome.action)}" '
+        f'data-outcome="{escape(outcome.outcome)}">',
+        f'<div id="outcome-cause"><p class="cause">{escape(cause)}</p>'
+        f'<p class="next">{escape(following)}</p></div>',
+    ]
+    if outcome.exit_status is not None:
+        status = int(outcome.exit_status)
+        sentence = table.sentence(language, "console.start.exit_status", status=status)
+        parts.append(f'<p id="exit-status" data-status="{status}">{escape(sentence)}</p>')
+    if outcome.raw_detail:
+        label = escape(table.sentence(language, "detail.disclosure"))
+        parts.append(
+            f'<details id="raw-detail"><summary>{label}</summary>'
+            f"<pre>{escape(outcome.raw_detail)}</pre></details>"
+        )
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def _controls_markup(state: str, csrf_field: str, language: str, table: StringTable, escape: Escape) -> str:
+    """Start when nothing runs, Stop when the companion runs from this UI;
+    another process this UI does not supervise gets neither (R7)."""
+
+    if state == STATE_NOT_RUNNING:
+        route, label, ident = START_ROUTE, table.sentence(language, "console.control.start"), "start"
+    elif state == STATE_RUNNING_HERE:
+        route, label, ident = STOP_ROUTE, table.sentence(language, "console.control.stop"), "stop"
+    else:
+        return ""
+    return (
+        f'<form id="{ident}-form" method="post" action="{route}">{csrf_field}'
+        f'<button type="submit">{escape(label)}</button></form>'
+    )
+
+
 #: Polls :data:`FEED_ROUTE` with the newest sequence shown and its time, and
 #: puts the new items first; a feed that is a new runtime's replaces the list.
 #: The next poll is scheduled only once the previous one has answered, so no
@@ -624,9 +783,15 @@ def render_console(
     table: StringTable,
     *,
     escape: Escape = _plain_escape,
+    csrf_field: str = "",
+    outcome: RuntimeOutcome | None = None,
 ) -> str:
     """The console page's body (R7): the runtime state, each enabled module,
     the feed newest first, the configured grants and the editor link.
+
+    With *csrf_field* (the session's hidden CSRF input) the state carries
+    its Start or Stop control; with *outcome*, the last Start or Stop's
+    report comes first (:func:`render_outcome`).
 
     Every sentence is the table's in *language*; every value goes through
     *escape*, which the UI makes its redacting escape (R4).
@@ -645,9 +810,11 @@ def render_console(
     title = escape(table.sentence(language, "console.title"))
     feed_title = escape(table.sentence(language, "console.feed.title"))
     editor = escape(table.sentence(language, "console.editor_link"))
+    controls = _controls_markup(state, csrf_field, language, table, escape) if csrf_field else ""
+    report = "" if outcome is None else render_outcome(outcome, language, table, escape=escape)
     return (
-        f"<h1>{title}</h1>"
-        f"{_state_markup(state, language, table, escape)}"
+        f"<h1>{title}</h1>{report}"
+        f"{_state_markup(state, language, table, escape)}{controls}"
         f"{_health_markup(health, language, table, escape)}"
         f'<section id="feed-section"><h2>{feed_title}</h2>{empty}'
         f'<ol id="feed" data-cursor="{cursor}" data-cursor-at="{escape(cursor_at)}">{"".join(items)}</ol></section>'
