@@ -4791,6 +4791,22 @@ def _sweep_profile(
     return ui, base
 
 
+def _sweep_feed(ui: ConfigUI, secret_values: Sequence[str]) -> None:
+    """A feed file beside *ui*'s profile whose excerpt, degraded cause and
+    reason token each carry every one of *secret_values* (plan P13)."""
+
+    carried = " ".join(secret_values)
+    entries = [
+        {"seq": 1, "fact": "channel.chat.message", "author": "viewer", "platform": "fakeplatform",
+         "kind": "message", "excerpt": carried},
+        {"seq": 2, "fact": "module.degraded", "module": LITERAL_MODULE, "reason": carried},
+        {"seq": 3, "fact": "input.trigger.rejected", "input": "twitch", "reason": carried},
+    ]
+    ui.settings.feed_path.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
+    )
+
+
 def _sweep_pages(sweep: _Sweep, cookie: str) -> dict[str, str]:
     """The base page, the core page and every module page, all 200."""
 
@@ -5070,6 +5086,13 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     wizard redirecting to the console for a profile it never ran for (A7),
     and a language the table does not offer refused without a write — so
     the secret sweep covers them too.
+
+    Phase 9 R7 (same allowlist entry, plan P13): the set gains the console's
+    ``/console`` (GET) and its feed poll ``/feed`` (GET, JSON), both driven by
+    the sweep over every shipped profile — refused without a session, and
+    rendered over a feed whose excerpt, degraded cause and reason carry every
+    secret-set canary — so the secret sweep covers them and the poll's JSON
+    answer joins the audited content types.
     """
 
     environ = _sweep_environ()
@@ -5102,6 +5125,21 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
         state_file = base.with_name(base.name + ".wizard.json")
         language = sweep.record("POST /language", _post(ui, "/language", cookie, csrf))
         assert language.status == 409 and not state_file.exists()
+        # The console and its feed poll (plan P13): a feed whose excerpt,
+        # cause and reason carry every secret-set canary renders none of them.
+        secret_canaries = [canary for canary in canaries if canary in ui.view().secret_values]
+        assert secret_canaries
+        _sweep_feed(ui, secret_canaries)
+        assert sweep.get("/console", None).status == 401
+        assert sweep.get("/feed", None).status == 401
+        console_page = sweep.get("/console", cookie)
+        assert console_page.status == 200 and b'data-seq="3"' in console_page.body
+        # The redaction guard hid them: the feed is data the renderer cannot
+        # keep out by itself.
+        assert config_ui.REDACTED.encode("utf-8") in console_page.body
+        feed_poll = sweep.get("/feed", cookie, after="0")
+        assert feed_poll.status == 200 and len(json.loads(feed_poll.body)["items"]) == 3
+        assert config_ui.REDACTED in "".join(json.loads(feed_poll.body)["items"])
         # Credential fields show their reference or the hidden-literal text.
         if "twitch" in read_base(base)["modules"]:
             twitch = pages[f"{MODULE_PAGE_PREFIX}twitch"]
@@ -5215,12 +5253,12 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     # must join this sweep).
     assert set(ui.routes) == {
         "/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply", "/instance",
-        "/wizard", "/language",
+        "/wizard", "/language", "/console", "/feed",
     }
     driven = {label for label, _response, _accepted in audited}
-    assert {"GET /wizard", "POST /language"} <= driven
+    assert {"GET /wizard", "POST /language", "GET /console", "GET /feed"} <= driven
     json_answers = [label for label, response, _ in audited if response.content_type == "application/json"]
-    assert json_answers and set(json_answers) == {"GET /instance"}
+    assert json_answers and set(json_answers) == {"GET /instance", "GET /feed"}
     assert {response.content_type.split(";")[0] for _, response, _ in audited} <= {
         "text/html", "text/plain", "application/json",
     }

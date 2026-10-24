@@ -30,6 +30,12 @@ The first-run wizard's screens (``/wizard``) and the language choice
 validates the screens, and the UI hands it the per-process fingerprint key,
 the first-run decision taken at construction, the stored credentials and
 its environment. The wizard never calls the supervisor.
+
+The console (``/console``) and its feed poll (``/feed``) are routes of the
+same table too (phase 9 R7): :mod:`core.config_ui.console` reads the
+runtime's supervision feed and renders the runtime state, each enabled
+module, the feed newest first and the configured grants in the chosen
+language, every value through :func:`esc`.
 """
 
 from __future__ import annotations
@@ -72,7 +78,7 @@ import yaml
 
 from core.actions import ANY_ACTION
 from core.bus import EventBus
-from core.config_ui import locations
+from core.config_ui import console, locations
 from core.config_ui.i18n import StringTable
 from core.config_ui.launcher import (
     LauncherError,
@@ -2974,6 +2980,8 @@ class ConfigUI:
             INSTANCE_ROUTE: (frozenset({"GET"}), self._instance_endpoint),
             WIZARD_ROUTE: (frozenset({"GET", "POST"}), self._wizard_endpoint),
             LANGUAGE_ROUTE: (frozenset({"POST"}), self._language_endpoint),
+            LANDING_CONSOLE: (frozenset({"GET"}), self._console_page),
+            console.FEED_ROUTE: (frozenset({"GET"}), self._feed_endpoint),
         }
 
     def __repr__(self) -> str:
@@ -3284,6 +3292,65 @@ class ConfigUI:
         except WizardStateError:
             return LANDING_WIZARD
         return landing_target(self.settings, state)
+
+    # -- the console (R7, R2) -------------------------------------------------
+
+    def _console_page(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``/console`` (R7): the runtime state from the status record and
+        the supervisor's child, each enabled module, the feed newest first,
+        the configured grants and the editor link, in the chosen language.
+        While the wizard is unfinished it is the landing page instead (A7)."""
+
+        if self._wizard_open():
+            return UIResponse(status=303, headers=(("Location", LANDING_WIZARD),))
+        view = self.view()
+        running = self.running_state()
+        feed = console.read_feed(self.settings.feed_path)
+        record = running.live_record
+        health = console.module_health(
+            view.enabled_modules(), None if record is None else record.modules, feed
+        )
+        wizard = self.wizard
+        language = wizard.language
+        body = console.render_console(
+            console.runtime_state(alive=running.alive, supervised=running.supervised),
+            feed,
+            health,
+            console.grants_of(view.rules(), any_action=ANY_ACTION),
+            language,
+            wizard.table,
+            escape=esc,
+        )
+        title = wizard.table.sentence(language, "console.title")
+        return _page(title, session, body, language=language)
+
+    def _feed_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``/feed?after=<sequence>&at=<time>`` (R7): the feed entries past the
+        cursor, rendered newest first as the console shows them, the new
+        cursor and its time, and whether the feed is a restarted runtime's
+        (then every retained entry is answered and the page replaces its list).
+        Only rendered, redacted items leave: no raw entry field is answered."""
+
+        presented = request.query.get(console.FEED_CURSOR, "0")
+        if not presented.isascii() or not presented.isdigit():
+            return _text(400, "400 Bad Request: the cursor must be a sequence number.")
+        after = int(presented)
+        at = request.query.get(console.FEED_CURSOR_AT, "")
+        if len(at) > console.FEED_CURSOR_AT_MAX:
+            return _text(400, "400 Bad Request: the cursor time is too long.")
+        # A fresh snapshot first, as every page takes one: the redaction
+        # guard then knows the configured secrets even when the poll is the
+        # first request this UI answers (R4).
+        self.view()
+        page = console.poll_feed(self.settings.feed_path, after, at or None)
+        wizard = self.wizard
+        items = console.render_feed_items(page.entries, wizard.language, wizard.table, escape=esc)
+        document = {"cursor": page.cursor, "at": page.at, "reset": page.reset, "items": items}
+        return UIResponse(
+            status=200,
+            body=json.dumps(document, ensure_ascii=False).encode("utf-8"),
+            content_type="application/json",
+        )
 
     # -- the status record (R7, R4) --------------------------------------------
 
