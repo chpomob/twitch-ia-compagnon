@@ -60,6 +60,11 @@ discovery, shape and identifiers are ``test_docs_bilingual.py``'s): the
 default location and the credential directory on each platform, spelled
 from :mod:`core.config_ui.locations`, the credential file's name, the
 install path and ``--install-launcher``, and the documentation index's links.
+
+P18 (R8, A3b): the trial-record template and its approval checker (AC25):
+``trial_record_problems`` returns every reason the phase gate refuses an
+approval. The fifteen-minute claim rests on the operator's record only (D1);
+no test here claims it.
 """
 
 from __future__ import annotations
@@ -79,6 +84,7 @@ import stat
 import sys
 import threading
 import webbrowser
+from datetime import datetime
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -5487,3 +5493,378 @@ def test_ac24_the_documentation_index_links_both_guides() -> None:
     for guide in FIRST_RUN_GUIDES:
         assert guide.is_file(), guide.name
         assert f"]({guide.name})" in index, guide.name
+
+
+# --------------------------------------------------------------------------- #
+# P18 (R8, A3b): the trial-record template and its approval checker (AC25)
+# --------------------------------------------------------------------------- #
+
+TRIAL_RECORD = ROOT / "docs" / "campaigns" / "phase9" / "trial-record.md"
+
+#: Amendment A1's criterion, as the record must state it.
+TRIAL_CRITERION = (
+    "from a working install to a first run in under fifteen minutes, "
+    "without a terminal and without YAML"
+)
+
+#: The 13 labelled fields of R8, in the template's order.
+TRIAL_FIELDS = (
+    "Date",
+    "Commit",
+    "Machine and platform",
+    "Install method (who, by which means, terminal used)",
+    "Install duration (minutes)",
+    "Profile",
+    "Trial start",
+    "Per-screen times",
+    "First-run time",
+    "Elapsed minutes",
+    "Terminal/YAML touched",
+    "Outcome",
+    "Limits",
+)
+_INSTALL_METHOD, _INSTALL_DURATION, _ELAPSED = TRIAL_FIELDS[3], TRIAL_FIELDS[4], TRIAL_FIELDS[9]
+_PLATFORM, _START, _SCREENS, _FIRST_RUN, _TOUCHED = (
+    TRIAL_FIELDS[2],
+    TRIAL_FIELDS[6],
+    TRIAL_FIELDS[7],
+    TRIAL_FIELDS[8],
+    TRIAL_FIELDS[10],
+)
+#: The five sub-fields of "Per-screen times".
+TRIAL_SCREENS = tuple(f"Screen {n} passed" for n in range(1, 6))
+TRIAL_STATUSES = ("not run", "run", "approved")
+
+#: The single time format the template prescribes: ISO local time, to the
+#: second, with its offset. ``Z``, a space, a missing offset or missing
+#: seconds are refused rather than guessed.
+_TRIAL_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}")
+_TRIAL_MINUTES = re.compile(r"\d+(?:\.\d+)?")
+_TRIAL_PLATFORM = re.compile(r"\b(?:Linux|macOS|Windows)\b", re.IGNORECASE)
+_NON_VALUES = {"-", "--", "\u2013", "\u2014", "?", "...", "\u2026", "n/a", "na", "none", "tbd", "todo", "unknown"}
+_TRIAL_LINE = re.compile(r"^(?P<indent>\s*)- (?P<label>[^:\n]+):(?P<value>.*)$")
+
+
+def _trial_values(text: str) -> dict[str, list[str]]:
+    """Every known label of the ``## Record`` section mapped to its values
+    (top-level fields at no indent, screen sub-fields indented), a value
+    stripped of whitespace and of one pair of enclosing backticks."""
+
+    _, heading, record = text.partition("\n## Record\n")
+    values: dict[str, list[str]] = {}
+    if not heading:
+        return values
+    for line in record.splitlines():
+        if line.startswith("## "):
+            break
+        match = _TRIAL_LINE.match(line)
+        if match is None:
+            continue
+        label = match["label"]
+        known = TRIAL_SCREENS if match["indent"] else TRIAL_FIELDS
+        if label in known:
+            value = match["value"].strip()
+            if len(value) >= 2 and value[0] == value[-1] == "`":
+                value = value[1:-1].strip()
+            values.setdefault(label, []).append(value)
+    return values
+
+
+def _trial_status(text: str) -> str | None:
+    match = re.search(r"^Status: (.*)$", text, re.MULTILINE)
+    return match[1].strip() if match else None
+
+
+def trial_record_problems(text: str) -> list[str]:
+    """Every reason AC25 refuses an approval of the trial record *text*; an
+    empty list is an approvable record. It checks completeness and
+    consistency only: whether a person was fast is the record's to say (D1)."""
+
+    values = _trial_values(text)
+    problems: list[str] = []
+    given: dict[str, str] = {}
+    for label in (*TRIAL_FIELDS, *TRIAL_SCREENS):
+        found = values.get(label, [])
+        if not found:
+            problems.append(f"{label}: absent")
+        elif len(found) > 1:
+            problems.append(f"{label}: given {len(found)} times")
+        elif label != _SCREENS:
+            if found[0]:
+                given[label] = found[0]
+            else:
+                problems.append(f"{label}: empty")
+
+    method = given.get(_INSTALL_METHOD)
+    if method is not None and (method.lower() in _NON_VALUES or re.fullmatch(r"<.*>", method)):
+        problems.append(f"{_INSTALL_METHOD}: not a value ({method!r})")
+    minutes: dict[str, float] = {}
+    for label in (_INSTALL_DURATION, _ELAPSED):
+        value = given.get(label)
+        if value is None:
+            continue
+        if _TRIAL_MINUTES.fullmatch(value):
+            minutes[label] = float(value)
+        else:
+            problems.append(f"{label}: not a value, a number of minutes is expected ({value!r})")
+    platform = given.get(_PLATFORM)
+    if platform is not None and not _TRIAL_PLATFORM.search(platform):
+        problems.append(f"{_PLATFORM}: names none of Linux, macOS or Windows ({platform!r})")
+    touched = given.get(_TOUCHED)
+    if touched is not None and touched.lower() != "no":
+        problems.append(f"{_TOUCHED}: not \"no\" ({touched!r})")
+
+    times: dict[str, datetime] = {}
+    for label in (_START, *TRIAL_SCREENS, _FIRST_RUN):
+        value = given.get(label)
+        if value is None:
+            continue
+        if _TRIAL_TIME.fullmatch(value):
+            try:
+                times[label] = datetime.fromisoformat(value)
+            except ValueError as error:
+                problems.append(f"{label}: not a real date and time ({value!r}: {error})")
+        else:
+            problems.append(
+                f"{label}: not an ISO local time with offset, as 2026-10-25T14:03:00+02:00 ({value!r})"
+            )
+    sequence = [(label, times[label]) for label in (*TRIAL_SCREENS, _FIRST_RUN) if label in times]
+    start = times.get(_START)
+    if start is not None:
+        early = [label for label, moment in sequence if moment < start]
+        if early:
+            problems.append(f"before the trial start: {', '.join(early)}")
+    backwards = [
+        f"{later} before {earlier}"
+        for (earlier, first), (later, second) in zip(sequence, sequence[1:])
+        if second < first
+    ]
+    if backwards:
+        problems.append(f"times not non-decreasing: {', '.join(backwards)}")
+    elapsed = minutes.get(_ELAPSED)
+    if elapsed is not None:
+        if start is not None and _FIRST_RUN in times:
+            measured = (times[_FIRST_RUN] - start).total_seconds() / 60
+            if abs(elapsed - measured) > 1:
+                problems.append(
+                    f"{_ELAPSED}: {_minutes_text(elapsed)} is not first-run time minus trial start "
+                    f"({_minutes_text(measured)}, to the minute)"
+                )
+        if elapsed >= 15:
+            problems.append(f"{_ELAPSED}: {_minutes_text(elapsed)} is 15 or more")
+    return problems
+
+
+def _minutes_text(minutes: float) -> str:
+    return f"{minutes:g}"
+
+
+_CONFORMING_TRIAL = {
+    "Date": "2026-10-25",
+    "Commit": "`2c123b8`",
+    "Machine and platform": "the streamer's desktop, Windows 11 23H2",
+    _INSTALL_METHOD: "the operator, by following docs/installation.md, with a terminal",
+    _INSTALL_DURATION: "35",
+    "Profile": "chat Q&A",
+    _START: "2026-10-25T14:00:00+02:00",
+    _SCREENS: "",
+    "Screen 1 passed": "2026-10-25T14:01:10+02:00",
+    "Screen 2 passed": "2026-10-25T14:03:00+02:00",
+    "Screen 3 passed": "2026-10-25T14:05:20+02:00",
+    "Screen 4 passed": "2026-10-25T14:08:00+02:00",
+    "Screen 5 passed": "2026-10-25T14:10:40+02:00",
+    _FIRST_RUN: "2026-10-25T14:11:30+02:00",
+    _ELAPSED: "11.5",
+    _TOUCHED: "no",
+    "Outcome": "a run recorded in the console for a chat question",
+    "Limits": "the install still needs a terminal (Phase 10)",
+}
+
+
+def _trial_record(**changes: str | None) -> str:
+    """A record rendered as the template lays it out, the conforming values
+    replaced by *changes* (a label given ``None`` is left out)."""
+
+    fields = {**_CONFORMING_TRIAL, **changes}
+    lines = ["# Trial record", "", "Status: run", "", "## Record", ""]
+    for label in TRIAL_FIELDS:
+        if fields.get(label) is not None:
+            lines.append(f"- {label}: {fields[label]}".rstrip())
+        if label == _SCREENS:
+            lines.extend(
+                f"  - {screen}: {fields[screen]}".rstrip()
+                for screen in TRIAL_SCREENS
+                if fields.get(screen) is not None
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _changed(label: str, value: str | None) -> dict[str, str | None]:
+    return {label: value}
+
+
+_TRIAL_VIOLATIONS = [
+    *[
+        pytest.param(_changed(label, None), f"{label}: absent", id=f"absent-{label}")
+        for label in (*TRIAL_FIELDS, *TRIAL_SCREENS)
+    ],
+    *[
+        pytest.param(_changed(label, ""), f"{label}: empty", id=f"empty-{label}")
+        for label in (*TRIAL_FIELDS, *TRIAL_SCREENS)
+        if label != _SCREENS
+    ],
+    *[
+        pytest.param(_changed(_INSTALL_METHOD, value), "not a value", id=f"install-method-{value}")
+        for value in ("n/a", "TBD", "-", "<who, means, terminal>")
+    ],
+    pytest.param(_changed(_INSTALL_DURATION, "about half an hour"), "number of minutes", id="duration-words"),
+    pytest.param(_changed(_INSTALL_DURATION, "?"), "number of minutes", id="duration-placeholder"),
+    pytest.param(_changed(_ELAPSED, "soon"), "number of minutes", id="elapsed-words"),
+    pytest.param(_changed(_ELAPSED, "11 min"), "number of minutes", id="elapsed-unit"),
+    pytest.param(_changed(_PLATFORM, "a laptop, Ubuntu 24.04"), "names none", id="platform-distribution"),
+    pytest.param(_changed(_PLATFORM, "a Mac"), "names none", id="platform-mac"),
+    pytest.param(_changed(_TOUCHED, "yes"), 'not "no"', id="touched-yes"),
+    pytest.param(_changed(_TOUCHED, "only once"), 'not "no"', id="touched-once"),
+    pytest.param(
+        {"Screen 3 passed": "2026-10-25T14:08:00+02:00", "Screen 4 passed": "2026-10-25T14:05:20+02:00"},
+        "Screen 4 passed before Screen 3 passed",
+        id="screens-out-of-order",
+    ),
+    pytest.param(
+        _changed("Screen 1 passed", "2026-10-25T13:59:00+02:00"),
+        "before the trial start: Screen 1 passed",
+        id="screen-before-start",
+    ),
+    pytest.param(
+        {_START: "2026-10-25T14:10:50+02:00", _ELAPSED: "0.67"},
+        "before the trial start: Screen 1 passed, Screen 2 passed, Screen 3 passed, "
+        "Screen 4 passed, Screen 5 passed",
+        id="start-after-the-screens",
+    ),
+    pytest.param(
+        {"Screen 5 passed": "2026-10-25T14:12:00+02:00"},
+        "First-run time before Screen 5 passed",
+        id="first-run-before-screen-five",
+    ),
+    pytest.param(_changed(_ELAPSED, "9"), "is not first-run time minus trial start", id="elapsed-mismatch"),
+    pytest.param(_changed(_ELAPSED, "13"), "is not first-run time minus trial start", id="elapsed-past-one"),
+    pytest.param(
+        {_FIRST_RUN: "2026-10-25T14:15:00+02:00", _ELAPSED: "15"}, "is 15 or more", id="elapsed-fifteen"
+    ),
+    pytest.param(
+        {_FIRST_RUN: "2026-10-25T14:22:00+02:00", _ELAPSED: "22"}, "is 15 or more", id="elapsed-twenty-two"
+    ),
+    *[
+        pytest.param(_changed(_START, value), "not an ISO local time with offset", id=f"start-{value}")
+        for value in (
+            "2026-10-25 14:00:00+02:00",
+            "2026-10-25T14:00:00Z",
+            "2026-10-25T14:00:00",
+            "2026-10-25T14:00+02:00",
+            "14:00",
+        )
+    ],
+    pytest.param(
+        _changed("Screen 2 passed", "25/10/2026 14:03"), "not an ISO local time with offset", id="screen-format"
+    ),
+    *[
+        pytest.param(_changed(label, value), f"{label}: not a real date and time", id=f"impossible-{value}")
+        for label, value in (
+            (_START, "2026-02-30T14:00:00+02:00"),
+            (_START, "2026-13-25T14:00:00+02:00"),
+            ("Screen 3 passed", "2026-10-25T25:05:20+02:00"),
+            ("Screen 4 passed", "2026-10-25T14:61:00+02:00"),
+            (_FIRST_RUN, "2026-10-25T14:11:60+02:00"),
+            (_FIRST_RUN, "2026-10-25T14:11:30+24:00"),
+        )
+    ],
+]
+
+
+def test_ac25_the_template_carries_the_thirteen_labels_and_the_criterion() -> None:
+    """AC25 (R8, A3b): the record states the criterion in Amendment A1's
+    words and lays out the 13 labelled fields of R8 once each, the five
+    per-screen times under theirs, with the install among the limits; its
+    status is one of the three the gate reads."""
+
+    text = TRIAL_RECORD.read_text(encoding="utf-8")
+    assert TRIAL_CRITERION in " ".join(text.split())
+    assert len(TRIAL_FIELDS) == 13
+    values = _trial_values(text)
+    assert {label: len(found) for label, found in values.items()} == {
+        label: 1 for label in (*TRIAL_FIELDS, *TRIAL_SCREENS)
+    }
+    assert "Limits lists what remains, the install step first" in text
+    assert _trial_status(text) in TRIAL_STATUSES
+    example = re.search(r"`(\d{4}-[^`]+)`", text)
+    assert example is not None and _TRIAL_TIME.fullmatch(example[1])
+
+
+def test_ac25_the_unfilled_template_is_not_approvable() -> None:
+    """AC25: the record with every value blanked (the template as shipped)
+    is refused, every field and screen named among the reasons."""
+
+    text = TRIAL_RECORD.read_text(encoding="utf-8")
+    blank = "\n".join(
+        line[: match.end("label") + 1] if (match := _TRIAL_LINE.match(line)) else line
+        for line in text.splitlines()
+    )
+    problems = trial_record_problems(blank)
+    named = {problem.split(":", 1)[0] for problem in problems}
+    assert named == {*TRIAL_FIELDS, *TRIAL_SCREENS} - {_SCREENS}, problems
+
+
+def test_ac25_the_record_on_file_is_approved_only_without_a_problem() -> None:
+    """AC25 (D1): the record on file is the operator's. While it is ``not
+    run`` the checker reports it not approvable (asserted, not a failure);
+    once its status says ``approved`` the checker must find no problem."""
+
+    text = TRIAL_RECORD.read_text(encoding="utf-8")
+    status = _trial_status(text)
+    problems = trial_record_problems(text)
+    if status == "approved":
+        assert problems == []
+    elif status == "not run":
+        assert problems
+
+
+def test_ac25_the_checker_accepts_a_conforming_record() -> None:
+    """AC25: a complete, consistent record under fifteen minutes passes, with
+    ±1 minute of rounding on the elapsed minutes either way."""
+
+    assert trial_record_problems(_trial_record()) == []
+    assert trial_record_problems(_trial_record(**{_ELAPSED: "12"})) == []
+    assert trial_record_problems(_trial_record(**{_ELAPSED: "10.5"})) == []
+    assert trial_record_problems(_trial_record(**{_TOUCHED: "No", _PLATFORM: "MacBook, macOS 15.1"})) == []
+
+
+@pytest.mark.parametrize(("changes", "reason"), _TRIAL_VIOLATIONS)
+def test_ac25_the_checker_refuses_each_violation_with_one_problem(
+    changes: dict[str, str | None], reason: str
+) -> None:
+    """AC25: each refusal reason, alone in its own fixture, is the one problem
+    reported."""
+
+    problems = trial_record_problems(_trial_record(**changes))
+    assert len(problems) == 1 and reason in problems[0], problems
+
+
+def test_ac25_a_field_given_twice_or_outside_the_record_section_is_refused() -> None:
+    """AC25: a label given twice is refused, and a record without its
+    ``## Record`` section reports every field absent."""
+
+    record = _trial_record().replace("- Outcome:", "- Outcome: first\n- Outcome:")
+    assert trial_record_problems(record) == ["Outcome: given 2 times"]
+    unsectioned = trial_record_problems(_trial_record().replace("## Record", "## Notes"))
+    assert unsectioned == [f"{label}: absent" for label in (*TRIAL_FIELDS, *TRIAL_SCREENS)]
+
+
+def test_ac25_an_impossible_time_is_reported_alongside_the_other_problems() -> None:
+    """AC25: a time of the prescribed shape that names no real moment is a
+    refusal reason like any other, not an error that hides the rest."""
+
+    problems = trial_record_problems(
+        _trial_record(**{_START: "2026-02-30T14:00:00+02:00", _TOUCHED: "yes", "Outcome": None})
+    )
+    assert [problem.split(":", 1)[0] for problem in problems] == ["Outcome", _TOUCHED, _START], problems
+    assert "not a real date and time" in problems[2]
