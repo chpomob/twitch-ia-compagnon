@@ -40,6 +40,15 @@ P11 (R5 screen 5, DD6): ``core.main.dry_run`` over each generated profile
 with a fake model answering ``"bonjour"`` (AC9, AC29's record half): the run
 id read back against the scheduler's record and the feed's run entries, the
 platform's sessions inert and never asked anything, no process started.
+
+P12 (R5, A7, R2, R4): the five wizard screens through ``ConfigUI.handle``
+with fake platform and model endpoints, a fake (and, for AC29, the real)
+dry-run entry and the manual clock: the order gating and its fingerprint
+table (AC13, the replaced-credential case and the state-file sweep of every
+HMAC), the language choice (AC6, AC7), screen 4's refusals, check and
+read-only view (AC16, AC11's response sweep), the failure pages (AC17),
+regeneration of the wizard's own files (AC28), screen 5's record (AC29) and
+the re-entry after a restart (AC30).
 """
 
 from __future__ import annotations
@@ -4214,3 +4223,1130 @@ def test_dd6_the_command_line_is_unchanged() -> None:
 
     with pytest.raises(SystemExit):
         application.main(["--config", "x.yaml", "--dry-run"])
+
+
+# --------------------------------------------------------------------------- #
+# P12 (R5, A7, R2, R4): the five screens, their server-side gating, the
+# regeneration of the wizard's own files and the re-entry after a restart
+# --------------------------------------------------------------------------- #
+
+import base64  # noqa: E402
+import hmac  # noqa: E402
+import html as _html  # noqa: E402
+from urllib.parse import quote, urlencode  # noqa: E402
+
+TOK_A = "tok_A-wizard-7c1f9e"
+TOK_B = "tok_B-wizard-2d9e4a"
+WIZARD_CLIENT_ID = "client-wizard-5q2xk"
+WIZARD_SECRET = "secret-wizard-8n4pd"
+WIZARD_MODEL_KEY = "key-wizard-3m7ur"
+WIZARD_MODEL_KEY_B = "key-wizard-b-6t1zo"
+WIZARD_TRANSCRIPTION_KEY = "key-transcription-9v5wc"
+WIZARD_VALUES = (
+    TOK_A, TOK_B, WIZARD_CLIENT_ID, WIZARD_SECRET, WIZARD_MODEL_KEY, WIZARD_MODEL_KEY_B,
+    WIZARD_TRANSCRIPTION_KEY,
+)
+WIZARD_REWARDS = [
+    {"id": "reward-id-ask-1", "title": "Ask the companion"},
+    {"id": "reward-id-hug-2", "title": "Send a hug"},
+]
+
+
+class _PlatformFake:
+    """The platform's validation and reward-list endpoints (no socket): the
+    validation answers by the presented token, every request is recorded."""
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.tokens: dict[str, Any] = {}
+        self.default: Any = None
+        self.rewards: Any = _json(200, {"data": WIZARD_REWARDS})
+        self.validations: list[str] = []
+        self.reward_reads: list[str] = []
+
+    def accept(self, token: str, **overrides: Any) -> None:
+        answer = {
+            "client_id": WIZARD_CLIENT_ID,
+            "login": "streamer_x",
+            "scopes": sorted({scope for profile in _profiles().values() for scope in profile.scopes}),
+            "user_id": "123",
+            "expires_in": 5000,
+        }
+        answer.update(overrides)
+        self.tokens[token] = _json(200, answer)
+
+    async def __call__(
+        self, method: str, url: str, *, headers: Any, body: bytes | None, timeout: float
+    ) -> wizard.HttpAnswer:
+        authorization = dict(headers)["Authorization"]
+        token = authorization.split(" ", 1)[1]
+        if "reward" in url:
+            self.reward_reads.append(token)
+            return self.rewards(self.clock)
+        self.validations.append(token)
+        answer = self.tokens.get(token, self.default)
+        if answer is None:
+            answer = _json(401, {"status": 401, "message": "invalid access token"})
+        return answer(self.clock)
+
+
+class _DryRuns:
+    """A fake dry-run entry: records each call and answers ``make(event)``."""
+
+    def __init__(self, clock: _Clock, make: Any = None) -> None:
+        self.clock = clock
+        self.calls: list[dict[str, Any]] = []
+        self.make = make if make is not None else _dry_record()
+
+    async def __call__(self, path: Path, event: Any, *, environ: Any, clock: Any, timeout: float) -> Any:
+        self.calls.append({"path": Path(path), "event": event, "environ": dict(environ), "timeout": timeout})
+        return self.make(event, self.clock)
+
+
+def _dry_record(outcome: str = "completed", **overrides: Any) -> Any:
+    def make(event: dict[str, Any], clock: _Clock) -> Any:
+        fields = {
+            "run_id": "run-dry-0001",
+            "outcome": outcome,
+            "reason": "success" if outcome == "completed" else "probability",
+            "origin": "dry_run",
+            "event": {
+                "input": event["metadata"]["source"],
+                "kind": event["payload"].get("kind", "message"),
+                "message_id": event["payload"]["message_id"],
+            },
+        }
+        fields.update(overrides)
+        return application.DryRunRecord(**fields)
+
+    return make
+
+
+class _Flow:
+    """One ConfigUI over a first-run profile, driven through its routes."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        name: str = "profile.yaml",
+        clock: _Clock | None = None,
+        platform: _PlatformFake | None = None,
+        dry: _DryRuns | None = None,
+        model: Any = None,
+        default: bool = False,
+    ) -> None:
+        self.root = root
+        if default:
+            # The A2 default location (no --config): the per-user directory,
+            # created owner-only as main() creates it.
+            self.profile = root / "xdg" / PRODUCT / "profile.yaml"
+            self.profile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            argv: list[str] = []
+        else:
+            self.profile = root / "site" / name
+            self.profile.parent.mkdir(parents=True, exist_ok=True)
+            argv = ["--config", str(self.profile)]
+        self.clock = clock or _Clock()
+        self.platform = platform or _PlatformFake(self.clock)
+        self.model = _FakeTransport(self.clock, model or _json(200, _COMPLETION))
+        self.dry = dry or _DryRuns(self.clock)
+        self.ui = config_ui.ConfigUI(
+            config_ui.UISettings.from_argv(argv),
+            environ={},
+            wizard_seams=wizard.WizardSeams(
+                platform_transport=self.platform,
+                model_transport=self.model,
+                dry_runner=self.dry,
+                clock=self.clock,
+            ),
+        )
+        self.starts = 0
+
+        def start(*args: Any, **kwargs: Any) -> Any:
+            self.starts += 1
+            raise AssertionError("the wizard started the runtime")
+
+        self.ui.supervisor.start = start  # type: ignore[method-assign]
+        self.landing, self.cookie = _access(self.ui)
+        session = self.ui._session(_ui_request("GET", "/", headers={"cookie": self.cookie}))
+        assert session is not None
+        self.csrf = session.csrf_token
+        self.responses: list[tuple[str, Any]] = [("GET /", self.landing)]
+
+    def close(self) -> None:
+        config_ui._LOG_REDACTION.sources.discard(self.ui)
+
+    @property
+    def location(self) -> str:
+        return dict(self.landing.headers)["Location"]
+
+    def get(self, path: str = "/wizard", **query: str) -> Any:
+        response = self.ui.handle(_ui_request("GET", path, query=query, headers={"cookie": self.cookie}))
+        self.responses.append((f"GET {path} {query}", response))
+        return response
+
+    def post(self, path: str, fields: dict[str, str], *, content_type: str | None = None, body: bytes | None = None) -> Any:
+        payload = body if body is not None else urlencode({**fields, "csrf_token": self.csrf}).encode()
+        request = config_ui.UIRequest(
+            method="POST", path=path, query={},
+            headers={
+                "host": "127.0.0.1:8765", "cookie": self.cookie, "x-csrf-token": self.csrf,
+                "content-type": content_type or "application/x-www-form-urlencoded",
+            },
+            body=payload,
+        )
+        response = self.ui.handle(request)
+        self.responses.append((f"POST {path} {sorted(fields)}", response))
+        return response
+
+    def screen(self, number: int, **fields: str) -> Any:
+        return self.post("/wizard", {"screen": str(number), **fields})
+
+    # -- the screens, passed with the fixture inputs ----------------------- #
+
+    def choice(self, profile_id: str = "chat_qa", language: str = "en", **overrides: str) -> Any:
+        fields = {"language": language, "profile": profile_id, **_choice_fields(profile_id)}
+        fields.update(overrides)
+        return self.screen(1, **fields)
+
+    def platform_screen(self, token: str = TOK_A, client_id: str = WIZARD_CLIENT_ID, **extra: str) -> Any:
+        fields = {
+            "credential.TWITCH_CLIENT_ID": client_id,
+            "credential.TWITCH_CLIENT_SECRET": WIZARD_SECRET,
+            "credential.TWITCH_ACCESS_TOKEN": token,
+        }
+        fields.update(extra)
+        return self.screen(2, **fields)
+
+    def model_screen(self, profile_id: str = "chat_qa", key: str = WIZARD_MODEL_KEY, **extra: str) -> Any:
+        fields = {
+            f"parameter.{profile_id}.model_endpoint": "https://model.invalid/v1/chat/completions",
+            f"parameter.{profile_id}.model_name": "fixture-model",
+            "credential.MODEL_API_KEY": key,
+        }
+        fields.update(extra)
+        return self.screen(3, **fields)
+
+    def through(self, profile_id: str = "chat_qa", upto: int = 5) -> None:
+        """Pass screens 1..*upto* with the fixture inputs, each asserted."""
+
+        self.platform.accept(TOK_A)
+        steps = [
+            lambda: self.choice(profile_id),
+            lambda: self._platform_pass(profile_id),
+            lambda: self.model_screen(profile_id) if profile_id != "silent" else self.screen(3),
+            lambda: self.screen(4),
+            lambda: self.screen(5),
+        ]
+        for number, step in enumerate(steps[:upto], start=1):
+            response = step()
+            assert _passed(response), (number, _cause(response), _text_of(response))
+
+    def _platform_pass(self, profile_id: str) -> Any:
+        response = self.platform_screen()
+        if profile_id == "channel_points":
+            assert _cause(response) == wizard.REWARD_NOT_PICKED
+            response = self.screen(2, **{"parameter.channel_points.reward_id": WIZARD_REWARDS[0]["id"]})
+        return response
+
+    def bodies(self) -> list[tuple[str, str]]:
+        found = []
+        for label, response in self.responses:
+            found.append((label, response.body.decode("utf-8")))
+            found += [(f"{label} header", f"{name}: {value}") for name, value in response.headers]
+        return found
+
+    def state(self) -> dict[str, Any]:
+        return json.loads(wizard.state_path(self.ui.base_path).read_text(encoding="utf-8"))
+
+
+def _choice_fields(profile_id: str) -> dict[str, str]:
+    if profile_id == "chat_qa":
+        return {"parameter.chat_qa.companion_name": "Nova"}
+    if profile_id == "spoken_keyword":
+        return {
+            "parameter.spoken_keyword.wake_word": "hey nova",
+            "parameter.spoken_keyword.recorder": "recorder --wav -",
+            "parameter.spoken_keyword.detector.kind": "command",
+            "parameter.spoken_keyword.detector.argv": "detector --phrase 'hey nova'",
+            "parameter.spoken_keyword.transcription_endpoint": "https://transcription.invalid/v1",
+            "parameter.spoken_keyword.transcription_model": "fixture-transcriber",
+            "credential.TRANSCRIPTION_API_KEY": WIZARD_TRANSCRIPTION_KEY,
+        }
+    return {}
+
+
+def _text_of(response: Any) -> str:
+    return response.body.decode("utf-8")
+
+
+def _passed(response: Any) -> bool:
+    return 'data-passed="true"' in _text_of(response)
+
+
+def _screen_of(response: Any) -> int | None:
+    match = re.search(r'<main id="wizard" data-screen="(\d)"', _text_of(response))
+    return None if match is None else int(match.group(1))
+
+
+def _cause(response: Any) -> str | None:
+    match = re.search(r'class="failure" data-cause="([^"]+)"', _text_of(response))
+    return None if match is None else match.group(1)
+
+
+def _next_open(response: Any) -> bool:
+    return 'id="next"' in _text_of(response)
+
+
+def _value_forms(value: str) -> list[str]:
+    """A value and its URL-encoded, HTML-escaped and JSON-escaped forms."""
+
+    return [value, quote(value, safe=""), _html.escape(value), json.dumps(value)[1:-1]]
+
+
+@pytest.fixture
+def flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """A factory of :class:`_Flow` over one per-user directory (A1, linux)."""
+
+    _default_environment(monkeypatch, tmp_path / "xdg")
+    made: list[_Flow] = []
+
+    def make(**options: Any) -> _Flow:
+        made.append(_Flow(tmp_path, **options))
+        return made[-1]
+
+    yield make
+    for item in made:
+        item.close()
+
+
+def _credential_files(tmp_path: Path) -> list[Path]:
+    return sorted((tmp_path / "xdg" / PRODUCT).glob("*.credentials.json"))
+
+
+def test_ac2_following_the_first_run_redirect_renders_screen_one(flow) -> None:
+    """AC2 (wizard half, R1): at first run the access URL's redirect, followed
+    with the session cookie, renders the wizard's first screen with its 4
+    profile options."""
+
+    run = flow()
+    assert not run.profile.exists()
+    assert run.location == "/wizard"
+    page = run.get(run.location)
+    assert page.status == 200 and page.content_type.startswith("text/html")
+    assert _screen_of(page) == 1
+    assert _text_of(page).count('type="radio" name="profile"') == 4
+    # The guards are the existing chain: no session, no wizard.
+    anonymous = run.ui.handle(_ui_request("GET", "/wizard"))
+    assert anonymous.status == 401 and b"wizard" not in anonymous.body
+
+
+@pytest.mark.parametrize("language", ["en", "fr"])
+def test_ac7_the_choice_screen_offers_four_profiles_in_order(flow, language: str) -> None:
+    """AC7 (R3): exactly 4 options, chat Q&A, channel points, spoken keyword,
+    silent, each with its name and description from the table."""
+
+    run = flow()
+    if language != "en":
+        moved = run.post("/language", {"language": language})
+        assert moved.status == 303 and dict(moved.headers)["Location"] == "/wizard"
+    page = _text_of(run.get())
+    assert f'<html lang="{language}">' in page
+    assert re.findall(r'type="radio" name="profile" value="([a-z_]+)"', page) == list(PROFILE_ORDER)
+    names = re.findall(r'<span class="profile-name">([^<]*)</span>', page)
+    descriptions = re.findall(r'<p class="profile-description">([^<]*)</p>', page)
+    assert names == [_html.escape(_EN.sentence(language, f"profile.{pid}.name")) for pid in PROFILE_ORDER]
+    assert descriptions == [
+        _html.escape(_EN.sentence(language, f"profile.{pid}.description")) for pid in PROFILE_ORDER
+    ]
+
+
+def test_ac6_french_on_screen_one_renders_the_next_page_in_french_and_survives(flow) -> None:
+    """AC6 (choice half, R2, DD3): ``fr`` chosen on screen 1 renders the next
+    page with its French sentences, and the choice survives a new ConfigUI
+    over the same profile directory (it lives in the state file)."""
+
+    run = flow()
+    assert _passed(run.choice("chat_qa", language="fr"))
+    following = _text_of(run.get(screen="2"))
+    assert '<html lang="fr">' in following
+    for key in ("wizard.screen2.title", "wizard.credential.access_token", "wizard.check"):
+        assert _html.escape(_EN.sentence("fr", key)) in following, key
+        assert _html.escape(_EN.sentence("en", key)) not in following, key
+    assert run.state()["language"] == "fr"
+
+    again = flow()
+    assert again.location == "/wizard"
+    page = _text_of(again.get())
+    assert '<html lang="fr">' in page and _html.escape(_EN.sentence("fr", "wizard.title")) in page
+    # /language moves it back, persisted the same way.
+    assert again.post("/language", {"language": "en"}).status == 303
+    assert again.state()["language"] == "en"
+    assert again.post("/language", {"language": "zz"}).status == 409
+    assert again.state()["language"] == "en"
+
+
+def _calls_of(run: _Flow, screen: int) -> int:
+    """The calls a screen's own validator received so far."""
+
+    if screen == 2:
+        return len(run.platform.validations)
+    if screen == 3:
+        return len(run.model.requests)
+    if screen == 4:
+        return int(run.profile.exists())
+    return len(run.dry.calls)
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 4])
+def test_ac13_each_screen_opens_only_once_the_previous_passed(flow, n: int) -> None:
+    """AC13 (R5): advancing to screen n+1 before screen n's success is refused,
+    re-renders screen n and makes 0 calls on the next screen's validator; a
+    GET of screen n+1 is refused the same way; once n passed, the next one
+    opens."""
+
+    run = flow()
+    run.platform.accept(TOK_A)
+    if n > 1:
+        run.through("chat_qa", upto=n - 1)
+    before = _calls_of(run, n + 1)
+    refused = run.screen(n + 1)
+    assert refused.status == 409 and _screen_of(refused) == n
+    assert _cause(refused) == wizard.ORDER_REFUSED and not _next_open(refused)
+    assert _calls_of(run, n + 1) == before
+    looked = run.get(screen=str(n + 1))
+    assert looked.status == 409 and _screen_of(looked) == n
+    step = {
+        1: lambda: run.choice(),
+        2: lambda: run.platform_screen(),
+        3: lambda: run.model_screen(),
+        4: lambda: run.screen(4),
+    }[n]
+    assert _passed(step())
+    opened = run.get(screen=str(n + 1))
+    assert opened.status == 200 and _screen_of(opened) == n + 1
+    assert run.starts == 0
+
+
+@pytest.mark.parametrize(
+    "n, change",
+    [
+        (1, lambda run: run.choice("chat_qa", **{"parameter.chat_qa.companion_name": "Orion"})),
+        (2, lambda run: run.platform_screen(client_id="client-other-0x")),
+        (3, lambda run: run.model_screen(**{"parameter.chat_qa.model_name": "other-model"})),
+    ],
+)
+def test_ac13_changing_a_validated_input_invalidates_it_and_every_later_screen(
+    flow, n: int, change: Any
+) -> None:
+    """AC13 (R5): after screens 1–4 passed, changing an input of screen n
+    leaves only the screens before n passed (screen n again when its new
+    input passes); a request for screen n+1 is refused again until n passes."""
+
+    run = flow()
+    run.through("chat_qa", upto=4)
+    assert run.ui.wizard.passed_screens() == (1, 2, 3, 4)
+    response = change(run)
+    kept = tuple(range(1, n + 1)) if _passed(response) else tuple(range(1, n))
+    assert run.ui.wizard.passed_screens() == kept
+    assert not any(run.ui.wizard.passed(number) for number in range(n + 1, 6))
+    refused = run.screen(n + 2) if n + 2 <= 5 else run.get(screen="5")
+    assert refused.status == 409 and _screen_of(refused) <= n + 1
+    if n == 2:
+        # A changed client id is validated again and refused: 2 stays open.
+        assert _cause(response) == wizard.CLIENT_ID_MISMATCH and not _next_open(response)
+        assert run.screen(3).status == 409
+
+
+def test_r5_a_replaced_credential_invalidates_its_screen_and_no_hmac_is_written(flow) -> None:
+    """R5 (plan P12, F-P3): fingerprints are value-sensitive without
+    persisting a secret. Replacing the token on screen 2 invalidates 2–5 and
+    the validator is called once with the new token; resubmitting it
+    unchanged keeps 2–5's records; replacing the model key on screen 3
+    invalidates 3–5, not 2. The state file holds no value, no HMAC and no
+    fingerprint computed with them, in hex or base64 (recomputed here through
+    the UI's own key), and not the key."""
+
+    run = flow()
+    wizard_ = run.ui.wizard
+    seen: set[str] = set()
+
+    def observe() -> None:
+        for number in wizard.SCREEN_NUMBERS:
+            seen.add(wizard_.fingerprint_of(number))
+
+    run.through("chat_qa", upto=3)
+    observe()
+    assert wizard_.passed_screens() == (1, 2, 3)
+
+    # tok_B refused first: 2–5 not passed, 3 refused until 2 passes again.
+    replaced = run.platform_screen(token=TOK_B)
+    observe()
+    assert run.platform.validations == [TOK_A, TOK_B]
+    assert _cause(replaced) == wizard.UNAUTHORIZED and wizard_.passed_screens() == (1,)
+    assert run.screen(3).status == 409
+    assert run.get(screen="3").status == 409
+
+    # tok_B accepted: exactly one more call, with tok_B; 3–5 must pass again.
+    run.platform.accept(TOK_B)
+    accepted = run.platform_screen(token=TOK_B)
+    observe()
+    assert run.platform.validations == [TOK_A, TOK_B, TOK_B]
+    assert _passed(accepted) and wizard_.passed_screens() == (1, 2)
+    assert run.screen(4).status == 409
+    assert _passed(run.model_screen())
+    assert wizard_.passed_screens() == (1, 2, 3)
+
+    # The same value resubmitted (typed again, or left empty: kept) changes nothing.
+    assert _passed(run.platform_screen(token=TOK_B))
+    assert _passed(run.platform_screen(token="", client_id=""))
+    assert run.platform.validations == [TOK_A, TOK_B, TOK_B]
+    assert wizard_.passed_screens() == (1, 2, 3)
+
+    # The model key: 3–5 invalidated, 2 kept, one more request with the new key.
+    requests = len(run.model.requests)
+    rekeyed = run.model_screen(key=WIZARD_MODEL_KEY_B)
+    observe()
+    assert _passed(rekeyed) and wizard_.passed_screens() == (1, 2, 3)
+    assert len(run.model.requests) == requests + 1
+    assert run.model.requests[-1]["headers"]["Authorization"].endswith(WIZARD_MODEL_KEY_B)
+    run.model.answer = _json(401, {"error": {"message": "bad key"}})
+    refused = run.model_screen(key=WIZARD_MODEL_KEY)
+    observe()
+    assert _cause(refused) == wizard.UNAUTHORIZED and wizard_.passed_screens() == (1, 2)
+    run.model.answer = _json(200, _COMPLETION)
+    assert _passed(run.model_screen(key=WIZARD_MODEL_KEY_B))
+    assert _passed(run.screen(4))
+    observe()
+
+    data = wizard.state_path(run.ui.base_path).read_bytes()
+    key = run.ui.fingerprint_key
+    digests = set(seen)
+    for value in (TOK_A, TOK_B, WIZARD_CLIENT_ID, WIZARD_SECRET, WIZARD_MODEL_KEY, WIZARD_MODEL_KEY_B):
+        assert value.encode() not in data
+        mac = hmac.new(key, value.encode("utf-8"), hashlib.sha256)
+        assert mac.hexdigest() == wizard_.credential_digest(value)
+        digests.add(mac.hexdigest())
+    forms: set[bytes] = {key.hex().encode(), base64.b64encode(key), base64.urlsafe_b64encode(key)}
+    for digest in digests:
+        raw = bytes.fromhex(digest)
+        forms |= {digest.encode(), base64.b64encode(raw), base64.urlsafe_b64encode(raw)}
+    assert not [form for form in forms if form in data]
+    assert len(digests) > 10
+    # The key and the table reach no response either.
+    for label, text in run.bodies():
+        assert key.hex() not in text and not any(digest in text for digest in digests), label
+
+
+def test_ac16_a_profile_that_appeared_after_detection_is_never_overwritten(flow) -> None:
+    """AC16 (R5, A7): a profile file that appears at the target after the UI
+    detected the first run makes screen 4 refuse; the file is byte-identical
+    afterwards and *next* stays closed."""
+
+    run = flow()
+    run.through("chat_qa", upto=3)
+    run.profile.write_text("enabled_modules: []\n# hand-written\n", encoding="utf-8")
+    before = run.profile.read_bytes()
+    refused = run.screen(4)
+    assert _cause(refused) == wizard.REFUSAL_APPEARED and not _next_open(refused)
+    assert run.profile.read_bytes() == before
+    assert _credential_files(run.root) == []
+    assert not run.ui.wizard.passed(4)
+
+
+def test_ac16_a_malformed_detector_names_the_field_and_keeps_next_closed(flow) -> None:
+    """AC16 (R5): the generated spoken-keyword profile with a malformed
+    detector fails the real configuration check (exit 2); screen 4 names
+    the offending field path in plain language and keeps *next* closed."""
+
+    run = flow()
+    run.platform.accept(TOK_A)
+    assert _passed(run.choice("spoken_keyword", **{"parameter.spoken_keyword.detector.kind": "telepathy"}))
+    assert _passed(run.platform_screen())
+    assert _passed(run.model_screen("spoken_keyword"))
+    failed = run.screen(4)
+    assert _cause(failed) == wizard.CHECK_FAILED_AT and not _next_open(failed)
+    field = "modules.audio_input.wake_word.detector.kind"
+    expected = _EN.sentence("en", "wizard.check_failed_at", field=field)
+    assert _html.escape(expected) in _text_of(failed)
+    assert "telepathy" not in _text_of(failed)
+    assert run.screen(5).status == 409 and run.dry.calls == []
+
+
+def test_ac16_the_profile_view_is_read_only_and_no_new_route_takes_yaml(flow) -> None:
+    """AC16 (R5, D6): the read-only view renders the written profile with 0
+    form controls; neither ``/wizard`` nor ``/language`` accepts YAML content
+    (a YAML body or field writes nothing); the editor's routes are unchanged."""
+
+    run = flow()
+    run.through("chat_qa", upto=4)
+    view = run.get(view="profile")
+    page = _text_of(view)
+    assert view.status == 200
+    assert _html.escape(run.profile.read_text(encoding="utf-8"), quote=True) in page
+    assert re.search(r"<(form|input|textarea|select|button)\b", page) is None
+    assert 'id="view-profile"' in _text_of(run.get(screen="4"))
+
+    written = run.profile.read_bytes()
+    marker = "modules_directory: /yaml-injected\nenabled_modules: [shell]\n"
+    for path in ("/wizard", "/language"):
+        run.post(path, {}, content_type="application/yaml", body=marker.encode())
+        run.post(path, {"screen": "4", "yaml": marker, "profile": marker, "content": marker})
+        assert run.profile.read_bytes() == written
+    assert run.ui.wizard.owns_profile()
+    assert "yaml-injected" not in run.profile.read_text(encoding="utf-8")
+    assert "yaml-injected" not in json.dumps(run.state())
+
+    editor = {
+        "/": frozenset({"GET"}), "/core": frozenset({"GET"}), "/module/": frozenset({"GET"}),
+        "/save": frozenset({"POST"}), "/remove": frozenset({"POST"}),
+        "/check": frozenset({"POST"}), "/apply": frozenset({"POST"}),
+    }
+    assert {path: run.ui.routes[path][0] for path in editor} == editor
+    assert {path: run.ui.routes[path][0] for path in ("/wizard", "/language")} == {
+        "/wizard": frozenset({"GET", "POST"}), "/language": frozenset({"POST"}),
+    }
+
+
+def test_the_wizard_routes_sit_behind_the_existing_guards(flow) -> None:
+    """R1: Host, session, method, Origin and CSRF refuse with the existing
+    routes' status codes, before any wizard work is done."""
+
+    run = flow()
+    run.platform.accept(TOK_A)
+    assert _passed(run.choice())
+    state_before = wizard.state_path(run.ui.base_path).read_bytes()
+
+    def request(method: str, path: str, **headers: str) -> Any:
+        body = urlencode({"screen": "2", "language": "fr", "csrf_token": headers.pop("csrf", run.csrf)})
+        return run.ui.handle(
+            config_ui.UIRequest(
+                method=method, path=path, query={},
+                headers={"content-type": "application/x-www-form-urlencoded", **headers},
+                body=body.encode(),
+            )
+        )
+
+    good = {"host": "127.0.0.1:8765", "cookie": run.cookie}
+    for path in ("/wizard", "/language"):
+        assert request("POST", path, host="evil.invalid", cookie=run.cookie).status == 403
+        assert request("POST", path, host="127.0.0.1:8765").status == 401
+        assert request("POST", path, **good, origin="http://evil.invalid").status == 403
+        assert request("POST", path, **good, csrf="wrong").status == 403
+    assert request("GET", "/language", **good).status == 405
+    assert request("PUT", "/wizard", **good, **{"x-csrf-token": run.csrf}).status == 405
+    assert run.platform.validations == [] and run.model.requests == []
+    assert wizard.state_path(run.ui.base_path).read_bytes() == state_before
+
+
+def _sweep_failures(texts: list[tuple[str, str]], submitted: tuple[str, ...]) -> None:
+    classes = re.compile(r"\b(" + "|".join(map(re.escape, _exception_class_names())) + r")\b")
+    for label, text in texts:
+        assert "Traceback" not in text and 'File "' not in text, label
+        assert classes.search(text) is None, (label, classes.search(text))
+        for value in submitted:
+            assert not any(form in text for form in _value_forms(value)), (label, value)
+
+
+def test_ac17_every_failure_page_is_plain_and_a_full_pass_starts_nothing(
+    flow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC17 (R5): every failure of screens 2–4 (AC14–AC16, through the pages)
+    and a dry run past 60 s on the fake clock render 0 ``Traceback``, 0
+    ``File "``, 0 exception class names and 0 submitted values; a complete
+    successful pass through screens 1–5 calls the supervisor's ``start`` 0
+    times."""
+
+    run = flow()
+    assert _passed(run.choice("channel_points"))
+    texts: list[tuple[str, str]] = []
+    for name, (answer, token) in PLATFORM_OUTCOMES.items():
+        run.platform.default = answer
+        run.platform.tokens.clear()
+        # The AC14 answers name P10's submitted client id.
+        response = run.platform_screen(token=f"{TOK_A}-{name}", client_id=SUBMITTED_CLIENT_ID)
+        assert _cause(response) == token and not _next_open(response), name
+        texts.append((name, _text_of(response)))
+    run.platform.default = None
+    run.platform.accept(TOK_A)
+    run.platform.rewards = _json(200, {"data": []})
+    empty = run.platform_screen()
+    assert _cause(empty) == wizard.NO_REWARDS and not _next_open(empty)
+    texts.append(("no rewards", _text_of(empty)))
+    run.platform.rewards = _json(200, {"data": WIZARD_REWARDS})
+    run.platform.accept(TOK_B)
+    listed = run.platform_screen(token=TOK_B)
+    assert _cause(listed) == wizard.REWARD_NOT_PICKED
+    assert all(_html.escape(reward["title"]) in _text_of(listed) for reward in WIZARD_REWARDS)
+    assert _text_of(listed).count('class="reward"') == 2
+    assert _passed(run.screen(2, **{"parameter.channel_points.reward_id": WIZARD_REWARDS[1]["id"]}))
+    for name, (answer, token) in MODEL_OUTCOMES.items():
+        run.model.answer = answer
+        response = run.model_screen("channel_points", key=f"{WIZARD_MODEL_KEY}-{name}")
+        assert _cause(response) == token and not _next_open(response), name
+        texts.append((name, _text_of(response)))
+    run.model.answer = _json(200, _COMPLETION)
+    assert _passed(run.model_screen("channel_points"))
+
+    # Screen 4's refusal (AC16) and screen 5 past its bound.
+    run.profile.write_text("enabled_modules: []\n", encoding="utf-8")
+    texts.append(("appeared", _text_of(run.screen(4))))
+    run.profile.unlink()
+    assert _passed(run.screen(4))
+
+    def late(event: Any, clock: _Clock) -> Any:
+        clock.now += 61.0
+        return _dry_record()(event, clock)
+
+    run.dry.make = late
+    slow = run.screen(5)
+    assert _cause(slow) == wizard.DRY_RUN_TIMED_OUT and not run.state()["completed"]
+    texts.append(("dry run > 60 s", _text_of(slow)))
+    submitted = WIZARD_VALUES + (SUBMITTED_CLIENT_ID,) + tuple(f"{TOK_A}-{name}" for name in PLATFORM_OUTCOMES) + tuple(
+        f"{WIZARD_MODEL_KEY}-{name}" for name in MODEL_OUTCOMES
+    )
+    _sweep_failures(texts, submitted)
+    _sweep_failures(run.bodies(), submitted)
+
+    # A complete successful pass, on another profile directory: 0 starts.
+    other = flow(name="other.yaml")
+    other.through("chat_qa")
+    assert other.state()["completed"] is True
+    assert other.starts == 0 and run.starts == 0
+    assert other.ui.child is None
+
+
+def test_ac14_the_platform_answer_fills_the_identities_of_the_written_profile(flow) -> None:
+    """AC14 (R5, through the screens): the login is shown, and the
+    broadcaster and bot identities of the written profile are the answer's
+    user id, never typed."""
+
+    run = flow()
+    run.through("chat_qa", upto=1)
+    response = run.platform_screen()
+    assert _html.escape(_EN.sentence("en", "platform.connected", login="streamer_x")) in _text_of(response)
+    shown = _text_of(run.get(screen="2"))
+    assert _passed(run.model_screen()) and _passed(run.screen(4))
+    document = yaml.safe_load(run.profile.read_text(encoding="utf-8"))
+    assert document["modules"]["twitch"]["broadcaster_id"] == "123"
+    assert document["modules"]["twitch"]["bot_user_id"] == "123"
+    assert document["modules"]["twitch"]["companion_name"] == "Nova"
+    assert 'value=""' in shown
+
+
+@posix_only
+def test_ac11_no_response_carries_a_value_and_inputs_render_empty_and_kept(flow) -> None:
+    """AC11 (response sweep, R4): over a full pass — the read-only profile
+    view and screen 2's re-render after a wrong client id included — the
+    profile, the overlay and every response hold 0 occurrences of a value
+    in plain, URL-encoded, HTML-escaped or JSON-escaped form; a credential
+    input renders empty and "kept"; the credential file is owner-only and
+    holds the values under their names."""
+
+    run = flow()
+    run.platform.accept(TOK_A)
+    assert _passed(run.choice())
+    wrong = run.platform_screen(client_id="client-wrong-1y")
+    assert _cause(wrong) == wizard.CLIENT_ID_MISMATCH
+    assert _passed(run.platform_screen())
+    assert _passed(run.model_screen()) and _passed(run.screen(4))
+    run.get(view="profile")
+    kept = _text_of(run.get(screen="2"))
+    for name in ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "TWITCH_ACCESS_TOKEN"):
+        field = re.search(rf'<input type="password"[^>]*name="credential\.{name}"[^>]*>', kept)
+        assert field is not None and 'value=""' in field.group(0) and 'data-state="kept"' in field.group(0)
+    assert _html.escape(_EN.sentence("en", "wizard.kept")) in kept
+    assert _passed(run.screen(5))
+
+    (stored,) = _credential_files(run.root)
+    assert stored.name == "profile.yaml.credentials.json"
+    assert stat.S_IMODE(stored.stat().st_mode) == 0o600
+    held = json.loads(stored.read_text(encoding="utf-8"))
+    assert held == {
+        "TWITCH_CLIENT_ID": WIZARD_CLIENT_ID, "TWITCH_CLIENT_SECRET": WIZARD_SECRET,
+        "TWITCH_ACCESS_TOKEN": TOK_A, "MODEL_API_KEY": WIZARD_MODEL_KEY,
+    }
+    files = [run.profile, run.profile.with_name("profile.local.yaml"), wizard.state_path(run.profile)]
+    texts = run.bodies() + [(os.fspath(path), path.read_text(encoding="utf-8")) for path in files if path.exists()]
+    for value in (TOK_A, WIZARD_CLIENT_ID, WIZARD_SECRET, WIZARD_MODEL_KEY, "client-wrong-1y"):
+        for label, text in texts:
+            assert not any(form in text for form in _value_forms(value)), (label, value)
+    location = _EN.sentence(
+        "en", "wizard.credentials.owner_only", directory=os.fspath(run.root / "xdg" / PRODUCT)
+    )
+    screen_four = [text for label, text in run.bodies() if label.startswith("POST /wizard") and 'data-screen="4"' in text]
+    assert screen_four and all(_html.escape(location) in text for text in screen_four)
+
+
+def test_ac11_screen_four_names_the_windows_directory_and_why(
+    flow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC11 (R4, A1): with the platform forced to Windows and
+    ``LOCALAPPDATA=<tmp>``, the credential file is under
+    ``<tmp>/twitch-ia-compagnon/`` and screen 4 names that directory and why."""
+
+    local = tmp_path / "local"
+    local.mkdir()
+    monkeypatch.setattr(locations, "running_platform", lambda: locations.WINDOWS)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    run = flow()
+    run.through("chat_qa", upto=3)
+    page = _text_of(run.get(screen="4"))
+    directory = local / PRODUCT
+    sentence = _EN.sentence("en", "wizard.credentials.local_appdata", directory=os.fspath(directory))
+    assert _html.escape(sentence) in page
+    assert _passed(run.screen(4))
+    assert (directory / "profile.yaml.credentials.json").exists()
+
+
+@pytest.mark.parametrize("platform", ["posix", "windows"])
+def test_ac11_a_refused_directory_stores_nothing_and_keeps_next_closed(
+    flow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    """AC11 (R4, A1): a group-writable per-user directory (POSIX) or an unset
+    ``LOCALAPPDATA`` (Windows): no credential file exists, no file in the
+    profile's or the per-user directory holds a value, screen 4 states the
+    refusal and keeps *next* closed."""
+
+    if platform == "posix":
+        if os.name != "posix":
+            pytest.skip("POSIX modes")
+        directory = tmp_path / "xdg" / PRODUCT
+        directory.mkdir(parents=True)
+        directory.chmod(0o770)
+        token = wizard.REFUSAL_SHARED
+    else:
+        monkeypatch.setattr(locations, "running_platform", lambda: locations.WINDOWS)
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        token = wizard.REFUSAL_NO_DIRECTORY
+    run = flow()
+    run.through("chat_qa", upto=3)
+    refused = run.screen(4)
+    assert _cause(refused) == token and not _next_open(refused)
+    assert not run.ui.wizard.passed(4) and run.screen(5).status == 409
+    assert _credential_files(run.root) == []
+    for value in (TOK_A, WIZARD_CLIENT_ID, WIZARD_SECRET, WIZARD_MODEL_KEY):
+        assert _files_holding([run.profile.parent, tmp_path / "xdg"], value) == []
+    assert run.dry.calls == []
+
+
+def test_ac28_a_corrected_name_regenerates_the_wizard_own_files(flow, tmp_path: Path) -> None:
+    """AC28 (R5, A7): after screen 4 wrote the files, a companion-name change
+    on screen 1 invalidates 1–5 (screen 5 refused); re-passing 1–4 replaces
+    the profile with the new name, leaving 1 profile and 1 credential file.
+    Once screen 5 completed, a new ConfigUI lands on the console (the A2
+    default location; with ``--config`` it is the editor, AC2)."""
+
+    run = flow(default=True)
+    run.through("chat_qa", upto=4)
+    assert "Nova" in run.profile.read_text(encoding="utf-8")
+    changed = run.choice("chat_qa", **{"parameter.chat_qa.companion_name": "Orion"})
+    assert _passed(changed) and run.ui.wizard.passed_screens() == (1,)
+    assert run.get(screen="5").status == 409 and run.screen(5).status == 409
+    assert _passed(run.platform_screen(token="", client_id=""))
+    assert _passed(run.model_screen(key=""))
+    assert _passed(run.screen(4))
+    document = yaml.safe_load(run.profile.read_text(encoding="utf-8"))
+    assert document["modules"]["twitch"]["companion_name"] == "Orion"
+    assert sorted(path.name for path in run.profile.parent.glob("*.yaml")) == ["profile.yaml"]
+    assert [path.name for path in _credential_files(tmp_path)] == ["profile.yaml.credentials.json"]
+    assert _passed(run.screen(5))
+    assert run.state()["completed"] is True
+    after = flow(default=True)
+    assert after.location == "/console"
+
+
+def test_ac28_a_profile_changed_by_another_writer_is_refused_naming_the_editor(flow) -> None:
+    """AC28 (A7): 1 byte appended to the written profile by another writer →
+    re-passing screen 4 refuses, the file is byte-identical afterwards and
+    the cause names the editor as the next action."""
+
+    run = flow()
+    run.through("chat_qa", upto=4)
+    with open(run.profile, "ab") as handle:
+        handle.write(b"#")
+    before = run.profile.read_bytes()
+    refused = run.screen(4)
+    assert _cause(refused) == wizard.REFUSAL_CHANGED and not _next_open(refused)
+    assert run.profile.read_bytes() == before
+    next_action = re.search(r'<p class="next-action">([^<]*)</p>', _text_of(refused)).group(1)
+    assert next_action == _html.escape(_EN.sentence("en", "wizard.refusal.file_changed_outside_wizard.next"))
+    assert "editor" in next_action
+    assert not run.ui.wizard.owns_profile()
+
+
+@pytest.mark.parametrize(
+    "make, cause",
+    [
+        (lambda event, clock: None, wizard.DRY_RUN_NO_RECORD),
+        (_dry_record(run_id=""), wizard.DRY_RUN_INCOMPLETE),
+        (_dry_record(outcome=""), wizard.DRY_RUN_INCOMPLETE),
+        (_dry_record(origin="runtime"), wizard.DRY_RUN_INCOMPLETE),
+        (_dry_record(event={"input": "twitch", "kind": "message", "message_id": "another"}),
+         wizard.DRY_RUN_INCOMPLETE),
+        (_dry_record(outcome="not_triggered"), wizard.DRY_RUN_UNEXPECTED),
+        (_dry_record(outcome="refused"), wizard.DRY_RUN_UNEXPECTED),
+    ],
+)
+def test_ac29_screen_five_completes_only_on_a_recorded_run(flow, make: Any, cause: str) -> None:
+    """AC29 (screen half, R5): no record, a record without a run id, an
+    outcome or the ``dry_run`` origin naming the driven event, or one whose
+    outcome is not the profile's expected one: screen 5 stays open, the state
+    is not completed, a cause and next action are shown, and another attempt
+    on the corrected entry completes it."""
+
+    run = flow()
+    run.through("chat_qa", upto=4)
+    run.dry.make = make
+    failed = run.screen(5)
+    assert _cause(failed) == cause and _screen_of(failed) == 5
+    assert 'class="next-action"' in _text_of(failed) and 'name="screen" value="5"' in _text_of(failed)
+    assert run.state()["completed"] is False and not run.ui.wizard.passed(5)
+    assert _location(run.ui) == "/wizard"
+    run.dry.make = _dry_record()
+    done = run.screen(5)
+    assert _passed(done) and 'id="console"' in _text_of(done)
+    assert _html.escape(_EN.sentence("en", "wizard.dry_run_completed", run_id="run-dry-0001")) in _text_of(done)
+    assert run.state()["completed"] is True and len(run.dry.calls) == 2
+    assert run.get().status == 303
+
+
+def test_ac29_a_dry_run_past_its_bound_or_refused_by_the_entry_stays_open(flow) -> None:
+    """AC29 (R5): an entry still running at 60 s on the fake clock, or one
+    raising its value-free refusal, leaves screen 5 open and retryable."""
+
+    run = flow()
+    run.through("chat_qa", upto=4)
+
+    async def stuck(path: Path, event: Any, **options: Any) -> Any:
+        run.clock.now += 60.0
+        await asyncio.Event().wait()
+
+    run.ui.wizard.seams.dry_runner = stuck
+    stalled = run.screen(5)
+    assert _cause(stalled) == wizard.DRY_RUN_TIMED_OUT and run.state()["completed"] is False
+
+    async def refused(path: Path, event: Any, **options: Any) -> Any:
+        raise application.DryRunError(application.DRY_RUN_NO_RECORD)
+
+    run.ui.wizard.seams.dry_runner = refused
+    assert _cause(run.screen(5)) == wizard.DRY_RUN_NO_RECORD
+    run.ui.wizard.seams.dry_runner = run.dry
+    assert _passed(run.screen(5)) and run.state()["completed"] is True
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_ORDER)
+def test_ac29_each_profile_completes_on_the_real_dry_run_record(
+    flow, monkeypatch: pytest.MonkeyPatch, profile_id: str
+) -> None:
+    """AC29 (R5, with P11's real entry and a fake model answering
+    ``"bonjour"``): each profile's screen 5 completes on the record the dry
+    run returns — a completed run for the three triggering profiles, "not
+    triggered" with its reason and 0 model requests for silent — the event
+    it drove being the one the wizard built; nothing is started."""
+
+    spied = _Spied(monkeypatch)
+    model = _bonjour()
+    records: list[Any] = []
+
+    async def real(path: Path, event: Any, *, environ: Any, clock: Any, timeout: float) -> Any:
+        record = await application.dry_run(
+            path, event, environ=environ, model_transport=lambda: model, timeout=timeout
+        )
+        records.append(record)
+        return record
+
+    run = flow()
+    run.dry.make = None
+    run.ui.wizard.seams.dry_runner = real
+    run.through(profile_id)
+    (record,) = records
+    assert run.state()["completed"] is True and run.starts == 0
+    assert record.origin == "dry_run" and record.run_id
+    page = _text_of(run.responses[-1][1])
+    if profile_id == "silent":
+        assert record.outcome == "not_triggered" and model.post_calls == []
+        sentence = _EN.sentence(
+            "en", "wizard.dry_run_not_triggered", run_id=record.run_id, reason=record.reason
+        )
+    else:
+        assert record.outcome == "completed" and list(spied.records) == [record.run_id]
+        assert len(model.post_calls) == 1
+        sentence = _EN.sentence("en", "wizard.dry_run_completed", run_id=record.run_id)
+    assert _html.escape(sentence) in page
+    assert spied.processes == 0
+
+
+def _fresh(flow, platform: _PlatformFake | None = None, **options: Any) -> _Flow:
+    """A new ConfigUI over the same directory, with fresh fake endpoints."""
+
+    clock = _Clock()
+    return flow(clock=clock, platform=platform or _PlatformFake(clock), **options)
+
+
+def test_ac30_a_restart_before_screen_five_resumes_only_screen_one(flow) -> None:
+    """AC30 (a): after screen 4 wrote the files, a new instance lands on the
+    wizard; screen 1 shows its recorded inputs as passed, the credentials
+    render empty and "kept"; screens 3–5 are refused until screen 2 passes
+    again; passing 2–4 makes exactly 1 platform validation and 1 model
+    request, and screen 5 runs its dry run once."""
+
+    first = flow()
+    first.through("chat_qa", upto=4)
+    assert first.state()["passed"] == [1]
+
+    second = _fresh(flow)
+    second.platform.accept(TOK_A)
+    assert second.location == "/wizard"
+    one = _text_of(second.get(screen="1"))
+    assert 'data-screen="1" data-passed="true"' in one and 'value="Nova"' in one
+    two = _text_of(second.get(screen="2"))
+    assert two.count('value="" autocomplete="off" data-state="kept"') == 3
+    for screen in ("3", "4", "5"):
+        assert second.get(screen=screen).status == 409
+        assert second.screen(int(screen)).status == 409
+    assert second.platform.validations == [] and second.model.requests == []
+    assert _passed(second.platform_screen(token="", client_id=""))
+    assert _passed(second.model_screen(key=""))
+    assert _passed(second.screen(4))
+    assert second.platform.validations == [TOK_A] and len(second.model.requests) == 1
+    assert _passed(second.screen(5))
+    assert len(second.dry.calls) == 1 and second.dry.calls[0]["environ"]["TWITCH_ACCESS_TOKEN"] == TOK_A
+    _no_value_in_state(second)
+
+
+def _no_value_in_state(run: _Flow) -> None:
+    data = wizard.state_path(run.ui.base_path).read_bytes()
+    for value in WIZARD_VALUES + ("tok-new-wizard-1q",):
+        assert value.encode() not in data
+
+
+def test_ac30_b_an_expired_stored_token_is_refused_and_a_new_one_passes(flow) -> None:
+    """AC30 (b): the platform now answers 401 for the stored token: screen 2
+    shows the 401 cause with *next* closed; a new token on the same screen
+    passes it."""
+
+    first = flow()
+    first.through("chat_qa", upto=4)
+    second = _fresh(flow)
+    refused = second.platform_screen(token="", client_id="")
+    assert _cause(refused) == wizard.UNAUTHORIZED and not _next_open(refused)
+    assert second.platform.validations == [TOK_A]
+    second.platform.accept("tok-new-wizard-1q")
+    assert _passed(second.platform_screen(token="tok-new-wizard-1q", client_id=""))
+    assert second.platform.validations == [TOK_A, "tok-new-wizard-1q"]
+    assert _passed(second.model_screen(key="")) and _passed(second.screen(4))
+    stored = json.loads(_credential_files(second.root)[0].read_text(encoding="utf-8"))
+    assert stored["TWITCH_ACCESS_TOKEN"] == "tok-new-wizard-1q"
+    _no_value_in_state(second)
+
+
+def test_ac30_c_a_failed_screen_five_is_retried_after_a_restart(flow) -> None:
+    """AC30 (c): after a failed screen 5, a new instance lands on the wizard
+    and screen 5 can be retried to success."""
+
+    first = flow()
+    first.through("chat_qa", upto=4)
+    first.dry.make = lambda event, clock: None
+    assert _cause(first.screen(5)) == wizard.DRY_RUN_NO_RECORD
+    second = _fresh(flow)
+    second.platform.accept(TOK_A)
+    assert second.location == "/wizard"
+    assert _passed(second.platform_screen(token="", client_id=""))
+    assert _passed(second.model_screen(key="")) and _passed(second.screen(4))
+    assert _passed(second.screen(5)) and second.state()["completed"] is True
+
+
+def test_ac30_d_a_completed_wizard_is_never_offered_again(flow) -> None:
+    """AC30 (d): after screen 5 completed, the access URL lands on the
+    console and every wizard route redirects to it, with no wizard screen."""
+
+    flow(default=True).through("chat_qa")
+    second = _fresh(flow, default=True)
+    assert second.location == "/console"
+    for response in (
+        second.get(),
+        second.get(screen="3"),
+        second.get(view="profile"),
+        second.screen(1, profile="silent"),
+        second.screen(5),
+    ):
+        assert response.status == 303 and dict(response.headers)["Location"] == "/console"
+        assert b"data-screen" not in response.body
+    assert second.platform.validations == [] and second.dry.calls == []
+
+
+def test_ac30_e_a_profile_changed_after_screen_four_is_refused_after_a_restart(flow) -> None:
+    """AC30 (e): the profile changed by another writer after screen 4: the
+    new instance lands on the wizard, screen 4 refuses and leaves the file
+    byte-identical, and the cause names the editor."""
+
+    first = flow()
+    first.through("chat_qa", upto=4)
+    first.profile.write_text(first.profile.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
+    before = first.profile.read_bytes()
+    second = _fresh(flow)
+    second.platform.accept(TOK_A)
+    assert second.location == "/wizard"
+    assert _passed(second.platform_screen(token="", client_id=""))
+    assert _passed(second.model_screen(key=""))
+    refused = second.screen(4)
+    assert _cause(refused) == wizard.REFUSAL_CHANGED and not _next_open(refused)
+    assert second.profile.read_bytes() == before
+    assert "editor" in _EN.sentence("en", "wizard.refusal.file_changed_outside_wizard.next")
+    _no_value_in_state(second)
+
+
+def test_ac5_the_wizard_screen_keys_are_in_both_files() -> None:
+    """AC5 re-run (P12): the collector sees the screens' keys — every
+    failure, refusal and location sentence of the wizard — and each is in
+    both files with the same placeholders."""
+
+    keys, dynamic = referenced_keys(KEY_SOURCES)
+    assert dynamic == []
+    files = _string_files()
+    wizard_keys = {key for key in keys if key.startswith("wizard.")}
+    assert len(wizard_keys) >= 90
+    for token in (*wizard._WIZARD_SENTENCES, *wizard._REFUSAL_SENTENCES):
+        assert f"wizard.{token}" in wizard_keys or f"wizard.refusal.{token}" in wizard_keys, token
+    for key in wizard_keys:
+        assert key in files["en"] and key in files["fr"], key
+        assert i18n.placeholders(files["en"][key]) == i18n.placeholders(files["fr"][key]), key
+
+
+def test_ac14_a_cached_validation_does_not_carry_over_to_another_profile(flow) -> None:
+    """AC14 (P12 fix round 1): a validation that passed for chat Q&A is not
+    reused for channel points with the same credentials — its scopes are
+    checked again, so the missing redemption scope fails screen 2."""
+
+    run = flow()
+    run.platform.accept(TOK_A, scopes=sorted(_profiles()["chat_qa"].scopes))
+    assert _passed(run.choice("chat_qa"))
+    assert _passed(run.platform_screen())
+    assert run.platform.validations == [TOK_A]
+    assert _passed(run.choice("channel_points"))
+    response = run.platform_screen()
+    assert _cause(response) == wizard.MISSING_SCOPE and not _next_open(response)
+    assert run.platform.validations == [TOK_A, TOK_A]
+
+
+def test_ac11_a_variable_in_the_config_path_reloads_the_stored_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC11 (A1, P12 fix round 1): with ``--config ${VAR}.yaml`` the UI reads
+    back the credential file the wizard wrote under the expanded name."""
+
+    _default_environment(monkeypatch, tmp_path / "xdg")
+    profile, document = _wizard_profile(tmp_path / "site")
+    monkeypatch.setenv("WIZARD_PROFILE", "profile")
+    settings = config_ui.UISettings.from_argv(["--config", str(tmp_path / "site" / "${WIZARD_PROFILE}.yaml")])
+    assert settings.base_path == profile.resolve()
+    state = wizard.WizardState(settings.base_path)
+    store = wizard.CredentialStore(settings.base_path, "linux", os.environ)
+    assert store.write(FIXTURE_CREDENTIALS, document["secrets"], state) is None
+    state.save(store)
+    assert store.path is not None and store.path.name == "profile.yaml.credentials.json"
+    assert settings.credential_path == store.path.resolve()
+    names = [reference[2:-1] for reference in document["secrets"]]
+    assert config_ui._stored_credentials(settings) == {name: FIXTURE_CREDENTIALS[name] for name in names}

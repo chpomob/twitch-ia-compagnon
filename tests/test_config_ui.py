@@ -5063,6 +5063,13 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     token-authenticated ``/instance``, which the sweep drives (refused without
     the token, answered with it) and whose JSON answer joins the audited
     content types; the final exact set is P15's.
+
+    Phase 9 R5/R2 (same allowlist entry, plan P12): the set gains the
+    wizard's ``/wizard`` (GET, POST) and ``/language`` (POST), both driven by
+    the sweep over every shipped profile — refused without a session, the
+    wizard redirecting to the console for a profile it never ran for (A7),
+    and a language the table does not offer refused without a write — so
+    the secret sweep covers them too.
     """
 
     environ = _sweep_environ()
@@ -5087,6 +5094,14 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
         cookie, csrf = _login(ui)
         tokens += [ui.token, cookie.split("=", 1)[1], csrf]
         pages = _sweep_pages(sweep, cookie)
+        # The wizard's routes (plan P12): a profile with no wizard state is
+        # never offered the wizard, and an unoffered language writes nothing.
+        assert sweep.get("/wizard", None).status == 401
+        wizard_page = sweep.get("/wizard", cookie)
+        assert wizard_page.status == 303 and ("Location", "/console") in wizard_page.headers
+        state_file = base.with_name(base.name + ".wizard.json")
+        language = sweep.record("POST /language", _post(ui, "/language", cookie, csrf))
+        assert language.status == 409 and not state_file.exists()
         # Credential fields show their reference or the hidden-literal text.
         if "twitch" in read_base(base)["modules"]:
             twitch = pages[f"{MODULE_PAGE_PREFIX}twitch"]
@@ -5200,7 +5215,10 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     # must join this sweep).
     assert set(ui.routes) == {
         "/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply", "/instance",
+        "/wizard", "/language",
     }
+    driven = {label for label, _response, _accepted in audited}
+    assert {"GET /wizard", "POST /language"} <= driven
     json_answers = [label for label, response, _ in audited if response.content_type == "application/json"]
     assert json_answers and set(json_answers) == {"GET /instance"}
     assert {response.content_type.split(";")[0] for _, response, _ in audited} <= {

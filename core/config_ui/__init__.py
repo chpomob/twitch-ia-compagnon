@@ -23,6 +23,13 @@ and its pages, the draft edits and Check (R5), Save and remove-override (R6),
 the supervised restart of Apply (R7, D9), the socket-free event loop (D7), the request bridge and the entry point. No
 section names a module: every page lists or renders what discovery found
 (A2).
+
+The first-run wizard's screens (``/wizard``) and the language choice
+(``/language``) are routes of the same table, behind the same guards
+(phase 9 R5, R2): :class:`core.config_ui.wizard.Wizard` renders and
+validates the screens, and the UI hands it the per-process fingerprint key,
+the first-run decision taken at construction, the stored credentials and
+its environment. The wizard never calls the supervisor.
 """
 
 from __future__ import annotations
@@ -73,7 +80,17 @@ from core.config_ui.launcher import (
     launcher_directories,
     write_launcher,
 )
-from core.config_ui.wizard import CredentialStore, WizardState, WizardStateError, state_path
+from core.config_ui.wizard import (
+    LANGUAGE_ROUTE,
+    WIZARD_ROUTE,
+    CredentialStore,
+    Wizard,
+    WizardPage,
+    WizardSeams,
+    WizardState,
+    WizardStateError,
+    state_path,
+)
 from core.contracts import (
     INPUT_OWNER_NONE,
     ContractError,
@@ -257,7 +274,7 @@ class UISettings:
         directory = locations.credential_directory(locations.running_platform(), os.environ)
         if directory is None:
             return None
-        return canonical_path(directory / locations.credential_file_name(self.config))
+        return canonical_path(directory / locations.credential_file_name(self.base_path))
 
     @property
     def instance_path(self) -> Path:
@@ -1972,9 +1989,9 @@ def _page_field(page: str) -> str:
     return f'<input type="hidden" name="{PAGE_FIELD}" value="{ident(page)}">'
 
 
-def _page(title: str, session: _Session, body: str) -> UIResponse:
+def _page(title: str, session: _Session, body: str, *, language: str = "en") -> UIResponse:
     document = (
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        f"<!doctype html><html lang=\"{html.escape(language, quote=True)}\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<meta name=\"csrf-token\" content=\"{html.escape(session.csrf_token, quote=True)}\">"
         f"<title>{esc(title)}</title><style>{_CSS}</style></head>"
@@ -2758,7 +2775,7 @@ Handler = Callable[[UIRequest, _Session], UIResponse]
 INSTANCE_ROUTE = "/instance"
 
 #: Paths whose requests change state: POST only, Origin- and CSRF-checked.
-STATE_CHANGING_PATHS = frozenset({"/save", "/remove", "/check", "/apply"})
+STATE_CHANGING_PATHS = frozenset({"/save", "/remove", "/check", "/apply", LANGUAGE_ROUTE})
 
 #: Every discovered module's page lives under this prefix (R4b).
 MODULE_PAGE_PREFIX = "/module/"
@@ -2808,7 +2825,7 @@ def _stored_credentials(settings: UISettings) -> dict[str, str]:
     wizard state leaves the per-user directory untouched.
     """
 
-    store = CredentialStore(settings.config, locations.running_platform(), os.environ)
+    store = CredentialStore(settings.base_path, locations.running_platform(), os.environ)
     if store.path is None or not os.path.lexists(state_path(settings.base_path)):
         return {}
     if not os.path.lexists(store.path):
@@ -2866,10 +2883,13 @@ class ConfigUI:
         checker: Checker | None = None,
         probe: Probe | None = None,
         supervisor: Supervisor | None = None,
+        wizard_seams: WizardSeams | None = None,
     ) -> None:
         self.settings = settings
         inherited: Mapping[str, str] = os.environ if environ is None else environ
+        self._inherited = inherited
         stored = _stored_credentials(settings)
+        self._stored = stored
         #: The UI process's own environment overlaid with the stored
         #: credentials (the stored value wins for the names it holds): "set/
         #: unset" is judged here, and Check, Apply and a UI-launched main
@@ -2890,10 +2910,22 @@ class ConfigUI:
         self.instance_marker = secrets.token_hex(16)
         #: Keys the opaque field names of :func:`_field_name` (R8).
         self.field_key = secrets.token_bytes(32)
+        #: Keys the HMAC of each credential value a wizard screen's
+        #: fingerprint covers (R5): minted per process, held in memory only,
+        #: never written to the state file, a log record or a response.
+        self.fingerprint_key = secrets.token_bytes(32)
         self.authorities = accepted_authorities(
             settings.host, settings.port, settings.allowed_hosts
         )
         self.base_path = settings.base_path
+        #: The first-run decision, taken once here (A2): a profile found at
+        #: the target later appeared after detection, and screen 4 refuses
+        #: to write over it (R5, AC16).
+        self.first_run = not self.base_path.exists()
+        #: What the wizard reaches outside the process (R5, D8).
+        self.wizard_seams = WizardSeams() if wizard_seams is None else wizard_seams
+        self._wizard: Wizard | None = None
+        self._wizard_lock = threading.Lock()
         self.overlay_path = settings.overlay_path
         #: The one file a Save or Remove may replace, resolved once here (R6).
         self._managed_overlay = settings.overlay_path
@@ -2940,6 +2972,8 @@ class ConfigUI:
             "/check": (frozenset({"POST"}), self._check_endpoint),
             "/apply": (frozenset({"POST"}), self._apply_endpoint),
             INSTANCE_ROUTE: (frozenset({"GET"}), self._instance_endpoint),
+            WIZARD_ROUTE: (frozenset({"GET", "POST"}), self._wizard_endpoint),
+            LANGUAGE_ROUTE: (frozenset({"POST"}), self._language_endpoint),
         }
 
     def __repr__(self) -> str:
@@ -3151,6 +3185,93 @@ class ConfigUI:
             body=json.dumps(document, sort_keys=True).encode("utf-8"),
             content_type="application/json",
         )
+
+    # -- the first-run wizard (R5, A7) ---------------------------------------
+
+    @property
+    def wizard(self) -> Wizard:
+        """The wizard over this UI's profile, built on first use with the
+        first-run decision and the stored credentials taken at construction;
+        it never calls the supervisor."""
+
+        with self._wizard_lock:
+            if self._wizard is None:
+                self._wizard = Wizard(
+                    self.base_path,
+                    key=self.fingerprint_key,
+                    table=StringTable.load(),
+                    first_run=self.first_run,
+                    stored=self._stored,
+                    environ=lambda: self.environ,
+                    checker=self._profile_check,
+                    runner=_run_socket_free,
+                    seams=self.wizard_seams,
+                    on_stored=self._credentials_stored,
+                    on_submitted=self._credential_submitted,
+                    escape=esc,
+                )
+            return self._wizard
+
+    def _profile_check(
+        self, path: Path, environ: Mapping[str, str]
+    ) -> tuple[bool, Sequence[str]]:
+        """Screen 4's check: the profile as ``--check-config`` reads it."""
+
+        return self.checker(path, environ, self.overlay_path, None)  # type: ignore[arg-type]
+
+    def _credential_submitted(self, value: str) -> None:
+        """A submitted credential joins the secret set at once (R4)."""
+
+        forms = _redaction_forms(value)
+        with self._secrets_lock:
+            self.secret_values = self.secret_values | forms
+
+    def _credentials_stored(self, values: Mapping[str, str]) -> None:
+        """Screen 4 stored *values*: they join the secret set and, the
+        stored value winning, the environment of Check, Apply, the dry run
+        and a UI-launched main process (R4, plan P7)."""
+
+        self._stored = dict(values)
+        forms = {form for value in values.values() if value for form in _redaction_forms(value)}
+        with self._secrets_lock:
+            self.secret_values = self.secret_values | forms
+        self.environ = {**self._inherited, **values} if values else self._inherited
+
+    def _wizard_open(self) -> bool:
+        return self._landing() == LANDING_WIZARD
+
+    def _wizard_response(self, page: WizardPage, session: _Session) -> UIResponse:
+        response = _page(page.title, session, page.body, language=page.language)
+        return UIResponse(
+            status=page.status,
+            body=response.body,
+            content_type=response.content_type,
+            headers=response.headers,
+        )
+
+    def _wizard_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``/wizard`` (R5): the screens while the wizard is unfinished; once
+        it is completed — or for a profile it never ran for — every request
+        is redirected to the console (A7)."""
+
+        if not self._wizard_open():
+            return UIResponse(status=303, headers=(("Location", LANDING_CONSOLE),))
+        if request.method.upper() == "POST":
+            with self._mutation_lock:
+                page = self.wizard.post(_form_fields(request), _csrf_field(session))
+        else:
+            page = self.wizard.get(request.query, _csrf_field(session))
+        return self._wizard_response(page, session)
+
+    def _language_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``/language`` (R2, DD3): persist the chosen language in the state
+        file, then back to the landing page. A language not offered changes
+        nothing."""
+
+        fields = dict(_form_fields(request))
+        if not self.wizard.set_language(fields.get("language", "")):
+            return _text(409, "409 Conflict: this language is not offered.")
+        return UIResponse(status=303, headers=(("Location", self._landing()),))
 
     def _landing(self) -> str:
         """:func:`landing_target` over the wizard state file read now. A state
