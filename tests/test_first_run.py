@@ -75,6 +75,7 @@ import builtins
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -82,12 +83,14 @@ import shlex
 import shutil
 import stat
 import sys
+import tempfile
 import threading
 import webbrowser
 from datetime import datetime
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -5868,3 +5871,204 @@ def test_ac25_an_impossible_time_is_reported_alongside_the_other_problems() -> N
     )
     assert [problem.split(":", 1)[0] for problem in problems] == ["Outcome", _TOUCHED, _START], problems
     assert "not a real date and time" in problems[2]
+
+
+# --------------------------------------------------------------------------- #
+# P19F2 (R4, R8): a credential never reaches a stream, nor a fragment of it
+# --------------------------------------------------------------------------- #
+
+_CANARY = "credential-canary-2846159703"
+_LONG_SUFFIX = "TAIL-FRAGMENT-9153726804-END"
+#: Longer than the drain's retention bound and than one read: it spans both.
+_LONG_SECRET = "client-secret-" + "x" * 9000 + _LONG_SUFFIX
+_GATE_TRACEBACK = "Traceback (most recent call last):\n"
+
+
+class _ExitingChild:
+    """A child that has already exited 1, its stderr a traceback holding *value*."""
+
+    pid = 987654
+
+    def __init__(self, value: str) -> None:
+        self.stderr = tempfile.TemporaryFile()
+        self.stderr.write((_GATE_TRACEBACK + f'  File "core/main.py", line 12\nRuntimeError: {value}\n').encode())
+        self.stderr.seek(0)
+
+    def poll(self) -> int:
+        return 1
+
+    def terminate(self) -> None:
+        pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 1
+
+    def kill(self) -> None:
+        pass
+
+
+def _start_failing_child(
+    flow: _Flow, value: str, caplog: pytest.LogCaptureFixture
+) -> tuple[Any, str, bytes, str]:
+    """POST ``/start`` through the real supervisor and drain, the child's
+    stderr carrying *value*; the response, its raw detail, the bytes the
+    server wrote to its own stderr, and every log record's text."""
+
+    flow.ui.supervisor = config_ui.Supervisor(
+        ["fake-child"], flow.ui.status_path, popen=lambda *a, **kw: _ExitingChild(value), environ=flow.ui.environ
+    )
+    captured, previous = io.BytesIO(), sys.stderr
+    caplog.set_level(logging.DEBUG, logger="core.config_ui")
+    sys.stderr = SimpleNamespace(buffer=captured)  # type: ignore[assignment]
+    try:
+        response = flow.post("/start", {})
+        flow.ui.supervisor.close()
+    finally:
+        sys.stderr = previous
+    body = response.body.decode("utf-8")
+    detail = re.search(r'<details id="raw-detail"><summary>[^<]*</summary><pre>(.*?)</pre></details>', body, re.S)
+    assert detail is not None, (response.status, body[:3000])
+    return response, _html.unescape(detail.group(1)), captured.getvalue(), caplog.text
+
+
+def _status_record_text(flow: _Flow) -> str:
+    path = Path(flow.ui.status_path)
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def test_p19f2_a_stored_credential_reaches_no_stream_when_the_child_fails(
+    flow, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Gate F1, its reproduction unchanged: a credential the wizard stored is
+    in the failing child's stderr; the page, the status record, the log
+    records and the server's own stderr each hold it zero times, while the
+    operator still sees that the child failed, its exit status and the
+    traceback's shape."""
+
+    monkeypatch.setattr(sys.modules[__name__], "WIZARD_SECRET", _CANARY)
+    session = flow()
+    session.through("chat_qa")
+    assert _CANARY in session.ui.secret_values
+
+    response, raw, forwarded, logs = _start_failing_child(session, _CANARY, caplog)
+
+    body = response.body.decode("utf-8")
+    assert response.status == 200
+    counts = (body.count(_CANARY), _status_record_text(session).count(_CANARY), logs.count(_CANARY),
+              forwarded.count(_CANARY.encode()))
+    assert counts == (0, 0, 0, 0)
+    for form in _value_forms(_CANARY):
+        assert form not in body and form.encode() not in forwarded
+    assert 'id="exit-status" data-status="1"' in body
+    assert raw.startswith(_GATE_TRACEBACK) and f"RuntimeError: {config_ui.REDACTED}" in raw
+    text = forwarded.decode("utf-8")
+    assert _GATE_TRACEBACK in text and 'File "core/main.py", line 12' in text
+    assert f"RuntimeError: {config_ui.REDACTED}\n" in text
+
+
+def test_p19f2_a_long_credential_leaves_no_fragment_in_any_surface(
+    flow, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Gate F2: a 9,042-character stored secret, longer than the drain's
+    retention bound and split across reads, is masked whole before any
+    truncation: neither it nor any suffix of it is in the raw detail, the
+    page, the status record, the log records or the server's stderr, and
+    the raw detail is still bounded."""
+
+    assert len(_LONG_SECRET) > config_ui.DRAIN_TAIL_BYTES
+    monkeypatch.setattr(sys.modules[__name__], "WIZARD_SECRET", _LONG_SECRET)
+    session = flow()
+    session.through("chat_qa")
+    assert _LONG_SECRET in session.ui.secret_values
+
+    response, raw, forwarded, logs = _start_failing_child(session, _LONG_SECRET, caplog)
+
+    body = response.body.decode("utf-8")
+    surfaces = {
+        "raw detail": raw,
+        "page": body,
+        "status record": _status_record_text(session),
+        "log records": logs,
+        "stderr": forwarded.decode("utf-8"),
+    }
+    # Every suffix of 12 characters or more ("9153726804-END" and up), and the
+    # filler run longer than any marker or ordinary line could hold.
+    fragments = [_LONG_SECRET[-length:] for length in range(12, len(_LONG_SECRET) + 1)]
+    for name, text in surfaces.items():
+        assert "TAIL-FRAGMENT" not in text and "x" * 32 not in text, name
+        assert not any(fragment in text for fragment in fragments), name
+    assert len(raw.encode("utf-8")) <= config_ui.REPORT_TAIL_BYTES
+    assert 'id="exit-status" data-status="1"' in body
+    assert raw.startswith(_GATE_TRACEBACK) and f"RuntimeError: {config_ui.REDACTED}" in raw
+    assert f"RuntimeError: {config_ui.REDACTED}\n" in surfaces["stderr"]
+
+
+def test_p19f2_without_a_stored_credential_the_traceback_reaches_the_operator_intact(
+    flow, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Negative control: with no stored credential the redaction blinds
+    nothing; the child's traceback reaches the raw detail and the server's
+    stderr byte for byte. The profile exists already, so no wizard runs and
+    nothing is stored."""
+
+    profile = tmp_path / "site" / "profile.yaml"
+    profile.parent.mkdir(parents=True)
+    profile.write_text("enabled_modules: []\n", encoding="utf-8")
+    session = flow()
+    assert session.ui.secret_values == frozenset() and _credential_files(session.root) == []
+    value = "the platform refused the request"
+
+    response, raw, forwarded, _logs = _start_failing_child(session, value, caplog)
+
+    expected = _GATE_TRACEBACK + f'  File "core/main.py", line 12\nRuntimeError: {value}\n'
+    assert raw == expected
+    assert forwarded == expected.encode()
+    assert config_ui.REDACTED not in response.body.decode("utf-8")
+    assert 'id="exit-status" data-status="1"' in response.body.decode("utf-8")
+
+
+def test_p19f2_the_drain_masks_a_value_split_between_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R8: a value written one byte per read is still masked whole before
+    it is forwarded or kept; the bytes around it pass unchanged."""
+
+    forwarded = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stderr", forwarded)
+    read_end, write_end = os.pipe()
+    drain = config_ui._StderrDrain(read_end, secrets=lambda: {_CANARY})
+    drain.start()
+    data = f"before {_CANARY} after\n".encode()
+    with os.fdopen(write_end, "wb", buffering=0) as writer:
+        for byte in data:
+            writer.write(bytes([byte]))
+    drain.join(5)
+    assert not drain.is_alive()
+    os.close(read_end)
+    expected = f"before {config_ui.REDACTED} after\n".encode()
+    assert forwarded.buffer.getvalue() == expected  # type: ignore[attr-defined]
+    assert bytes(drain._tail) == expected
+
+
+def test_p19f2_overlapping_matches_never_grow_the_drain_hold_back() -> None:
+    """R8: a value whose occurrences overlap (``aa`` in a run of ``a``) is
+    masked as it streams; only the bytes that could still begin a value are
+    held, so a child writing without end never grows the drain's buffer."""
+
+    drain = config_ui._StderrDrain(-1, secrets=lambda: {"aa"})
+    emitted = b"".join(drain._redacted("a" * 4096, final=False) for _ in range(64))
+    assert len(drain._pending) + len(drain._context) <= 2
+    emitted += drain._redacted("b", final=False) + drain._redacted("", final=True)
+    assert emitted == f"{config_ui.REDACTED}b".encode()
+
+
+def test_p19f2_a_generator_of_values_still_redacts_a_launch_failure(tmp_path: Path) -> None:
+    """R8: the values a restart is given are read once; a launch failure is
+    redacted with the same values even when they came from a generator."""
+
+    def popen(*args: Any, **kwargs: Any) -> Any:
+        raise FileNotFoundError(2, f"No such file or directory: '{_CANARY}'")
+
+    supervisor = config_ui.Supervisor(("x",), tmp_path / "status.json", popen=popen)
+    report = supervisor.restart("0" * 64, (value for value in (_CANARY,)))
+    assert report.outcome == config_ui.APPLY_REFUSED
+    assert len(report.diagnostics) == 1
+    assert _CANARY not in report.diagnostics[0]

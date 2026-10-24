@@ -1683,6 +1683,12 @@ _LOG_REDACTION = _RedactionFilter()
 logger.addFilter(_LOG_REDACTION)
 
 
+def _live_secret_values() -> frozenset[str]:
+    """The secret set of every live :class:`ConfigUI`, as the log filter sees it."""
+
+    return frozenset(value for source in list(_LOG_REDACTION.sources) for value in source.secret_values)
+
+
 # ---------------------------------------------------------------------------
 # Rendering (R4, R9)
 #
@@ -5614,9 +5620,11 @@ def _write_overlay(
 # path within a bounded window for one of three outcomes. A status record
 # naming any other pid is never signalled. The child's stdout is inherited,
 # so it can never fill a pipe; its stderr is a pipe drained for the child's
-# whole life by a :class:`_StderrDrain` thread, which forwards it to the
-# UI's own stderr (the terminal, never a page or a log record) and keeps a
-# bounded tail for a refused Apply's report.
+# whole life by a :class:`_StderrDrain` thread, which redacts it, then
+# forwards it to the UI's own stderr (the terminal, never a page or a log
+# record) and keeps a bounded tail of the redacted bytes for a refused
+# Apply's report. No byte of the child's stderr leaves the server before
+# every complete occurrence of every secret-set value in it is masked.
 # ---------------------------------------------------------------------------
 
 APPLY_ACCEPTED = "accepted"
@@ -5639,19 +5647,76 @@ REPORT_TAIL_BYTES = 2 * 1024
 _DRAIN_CHUNK = 4096
 
 
-class _StderrDrain(threading.Thread):
-    """Reads one child's stderr pipe until EOF (D9).
+def _secret_needles(secret_values: Iterable[str]) -> frozenset[str]:
+    """The UTF-8 bytes of every response form of every value, spelled as latin-1 text.
 
-    Each chunk is forwarded to the UI's own ``sys.stderr.buffer`` (a failed
-    write only skips forwarding; draining never stops early) and appended to
-    a tail trimmed to the last :data:`DRAIN_TAIL_BYTES` under a lock.
+    Latin-1 maps each byte to one character and back, so :func:`mask_known`
+    masks a byte stream exactly, and leaves every other byte (valid UTF-8 or
+    not) untouched.
     """
 
-    def __init__(self, fd: int, stream: Any = None) -> None:
+    return frozenset(
+        form.encode("utf-8").decode("latin-1")
+        for value in secret_values
+        if value
+        for form in _redaction_forms(value)
+        if form
+    )
+
+
+def _covered(text: str, needles: Iterable[str]) -> list[bool]:
+    """For each index of *text*, whether some occurrence of a needle covers it.
+
+    The same union of spans :func:`core.contracts.mask_known` masks; the drain
+    needs the spans themselves to emit a stream in pieces.
+    """
+
+    covered = [False] * len(text)
+    for needle in needles:
+        start = text.find(needle)
+        while start != -1:
+            covered[start : start + len(needle)] = [True] * len(needle)
+            start = text.find(needle, start + 1)
+    return covered
+
+
+class _StderrDrain(threading.Thread):
+    """Reads one child's stderr pipe until EOF (D9, R8).
+
+    The bytes read are redacted before anything else happens to them:
+    every complete occurrence, in every response form, of every value of
+    *secrets* (asked again for each chunk) is masked with :data:`REDACTED`
+    by :func:`core.contracts.mask_known`. A value can be split between two
+    reads, so the last bytes that could still begin one are held back until
+    the next read, or EOF, completes or rules it out. Every earlier byte is
+    final and emitted at once, masked or not; the last emitted bytes are kept
+    as context so an occurrence begun there still masks the bytes it reaches,
+    and a masked run continued across reads stays one marker. Nothing held
+    is ever longer than the longest form, however values overlap. Only the
+    redacted bytes are then
+    forwarded to the UI's own ``sys.stderr.buffer`` (a failed write only
+    skips forwarding; draining never stops early) and appended to a tail
+    trimmed to the last :data:`DRAIN_TAIL_BYTES` under a lock, so the tail
+    is truncated after redaction and never keeps a fragment of a value.
+    """
+
+    def __init__(
+        self,
+        fd: int,
+        stream: Any = None,
+        secrets: Callable[[], Iterable[str]] = _live_secret_values,
+    ) -> None:
         super().__init__(name="stderr-drain", daemon=True)
         self._fd = fd
         #: The pipe's file object, closed by :meth:`close` once drained.
         self._stream = stream
+        self._secrets = secrets
+        #: Bytes read but not yet redacted (latin-1 text): a value may continue.
+        self._pending = ""
+        #: The last bytes already emitted (raw), where a value may have begun.
+        self._context = ""
+        #: Whether the last byte emitted was masked (its marker is already out).
+        self._open_run = False
         self._tail = bytearray()
         self._lock = threading.Lock()
         self._finished = False
@@ -5666,17 +5731,59 @@ class _StderrDrain(threading.Thread):
                     break
                 if not chunk:
                     break
-                self._forward(chunk)
-                with self._lock:
-                    self._tail += chunk
-                    if len(self._tail) > DRAIN_TAIL_BYTES:
-                        del self._tail[:-DRAIN_TAIL_BYTES]
+                self._emit(self._redacted(chunk.decode("latin-1"), final=False))
         finally:
+            self._emit(self._redacted("", final=True))
             with self._lock:
                 self._finished = True
                 close = self._close_when_finished
             if close:
                 self._close_stream()
+
+    def _redacted(self, text: str, *, final: bool) -> bytes:
+        """The redacted bytes now known to hold no part of an unseen value."""
+
+        try:
+            needles = _secret_needles(self._secrets())
+        except Exception:  # noqa: BLE001 - an unreadable secret set hides everything
+            self._pending, self._context, self._open_run = "", "", False
+            return REDACTED.encode("utf-8") + b"\n" if text or final else b""
+        if not needles:
+            ready = self._pending + text
+            self._pending, self._context, self._open_run = "", "", False
+            return ready.encode("latin-1")
+        longest = max(len(needle) for needle in needles)
+        whole = self._context + self._pending + text
+        offset = len(self._context)
+        # Every occurrence covering an index below ``cut`` starts at most
+        # ``longest - 1`` before it (inside the context) and ends inside ``whole``.
+        cut = len(whole) if final else max(offset, len(whole) - longest + 1)
+        covered = _covered(whole, needles)
+        pieces: list[str] = []
+        index = offset
+        while index < cut:
+            end = index
+            while end < cut and covered[end] == covered[index]:
+                end += 1
+            if not covered[index]:
+                pieces.append(whole[index:end])
+            elif not (index == offset and self._open_run):
+                pieces.append(REDACTED)
+            index = end
+        if cut > offset:
+            self._open_run = covered[cut - 1]
+        self._context = whole[max(0, cut - longest + 1) : cut]
+        self._pending = whole[cut:]
+        return "".join(pieces).encode("latin-1")
+
+    def _emit(self, data: bytes) -> None:
+        if not data:
+            return
+        self._forward(data)
+        with self._lock:
+            self._tail += data
+            if len(self._tail) > DRAIN_TAIL_BYTES:
+                del self._tail[:-DRAIN_TAIL_BYTES]
 
     @staticmethod
     def _forward(chunk: bytes) -> None:
@@ -5792,6 +5899,8 @@ class Supervisor:
         #: Guards :attr:`child` against a launch racing :meth:`close`.
         self._lock = threading.Lock()
         self._closed = False
+        #: Values a restart was given, redacted from the drain beside the live UIs' set.
+        self._secret_values: frozenset[str] = frozenset()
 
     def close(self) -> None:
         """Forbid every later launch, then stop the child (the UI's final cleanup).
@@ -5843,10 +5952,13 @@ class Supervisor:
     def start(self) -> Any:
         """Start the launch argv without a shell, and its stderr drain (D9).
 
-        Raises :class:`SupervisorClosed` after :meth:`close`, and ``OSError``
-        when the launch argv cannot be executed.
+        The drain redacts the last restart's secret values and the secret
+        set of every live configuration UI from each byte before it leaves
+        the server (R8). Raises :class:`SupervisorClosed` after
+        :meth:`close`, and ``OSError`` when the launch argv cannot be executed.
         """
 
+        known = self._secret_values
         environ = os.environ if self._environ is None else self._environ
         with self._lock:
             if self._closed:
@@ -5861,7 +5973,11 @@ class Supervisor:
             )
             self.child = child
             stream = child.stderr
-            drain = _StderrDrain(stream.fileno(), stream) if stream is not None else None
+            drain = (
+                _StderrDrain(stream.fileno(), stream, lambda: known | _live_secret_values())
+                if stream is not None
+                else None
+            )
             self._drain = drain
         if drain is not None:
             drain.start()
@@ -5887,6 +6003,8 @@ class Supervisor:
                     f"{self.kill_wait:g} s after kill; nothing new was started",
                 ),
             )
+        secret_values = frozenset(secret_values)
+        self._secret_values = secret_values
         try:
             child = self.start()
         except SupervisorClosed as exc:
@@ -5937,8 +6055,9 @@ class Supervisor:
 def _report_tail(text: str, secret_values: Iterable[str]) -> str:
     """The last :data:`REPORT_TAIL_BYTES` of *text*, redacted and value-free (R8).
 
-    Redaction runs on the whole drained tail first, so a secret cut by the
-    2 KiB boundary was already replaced.
+    The drain already redacted every byte before keeping its tail; redaction
+    runs again on that whole tail first, so a secret cut by the 2 KiB
+    boundary was already replaced.
     """
 
     redacted = _redact(text, secret_values)
