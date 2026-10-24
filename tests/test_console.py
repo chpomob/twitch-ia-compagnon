@@ -1089,8 +1089,12 @@ def test_ac21_the_module_list_shows_the_degraded_module_with_cause_and_next_acti
     assert f'<q class="cause-text">{html_escape(DEGRADED_CAUSE)}</q>' in modules["audio_output"]
     assert html_escape(TABLE.sentence("en", "console.module.degraded.next")) in modules["audio_output"]
     assert modules["twitch"] == html_escape(TABLE.sentence("en", "console.module.ready", module="twitch"))
-    # The configured grant is listed, read-only.
-    assert "<code>brain-reads-chat</code>" in body and "<form" not in body
+    # The configured grant is listed. Superseded by R7/A6 (plan P15): its
+    # one control is now its Revoke — the only form on this page (the
+    # runtime is another process's, so neither Start nor Stop is offered).
+    assert "<code>brain-reads-chat</code>" in body
+    forms = re.findall(r'<form [^>]*action="([^"]+)"', body)
+    assert forms == [console.REVOKE_ROUTE]
 
 
 def test_ac21_the_poll_with_the_newest_cursor_returns_no_entry(ac21: SimpleNamespace) -> None:
@@ -1590,3 +1594,525 @@ def test_ac32_no_wizard_response_renders_a_raw_detail_disclosure(
             assert "<details" not in text
     finally:
         run.close()
+
+
+# --------------------------------------------------------------------------- #
+# P15: grant listing and Revoke through the managed overlay; the final route
+# set (R7, A6; AC23, AC4)
+# --------------------------------------------------------------------------- #
+
+from core.actions import (  # noqa: E402
+    REASON_NO_RULE,
+    ActionExecutor,
+    ActionRegistry,
+    AuthorizationPolicy,
+)
+from core.contracts import ActionCall, ActionObservation, ActionSpec, Destination  # noqa: E402
+from core.overlay import deep_merge, read_base, read_overlay  # noqa: E402
+
+BROADCASTER_VARIABLE = "TWITCH_BROADCASTER_ID"
+BROADCASTER = "4815162342"
+USERS_READ = "users.read"
+
+#: Two grants, as the shipped example writes them: the destination channel
+#: is a ``${…}`` reference, which the overlay must keep unresolved.
+GRANTS_PROFILE = f"""\
+modules_directory: ./mods
+enabled_modules: []
+modules: {{}}
+actions:
+  - rule_id: brain-reads-chat
+    action_name: chat.read
+    destination:
+      platform: twitch
+      channel_id: ${{{BROADCASTER_VARIABLE}}}
+      scope: chat
+    principals: [brain]
+    natures: [read]
+    granted_permissions: [chat.read]
+  - rule_id: brain-reads-users
+    action_name: {USERS_READ}
+    destination:
+      platform: twitch
+      channel_id: ${{{BROADCASTER_VARIABLE}}}
+      scope: chat
+    principals: [brain]
+    natures: [read]
+    granted_permissions: [{USERS_READ}]
+"""
+
+USERS_READ_SPEC = ActionSpec(
+    name=USERS_READ,
+    version=1,
+    description="Return what is known of one author.",
+    argument_schema={"type": "object", "properties": {}, "additionalProperties": False},
+    result_schema={"type": "object"},
+    nature="read",
+    required_permissions=(USERS_READ,),
+    supported_destinations=(Destination("twitch", "*", "chat"),),
+    timeout_seconds=5.0,
+    idempotency="natural",
+)
+
+
+def _grants_ui(tmp_path: Path) -> config_ui.ConfigUI:
+    (tmp_path / "mods").mkdir(parents=True, exist_ok=True)
+    base = tmp_path / "config.yaml"
+    base.write_text(GRANTS_PROFILE, encoding="utf-8")
+    return config_ui.ConfigUI(
+        config_ui.UISettings.from_argv(["--config", str(base)]),
+        environ={BROADCASTER_VARIABLE: BROADCASTER},
+    )
+
+
+def _ready_on_disk(ui: config_ui.ConfigUI) -> Any:
+    """A child that publishes a ready record of the configuration on disk
+    when it starts, as the runtime does, then runs."""
+
+    def script(child: FakeChild) -> None:
+        status = Path(child.env[STATUS_FILE_VARIABLE])
+        staged = status.with_name(status.name + ".tmp")
+        _write_status(staged, {}, pid=child.pid)
+        record = json.loads(staged.read_text(encoding="utf-8"))
+        record["digest"] = config_ui.on_disk_digest(ui.base_path, ui.overlay_path)
+        staged.write_text(json.dumps(record), encoding="utf-8")
+        os.replace(staged, status)
+        child.hold()
+
+    return script
+
+
+def _grant_rows(body: str) -> list[str]:
+    return re.findall(r'<tr class="grant" data-rule="([^"]*)">', body)
+
+
+def _fingerprint(body: str) -> str:
+    found = re.search(r'name="fingerprint" value="([^"]*)"', body)
+    assert found, body
+    return found.group(1)
+
+
+def _revoke(
+    ui: config_ui.ConfigUI, cookie: str, csrf: str, rule_id: str, fingerprint: str
+) -> config_ui.UIResponse:
+    from urllib.parse import urlencode
+
+    return ui.handle(
+        _ui_request(
+            "POST",
+            console.REVOKE_ROUTE,
+            headers={"cookie": cookie, "content-type": "application/x-www-form-urlencoded"},
+            body=urlencode(
+                [("csrf_token", csrf), ("fingerprint", fingerprint), (console.REVOKE_GRANT_FIELD, ui.grant_token(rule_id))]
+            ).encode("utf-8"),
+        )
+    )
+
+
+async def _users_read(config: dict[str, Any]) -> tuple[ActionObservation, int]:
+    """One ``users.read`` call by the brain through the executor, its policy
+    built from *config*'s ``actions`` exactly as the runtime builds it."""
+
+    policy = AuthorizationPolicy(application._authorization_rules(config))
+    registry = ActionRegistry(authorization=policy)
+    registry.declare(USERS_READ_SPEC, module="users")
+    calls: list[Any] = []
+
+    class _Provider:
+        name = "users-fake"
+
+        async def invoke(self, invocation: Any) -> ActionObservation:
+            calls.append(invocation)
+            return ActionObservation(status="success", provenance={"transport": "fake"}, result={})
+
+    registry.bind(USERS_READ, _Provider(), module="users")
+    registry.mark_ready("users")
+    executor = ActionExecutor(registry, policy, clock=lambda: 0.0)
+    observation = await executor.invoke(
+        ActionCall(
+            action_name=USERS_READ,
+            action_version=1,
+            arguments={},
+            conversation_id="conv-1",
+            run_id="run-1",
+            call_id="call-1",
+            source_event_id="evt-1",
+            destination=Destination("twitch", BROADCASTER, "chat"),
+            principal="brain",
+            deadline=1000.0,
+        )
+    )
+    return observation, len(calls)
+
+
+def test_ac23_the_console_lists_every_configured_grant_with_its_revoke(tmp_path: Path) -> None:
+    """AC23 (R7, A6): both grants are listed with rule id, action, principal
+    and destination, each with its Revoke control — the page's only grant
+    control: no form adds a grant or changes a policy, bound or setting."""
+
+    ui = _grants_ui(tmp_path)
+    cookie, _csrf = _login(ui)
+    body = _get(ui, "/console", cookie).body.decode("utf-8")
+
+    assert _grant_rows(body) == ["brain-reads-chat", "brain-reads-users"]
+    row = re.search(r'<tr class="grant" data-rule="brain-reads-users">(.*?)</tr>', body).group(1)
+    cells = re.findall(r"<td>(.*?)</td>", row)
+    assert cells[:4] == [
+        "<code>brain-reads-users</code>",
+        USERS_READ,
+        "brain",
+        html_escape(f"platform: twitch, channel_id: ${{{BROADCASTER_VARIABLE}}}, scope: chat"),
+    ]
+    token = ui.grant_token("brain-reads-users")
+    assert f'name="{console.REVOKE_GRANT_FIELD}" value="{token}"' in cells[4]
+    assert "brain-reads-users" not in cells[4]
+    assert html_escape(TABLE.sentence("en", "console.grants.revoke")) in cells[4]
+    forms = re.findall(r'<form [^>]*action="([^"]+)"', body)
+    assert sorted(forms) == sorted([console.START_ROUTE, console.REVOKE_ROUTE, console.REVOKE_ROUTE])
+    # The resolved channel never reaches the page: grants are shown unresolved.
+    assert BROADCASTER not in body
+
+
+def test_ac23_revoke_with_a_supervised_child_writes_the_overlay_and_restarts_once(
+    tmp_path: Path, fake_spawn: FakeOS
+) -> None:
+    """AC23 (R7, A6): Revoke on ``brain-reads-users`` leaves the base
+    byte-identical, writes the managed overlay so that the merged ``actions``
+    lists only ``brain-reads-chat`` (the remaining rule unchanged, its
+    ``${…}`` unresolved), performs exactly 1 supervised restart (one Check,
+    one stop, one start) and shows its report; afterwards a ``users.read``
+    call through the executor over the merged configuration is refused
+    ``no_applicable_rule`` — it ran before — and the console renders that
+    refusal's sentence."""
+
+    ui = _grants_ui(tmp_path)
+    checks: list[Any] = []
+    ui.checker = lambda *args: checks.append(args) or (True, [])  # type: ignore[assignment]
+    launches = _Launches(ui, fake_spawn, _ready_on_disk(ui))
+    restarts: list[Any] = []
+    real_restart = ui.supervisor.restart
+
+    def restart(*args: Any, **kwargs: Any) -> Any:
+        restarts.append(args)
+        return real_restart(*args, **kwargs)
+
+    ui.supervisor.restart = restart  # type: ignore[method-assign]
+    cookie, csrf = _login(ui)
+    base = ui.base_path
+    environ = {BROADCASTER_VARIABLE: BROADCASTER}
+    try:
+        before, _invoked = asyncio.run(_users_read(application.load_config(base, environ=environ)))
+        assert before.status == "success" and _invoked == 1
+        started = ui.handle(
+            _ui_request(
+                "POST", "/start",
+                headers={"cookie": cookie, "content-type": "application/x-www-form-urlencoded"},
+                body=f"csrf_token={csrf}".encode("utf-8"),
+            )
+        )
+        assert _outcome(started.body.decode("utf-8")) == (console.ACTION_START, console.START_STARTED)
+        page = _get(ui, "/console", cookie).body.decode("utf-8")
+        base_bytes = base.read_bytes()
+
+        response = _revoke(ui, cookie, csrf, "brain-reads-users", _fingerprint(page))
+
+        assert response.status == 200
+        body = response.body.decode("utf-8")
+        assert _outcome(body) == (console.ACTION_REVOKE, console.REVOKE_APPLIED)
+        assert _cause_markup(body) == _expected_cause("en", "console.revoke.applied", "console.revoke.applied.next")
+        assert '<p id="outcome-rule">' in body and "<code>brain-reads-users</code></p>" in body
+        assert base.read_bytes() == base_bytes
+        overlay = read_overlay(ui.overlay_path)
+        merged = deep_merge(read_base(base), overlay)
+        assert [rule["rule_id"] for rule in merged["actions"]] == ["brain-reads-chat"]
+        assert merged["actions"][0] == read_base(base)["actions"][0]
+        assert set(overlay) == {"actions"}
+        overlay_text = ui.overlay_path.read_text(encoding="utf-8")
+        assert f"${{{BROADCASTER_VARIABLE}}}" in overlay_text and BROADCASTER not in overlay_text
+        # Exactly one supervised restart, through Apply's Check.
+        assert len(restarts) == 1 and len(checks) == 1
+        assert len(launches.starts) == 2 and len(launches.stops) == 1
+        assert launches.locked == [True, True, True]
+        assert f'data-state="{console.STATE_RUNNING_HERE}"' in body
+        # The console now lists the remaining grant only.
+        assert _grant_rows(body) == ["brain-reads-chat"]
+
+        config = application.load_config(base, environ=environ, overlay=ui.overlay_path)
+        after, invoked = asyncio.run(_users_read(config))
+        assert after.status == "refused" and invoked == 0
+        assert after.provenance["authorization_reason"] == REASON_NO_RULE == "no_applicable_rule"
+        _write_feed(
+            ui.settings.feed_path,
+            [
+                {
+                    "seq": 1, "at": "2026-10-24T08:00:02.000Z", "fact": TRACE_ACTION_COMPLETED,
+                    "action": USERS_READ, "status": after.status, "error_code": after.error["code"],
+                    "reason": after.provenance["authorization_reason"],
+                }
+            ],
+        )
+        refused = _get(ui, "/console", cookie).body.decode("utf-8")
+        ((_seq, fact, inner),) = _items(refused)
+        assert fact == TRACE_ACTION_COMPLETED
+        assert html_escape(TABLE.sentence("en", "reason.no_applicable_rule")) in inner
+        assert 'data-reason="no_applicable_rule"' in inner
+    finally:
+        ui.supervisor.stop_grace = 0.5
+        ui.supervisor.stop()
+
+
+@pytest.mark.parametrize("language", ["en", "fr"])
+def test_ac23_revoke_with_nothing_running_takes_effect_at_the_next_start(tmp_path: Path, language: str) -> None:
+    """A6: with no child of this UI, the removal is written and nothing is
+    stopped, started or checked; the report says it takes effect at the
+    next start, in the chosen language."""
+
+    calls: list[str] = []
+
+    class _Watched:
+        child = None
+
+        def __getattr__(self, name: str) -> Any:
+            calls.append(name)
+            return lambda *args, **kwargs: None
+
+    (tmp_path / "mods").mkdir()
+    base = tmp_path / "config.yaml"
+    base.write_text(GRANTS_PROFILE, encoding="utf-8")
+    ui = config_ui.ConfigUI(
+        config_ui.UISettings.from_argv(["--config", str(base)]),
+        environ={},
+        checker=lambda *args: calls.append("checker"),  # type: ignore[arg-type,return-value]
+        supervisor=_Watched(),  # type: ignore[arg-type]
+    )
+    cookie, csrf = _login(ui)
+    _choose(ui, cookie, csrf, language)
+    page = _get(ui, "/console", cookie).body.decode("utf-8")
+    base_bytes = base.read_bytes()
+
+    body = _revoke(ui, cookie, csrf, "brain-reads-chat", _fingerprint(page)).body.decode("utf-8")
+
+    assert _outcome(body) == (console.ACTION_REVOKE, console.REVOKE_PENDING)
+    assert _cause_markup(body) == _expected_cause(language, "console.revoke.pending", "console.revoke.pending.next")
+    assert calls == []
+    assert base.read_bytes() == base_bytes
+    merged = deep_merge(read_base(base), read_overlay(ui.overlay_path))
+    assert [rule["rule_id"] for rule in merged["actions"]] == ["brain-reads-users"]
+    assert _grant_rows(body) == ["brain-reads-users"]
+
+
+def test_ac23_revoke_refuses_an_unknown_rule_and_a_stale_page_without_writing(tmp_path: Path) -> None:
+    """A6: an id no single rule carries, and a page rendered before the
+    overlay changed, write nothing; the last grant revoked leaves an empty
+    list, which the merge keeps (the overlay replaces lists)."""
+
+    ui = _grants_ui(tmp_path)
+    cookie, csrf = _login(ui)
+    fingerprint = _fingerprint(_get(ui, "/console", cookie).body.decode("utf-8"))
+
+    for rule_id in ("brain-reads-nothing", "", "brain"):
+        body = _revoke(ui, cookie, csrf, rule_id, fingerprint).body.decode("utf-8")
+        assert _outcome(body) == (console.ACTION_REVOKE, console.REVOKE_UNKNOWN_RULE)
+        assert not ui.overlay_path.exists()
+
+    first = _revoke(ui, cookie, csrf, "brain-reads-chat", fingerprint).body.decode("utf-8")
+    assert _outcome(first)[1] == console.REVOKE_PENDING
+    written = ui.overlay_path.read_bytes()
+    stale = _revoke(ui, cookie, csrf, "brain-reads-users", fingerprint).body.decode("utf-8")
+    assert _outcome(stale) == (console.ACTION_REVOKE, console.REVOKE_STALE)
+    assert ui.overlay_path.read_bytes() == written
+
+    last = _revoke(ui, cookie, csrf, "brain-reads-users", _fingerprint(first)).body.decode("utf-8")
+    assert _outcome(last)[1] == console.REVOKE_PENDING
+    assert deep_merge(read_base(ui.base_path), read_overlay(ui.overlay_path))["actions"] == []
+    assert _grant_rows(last) == [] and 'id="grants-none"' in last
+
+
+def test_ac23_revoke_posts_an_opaque_token_never_the_redacted_rule_id(tmp_path: Path) -> None:
+    """R4, A6: a rule id holding a secret-set value is shown hidden, so the
+    Revoke control posts the rule's opaque token instead: the page's own
+    form removes that rule — not the one whose id spells the masked text —
+    and the secret reaches neither the page nor the overlay's report."""
+
+    (tmp_path / "mods").mkdir()
+    base = tmp_path / "config.yaml"
+    masked = f"grant-{config_ui.REDACTED}"
+    base.write_text(
+        GRANTS_PROFILE.replace("brain-reads-chat", f"grant-{SECRET}").replace("brain-reads-users", f"'{masked}'")
+        + "secrets: ['${CONSOLE_SECRET}']\n",
+        encoding="utf-8",
+    )
+    ui = config_ui.ConfigUI(
+        config_ui.UISettings.from_argv(["--config", str(base)]),
+        environ={BROADCASTER_VARIABLE: BROADCASTER, "CONSOLE_SECRET": SECRET},
+    )
+    cookie, csrf = _login(ui)
+    page = _get(ui, "/console", cookie).body.decode("utf-8")
+    assert SECRET not in page
+    tokens = re.findall(rf'name="{console.REVOKE_GRANT_FIELD}" value="([^"]*)"', page)
+    assert tokens == [ui.grant_token(f"grant-{SECRET}"), ui.grant_token(masked)]
+
+    from urllib.parse import urlencode
+
+    response = ui.handle(
+        _ui_request(
+            "POST",
+            console.REVOKE_ROUTE,
+            headers={"cookie": cookie, "content-type": "application/x-www-form-urlencoded"},
+            body=urlencode(
+                [("csrf_token", csrf), ("fingerprint", _fingerprint(page)), (console.REVOKE_GRANT_FIELD, tokens[0])]
+            ).encode("utf-8"),
+        )
+    )
+    body = response.body.decode("utf-8")
+    assert _outcome(body) == (console.ACTION_REVOKE, console.REVOKE_PENDING)
+    assert SECRET not in body
+    merged = deep_merge(read_base(base), read_overlay(ui.overlay_path))
+    assert [rule["rule_id"] for rule in merged["actions"]] == [masked]
+
+
+def test_ac23_the_route_table_s_new_entries_are_exactly_the_eight() -> None:
+    """AC23: the console exposes no route that adds a grant or changes a
+    policy, an admission bound or a module setting — the route table's new
+    entries are exactly the wizard, console, feed, start, stop, revoke,
+    language and token-authenticated ``/instance`` routes."""
+
+    ui = config_ui.ConfigUI(config_ui.UISettings.from_argv([]), environ={})
+    try:
+        existing = {"/", "/core", config_ui.MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply"}
+        assert existing <= set(ui.routes)
+        assert set(ui.routes) - existing == {
+            "/wizard", "/language", "/console", "/feed", "/start", "/stop", "/revoke", "/instance",
+        }
+        assert ui.routes["/revoke"][0] == frozenset({"POST"})
+        assert config_ui.STATE_CHANGING_PATHS - {"/save", "/remove", "/check", "/apply"} == {
+            "/language", "/start", "/stop", "/revoke",
+        }
+    finally:
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+# -- AC4: the full guard sweep over every new route ------------------------- #
+
+#: Every new route and the methods it serves (AC23's eight).
+NEW_ROUTES = {
+    "/wizard": ("GET", "POST"),
+    "/language": ("POST",),
+    "/console": ("GET",),
+    "/feed": ("GET",),
+    "/start": ("POST",),
+    "/stop": ("POST",),
+    "/revoke": ("POST",),
+}
+
+
+def test_ac4_every_new_route_is_refused_by_the_existing_guards_with_no_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC4 (R1), full sweep: for every new route, (a) a wrong Host, (b) no
+    session, (c) a wrong method, (d) a foreign Origin on a state change and
+    (e) a missing or wrong CSRF token on a state change are refused with the
+    status the existing routes answer the same request with; ``/instance``
+    (the P8 row, re-run here) answers (a) and (c) alike and, in place of
+    (b), refuses a missing or wrong access token as the access URL does.
+    0 validator, checker, supervisor, file-write or feed-read calls."""
+
+    first_run._default_environment(monkeypatch, tmp_path / "xdg")
+    calls: list[str] = []
+
+    class _Watched:
+        child = None
+
+        def __getattr__(self, name: str) -> Any:
+            calls.append(f"supervisor.{name}")
+            return lambda *args, **kwargs: None
+
+    def transport(name: str) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            calls.append(name)
+            raise AssertionError(f"{name} reached")
+
+        return call
+
+    for name in ("read_feed", "poll_feed"):
+        monkeypatch.setattr(console, name, transport(f"feed.{name}"))
+    monkeypatch.setattr(config_ui, "_write_overlay", transport("write_overlay"))
+    base = _grants_ui(tmp_path).base_path
+    ui = config_ui.ConfigUI(
+        config_ui.UISettings.from_argv(["--config", str(base)]),
+        environ={},
+        checker=transport("checker"),  # type: ignore[arg-type]
+        supervisor=_Watched(),  # type: ignore[arg-type]
+        wizard_seams=config_ui.WizardSeams(
+            platform_transport=transport("validator.platform"),
+            model_transport=transport("validator.model"),
+            dry_runner=transport("validator.dry_run"),
+        ),
+    )
+    cookie, csrf = _login(ui)
+    files = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    form = {"cookie": cookie, "content-type": "application/x-www-form-urlencoded"}
+    body = f"csrf_token={csrf}&grant=x&language=fr".encode("utf-8")
+
+    def status(method: str, path: str, **options: Any) -> int:
+        return ui.handle(_ui_request(method, path, **options)).status
+
+    def answers(path: str, method: str, other: str) -> dict[str, int]:
+        """The refusals of one route; *other* is a method it does not serve."""
+
+        found = {
+            "wrong host": status(method, path, headers=form, body=body, host="evil.example:8765"),
+            "no session": status(method, path, headers={"content-type": form["content-type"]}, body=body),
+            "forged session": status(
+                method, path, headers={**form, "cookie": f"{config_ui.SESSION_COOKIE}=forged"}, body=body
+            ),
+            "wrong method": status(other, path, headers=form, body=body),
+        }
+        if method == "POST":
+            found["foreign origin"] = status(
+                method, path, headers={**form, "origin": "http://evil.example:8765"}, body=body
+            )
+            found["missing csrf"] = status(method, path, headers=form, body=b"grant=x")
+            found["wrong csrf"] = status(method, path, headers=form, body=b"csrf_token=wrong&grant=x")
+        return found
+
+    # What the existing routes answer: a state change and a page.
+    expected = {"POST": answers("/save", "POST", "GET"), "GET": answers("/core", "GET", "POST")}
+    assert expected["POST"] == {
+        "wrong host": 403, "no session": 401, "forged session": 401, "wrong method": 405,
+        "foreign origin": 403, "missing csrf": 403, "wrong csrf": 403,
+    }
+    swept = 0
+    for path, methods in NEW_ROUTES.items():
+        for method in methods:
+            other = "PUT" if len(methods) == 2 else ("GET" if method == "POST" else "POST")
+            assert answers(path, method, other) == expected[method], (path, method)
+            swept += 1
+    assert swept == 8
+
+    # ``/instance``: (a), (c), and a missing or wrong access token.
+    wrong_token = status("GET", "/", query={"token": "x" * 43})
+    marker = ui.instance_marker.encode("utf-8")
+    sessions = len(ui._sessions)
+    for request_status, options in (
+        (expected["GET"]["wrong host"], {"query": {"token": ui.token}, "host": "evil.example:8765"}),
+        (expected["GET"]["wrong method"], {"query": {"token": ui.token}, "method": "POST"}),
+        (expected["GET"]["wrong method"], {"query": {"token": ui.token}, "method": "PUT"}),
+        (wrong_token, {}),
+        (wrong_token, {"query": {"token": ""}}),
+        (wrong_token, {"query": {"token": ui.token[:-1]}}),
+        (wrong_token, {"headers": {"cookie": cookie}}),
+    ):
+        method = options.pop("method", "GET")
+        response = ui.handle(_ui_request(method, "/instance", **options))
+        assert response.status == request_status, options
+        assert marker not in response.body
+        assert not any(name == "Set-Cookie" for name, _ in response.headers)
+    assert len(ui._sessions) == sessions
+    good = ui.handle(_ui_request("GET", "/instance", query={"token": ui.token}))
+    assert good.status == 200 and json.loads(good.body)["marker"] == ui.instance_marker
+    assert len(ui._sessions) == sessions
+
+    assert calls == []
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files
+    config_ui._LOG_REDACTION.sources.discard(ui)

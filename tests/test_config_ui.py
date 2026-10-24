@@ -5101,6 +5101,16 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     (the redacted tail behind the closed disclosure), a start that comes up
     ready, its stop, and a stop with nothing to stop — so the secret sweep
     covers them too.
+
+    Phase 9 R7/A6 (same allowlist entry, plan P15): the set gains the
+    console's ``/revoke`` (POST, CSRF), and the assertion becomes final:
+    exactly the 7 existing routes plus ``/wizard``, ``/language``,
+    ``/console``, ``/feed``, ``/start``, ``/stop``, ``/revoke`` and
+    ``/instance``. Revoke is driven by the sweep over the supervised
+    profile — refused without a session or CSRF token, a removal with this
+    UI's child running (one supervised restart and its report), one with
+    nothing running and an unknown rule — so the secret sweep covers every
+    new route.
     """
 
     environ = _sweep_environ()
@@ -5245,6 +5255,35 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
     assert stopped.status == 200 and b'data-outcome="stopped"' in stopped.body
     nothing = sweep.record("POST /stop (nothing)", _post(ui, "/stop", cookie, csrf))
     assert nothing.status == 200 and b'data-outcome="nothing"' in nothing.body
+    # Revoke (plan P15): refused without a session or CSRF token; with this
+    # UI's child running, one supervised restart and its report; with none,
+    # written for the next start; an unknown rule writes nothing.
+    assert sweep.record("POST /revoke (no session)", _post(ui, "/revoke", "", csrf)).status == 401
+    assert sweep.record("POST /revoke (no csrf)", _post(ui, "/revoke", cookie, None)).status == 403
+    rules = [rule["rule_id"] for rule in ui.view().rules()]
+    assert {"brain-reads-chat", "brain-reads-users"} <= set(rules)
+    sweep.record("POST /start (before revoke)", _post(ui, "/start", cookie, csrf))
+    base_bytes = base.read_bytes()
+    applied = sweep.record(
+        "POST /revoke (applied)",
+        _write(ui, cookie, "/revoke", "/console", [("grant", ui.grant_token("brain-reads-users"))]),
+    )
+    assert applied.status == 200 and b'data-outcome="applied"' in applied.body
+    sweep.record("POST /stop (after revoke)", _post(ui, "/stop", cookie, csrf))
+    pending = sweep.record(
+        "POST /revoke (pending)",
+        _write(ui, cookie, "/revoke", "/console", [("grant", ui.grant_token("brain-reads-chat"))]),
+    )
+    assert pending.status == 200 and b'data-outcome="pending"' in pending.body
+    unknown = sweep.record(
+        "POST /revoke (unknown rule)",
+        _write(ui, cookie, "/revoke", "/console", [("grant", ui.grant_token("brain-reads-chat"))]),
+    )
+    assert unknown.status == 200 and b'data-outcome="unknown_rule"' in unknown.body
+    assert base.read_bytes() == base_bytes
+    assert [rule["rule_id"] for rule in ui.view().rules()] == [
+        rule for rule in rules if rule not in ("brain-reads-chat", "brain-reads-users")
+    ]
     _sweep_pages(sweep, cookie)
     collected += sweep.texts()
     audited += [(label, response, frozenset(ui.authorities)) for label, response in sweep.responses]
@@ -5272,16 +5311,18 @@ def test_ac35_no_secret_value_reaches_any_response_log_report_or_record(
             assert token not in text
     assert len(collected) > 100
 
-    # Every route the UI serves was driven (the one JSON endpoint is R1's
-    # ``/instance``; every other route answers HTML or text, and a new one
-    # must join this sweep).
+    # Every route the UI serves was driven (the JSON endpoints are R1's
+    # ``/instance`` and the feed poll; every other route answers HTML or
+    # text). The set is final (plan P15): the 7 existing routes and the 8
+    # phase-9 ones, no other.
     assert set(ui.routes) == {
-        "/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply", "/instance",
-        "/wizard", "/language", "/console", "/feed", "/start", "/stop",
+        "/", "/core", MODULE_PAGE_PREFIX, "/save", "/remove", "/check", "/apply",
+        "/wizard", "/language", "/console", "/feed", "/start", "/stop", "/revoke", "/instance",
     }
     driven = {label for label, _response, _accepted in audited}
     assert {"GET /wizard", "POST /language", "GET /console", "GET /feed"} <= driven
     assert {"POST /start (exited)", "POST /start (started)", "POST /stop (stopped)"} <= driven
+    assert {"POST /revoke (applied)", "POST /revoke (pending)", "POST /revoke (unknown rule)"} <= driven
     json_answers = [label for label, response, _ in audited if response.content_type == "application/json"]
     assert json_answers and set(json_answers) == {"GET /instance", "GET /feed"}
     assert {response.content_type.split(";")[0] for _, response, _ in audited} <= {

@@ -3,8 +3,8 @@
 The console page shows the runtime state (running under this UI, not
 running, or another process this UI does not supervise), each enabled module
 ready or degraded — a degraded one with its cause and a next action — the
-supervision feed's entries newest first, the configured grants, and a link to
-the existing editor. Every sentence comes from the string table (R2); every
+supervision feed's entries newest first, the configured grants each with its
+Revoke control (A6), and a link to the existing editor. Every sentence comes from the string table (R2); every
 value shown is module- or runtime-owned data and is passed through the
 caller's escape, which redacts the UI's secret set (R4).
 
@@ -14,12 +14,16 @@ P2) with a bounded read, tolerating a missing or partly written file;
 plain-language sentence, and an unknown token to the generic sentence naming
 it, never to an empty line. :func:`render_outcome` shows what a Start or
 Stop came to: the cause, a table sentence chosen from the outcome alone, and
-the raw detail, the redacted stderr tail, behind a closed disclosure. This
-module opens no socket and writes no file.
+the raw detail, the redacted stderr tail, behind a closed disclosure.
+:func:`revoked_rules` is what a Revoke writes (A6): the merged ``actions``
+list without one rule, the whole remaining list, since the overlay replaces a
+list wholesale. This module opens no socket and writes no file.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -106,8 +110,28 @@ STOP_UNCONFIRMED = "unconfirmed"
 STOP_NOT_OURS = "not_ours"
 STOP_NOTHING = "nothing"
 
+#: The console's one grant control (R7, A6): a CSRF-guarded POST naming one
+#: configured rule by its opaque :func:`grant_token`, which it removes
+#: through the managed overlay. The rule id itself is never posted: the page
+#: shows it redacted, so a posted copy could name another rule or none.
+#: No route or control adds or widens a grant.
+REVOKE_ROUTE = "/revoke"
+REVOKE_GRANT_FIELD = "grant"
+
+#: What a Revoke can come to (R7, A6). Written, it takes effect at the next
+#: start (*pending*) or, with a child of this UI running, through one
+#: supervised restart: accepted, refused or not confirmed within the window.
+REVOKE_PENDING = "pending"
+REVOKE_APPLIED = "applied"
+REVOKE_APPLY_REFUSED = "apply_refused"
+REVOKE_APPLY_UNKNOWN = "apply_unknown"
+REVOKE_UNKNOWN_RULE = "unknown_rule"
+REVOKE_STALE = "stale"
+REVOKE_NOT_WRITTEN = "not_written"
+
 ACTION_START = "start"
 ACTION_STOP = "stop"
+ACTION_REVOKE = "revoke"
 
 Escape = Callable[[Any], str]
 
@@ -380,11 +404,41 @@ class Grant:
     action: str
     principal: str
     destination: str
+    #: What the Revoke control posts (:func:`grant_token`); empty when the
+    #: rule has no string id, which no Revoke can name.
+    token: str = ""
 
 
-def grants_of(rules: Sequence[Any], *, any_action: str = "*") -> list[Grant]:
+def grant_token(key: bytes, rule_id: str) -> str:
+    """The opaque name a Revoke posts for *rule_id*: its HMAC under *key*.
+
+    The UI's per-process key keeps it from revealing the id, which may hold
+    a secret-set value the page shows hidden; :func:`rule_of_token` maps it
+    back to the id as the files spell it.
+    """
+
+    return hmac.new(key, rule_id.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def rule_of_token(rules: Sequence[Any], key: bytes, token: str) -> str | None:
+    """The string ``rule_id`` of *rules* whose :func:`grant_token` is
+    *token*, or ``None`` when none is (an empty id never is)."""
+
+    if not token:
+        return None
+    for rule in rules:
+        rule_id = rule.get("rule_id") if isinstance(rule, Mapping) else None
+        if isinstance(rule_id, str) and rule_id and hmac.compare_digest(grant_token(key, rule_id), token):
+            return rule_id
+    return None
+
+
+def grants_of(
+    rules: Sequence[Any], *, any_action: str = "*", key: bytes | None = None
+) -> list[Grant]:
     """The configured ``actions`` rules as grants, in order; an entry that is
-    not a mapping is skipped (the editor reports it)."""
+    not a mapping is skipped (the editor reports it). With *key*, each rule
+    with a string id carries its :func:`grant_token`."""
 
     def listing(value: Any) -> str:
         if value is None:
@@ -400,15 +454,39 @@ def grants_of(rules: Sequence[Any], *, any_action: str = "*") -> list[Grant]:
         if not isinstance(rule, Mapping):
             continue
         action = rule.get("action_name", any_action)
+        rule_id = rule.get("rule_id")
+        named = key is not None and isinstance(rule_id, str) and bool(rule_id)
         grants.append(
             Grant(
                 rule_id=listing(rule.get("rule_id")),
                 action=any_action if action is None else listing(action),
                 principal=listing(rule.get("principals")),
                 destination=listing(rule.get("destination")),
+                token=grant_token(key, rule_id) if named else "",
             )
         )
     return grants
+
+
+def revoked_rules(rules: Sequence[Any], rule_id: str) -> list[Any] | None:
+    """*rules* without the one rule whose ``rule_id`` is *rule_id*, in order.
+
+    *rules* is the merged ``actions`` list of the unresolved documents, so a
+    rule is named as the files spell it (a ``${…}`` stays a reference). The
+    result is the whole remaining list — the overlay replaces a list
+    wholesale (``deep_merge``), so a removal is written as what is left —
+    and holds every other rule unchanged. ``None`` when no rule, or more than
+    one, carries that id: nothing is then removed.
+    """
+
+    matching = [
+        index
+        for index, rule in enumerate(rules)
+        if isinstance(rule, Mapping) and isinstance(rule.get("rule_id"), str) and rule["rule_id"] == rule_id
+    ]
+    if not rule_id or len(matching) != 1:
+        return None
+    return [rule for index, rule in enumerate(rules) if index != matching[0]]
 
 
 # --------------------------------------------------------------------------- #
@@ -576,8 +654,23 @@ def _health_markup(
     )
 
 
-def _grants_markup(grants: Sequence[Grant], language: str, table: StringTable, escape: Escape) -> str:
-    """The configured grants, read-only: the console adds or widens none."""
+def _revoke_form(grant: Grant, revoke_fields: str, language: str, table: StringTable, escape: Escape) -> str:
+    """One grant's Revoke control: the session's hidden fields and its
+    opaque token, a structural value never redacted."""
+
+    label = escape(table.sentence(language, "console.grants.revoke"))
+    return (
+        f'<form class="revoke" method="post" action="{REVOKE_ROUTE}">{revoke_fields}'
+        f'<input type="hidden" name="{REVOKE_GRANT_FIELD}" value="{html.escape(grant.token, quote=True)}">'
+        f'<button type="submit">{label}</button></form>'
+    )
+
+
+def _grants_markup(
+    grants: Sequence[Grant], language: str, table: StringTable, escape: Escape, revoke_fields: str = ""
+) -> str:
+    """The configured grants, each with its Revoke control when
+    *revoke_fields* is given (A6): the console adds or widens none."""
 
     title = escape(table.sentence(language, "console.grants.title"))
     if not grants:
@@ -592,10 +685,19 @@ def _grants_markup(grants: Sequence[Grant], language: str, table: StringTable, e
             table.sentence(language, "console.grants.destination"),
         )
     )
+    if revoke_fields:
+        headings += "<th></th>"
+
+    def control(grant: Grant) -> str:
+        if not revoke_fields:
+            return ""
+        form = _revoke_form(grant, revoke_fields, language, table, escape) if grant.token else ""
+        return f"<td>{form}</td>"
+
     rows = "".join(
-        f'<tr class="grant"><td><code>{escape(grant.rule_id)}</code></td>'
+        f'<tr class="grant" data-rule="{escape(grant.rule_id)}"><td><code>{escape(grant.rule_id)}</code></td>'
         f"<td>{escape(grant.action)}</td><td>{escape(grant.principal)}</td>"
-        f"<td>{escape(grant.destination)}</td></tr>"
+        f"<td>{escape(grant.destination)}</td>{control(grant)}</tr>"
         for grant in grants
     )
     return (
@@ -610,13 +712,15 @@ class RuntimeOutcome:
 
     *raw_detail* is the child's bounded stderr tail (or the launch error),
     already redacted by the caller: quoted data, never translated, shown
-    only behind the closed disclosure. It never chooses the cause.
+    only behind the closed disclosure. It never chooses the cause. A
+    Revoke's report also names its *rule_id*, as data.
     """
 
     action: str
     outcome: str
     exit_status: int | None = None
     raw_detail: str = ""
+    rule_id: str = ""
 
 
 def _outcome_sentences(outcome: RuntimeOutcome, language: str, table: StringTable) -> tuple[str, str]:
@@ -643,6 +747,38 @@ def _outcome_sentences(outcome: RuntimeOutcome, language: str, table: StringTabl
             ),
         }
         return sentences.get(outcome.outcome, sentences[STOP_NOTHING])
+    if outcome.action == ACTION_REVOKE:
+        sentences = {
+            REVOKE_PENDING: (
+                table.sentence(language, "console.revoke.pending"),
+                table.sentence(language, "console.revoke.pending.next"),
+            ),
+            REVOKE_APPLIED: (
+                table.sentence(language, "console.revoke.applied"),
+                table.sentence(language, "console.revoke.applied.next"),
+            ),
+            REVOKE_APPLY_REFUSED: (
+                table.sentence(language, "console.revoke.apply_refused"),
+                table.sentence(language, "console.revoke.apply_refused.next"),
+            ),
+            REVOKE_APPLY_UNKNOWN: (
+                table.sentence(language, "console.revoke.apply_unknown"),
+                table.sentence(language, "console.revoke.apply_unknown.next"),
+            ),
+            REVOKE_UNKNOWN_RULE: (
+                table.sentence(language, "console.revoke.unknown_rule"),
+                table.sentence(language, "console.revoke.unknown_rule.next"),
+            ),
+            REVOKE_STALE: (
+                table.sentence(language, "console.revoke.stale"),
+                table.sentence(language, "console.revoke.stale.next"),
+            ),
+            REVOKE_NOT_WRITTEN: (
+                table.sentence(language, "console.revoke.not_written"),
+                table.sentence(language, "console.revoke.not_written.next"),
+            ),
+        }
+        return sentences.get(outcome.outcome, sentences[REVOKE_NOT_WRITTEN])
     sentences = {
         START_STARTED: (
             table.sentence(language, "console.start.started"),
@@ -681,13 +817,15 @@ def outcome_title(outcome: RuntimeOutcome, language: str, table: StringTable) ->
 
     if outcome.action == ACTION_STOP:
         return table.sentence(language, "console.stop.title")
+    if outcome.action == ACTION_REVOKE:
+        return table.sentence(language, "console.revoke.title")
     return table.sentence(language, "console.start.title")
 
 
 def render_outcome(
     outcome: RuntimeOutcome, language: str, table: StringTable, *, escape: Escape = _plain_escape
 ) -> str:
-    """A Start or Stop outcome's two surfaces (R7, AC32).
+    """A Start, Stop or Revoke outcome's two surfaces (R7, AC32).
 
     The **cause** — the table's sentence and next action in *language* — is
     always shown, outside any disclosure, and holds nothing of the raw
@@ -704,6 +842,9 @@ def render_outcome(
         f'<div id="outcome-cause"><p class="cause">{escape(cause)}</p>'
         f'<p class="next">{escape(following)}</p></div>',
     ]
+    if outcome.rule_id:
+        label = escape(table.sentence(language, "console.revoke.rule"))
+        parts.append(f'<p id="outcome-rule">{label} <code>{escape(outcome.rule_id)}</code></p>')
     if outcome.exit_status is not None:
         status = int(outcome.exit_status)
         sentence = table.sentence(language, "console.start.exit_status", status=status)
@@ -784,14 +925,16 @@ def render_console(
     *,
     escape: Escape = _plain_escape,
     csrf_field: str = "",
+    revoke_fields: str = "",
     outcome: RuntimeOutcome | None = None,
 ) -> str:
     """The console page's body (R7): the runtime state, each enabled module,
     the feed newest first, the configured grants and the editor link.
 
     With *csrf_field* (the session's hidden CSRF input) the state carries
-    its Start or Stop control; with *outcome*, the last Start or Stop's
-    report comes first (:func:`render_outcome`).
+    its Start or Stop control; with *revoke_fields* (the hidden fields a
+    Revoke posts) each grant carries its Revoke control; with *outcome*, the
+    last Start, Stop or Revoke's report comes first (:func:`render_outcome`).
 
     Every sentence is the table's in *language*; every value goes through
     *escape*, which the UI makes its redacting escape (R4).
@@ -818,7 +961,7 @@ def render_console(
         f"{_health_markup(health, language, table, escape)}"
         f'<section id="feed-section"><h2>{feed_title}</h2>{empty}'
         f'<ol id="feed" data-cursor="{cursor}" data-cursor-at="{escape(cursor_at)}">{"".join(items)}</ol></section>'
-        f"{_grants_markup(grants, language, table, escape)}"
+        f"{_grants_markup(grants, language, table, escape, revoke_fields)}"
         f'<p><a id="editor-link" href="{EDITOR_LINK_PATH}">{editor}</a></p>'
         f"<script>{_POLL_SCRIPT}</script>"
     )

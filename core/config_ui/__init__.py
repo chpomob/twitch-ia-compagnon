@@ -2787,7 +2787,16 @@ INSTANCE_ROUTE = "/instance"
 
 #: Paths whose requests change state: POST only, Origin- and CSRF-checked.
 STATE_CHANGING_PATHS = frozenset(
-    {"/save", "/remove", "/check", "/apply", LANGUAGE_ROUTE, console.START_ROUTE, console.STOP_ROUTE}
+    {
+        "/save",
+        "/remove",
+        "/check",
+        "/apply",
+        LANGUAGE_ROUTE,
+        console.START_ROUTE,
+        console.STOP_ROUTE,
+        console.REVOKE_ROUTE,
+    }
 )
 
 #: Every discovered module's page lives under this prefix (R4b).
@@ -2927,6 +2936,10 @@ class ConfigUI:
         #: fingerprint covers (R5): minted per process, held in memory only,
         #: never written to the state file, a log record or a response.
         self.fingerprint_key = secrets.token_bytes(32)
+        #: Keys the opaque token each Revoke control posts for its rule
+        #: (:func:`console.grant_token`): a rule id may hold a secret-set
+        #: value the page shows hidden, so the id itself is never posted.
+        self.grant_key = secrets.token_bytes(32)
         self.authorities = accepted_authorities(
             settings.host, settings.port, settings.allowed_hosts
         )
@@ -2991,6 +3004,7 @@ class ConfigUI:
             console.FEED_ROUTE: (frozenset({"GET"}), self._feed_endpoint),
             console.START_ROUTE: (frozenset({"POST"}), self._start_endpoint),
             console.STOP_ROUTE: (frozenset({"POST"}), self._stop_endpoint),
+            console.REVOKE_ROUTE: (frozenset({"POST"}), self._revoke_endpoint),
         }
 
     def __repr__(self) -> str:
@@ -3318,7 +3332,7 @@ class ConfigUI:
     def _console_response(
         self, session: _Session, outcome: console.RuntimeOutcome | None = None
     ) -> UIResponse:
-        """The console page, with *outcome* (a Start or Stop report) first."""
+        """The console page, with *outcome* (a Start, Stop or Revoke report) first."""
 
         view = self.view()
         running = self.running_state()
@@ -3335,11 +3349,15 @@ class ConfigUI:
             ),
             feed,
             health,
-            console.grants_of(view.rules(), any_action=ANY_ACTION),
+            console.grants_of(view.rules(), any_action=ANY_ACTION, key=self.grant_key),
             language,
             wizard.table,
             escape=esc,
             csrf_field=_csrf_field(session),
+            revoke_fields=(
+                f"{_csrf_field(session)}"
+                f'<input type="hidden" name="{FINGERPRINT_FIELD}" value="{ident(_view_fingerprint(view))}">'
+            ),
             outcome=outcome,
         )
         if outcome is None:
@@ -3363,6 +3381,96 @@ class ConfigUI:
         if self._wizard_open():
             return UIResponse(status=303, headers=(("Location", LANDING_WIZARD),))
         return self._console_response(session, self.stop_runtime())
+
+    def _revoke_endpoint(self, request: UIRequest, session: _Session) -> UIResponse:
+        """``POST /revoke`` (R7, A6): :meth:`revoke_grant` of the posted grant
+        token, then the console with its report."""
+
+        if self._wizard_open():
+            return UIResponse(status=303, headers=(("Location", LANDING_WIZARD),))
+        fields = _form_fields(request)
+        report = self.revoke_grant(
+            _posted(fields, console.REVOKE_GRANT_FIELD), fingerprint=_posted(fields, FINGERPRINT_FIELD)
+        )
+        return self._console_response(session, report)
+
+    def grant_token(self, rule_id: str) -> str:
+        """The opaque token the console's Revoke control posts for *rule_id*."""
+
+        return console.grant_token(self.grant_key, rule_id)
+
+    def revoke_grant(self, token: str, *, fingerprint: str) -> console.RuntimeOutcome:
+        """Remove the one ``actions`` rule named by *token* through the managed overlay (A6).
+
+        *token* is the rule's :meth:`grant_token`, mapped back to the id as
+        the unresolved files spell it; a token no rule's id matches names no
+        rule, so nothing is removed.
+
+        The base is never written: the overlay's ``actions`` becomes the
+        merged list of the unresolved files minus that rule — the overlay
+        replaces a list wholesale, so the removal is the whole remaining list
+        — through :func:`_write_overlay`, with the stale check every write
+        has. With a child of this UI running, the removal takes effect
+        through exactly one supervised restart, :meth:`apply`, whose report
+        is the outcome; otherwise at the next start. Nothing else of the
+        configuration changes, and nothing is ever added to a grant.
+        """
+
+        revoke = console.ACTION_REVOKE
+        prepared = self._prepare_write(fingerprint)
+        if isinstance(prepared, WriteResult):
+            outcome = console.REVOKE_STALE if prepared.outcome == OUTCOME_STALE else console.REVOKE_NOT_WRITTEN
+            return self._revoked(console.RuntimeOutcome(revoke, outcome))
+        base, overlay = prepared
+        merged = deep_merge(base, overlay).get(ACTIONS_KEY)
+        rules = merged if isinstance(merged, list) else []
+        rule_id = console.rule_of_token(rules, self.grant_key, token)
+        remaining = None if rule_id is None else console.revoked_rules(rules, rule_id)
+        if rule_id is None:
+            return self._revoked(console.RuntimeOutcome(revoke, console.REVOKE_UNKNOWN_RULE))
+        if remaining is None:
+            return self._revoked(console.RuntimeOutcome(revoke, console.REVOKE_UNKNOWN_RULE, rule_id=rule_id))
+        draft = _detached(overlay)
+        draft[ACTIONS_KEY] = remaining
+        try:
+            _write_overlay(self.overlay_path, self._managed_overlay, self.base_path, draft)
+        except (OSError, RuntimeError):
+            return self._revoked(console.RuntimeOutcome(revoke, console.REVOKE_NOT_WRITTEN, rule_id=rule_id))
+        if not self._child_alive():
+            return self._revoked(console.RuntimeOutcome(revoke, console.REVOKE_PENDING, rule_id=rule_id))
+        report = self.apply()
+        outcomes = {
+            APPLY_ACCEPTED: console.REVOKE_APPLIED,
+            APPLY_UNKNOWN: console.REVOKE_APPLY_UNKNOWN,
+            APPLY_REFUSED: console.REVOKE_APPLY_REFUSED,
+        }
+        detail = "\n".join(part for part in (*report.diagnostics, report.stderr_tail) if part)
+        return self._revoked(
+            console.RuntimeOutcome(
+                revoke,
+                outcomes[report.outcome],
+                exit_status=report.exit_status,
+                raw_detail=_redact(detail, self.secret_values),
+                rule_id=rule_id,
+            )
+        )
+
+    def _revoked(self, report: console.RuntimeOutcome) -> console.RuntimeOutcome:
+        """Log a Revoke with its outcome, the paths and the redacted rule id."""
+
+        rule = _redact(report.rule_id, self.secret_values)
+        logger.info(
+            "grant revoke %s: rule %s, overlay %s",
+            report.outcome,
+            rule,
+            "(none)" if self.overlay_path is None else os.fspath(self.overlay_path),
+            extra={
+                "config_ui_operation": "revoke",
+                "config_ui_outcome": report.outcome,
+                "config_ui_paths": (rule,),
+            },
+        )
+        return report
 
     def start_runtime(self) -> console.RuntimeOutcome:
         """Launch the profile through :meth:`Supervisor.start` (R7).
