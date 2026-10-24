@@ -816,6 +816,20 @@ variables). `tests/test_phase5_docs_status.py` fait respecter ce statut.
 | --- | --- | --- |
 | Automation bridge (`streamerbot`) contre une instance réelle | `tests/test_phase5_trials.py` (8 nœuds opt-in) | not delivered — awaiting real-instance trial |
 
+## Phase 9 — le premier lancement
+
+La phase 9 (spec `phase9-first-run`, `docs/campaigns/phase9/spec.md`) rend le
+produit installé utilisable par un streamer sans terminal et sans YAML :
+l'assistant de cinq écrans, quatre profils prêts à l'emploi et la console, dans
+l'interface locale existante. Les documents :
+
+- [`first-run.md`](first-run.md) — le guide du premier lancement (anglais,
+  normatif) : l'installation et `--install-launcher`, le lanceur,
+  l'emplacement par défaut et le fichier d'identifiants sur les trois
+  plateformes, les cinq écrans, la console et le passage à l'éditeur ;
+- [`first-run.fr.md`](first-run.fr.md) — sa traduction française ; le texte
+  anglais fait foi.
+
 ## Lecture des manifests de runs
 
 [runs/](runs/) conserve les cinq manifests originaux, sans suppression ni

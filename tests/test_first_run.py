@@ -54,6 +54,12 @@ P16 (R8): the package data of the string tables and the profiles, and the
 runtime dependency set, read from ``pyproject.toml`` in process (AC26's
 pyproject half; the installed-distribution node in ``test_profiles.py``
 asserts the shipped bytes).
+
+P17 (R8): the first-run guide pair (AC24's content half; the pair's
+discovery, shape and identifiers are ``test_docs_bilingual.py``'s): the
+default location and the credential directory on each platform, spelled
+from :mod:`core.config_ui.locations`, the credential file's name, the
+install path and ``--install-launcher``, and the documentation index's links.
 """
 
 from __future__ import annotations
@@ -5383,3 +5389,101 @@ def test_ac26_pyproject_ships_the_strings_and_profiles_with_two_dependencies() -
     assert any(
         pattern == "core*" for pattern in project["tool"]["setuptools"]["packages"]["find"]["include"]
     )
+
+
+# --------------------------------------------------------------------------- #
+# P17 (R8): the first-run guide pair (AC24)
+# --------------------------------------------------------------------------- #
+
+FIRST_RUN_GUIDES = (ROOT / "docs" / "first-run.md", ROOT / "docs" / "first-run.fr.md")
+
+#: Each platform's base directory as the guide spells it, and the environment
+#: that makes :mod:`locations` resolve it under a placeholder root.
+_GUIDE_BASES = {
+    locations.LINUX: ("$XDG_CONFIG_HOME", {"XDG_CONFIG_HOME": "/placeholder"}),
+    locations.WINDOWS: ("%APPDATA%", {"APPDATA": "/placeholder", "LOCALAPPDATA": "/local"}),
+    locations.MACOS: ("~", {"HOME": "/placeholder"}),
+}
+
+
+def _as_guide_spells(platform: str, path: Path, root: str, spelling: str) -> str:
+    """*path* under *root*, written from *spelling* with the platform's separator."""
+
+    separator = "\\" if platform == locations.WINDOWS else "/"
+    return separator.join((spelling, *path.relative_to(root).parts))
+
+
+def _code_spans(path: Path) -> set[str]:
+    return set(re.findall(r"`([^`\n]+)`", path.read_text(encoding="utf-8")))
+
+
+def test_ac24_the_guide_names_the_default_location_on_each_platform() -> None:
+    """AC24 (R8): both guides name, in a code span, the A2 default profile of
+    Linux, Windows and macOS, as :func:`locations.default_profile_path`
+    resolves it (and the Linux fallback without ``XDG_CONFIG_HOME``)."""
+
+    expected = {
+        _as_guide_spells(
+            platform, locations.default_profile_path(platform, environ), "/placeholder", spelling
+        )
+        for platform, (spelling, environ) in _GUIDE_BASES.items()
+    }
+    fallback = locations.default_profile_path(locations.LINUX, {"HOME": "/placeholder"})
+    expected.add(_as_guide_spells(locations.LINUX, fallback, "/placeholder", "~"))
+    assert expected == {
+        "$XDG_CONFIG_HOME/twitch-ia-compagnon/profile.yaml",
+        "~/.config/twitch-ia-compagnon/profile.yaml",
+        "%APPDATA%\\twitch-ia-compagnon\\profile.yaml",
+        "~/Library/Application Support/twitch-ia-compagnon/profile.yaml",
+    }
+    for guide in FIRST_RUN_GUIDES:
+        assert expected <= _code_spans(guide), (guide.name, sorted(expected - _code_spans(guide)))
+
+
+def test_ac24_the_guide_names_the_credential_file_and_its_directory_on_each_platform() -> None:
+    """AC24 (R8, A1): both guides name the credential file by its name,
+    ``<profile-file-name>.credentials.json`` and its value at the default,
+    and its per-user directory on each platform as
+    :func:`locations.credential_directory` resolves it (``%LOCALAPPDATA%`` on
+    Windows, never the roaming ``%APPDATA%``), trailing separator included."""
+
+    names = {
+        "<profile-file-name>" + locations.CREDENTIAL_SUFFIX,
+        locations.credential_file_name(locations.PROFILE_FILE_NAME),
+    }
+    assert names == {"<profile-file-name>.credentials.json", "profile.yaml.credentials.json"}
+    bases = dict(_GUIDE_BASES)
+    bases[locations.WINDOWS] = ("%LOCALAPPDATA%", {"APPDATA": "/roaming", "LOCALAPPDATA": "/placeholder"})
+    directories = set()
+    for platform, (spelling, environ) in bases.items():
+        directory = locations.credential_directory(platform, environ)
+        assert directory is not None
+        separator = "\\" if platform == locations.WINDOWS else "/"
+        directories.add(_as_guide_spells(platform, directory, "/placeholder", spelling) + separator)
+    assert directories == {
+        "$XDG_CONFIG_HOME/twitch-ia-compagnon/",
+        "%LOCALAPPDATA%\\twitch-ia-compagnon\\",
+        "~/Library/Application Support/twitch-ia-compagnon/",
+    }
+    for guide in FIRST_RUN_GUIDES:
+        spans = _code_spans(guide)
+        assert names | directories <= spans, (guide.name, sorted((names | directories) - spans))
+
+
+def test_ac24_the_guide_documents_the_install_path_and_the_launcher() -> None:
+    """R8 (A3b): both guides point to the install path, ``docs/installation.md``,
+    and give the ``--install-launcher`` command as a fenced command."""
+
+    for guide in FIRST_RUN_GUIDES:
+        text = guide.read_text(encoding="utf-8")
+        assert "](installation.md)" in text, guide.name
+        assert "\npython -m core.config_ui --install-launcher\n" in text, guide.name
+
+
+def test_ac24_the_documentation_index_links_both_guides() -> None:
+    """AC24 (R8): ``docs/README.md`` links the English guide and its translation."""
+
+    index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    for guide in FIRST_RUN_GUIDES:
+        assert guide.is_file(), guide.name
+        assert f"]({guide.name})" in index, guide.name

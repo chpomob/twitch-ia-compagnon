@@ -53,6 +53,7 @@ GUIDES = (
     "automation-bridge",
     "web-knowledge",
     "triggers",
+    "first-run",
 )
 """The guides that must exist in both languages.
 
