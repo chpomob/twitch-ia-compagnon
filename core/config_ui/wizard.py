@@ -33,10 +33,20 @@ the wizard wrote, so only those files are ever read back or replaced. The
 credential file's ownership check and replacement hold a lock on its
 directory, and a file absent at the check is published exclusively, so a
 concurrent wizard never overwrites one it did not see.
+
+The validators of screens 2 and 3 (R5, D3) — :func:`validate_platform`,
+:func:`list_rewards` and :func:`validate_model` — each make one request
+through an injected :class:`Transport` under their own bound on an injected
+clock, read the endpoints from the chosen profile's data, and end with a
+success or a value-free :class:`Failure` token that :func:`failure_sentences`
+turns into a string-table cause and next action. Nothing they do is logged,
+and no exception text or submitted value survives into a result.
+:func:`aiohttp_transport` is the production transport.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import hashlib
@@ -45,14 +55,17 @@ import os
 import re
 import secrets as _secrets
 import stat
-from collections.abc import Collection, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Protocol
+from urllib.parse import urlencode
 
 import yaml
 
 from core.config_ui import locations
+from core.config_ui.i18n import StringTable
 
 try:
     import fcntl
@@ -973,3 +986,510 @@ class CredentialStore:
             return Refusal(REFUSAL_CHANGED, self.path)
         self._values = dict(data)
         return dict(data)
+
+
+# --------------------------------------------------------------------------- #
+# The validators of screens 2 and 3 (R5, D3) and their failure map
+# --------------------------------------------------------------------------- #
+
+#: Each validator's own bound, in seconds (R5).
+PLATFORM_TIMEOUT_SECONDS = 10.0
+MODEL_TIMEOUT_SECONDS = 30.0
+
+#: The most of an answer's body a validator reads; a longer one is no
+#: answer it can trust.
+MAX_ANSWER_BYTES = 1 << 20
+
+#: How often, in real seconds, a pending request looks at the injected clock:
+#: a fake clock moved past the bound ends the wait within one look.
+CLOCK_POLL_SECONDS = 0.05
+
+#: The stage a failure belongs to: the token check, the reward list, the model.
+STAGE_PLATFORM = "platform"
+STAGE_REWARDS = "rewards"
+STAGE_MODEL = "model"
+
+#: The failure tokens (value-free; :func:`failure_sentences` translates them).
+CONNECTION_REFUSED = "connection_refused"
+TIMEOUT = "timeout"
+UNAUTHORIZED = "unauthorized"
+CLIENT_ID_MISMATCH = "client_id_mismatch"
+MISSING_SCOPE = "missing_scope"
+MALFORMED_ANSWER = "malformed_answer"
+NO_REWARDS = "no_rewards"
+NOT_FOUND = "not_found"
+NOT_A_COMPLETION = "not_a_completion"
+EMPTY_ANSWER = "empty_answer"
+
+#: The tokens each stage may end with.
+PLATFORM_FAILURES = (
+    CONNECTION_REFUSED, TIMEOUT, UNAUTHORIZED, CLIENT_ID_MISMATCH, MISSING_SCOPE, MALFORMED_ANSWER,
+)
+REWARD_FAILURES = (CONNECTION_REFUSED, TIMEOUT, UNAUTHORIZED, MALFORMED_ANSWER, NO_REWARDS)
+MODEL_FAILURES = (
+    CONNECTION_REFUSED, TIMEOUT, UNAUTHORIZED, NOT_FOUND, NOT_A_COMPLETION, EMPTY_ANSWER,
+)
+
+#: The one question the model check asks; any non-empty text answers it.
+MODEL_PROBE_PROMPT = "Reply with one short word."
+MODEL_PROBE_MAX_TOKENS = 16
+
+# A value a header can carry: printable ASCII without spaces.
+_HEADER_VALUE = re.compile(r"[\x21-\x7e]+")
+
+
+@dataclass(frozen=True, slots=True)
+class HttpAnswer:
+    """What a transport returns: the status and at most
+    :data:`MAX_ANSWER_BYTES` + 1 bytes of the body."""
+
+    status: int
+    body: bytes
+
+
+class Transport(Protocol):
+    """One HTTP exchange. *timeout* is the validator's remaining budget, a
+    hint the transport may honour; the validator enforces its bound itself.
+    A connection failure raises :class:`OSError` (``ConnectionError``), an
+    exhausted budget :class:`TimeoutError`."""
+
+    async def __call__(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpAnswer: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Failure:
+    """Why a validator did not pass: its stage, its token, and the names a
+    sentence shows (the missing scope names, profile data, never secrets).
+    It never holds an exception text or a submitted value."""
+
+    stage: str
+    token: str
+    scopes: tuple[str, ...] = ()
+    seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformValidation:
+    """Screen 2's token check: a failure, or the channel the token names.
+
+    On success *identities* fills every identity the profile declares (the
+    broadcaster and the bot) with the answer's user id: never typed (R5).
+    """
+
+    failure: Failure | None
+    login: str | None = None
+    user_id: str | None = None
+    identities: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+
+    @property
+    def passed(self) -> bool:
+        return self.failure is None
+
+
+@dataclass(frozen=True, slots=True)
+class Reward:
+    id: str
+    title: str
+
+
+@dataclass(frozen=True, slots=True)
+class RewardList:
+    """The channel's custom rewards (A5), or why they could not be listed."""
+
+    failure: Failure | None
+    rewards: tuple[Reward, ...] = ()
+
+    @property
+    def passed(self) -> bool:
+        return self.failure is None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelValidation:
+    """Screen 3's completion check: a failure, an answer, or not needed (A4)."""
+
+    failure: Failure | None
+    not_needed: bool = False
+
+    @property
+    def passed(self) -> bool:
+        return self.failure is None
+
+
+async def _exchange(
+    stage: str,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    body: bytes | None,
+    transport: Transport,
+    clock: Callable[[], float],
+    timeout: float,
+) -> HttpAnswer | Failure:
+    """One request under the validator's own bound on *clock*: an answer
+    arriving once *timeout* has elapsed is no answer. Nothing is logged —
+    neither the URL nor a header — and no exception text survives."""
+
+    started = clock()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    request = asyncio.ensure_future(
+        transport(method, url, headers=headers, body=body, timeout=timeout)
+    )
+    # The bound holds on both clocks: the injected one, looked at while the
+    # request is pending, and the loop's, so a real stall ends too.
+    try:
+        while not request.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0 or clock() - started >= timeout:
+                request.cancel()
+                with contextlib.suppress(BaseException):
+                    await request
+                return Failure(stage, TIMEOUT, seconds=timeout)
+            await asyncio.wait({request}, timeout=min(CLOCK_POLL_SECONDS, remaining))
+    except asyncio.CancelledError:
+        request.cancel()
+        raise
+    try:
+        answer = request.result()
+    except (TimeoutError, asyncio.TimeoutError):
+        return Failure(stage, TIMEOUT, seconds=timeout)
+    except Exception:
+        # Refused, reset, unresolvable or an address no client accepts: the
+        # endpoint was not reached. The exception's text is never kept.
+        return Failure(stage, CONNECTION_REFUSED)
+    if clock() - started >= timeout:
+        return Failure(stage, TIMEOUT, seconds=timeout)
+    if (
+        not isinstance(answer, HttpAnswer)
+        or isinstance(answer.status, bool)
+        or not isinstance(answer.status, int)
+        or not isinstance(answer.body, (bytes, bytearray))
+    ):
+        return Failure(stage, MALFORMED_ANSWER if stage != STAGE_MODEL else NOT_A_COMPLETION)
+    return answer
+
+
+def _decoded(answer: HttpAnswer) -> Any:
+    """The JSON body of *answer*, or ``None`` when it is not one."""
+
+    if len(answer.body) > MAX_ANSWER_BYTES:
+        return None
+    try:
+        return json.loads(bytes(answer.body).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        # RecursionError: nesting deep enough to exhaust the decoder.
+        return None
+
+
+def _plain_word(value: Any) -> bool:
+    return isinstance(value, str) and _HEADER_VALUE.fullmatch(value) is not None and "${" not in value
+
+
+async def validate_platform(
+    profile: Profile,
+    token: str,
+    client_id: str,
+    *,
+    transport: Transport,
+    clock: Callable[[], float],
+    timeout: float = PLATFORM_TIMEOUT_SECONDS,
+) -> PlatformValidation:
+    """Screen 2: one GET of the profile's validation endpoint (R5).
+
+    It passes only when the answer is a 200 naming the submitted client id,
+    every scope the profile needs, a login and a user id; otherwise one of
+    :data:`PLATFORM_FAILURES`. A submitted value no header can carry is
+    refused as the endpoint would refuse it, with no request.
+    """
+
+    token, client_id = token.strip(), client_id.strip()
+    if not _plain_word(token):
+        return PlatformValidation(Failure(STAGE_PLATFORM, UNAUTHORIZED))
+    answer = await _exchange(
+        STAGE_PLATFORM,
+        "GET",
+        profile.validation_endpoint,
+        {"Authorization": f"OAuth {token}"},
+        None,
+        transport,
+        clock,
+        timeout,
+    )
+    if isinstance(answer, Failure):
+        return PlatformValidation(answer)
+    if answer.status == 401:
+        return PlatformValidation(Failure(STAGE_PLATFORM, UNAUTHORIZED))
+    data = _decoded(answer) if answer.status == 200 else None
+    if (
+        not isinstance(data, Mapping)
+        or not _plain_word(data.get("login"))
+        or not _plain_word(data.get("user_id"))
+        or not isinstance(data.get("client_id"), str)
+        or not isinstance(data.get("scopes"), list)
+        or not all(isinstance(scope, str) for scope in data["scopes"])
+    ):
+        return PlatformValidation(Failure(STAGE_PLATFORM, MALFORMED_ANSWER))
+    if data["client_id"] != client_id:
+        return PlatformValidation(Failure(STAGE_PLATFORM, CLIENT_ID_MISMATCH))
+    missing = tuple(scope for scope in profile.scopes if scope not in set(data["scopes"]))
+    if missing:
+        return PlatformValidation(Failure(STAGE_PLATFORM, MISSING_SCOPE, scopes=missing))
+    user_id = data["user_id"]
+    return PlatformValidation(
+        None,
+        login=data["login"],
+        user_id=user_id,
+        identities=MappingProxyType({name: user_id for name in profile.identities}),
+    )
+
+
+async def list_rewards(
+    profile: Profile,
+    token: str,
+    client_id: str,
+    user_id: str,
+    *,
+    transport: Transport,
+    clock: Callable[[], float],
+    timeout: float = PLATFORM_TIMEOUT_SECONDS,
+) -> RewardList:
+    """The channel's custom rewards: one bounded GET of the profile's reward
+    list endpoint for *user_id* (A5). The credentials travel in headers
+    only; the query names the channel's user id, which is not a secret. An
+    empty list is :data:`NO_REWARDS`: the reward must be created first."""
+
+    token, client_id = token.strip(), client_id.strip()
+    if not (_plain_word(token) and _plain_word(client_id)):
+        return RewardList(Failure(STAGE_REWARDS, UNAUTHORIZED))
+    if not _plain_word(user_id):
+        return RewardList(Failure(STAGE_REWARDS, MALFORMED_ANSWER))
+    answer = await _exchange(
+        STAGE_REWARDS,
+        "GET",
+        f"{profile.reward_list_endpoint}?{urlencode({'broadcaster_id': user_id})}",
+        {"Authorization": f"Bearer {token}", "Client-Id": client_id},
+        None,
+        transport,
+        clock,
+        timeout,
+    )
+    if isinstance(answer, Failure):
+        return RewardList(answer)
+    if answer.status == 401:
+        return RewardList(Failure(STAGE_REWARDS, UNAUTHORIZED))
+    data = _decoded(answer) if answer.status == 200 else None
+    entries = data.get("data") if isinstance(data, Mapping) else None
+    if not isinstance(entries, list) or not all(
+        isinstance(entry, Mapping)
+        and isinstance(entry.get("id"), str)
+        and entry["id"].strip()
+        and isinstance(entry.get("title"), str)
+        and entry["title"].strip()
+        for entry in entries
+    ):
+        return RewardList(Failure(STAGE_REWARDS, MALFORMED_ANSWER))
+    if not entries:
+        return RewardList(Failure(STAGE_REWARDS, NO_REWARDS))
+    return RewardList(None, tuple(Reward(entry["id"], entry["title"]) for entry in entries))
+
+
+async def validate_model(
+    endpoint: str,
+    model: str,
+    api_key: str,
+    *,
+    transport: Transport,
+    clock: Callable[[], float],
+    timeout: float = MODEL_TIMEOUT_SECONDS,
+    profile: Profile | None = None,
+) -> ModelValidation:
+    """Screen 3: exactly one chat-completions request to *endpoint* (R5).
+
+    It passes only when the answer is a chat completion whose first choice
+    holds non-empty text; otherwise one of :data:`MODEL_FAILURES`. For a
+    *profile* that needs no model (A4) it is not needed and no request is
+    made. A key no header can carry is refused as the endpoint would refuse
+    it, with no request.
+    """
+
+    if profile is not None and not profile.model_needed:
+        return ModelValidation(None, not_needed=True)
+    api_key = api_key.strip()
+    if not _plain_word(api_key):
+        return ModelValidation(Failure(STAGE_MODEL, UNAUTHORIZED))
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": MODEL_PROBE_PROMPT}],
+            "max_tokens": MODEL_PROBE_MAX_TOKENS,
+        }
+    ).encode()
+    answer = await _exchange(
+        STAGE_MODEL,
+        "POST",
+        endpoint.strip(),
+        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        body,
+        transport,
+        clock,
+        timeout,
+    )
+    if isinstance(answer, Failure):
+        return ModelValidation(answer)
+    if answer.status in (401, 403):
+        return ModelValidation(Failure(STAGE_MODEL, UNAUTHORIZED))
+    if answer.status == 404:
+        return ModelValidation(Failure(STAGE_MODEL, NOT_FOUND))
+    data = _decoded(answer) if 200 <= answer.status < 300 else None
+    choices = data.get("choices") if isinstance(data, Mapping) else None
+    first = choices[0] if isinstance(choices, list) and choices else None
+    message = first.get("message") if isinstance(first, Mapping) else None
+    content = message.get("content", None) if isinstance(message, Mapping) else 0
+    if content is not None and not isinstance(content, str):
+        return ModelValidation(Failure(STAGE_MODEL, NOT_A_COMPLETION))
+    if content is None or not content.strip():
+        return ModelValidation(Failure(STAGE_MODEL, EMPTY_ANSWER))
+    return ModelValidation(None)
+
+
+async def aiohttp_transport(
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    body: bytes | None,
+    timeout: float,
+) -> HttpAnswer:
+    """The production :class:`Transport`: one ``aiohttp`` request with no
+    redirect followed, its body read up to :data:`MAX_ANSWER_BYTES` + 1.
+
+    The UI runs a validator using it on its socket-free loop; its session —
+    and so its real connector — is created here only, never in a test
+    (AC33). A client failure becomes a ``ConnectionError`` without its text.
+    """
+
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.request(
+                method, url, headers=dict(headers), data=body, allow_redirects=False
+            ) as response:
+                received = bytearray()
+                while len(received) <= MAX_ANSWER_BYTES:
+                    chunk = await response.content.read(65536)
+                    if not chunk:
+                        break
+                    received += chunk
+                return HttpAnswer(response.status, bytes(received[: MAX_ANSWER_BYTES + 1]))
+    except (TimeoutError, asyncio.TimeoutError):
+        # Distinct classes before Python 3.11.
+        raise TimeoutError("the validator's bound elapsed") from None
+    except (aiohttp.ClientError, ValueError):
+        raise ConnectionError("the endpoint was not reached") from None
+
+
+# Every failure's cause and next action, one literal key pair per token, so
+# the AC5 collector sees every key the map uses.
+_FAILURE_SENTENCES: Mapping[tuple[str, str], Callable[[StringTable, str, Failure], tuple[str, str]]] = {
+    (STAGE_PLATFORM, CONNECTION_REFUSED): lambda table, language, failure: (
+        table.sentence(language, "platform.connection_refused"),
+        table.sentence(language, "platform.connection_refused.next"),
+    ),
+    (STAGE_PLATFORM, TIMEOUT): lambda table, language, failure: (
+        table.sentence(language, "platform.timeout", seconds=f"{failure.seconds:g}"),
+        table.sentence(language, "platform.timeout.next"),
+    ),
+    (STAGE_PLATFORM, UNAUTHORIZED): lambda table, language, failure: (
+        table.sentence(language, "platform.unauthorized"),
+        table.sentence(language, "platform.unauthorized.next"),
+    ),
+    (STAGE_PLATFORM, CLIENT_ID_MISMATCH): lambda table, language, failure: (
+        table.sentence(language, "platform.client_id_mismatch"),
+        table.sentence(language, "platform.client_id_mismatch.next"),
+    ),
+    (STAGE_PLATFORM, MISSING_SCOPE): lambda table, language, failure: (
+        table.sentence(language, "platform.missing_scope", scopes=", ".join(failure.scopes)),
+        table.sentence(language, "platform.missing_scope.next"),
+    ),
+    (STAGE_PLATFORM, MALFORMED_ANSWER): lambda table, language, failure: (
+        table.sentence(language, "platform.malformed_answer"),
+        table.sentence(language, "platform.malformed_answer.next"),
+    ),
+    (STAGE_REWARDS, CONNECTION_REFUSED): lambda table, language, failure: (
+        table.sentence(language, "rewards.connection_refused"),
+        table.sentence(language, "rewards.connection_refused.next"),
+    ),
+    (STAGE_REWARDS, TIMEOUT): lambda table, language, failure: (
+        table.sentence(language, "rewards.timeout", seconds=f"{failure.seconds:g}"),
+        table.sentence(language, "rewards.timeout.next"),
+    ),
+    (STAGE_REWARDS, UNAUTHORIZED): lambda table, language, failure: (
+        table.sentence(language, "rewards.unauthorized"),
+        table.sentence(language, "rewards.unauthorized.next"),
+    ),
+    (STAGE_REWARDS, MALFORMED_ANSWER): lambda table, language, failure: (
+        table.sentence(language, "rewards.malformed_answer"),
+        table.sentence(language, "rewards.malformed_answer.next"),
+    ),
+    (STAGE_REWARDS, NO_REWARDS): lambda table, language, failure: (
+        table.sentence(language, "rewards.no_rewards"),
+        table.sentence(language, "rewards.no_rewards.next"),
+    ),
+    (STAGE_MODEL, CONNECTION_REFUSED): lambda table, language, failure: (
+        table.sentence(language, "model.connection_refused"),
+        table.sentence(language, "model.connection_refused.next"),
+    ),
+    (STAGE_MODEL, TIMEOUT): lambda table, language, failure: (
+        table.sentence(language, "model.timeout", seconds=f"{failure.seconds:g}"),
+        table.sentence(language, "model.timeout.next"),
+    ),
+    (STAGE_MODEL, UNAUTHORIZED): lambda table, language, failure: (
+        table.sentence(language, "model.unauthorized"),
+        table.sentence(language, "model.unauthorized.next"),
+    ),
+    (STAGE_MODEL, NOT_FOUND): lambda table, language, failure: (
+        table.sentence(language, "model.not_found"),
+        table.sentence(language, "model.not_found.next"),
+    ),
+    (STAGE_MODEL, NOT_A_COMPLETION): lambda table, language, failure: (
+        table.sentence(language, "model.not_a_completion"),
+        table.sentence(language, "model.not_a_completion.next"),
+    ),
+    (STAGE_MODEL, EMPTY_ANSWER): lambda table, language, failure: (
+        table.sentence(language, "model.empty_answer"),
+        table.sentence(language, "model.empty_answer.next"),
+    ),
+}
+
+
+def failure_sentences(table: StringTable, language: str, failure: Failure) -> tuple[str, str]:
+    """The plain-language cause of *failure* and the exact next action, from
+    the string table (R5): never an exception text nor a submitted value."""
+
+    return _FAILURE_SENTENCES[(failure.stage, failure.token)](table, language, failure)
+
+
+def platform_sentence(table: StringTable, language: str, validation: PlatformValidation) -> str:
+    """Screen 2's success: the channel the token names (R5)."""
+
+    assert validation.passed and validation.login is not None
+    return table.sentence(language, "platform.connected", login=validation.login)
+
+
+def model_sentence(table: StringTable, language: str, validation: ModelValidation) -> str:
+    """Screen 3's success: answered, or not needed (A4)."""
+
+    assert validation.passed
+    if validation.not_needed:
+        return table.sentence(language, "model.not_needed")
+    return table.sentence(language, "model.answered")

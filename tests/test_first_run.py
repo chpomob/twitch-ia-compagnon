@@ -30,11 +30,17 @@ P8 (R1): the instance record, the ``/instance`` route and the second launch
 P9 (R1, A3): the OS launcher writer and ``--install-launcher`` (AC27), with
 the platform forced and every launcher directory redirected, so each
 platform's format is written and checked on any host.
+
+P10 (R5 screens 2–3, D3): the platform, reward-list and model validators
+(AC14, AC15, AC17's validator half) behind fake transports on the manual
+clock, their failure map swept for traces, class names and submitted values,
+and the production transport against a fake ``aiohttp`` session.
 """
 
 from __future__ import annotations
 
 import ast
+import asyncio
 import builtins
 import hashlib
 import io
@@ -3215,3 +3221,589 @@ def test_a3_the_default_launcher_directories(tmp_path: Path) -> None:
     assert launcher.platform_name("win32") == locations.WINDOWS
     assert launcher.platform_name("darwin") == locations.MACOS
     assert launcher.platform_name("linux") == locations.LINUX
+
+
+# --------------------------------------------------------------------------- #
+# P10 (R5 screens 2–3, D3): the platform and model validators (AC14, AC15,
+# AC17's validator half), behind injected transports and a manual clock
+# --------------------------------------------------------------------------- #
+
+#: The values a streamer submits on screens 2 and 3; none may reach a
+#: rendered failure (AC17).
+SUBMITTED_TOKEN = "tok-submitted-9f2kq"
+SUBMITTED_CLIENT_ID = "client-submitted-4hz"
+SUBMITTED_ENDPOINT = "https://model-submitted.invalid/v1/chat/completions"
+SUBMITTED_MODEL = "model-submitted-x1"
+SUBMITTED_KEY = "key-submitted-7ww"
+SUBMITTED = (SUBMITTED_TOKEN, SUBMITTED_CLIENT_ID, SUBMITTED_ENDPOINT, SUBMITTED_MODEL, SUBMITTED_KEY)
+
+
+class _FakeTransport:
+    """A :class:`wizard.Transport` answering from *answer(clock)*: an
+    :class:`wizard.HttpAnswer`, or a raise. Every request is recorded; no
+    socket is ever created (AC33)."""
+
+    def __init__(self, clock: _Clock, answer: Any) -> None:
+        self.clock = clock
+        self.answer = answer
+        self.requests: list[dict[str, Any]] = []
+
+    async def __call__(
+        self, method: str, url: str, *, headers: Any, body: bytes | None, timeout: float
+    ) -> wizard.HttpAnswer:
+        self.requests.append(
+            {"method": method, "url": url, "headers": dict(headers), "body": body, "timeout": timeout}
+        )
+        return self.answer(self.clock)
+
+
+def _json(status: int, document: Any) -> Any:
+    return lambda clock: wizard.HttpAnswer(status, json.dumps(document).encode())
+
+
+def _raw(status: int, body: bytes) -> Any:
+    return lambda clock: wizard.HttpAnswer(status, body)
+
+
+def _raising(error: BaseException, advance: float = 0.0) -> Any:
+    def answer(clock: _Clock) -> wizard.HttpAnswer:
+        clock.now += advance
+        raise error
+
+    return answer
+
+
+def _late(answer: Any, advance: float) -> Any:
+    """*answer*, arriving *advance* seconds later on the manual clock."""
+
+    def late(clock: _Clock) -> wizard.HttpAnswer:
+        clock.now += advance
+        return answer(clock)
+
+    return late
+
+
+def _validation_answer(**overrides: Any) -> dict[str, Any]:
+    answer = {
+        "client_id": SUBMITTED_CLIENT_ID,
+        "login": "streamer_x",
+        "scopes": list(_profiles()["channel_points"].scopes),
+        "user_id": "123",
+        "expires_in": 5000,
+    }
+    answer.update(overrides)
+    return answer
+
+
+#: AC14's six platform outcomes: the transport's answer and the token.
+PLATFORM_OUTCOMES = {
+    "connection_refused": (
+        _raising(ConnectionRefusedError(f"refused {SUBMITTED_TOKEN}")), wizard.CONNECTION_REFUSED
+    ),
+    "no_answer_in_10_s": (_raising(TimeoutError("timed out"), 10.0), wizard.TIMEOUT),
+    "http_401": (_json(401, {"status": 401, "message": "invalid access token"}), wizard.UNAUTHORIZED),
+    "other_client_id": (
+        _json(200, _validation_answer(client_id="someone-else")), wizard.CLIENT_ID_MISMATCH
+    ),
+    "missing_scope": (
+        _json(200, _validation_answer(scopes=["user:read:chat"])), wizard.MISSING_SCOPE
+    ),
+    "malformed": (_raw(200, b"<html>not json</html>"), wizard.MALFORMED_ANSWER),
+}
+
+#: AC15's six model outcomes.
+MODEL_OUTCOMES = {
+    "connection_refused": (
+        _raising(ConnectionRefusedError(f"refused {SUBMITTED_ENDPOINT}")), wizard.CONNECTION_REFUSED
+    ),
+    "no_answer_in_30_s": (_raising(TimeoutError("timed out"), 30.0), wizard.TIMEOUT),
+    "http_401": (_json(401, {"error": {"message": "bad key"}}), wizard.UNAUTHORIZED),
+    "http_403": (_json(403, {"error": {"message": "forbidden"}}), wizard.UNAUTHORIZED),
+    "http_404": (_json(404, {"error": {"message": "no such model"}}), wizard.NOT_FOUND),
+    "not_a_completion": (_json(200, {"object": "list", "data": []}), wizard.NOT_A_COMPLETION),
+    "empty_answer": (
+        _json(200, {"choices": [{"message": {"role": "assistant", "content": "  "}}]}),
+        wizard.EMPTY_ANSWER,
+    ),
+}
+
+_COMPLETION = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "bonjour"}}]}
+
+
+async def _platform(answer: Any, profile_id: str = "channel_points") -> tuple[Any, _FakeTransport]:
+    clock = _Clock()
+    transport = _FakeTransport(clock, answer)
+    result = await wizard.validate_platform(
+        _profiles()[profile_id], SUBMITTED_TOKEN, SUBMITTED_CLIENT_ID,
+        transport=transport, clock=clock,
+    )
+    return result, transport
+
+
+async def _rewards(answer: Any) -> tuple[Any, _FakeTransport]:
+    clock = _Clock()
+    transport = _FakeTransport(clock, answer)
+    result = await wizard.list_rewards(
+        _profiles()["channel_points"], SUBMITTED_TOKEN, SUBMITTED_CLIENT_ID, "123",
+        transport=transport, clock=clock,
+    )
+    return result, transport
+
+
+async def _model(answer: Any, profile_id: str | None = None) -> tuple[Any, _FakeTransport]:
+    clock = _Clock()
+    transport = _FakeTransport(clock, answer)
+    result = await wizard.validate_model(
+        SUBMITTED_ENDPOINT, SUBMITTED_MODEL, SUBMITTED_KEY, transport=transport, clock=clock,
+        profile=None if profile_id is None else _profiles()[profile_id],
+    )
+    return result, transport
+
+
+def _rendered(failure: wizard.Failure) -> dict[str, tuple[str, str]]:
+    return {
+        language: wizard.failure_sentences(_EN, language, failure) for language in ("en", "fr")
+    }
+
+
+async def test_ac14_each_platform_outcome_is_a_distinct_cause_and_keeps_next_closed() -> None:
+    """AC14: connection refused, no answer within 10 s (manual clock), 401,
+    another client id, a missing scope and a malformed answer each end with
+    their own token and a distinct string-table cause with a next action,
+    after one request; nothing passes, so no identity is filled."""
+
+    causes: dict[str, set[str]] = {"en": set(), "fr": set()}
+    for name, (answer, token) in PLATFORM_OUTCOMES.items():
+        result, transport = await _platform(answer)
+        assert not result.passed, name
+        assert result.failure.token == token, name
+        assert (result.login, result.user_id, dict(result.identities)) == (None, None, {}), name
+        assert len(transport.requests) == 1, name
+        for language, (cause, action) in _rendered(result.failure).items():
+            assert cause.strip() and action.strip() and cause != action, name
+            causes[language].add(cause)
+    assert all(len(found) == len(PLATFORM_OUTCOMES) for found in causes.values())
+
+
+async def test_ac14_the_request_is_one_get_of_the_profile_endpoint_with_the_token() -> None:
+    result, transport = await _platform(_json(200, _validation_answer()))
+    assert result.passed
+    (request,) = transport.requests
+    assert request["method"] == "GET" and request["body"] is None
+    assert request["url"] == _profiles()["channel_points"].validation_endpoint
+    assert request["headers"] == {"Authorization": f"OAuth {SUBMITTED_TOKEN}"}
+    assert request["timeout"] == wizard.PLATFORM_TIMEOUT_SECONDS == 10
+
+
+async def test_ac14_the_missing_scope_names_are_shown() -> None:
+    result, _transport = await _platform(PLATFORM_OUTCOMES["missing_scope"][0])
+    assert result.failure.scopes == ("user:write:chat", "channel:read:redemptions")
+    for cause, _action in _rendered(result.failure).values():
+        assert "user:write:chat" in cause and "channel:read:redemptions" in cause
+
+
+async def test_ac14_success_shows_the_login_and_fills_both_identities(tmp_path: Path) -> None:
+    """AC14: a 200 naming ``streamer_x`` and ``123`` shows ``streamer_x``,
+    and the generated profile's broadcaster and bot identities are ``123``,
+    taken from the answer, never typed."""
+
+    for profile_id in PROFILE_ORDER:
+        result, transport = await _platform(_json(200, _validation_answer()), profile_id)
+        assert result.passed and len(transport.requests) == 1
+        assert (result.login, result.user_id) == ("streamer_x", "123")
+        for language in ("en", "fr"):
+            assert "streamer_x" in wizard.platform_sentence(_EN, language, result)
+        profile = _profiles()[profile_id]
+        document = wizard.generate_profile(
+            profile, FIXTURE_PARAMETERS[profile_id], dict(result.identities)
+        )
+        platform = document["modules"][profile.platform_module]
+        assert (platform["broadcaster_id"], platform["bot_user_id"]) == ("123", "123")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _validation_answer(login=7),
+        _validation_answer(user_id=123),
+        _validation_answer(user_id=""),
+        _validation_answer(user_id="${TWITCH_ACCESS_TOKEN}"),
+        _validation_answer(scopes="user:read:chat"),
+        _validation_answer(scopes=[1, 2]),
+        _validation_answer(client_id=None),
+        ["not", "an", "object"],
+        None,
+    ],
+)
+async def test_ac14_a_200_whose_fields_have_wrong_types_is_malformed_not_raised(body: Any) -> None:
+    """Plan P10 risk: a malformed but 200 answer maps to ``malformed_answer``."""
+
+    result, _transport = await _platform(_json(200, body))
+    assert result.failure.token == wizard.MALFORMED_ANSWER
+
+
+@pytest.mark.parametrize("status", [200, 500, 302])
+async def test_an_unreadable_or_unexpected_platform_answer_is_malformed(status: int) -> None:
+    result, _transport = await _platform(_raw(status, b"\xff\xfe" if status == 200 else b"{}"))
+    assert result.failure.token == wizard.MALFORMED_ANSWER
+
+
+async def test_ac14_an_answer_arriving_after_10_s_is_no_answer() -> None:
+    """Plan P10 risk: the validator's own bound on the injected clock — not
+    the transport's — decides: a valid answer 10 s late is a timeout."""
+
+    result, _transport = await _platform(_late(_json(200, _validation_answer()), 10.0))
+    assert result.failure == wizard.Failure(wizard.STAGE_PLATFORM, wizard.TIMEOUT, seconds=10.0)
+    result, _transport = await _platform(_late(_json(200, _validation_answer()), 9.5))
+    assert result.passed
+
+
+async def test_ac14_a_pending_request_ends_when_the_injected_clock_passes_the_bound() -> None:
+    """Review A1: a transport that never answers ends as a timeout once the
+    manual clock moves past 10 s — not at the loop's real deadline."""
+
+    clock = _Clock()
+    never = asyncio.Event()
+
+    async def pending(method: str, url: str, *, headers: Any, body: bytes | None, timeout: float) -> Any:
+        await never.wait()
+
+    validation = asyncio.ensure_future(
+        wizard.validate_platform(
+            _profiles()["channel_points"], SUBMITTED_TOKEN, SUBMITTED_CLIENT_ID,
+            transport=pending, clock=clock,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not validation.done()
+    clock.now += 10.0
+    result = await asyncio.wait_for(validation, 5.0)
+    assert result.failure == wizard.Failure(wizard.STAGE_PLATFORM, wizard.TIMEOUT, seconds=10.0)
+
+
+async def test_an_asyncio_timeout_from_the_transport_is_a_timeout() -> None:
+    """Review A2: before Python 3.11 ``asyncio.TimeoutError`` is its own class;
+    it keeps the timeout's cause and next action either way."""
+
+    result, _transport = await _platform(_raising(asyncio.TimeoutError()))
+    assert result.failure == wizard.Failure(wizard.STAGE_PLATFORM, wizard.TIMEOUT, seconds=10.0)
+
+
+async def test_an_answer_nested_past_the_decoder_is_malformed_not_raised() -> None:
+    """Review A3: nesting that exhausts ``json.loads`` is a malformed answer."""
+
+    deep = b"[" * 100000 + b"]" * 100000
+    result, _transport = await _platform(_raw(200, deep))
+    assert result.failure.token == wizard.MALFORMED_ANSWER
+    result, _transport = await _model(_raw(200, deep))
+    assert result.failure.token == wizard.NOT_A_COMPLETION
+
+
+async def test_a_token_no_header_can_carry_is_refused_without_a_request() -> None:
+    clock = _Clock()
+    transport = _FakeTransport(clock, _json(200, _validation_answer()))
+    result = await wizard.validate_platform(
+        _profiles()["chat_qa"], "tok\r\nX-Injected: 1", SUBMITTED_CLIENT_ID,
+        transport=transport, clock=clock,
+    )
+    assert result.failure.token == wizard.UNAUTHORIZED and transport.requests == []
+
+
+async def test_ac14_two_rewards_render_two_choices_by_title() -> None:
+    """AC14 (A5): one bounded read of the reward list for the validated user
+    id, with the credentials in headers only; 2 rewards → 2 titled choices."""
+
+    rewards = {"data": [{"id": "r-1", "title": "Hydrate"}, {"id": "r-2", "title": "Ask Nova"}]}
+    result, transport = await _rewards(_json(200, rewards))
+    assert result.passed
+    assert [(reward.id, reward.title) for reward in result.rewards] == [
+        ("r-1", "Hydrate"), ("r-2", "Ask Nova")
+    ]
+    (request,) = transport.requests
+    assert request["method"] == "GET"
+    assert request["url"] == (
+        _profiles()["channel_points"].reward_list_endpoint + "?broadcaster_id=123"
+    )
+    assert SUBMITTED_TOKEN not in request["url"] and SUBMITTED_CLIENT_ID not in request["url"]
+    assert request["headers"] == {
+        "Authorization": f"Bearer {SUBMITTED_TOKEN}", "Client-Id": SUBMITTED_CLIENT_ID
+    }
+
+
+async def test_ac14_an_empty_reward_list_is_its_own_cause() -> None:
+    """AC14: an empty list yields "create the reward first" and keeps *next*
+    closed; its cause differs from every platform cause."""
+
+    result, _transport = await _rewards(_json(200, {"data": []}))
+    assert not result.passed and result.failure.token == wizard.NO_REWARDS
+    cause, action = wizard.failure_sentences(_EN, "en", result.failure)
+    assert "Create the reward first" in action
+    platform_causes = {
+        wizard.failure_sentences(_EN, "en", wizard.Failure(wizard.STAGE_PLATFORM, token))[0]
+        for token in wizard.PLATFORM_FAILURES
+    }
+    assert cause not in platform_causes
+
+
+@pytest.mark.parametrize(
+    ("answer", "token"),
+    [
+        (PLATFORM_OUTCOMES["connection_refused"][0], wizard.CONNECTION_REFUSED),
+        (PLATFORM_OUTCOMES["no_answer_in_10_s"][0], wizard.TIMEOUT),
+        (PLATFORM_OUTCOMES["http_401"][0], wizard.UNAUTHORIZED),
+        (_json(200, {"data": [{"id": 1, "title": "x"}]}), wizard.MALFORMED_ANSWER),
+        (_json(200, {"data": {"id": "r"}}), wizard.MALFORMED_ANSWER),
+        (_raw(200, b"nope"), wizard.MALFORMED_ANSWER),
+    ],
+)
+async def test_the_reward_list_ends_with_the_same_transport_failures(answer: Any, token: str) -> None:
+    result, transport = await _rewards(answer)
+    assert result.failure.token == token and result.rewards == ()
+    assert len(transport.requests) == 1
+
+
+async def test_ac15_each_model_outcome_is_a_distinct_cause_and_keeps_next_closed() -> None:
+    """AC15: connection refused, no answer within 30 s (manual clock),
+    401/403, 404, a body that is not a chat completion and an empty answer
+    each end with a distinct string-table cause with a next action, after
+    one request (401 and 403 share the unauthorized cause: six outcomes)."""
+
+    causes: dict[str, dict[str, str]] = {"en": {}, "fr": {}}
+    for name, (answer, token) in MODEL_OUTCOMES.items():
+        result, transport = await _model(answer)
+        assert not result.passed and not result.not_needed, name
+        assert result.failure.token == token, name
+        assert len(transport.requests) == 1, name
+        for language, (cause, action) in _rendered(result.failure).items():
+            assert cause.strip() and action.strip() and cause != action, name
+            causes[language][token] = cause
+    for found in causes.values():
+        assert len(found) == len(set(found.values())) == len(wizard.MODEL_FAILURES) == 6
+
+
+async def test_ac15_an_answer_opens_next_after_exactly_one_request() -> None:
+    result, transport = await _model(_json(200, _COMPLETION))
+    assert result.passed and not result.not_needed
+    (request,) = transport.requests
+    assert request["method"] == "POST" and request["url"] == SUBMITTED_ENDPOINT
+    assert request["headers"] == {
+        "Authorization": f"Bearer {SUBMITTED_KEY}", "Content-Type": "application/json"
+    }
+    body = json.loads(request["body"])
+    assert body["model"] == SUBMITTED_MODEL and body["messages"][0]["role"] == "user"
+    assert request["timeout"] == wizard.MODEL_TIMEOUT_SECONDS == 30
+    assert wizard.model_sentence(_EN, "en", result) == _say("model.answered")
+
+
+async def test_ac15_the_silent_profile_needs_no_model_and_makes_no_request() -> None:
+    result, transport = await _model(_json(200, _COMPLETION), "silent")
+    assert result.passed and result.not_needed and transport.requests == []
+    assert wizard.model_sentence(_EN, "fr", result) == _EN.sentence("fr", "model.not_needed")
+    for profile_id in ("chat_qa", "channel_points", "spoken_keyword"):
+        result, transport = await _model(_json(200, _COMPLETION), profile_id)
+        assert result.passed and not result.not_needed and len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"choices": []},
+        {"choices": "bonjour"},
+        {"choices": [{"text": "bonjour"}]},
+        {"choices": [{"message": {"content": ["bonjour"]}}]},
+        {"choices": [{"message": "bonjour"}]},
+        ["bonjour"],
+    ],
+)
+async def test_ac15_a_2xx_body_of_another_shape_is_not_a_completion(body: Any) -> None:
+    result, _transport = await _model(_json(200, body))
+    assert result.failure.token == wizard.NOT_A_COMPLETION
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"choices": [{"message": {"role": "assistant", "content": None}}]},
+        {"choices": [{"message": {"role": "assistant"}}]},
+        {"choices": [{"message": {"content": ""}}]},
+    ],
+)
+async def test_ac15_no_text_is_an_empty_answer(body: Any) -> None:
+    result, _transport = await _model(_json(200, body))
+    assert result.failure.token == wizard.EMPTY_ANSWER
+
+
+async def test_ac15_an_answer_arriving_after_30_s_is_no_answer() -> None:
+    result, _transport = await _model(_late(_json(200, _COMPLETION), 30.0))
+    assert result.failure == wizard.Failure(wizard.STAGE_MODEL, wizard.TIMEOUT, seconds=30.0)
+    for language, (cause, _action) in _rendered(result.failure).items():
+        assert "30" in cause, language
+
+
+async def test_an_oversized_or_undecodable_model_answer_is_not_a_completion() -> None:
+    big = b'{"choices": [{"message": {"content": "' + b"a" * wizard.MAX_ANSWER_BYTES + b'"}}]}'
+    for body in (big, b"\xff", b"not json"):
+        result, _transport = await _model(_raw(200, body))
+        assert result.failure.token == wizard.NOT_A_COMPLETION
+    result, _transport = await _model(_raw(500, b"{}"))
+    assert result.failure.token == wizard.NOT_A_COMPLETION
+
+
+async def test_any_transport_error_is_a_connection_failure_without_its_text() -> None:
+    for error in (OSError("dns"), ValueError(f"bad url {SUBMITTED_ENDPOINT}"), RuntimeError("x")):
+        result, _transport = await _model(_raising(error))
+        assert result.failure == wizard.Failure(wizard.STAGE_MODEL, wizard.CONNECTION_REFUSED)
+
+
+def _exception_class_names() -> set[str]:
+    import aiohttp
+
+    names = {
+        name for name, value in vars(builtins).items()
+        if isinstance(value, type) and issubclass(value, BaseException)
+    }
+    names |= {
+        name for name, value in vars(aiohttp).items()
+        if isinstance(value, type) and issubclass(value, BaseException)
+    }
+    return names | {"JSONDecodeError", "CancelledError", "ProfileError", "StringTableError"}
+
+
+def _all_failures() -> list[wizard.Failure]:
+    failures = [
+        wizard.Failure(wizard.STAGE_PLATFORM, token, scopes=("user:write:chat",), seconds=10.0)
+        for token in wizard.PLATFORM_FAILURES
+    ]
+    failures += [
+        wizard.Failure(wizard.STAGE_REWARDS, token, seconds=10.0) for token in wizard.REWARD_FAILURES
+    ]
+    failures += [
+        wizard.Failure(wizard.STAGE_MODEL, token, seconds=30.0) for token in wizard.MODEL_FAILURES
+    ]
+    return failures
+
+
+async def test_ac17_no_failure_text_holds_a_trace_a_class_name_or_a_submitted_value() -> None:
+    """AC17 (validator half): every cause and next action, rendered in every
+    language for every token of every stage — and the failures the fakes
+    provoke with the submitted values inside their exception texts — hold
+    0 ``Traceback``, 0 ``File "``, 0 exception class names and 0 submitted
+    values. Every token of every stage has its sentences."""
+
+    classes = re.compile(r"\b(" + "|".join(map(re.escape, _exception_class_names())) + r")\b")
+    provoked = [(await _platform(answer))[0].failure for answer, _ in PLATFORM_OUTCOMES.values()]
+    provoked += [(await _model(answer))[0].failure for answer, _ in MODEL_OUTCOMES.values()]
+    provoked += [
+        (await _rewards(answer))[0].failure
+        for answer in (_json(200, {"data": []}), PLATFORM_OUTCOMES["connection_refused"][0])
+    ]
+    swept = 0
+    for failure in _all_failures() + provoked:
+        for language in _EN.sentences:
+            for text in wizard.failure_sentences(_EN, language, failure):
+                assert "Traceback" not in text and 'File "' not in text, text
+                assert classes.search(text) is None, text
+                assert not any(value in text for value in SUBMITTED), text
+                swept += 1
+    assert swept == 2 * 2 * (len(_all_failures()) + len(provoked))
+    # The results carry nothing of an exception or of a submitted value.
+    for failure in provoked:
+        assert not any(value in repr(failure) for value in SUBMITTED)
+
+
+def test_ac5_the_validator_keys_are_in_both_files() -> None:
+    """AC5 re-run: the keys P10 references exist in both files with the same
+    placeholders (the referenced-keys check above covers ``wizard.py``)."""
+
+    keys, dynamic = referenced_keys([CONFIG_UI / "wizard.py"])
+    assert dynamic == []
+    assert {
+        "platform.connected", "platform.missing_scope", "rewards.no_rewards",
+        "model.not_needed", "model.empty_answer.next",
+    } <= keys
+    files = _string_files()
+    for code, sentences in files.items():
+        assert keys <= sentences.keys(), code
+    assert i18n.placeholders(files["fr"]["platform.missing_scope"]) == {"scopes"}
+
+
+def test_the_validators_log_nothing_and_name_no_platform() -> None:
+    """Plan P10 risk and DD1: no validator logs (the request URL included),
+    and the endpoints come from the profile's data."""
+
+    source = (CONFIG_UI / "wizard.py").read_text(encoding="utf-8")
+    assert "logging" not in source and "print(" not in source
+    assert not re.search(r"twitch|helix|oauth2", source, re.I)
+
+
+class _FakeContent:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    async def read(self, size: int) -> bytes:
+        chunk, self.body = self.body[:size], self.body[size:]
+        return chunk
+
+
+class _FakeResponse:
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self.content = _FakeContent(body)
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+class _FakeSession:
+    """Stands in for ``aiohttp.ClientSession`` (no connector, no socket)."""
+
+    calls: list[tuple[Any, ...]] = []
+
+    def __init__(self, outcome: Any, **kwargs: Any) -> None:
+        self.outcome = outcome
+        self.kwargs = kwargs
+
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    def request(self, method: str, url: str, **kwargs: Any) -> _FakeResponse:
+        self.calls.append((method, url, kwargs, self.kwargs))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+async def test_the_production_transport_maps_client_failures_and_bounds_the_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aiohttp
+
+    def install(outcome: Any) -> None:
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda **kwargs: _FakeSession(outcome, **kwargs))
+
+    install(_FakeResponse(200, b"x" * (wizard.MAX_ANSWER_BYTES + 70000)))
+    answer = await wizard.aiohttp_transport(
+        "GET", "https://example.invalid/", headers={"A": "b"}, body=None, timeout=10.0
+    )
+    assert answer.status == 200 and len(answer.body) == wizard.MAX_ANSWER_BYTES + 1
+    method, url, kwargs, session = _FakeSession.calls[-1]
+    assert kwargs["allow_redirects"] is False and session["timeout"].total == 10.0
+    for error, raised in (
+        (aiohttp.ClientConnectionError(SUBMITTED_TOKEN), ConnectionError),
+        (aiohttp.InvalidURL(SUBMITTED_ENDPOINT), ConnectionError),
+        (asyncio.TimeoutError(), TimeoutError),
+    ):
+        install(error)
+        with pytest.raises(raised) as caught:
+            await wizard.aiohttp_transport(
+                "GET", SUBMITTED_ENDPOINT, headers={}, body=None, timeout=1.0
+            )
+        assert SUBMITTED_TOKEN not in str(caught.value)
+        assert SUBMITTED_ENDPOINT not in str(caught.value)
+        assert caught.value.__cause__ is None
