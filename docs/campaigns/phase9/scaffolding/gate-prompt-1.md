@@ -49,6 +49,9 @@ the silent profile, whose record must not pretend a trigger fired.
 - No added `skip`, `xfail`, `importorskip` or deleted test; only the allowlisted expectations changed, each
   a constant or count the phase forces. Compare assertion ASTs.
 - No new runtime dependency; no test opens a socket or spawns a process outside the named exemptions.
+- **No test passes because the machine is slow.** A test that expects a timeout or an abandonment from a
+  small wall-clock budget fails on a faster interpreter (this is how Python 3.13 went red on a
+  documentation commit in phase 8). Check the suite for that pattern and report any instance you find.
 - Full suite green on the project interpreter **and** on the floor interpreter:
   `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/ -q -p no:cacheprovider` and
   `~/.hermes/cache/scratch/venv310/bin/python -m pytest tests/ -q -p no:cacheprovider`.
