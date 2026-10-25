@@ -15,6 +15,12 @@ process that published it, so the instance record is removed as stale and
 Start is not refused by the status record; a start time before publication,
 or one that cannot be read, leaves phase 9's judgement unchanged. The
 comparison is strict, with no tolerance (plan finding P1).
+
+Then the container-mode settings (R1, AC1–AC3): the one value-free warning
+for a bind that is not loopback, ``--no-browser`` (the opener is never
+called, the access URL is still printed once) and ``--token-file`` (the
+token read from a file under A5's rules, an unusable file refusing to start
+with a diagnostic that names the path and never the content).
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from test_config_ui import _request
 
 import core.config_ui as config_ui
 from core.config_ui import console, locations
@@ -444,3 +451,217 @@ def test_ac10_the_status_publication_time_falls_back_to_the_file_time(tmp_path: 
         assert ui._published_seconds(unparsable) == PUBLISHED + 5.0
     finally:
         config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+# -- container-mode settings (R1) -------------------------------------------- #
+
+#: The 43-character token of AC3's valid file.
+VALID_TOKEN = "Tk0_valid-container-token-AAAAAAAAAAAAAAAAA"
+assert len(VALID_TOKEN) == 43
+
+
+class _ServeUI:
+    """A fake ``serve``: records the UI and what standard error held when it
+    was called, and runs ``on_listening`` as the real one does."""
+
+    def __init__(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self.capsys = capsys
+        self.calls: list[Any] = []
+        self.stderr_before: list[str] = []
+        self.stdout_before: list[str] = []
+        self.record: dict[str, Any] | None = None
+
+    def __call__(self, ui: Any, settings: Any) -> None:
+        captured = self.capsys.readouterr()
+        self.stdout_before.append(captured.out)
+        self.stderr_before.append(captured.err)
+        self.calls.append(ui)
+        self.record = json.loads(settings.instance_path.read_text(encoding="utf-8"))
+        if ui.on_listening is not None:
+            ui.on_listening()
+
+
+def _profile(root: Path) -> Path:
+    (root / "mods").mkdir()
+    base = root / "config.yaml"
+    base.write_text("modules_directory: ./mods\nenabled_modules: []\n", encoding="utf-8")
+    return base
+
+
+def _run(
+    root: Path, capsys: pytest.CaptureFixture[str], *extra: str
+) -> tuple[int, _ServeUI, list[str], str, str]:
+    """``main`` over a fresh profile with *extra*; returns the status, the
+    fake serve, the opener's calls and the rest of stdout and stderr."""
+
+    base = _profile(root)
+    opened: list[str] = []
+    serve = _ServeUI(capsys)
+    seams = config_ui.InstanceSeams(platform="linux")
+    status = config_ui.main(
+        ["--config", str(base), *extra], opener=opened.append, serve=serve, instance=seams
+    )
+    after = capsys.readouterr()
+    return status, serve, opened, after.out, after.err
+
+
+def _warnings(text: str) -> list[str]:
+    return [line for line in text.splitlines() if "reachable from the network" in line]
+
+
+def test_ac1_a_wildcard_bind_writes_one_value_free_warning_before_serving(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, serve, _opened, _out, err = _run(
+        tmp_path, capsys, "--host", "0.0.0.0", "--port", "18765", "--allow-non-loopback"
+    )
+    assert status == 0 and len(serve.calls) == 1
+    (before,) = serve.stderr_before
+    (line,) = _warnings(before)
+    assert "0.0.0.0" in line and "18765" in line and "token" in line
+    (ui,) = serve.calls
+    assert ui.token not in line
+    assert ui.token not in before
+    assert ui.instance_marker not in line
+    assert _warnings(err) == []
+
+
+@pytest.mark.parametrize("host", ["::", "192.0.2.10"])
+def test_ac1_every_non_loopback_bind_warns_once(
+    host: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _status, serve, _opened, _out, err = _run(tmp_path, capsys, "--host", host, "--allow-non-loopback")
+    (before,) = serve.stderr_before
+    assert len(_warnings(before)) == 1 and host in _warnings(before)[0]
+    assert _warnings(err) == []
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_ac1_a_loopback_bind_writes_no_warning(
+    host: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, serve, _opened, _out, err = _run(tmp_path, capsys, "--host", host)
+    assert status == 0 and len(serve.calls) == 1
+    assert _warnings(serve.stderr_before[0]) == [] and _warnings(err) == []
+
+
+def test_ac1_the_warning_is_built_from_host_and_port_only() -> None:
+    line = config_ui.non_loopback_warning("0.0.0.0", 8765)
+    assert line is not None and "\n" not in line
+    assert config_ui.non_loopback_warning("127.0.0.1", 8765) is None
+    assert inspect.signature(config_ui.non_loopback_warning).parameters.keys() == {"host", "port"}
+
+
+@pytest.mark.parametrize(("extra", "calls"), [((), 1), (("--no-browser",), 0)], ids=["default", "no_browser"])
+def test_ac2_no_browser_leaves_the_opener_uncalled_and_prints_the_url_once(
+    extra: tuple[str, ...], calls: int, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, serve, opened, out, _err = _run(tmp_path, capsys, *extra)
+    assert status == 0 and len(serve.calls) == 1
+    (ui,) = serve.calls
+    printed = serve.stdout_before[0] + out
+    assert printed.count(ui.access_url) == 1
+    assert opened == [ui.access_url] * calls
+
+
+def test_ac2_no_browser_covers_the_running_instance_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A confirmed instance of this version is handed to the opener today;
+    with ``--no-browser`` its access URL is printed once and nothing opens."""
+
+    monkeypatch.setattr(locations, "running_platform", lambda: locations.LINUX)
+    record = _instance_record(monkeypatch, tmp_path)
+    url = json.loads(record.read_text(encoding="utf-8"))["access_url"]
+    answer = json.dumps({"marker": "f" * 32, "version": locations.product_version()}).encode("utf-8")
+
+    def launch(*extra: str) -> tuple[int, list[str], str]:
+        clock = _Clock()
+        seams = config_ui.InstanceSeams(
+            liveness=lambda pid: pid == FOREIGN_PID,
+            probe=lambda port, probed, timeout: (200, answer),
+            clock=clock,
+            sleep=clock.sleep,
+            platform="linux",
+            started_at=_started(PUBLISHED - 60.0),
+        )
+        opened: list[str] = []
+        serve = _Serve()
+        status = config_ui.main(list(extra), opener=opened.append, serve=serve, instance=seams)
+        assert serve.calls == []
+        return status, opened, capsys.readouterr().out
+
+    status, opened, out = launch("--no-browser")
+    assert (status, opened, out.count(url)) == (0, [], 1)
+    status, opened, out = launch()
+    assert (status, opened, out.count(url)) == (0, [url], 1)
+
+
+def test_ac3_a_valid_token_file_supplies_the_token(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    token_file = tmp_path / "token"
+    token_file.write_text(VALID_TOKEN + "\n", encoding="utf-8")
+    status, serve, _opened, out, _err = _run(tmp_path, capsys, "--token-file", str(token_file))
+    assert status == 0 and len(serve.calls) == 1
+    (ui,) = serve.calls
+    printed = serve.stdout_before[0] + out
+    (line,) = [line for line in printed.splitlines() if "?token=" in line]
+    assert line.endswith("?token=" + VALID_TOKEN)
+    assert ui.token == VALID_TOKEN
+    # The instance record persists it on POSIX, where the health probe reads it.
+    assert serve.record is not None and serve.record["access_url"].endswith("?token=" + VALID_TOKEN)
+    try:
+        response = ui.handle(_request("GET", "/", query={"token": VALID_TOKEN}))
+        assert response.status == 303
+        cookie = dict(response.headers)["Set-Cookie"].split(";")[0]
+        assert ui._session(_request("GET", "/", headers={"cookie": cookie})) is not None
+        refused = ui.handle(_request("GET", "/", query={"token": VALID_TOKEN[:-1] + "B"}))
+        assert "Set-Cookie" not in dict(refused.headers)
+    finally:
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+@pytest.mark.parametrize(
+    ("content", "rule"),
+    [
+        pytest.param(None, "unreadable", id="missing"),
+        pytest.param("", "empty", id="empty"),
+        pytest.param("Mx42" + "q" * 38, "length 43–128", id="42_chars"),
+        pytest.param("Lx129" + "r" * 124, "length 43–128", id="129_chars"),
+        pytest.param("Px+" + "s" * 41, "alphabet A–Z a–z 0–9 - _", id="plus"),
+    ],
+)
+def test_ac3_an_unusable_token_file_refuses_to_start(
+    content: str | None, rule: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    token_file = tmp_path / "token"
+    if content is not None:
+        assert content == "" or len(content) in (42, 129, 44)
+        token_file.write_text(content + "\n", encoding="utf-8")
+    status, serve, opened, _out, err = _run(tmp_path, capsys, "--token-file", str(token_file))
+    assert status == 2
+    assert serve.calls == [] and opened == []
+    lines = err.strip().splitlines()
+    assert len(lines) == 1
+    assert str(token_file) in lines[0] and rule in lines[0]
+    if content:
+        assert content not in err
+    # Refused before any claim: no instance record was published.
+    assert not (tmp_path / ("config.yaml" + config_ui.INSTANCE_SUFFIX)).exists()
+
+
+def test_ac3_whitespace_around_the_token_is_stripped(tmp_path: Path) -> None:
+    token_file = tmp_path / "token"
+    token_file.write_bytes(b"  \t" + VALID_TOKEN.encode("ascii") + b"\r\n\n")
+    assert config_ui.read_token_file(token_file) == VALID_TOKEN
+    token_file.write_bytes(b"\xff" * 50)
+    with pytest.raises(config_ui.TokenFileError, match="unreadable"):
+        config_ui.read_token_file(token_file)
+
+
+def test_r1_the_new_options_are_absent_by_default() -> None:
+    settings = config_ui.UISettings.from_argv(["--config", "x.yaml"])
+    assert settings.no_browser is False and settings.token_file is None
+    parsed = config_ui.UISettings.from_argv(["--config", "x.yaml", "--no-browser", "--token-file", "t"])
+    assert parsed.no_browser is True and parsed.token_file == Path("t")

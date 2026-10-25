@@ -207,6 +207,10 @@ class UISettings:
     default_location: bool = False
     #: ``--install-launcher``: write the OS launcher and exit (R1, A3).
     install_launcher: bool = False
+    #: ``--no-browser``: never call the browser opener (phase 10 R1).
+    no_browser: bool = False
+    #: ``--token-file``: the access token's file (phase 10 R1, A5).
+    token_file: Path | None = None
 
     @classmethod
     def from_argv(cls, argv: Sequence[str]) -> UISettings:
@@ -239,6 +243,8 @@ class UISettings:
             launch_argv=tuple(launch),
             default_location=default_location,
             install_launcher=parsed.install_launcher,
+            no_browser=parsed.no_browser,
+            token_file=None if parsed.token_file is None else Path(parsed.token_file),
         )
 
     # Every path below is in its one canonical form (``core.overlay.
@@ -330,7 +336,59 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the per-user OS launcher for this interpreter, print its path and exit",
     )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="never open a browser; the access URL is still printed",
+    )
+    parser.add_argument(
+        "--token-file",
+        metavar="PATH",
+        help="read the access token from a file instead of generating one",
+    )
     return parser
+
+
+#: A supplied access token: at least the 256 bits of a generated one, from
+#: the URL-safe base64 alphabet (phase 10 A5).
+_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43,128}")
+
+
+class TokenFileError(Exception):
+    """A ``--token-file`` that cannot supply the token; the message names
+    the path and the rule broken, never the file's content (phase 10 R1)."""
+
+
+def read_token_file(path: Path) -> str:
+    """The access token *path* holds, surrounding whitespace stripped (A5).
+
+    Raises :class:`TokenFileError` for an unreadable, empty or invalid file.
+    """
+
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise TokenFileError(f"token file {path}: unreadable") from None
+    token = text.strip()
+    if not token:
+        raise TokenFileError(f"token file {path}: empty")
+    if not 43 <= len(token) <= 128:
+        raise TokenFileError(f"token file {path}: length 43–128")
+    if _TOKEN_PATTERN.fullmatch(token) is None:
+        raise TokenFileError(f"token file {path}: alphabet A–Z a–z 0–9 - _")
+    return token
+
+
+def non_loopback_warning(host: str, port: int) -> str | None:
+    """The one start-up line for a bind that is not loopback, built from
+    *host* and *port* only (phase 10 R1); ``None`` for a loopback bind."""
+
+    if _is_loopback(host):
+        return None
+    return (
+        f"config_ui: warning: bound to {host} port {port}: the configuration UI is "
+        "reachable from the network and protected only by the access token"
+    )
 
 
 def startup_checks(settings: UISettings) -> list[str]:
@@ -3020,6 +3078,7 @@ class ConfigUI:
         supervisor: Supervisor | None = None,
         wizard_seams: WizardSeams | None = None,
         started_at: Callable[[int], float | None] | None = None,
+        token: str | None = None,
     ) -> None:
         self.settings = settings
         inherited: Mapping[str, str] = os.environ if environ is None else environ
@@ -3038,7 +3097,9 @@ class ConfigUI:
             form for value in stored.values() if value for form in _redaction_forms(value)
         )
         self._secrets_lock = threading.Lock()
-        self.token = secrets.token_urlsafe(32)
+        #: The access token: a validated ``--token-file`` value, else minted
+        #: per start (phase 10 A5); checked the same way whatever its source.
+        self.token = secrets.token_urlsafe(32) if token is None else token
         #: This serving process's instance marker (R1): 128 random bits,
         #: distinct from the token, answered by ``/instance`` and written to
         #: the instance record, so a second launch can tell this UI from
@@ -7056,10 +7117,11 @@ def claim_instance(
             if version == own:
                 # Standard output, as A3's single print: a print is no log.
                 report(_t("instance.already_running", url=record.access_url), stream=sys.stdout)
-                try:
-                    opener(record.access_url)
-                except Exception:
-                    logger.warning("the browser could not be opened: use the printed access URL")
+                if not settings.no_browser:
+                    try:
+                        opener(record.access_url)
+                    except Exception:
+                        logger.warning("the browser could not be opened: use the printed access URL")
                 raise _SecondLaunch(0)
             report(
                 _t("instance.version_mismatch", running=version, own=own),
@@ -7170,6 +7232,9 @@ def main(
     replace serves nothing, and a clean exit removes the record (R1).
     ``--install-launcher`` writes the OS launcher over the *launcher* seams
     and exits before any startup check, instance record or serve (R1, A3).
+    ``--no-browser`` leaves *opener* uncalled, ``--token-file`` supplies the
+    token (an unusable file exits 2 before any claim or serve), and a bind
+    that is not loopback writes one warning line before serving (phase 10 R1).
     """
 
     if opener is None:
@@ -7192,6 +7257,13 @@ def main(
     if refusal is not None:
         print(f"config_ui: string table refused: {refusal}", file=sys.stderr)
         return 2
+    token = None
+    if settings.token_file is not None:
+        try:
+            token = read_token_file(settings.token_file)
+        except TokenFileError as exc:
+            print(f"config_ui: {exc}", file=sys.stderr)
+            return 2
     if settings.default_location:
         # Only the A2 default's directory is created; a --config run creates
         # nothing (A2: every existing behaviour is unchanged).
@@ -7207,7 +7279,7 @@ def main(
                 file=sys.stderr,
             )
             return 2
-    ui = ConfigUI(settings)
+    ui = ConfigUI(settings, token=token)
     seams = InstanceSeams() if instance is None else instance
     ended = claim_instance(ui, seams, opener)
     if ended is not None:
@@ -7224,7 +7296,11 @@ def main(
             # neither it nor the failure's text (which may quote it) is logged.
             logger.warning("the browser could not be opened: use the printed access URL")
 
-    ui.on_listening = open_browser
+    if not settings.no_browser:
+        ui.on_listening = open_browser
+    warning = non_loopback_warning(settings.host, settings.port)
+    if warning is not None:
+        print(warning, file=sys.stderr, flush=True)
     try:
         serve(ui, settings)
     finally:
