@@ -33,3 +33,10 @@ venv/
 *.orig
 *.rej
 /.adversarial-spec/
+
+# Campaign run artefacts: written on every loop, diagnosable, never part of the phase record.
+# Tracked once by a squash merge, they made every later merge fail on untracked duplicates.
+docs/campaigns/phase*/scaffolding/logs/
+docs/campaigns/phase*/scaffolding/loop-out/
+docs/campaigns/phase*/scaffolding/campaign.log
+docs/campaigns/phase*/scaffolding/campaign-summary.md
