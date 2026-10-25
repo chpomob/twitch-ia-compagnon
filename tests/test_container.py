@@ -21,6 +21,12 @@ for a bind that is not loopback, ``--no-browser`` (the opener is never
 called, the access URL is still printed once) and ``--token-file`` (the
 token read from a file under A5's rules, an unusable file refusing to start
 with a diagnostic that names the path and never the content).
+
+Then the supervision record (R6 item 3, AC19): published ``not_started``
+by ``main``'s claim path, rewritten ``launched`` each time the supervisor
+returns a child and ``stopped`` by the console's Stop, removed at release
+when it carries this UI's marker; a UI built without the claim writes none,
+and a file at its path refuses to start (``supervision_path_collision``).
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import ast
 import inspect
 import json
 import os
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -665,3 +672,255 @@ def test_r1_the_new_options_are_absent_by_default() -> None:
     assert settings.no_browser is False and settings.token_file is None
     parsed = config_ui.UISettings.from_argv(["--config", "x.yaml", "--no-browser", "--token-file", "t"])
     assert parsed.no_browser is True and parsed.token_file == Path("t")
+
+
+# -- the supervision record (R6 item 3, AC19) -------------------------------- #
+
+#: The status record's timestamp format, which ``launched_at`` uses.
+STATUS_TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z")
+#: A fixture content no diagnostic may quote.
+FIXTURE_CONTENT = "supervision-fixture-4b81e0-never-quoted"
+
+
+class _FakeChild:
+    """A child that runs until terminated; no process is started."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.stderr = None
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    kill = terminate
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
+
+
+def _fake_launches(ui: Any) -> list[_FakeChild]:
+    """Make *ui*'s own supervisor start fake children (pids 5001, 5002, …),
+    watch none of them past one poll, and let every Check pass."""
+
+    children: list[_FakeChild] = []
+
+    def popen(*args: Any, **kwargs: Any) -> _FakeChild:
+        children.append(_FakeChild(5000 + len(children) + 1))
+        return children[-1]
+
+    ui.supervisor.popen = popen
+    ui.supervisor.apply_window = 0.0
+    ui.checker = lambda *args, **kwargs: (True, ())
+    return children
+
+
+def _supervision(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _claimed(root: Path, during: Callable[[Any, Path], None]) -> tuple[int, Path]:
+    """``main`` over a fresh profile, *during* run with the UI and its
+    supervision record's path while it serves; returns the exit status and
+    that path."""
+
+    base = _profile(root)
+    record = root / ("config.yaml" + config_ui.SUPERVISION_SUFFIX)
+    calls: list[Any] = []
+
+    def serve(ui: Any, settings: Any) -> None:
+        calls.append(ui)
+        try:
+            during(ui, record)
+        finally:
+            config_ui._LOG_REDACTION.sources.discard(ui)
+
+    seams = config_ui.InstanceSeams(platform="linux")
+    status = config_ui.main(["--config", str(base)], opener=lambda url: None, serve=serve, instance=seams)
+    assert len(calls) == 1
+    return status, record
+
+
+def test_ac19_the_supervision_path_is_derived_as_the_instance_records(tmp_path: Path) -> None:
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    settings = config_ui.UISettings.from_argv(["--config", str(tmp_path / "link" / "a.yml")])
+    expected = tmp_path / "real" / "a.yml.supervisor.json"
+    assert config_ui.supervision_path(settings) == settings.supervision_path == expected
+    assert settings.supervision_path.parent == settings.instance_path.parent
+
+
+def test_ac19_the_record_follows_the_supervisor_and_release_removes_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def during(ui: Any, record: Path) -> None:
+        children = _fake_launches(ui)
+        seen.append(_supervision(record))
+        if os.name != "nt":
+            assert record.stat().st_mode & 0o777 == 0o600
+        assert ui.start_runtime().outcome == console.START_UNCONFIRMED
+        seen.append(_supervision(record))
+        ui.apply()
+        seen.append(_supervision(record))
+        assert ui.stop_runtime().outcome == console.STOP_STOPPED
+        seen.append(_supervision(record))
+        assert [child.pid for child in children] == [5001, 5002]
+        # Apply's own stop is no console Stop: the record stays launched.
+        ui.start_runtime()
+        ui.apply()
+        seen.append(_supervision(record))
+        assert ui.instance_marker == seen[0]["marker"]
+
+    status, record = _claimed(tmp_path, during)
+    assert status == 0
+    marker = seen[0]["marker"]
+    assert seen[0] == {"version": 1, "marker": marker, "state": "not_started"}
+    for document, pid in [(seen[1], 5001), (seen[2], 5002), (seen[4], 5004)]:
+        assert set(document) == {"version", "marker", "state", "pid", "launched_at"}
+        assert (document["version"], document["marker"], document["state"]) == (1, marker, "launched")
+        assert document["pid"] == pid
+        assert STATUS_TIMESTAMP.fullmatch(document["launched_at"])
+        assert config_ui._timestamp_seconds(document["launched_at"]) is not None
+    assert seen[3] == {"version": 1, "marker": marker, "state": "stopped"}
+    assert not record.exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["config.yaml", "mods"]
+
+
+def test_ac19_publication_replaces_a_record_present(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stale = tmp_path / ("config.yaml" + config_ui.SUPERVISION_SUFFIX)
+    stale.write_text('{"version": 1, "marker": "' + "e" * 32 + '", "state": "stopped"}\n', encoding="utf-8")
+    seen: list[dict[str, Any]] = []
+    status, record = _claimed(tmp_path, lambda ui, record: seen.append(_supervision(record)))
+    assert status == 0
+    assert seen[0]["state"] == "not_started" and seen[0]["marker"] != "e" * 32
+    assert not record.exists()
+
+
+def test_ac19_release_removes_its_record_when_the_instance_record_was_replaced(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    foreign = json.dumps({"pid": FOREIGN_PID, "port": 8765, "marker": "f" * 32}) + "\n"
+
+    def during(ui: Any, record: Path) -> None:
+        ui.settings.instance_path.write_text(foreign, encoding="utf-8")
+
+    status, record = _claimed(tmp_path, during)
+    assert status == 0
+    assert not record.exists()
+    instance = tmp_path / ("config.yaml" + config_ui.INSTANCE_SUFFIX)
+    assert instance.read_text(encoding="utf-8") == foreign
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(["config.yaml", "mods", instance.name])
+
+
+def test_ac19_a_record_with_another_marker_is_byte_identical_after_release(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    other = b'{"marker": "' + b"d" * 32 + b'", "state": "launched", "version": 1}\n'
+
+    def during(ui: Any, record: Path) -> None:
+        record.write_bytes(other)
+
+    status, record = _claimed(tmp_path, during)
+    assert status == 0
+    assert record.read_bytes() == other
+
+
+def test_ac19_a_ui_built_without_the_claim_writes_none(tmp_path: Path) -> None:
+    base = _profile(tmp_path)
+    ui = config_ui.ConfigUI(config_ui.UISettings.from_argv(["--config", str(base)]), environ={})
+    try:
+        children = _fake_launches(ui)
+        before = sorted(path.name for path in tmp_path.iterdir())
+        assert ui.start_runtime().outcome == console.START_UNCONFIRMED
+        ui.apply()
+        assert ui.stop_runtime().outcome == console.STOP_STOPPED
+        assert len(children) == 2
+        assert sorted(path.name for path in tmp_path.iterdir()) == before
+        assert not ui.settings.supervision_path.exists()
+        ui.release_supervision()
+    finally:
+        ui.supervisor.close()
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+@pytest.mark.usefixtures("linux_platform")
+@pytest.mark.parametrize("configured", ["status", "overlay", "feed", "token"])
+def test_ac19_a_file_at_the_supervision_path_refuses_to_start(
+    configured: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv(config_ui.FEED_FILE_VARIABLE, raising=False)
+    target = tmp_path / PRODUCT / "profile.yaml.supervisor.json"
+    target.parent.mkdir()
+    target.write_text(FIXTURE_CONTENT, encoding="utf-8")
+    argv: list[str] = []
+    if configured == "feed":
+        monkeypatch.setenv(config_ui.FEED_FILE_VARIABLE, str(target))
+    elif configured == "token":
+        argv = ["--token-file", str(target)]
+    else:
+        argv = ["--status-file" if configured == "status" else "--overlay", str(target)]
+
+    problems = config_ui.startup_checks(config_ui.UISettings.from_argv(argv))
+    assert problems == [
+        f"supervision_path_collision: supervision record file {target} collides with "
+        f"the {configured} file {target}"
+    ]
+    assert FIXTURE_CONTENT not in problems[0]
+
+    serve = _Serve()
+    assert config_ui.main(argv, opener=lambda url: None, serve=serve) != 0
+    captured = capsys.readouterr()
+    assert "supervision_path_collision" in captured.err
+    assert FIXTURE_CONTENT not in captured.out + captured.err
+    assert serve.calls == []
+    assert target.read_text(encoding="utf-8") == FIXTURE_CONTENT
+    assert sorted(path.name for path in target.parent.iterdir()) == [target.name]
+
+
+@pytest.mark.usefixtures("linux_platform")
+def test_ac19_a_token_file_aliasing_the_supervision_path_refuses_to_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A symbolic link to the supervision record is that file: publication
+    # would overwrite the token and release would delete it.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv(config_ui.FEED_FILE_VARIABLE, raising=False)
+    target = tmp_path / PRODUCT / "profile.yaml.supervisor.json"
+    target.parent.mkdir()
+    target.write_text("a" * 32 + "\n", encoding="utf-8")
+    alias = tmp_path / "token"
+    alias.symlink_to(target)
+
+    problems = config_ui.startup_checks(
+        config_ui.UISettings.from_argv(["--token-file", str(alias)])
+    )
+    assert problems == [
+        f"supervision_path_collision: supervision record file {target} collides with "
+        f"the token file {target}"
+    ]
+
+
+@pytest.mark.usefixtures("linux_platform")
+def test_ac19_the_default_location_has_no_supervision_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv(config_ui.FEED_FILE_VARIABLE, raising=False)
+    assert config_ui.startup_checks(config_ui.UISettings.from_argv([])) == []

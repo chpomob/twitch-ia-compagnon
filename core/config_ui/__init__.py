@@ -131,6 +131,7 @@ from core.main import (
     SECRETS_KEY,
     _STARTUP_DEADLINE_SECONDS,
     _builtin_modules_directory,
+    _utc_timestamp,
     check_config,
 )
 from core.overlay import (
@@ -183,6 +184,13 @@ _PROG = "python -m core.config_ui"
 
 #: The instance record's suffix, appended to the base file's full name (R1).
 INSTANCE_SUFFIX = ".instance.json"
+#: The supervision record's suffix, derived as the instance record's (phase 10 R6).
+SUPERVISION_SUFFIX = ".supervisor.json"
+#: The supervision record's format version and its three states (R6).
+SUPERVISION_VERSION = 1
+SUPERVISION_NOT_STARTED = "not_started"
+SUPERVISION_LAUNCHED = "launched"
+SUPERVISION_STOPPED = "stopped"
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +312,19 @@ class UISettings:
         """The supervision feed ``<base>.feed.jsonl``, canonical (DD9)."""
 
         return canonical_path(default_feed_path(self.config))
+
+    @property
+    def supervision_path(self) -> Path:
+        """The supervision record ``<base>.supervisor.json``, canonical (phase 10 R6)."""
+
+        return supervision_path(self)
+
+
+def supervision_path(settings: UISettings) -> Path:
+    """``<base>.supervisor.json`` beside the profile, derived as the instance
+    record ``<base>.instance.json`` is (phase 10 R6)."""
+
+    return canonical_path(settings.config.with_name(settings.config.name + SUPERVISION_SUFFIX))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -460,6 +481,29 @@ def startup_checks(settings: UISettings) -> list[str]:
                     f"{other} file {named}"
                 )
         against.append((role, path))
+    # The supervision record (phase 10 R6) is checked after every other
+    # member, so its collision is reported once, naming the first file hit.
+    # The feed is also the one its environment variable names, as a runtime
+    # started beside this UI with that environment would write it. The
+    # --token-file input is checked too: publication would overwrite it and
+    # release would delete it, so the next launch could not read its token.
+    try:
+        supervision = settings.supervision_path
+        named_feed = os.environ.get(FEED_FILE_VARIABLE)
+        if named_feed:
+            against.append(("feed", canonical_path(named_feed)))
+        if settings.token_file is not None:
+            against.append(("token", canonical_path(settings.token_file)))
+    except OverlayError as exc:
+        problems.append(f"path_not_canonical: {exc}")
+        return problems
+    for other, named in against:
+        if named is not None and same_file(supervision, named):
+            problems.append(
+                f"supervision_path_collision: supervision record file {supervision} "
+                f"collides with the {other} file {named}"
+            )
+            break
     return problems
 
 
@@ -3165,6 +3209,14 @@ class ConfigUI:
             if supervisor is None
             else supervisor
         )
+        if supervisor is None:
+            # Every child Supervisor.start returns (console Start, Apply's
+            # restart) is recorded as launched (phase 10 R6).
+            self.supervisor.on_start = self._supervision_launched
+        #: The supervision record this UI publishes (phase 10 R6): set only
+        #: by main's claim path; while ``None`` no transition writes one.
+        self._supervision: Path | None = None
+        self._supervision_lock = threading.Lock()
         #: The last Apply's report, shown on the pages (R7).
         self.last_apply: ApplyReport | None = None
         #: Called once by :func:`serve` when the listener accepts connections,
@@ -3716,6 +3768,47 @@ class ConfigUI:
             self._start_reader(),
         )
 
+    # -- The supervision record (phase 10 R6) ---------------------------------
+
+    def publish_supervision(self, path: Path) -> None:
+        """Publish ``not_started`` at *path*, replacing any record present;
+        from now on each transition rewrites it. Only :func:`main`'s claim
+        path calls this, right after the instance record is claimed."""
+
+        with self._supervision_lock:
+            self._supervision = path
+        self._record_supervision(SUPERVISION_NOT_STARTED)
+
+    def release_supervision(self) -> None:
+        """Remove the supervision record when it carries this UI's marker;
+        no transition writes one afterwards."""
+
+        with self._supervision_lock:
+            path, self._supervision = self._supervision, None
+            if path is None:
+                return
+            try:
+                _remove_supervision_if(path, self.settings.instance_path, self.instance_marker)
+            except OSError:
+                logger.warning("the supervision record could not be removed on exit")
+
+    def _supervision_launched(self, child: Any) -> None:
+        self._record_supervision(SUPERVISION_LAUNCHED, child)
+
+    def _record_supervision(self, state: str, child: Any = None) -> None:
+        """Rewrite the supervision record with *state*; nothing while this UI
+        has published none. A failed write is logged, value-free."""
+
+        with self._supervision_lock:
+            path = self._supervision
+            if path is None:
+                return
+            content = supervision_document(self.instance_marker, state, child)
+            try:
+                _write_supervision(path, self.settings.instance_path, content)
+            except OSError:
+                logger.warning("the supervision record could not be written (%s)", state)
+
     def _child_alive(self) -> bool:
         """Whether this UI's child is still alive, whatever its status record says."""
 
@@ -3752,6 +3845,7 @@ class ConfigUI:
             report = console.RuntimeOutcome(stop, outcome)
         elif self.supervisor.stop():
             report = console.RuntimeOutcome(stop, console.STOP_STOPPED)
+            self._record_supervision(SUPERVISION_STOPPED)
         else:
             report = console.RuntimeOutcome(stop, console.STOP_UNCONFIRMED)
         logger.info(
@@ -6130,6 +6224,9 @@ class Supervisor:
         self._closed = False
         #: Values a restart was given, redacted from the drain beside the live UIs' set.
         self._secret_values: frozenset[str] = frozenset()
+        #: Called with each child :meth:`start` returns, outside the lock;
+        #: the UI records it as launched (phase 10 R6).
+        self.on_start: Callable[[Any], None] | None = None
 
     def close(self) -> None:
         """Forbid every later launch, then stop the child (the UI's final cleanup).
@@ -6210,6 +6307,8 @@ class Supervisor:
             self._drain = drain
         if drain is not None:
             drain.start()
+        if self.on_start is not None:
+            self.on_start(child)
         return child
 
     def restart(self, digest: str, secret_values: Iterable[str] = ()) -> ApplyReport:
@@ -7160,10 +7259,82 @@ def claim_instance(
     return unusable()
 
 
+def supervision_document(marker: str, state: str, child: Any = None) -> bytes:
+    """The supervision record's bytes (phase 10 R6): version, marker and
+    state, plus the child's pid and the status record's timestamp when
+    *state* is ``launched``."""
+
+    document: dict[str, Any] = {
+        "version": SUPERVISION_VERSION,
+        "marker": marker,
+        "state": state,
+    }
+    if state == SUPERVISION_LAUNCHED:
+        document["pid"] = child.pid
+        document["launched_at"] = _utc_timestamp()
+    return (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _write_supervision(path: Path, instance: Path, content: bytes) -> None:
+    """Replace the supervision record at *path* with *content*, atomically
+    (phase 10 R6): a temporary file beside it, owner-only from its creation
+    on POSIX, then ``os.replace`` under the instance record's lock (shared,
+    as a publication holds it; the write is short). The temporary file
+    never outlives the call; an ``OSError`` propagates."""
+
+    temp = path.with_name(f".{path.name}.{os.getpid()}-{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temp, flags, 0o600)
+    try:
+        try:
+            view = memoryview(content)
+            while view:
+                view = view[os.write(descriptor, view) :]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        with _instance_lock(instance, exclusive=False):
+            os.replace(temp, path)
+    finally:
+        with suppress(OSError):
+            os.unlink(temp)
+
+
+def _remove_supervision_if(path: Path, instance: Path, marker: str) -> bool:
+    """Remove the supervision record only while it carries *marker* (R6),
+    holding the instance record's lock exclusively so no write lands
+    between the judgement and the removal. A record with another marker,
+    or one that does not parse, is left untouched. Returns whether a
+    record was removed."""
+
+    with _instance_lock(instance, exclusive=True):
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return False
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return False
+        if not isinstance(document, dict) or document.get("marker") != marker:
+            return False
+        os.unlink(path)
+        return True
+
+
 def release_instance(ui: ConfigUI, platform: str | None = None) -> None:
     """Remove the instance record on a clean exit, only while it still holds
-    this instance's marker (R1)."""
+    this instance's marker (R1). The supervision record goes first, when it
+    carries this UI's marker, whether or not the instance record is still
+    this UI's (phase 10 R6)."""
 
+    try:
+        ui.release_supervision()
+    finally:
+        _release_instance_record(ui, platform)
+
+
+def _release_instance_record(ui: ConfigUI, platform: str | None) -> None:
     platform = platform if platform is not None else locations.running_platform()
     path = ui.settings.instance_path
     aside = path.with_name(f".{path.name}.{os.getpid()}-{secrets.token_hex(8)}.exit")
@@ -7285,23 +7456,26 @@ def main(
     if ended is not None:
         ui.supervisor.close()
         return ended
-    print(f"Configuration UI: {ui.access_url}", flush=True)
-    logger.info("configuration UI serving on %s", ui.access_authority)
-
-    def open_browser() -> None:
-        try:
-            opener(ui.access_url)
-        except Exception:
-            # The printed URL is the fallback; the URL carries the token, so
-            # neither it nor the failure's text (which may quote it) is logged.
-            logger.warning("the browser could not be opened: use the printed access URL")
-
-    if not settings.no_browser:
-        ui.on_listening = open_browser
-    warning = non_loopback_warning(settings.host, settings.port)
-    if warning is not None:
-        print(warning, file=sys.stderr, flush=True)
     try:
+        # Claimed: the supervision record is published now, replacing any
+        # present, and removed by the release below (phase 10 R6).
+        ui.publish_supervision(settings.supervision_path)
+        print(f"Configuration UI: {ui.access_url}", flush=True)
+        logger.info("configuration UI serving on %s", ui.access_authority)
+
+        def open_browser() -> None:
+            try:
+                opener(ui.access_url)
+            except Exception:
+                # The printed URL is the fallback; the URL carries the token, so
+                # neither it nor the failure's text (which may quote it) is logged.
+                logger.warning("the browser could not be opened: use the printed access URL")
+
+        if not settings.no_browser:
+            ui.on_listening = open_browser
+        warning = non_loopback_warning(settings.host, settings.port)
+        if warning is not None:
+            print(warning, file=sys.stderr, flush=True)
         serve(ui, settings)
     finally:
         try:
