@@ -1200,6 +1200,113 @@ def _windows_process_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _read_proc_text(path: str) -> str:
+    with open(path, encoding="ascii", errors="replace") as handle:
+        return handle.read(4096)
+
+
+def process_started_at(
+    pid: int,
+    *,
+    read_text: Callable[[str], str] | None = None,
+    clock: Callable[[], float] | None = None,
+    ticks_per_second: int | None = None,
+    platform: str | None = None,
+) -> float | None:
+    """When process *pid* started, in wall-clock UTC epoch seconds, or
+    ``None`` when it cannot be read (phase 10 R2).
+
+    Linux only: field 22 (``starttime``, clock ticks since boot) of
+    ``/proc/<pid>/stat``, parsed after the last ``)`` (``comm`` may hold
+    spaces and parentheses), over ``SC_CLK_TCK``, added to a boot time of
+    ``clock()`` minus the first field of ``/proc/uptime``, both files read in
+    this one call. That keeps centisecond precision, where ``btime`` of
+    ``/proc/stat`` is whole seconds and would move a start up to 1 s earlier.
+    The boot time follows the current wall clock, as ``st_mtime`` and the
+    status record's timestamp do; the wall clock is read before
+    ``/proc/uptime``, so a delay between the two reads only moves the
+    computed start earlier. Any other platform, any ``OSError`` and
+    any parse failure is ``None``. The keyword arguments are test seams.
+    """
+
+    if (sys.platform if platform is None else platform) != "linux":
+        return None
+    read = _read_proc_text if read_text is None else read_text
+    now = time.time if clock is None else clock
+    try:
+        stat_text = read(f"/proc/{pid}/stat")
+        # The wall clock is sampled before the uptime, never after: a delay
+        # between the two samples then moves the boot time, and the start,
+        # earlier (a genuine publisher is never judged stale for it) where
+        # the other order would move them later by that delay.
+        wall = now()
+        uptime_text = read("/proc/uptime")
+        ticks = os.sysconf("SC_CLK_TCK") if ticks_per_second is None else ticks_per_second
+        _comm, closing, rest = stat_text.rpartition(")")
+        fields = rest.split()
+        # ``rest`` starts at field 3 (state): field 22 is its 20th entry.
+        if not closing or len(fields) < 20 or ticks <= 0:
+            return None
+        starttime = int(fields[19])
+        uptime = float(uptime_text.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    if starttime < 0 or not math.isfinite(uptime):
+        return None
+    return wall - uptime + starttime / ticks
+
+
+def record_pid_live(
+    pid: int,
+    published_at: float,
+    liveness: Callable[[int], bool],
+    started_at: Callable[[int], float | None],
+) -> bool:
+    """Whether a record published at *published_at* (epoch seconds) names a
+    live publisher (phase 10 R2).
+
+    ``liveness(pid)`` is returned unchanged when the pid is not live or its
+    start time is unknown; a live process that started strictly after the
+    publication is not the publisher, with no tolerance (R2, AC10). A
+    genuine publisher started before it wrote its record, and tick
+    truncation only moves a computed start earlier, so it is never judged
+    stale. A backwards wall-clock step between publication and this
+    judgement is outside R2 and may judge a genuine publisher stale.
+    """
+
+    live = liveness(pid)
+    if not live:
+        return live
+    started = started_at(pid)
+    if started is None:
+        return live
+    if started > published_at:
+        return False
+    return live
+
+
+def _unknown_start(pid: int) -> float | None:
+    """The start-time seam that never knows: the judgement is unchanged."""
+
+    return None
+
+
+def _timestamp_seconds(value: str) -> float | None:
+    """A status record timestamp (already validated) as epoch seconds."""
+
+    match = _TIMESTAMP.fullmatch(value)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, fraction = match.groups()
+    try:
+        moment = datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second), tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+    return moment.timestamp() + int((fraction or "0").ljust(6, "0")) / 1_000_000
+
+
 @dataclass(frozen=True)
 class RunningState:
     """The status record as the pages show it (R4, R7)."""
@@ -2912,6 +3019,7 @@ class ConfigUI:
         probe: Probe | None = None,
         supervisor: Supervisor | None = None,
         wizard_seams: WizardSeams | None = None,
+        started_at: Callable[[int], float | None] | None = None,
     ) -> None:
         self.settings = settings
         inherited: Mapping[str, str] = os.environ if environ is None else environ
@@ -2979,6 +3087,13 @@ class ConfigUI:
         #: The liveness probe of a status record's process; a seam for tests,
         #: production always uses :func:`process_alive` (R7).
         self.probe: Probe = process_alive if probe is None else probe
+        #: The start-time reader of the status record's stale rule (phase
+        #: 10 R2); a seam for tests. ``None`` is :func:`process_started_at` while
+        #: :attr:`probe` is the default, and no start time under an injected
+        #: probe: a fake probe's pid is no process of its record (fixtures
+        #: hold fixed past timestamps and pids such as 4242, which a real
+        #: process may hold), so the real reader would change its judgement.
+        self.started_at: Callable[[int], float | None] | None = started_at
         #: Stops and starts the main process this UI launched (R7, A4).
         self.supervisor = (
             Supervisor(
@@ -3359,7 +3474,9 @@ class ConfigUI:
         language = wizard.language
         body = console.render_console(
             console.runtime_state(
-                alive=running.alive, supervised=running.supervised, starting=self._child_alive()
+                alive=self._holds_status_record(running),
+                supervised=running.supervised,
+                starting=self._child_alive(),
             ),
             feed,
             health,
@@ -3503,7 +3620,7 @@ class ConfigUI:
         # before any tail is read (R4).
         self.view()
         running = self.running_state()
-        if running.alive:
+        if self._holds_status_record(running):
             outcome = console.START_RUNNING_HERE if running.supervised else console.START_ANOTHER_INSTANCE
             report = console.RuntimeOutcome(console.ACTION_START, outcome)
         elif self._child_alive():
@@ -3518,6 +3635,25 @@ class ConfigUI:
             extra={"config_ui_operation": "start", "config_ui_outcome": report.outcome},
         )
         return report
+
+    def _holds_status_record(self, running: RunningState) -> bool:
+        """Whether a live process holds the status record, for the runtime
+        actions: Start's refusal, Stop's report and the console's runtime
+        state, which offers Start only when this is false. A live pid whose
+        process started after the record's publication is not its publisher
+        and holds nothing (phase 10 R2, :func:`record_pid_live`), so a record
+        left by a predecessor never blocks Start, from the console or not.
+        The record and supervision sections keep phase 9's judgement."""
+
+        record = running.live_record
+        if record is None:
+            return False
+        return record_pid_live(
+            record.pid,
+            self._published_seconds(record),
+            lambda pid: running.alive,
+            self._start_reader(),
+        )
 
     def _child_alive(self) -> bool:
         """Whether this UI's child is still alive, whatever its status record says."""
@@ -3550,7 +3686,8 @@ class ConfigUI:
 
         stop = console.ACTION_STOP
         if self.child is None:
-            outcome = console.STOP_NOT_OURS if self.running_state().alive else console.STOP_NOTHING
+            held = self._holds_status_record(self.running_state())
+            outcome = console.STOP_NOT_OURS if held else console.STOP_NOTHING
             report = console.RuntimeOutcome(stop, outcome)
         elif self.supervisor.stop():
             report = console.RuntimeOutcome(stop, console.STOP_STOPPED)
@@ -3618,6 +3755,29 @@ class ConfigUI:
             if on_disk is not None:
                 drift = DRIFT_IN_SYNC if record.digest == on_disk else DRIFT_DIFFERS
         return RunningState(reading, alive=alive, drift=drift, supervised=supervised)
+
+    def _start_reader(self) -> Callable[[int], float | None]:
+        """The stale rule's start-time reader (see :attr:`started_at`)."""
+
+        if self.started_at is not None:
+            return self.started_at
+        if self.probe is process_alive:
+            return lambda pid: process_started_at(pid)
+        return _unknown_start
+
+    def _published_seconds(self, record: StatusRecord) -> float:
+        """The record's publication time: its own ``published_at``, falling
+        back to the status file's ``st_mtime`` (phase 10 R2); with neither,
+        infinity, so no start time is ever after it (the judgement is
+        unchanged)."""
+
+        seconds = _timestamp_seconds(record.published_at)
+        if seconds is not None:
+            return seconds
+        try:
+            return os.stat(self.status_path).st_mtime
+        except OSError:
+            return math.inf
 
     @staticmethod
     def _running_section(running: RunningState) -> str:
@@ -6532,6 +6692,9 @@ class InstanceSeams:
     running one); it decides whether the token is persisted. ``publish(temp,
     record)``: the no-replace step that gives the written temporary file the
     record's name, raising ``FileExistsError`` when the name is taken.
+    ``started_at(pid)``: when *pid* started, in epoch seconds, or ``None``
+    (:func:`process_started_at`); a live pid that started after the record
+    file's ``st_mtime`` is judged not live (phase 10 R2).
     """
 
     liveness: Callable[[int], bool] = lambda pid: process_alive(pid, None)
@@ -6540,6 +6703,7 @@ class InstanceSeams:
     sleep: Callable[[float], None] = lambda seconds: time.sleep(seconds)
     platform: str | None = None
     publish: Callable[[Path, Path], None] = lambda temp, record: _no_replace_rename(temp, record)
+    started_at: Callable[[int], float | None] = lambda pid: process_started_at(pid)
 
 
 @dataclass(frozen=True)
@@ -6600,13 +6764,15 @@ def parse_instance_record(raw: bytes, platform: str) -> InstanceRecord | None:
     return InstanceRecord(pid=pid, port=port, marker=marker, access_url=access_url)
 
 
-def _read_instance(path: Path) -> bytes | None:
-    """The record's bytes, or ``None`` when there is none (a record removed
-    while it is read is no record)."""
+def _read_instance(path: Path) -> tuple[bytes, float] | None:
+    """The record's bytes and its publication time (the file's
+    ``st_mtime``, of the file read), or ``None`` when there is none (a
+    record removed while it is read is no record)."""
 
     try:
         with open(path, "rb") as handle:
-            return handle.read(INSTANCE_MAX_BYTES + 1)
+            published = os.fstat(handle.fileno()).st_mtime
+            return handle.read(INSTANCE_MAX_BYTES + 1), published
     except FileNotFoundError:
         return None
 
@@ -6862,12 +7028,15 @@ def claim_instance(
         report(_t("instance.unusable", path=path), _t("instance.unusable.next"))
         return EXIT_INSTANCE
 
-    def judge(raw: bytes) -> None:
+    def judge(raw: bytes, published: float) -> None:
         """Return when the record is stale; raise :class:`_SecondLaunch`
-        when it names an instance this launch does not replace."""
+        when it names an instance this launch does not replace. A live pid
+        that started after *published* is not the record's (phase 10 R2)."""
 
         record = parse_instance_record(raw, platform)
-        if record is None or not seams.liveness(record.pid):
+        if record is None or not record_pid_live(
+            record.pid, published, seams.liveness, seams.started_at
+        ):
             return
         exists = _t("instance.record_exists", path=path)
         if not _persists_token(platform):
@@ -6911,9 +7080,10 @@ def claim_instance(
     content = instance_document(ui, platform)
     try:
         for _round in range(INSTANCE_MAX_ROUNDS):
-            raw = _read_instance(path)
-            if raw is not None:
-                judge(raw)
+            entry = _read_instance(path)
+            if entry is not None:
+                raw, published = entry
+                judge(raw, published)
                 if _remove_instance_if(path, aside, lambda found: found == raw):
                     report(_t("instance.stale"))
                 # Removed or put back: read the name again either way.

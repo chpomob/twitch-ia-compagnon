@@ -1,0 +1,301 @@
+{
+  "run_uuid": "11a57fcf-f205-4a3a-89d2-261da340e0a3",
+  "start_time": 1792953011.144271,
+  "context": {
+    "ok": true,
+    "reason": "ok",
+    "thresholds": {
+      "min_chars": 20,
+      "min_tokens": 5,
+      "required_sections": [],
+      "min_source_lines": 0
+    }
+  },
+  "thresholds": {
+    "min_chars": 20,
+    "min_tokens": 5,
+    "required_sections": [],
+    "min_source_lines": 0
+  },
+  "complexity": {
+    "score": 8061,
+    "level": "medium",
+    "recommended_agents": 4,
+    "stats": {
+      "chars": 7541,
+      "files": 0,
+      "source_lines": 13,
+      "hunks": 0,
+      "requirements": 0,
+      "modules": 0
+    },
+    "tier": "medium",
+    "max_agents": 4,
+    "summary": "medium: 7541 chars, 0 files, 13 source lines, 0 hunks, 0 requirements, 0 modules"
+  },
+  "execution": {
+    "max_retries": 3,
+    "max_input_chars": 262144,
+    "max_output_chars": 131072,
+    "truncate_input": false,
+    "show_costs": false,
+    "max_agents": 6
+  },
+  "attempts": [
+    {
+      "phase": "build",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 980.927369560115,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1893,
+        "completion_tokens": 1225,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "build",
+        "persona": "builder"
+      }
+    },
+    {
+      "phase": "review",
+      "call": 1,
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 139.8052104320377,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "est_cost_usd": 0.0,
+        "estimated": false,
+        "phase": "review",
+        "persona": "critic"
+      }
+    }
+  ],
+  "calls": [
+    {
+      "label": "build",
+      "ok": true,
+      "attempts": [
+        {
+          "attempt": 1,
+          "returncode": 0,
+          "elapsed": 980.927369560115,
+          "retryable": false,
+          "reason": "success",
+          "usage": {
+            "model": "other",
+            "prompt_tokens": 1893,
+            "completion_tokens": 1225,
+            "est_cost_usd": 0.0,
+            "estimated": true,
+            "phase": "build",
+            "persona": "builder"
+          }
+        }
+      ],
+      "cap_events": []
+    },
+    {
+      "label": "review",
+      "ok": true,
+      "attempts": [
+        {
+          "call": 1,
+          "attempt": 1,
+          "returncode": 0,
+          "elapsed": 139.8052104320377,
+          "retryable": false,
+          "reason": "success",
+          "usage": {
+            "model": "other",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "est_cost_usd": 0.0,
+            "estimated": false,
+            "phase": "review",
+            "persona": "critic"
+          }
+        }
+      ],
+      "cap_events": [
+        {
+          "call": 1,
+          "kind": "output",
+          "stream": "stderr",
+          "attempt": 1,
+          "limit": 131072,
+          "original_chars": 674663,
+          "truncated": true
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    {
+      "code": "epistemic_label_defaulted",
+      "finding_id": "A1",
+      "message": "missing or invalid confidence/basis normalized to low/inference"
+    },
+    {
+      "code": "epistemic_label_defaulted",
+      "finding_id": "A2",
+      "message": "missing or invalid confidence/basis normalized to low/inference"
+    }
+  ],
+  "provider_history": [],
+  "cap_events": [
+    {
+      "phase": "review",
+      "call": 1,
+      "kind": "output",
+      "stream": "stderr",
+      "attempt": 1,
+      "limit": 131072,
+      "original_chars": 674663,
+      "truncated": true
+    }
+  ],
+  "gates": [
+    {
+      "gate": "pre_build",
+      "command": "",
+      "ok": true,
+      "exit_code": 0,
+      "infra": false,
+      "log": "",
+      "truncated": false,
+      "project_markers": [
+        ".git",
+        "pyproject.toml"
+      ]
+    }
+  ],
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 1893,
+        "completion_tokens": 1225,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "build": {
+        "prompt_tokens": 1893,
+        "completion_tokens": 1225,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "review": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "est_cost_usd": 0.0,
+        "estimated": false
+      }
+    },
+    "personas": {
+      "builder": {
+        "prompt_tokens": 1893,
+        "completion_tokens": 1225,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "critic": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "est_cost_usd": 0.0,
+        "estimated": false
+      }
+    },
+    "total": {
+      "prompt_tokens": 1893,
+      "completion_tokens": 1225,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 1893,
+        "completion_tokens": 1225,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "build",
+        "persona": "builder"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "est_cost_usd": 0.0,
+        "estimated": false,
+        "phase": "review",
+        "persona": "critic"
+      }
+    ]
+  },
+  "feature": "phase10-p1",
+  "completed": [
+    "git_setup",
+    "pre_build_gate",
+    "build",
+    "review"
+  ],
+  "stash_id": "fdaab36db5a4e23c393caad670dec38d9f96fe53",
+  "branch": "loop/phase10-p1/1",
+  "branch_point": "3cadf86715f9112ccb77f32ab8eeeb2a538bc739",
+  "parent_branch": "main",
+  "gitignore_snapshot": "# Python\n__pycache__/\n*.py[cod]\n*.egg-info/\nbuild/\ndist/\n.venv/\nvenv/\n\n# Tooling caches\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n\n# Pipeline working directories (adversarial campaigns)\n.adversarial-loop/\n.adversarial-plan/\n.adversarial-spec/\n/docs/campaigns/phase2/scaffolding/spec-out/\n/docs/campaigns/phase3/scaffolding/spec-out/\n/docs/campaigns/phase4/scaffolding/artifacts/\n\n# Volatile campaign logs and per-run manifests\n/docs/campaigns/phase4/scaffolding/*.log\n/docs/runs/\n\n# Operator-generated files (phase 4): the overlay managed by the configuration UI and the runtime's\n# status record \u2014 generated per operator, not sources.\n*.local.yaml\n*.status.json\n\n# Patch leftovers\n*.orig\n*.rej\n/.adversarial-spec/\n",
+  "loop": 0,
+  "findings": [
+    {
+      "id": "A1",
+      "severity": "major",
+      "file": "core/config_ui/__init__.py",
+      "line": 3615,
+      "summary": "Apply the stale-record judgement to console rendering too",
+      "evidence": "The new check runs only inside start_runtime(). _console_response() still uses running_state().alive, which checks PID liveness alone. For a stale status record naming a reused live PID, the console therefore renders STATE_UNSUPERVISED, and _controls_markup() provides no Start button. Users remain blocked from starting through the UI; the new tests bypass this by calling start_runtime() directly.",
+      "confidence": "low",
+      "basis": "inference",
+      "warnings": [
+        "epistemic_label_defaulted"
+      ]
+    },
+    {
+      "id": "A2",
+      "severity": "major",
+      "file": "core/config_ui/__init__.py",
+      "line": 1237,
+      "summary": "Account for delays between uptime and wall-clock sampling",
+      "evidence": "The wall clock is sampled after reading uptime, so any intervening scheduling delay shifts the computed process start forward by that delay. If a genuine publisher wrote its record 100 ms after starting and this reader is descheduled for 200 ms between these samples, record_pid_live() incorrectly declares it stale. claim_instance() then deletes the active instance's record without probing it. Pair or bracket the clock samples and handle uncertain measurements before applying the strict comparison.",
+      "confidence": "low",
+      "basis": "inference",
+      "warnings": [
+        "epistemic_label_defaulted"
+      ]
+    }
+  ],
+  "phase": "review",
+  "epistemic_labels": {
+    "confidence": {
+      "high": 0,
+      "medium": 0,
+      "low": 2
+    },
+    "basis": {
+      "spec": 0,
+      "code": 0,
+      "inference": 2,
+      "external": 0
+    },
+    "combined": {
+      "low/inference": 2
+    }
+  }
+}

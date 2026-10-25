@@ -1,0 +1,37 @@
+{
+  "phase": "build",
+  "exit_code": 0,
+  "commit_sha": "8249259ad7900f892ae310a1f0e40e145af135f6",
+  "stdout": "P1 done \u2014 commit 61dbd35 on loop/phase10-p1/1 (not pushed). The full suite passes: `.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` gives 5285 passed, 20 skipped (the skips were already there). Only the two listed files changed; spec.md and plan.md are untouched.\n\n## What changed\n\n**core/config_ui/__init__.py**\n- `process_started_at(pid, *, read_text, clock, ticks_per_second, platform)` gives a process's start time in epoch seconds:\n  - It reads field 22 (`starttime`) of `/proc/<pid>/stat`, parsing after the last `)` because the process name can contain spaces and brackets.\n  - It divides by `SC_CLK_TCK` and adds a boot time of the wall clock minus `/proc/uptime`, read in the same call, so it keeps hundredths of a second.\n  - It returns `None` off Linux or on any `OSError` or parse failure. The keyword arguments are only there so tests can inject inputs.\n  - Checked on this host: for the test's own process it gives 0.07 s before now; for a missing pid it gives `None`.\n- `record_pid_live(pid, published_at, liveness, started_at)` returns `liveness(pid)` unchanged when the pid is dead or its start time is unknown. It returns `False` when `started > published_at`, a plain comparison with no tolerance (finding P1).\n- **Instance-record claim path:**\n  - `_read_instance` now also returns the record's `st_mtime`, taken with `fstat` on the same file it read.\n  - `judge()` uses `record_pid_live` with the new `InstanceSeams.started_at` seam, which defaults to the real reader (looked up at call time). The record format is unchanged.\n- **Start's refusal by the status record:**\n  - New `ConfigUI(started_at=...)` seam and helpers `_holds_status_record`, `_start_reader` and `_published_seconds`.\n  - The publication time is the record's `published_at`; if that can't be parsed it falls back to the file's `st_mtime`, and if neither is available nothing counts as started after it.\n\n**tests/test_container.py** (new, opens no sockets): a module docstring describing R7's split between ordinary and trial checks, and 32 AC10 tests:\n- A record whose process started after publication: the instance record is removed as stale, `main([])` serves once and nothing is probed; Start is not refused (it reaches `supervisor.start`).\n- A start before publication, an unreadable start time, and the default reader under a fake probe: the judgement is the same as in phase 9.\n- The five boundary cases (+0.5 s, +1 ms and +1.5 s \u2192 not live; equal and \u22121 ms \u2192 live) on both paths. On the instance path the record's `st_mtime` is set with `os.utime`.\n- A static check on `record_pid_live`'s syntax tree: exactly one ordering comparison, which is `started > published_at`; no arithmetic or numbers in the body; and the body reads only its own parameters and two local variables.\n- Parser tests on fixture strings, including process names `\"a b) (c\"`, `\") )\"` and `\"x)\"`. Uptime `\"1234.56 99.0\"`, clock `10000.25` and 123400 ticks at 100 Hz give `10000.25 - 1234.56 + 1234.00`.\n- The fallback to `st_mtime` for the status record.\n\n## Decisions to flag\n1. **On the Start path, the real reader is used only while the probe is the default** (the case named in the plan's Risks; recorded in the `ConfigUI.started_at` comment). Existing tests pair a fake probe with pid 4242 and fixed past timestamps; on a real machine a process holding that pid could start after those timestamps, which would make the tests flaky. The instance path always uses the real reader: `test_first_run`'s records name this test process or pid 1, both started before the record, and those tests pass unchanged.\n2. **The rule is applied to Start's refusal only, not to the general `running_state()`** that the pages use. My first version also applied it there, and that broke `test_config_ui.py::test_ac40_v_is_usable_and_extra_keys_change_nothing`: that test uses the real probe, the test's own pid and a fixed past `published_at` (\"2026-09-28\"), so the record would have looked stale. The plan's wording (b) names only the foreign-live-pid refusal used by Start, so the pages still judge liveness exactly as in phase 9. One consequence: when Start is no longer refused because of a stale record, the console still shows that record's process as running until a launch replaces the record. A later step may want the pages to follow the same rule; that would need the AC40 fixtures changed, which this step's file list doesn't allow.\n3. The status record's `published_at` is written at millisecond precision and rounded down (`core/main.py` `_utc_timestamp`). A genuine publisher starts well over 1 ms before it publishes, so it is not judged stale.\n4. A backwards jump of the wall clock between publication and the judgement is out of R2's scope, as the plan says; this is noted in the `record_pid_live` docstring.\n\n`docs/campaigns/phase10/scaffolding/{campaign.log,loop-out/}` are still untracked and were not committed.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 980.927369560115,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 1893,
+          "completion_tokens": 1225,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "build",
+          "persona": "builder"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 1893,
+      "completion_tokens": 1225,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "build",
+      "persona": "builder"
+    }
+  },
+  "provider_history": []
+}

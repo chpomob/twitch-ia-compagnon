@@ -1,0 +1,13 @@
+{
+  "gate": "pre_build",
+  "command": "",
+  "ok": true,
+  "exit_code": 0,
+  "infra": false,
+  "log": "",
+  "truncated": false,
+  "project_markers": [
+    ".git",
+    "pyproject.toml"
+  ]
+}
