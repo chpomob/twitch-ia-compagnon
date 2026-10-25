@@ -87,7 +87,7 @@ import tempfile
 import threading
 import webbrowser
 from datetime import datetime
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -515,8 +515,13 @@ def test_ac6_deleting_one_key_withdraws_the_language(tmp_path: Path) -> None:
     (directory / "de.json").write_text(json.dumps(copy), encoding="utf-8")
     table = StringTable.load(directory)
     assert [code for code, _ in table.languages()] == ["en", "fr"]
-    assert removed in table.refused["de"]
-    assert table.language_or_default("de") == "en"
+    # P19F3: the plain cause names the table and the count, not the key.
+    assert table.refused["de"] == "de.json: 1 key missing"
+    assert removed not in table.refused["de"]
+    # A chosen language that is withdrawn is refused, never replaced.
+    with pytest.raises(i18n.LanguageUnavailable) as refused:
+        table.language_or_default("de")
+    assert refused.value.cause == "de.json: 1 key missing"
     assert table.language_or_default("fr") == "fr"
     assert table.language_or_default(None) == "en"
 
@@ -1167,7 +1172,220 @@ def test_the_profiles_name_no_other_platform_nor_vendor() -> None:
 # P5: the credential store (A1, R4) and the wizard state file (A7)
 # --------------------------------------------------------------------------- #
 
-posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX modes and owners")
+#: Amendment A2's one exemption class: a test whose *subject* is a POSIX-only
+#: facility (file modes, owners, ``flock``) has no equivalent where the
+#: facility does not exist. Every use is enumerated in
+#: :data:`POSIX_ONLY_USES` and pinned by
+#: ``test_a2_posix_only_is_the_one_exemption_and_its_uses_are_enumerated``.
+POSIX_ONLY_REASON = "A2: the subject is a POSIX-only facility (file modes, owners, flock)"
+posix_only = pytest.mark.skipif(os.name != "posix", reason=POSIX_ONLY_REASON)
+
+
+@pytest.fixture
+def linux_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The platform value forced to Linux: the A2 default location and the
+    instance record's POSIX form (the access URL kept) are chosen whatever
+    the host. The value only picks the branch; nothing native is assumed."""
+
+    monkeypatch.setattr(locations, "running_platform", lambda: locations.LINUX)
+
+
+def _force_windows(monkeypatch: pytest.MonkeyPatch, local: Path) -> Path:
+    """The platform value forced to Windows with ``LOCALAPPDATA=<local>``:
+    the credential store needs no owner or mode check there, so a case that
+    uses it runs on any host. Returns the per-user directory."""
+
+    local.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(locations, "running_platform", lambda: locations.WINDOWS)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    return local / PRODUCT
+
+
+#: Every use of :data:`posix_only` in ``tests/`` (A2): ``file::function`` for
+#: a decorated function, ``file::function[value]`` for one parameter. Adding
+#: or removing one is a diff here.
+POSIX_ONLY_USES = (
+    "test_first_run.py::test_a1_a_directory_owned_by_another_user_is_refused",
+    "test_first_run.py::test_a1_concurrent_wizards_check_and_replace_one_at_a_time",
+    "test_first_run.py::test_a7_the_state_file_is_owner_only_and_persists_only_screen_one",
+    "test_first_run.py::test_ac11_a_group_or_other_writable_directory_is_refused",
+    "test_first_run.py::test_ac11_a_refused_directory_stores_nothing_and_keeps_next_closed[posix]",
+    "test_first_run.py::test_ac11_no_response_carries_a_value_and_inputs_render_empty_and_kept[linux]",
+    "test_first_run.py::test_ac11_the_credential_file_is_owner_only_under_the_per_user_directory",
+    "test_first_run.py::test_ac31_the_published_record_is_owner_only_and_no_secret_leaves_it",
+)
+
+#: The skip and importorskip calls that predate this phase (the phase base
+#: ``b7ec50d``): opt-in live trials, a root host, a clone without git or pip,
+#: a host without a tz database or aiohttp. A2 forbids any other.
+PRE_PHASE_SKIPS = (
+    "test_config_ui.py::test_ac39_a_record_with_mode_000_is_unusable:skip",
+    "test_input_ownership.py::test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base:skip",
+    "test_input_ownership.py::test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base:skip",
+    "test_input_ownership.py::test_ac2_the_shipped_profiles_have_zero_changed_lines_since_the_phase_base:skip",
+    "test_phase2_trials.py::required:skip",
+    "test_phase3_trials.py::gate:skip",
+    "test_phase5_trials.py::gate:skip",
+    "test_profiles.py::test_installed_distribution_discovers_the_shipped_manifests_and_answers_help:skip",
+    "test_proxy.py::test_the_real_listener_cuts_an_oversized_binary_frame_before_the_module_sees_it:importorskip",
+    "test_youtube.py::test_the_quota_day_agrees_with_the_tz_database_when_one_is_installed:skip",
+)
+
+_SKIP_CALLS = frozenset({"skip", "importorskip", "xfail"})
+_SKIP_MARKS = frozenset({"skip", "skipif", "xfail"})
+
+
+def _is_pytest(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id == "pytest"
+
+
+def _skip_kind(node: ast.AST) -> str | None:
+    """``skip``/``importorskip``/``xfail`` for ``pytest.<kind>(…)``; the mark
+    name for ``pytest.mark.<skip|skipif|xfail>``; ``None`` otherwise."""
+
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _SKIP_CALLS and _is_pytest(func.value):
+            return func.attr
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr in _SKIP_MARKS
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "mark"
+        and _is_pytest(node.value.value)
+    ):
+        return node.attr
+    if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] == "pytest":
+        names = {alias.name for alias in node.names} & (_SKIP_CALLS | _SKIP_MARKS | {"mark"})
+        return f"import {sorted(names)}" if names else None
+    return None
+
+
+def _a2_scan(sources: Mapping[str, str]) -> tuple[list[str], list[str]]:
+    """``(posix_only uses, other skips)`` over *sources* (file name → text):
+    each use as :data:`POSIX_ONLY_USES` spells it, each other skip as
+    ``file::function:kind`` (``<module>`` outside a function); the
+    :data:`posix_only` definition itself is the one allowed ``skipif``."""
+
+    uses: list[str] = []
+    skips: list[str] = []
+    for name, source in sorted(sources.items()):
+        tree = ast.parse(source)
+        owners: dict[ast.AST, str] = {}
+        for function in ast.walk(tree):
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Breadth first: an inner function is reached after its
+                # outer one, so the innermost owner is the one kept.
+                for inner in ast.walk(function):
+                    if inner is not function:
+                        owners[inner] = function.name
+        definitions: set[ast.AST] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "posix_only" for target in node.targets
+            ):
+                definitions.update(ast.walk(node.value))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for decorator in node.decorator_list:
+                    for inner in ast.walk(decorator):
+                        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and (
+                            inner.func.attr == "param"
+                        ):
+                            marks = [k.value for k in inner.keywords if k.arg == "marks"]
+                            if any(isinstance(m, ast.Name) and m.id == "posix_only" for m in marks):
+                                value = ast.literal_eval(inner.args[0])
+                                uses.append(f"{name}::{node.name}[{value}]")
+                    if isinstance(decorator, ast.Name) and decorator.id == "posix_only":
+                        uses.append(f"{name}::{node.name}")
+            kind = _skip_kind(node)
+            if kind is not None and node not in definitions:
+                skips.append(f"{name}::{owners.get(node, '<module>')}:{kind}")
+        # Any other mention of the name (an alias, a pytestmark) is a use the
+        # enumeration does not see: name it so the comparison fails. Reading
+        # the marker's own fields (the invariant below) applies nothing.
+        inspected = {
+            id(node.value) for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr in ("name", "args", "kwargs")
+        }
+        named = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == "posix_only"
+            and isinstance(node.ctx, ast.Load) and id(node) not in inspected
+        ]
+        seen = sum(1 for use in uses if use.startswith(f"{name}::"))
+        if len(named) != seen:
+            uses.append(f"{name}::<{len(named) - seen} unenumerated posix_only reference(s)>")
+    return sorted(uses), sorted(skips)
+
+
+def _test_sources() -> dict[str, str]:
+    directory = Path(__file__).resolve().parent
+    return {
+        os.fspath(path.relative_to(directory)).replace(os.sep, "/"): path.read_text(encoding="utf-8")
+        for path in sorted(directory.rglob("*.py"))
+    }
+
+
+def test_a2_posix_only_is_the_one_exemption_and_its_uses_are_enumerated() -> None:
+    """A2: :data:`posix_only` is the one exemption class, its uses are exactly
+    :data:`POSIX_ONLY_USES` (count and nodes), and a scan of ``tests/`` finds
+    no ``skip``, ``skipif``, ``xfail`` or ``importorskip`` beyond its own
+    definition and :data:`PRE_PHASE_SKIPS`."""
+
+    assert posix_only.name == "skipif"
+    assert posix_only.kwargs == {"reason": POSIX_ONLY_REASON}
+    assert posix_only.args == (os.name != "posix",)
+    uses, skips = _a2_scan(_test_sources())
+    assert len(uses) == len(POSIX_ONLY_USES) == 8
+    assert uses == sorted(POSIX_ONLY_USES)
+    assert skips == sorted(PRE_PHASE_SKIPS)
+    assert len(skips) == 10
+
+
+def test_a2_the_scan_sees_a_use_added_or_removed() -> None:
+    """The invariant is not vacuous: one ``posix_only`` added to another
+    function, one removed, one aliased, or one new skip of any form changes
+    what the scan reports."""
+
+    sources = _test_sources()
+    here = "test_first_run.py"
+    baseline = _a2_scan(sources)
+    source = sources[here]
+
+    added = source.replace(
+        "\ndef test_ac11_windows_stores_under_local_appdata(",
+        "\n@posix_only\ndef test_ac11_windows_stores_under_local_appdata(",
+        1,
+    )
+    uses, _ = _a2_scan({**sources, here: added})
+    assert uses != baseline[0]
+    assert "test_first_run.py::test_ac11_windows_stores_under_local_appdata" in uses
+
+    removed = source.replace(
+        "@posix_only\ndef test_a1_a_directory_owned_by_another_user_is_refused(",
+        "def test_a1_a_directory_owned_by_another_user_is_refused(",
+        1,
+    )
+    assert removed != source
+    uses, _ = _a2_scan({**sources, here: removed})
+    assert len(uses) == len(POSIX_ONLY_USES) - 1
+
+    aliased = source + "\nlater = posix_only\n"
+    uses, _ = _a2_scan({**sources, here: aliased})
+    assert uses != baseline[0]
+
+    for extra in (
+        "@pytest.mark.skipif(True, reason='x')\ndef test_x() -> None: ...\n",
+        "@pytest.mark.skip\ndef test_x() -> None: ...\n",
+        "@pytest.mark.xfail\ndef test_x() -> None: ...\n",
+        "def test_x() -> None:\n    pytest.skip('x')\n",
+        "def test_x() -> None:\n    pytest.xfail('x')\n",
+        "pytest.importorskip('x')\n",
+        "from pytest import skip\n",
+    ):
+        _, skips = _a2_scan({**sources, "test_extra.py": extra})
+        assert skips != baseline[1], extra
 
 
 def _wizard_profile(directory: Path, profile_id: str = "chat_qa", name: str = "profile.yaml"):
@@ -2078,12 +2296,15 @@ STORED_BASE = (
 
 
 def _stored_profile(
-    monkeypatch: pytest.MonkeyPatch, root: Path, values: dict[str, str]
+    monkeypatch: pytest.MonkeyPatch, root: Path, values: dict[str, str], *, windows: bool = False
 ) -> Path:
     """A finished wizard's profile whose credential file holds *values*,
-    under a per-user directory pointed at *root*."""
+    under a per-user directory pointed at *root* (``LOCALAPPDATA`` under it,
+    the platform value forced to Windows, with *windows*)."""
 
     _default_environment(monkeypatch, root / "xdg")
+    if windows:
+        _force_windows(monkeypatch, root / "local")
     (root / "mods" / "xmod").mkdir(parents=True)
     (root / "mods" / "xmod" / "module.yaml").write_text(STORED_MODULE, encoding="utf-8")
     base = root / "profile.yaml"
@@ -2091,6 +2312,9 @@ def _stored_profile(
     state = wizard.WizardState(base)
     store = wizard.CredentialStore(base, locations.running_platform(), os.environ)
     assert store.write(values, ["${TWITCH_ACCESS_TOKEN}"], state) is None
+    if windows:
+        assert store.location_reason == wizard.LOCATION_LOCAL_APPDATA
+        assert store.path.parent == root / "local" / PRODUCT
     state.completed = True
     state.save(store)
     return base
@@ -2120,7 +2344,6 @@ class _ExitedChild:
         return None
 
 
-@posix_only
 def test_ac12_the_kept_credential_reaches_every_environment_redacted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2134,7 +2357,9 @@ def test_ac12_the_kept_credential_reaches_every_environment_redacted(
     credential as set; a log record and an Apply stderr tail carrying the
     stored value render it redacted."""
 
-    base = _stored_profile(monkeypatch, tmp_path, {"TWITCH_ACCESS_TOKEN": "stored"})
+    # The platform value forced to Windows: the merge and the redaction are
+    # the subject, and that store needs nothing native (A2).
+    base = _stored_profile(monkeypatch, tmp_path, {"TWITCH_ACCESS_TOKEN": "stored"}, windows=True)
     settings = config_ui.UISettings.from_argv(["--config", str(base)])
     ui = config_ui.ConfigUI(settings, environ={"TWITCH_ACCESS_TOKEN": "inherited", "KEEP": "1"})
     try:
@@ -2191,14 +2416,13 @@ def test_ac12_the_kept_credential_reaches_every_environment_redacted(
         config_ui._LOG_REDACTION.sources.discard(ui)
 
 
-@posix_only
 def test_ac12_a_kept_credential_alone_counts_as_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R4: with nothing inherited, the stored value is what makes the
     referenced credential set."""
 
-    base = _stored_profile(monkeypatch, tmp_path, {"TWITCH_ACCESS_TOKEN": "stored"})
+    base = _stored_profile(monkeypatch, tmp_path, {"TWITCH_ACCESS_TOKEN": "stored"}, windows=True)
     ui = config_ui.ConfigUI(config_ui.UISettings.from_argv(["--config", str(base)]), environ={})
     try:
         assert dict(ui.environ) == {"TWITCH_ACCESS_TOKEN": "stored"}
@@ -2459,7 +2683,7 @@ def test_ac31_the_instance_keys_exist_in_both_languages() -> None:
     assert len(shipped) >= 10
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 def test_ac31_a_confirmed_instance_of_this_version_is_opened_not_served(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2486,7 +2710,7 @@ def test_ac31_a_confirmed_instance_of_this_version_is_opened_not_served(
     config_ui._LOG_REDACTION.sources.discard(first)
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 def test_ac31_a_slow_first_attempt_then_a_confirming_one_within_ten_seconds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2510,7 +2734,7 @@ def test_ac31_a_slow_first_attempt_then_a_confirming_one_within_ten_seconds(
     config_ui._LOG_REDACTION.sources.discard(first)
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 def test_ac31_the_recorded_port_wins_over_the_asked_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2528,7 +2752,7 @@ def test_ac31_the_recorded_port_wins_over_the_asked_one(
     config_ui._LOG_REDACTION.sources.discard(first)
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 def test_ac31_a_raising_opener_still_serves_nothing_and_prints_the_line(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2551,7 +2775,7 @@ def test_ac31_a_raising_opener_still_serves_nothing_and_prints_the_line(
     config_ui._LOG_REDACTION.sources.discard(first)
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 @pytest.mark.parametrize("mode", ["refused", "timeout", "wrong_token", "mixed"])
 def test_ac31_an_unconfirmed_live_record_is_reported_and_kept(
     mode: str,
@@ -2623,7 +2847,7 @@ def _missing_marker(content: bytes) -> bytes:
     return json.dumps(document).encode("utf-8")
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 @pytest.mark.parametrize("case", ["a_not_live", "b_reused_pid", "c_truncated", "d_missing_field"])
 def test_ac31_a_stale_record_is_replaced_and_this_launch_serves(
     case: str,
@@ -2642,13 +2866,27 @@ def test_ac31_a_stale_record_is_replaced_and_this_launch_serves(
     clock = _Clock()
     probe = _Probe(clock, _answering("f" * 32, product_version()))
     seams = _seams(clock, probe, live=case != "a_not_live")
+    # The replacement's temporary is created 0600: asked of ``os.open``, so
+    # the case holds on any host; the native mode bits are the subject of
+    # the (A2-exempted) published-record case.
+    created: list[int] = []
+    real_open = os.open
+
+    def recording_open(path: Any, flags: int, mode: int = 0o777, *rest: Any, **options: Any) -> int:
+        name = Path(os.fspath(path)).name
+        if name.startswith(f".{record.name}.") and name.endswith(".tmp"):
+            created.append(mode)
+        return real_open(path, flags, mode, *rest, **options)
+
+    monkeypatch.setattr(os, "open", recording_open)
     serve, opener = _Recording(record), _Calls()
     assert config_ui.main([], opener=opener, serve=serve, instance=seams) == 0
+    monkeypatch.setattr(os, "open", real_open)
     ((ui, _settings),) = serve.calls
     assert opener.calls == [(ui.access_url,)]
     assert all(first.access_url not in call for call in opener.calls)
-    ((published, mode),) = serve.seen
-    assert mode == 0o600
+    assert created == [0o600]
+    ((published, _mode),) = serve.seen
     assert json.loads(published) == {
         "pid": os.getpid(), "port": 8765, "marker": ui.instance_marker, "access_url": ui.access_url,
     }
@@ -2664,6 +2902,7 @@ def test_ac31_a_stale_record_is_replaced_and_this_launch_serves(
 
 
 @posix_only
+@pytest.mark.usefixtures("linux_platform")
 def test_ac31_the_published_record_is_owner_only_and_no_secret_leaves_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2812,7 +3051,7 @@ def test_ac31_a_non_posix_record_whose_pid_is_not_live_is_stale(
     config_ui._LOG_REDACTION.sources.discard(first)
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 def test_ac31_another_version_is_reported_and_never_opened(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2872,7 +3111,7 @@ def test_ac31_a_failed_publication_leaves_no_record_and_serves_nothing(
     assert "http://" not in captured.out + captured.err
 
 
-@posix_only
+@pytest.mark.usefixtures("linux_platform")
 def test_ac31_two_launches_racing_serve_once_and_the_loser_opens_the_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2930,7 +3169,6 @@ def test_ac31_two_launches_racing_serve_once_and_the_loser_opens_the_winner(
     capsys.readouterr()
 
 
-@posix_only
 def test_ac31_a_removal_holds_the_name_against_a_publication(tmp_path: Path) -> None:
     """While a removal has renamed the record aside, a publication waits for
     it: the record it puts back is never replaced and the publication loses,
@@ -4612,6 +4850,153 @@ def test_ac6_french_on_screen_one_renders_the_next_page_in_french_and_survives(f
     assert again.state()["language"] == "en"
 
 
+# --------------------------------------------------------------------------- #
+# P19F3 N1: a French session never renders English
+# --------------------------------------------------------------------------- #
+
+
+def _english_sentences(body: str) -> list[str]:
+    """The English table's sentences rendered in *body* that the French
+    table does not share (placeholder-free, so each is matched whole). The
+    language picker's display names are each language's own, not a
+    sentence in it."""
+
+    english, french = _string_files()["en"], _string_files()["fr"]
+    return [
+        key
+        for key, text in english.items()
+        if key != i18n.NAME_KEY
+        and "{" not in text
+        and text != french.get(key)
+        and _html.escape(text) in body
+    ]
+
+
+def _strings_without(tmp_path: Path, code: str, *keys: str) -> Path:
+    directory = _fixture_strings(tmp_path)
+    table = json.loads((directory / f"{code}.json").read_text(encoding="utf-8"))
+    for key in keys:
+        del table[key]
+    (directory / f"{code}.json").write_text(json.dumps(table), encoding="utf-8")
+    return directory
+
+
+@pytest.mark.parametrize(
+    ("code", "keys", "cause"),
+    [
+        ("fr", ("wizard.screen2.title",), "fr.json: 1 key missing"),
+        ("fr", ("wizard.screen2.title", "wizard.check"), "fr.json: 2 keys missing"),
+        ("en", ("wizard.screen2.title",), "en.json: 1 key missing"),
+    ],
+    ids=["french-one", "french-two", "english"],
+)
+def test_p19f3_an_incomplete_shipped_table_refuses_to_load(
+    tmp_path: Path, code: str, keys: tuple[str, ...], cause: str
+) -> None:
+    """N1: a shipped table missing a key is a refusal with a plain cause —
+    which table and how many keys, nothing else — never a withdrawn
+    language; the English table is checked the same way."""
+
+    directory = _strings_without(tmp_path, code, *keys)
+    with pytest.raises(StringTableError) as refused:
+        StringTable.load(directory)
+    assert str(refused.value) == cause
+    assert not any(key in str(refused.value) for key in keys)
+
+
+def test_p19f3_a_shipped_table_with_other_placeholders_refuses_to_load(tmp_path: Path) -> None:
+    directory = _fixture_strings(tmp_path)
+    french = json.loads((directory / "fr.json").read_text(encoding="utf-8"))
+    french[i18n.UNKNOWN_REASON_KEY] = "Refusé : {reason}."
+    (directory / "fr.json").write_text(json.dumps(french), encoding="utf-8")
+    with pytest.raises(StringTableError, match=r"^fr\.json: placeholders differ for 1 key$"):
+        StringTable.load(directory)
+
+
+def test_p19f3_an_incomplete_french_table_is_a_startup_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N1: the UI does not start over an incomplete shipped table: exit 2,
+    the plain cause on stderr, nothing served or opened."""
+
+    _default_environment(monkeypatch, tmp_path / "xdg")
+    directory = _strings_without(tmp_path, "fr", "wizard.screen2.title")
+    monkeypatch.setattr(StringTable.load.__func__, "__defaults__", (directory,))
+    serve, opener = _Calls(), _Calls()
+    assert config_ui.main([], opener=opener, serve=serve) == 2
+    assert serve.calls == [] and opener.calls == []
+    assert capsys.readouterr().err == "config_ui: string table refused: fr.json: 1 key missing\n"
+
+
+def _withdrawn_french() -> StringTable:
+    """The shipped table with French withdrawn as an incomplete file is."""
+
+    return StringTable(
+        sentences={"en": _EN.sentences["en"]},
+        shape=_EN.shape,
+        refused={"fr": "fr.json: 1 key missing"},
+    )
+
+
+def test_p19f3_a_french_session_whose_table_is_withdrawn_renders_no_english(
+    flow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N1, the gate's reproduction: ``fr`` persisted, then a UI over the same
+    store whose table no longer offers French. The session refuses with the
+    plain cause, renders 0 English sentences, and stays ``fr``; a restart
+    over that profile is refused before serving."""
+
+    first = flow()
+    assert _passed(first.choice("chat_qa", language="fr"))
+    monkeypatch.setattr(StringTable, "load", classmethod(lambda cls, *a, **kw: _withdrawn_french()))
+    again = flow()
+    for query in ({"screen": "2"}, {}):
+        response = again.get(**query)
+        body = response.body.decode("utf-8")
+        assert response.status == 503, query
+        assert body == "fr.json: 1 key missing"
+        assert _english_sentences(body) == []
+    assert _english_sentences(_text_of(again.choice("chat_qa", language="fr"))) == []
+    assert again.state()["language"] == "fr"
+    # The positive control: the same body under the complete table is French.
+    monkeypatch.undo()
+    _default_environment(monkeypatch, tmp_path / "xdg")
+    page = _text_of(flow().get(screen="2"))
+    assert _html.escape(_EN.sentence("fr", "wizard.screen2.title")) in page
+    assert _english_sentences(page) == []
+
+    monkeypatch.setattr(StringTable, "load", classmethod(lambda cls, *a, **kw: _withdrawn_french()))
+    serve = _Calls()
+    assert config_ui.main(["--config", str(first.profile)], opener=_Calls(), serve=serve) == 2
+    assert serve.calls == []
+    assert capsys.readouterr().err == "config_ui: string table refused: fr.json: 1 key missing\n"
+
+
+def test_p19f3_a_switch_to_a_withdrawn_table_is_refused_and_keeps_french(
+    flow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1: a complete table still switches languages; a switch to a table
+    that does not validate is refused with its cause and the session keeps
+    its language."""
+
+    directory = _fixture_strings(tmp_path)
+    german = json.loads((directory / "en.json").read_text(encoding="utf-8"))
+    del german["wizard.screen2.title"]
+    (directory / "de.json").write_text(json.dumps(german), encoding="utf-8")
+    monkeypatch.setattr(StringTable.load.__func__, "__defaults__", (directory,))
+    run = flow()
+    assert run.post("/language", {"language": "fr"}).status == 303
+    assert run.state()["language"] == "fr"
+    refused = run.post("/language", {"language": "de"})
+    assert refused.status == 409
+    assert refused.body.decode("utf-8") == "409 Conflict: de.json: 1 key missing"
+    assert run.state()["language"] == "fr"
+    page = _text_of(run.get())
+    assert '<html lang="fr">' in page and _english_sentences(page) == []
+    assert run.post("/language", {"language": "en"}).status == 303
+    assert run.state()["language"] == "en"
+
+
 def _calls_of(run: _Flow, screen: int) -> int:
     """The calls a screen's own validator received so far."""
 
@@ -4960,15 +5345,26 @@ def test_ac14_the_platform_answer_fills_the_identities_of_the_written_profile(fl
     assert 'value=""' in shown
 
 
-@posix_only
-def test_ac11_no_response_carries_a_value_and_inputs_render_empty_and_kept(flow) -> None:
+@pytest.mark.parametrize("platform", ["windows", pytest.param("linux", marks=posix_only)])
+def test_ac11_no_response_carries_a_value_and_inputs_render_empty_and_kept(
+    flow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
     """AC11 (response sweep, R4): over a full pass — the read-only profile
     view and screen 2's re-render after a wrong client id included — the
     profile, the overlay and every response hold 0 occurrences of a value
     in plain, URL-encoded, HTML-escaped or JSON-escaped form; a credential
-    input renders empty and "kept"; the credential file is owner-only and
-    holds the values under their names."""
+    input renders empty and "kept"; the credential file holds the values
+    under their names. The sweep runs on any host with the platform value
+    forced to Windows; the Linux case adds the owner-only mode and the
+    owner-only sentence, a POSIX subject (A2)."""
 
+    if platform == "windows":
+        directory = _force_windows(monkeypatch, tmp_path / "local")
+        location_key = "wizard.credentials.local_appdata"
+    else:
+        monkeypatch.setattr(locations, "running_platform", lambda: locations.LINUX)
+        directory = tmp_path / "xdg" / PRODUCT
+        location_key = "wizard.credentials.owner_only"
     run = flow()
     run.platform.accept(TOK_A)
     assert _passed(run.choice())
@@ -4984,9 +5380,10 @@ def test_ac11_no_response_carries_a_value_and_inputs_render_empty_and_kept(flow)
     assert _html.escape(_EN.sentence("en", "wizard.kept")) in kept
     assert _passed(run.screen(5))
 
-    (stored,) = _credential_files(run.root)
+    (stored,) = sorted(directory.glob("*.credentials.json"))
     assert stored.name == "profile.yaml.credentials.json"
-    assert stat.S_IMODE(stored.stat().st_mode) == 0o600
+    if platform == "linux":
+        assert stat.S_IMODE(stored.stat().st_mode) == 0o600
     held = json.loads(stored.read_text(encoding="utf-8"))
     assert held == {
         "TWITCH_CLIENT_ID": WIZARD_CLIENT_ID, "TWITCH_CLIENT_SECRET": WIZARD_SECRET,
@@ -4997,9 +5394,7 @@ def test_ac11_no_response_carries_a_value_and_inputs_render_empty_and_kept(flow)
     for value in (TOK_A, WIZARD_CLIENT_ID, WIZARD_SECRET, WIZARD_MODEL_KEY, "client-wrong-1y"):
         for label, text in texts:
             assert not any(form in text for form in _value_forms(value)), (label, value)
-    location = _EN.sentence(
-        "en", "wizard.credentials.owner_only", directory=os.fspath(run.root / "xdg" / PRODUCT)
-    )
+    location = _EN.sentence("en", location_key, directory=os.fspath(directory))
     screen_four = [text for label, text in run.bodies() if label.startswith("POST /wizard") and 'data-screen="4"' in text]
     assert screen_four and all(_html.escape(location) in text for text in screen_four)
 
@@ -5025,7 +5420,7 @@ def test_ac11_screen_four_names_the_windows_directory_and_why(
     assert (directory / "profile.yaml.credentials.json").exists()
 
 
-@pytest.mark.parametrize("platform", ["posix", "windows"])
+@pytest.mark.parametrize("platform", [pytest.param("posix", marks=posix_only), "windows"])
 def test_ac11_a_refused_directory_stores_nothing_and_keeps_next_closed(
     flow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:
@@ -5035,8 +5430,7 @@ def test_ac11_a_refused_directory_stores_nothing_and_keeps_next_closed(
     refusal and keeps *next* closed."""
 
     if platform == "posix":
-        if os.name != "posix":
-            pytest.skip("POSIX modes")
+        monkeypatch.setattr(locations, "running_platform", lambda: locations.LINUX)
         directory = tmp_path / "xdg" / PRODUCT
         directory.mkdir(parents=True)
         directory.chmod(0o770)

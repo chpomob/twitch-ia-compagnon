@@ -2,13 +2,19 @@
 
 Every sentence the wizard and the console show comes from a JSON file under
 ``strings/``: a flat object mapping a key to a sentence, the file's stem being
-the language code (``en.json`` is ``en``). ``en.json`` is the reference: it
-must be complete and well-formed, or the table refuses to load. Any other
-file is offered only when it matches the reference exactly — the same key
-set, a non-empty string for every key, and for every key the same set of
+the language code (``en.json`` is ``en``). ``en.json`` is the reference.
+The shipped tables (:data:`SHIPPED`) must each be complete and well-formed —
+neither may miss a key the other has — or the table refuses to load, with a
+plain cause naming the table and how many keys it misses. Any other file is
+offered only when it matches the reference exactly — the same key set, a
+non-empty string for every key, and for every key the same set of
 ``{placeholder}`` names — so a third language is added by dropping a file
 beside the shipped ones, with no code change, and an incomplete one is never
-offered (it is listed in :attr:`StringTable.refused` with the reason).
+offered (it is listed in :attr:`StringTable.refused` with the same cause).
+
+A language chosen for a session is never replaced by another: asking for a
+language that is not offered raises :class:`LanguageUnavailable` with its
+cause, so a French session refuses rather than render English (P19F3).
 
 Each file names itself through :data:`NAME_KEY`, which :meth:`languages`
 returns as the display name. The existing editor's text is not here (R2).
@@ -28,6 +34,9 @@ STRINGS_DIRECTORY = Path(__file__).resolve().parent / "strings"
 #: The reference language: its key set and placeholder sets define the table.
 REFERENCE = "en"
 
+#: The languages the product ships: each must validate, or nothing loads.
+SHIPPED = (REFERENCE, "fr")
+
 #: The key holding each language's own display name.
 NAME_KEY = "language.name"
 
@@ -39,7 +48,17 @@ _FORMATTER = string.Formatter()
 
 
 class StringTableError(ValueError):
-    """The reference file is missing or malformed, or a lookup is invalid."""
+    """A shipped file is missing or malformed, or a lookup is invalid."""
+
+
+class LanguageUnavailable(StringTableError):
+    """A chosen language that is not offered: refused with its :attr:`cause`,
+    never replaced by the default."""
+
+    def __init__(self, language: str, cause: str) -> None:
+        super().__init__(cause)
+        self.language = language
+        self.cause = cause
 
 
 def placeholders(text: str) -> frozenset[str]:
@@ -87,13 +106,24 @@ def _shape(sentences: Mapping[str, str]) -> dict[str, frozenset[str]]:
     return shape
 
 
-def _mismatch(reference: Mapping[str, frozenset[str]], other: Mapping[str, frozenset[str]]) -> str:
-    missing = sorted(reference.keys() - other.keys())
-    extra = sorted(other.keys() - reference.keys())
-    if missing or extra:
-        return f"key set differs (missing {missing}, extra {extra})"
-    different = sorted(key for key in reference if reference[key] != other[key])
-    return f"placeholders differ for {different}" if different else ""
+def _keys(count: int) -> str:
+    return f"{count} key" if count == 1 else f"{count} keys"
+
+
+def _mismatch(
+    name: str, reference: Mapping[str, frozenset[str]], other: Mapping[str, frozenset[str]]
+) -> str:
+    """The plain cause *other* (the file *name*) does not validate against
+    *reference*: the table and a count, never the keys or sentences."""
+
+    missing = len(reference.keys() - other.keys())
+    if missing:
+        return f"{name}: {_keys(missing)} missing"
+    extra = len(other.keys() - reference.keys())
+    if extra:
+        return f"{name}: {_keys(extra)} extra"
+    different = sum(1 for key in reference if reference[key] != other[key])
+    return f"{name}: placeholders differ for {_keys(different)}" if different else ""
 
 
 @dataclass(frozen=True)
@@ -110,7 +140,10 @@ class StringTable:
 
         Raises :class:`StringTableError` when ``en.json`` is absent or not a
         well-formed table (a non-empty object of non-empty strings with bare
-        placeholders, holding :data:`NAME_KEY` and :data:`UNKNOWN_REASON_KEY`).
+        placeholders, holding :data:`NAME_KEY` and :data:`UNKNOWN_REASON_KEY`),
+        and when a :data:`SHIPPED` table is absent, malformed, or misses a key
+        another shipped table has: an incomplete shipped table is a refusal,
+        never a withdrawn language.
         """
 
         directory = Path(directory)
@@ -126,16 +159,33 @@ class StringTable:
         if shape[UNKNOWN_REASON_KEY] != {"token"}:
             raise StringTableError(f"{UNKNOWN_REASON_KEY!r} must have exactly {{token}}")
         sentences: dict[str, Mapping[str, str]] = {REFERENCE: reference}
+        for code in SHIPPED:
+            if code == REFERENCE:
+                continue
+            path = directory / f"{code}.json"
+            try:
+                candidate = _read(path)
+                other = _shape(candidate)
+            except StringTableError as error:
+                raise StringTableError(f"{path.name} {error}") from None
+            # The reference is checked the same way: it misses what it lacks.
+            missing = len(other.keys() - shape.keys())
+            if missing:
+                raise StringTableError(f"{reference_path.name}: {_keys(missing)} missing")
+            reason = _mismatch(path.name, shape, other)
+            if reason:
+                raise StringTableError(reason)
+            sentences[code] = candidate
         refused: dict[str, str] = {}
         for path in sorted(directory.glob("*.json")):
             code = path.stem
-            if code == REFERENCE:
+            if code in SHIPPED:
                 continue
             try:
                 candidate = _read(path)
-                reason = _mismatch(shape, _shape(candidate))
+                reason = _mismatch(path.name, shape, _shape(candidate))
             except StringTableError as error:
-                reason = str(error)
+                reason = f"{path.name} {error}"
             if reason:
                 refused[code] = reason
             else:
@@ -150,10 +200,21 @@ class StringTable:
     def offers(self, language: str) -> bool:
         return language in self.sentences
 
-    def language_or_default(self, language: str | None) -> str:
-        """*language* when offered, else the reference (the R2 default)."""
+    def cause(self, language: str) -> str:
+        """Why *language* is not offered: its file's refusal, when it has one."""
 
-        return language if language is not None and self.offers(language) else REFERENCE
+        return self.refused.get(language, "language not offered")
+
+    def language_or_default(self, language: str | None) -> str:
+        """*language* when offered; the reference (the R2 default) only when
+        none is chosen. A chosen language that is not offered raises
+        :class:`LanguageUnavailable`: a session never changes language."""
+
+        if not language:
+            return REFERENCE
+        if not self.offers(language):
+            raise LanguageUnavailable(language, self.cause(language))
+        return language
 
     def sentence(self, language: str, key: str, **values: object) -> str:
         """The sentence *key* in *language*, formatted with *values*.

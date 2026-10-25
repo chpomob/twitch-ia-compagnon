@@ -691,3 +691,31 @@ Not an allowlist entry (it does not fail; AC26 strengthens it):
 gains assertions that the 2 string files and the 4 profiles are installed byte-identical; nothing in it
 is removed or loosened, its 21-manifest count stays, and its companion
 `test_install_test_skips_only_when_pip_is_unavailable` still holds over the adapted source.
+
+### Added by P19F3 (the gate's N2): existing functions changed beyond the three entries above
+
+The baseline/current AST comparison (`b7ec50d` → P19F3) finds eight changed existing test functions,
+zero deleted. The three above and the AC26 strengthening are authorized there; the `test_ac35` entry
+also covers its response-type constant gaining `application/json` (R1's `/instance`, R7's `/feed`), with
+an added assertion pinning those as the only two JSON routes. Each entry below keeps every baseline
+assertion, in order, and only adds assertions or a constant:
+
+- `tests/test_agentic_loop.py::test_ac31_the_core_and_the_neutral_modules_name_no_platform` — constant
+  (the DD1 exemption set, exactly `core/config_ui/locations.py`, `profiles/`, `strings/`) plus 3 added
+  assertions pinning it; forced by R2/R3/R5/A1, which put Twitch-named data under `core/config_ui/`.
+- `tests/test_youtube.py::test_the_broad_core_scan_names_no_platform_or_vendor` — the same DD1 constant
+  plus 2 added assertions; same requirements. AC39's `kick|youtube` scan is not adapted.
+- `tests/test_web.py::test_p3f1_one_huge_construct_still_reaches_the_deadline` — 2 added assertions
+  (one read inside the walk; abandoned walk under a quarter of the whole); forced by P19F1, which
+  replaces a deadline a fast interpreter never reaches with one that expires on the walk's first read.
+- `tests/test_web.py::test_p12f4_the_search_for_a_tag_end_stops_soon_after_its_deadline` — 3 added
+  assertions (the search without a deadline finds no end; one deadline read; under a quarter of it);
+  forced by P19F1's sweep (a deadline already expired, not a 0.05 s budget).
+- `tests/test_web.py::test_p12f4_the_json_walk_stops_soon_after_its_deadline_inside_one_value` — 1
+  added assertion (the walk stopped at the deadline's 100th read); forced by P19F1's sweep.
+
+Three more existing `test_web.py` functions keep their assertion lists unchanged and carry P19F1 through a
+fake only (`hold_the_walk_past_its_deadline` holds the worker's walk at a deadline check until its
+deadline has expired): `test_p3f1_the_deadline_bounds_extraction_on_the_real_clock`,
+`test_p12f4_a_6_mb_search_answer_times_out_at_1s_on_the_real_clock`,
+`test_p12f4_a_timed_out_scalar_answer_leaves_no_walk_running`.

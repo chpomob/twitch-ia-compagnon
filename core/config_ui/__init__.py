@@ -84,7 +84,7 @@ import yaml
 from core.actions import ANY_ACTION
 from core.bus import EventBus
 from core.config_ui import console, locations
-from core.config_ui.i18n import StringTable
+from core.config_ui.i18n import LanguageUnavailable, StringTable, StringTableError
 from core.config_ui.launcher import (
     LauncherError,
     LauncherSeams,
@@ -3207,10 +3207,15 @@ class ConfigUI:
         methods, handler = route
         if method not in methods:
             return _text(405, "405 Method Not Allowed", (("Allow", ", ".join(sorted(methods))),))
-        if request.path in STATE_CHANGING_PATHS:
-            with self._mutation_lock:
-                return handler(request, session)
-        return handler(request, session)
+        try:
+            if request.path in STATE_CHANGING_PATHS:
+                with self._mutation_lock:
+                    return handler(request, session)
+            return handler(request, session)
+        except LanguageUnavailable as refused:
+            # The session's language no longer validates: refuse with the
+            # plain cause, never render another language (P19F3).
+            return _text(503, refused.cause)
 
     def _instance_endpoint(self, request: UIRequest, session: _Session | None) -> UIResponse:
         """``/instance`` (R1): the instance marker and the product version,
@@ -3306,7 +3311,10 @@ class ConfigUI:
         nothing."""
 
         fields = dict(_form_fields(request))
-        if not self.wizard.set_language(fields.get("language", "")):
+        language = fields.get("language", "")
+        if not self.wizard.set_language(language):
+            if language in self.wizard.table.refused:
+                return _text(409, f"409 Conflict: {self.wizard.table.cause(language)}")
             return _text(409, "409 Conflict: this language is not offered.")
         return UIResponse(status=303, headers=(("Location", self._landing()),))
 
@@ -6791,6 +6799,26 @@ class _SecondLaunch(Exception):
         self.status = status
 
 
+def string_table_refusal(settings: UISettings) -> str | None:
+    """The plain cause the UI must not start for, from its string table:
+    a shipped table that does not validate, or a persisted language that is
+    no longer offered (P19F3); ``None`` when the table serves the profile."""
+
+    try:
+        table = StringTable.load()
+    except StringTableError as error:
+        return str(error)
+    try:
+        language = WizardState(settings.base_path).language
+    except WizardStateError:
+        return None
+    try:
+        table.language_or_default(language)
+    except LanguageUnavailable as refused:
+        return refused.cause
+    return None
+
+
 def _instance_sentences(settings: UISettings) -> Callable[..., str]:
     """``_t(key, **values)`` over the string table, in the profile's language
     (the wizard state's, defaulting to English: R2)."""
@@ -6989,6 +7017,10 @@ def main(
     if problems:
         for problem in problems:
             print(f"config_ui: {problem}", file=sys.stderr)
+        return 2
+    refusal = string_table_refusal(settings)
+    if refusal is not None:
+        print(f"config_ui: string table refused: {refusal}", file=sys.stderr)
         return 2
     if settings.default_location:
         # Only the A2 default's directory is created; a --config run creates

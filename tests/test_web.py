@@ -1715,7 +1715,7 @@ def test_p3f1_one_huge_construct_still_reaches_the_deadline(
     start = time.monotonic()
     assert extract_text(body, "text/html").text == "x"
     whole = time.monotonic() - start
-    assert whole < 6
+    assert time.monotonic() - start < 6
 
     walking = [False]
     goahead = web._TextParser.goahead
@@ -1735,13 +1735,15 @@ def test_p3f1_one_huge_construct_still_reaches_the_deadline(
         return walking[0]
 
     token = web._EXTRACTION_EXPIRED.set(expired)
-    start = time.monotonic()
+    # The deadline is armed now and expires at the walk's first read.
+    deadline = time.monotonic()
     try:
         with pytest.raises(web.ExtractionAbandoned):
             extract_text(body, "text/html")
     finally:
         web._EXTRACTION_EXPIRED.reset(token)
-    abandoned = time.monotonic() - start
+    abandoned = time.monotonic() - deadline
+    assert time.monotonic() - deadline < 0.8
     assert reads.count(True) == 1 and reads[-1] is True, reads
     assert abandoned < whole / 4, (abandoned, whole)
 
@@ -4339,27 +4341,33 @@ def test_p12f4_the_search_for_a_tag_end_stops_soon_after_its_deadline(body: byte
 
     import modules.web as web
 
-    def search() -> int:
+    def parser_over_body() -> Any:
         parser = web._TextParser()
         parser.rawdata = body.decode("ascii")
+        return parser
+
+    def search(parser: Any) -> int:
         if body.startswith(b"</"):
             return parser.parse_endtag(0)
         return parser.check_for_whole_start_tag(0)
 
+    parser = parser_over_body()
     start = time.monotonic()
-    assert search() == -1
+    assert search(parser) == -1
     whole = time.monotonic() - start
 
     # P19F1: a deadline already expired, not a budget a fast machine beats.
+    parser = parser_over_body()
     expired = ExpiresOnRead(1)
     token = web._EXTRACTION_EXPIRED.set(expired)
-    start = time.monotonic()
+    deadline = time.monotonic()
     try:
         with pytest.raises(web.ExtractionAbandoned):
-            search()
+            search(parser)
     finally:
         web._EXTRACTION_EXPIRED.reset(token)
-    abandoned = time.monotonic() - start
+    abandoned = time.monotonic() - deadline
+    assert time.monotonic() - deadline < 0.05
     assert expired.reads == 1
     assert abandoned < whole / 4, (abandoned, whole)
 
@@ -4674,13 +4682,16 @@ def test_p12f4_the_json_walk_stops_soon_after_its_deadline_inside_one_value(
     # fast machine beats. A walk that looked at it only as each value
     # begins reads it a handful of times and never expires; one that looks
     # before each scalar stops at the 100th of millions.
+    answer = document.encode("utf-8")
     expired = ExpiresOnRead(100)
     token = web._EXTRACTION_EXPIRED.set(expired)
+    deadline = time.monotonic()
     try:
         with pytest.raises(web.ExtractionAbandoned):
-            web._json_answer(document.encode("utf-8"))
+            web._json_answer(answer)
     finally:
         web._EXTRACTION_EXPIRED.reset(token)
+    assert time.monotonic() - deadline < 0.05
     assert expired.reads == 100
 
 
