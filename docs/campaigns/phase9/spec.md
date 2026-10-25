@@ -657,6 +657,21 @@ over `core/`, `modules/`, `demo/`, `tests/`; dynamic or reflective callers are n
 
 ## Test failure allowlist
 
+### Amendment A2 (2026-10-25) — one named exemption for POSIX-only subjects
+
+The closing gate found 18 uses of a single `posix_only` marker plus one `pytest.skip`, and this phase's
+invariant forbids new skips. The invariant as written is too absolute: a test whose **subject** is a POSIX
+facility — file modes, owners, per-user directory checks — has no equivalent on a platform that does not
+have it, and forcing the platform *value* does not create the facility. A silent skip would hide that; an
+explicit failure would make the suite red on a platform the project does not support.
+
+A2 therefore permits **exactly one exemption class**: a single named marker for tests whose subject is a
+POSIX-only facility, carrying a reason, used only on such tests. It is enumerated in one place, its use
+count and node list are asserted by an invariant test, and adding a node to it is a visible diff. Every
+other skip, xfail or importorskip stays forbidden, and tests of *platform behaviour* — the Windows
+directory and ACL branches, the launcher's per-platform contents — must run on any platform by forcing the
+platform value. A test that needs a native facility it cannot have is exempted, never failed.
+
 Each entry fails only because R1 makes `--config` optional or R1/R7 add routes; the adaptation keeps
 the assertion's strength.
 
