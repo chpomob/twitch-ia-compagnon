@@ -27,6 +27,11 @@ by ``main``'s claim path, rewritten ``launched`` each time the supervisor
 returns a child and ``stopped`` by the console's Stop, removed at release
 when it carries this UI's marker; a UI built without the claim writes none,
 and a file at its path refuses to start (``supervision_path_collision``).
+
+Then ``--start-runtime`` (R1 d, AC4): once listening, the console Start's
+own entry runs exactly once when a completed profile is present, with that
+Start's refusals; with no profile or an unfinished wizard nothing starts and
+one value-free reason line is logged.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import inspect
 import json
 import os
 import re
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -924,3 +930,240 @@ def test_ac19_the_default_location_has_no_supervision_collision(
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
     monkeypatch.delenv(config_ui.FEED_FILE_VARIABLE, raising=False)
     assert config_ui.startup_checks(config_ui.UISettings.from_argv([])) == []
+
+
+# -- --start-runtime (R1 d, AC4) --------------------------------------------- #
+
+#: What a start-runtime log line may never hold.
+TOKEN_TEXT = "token="
+
+
+def _wizard_state(base: Path, completed: bool) -> None:
+    document = {"format": config_ui.wizard.STATE_FORMAT, "completed": completed}
+    Path(os.fspath(base) + ".wizard.json").write_text(json.dumps(document), encoding="utf-8")
+
+
+class _ListeningServe:
+    """A fake ``serve``: fakes the supervisor's launches, counts its starts
+    before and after the fake listening signal (``on_listening``, called
+    twice: the hook runs once per UI start), and reads the supervision record."""
+
+    def __init__(self, prepare: Callable[[Any], None] | None = None) -> None:
+        self.prepare = prepare
+        self.starts: list[int] = []
+        # Set at the first start, for an opener that waits on it.
+        self.started = threading.Event()
+        self.before: int | None = None
+        self.supervision: dict[str, Any] | None = None
+        self.console_outcome: str | None = None
+        self.ui: Any = None
+
+    def __call__(self, ui: Any, settings: Any) -> None:
+        self.ui = ui
+        try:
+            _fake_launches(ui)
+            start = ui.supervisor.start
+
+            def counted() -> Any:
+                self.starts.append(1)
+                self.started.set()
+                return start()
+
+            ui.supervisor.start = counted
+            if self.prepare is not None:
+                self.prepare(ui)
+            self.before = len(self.starts)
+            if ui.on_listening is not None:
+                ui.on_listening()
+                ui.on_listening()
+            if settings.supervision_path.exists():
+                self.supervision = _supervision(settings.supervision_path)
+            if self.prepare is not None:
+                # The console's own Start, for its refusal.
+                self.console_outcome = ui.start_runtime().outcome
+        finally:
+            config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+def _start_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.getMessage().startswith("start-runtime")]
+
+
+def _assert_value_free(lines: list[str], ui: Any, root: Path) -> None:
+    for line in lines:
+        assert TOKEN_TEXT not in line and ui.token not in line and ui.instance_marker not in line
+        assert os.fspath(root) not in line
+
+
+def test_ac4_a_completed_profile_starts_once_after_listening(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="core.config_ui")
+    base = _profile(tmp_path)
+    _wizard_state(base, completed=True)
+    serve = _ListeningServe()
+    opened: list[str] = []
+    status = config_ui.main(
+        ["--config", str(base), "--start-runtime"],
+        opener=opened.append,
+        serve=serve,
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert status == 0
+    assert serve.before == 0 and len(serve.starts) == 1
+    # P2's opener is unchanged and still runs first, once per signal.
+    assert opened == [serve.ui.access_url] * 2
+    assert serve.supervision is not None
+    assert serve.supervision["state"] == "launched" and serve.supervision["pid"] == 5001
+    assert _start_lines(caplog) == []
+    assert any("runtime start unconfirmed" in record.getMessage() for record in caplog.records)
+    assert capsys.readouterr().out.count("Configuration UI: ") == 1
+
+
+def test_ac4_a_blocking_opener_does_not_hold_the_runtime_start(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A terminal browser blocks until it closes: the runtime starts meanwhile.
+    base = _profile(tmp_path)
+    _wizard_state(base, completed=True)
+    serve = _ListeningServe()
+    seen: list[bool] = []
+
+    def blocking_opener(url: str) -> None:
+        seen.append(serve.started.wait(5.0) and bool(serve.starts))
+
+    status = config_ui.main(
+        ["--config", str(base), "--start-runtime"],
+        opener=blocking_opener,
+        serve=serve,
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert status == 0 and len(serve.starts) == 1
+    # Each signal's opener saw the runtime start while it was still open.
+    assert seen == [True, True]
+
+
+def test_ac4_a_completed_profile_without_a_wizard_state_starts_too(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A --config profile no wizard wrote lands on the editor: it starts.
+    base = _profile(tmp_path)
+    serve = _ListeningServe()
+    status = config_ui.main(
+        ["--config", str(base), "--start-runtime", "--no-browser"],
+        opener=lambda url: None,
+        serve=serve,
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert status == 0 and len(serve.starts) == 1
+
+
+def test_ac4_an_unfinished_wizard_starts_nothing_and_logs_a_value_free_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="core.config_ui")
+    base = _profile(tmp_path)
+    _wizard_state(base, completed=False)
+    serve = _ListeningServe()
+    status = config_ui.main(
+        ["--config", str(base), "--start-runtime", "--no-browser"],
+        opener=lambda url: None,
+        serve=serve,
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert status == 0 and serve.starts == []
+    lines = _start_lines(caplog)
+    assert lines == ["start-runtime: wizard unfinished"]
+    _assert_value_free(lines, serve.ui, tmp_path)
+    assert serve.supervision is not None and serve.supervision["state"] == "not_started"
+
+
+@pytest.mark.usefixtures("linux_platform")
+def test_ac4_no_profile_starts_nothing_and_logs_a_value_free_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="core.config_ui")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv(config_ui.FEED_FILE_VARIABLE, raising=False)
+    serve = _ListeningServe()
+    status = config_ui.main(
+        ["--start-runtime", "--no-browser"],
+        opener=lambda url: None,
+        serve=serve,
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert status == 0 and serve.starts == []
+    assert not serve.ui.settings.base_path.exists()
+    lines = _start_lines(caplog)
+    assert lines == ["start-runtime: no profile"]
+    _assert_value_free(lines, serve.ui, tmp_path)
+
+
+def test_ac4_a_live_status_record_refuses_as_the_console_start_does(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="core.config_ui")
+    base = _profile(tmp_path)
+    _wizard_state(base, completed=True)
+
+    def live_record(ui: Any) -> None:
+        ui.probe = lambda pid, child: pid == FOREIGN_PID
+        ui.started_at = _started(PUBLISHED - 60.0)
+        ui.status_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "pid": FOREIGN_PID,
+                    "started_at": "2026-10-24T08:00:00Z",
+                    "published_at": PUBLISHED_AT,
+                    "sequence": 1,
+                    "digest": "0" * 64,
+                    "state": "ready",
+                    "modules": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    serve = _ListeningServe(live_record)
+    status = config_ui.main(
+        ["--config", str(base), "--start-runtime", "--no-browser"],
+        opener=lambda url: None,
+        serve=serve,
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert status == 0 and serve.starts == []
+    assert serve.console_outcome == console.START_ANOTHER_INSTANCE
+    lines = _start_lines(caplog)
+    assert lines == [f"start-runtime: {console.START_ANOTHER_INSTANCE}"]
+    _assert_value_free(lines, serve.ui, tmp_path)
+    assert serve.supervision is not None and serve.supervision["state"] == "not_started"
+
+
+@pytest.mark.parametrize("extra", [[], ["--no-browser"]], ids=["opener", "no_browser"])
+def test_ac4_without_the_option_nothing_starts(
+    extra: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="core.config_ui")
+    base = _profile(tmp_path)
+    _wizard_state(base, completed=True)
+    serve = _ListeningServe()
+    status = config_ui.main(
+        ["--config", str(base), *extra],
+        opener=lambda url: None,
+        serve=serve,
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert status == 0 and serve.starts == []
+    assert _start_lines(caplog) == []
+    assert serve.supervision is not None and serve.supervision["state"] == "not_started"
+
+
+def test_r1_start_runtime_is_absent_by_default() -> None:
+    assert config_ui.UISettings.from_argv(["--config", "x.yaml"]).start_runtime is False
+    assert config_ui.UISettings.from_argv(["--config", "x.yaml", "--start-runtime"]).start_runtime is True

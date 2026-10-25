@@ -219,6 +219,8 @@ class UISettings:
     no_browser: bool = False
     #: ``--token-file``: the access token's file (phase 10 R1, A5).
     token_file: Path | None = None
+    #: ``--start-runtime``: start the supervised runtime once listening (phase 10 R1).
+    start_runtime: bool = False
 
     @classmethod
     def from_argv(cls, argv: Sequence[str]) -> UISettings:
@@ -253,6 +255,7 @@ class UISettings:
             install_launcher=parsed.install_launcher,
             no_browser=parsed.no_browser,
             token_file=None if parsed.token_file is None else Path(parsed.token_file),
+            start_runtime=parsed.start_runtime,
         )
 
     # Every path below is in its one canonical form (``core.overlay.
@@ -366,6 +369,11 @@ def _parser() -> argparse.ArgumentParser:
         "--token-file",
         metavar="PATH",
         help="read the access token from a file instead of generating one",
+    )
+    parser.add_argument(
+        "--start-runtime",
+        action="store_true",
+        help="once listening, start the runtime when a completed profile is present",
     )
     return parser
 
@@ -3222,6 +3230,8 @@ class ConfigUI:
         #: Called once by :func:`serve` when the listener accepts connections,
         #: off the event loop; :func:`main` sets it to open the browser (A3).
         self.on_listening: Callable[[], object] | None = None
+        #: ``--start-runtime`` has run (or was declined) for this UI start.
+        self._listening_start_done = False
         _LOG_REDACTION.sources.add(self)
         self.routes: dict[str, tuple[frozenset[str], Handler]] = {
             "/": (frozenset({"GET"}), self._base_page),
@@ -3747,6 +3757,29 @@ class ConfigUI:
             os.fspath(self.status_path),
             extra={"config_ui_operation": "start", "config_ui_outcome": report.outcome},
         )
+        return report
+
+    def start_runtime_at_listening(self) -> console.RuntimeOutcome | None:
+        """``--start-runtime`` (phase 10 R1 d): :meth:`start_runtime`, the
+        console Start's own entry with its refusals, when the access URL
+        would land on the console or the editor; otherwise nothing starts and
+        one value-free reason line is logged. A refusal or failure is logged
+        by its outcome alone and the UI keeps serving. Runs at most once per
+        UI, under the mutation lock the console's Start route takes."""
+
+        with self._mutation_lock:
+            if self._listening_start_done:
+                return None
+            self._listening_start_done = True
+            if not self.base_path.exists():
+                logger.warning("start-runtime: no profile")
+                return None
+            if self._landing() == LANDING_WIZARD:
+                logger.warning("start-runtime: wizard unfinished")
+                return None
+            report = self.start_runtime()
+        if report.outcome not in (console.START_STARTED, console.START_UNCONFIRMED):
+            logger.warning("start-runtime: %s", report.outcome)
         return report
 
     def _holds_status_record(self, running: RunningState) -> bool:
@@ -7405,7 +7438,9 @@ def main(
     and exits before any startup check, instance record or serve (R1, A3).
     ``--no-browser`` leaves *opener* uncalled, ``--token-file`` supplies the
     token (an unusable file exits 2 before any claim or serve), and a bind
-    that is not loopback writes one warning line before serving (phase 10 R1).
+    that is not loopback writes one warning line before serving, and
+    ``--start-runtime`` starts the runtime once listening through
+    :meth:`ConfigUI.start_runtime_at_listening` (phase 10 R1).
     """
 
     if opener is None:
@@ -7471,8 +7506,28 @@ def main(
                 # neither it nor the failure's text (which may quote it) is logged.
                 logger.warning("the browser could not be opened: use the printed access URL")
 
-        if not settings.no_browser:
-            ui.on_listening = open_browser
+        def listening() -> None:
+            # The opener first (P2's behaviour), then the runtime. The opener
+            # may block (a terminal browser waits until it closes), so with
+            # --start-runtime it runs on its own thread and the runtime starts
+            # without waiting for it; the hook still returns after both.
+            if not settings.start_runtime:
+                open_browser()
+                return
+            opening = None
+            if not settings.no_browser:
+                opening = threading.Thread(target=open_browser, name="config-ui-browser", daemon=True)
+                opening.start()
+            try:
+                ui.start_runtime_at_listening()
+            except Exception:
+                # Value-free: the failure's text may quote a path or a value.
+                logger.warning("start-runtime: failed")
+            if opening is not None:
+                opening.join()
+
+        if not settings.no_browser or settings.start_runtime:
+            ui.on_listening = listening
         warning = non_loopback_warning(settings.host, settings.port)
         if warning is not None:
             print(warning, file=sys.stderr, flush=True)
