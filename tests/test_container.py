@@ -39,6 +39,13 @@ records, a fake probe, a fake liveness judgement and an injected clock,
 row's status, the earlier row deciding a case that matches two; the probe
 carries the record's token and no cookie, and the default probe connects
 only to ``127.0.0.1`` and, never answered, ends within 5 s of its clock.
+
+Then the invariants (R1, R5, AC5, AC18): under each of the 16 combinations
+of ``--token-file``, ``--no-browser``, ``--start-runtime`` and a non-loopback
+bind, the UI ``main`` builds answers its route table, driven in-process, with
+phase 9's three route classes, every class-(iii) refusal equal to the one a
+default :class:`UISettings` gives; and a credential both inherited and stored
+reaches the supervised child with its stored value.
 """
 
 from __future__ import annotations
@@ -1730,3 +1737,221 @@ def test_ac20_a_probe_that_never_answers_ends_within_5_seconds_unhealthy(
     assert case.run(capsys) == ("unhealthy: not answering", 1)
     assert connector.addresses == [("127.0.0.1", HEALTH_PORT)]
     assert 0 < clock[0] - 100.0 <= 5.0
+
+
+# -- route-class invariance (R1, AC5) ---------------------------------------- #
+
+#: The four container-mode settings AC5 combines, each as ``main``'s
+#: arguments; ``--token-file``'s path is filled in per test.
+CONTAINER_OPTIONS = ("token_file", "no_browser", "start_runtime", "non_loopback")
+COMBINATIONS = [
+    pytest.param(chosen, id="+".join(chosen) or "none")
+    for mask in range(1 << len(CONTAINER_OPTIONS))
+    for chosen in [tuple(name for bit, name in enumerate(CONTAINER_OPTIONS) if mask >> bit & 1)]
+]
+assert len(COMBINATIONS) == 16
+#: The accepted Host every request names: loopback, which a wildcard bind
+#: also accepts (A8), on the default port.
+ROUTE_HOST = f"127.0.0.1:{config_ui.DEFAULT_PORT}"
+#: A session cookie no UI issued.
+FORGED_COOKIE = f"{config_ui.SESSION_COOKIE}=forged"
+
+
+def _route_request(method: str, path: str, *, headers: dict[str, str] | None = None) -> Any:
+    return _request(method, path, host=ROUTE_HOST, headers=headers)
+
+
+def _class_iii_requests(ui: Any) -> dict[tuple[str, str, str], Any]:
+    """Every route of *ui*'s table but ``/instance`` (class (i)), by GET and
+    by a CSRF-carrying form POST, without a cookie and with a forged one;
+    ``GET /`` carries no token, so it is not the access URL (class (ii))."""
+
+    requests: dict[tuple[str, str, str], Any] = {}
+    form = {"content-type": "application/x-www-form-urlencoded"}
+    for route in ui.routes:
+        if route == config_ui.INSTANCE_ROUTE:
+            continue
+        path = route + "twitch" if route == config_ui.MODULE_PAGE_PREFIX else route
+        for cookie in ("none", "forged"):
+            jar = {} if cookie == "none" else {"cookie": FORGED_COOKIE}
+            requests[("GET", path, cookie)] = _route_request("GET", path, headers=jar)
+            post = _request(
+                "POST", path, host=ROUTE_HOST, headers={**form, **jar}, body=b"csrf_token=guessed"
+            )
+            requests[("POST", path, cookie)] = post
+    return requests
+
+
+def _answers(ui: Any, requests: dict[tuple[str, str, str], Any]) -> dict[tuple[str, str, str], tuple[Any, ...]]:
+    answered = {}
+    for key, request in requests.items():
+        response = ui.handle(request)
+        answered[key] = (response.status, response.body, response.content_type, response.headers)
+    return answered
+
+
+def _header_names(response: Any) -> set[str]:
+    return {name.lower() for name, _value in response.headers}
+
+
+class _RouteServe:
+    """A fake ``serve``: fakes the supervisor's launches, gives the
+    listening signal as the real one does, then drives the route table
+    in-process (no socket) and keeps what it answered."""
+
+    def __init__(self) -> None:
+        self.ui: Any = None
+        self.settings: Any = None
+        self.class_iii: dict[tuple[str, str, str], tuple[Any, ...]] = {}
+        self.instance: Any = None
+        self.instance_without_token: Any = None
+        self.instance_wrong_token: Any = None
+        self.access: Any = None
+        self.sessions_after_instance: int | None = None
+        self.session_from_access: Any = None
+
+    def __call__(self, ui: Any, settings: Any) -> None:
+        self.ui, self.settings = ui, settings
+        try:
+            _fake_launches(ui)
+            if ui.on_listening is not None:
+                ui.on_listening()
+            self.class_iii = _answers(ui, _class_iii_requests(ui))
+            route = config_ui.INSTANCE_ROUTE
+            sessions = len(ui._sessions)
+            self.instance = ui.handle(_request("GET", route, host=ROUTE_HOST, query={"token": ui.token}))
+            self.instance_without_token = ui.handle(_route_request("GET", route))
+            wrong = ui.token[:-1] + ("B" if ui.token[-1] != "B" else "C")
+            self.instance_wrong_token = ui.handle(_request("GET", route, host=ROUTE_HOST, query={"token": wrong}))
+            self.sessions_after_instance = len(ui._sessions) - sessions
+            self.access = ui.handle(_request("GET", "/", host=ROUTE_HOST, query={"token": ui.token}))
+            cookie = dict(self.access.headers).get("Set-Cookie", "").split(";")[0]
+            self.session_from_access = ui._session(_route_request("GET", "/", headers={"cookie": cookie}))
+        finally:
+            config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+def _reference_refusals(base: Path) -> tuple[set[str], dict[tuple[str, str, str], tuple[Any, ...]]]:
+    """The route table and the class-(iii) refusals of a UI built from a
+    default :class:`UISettings` over *base*: what every request gets today."""
+
+    ui = config_ui.ConfigUI(config_ui.UISettings.from_argv(["--config", str(base)]))
+    try:
+        return set(ui.routes), _answers(ui, _class_iii_requests(ui))
+    finally:
+        config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+@pytest.mark.parametrize("chosen", COMBINATIONS)
+def test_ac5_the_route_classes_are_phase_9s_under_every_combination(
+    chosen: tuple[str, ...], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _profile(tmp_path)
+    routes, reference = _reference_refusals(base)
+    # The reference is a refusal on every class-(iii) route, never a page.
+    assert reference and {answer[0] for answer in reference.values()} == {401}
+
+    token_file = tmp_path / "token"
+    token_file.write_text(VALID_TOKEN + "\n", encoding="utf-8")
+    argv = ["--config", str(base)]
+    if "token_file" in chosen:
+        argv += ["--token-file", str(token_file)]
+    if "no_browser" in chosen:
+        argv.append("--no-browser")
+    if "start_runtime" in chosen:
+        argv.append("--start-runtime")
+    if "non_loopback" in chosen:
+        argv += ["--host", "0.0.0.0", "--allow-non-loopback"]
+    serve = _RouteServe()
+    opened: list[str] = []
+    status = config_ui.main(argv, opener=opened.append, serve=serve, instance=config_ui.InstanceSeams(platform="linux"))
+    capsys.readouterr()
+    assert status == 0 and serve.ui is not None
+
+    # The combination is the one in effect.
+    settings, ui = serve.settings, serve.ui
+    assert settings.no_browser is ("no_browser" in chosen)
+    assert settings.start_runtime is ("start_runtime" in chosen)
+    assert settings.host == ("0.0.0.0" if "non_loopback" in chosen else "127.0.0.1")
+    assert (ui.token == VALID_TOKEN) is ("token_file" in chosen)
+    assert len(opened) == (0 if "no_browser" in chosen else 1)
+
+    # Class (iii): the same route table, and every route refused exactly as
+    # the default configuration refuses it.
+    assert set(ui.routes) == routes
+    assert serve.class_iii == reference
+
+    # Class (i): the token, no session cookie → the marker and version only,
+    # no cookie and no session; without the token (or a wrong one) → 401.
+    instance = serve.instance
+    assert instance.status == 200 and instance.content_type == "application/json"
+    document = json.loads(instance.body)
+    assert set(document) == {"marker", "version"}
+    assert document == {"marker": ui.instance_marker, "version": locations.product_version()}
+    assert "set-cookie" not in _header_names(instance)
+    assert serve.instance_without_token.status == 401
+    assert serve.instance_wrong_token.status == 401
+    assert "set-cookie" not in _header_names(serve.instance_without_token)
+    assert serve.sessions_after_instance == 0
+
+    # Class (ii): the access URL → a redirect setting the session cookie,
+    # no content.
+    access = serve.access
+    assert access.status == 303 and access.body == b""
+    headers = dict(access.headers)
+    assert "Location" in headers
+    assert headers["Set-Cookie"].startswith(config_ui.SESSION_COOKIE + "=")
+    assert serve.session_from_access is not None
+
+
+# -- credential precedence (R5, AC18) ---------------------------------------- #
+
+#: The credential both inherited and stored, and its two sentinel values.
+CREDENTIAL = "TWITCH_ACCESS_TOKEN"
+INHERITED_VALUE = "inherited-sentinel-7c1d90a4"
+STORED_VALUE = "stored-sentinel-e52b6f13"
+
+
+def test_ac18_the_stored_credential_wins_in_the_supervised_childs_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linux_platform: None
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv(CREDENTIAL, INHERITED_VALUE)
+    base = _profile(tmp_path)
+    base.write_text(
+        f"modules_directory: ./mods\nenabled_modules: []\nsecrets: ['${{{CREDENTIAL}}}']\n", encoding="utf-8"
+    )
+    state = config_ui.wizard.WizardState(base)
+    store = config_ui.wizard.CredentialStore(base, locations.running_platform(), os.environ)
+    assert store.write({CREDENTIAL: STORED_VALUE}, [f"${{{CREDENTIAL}}}"], state) is None
+    state.completed = True
+    state.save(store)
+    assert store.path is not None and STORED_VALUE in store.path.read_text(encoding="utf-8")
+
+    # The UI's environment is the process's own, inherited one.
+    settings = config_ui.UISettings.from_argv(["--config", str(base)])
+    ui = config_ui.ConfigUI(settings)
+    try:
+        assert os.environ[CREDENTIAL] == INHERITED_VALUE
+        # The existing builder, called directly.
+        built = config_ui._LaunchEnviron(lambda: ui.environ, settings.feed_path)
+        assert built[CREDENTIAL] == STORED_VALUE
+        assert dict(built)[CREDENTIAL] == STORED_VALUE
+
+        # And what the supervisor actually hands its child.
+        launched: list[dict[str, str]] = []
+
+        def popen(*args: Any, **options: Any) -> _FakeChild:
+            launched.append(dict(options["env"]))
+            return _FakeChild(5001)
+
+        ui.supervisor.popen = popen
+        ui.supervisor.start()
+        ui.supervisor.stop()
+        (env,) = launched
+        assert env[CREDENTIAL] == STORED_VALUE
+        assert INHERITED_VALUE not in env.values()
+    finally:
+        ui.supervisor.close()
+        config_ui._LOG_REDACTION.sources.discard(ui)
