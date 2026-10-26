@@ -2525,14 +2525,15 @@ print(json.dumps({"passed": list(ui.wizard.passed_screens()), "completed": ui.wi
 """
 
 #: Run inside the container: the files written since the container started
-#: (temporary and kernel trees excluded), and the names the product's own
+#: (temporary and kernel trees excluded), every path whose stat failed (a
+#: finding of the scan, never dropped), and the names the product's own
 #: settings give the files of the default location (AC7).
 FILES_PROOF = """
 import json, os
 from core import config_ui
 
 skipped = {"/proc", "/sys", "/dev", "/run", "/tmp"}
-written = []
+written, unreadable = [], []
 for root, directories, files in os.walk("/"):
     directories[:] = [name for name in directories if os.path.join(root, name) not in skipped]
     for name in files:
@@ -2540,8 +2541,8 @@ for root, directories, files in os.walk("/"):
         try:
             if os.lstat(path).st_mtime > ARGS["since"]:
                 written.append(path)
-        except OSError:
-            pass
+        except OSError as error:
+            unreadable.append({"path": path, "error": f"{type(error).__name__}: {error.strerror or error}"})
 settings = config_ui.UISettings.from_argv([])
 named = {
     "profile": settings.base_path,
@@ -2555,6 +2556,7 @@ named = {
 }
 print(json.dumps({
     "written": sorted(written),
+    "unreadable": unreadable,
     "named": {role: None if path is None else str(path) for role, path in named.items()},
     "present": sorted(os.listdir(ARGS["directory"])),
 }))
@@ -2813,11 +2815,17 @@ class _Project:
     def python(self, script: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """*script* piped to the container's own interpreter, as its user."""
 
+        return self.python_output(script, arguments)[0]
+
+    def python_output(self, script: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """:meth:`python`'s answer and the exec's combined output: what the
+        proof printed never reaches ``docker compose logs``."""
+
         result = self.compose(
             "exec", "-T", SERVICE, "python", "-",
             cause="the proof code failed in the container", stdin=_proof(script, arguments),
         )
-        return _answered(result, "the proof code")
+        return _answered(result, "the proof code"), result.stdout + result.stderr
 
     def logs(self) -> str:
         return self.compose("logs", "--no-color", SERVICE, cause="docker compose logs failed").stdout
@@ -2886,11 +2894,14 @@ def _landing(project: _Project) -> str:
     return re.sub(r"^https?://[^/]+", "", answer["location"] or "")
 
 
-def _complete_wizard(project: _Project, credentials: dict[str, str]) -> None:
-    answer = project.python(
+def _complete_wizard(project: _Project, credentials: dict[str, str]) -> str:
+    """Screens 1–5 (screen 5 the dry run); the proof's combined output."""
+
+    answer, output = project.python_output(
         WIZARD_PROOF, {"profile": "silent", "credentials": credentials, "user_id": TRIAL_USER_ID}
     )
     assert answer == {"passed": [1, 2, 3, 4, 5], "completed": True}, answer
+    return output
 
 
 def _started_at(project: _Project) -> float:
@@ -3037,6 +3048,7 @@ def test_trial_container_volume(tmp_path: Path) -> None:
         assert last.startswith(("ready", "degraded")), last
 
         listing = project.python(FILES_PROOF, {"since": since, "directory": DATA_DIRECTORY})
+        assert listing["unreadable"] == [], listing["unreadable"]
         outside = [path for path in listing["written"] if not path.startswith(DATA_DIRECTORY + "/")]
         assert outside == [], outside
         expected = {
@@ -3051,7 +3063,9 @@ def test_trial_container_volume(tmp_path: Path) -> None:
 def test_trial_container_secrets(tmp_path: Path) -> None:
     required(CONTAINER_TRIAL_VARIABLE)
     # AC16: sentinel credentials in the environment and the credential file,
-    # a wizard run and its dry run, a restart; no sentinel in any log.
+    # a wizard run and its dry run, a restart; no sentinel in any log. The
+    # logs are read before the restart and again after it; the wizard's own
+    # output (an exec, outside the compose log) is asserted on as well.
     docker = _docker()
     _daemon(docker)
     sentinels = _sentinels()
@@ -3059,7 +3073,18 @@ def test_trial_container_secrets(tmp_path: Path) -> None:
     override.write_text(yaml.safe_dump({"services": {SERVICE: {"environment": sentinels}}}), encoding="utf-8")
     with _project(docker, "test_trial_container_secrets", [COMPOSE, override]) as project:
         project.up()
-        _complete_wizard(project, sentinels)
+        wizard_output = _complete_wizard(project, sentinels)
+        first_logs = project.logs()
+        first_health = "\n".join(project.health()[1])
+        for name, value in sentinels.items():
+            assert value not in wizard_output, name
+            assert value not in first_logs, name
+            assert value not in first_health, name
+        first_tokens = _tokens(first_logs)
+        assert len(first_tokens) == 1, len(first_tokens)
+        assert first_tokens[0] not in first_health and first_tokens[0] not in wizard_output
+        assert "token=" not in first_health and "http://" not in first_health
+
         project.kill()
         restarted = time.time()
         project.up()
@@ -3082,9 +3107,13 @@ def test_trial_container_health(tmp_path: Path) -> None:
     required(CONTAINER_TRIAL_VARIABLE)
     # AC21: healthy once serving; the runtime SIGKILLed → unhealthy within 3
     # intervals, ``unhealthy: runtime exited``; the UI killed → never healthy.
+    # The shipped ``restart: unless-stopped`` is turned off for this trial
+    # only, so no replacement can be the container observed after the kill.
     docker = _docker()
     _daemon(docker)
-    with _project(docker, "test_trial_container_health") as project:
+    override = tmp_path / "compose.health.yaml"
+    override.write_text(yaml.safe_dump({"services": {SERVICE: {"restart": "no"}}}), encoding="utf-8")
+    with _project(docker, "test_trial_container_health", [COMPOSE, override]) as project:
         project.up()
         assert project.health()[0] == "healthy"
         _complete_wizard(project, _sentinels())
@@ -3101,12 +3130,20 @@ def test_trial_container_health(tmp_path: Path) -> None:
         assert status == "unhealthy" and health_log[-1] == "unhealthy: runtime exited", health_log[-1:]
 
         instance = json.loads(_record(project, f"{DATA_DIRECTORY}/{locations.PROFILE_FILE_NAME}{config_ui.INSTANCE_SUFFIX}") or b"{}")
+        before = project.inspect()
+        assert before["HostConfig"]["RestartPolicy"]["Name"] == "no", before["HostConfig"]["RestartPolicy"]
         killed = time.time()
         project.python(KILL_PROOF, {"pid": instance["pid"]})
         exited = "die" in _events(project, "die", killed, 2 * HEALTH_INTERVAL_SECONDS)
-        state = project.inspect()["State"]
+        after = project.inspect()
+        state = after["State"]
+        # The instance observed is the one killed: same container, not restarted.
+        assert (after["Id"], after["RestartCount"], state["StartedAt"]) == (
+            before["Id"], before["RestartCount"], before["State"]["StartedAt"]
+        )
         assert exited or (state.get("Health") or {}).get("Status") == "unhealthy"
         assert (state.get("Health") or {}).get("Status") != "healthy"
+        assert "health_status: healthy" not in _events(project, "health_status", killed, 0)
 
 
 def test_trial_container_profiles(tmp_path: Path) -> None:
