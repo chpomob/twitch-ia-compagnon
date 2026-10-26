@@ -274,8 +274,8 @@ La période de démarrage (90 s) dépasse ces 60 s, donc un démarrage normal n'
 
 ## 10. Taille de l'image
 
-L'image mesure **0.0 MB** selon `docker image inspect --format '{{.Size}}'`.
-Ce chiffre est provisoire jusqu'à ce que l'essai de la phase 10 mesure l'image et le remplace.
+L'image mesure **147.7 MB** selon `docker image inspect --format '{{.Size}}'`,
+mesurée lors de l'essai de la phase 10 ([compte rendu d'essai](campaigns/phase10/trial-record.md)).
 
 ## 11. Limites
 

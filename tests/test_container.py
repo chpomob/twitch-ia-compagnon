@@ -95,6 +95,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -218,52 +219,111 @@ def _reader(files: dict[str, str]) -> Callable[[str], str]:
 
 @pytest.mark.parametrize("comm", ["python", "a b) (c", ") )", "x)"])
 def test_ac10_the_start_time_reader_keeps_sub_second_precision(comm: str) -> None:
-    files = {"/proc/4242/stat": _stat_line(comm, 123400), "/proc/uptime": "1234.56 99.0\n"}
+    files = {"/proc/4242/stat": _stat_line(comm, 123400)}
     started = config_ui.process_started_at(
-        4242, read_text=_reader(files), clock=lambda: 10000.25, ticks_per_second=100, platform="linux"
+        4242,
+        read_text=_reader(files),
+        clock=lambda: 10000.25,
+        boot_clock=lambda: 1234.56,
+        ticks_per_second=100,
+        platform="linux",
     )
     assert started == pytest.approx(10000.25 - 1234.56 + 1234.00, abs=1e-9)
     assert started is not None and round(started % 1, 2) == 0.69
 
 
+@pytest.mark.parametrize("fraction", [0.0, 0.001, 0.0035, 0.0099])
+def test_ac10_the_uptime_is_not_truncated(fraction: float) -> None:
+    """The uptime is ``CLOCK_BOOTTIME`` at its own resolution, neither cut to
+    the centiseconds ``/proc/uptime`` prints (a runtime whose supervision
+    record was written 1 ms after its start was judged stale: up to 8 ms late
+    in the container trial, so ``--health`` said ``unhealthy: runtime
+    exited``) nor rounded up to them (a pid reused 1 ms after a publication
+    passed as its publisher)."""
+
+    uptime = 1234.56 + fraction
+    wall = 10000.25
+    true_start = wall - uptime + 1234.00
+    files = {"/proc/4242/stat": _stat_line("p", 123400)}
+    started = config_ui.process_started_at(
+        4242,
+        read_text=_reader(files),
+        clock=lambda: wall,
+        boot_clock=lambda: uptime,
+        ticks_per_second=100,
+        platform="linux",
+    )
+    assert started == pytest.approx(true_start, abs=1e-9)
+    assert config_ui.record_pid_live(4242, true_start + 0.001, _live, lambda pid: started) is True
+    assert config_ui.record_pid_live(4242, true_start - 0.001, _live, lambda pid: started) is False
+
+
+def test_ac10_the_default_uptime_is_the_boot_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default uptime is ``CLOCK_BOOTTIME``, the clock ``starttime``
+    counts in, read through no text (no truncation)."""
+
+    asked: list[int] = []
+
+    def clock_gettime(clock_id: int) -> float:
+        asked.append(clock_id)
+        return 1234.5678
+
+    monkeypatch.setattr(time, "CLOCK_BOOTTIME", 7, raising=False)
+    monkeypatch.setattr(time, "clock_gettime", clock_gettime)
+    files = {"/proc/4242/stat": _stat_line("p", 123400)}
+    started = config_ui.process_started_at(
+        4242, read_text=_reader(files), clock=lambda: 10000.25, ticks_per_second=100, platform="linux"
+    )
+    assert asked == [7]
+    assert started == pytest.approx(10000.25 - 1234.5678 + 1234.00, abs=1e-9)
+
+
 def test_ac10_the_wall_clock_is_read_before_the_uptime() -> None:
     """A delay between the two samples moves the computed start earlier,
-    never later: the wall clock is sampled before ``/proc/uptime`` is read."""
+    never later: the wall clock is sampled before the uptime."""
 
-    files = {"/proc/4242/stat": _stat_line("p", 123400), "/proc/uptime": "1234.56 99.0\n"}
+    files = {"/proc/4242/stat": _stat_line("p", 123400)}
     order: list[str] = []
-    read = _reader(files)
-
-    def traced(path: str) -> str:
-        order.append(path)
-        return read(path)
 
     def clock() -> float:
         order.append("clock")
         return 10000.25
 
-    config_ui.process_started_at(4242, read_text=traced, clock=clock, ticks_per_second=100, platform="linux")
-    assert order.index("clock") < order.index("/proc/uptime")
+    def boot_clock() -> float:
+        order.append("uptime")
+        return 1234.56
+
+    config_ui.process_started_at(
+        4242, read_text=_reader(files), clock=clock, boot_clock=boot_clock, ticks_per_second=100, platform="linux"
+    )
+    assert order == ["clock", "uptime"]
+
+
+def _no_boot_clock() -> float:
+    raise OSError("no CLOCK_BOOTTIME")
 
 
 @pytest.mark.parametrize(
-    "files",
+    ("files", "boot_clock"),
     [
-        pytest.param({"/proc/uptime": "1.0 1.0"}, id="no_stat"),
-        pytest.param({"/proc/4242/stat": _stat_line("p", 5)}, id="no_uptime"),
-        pytest.param({"/proc/4242/stat": "4242 no parenthesis", "/proc/uptime": "1.0 1.0"}, id="no_paren"),
-        pytest.param({"/proc/4242/stat": "4242 (p) S 1 2", "/proc/uptime": "1.0 1.0"}, id="short"),
-        pytest.param({"/proc/4242/stat": _stat_line("p", 5), "/proc/uptime": ""}, id="empty_uptime"),
-        pytest.param({"/proc/4242/stat": _stat_line("p", 5), "/proc/uptime": "x 1"}, id="bad_uptime"),
+        pytest.param({}, lambda: 1.0, id="no_stat"),
+        pytest.param({"/proc/4242/stat": _stat_line("p", 5)}, _no_boot_clock, id="no_uptime"),
+        pytest.param({"/proc/4242/stat": "4242 no parenthesis"}, lambda: 1.0, id="no_paren"),
+        pytest.param({"/proc/4242/stat": "4242 (p) S 1 2"}, lambda: 1.0, id="short"),
+        pytest.param({"/proc/4242/stat": _stat_line("p", 5)}, lambda: math.nan, id="bad_uptime"),
         pytest.param(
-            {"/proc/4242/stat": _stat_line("p", 5).replace(" 5 1000", " five 1000"), "/proc/uptime": "1 1"},
-            id="bad_starttime",
+            {"/proc/4242/stat": _stat_line("p", 5).replace(" 5 1000", " five 1000")}, lambda: 1.0, id="bad_starttime"
         ),
     ],
 )
-def test_ac10_an_unreadable_start_time_is_none(files: dict[str, str]) -> None:
+def test_ac10_an_unreadable_start_time_is_none(files: dict[str, str], boot_clock: Callable[[], float]) -> None:
     assert config_ui.process_started_at(
-        4242, read_text=_reader(files), clock=lambda: 100.0, ticks_per_second=100, platform="linux"
+        4242,
+        read_text=_reader(files),
+        clock=lambda: 100.0,
+        boot_clock=boot_clock,
+        ticks_per_second=100,
+        platform="linux",
     ) is None
 
 
@@ -2026,6 +2086,16 @@ CONTAINER_COMMAND = [
 ]
 #: Stage 1 copies these sources by name and nothing else.
 BUILD_SOURCES = ["pyproject.toml", "LICENSE", "core", "modules"]
+#: The final stage's whole environment: the base's ``PATH`` and ``LANG``,
+#: the companion's three; never the base's ``GPG_KEY`` (AC17) or its other
+#: build variables.
+FINAL_ENVIRONMENT = {
+    "PATH": "/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "XDG_CONFIG_HOME": "/data",
+    "HOME": "/data",
+    "PYTHONUNBUFFERED": "1",
+}
 #: AC17: names an image environment variable or label must never match.
 SECRET_NAME = re.compile(r".*_KEY|.*_TOKEN|.*_SECRET|.*PASSWORD.*")
 
@@ -2095,54 +2165,79 @@ def _credential_names() -> set[str]:
     return names
 
 
-def test_ac11_two_stages_on_one_digest_pinned_base() -> None:
+def test_ac11_the_build_and_runtime_stages_on_one_digest_pinned_base() -> None:
     stages = _stages()
-    assert len(stages) == 2
-    (build_from,), (final_from,) = (_arguments(stage, "FROM") for stage in stages)
-    final_image = final_from.split()[0]
-    assert PINNED_BASE.fullmatch(final_image), final_image
+    assert len(stages) == 3
+    (build_from,), (runtime_from,), (final_from,) = (_arguments(stage, "FROM") for stage in stages)
+    runtime_words = runtime_from.split()
+    runtime_image = runtime_words[0]
+    assert PINNED_BASE.fullmatch(runtime_image), runtime_image
+    assert [word.lower() for word in runtime_words[1:]] == ["as", "runtime"]
     build_words = build_from.split()
-    assert build_words[0] == final_image
+    assert build_words[0] == runtime_image
     assert [word.lower() for word in build_words[1:]] == ["as", "build"]
+    # The final stage is the runtime stage's files without its base's
+    # environment: Docker cannot unset an inherited variable (AC17).
+    assert final_from == "scratch"
+
+
+def test_ac11_the_final_stage_is_the_runtime_stages_files_and_nothing_else() -> None:
+    _, runtime, final = _stages()
+    runtime_name = _arguments(runtime, "FROM")[0].split()[-1]
+    copies = [_copy_sources(arguments) for arguments in _arguments(final, "COPY")]
+    assert copies == [([f"--from={runtime_name}"], ["/"])]
+    assert _arguments(final, "COPY")[0].split()[-1] == "/"
+    assert not _arguments(final, "RUN") and not _arguments(final, "ADD")
 
 
 def test_ac11_the_final_stage_installs_the_first_stages_wheel_and_no_checkout() -> None:
-    build, final = _stages()
+    build, runtime, _ = _stages()
     build_name = _arguments(build, "FROM")[0].split()[-1]
-    copies = [_copy_sources(arguments) for arguments in _arguments(final, "COPY")]
+    copies = [_copy_sources(arguments) for arguments in _arguments(runtime, "COPY")]
     assert copies == [([f"--from={build_name}"], ["/wheels"])]
     assert "/wheels" in " ".join(_arguments(build, "RUN"))
     assert "--wheel-dir /wheels" in " ".join(_arguments(build, "RUN"))
-    installs = [run for run in _arguments(final, "RUN") if "pip install" in run]
+    installs = [run for run in _arguments(runtime, "RUN") if "pip install" in run]
     assert len(installs) == 1 and re.search(r"pip install [^&]*/wheels/\*\.whl", installs[0])
-    assert not _arguments(final, "ADD")
+    assert not _arguments(runtime, "ADD")
 
 
 def test_ac11_the_build_stage_copies_only_the_wheels_files_by_name() -> None:
     for stage in _stages():
         assert not _arguments(stage, "ADD")
         for arguments in _arguments(stage, "COPY"):
-            _, sources = _copy_sources(arguments)
+            flags, sources = _copy_sources(arguments)
+            if any(flag.startswith("--from=") for flag in flags):
+                # A stage's files, not the context's (the final stage's ``/``).
+                continue
             assert all(source.rstrip("/") not in (".", "./", "") for source in sources), arguments
-    build, _ = _stages()
+    build = _stages()[0]
     sources = [source for arguments in _arguments(build, "COPY") for source in _copy_sources(arguments)[1]]
     assert sources == BUILD_SOURCES
 
 
 def test_ac11_the_final_user_is_numeric_10001_with_its_data_volume() -> None:
-    _, final = _stages()
+    _, runtime, final = _stages()
     assert _arguments(final, "USER")[-1] == "10001"
     assert _arguments(final, "VOLUME") == ["/data"]
     assert _arguments(final, "EXPOSE") == ["8765"]
-    environment = " ".join(_arguments(final, "ENV")).split()
-    assert {"XDG_CONFIG_HOME=/data", "HOME=/data", "PYTHONUNBUFFERED=1"} <= set(environment)
-    runs = " ".join(_arguments(final, "RUN"))
+    runs = " ".join(_arguments(runtime, "RUN"))
     assert "mkdir -m 0700 /data" in runs and "chown 10001:10001 /data" in runs
     assert "--uid 10001" in runs and "--gid 10001" in runs and "--home-dir /data" in runs
 
 
+def test_ac17_the_final_stage_declares_exactly_the_companions_environment() -> None:
+    build, runtime, final = _stages()
+    words = " ".join(_arguments(final, "ENV")).split()
+    assert dict(word.split("=", 1) for word in words) == FINAL_ENVIRONMENT
+    assert len(words) == len(FINAL_ENVIRONMENT)
+    # The final stage starts from nothing, so its ENV is the image's whole
+    # environment; the stages before it declare none of their own.
+    assert not _arguments(build, "ENV") and not _arguments(runtime, "ENV")
+
+
 def test_ac11_the_default_command_is_a2s_and_parses_as_container_mode() -> None:
-    _, final = _stages()
+    final = _stages()[-1]
     (command,) = _arguments(final, "CMD")
     argv = json.loads(command)
     assert argv == CONTAINER_COMMAND
@@ -2153,7 +2248,7 @@ def test_ac11_the_default_command_is_a2s_and_parses_as_container_mode() -> None:
 
 
 def test_ac11_the_healthcheck_runs_the_health_command() -> None:
-    _, final = _stages()
+    final = _stages()[-1]
     (healthcheck,) = _arguments(final, "HEALTHCHECK")
     options, _, command = healthcheck.partition(" CMD ")
     assert json.loads(command) == ["twitch-ia-compagnon-config-ui", "--health"]
@@ -2371,7 +2466,7 @@ def test_ac14_the_healthcheck_runs_the_health_command_with_the_dockerfiles_timin
     healthcheck = _service()["healthcheck"]
     assert healthcheck["test"] == ["CMD", "twitch-ia-compagnon-config-ui", "--health"]
     assert "--health" in healthcheck["test"]
-    _, final = _stages()
+    final = _stages()[-1]
     (dockerfile,) = _arguments(final, "HEALTHCHECK")
     options, _, _ = dockerfile.partition(" CMD ")
     flags = dict(option.lstrip("-").split("=", 1) for option in options.split())
@@ -2625,6 +2720,74 @@ def test_ac13_each_guide_states_one_size_in_mb_to_one_decimal(guide: Path) -> No
     assert len(_SIZE.findall(size_section)) == 1
 
 
+#: R8's trial record (``docs/campaigns/phase10/trial-record.md``).
+TRIAL_RECORD = DOCS / "campaigns" / "phase10" / "trial-record.md"
+#: The fields the spec's target list and P12 name for it, in its order.
+TRIAL_RECORD_FIELDS = (
+    "Who",
+    "Host",
+    "Docker Engine version",
+    "Docker Compose version",
+    "Commit",
+    "Commands",
+    "Trial start",
+    "Trial end",
+    "Image size (bytes)",
+    "Health states observed",
+    "First run",
+    "Restart over the restored volume",
+    "Trial nodes",
+    "Outcome",
+    "Limits",
+)
+_RECORD_LINE = re.compile(r"^- (?P<label>[^:\n]+):(?P<value>.*)$")
+_RECORD_NON_VALUES = {"", "-", "?", "...", "…", "n/a", "tbd", "todo", "unknown"}
+
+
+def _record_fields(text: str) -> dict[str, list[str]]:
+    """Each top-level ``- Label: value`` of the ``## Record`` section; a
+    value is its line's text plus the indented lines under it."""
+
+    _, heading, record = text.partition("\n## Record\n")
+    assert heading, "the trial record has no ## Record section"
+    fields: dict[str, list[str]] = {}
+    label = None
+    for line in record.splitlines():
+        if line.startswith("## "):
+            break
+        match = _RECORD_LINE.match(line)
+        if match is not None:
+            label = match["label"]
+            fields.setdefault(label, []).append(match["value"].strip())
+        elif label is not None and line.startswith((" ", "\t")) and line.strip():
+            fields[label][-1] = (fields[label][-1] + "\n" + line.strip()).strip()
+    return fields
+
+
+def test_ac25_the_trial_record_fills_every_field_once() -> None:
+    fields = _record_fields(TRIAL_RECORD.read_text(encoding="utf-8"))
+    assert list(fields) == list(TRIAL_RECORD_FIELDS)
+    for label in TRIAL_RECORD_FIELDS:
+        (value,) = fields[label]
+        assert value.strip("`").strip().lower() not in _RECORD_NON_VALUES, label
+    assert re.fullmatch(r"[0-9a-f]{40}", fields["Commit"][0].strip("`")), fields["Commit"]
+    for label in ("Trial start", "Trial end"):
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", fields[label][0]), fields[label]
+    for node in TRIAL_NODES:
+        assert node in fields["Trial nodes"][0], node
+
+
+@pytest.mark.parametrize("guide", [GUIDE, GUIDE_FR], ids=lambda path: path.name)
+def test_ac13_the_guides_size_agrees_with_the_records_bytes(guide: Path) -> None:
+    (recorded,) = _record_fields(TRIAL_RECORD.read_text(encoding="utf-8"))["Image size (bytes)"]
+    size = int(recorded.strip("`"))
+    (size_section,) = [text for title, text in _guide_sections(guide).items() if "MB" in text]
+    (stated,) = _SIZE.findall(size_section)
+    megabytes = float(stated.removesuffix(" MB"))
+    assert megabytes > 0
+    assert abs(megabytes * 1_000_000 - size) <= 0.05 * size, (stated, size)
+
+
 def test_ac25_the_documentation_index_links_both_guides() -> None:
     text = (DOCS / "README.md").read_text(encoding="utf-8")
     assert "](self-hosting.md)" in text
@@ -2776,11 +2939,18 @@ import json, os
 from core import config_ui
 
 skipped = {"/proc", "/sys", "/dev", "/run", "/tmp"}
+# The files Docker mounts into every container and rewrites at each start
+# (/etc/hostname, /etc/hosts, /etc/resolv.conf): mount points, not the image's
+# filesystem, and not writable by uid 10001.
+with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+    mounted = {line.split()[4] for line in handle}
 written, unreadable = [], []
 for root, directories, files in os.walk("/"):
     directories[:] = [name for name in directories if os.path.join(root, name) not in skipped]
     for name in files:
         path = os.path.join(root, name)
+        if path in mounted:
+            continue
         try:
             if os.lstat(path).st_mtime > ARGS["since"]:
                 written.append(path)
@@ -2818,6 +2988,78 @@ import json, os, signal
 os.kill(ARGS["pid"], signal.SIGKILL)
 print(json.dumps({"killed": ARGS["pid"]}))
 """
+
+#: The fake Twitch the runtime nodes (AC9, AC16, AC21) start beside the
+#: companion. Their volume holds a completed wizard whose credentials are the
+#: trial's sentinels, so on the restart ``--start-runtime`` launches the
+#: runtime and the twitch module validates the sentinel token: against the
+#: real ``id.twitch.tv`` that is a 401, ``prepare`` fails and the runtime
+#: exits — a rejected token stops startup by design, and the health line
+#: ``unhealthy: runtime exited`` is then the truth. The control run of the
+#: shipped compose file over an empty volume never launches a runtime, which
+#: is why it is healthy. So the platform's edges are faked here, as the
+#: wizard proof fakes its validation: a service on the project's network
+#: answers for Twitch's host names over TLS signed by its own authority, and
+#: the companion trusts that authority through ``SSL_CERT_FILE``; the image's
+#: code, its module and the health contract are untouched.
+FAKE_TWITCH = """
+import asyncio, json, os, ssl, subprocess
+from aiohttp import web
+
+directory = ARGS["directory"]
+authority_key, authority = os.path.join(directory, "authority.key"), os.path.join(directory, "authority.pem")
+key, certificate = os.path.join(directory, "server.key"), os.path.join(directory, "server.pem")
+
+
+def openssl(*arguments):
+    subprocess.run(["openssl", *arguments], check=True, capture_output=True)
+
+
+openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=tiac trial authority",
+        "-keyout", authority_key, "-out", authority)
+openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=" + ARGS["hosts"][0],
+        "-CA", authority, "-CAkey", authority_key,
+        "-addext", "subjectAltName=" + ",".join("DNS:" + host for host in ARGS["hosts"]),
+        "-keyout", key, "-out", certificate)
+os.chmod(authority, 0o644)
+
+
+async def validate(request):
+    return web.json_response(ARGS["validation"])
+
+
+async def eventsub(request):
+    websocket = web.WebSocketResponse()
+    await websocket.prepare(request)
+    welcome = {"metadata": {"message_type": "session_welcome"}, "payload": {"session": {"id": "tiac-trial-session"}}}
+    await websocket.send_str(json.dumps(welcome))
+    async for _ in websocket:
+        pass
+    return websocket
+
+
+async def subscribe(request):
+    return web.json_response({"data": [{"id": "tiac-trial-subscription", "status": "enabled"}]}, status=202)
+
+
+async def main():
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(certificate, key)
+    application = web.Application()
+    application.router.add_get(ARGS["paths"]["validate"], validate)
+    application.router.add_get(ARGS["paths"]["eventsub"], eventsub)
+    application.router.add_post(ARGS["paths"]["subscriptions"], subscribe)
+    runner = web.AppRunner(application, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", 443, ssl_context=context).start()
+    open(os.path.join(directory, "ready"), "w").close()
+    await asyncio.Event().wait()
+
+
+asyncio.run(main())
+"""
+#: Where the fake's authority is shared with the companion (read-only there).
+FAKE_TWITCH_DIRECTORY = "/run/tiac-trial-twitch"
 
 #: Run inside an image container as root: the files no layer may hold, the
 #: repository's leftovers, ``/data`` and the shipped profiles (AC12, AC17, P2).
@@ -3042,8 +3284,9 @@ def _answered(result: subprocess.CompletedProcess[str], cause: str) -> dict[str,
 
 class _Project:
     """One trial's compose project: its own name, the shipped compose file
-    (plus, for AC16, an override holding the sentinel environment) and the
-    build context from the environment."""
+    (plus, per node, overrides: AC16's sentinel environment, AC21's restart
+    policy, the runtime nodes' :data:`FAKE_TWITCH`) and the build context
+    from the environment."""
 
     def __init__(self, docker: str, node: str, files: list[Path]) -> None:
         self.docker = docker
@@ -3173,6 +3416,65 @@ def _landing(project: _Project) -> str:
     return re.sub(r"^https?://[^/]+", "", answer["location"] or "")
 
 
+def _fake_twitch(root: Path, credentials: dict[str, str]) -> Path:
+    """A compose override adding :data:`FAKE_TWITCH` as a ``twitch`` service
+    the companion waits for; the override's path. The fake answers the
+    validation the wizard proof's platform answers, at the module's own URLs."""
+
+    from urllib.parse import urlsplit
+
+    from modules import twitch
+
+    urls = {
+        "validate": twitch.TOKEN_VALIDATION_URL,
+        "eventsub": twitch.EVENTSUB_URL,
+        "subscriptions": twitch.EVENTSUB_SUBSCRIPTIONS_URL,
+    }
+    hosts = sorted({urlsplit(url).hostname for url in urls.values()})
+    profile = {item.id: item for item in wizard.load_profiles()}["silent"]
+    validation = {
+        "client_id": credentials["TWITCH_CLIENT_ID"],
+        "login": "trialchannel",
+        "user_id": TRIAL_USER_ID,
+        "scopes": list(profile.scopes),
+        "expires_in": 86400,
+    }
+    script = _proof(
+        FAKE_TWITCH,
+        {
+            "directory": FAKE_TWITCH_DIRECTORY,
+            "hosts": hosts,
+            "paths": {role: urlsplit(url).path for role, url in urls.items()},
+            "validation": validation,
+        },
+    )
+    services = {
+        SERVICE: {
+            "depends_on": {"twitch": {"condition": "service_healthy"}},
+            "environment": {"SSL_CERT_FILE": f"{FAKE_TWITCH_DIRECTORY}/authority.pem"},
+            "volumes": [f"tiac-trial-twitch:{FAKE_TWITCH_DIRECTORY}:ro"],
+        },
+        "twitch": {
+            "image": _image(),
+            "user": "0",
+            "command": ["python", "-c", script],
+            "volumes": [f"tiac-trial-twitch:{FAKE_TWITCH_DIRECTORY}"],
+            "networks": {"default": {"aliases": hosts}},
+            "healthcheck": {
+                "test": ["CMD", "test", "-f", f"{FAKE_TWITCH_DIRECTORY}/ready"],
+                "interval": "1s",
+                "timeout": "5s",
+                "retries": 120,
+            },
+        },
+    }
+    override = root / "compose.twitch.yaml"
+    override.write_text(
+        yaml.safe_dump({"services": services, "volumes": {"tiac-trial-twitch": {}}}), encoding="utf-8"
+    )
+    return override
+
+
 def _complete_wizard(project: _Project, credentials: dict[str, str]) -> str:
     """Screens 1–5 (screen 5 the dry run); the proof's combined output."""
 
@@ -3258,7 +3560,7 @@ def test_trial_container_image(tmp_path: Path) -> None:
         assert closure["uid"] == 10001
         uid = _command([docker, "run", "--rm", "--entrypoint", "id", image, "-u"], cause="id -u failed")
         assert uid.stdout.strip() == "10001"
-        base = _arguments(_stages()[-1], "FROM")[0].split()[0]
+        base = _arguments(_stages()[1], "FROM")[0].split()[0]
         added = _pip_names(docker, image) - _pip_names(docker, base)
         assert added == {"twitch-ia-compagnon", *closure["closure"]}, added
         if sys.version_info >= (3, 11):
@@ -3278,6 +3580,7 @@ def test_trial_container_image(tmp_path: Path) -> None:
         config = inspected["Config"]
         names = [entry.split("=", 1)[0] for entry in config.get("Env") or ()] + list(config.get("Labels") or {})
         assert not [name for name in names if name in _credential_names() or SECRET_NAME.fullmatch(name)], names
+        assert dict(entry.split("=", 1) for entry in config.get("Env") or ()) == FINAL_ENVIRONMENT
         size = int(_command([docker, "image", "inspect", "--format", "{{.Size}}", image], cause="docker image inspect failed").stdout.strip())
         commit = _command(["git", "-C", str(ROOT), "rev-parse", "HEAD"], cause="git rev-parse failed").stdout.strip()
         TRIAL_ARTEFACT.parent.mkdir(parents=True, exist_ok=True)
@@ -3309,7 +3612,8 @@ def test_trial_container_volume(tmp_path: Path) -> None:
     # credentials, runtime running), AC7 (every write under the per-user directory).
     docker = _docker()
     _daemon(docker)
-    with _project(docker, "test_trial_container_volume") as project:
+    twitch = _fake_twitch(tmp_path, _sentinels())
+    with _project(docker, "test_trial_container_volume", [COMPOSE, twitch]) as project:
         project.up()
         since = _started_at(project)
         assert _landing(project) == config_ui.LANDING_WIZARD
@@ -3350,7 +3654,8 @@ def test_trial_container_secrets(tmp_path: Path) -> None:
     sentinels = _sentinels()
     override = tmp_path / "compose.secrets.yaml"
     override.write_text(yaml.safe_dump({"services": {SERVICE: {"environment": sentinels}}}), encoding="utf-8")
-    with _project(docker, "test_trial_container_secrets", [COMPOSE, override]) as project:
+    twitch = _fake_twitch(tmp_path, sentinels)
+    with _project(docker, "test_trial_container_secrets", [COMPOSE, override, twitch]) as project:
         project.up()
         wizard_output = _complete_wizard(project, sentinels)
         first_logs = project.logs()
@@ -3392,7 +3697,8 @@ def test_trial_container_health(tmp_path: Path) -> None:
     _daemon(docker)
     override = tmp_path / "compose.health.yaml"
     override.write_text(yaml.safe_dump({"services": {SERVICE: {"restart": "no"}}}), encoding="utf-8")
-    with _project(docker, "test_trial_container_health", [COMPOSE, override]) as project:
+    twitch = _fake_twitch(tmp_path, _sentinels())
+    with _project(docker, "test_trial_container_health", [COMPOSE, override, twitch]) as project:
         project.up()
         assert project.health()[0] == "healthy"
         _complete_wizard(project, _sentinels())

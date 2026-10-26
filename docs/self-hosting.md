@@ -263,8 +263,8 @@ The start period (90 s) is longer than those 60 s, so a normal start is never re
 
 ## 10. Image size
 
-The image measures **0.0 MB** as reported by `docker image inspect --format '{{.Size}}'`.
-This figure is a placeholder until the phase-10 trial measures the image and replaces it.
+The image measures **147.7 MB** as reported by `docker image inspect --format '{{.Size}}'`,
+measured in the phase-10 trial ([trial record](campaigns/phase10/trial-record.md)).
 
 ## 11. Limits
 

@@ -1349,11 +1349,19 @@ def _read_proc_text(path: str) -> str:
         return handle.read(4096)
 
 
+def _boot_clock() -> float:
+    """Seconds since boot, suspend included, at nanosecond resolution: the
+    clock ``starttime`` of ``/proc/<pid>/stat`` counts in."""
+
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
 def process_started_at(
     pid: int,
     *,
     read_text: Callable[[str], str] | None = None,
     clock: Callable[[], float] | None = None,
+    boot_clock: Callable[[], float] | None = None,
     ticks_per_second: int | None = None,
     platform: str | None = None,
 ) -> float | None:
@@ -1363,20 +1371,26 @@ def process_started_at(
     Linux only: field 22 (``starttime``, clock ticks since boot) of
     ``/proc/<pid>/stat``, parsed after the last ``)`` (``comm`` may hold
     spaces and parentheses), over ``SC_CLK_TCK``, added to a boot time of
-    ``clock()`` minus the first field of ``/proc/uptime``, both files read in
-    this one call. That keeps centisecond precision, where ``btime`` of
-    ``/proc/stat`` is whole seconds and would move a start up to 1 s earlier.
-    The boot time follows the current wall clock, as ``st_mtime`` and the
-    status record's timestamp do; the wall clock is read before
-    ``/proc/uptime``, so a delay between the two reads only moves the
-    computed start earlier. Any other platform, any ``OSError`` and
-    any parse failure is ``None``. The keyword arguments are test seams.
+    ``clock()`` minus the uptime, both sampled in this one call. The uptime
+    is ``CLOCK_BOOTTIME`` (``boot_clock()``), the clock ``/proc/uptime``
+    prints, at nanosecond resolution: ``/proc/uptime`` truncates to
+    centiseconds, which moves the boot time, and the start, up to 10 ms
+    later (a publisher that wrote its record within that of its own start
+    judged stale), and rounding it up instead moves them up to 10 ms earlier
+    (a pid reused within that of a publication judged live); ``btime`` of
+    ``/proc/stat`` is whole seconds. The boot time follows the current wall
+    clock, as ``st_mtime`` and the status record's timestamp do; the wall
+    clock is sampled before the uptime, so a delay between the two samples
+    only moves the computed start earlier. Any other platform, any
+    ``OSError`` and any parse failure is ``None``. The keyword arguments are
+    test seams.
     """
 
     if (sys.platform if platform is None else platform) != "linux":
         return None
     read = _read_proc_text if read_text is None else read_text
     now = time.time if clock is None else clock
+    since_boot = _boot_clock if boot_clock is None else boot_clock
     try:
         stat_text = read(f"/proc/{pid}/stat")
         # The wall clock is sampled before the uptime, never after: a delay
@@ -1384,7 +1398,7 @@ def process_started_at(
         # earlier (a genuine publisher is never judged stale for it) where
         # the other order would move them later by that delay.
         wall = now()
-        uptime_text = read("/proc/uptime")
+        uptime = since_boot()
         ticks = os.sysconf("SC_CLK_TCK") if ticks_per_second is None else ticks_per_second
         _comm, closing, rest = stat_text.rpartition(")")
         fields = rest.split()
@@ -1392,8 +1406,7 @@ def process_started_at(
         if not closing or len(fields) < 20 or ticks <= 0:
             return None
         starttime = int(fields[19])
-        uptime = float(uptime_text.split()[0])
-    except (OSError, ValueError, IndexError):
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
     if starttime < 0 or not math.isfinite(uptime):
         return None
