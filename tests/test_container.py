@@ -2381,6 +2381,12 @@ def test_ac14_the_healthcheck_runs_the_health_command_with_the_dockerfiles_timin
     assert str(healthcheck["retries"]) == flags["retries"]
 
 
+def test_ac21_the_trials_health_wait_outlasts_the_declared_start_period_and_retries() -> None:
+    # The trial must not give up while Docker itself still calls it starting.
+    timeout = _seconds(_service()["healthcheck"]["timeout"])
+    assert _health_deadline() >= 90 + (30 + timeout) * 3
+
+
 def test_ac14_the_build_context_is_a1s_git_url_overridable_by_one_variable() -> None:
     assert _service()["build"] == {"context": BUILD_CONTEXT}
 
@@ -2652,10 +2658,11 @@ TRIAL_NODES = (
 SERVICE = "companion"
 #: The per-user directory inside the image (A3).
 DATA_DIRECTORY = "/data/twitch-ia-compagnon"
-#: Bounds of every Docker call: the build, ``up --wait``, anything else.
+#: Bounds of every Docker call: the build, anything else.
 BUILD_SECONDS = 1800
-WAIT_SECONDS = 300
 COMMAND_SECONDS = 180
+#: How often the trial reads the health status while it waits.
+HEALTH_POLL_SECONDS = 5
 #: The healthcheck's interval and timeout (the Dockerfile's, AC21's unit).
 HEALTH_INTERVAL_SECONDS = 30
 HEALTH_TIMEOUT_SECONDS = 10
@@ -3000,6 +3007,26 @@ def _image() -> str:
     return str(_service()["image"])
 
 
+def _seconds(duration: str) -> int:
+    """A compose duration of whole seconds (``"90s"``) as an int."""
+
+    match = re.fullmatch(r"(\d+)s", str(duration))
+    assert match, duration
+    return int(match.group(1))
+
+
+def _health_deadline() -> int:
+    """How long :meth:`_Project.up` waits: the compose file's own
+    ``start_period + (interval + timeout) × (retries + 1)``. Docker schedules
+    each interval after the previous probe ends, so every counted run adds its
+    own timeout; the one extra run covers a probe begun inside the start
+    period, whose failure does not count."""
+
+    healthcheck = _service()["healthcheck"]
+    probe = _seconds(healthcheck["interval"]) + _seconds(healthcheck["timeout"])
+    return _seconds(healthcheck["start_period"]) + probe * (int(healthcheck["retries"]) + 1)
+
+
 def _proof(script: str, arguments: dict[str, Any]) -> str:
     """*script* with its arguments bound: piped to an interpreter, never baked."""
 
@@ -3035,12 +3062,28 @@ class _Project:
         self.compose("build", cause="docker build failed", timeout=BUILD_SECONDS)
 
     def up(self) -> None:
-        """``up -d`` waiting, within Docker's own bound, for a healthy service."""
+        """``up -d``, then the health status polled until Docker settles it:
+        ``healthy`` passes; ``unhealthy``, an exit or the deadline (never
+        shorter than the compose file's ``start_period + (interval + timeout) ×
+        retries``)
+        fails with the container's last health log."""
 
-        self.compose(
-            "up", "-d", "--wait", "--wait-timeout", str(WAIT_SECONDS),
-            cause="docker compose up did not report the service healthy", timeout=WAIT_SECONDS + 60,
-        )
+        self.compose("up", "-d", cause="docker compose up -d failed")
+        deadline = time.monotonic() + _health_deadline()
+        while True:
+            state = self.inspect()["State"]
+            health = state.get("Health") or {}
+            status = health.get("Status", "")
+            if status == "healthy":
+                return
+            if status == "unhealthy" or not state.get("Running") or time.monotonic() >= deadline:
+                outputs = [entry["Output"].strip() for entry in health.get("Log") or ()]
+                pytest.fail(
+                    f"the service is {status or state.get('Status')!r}, not healthy"
+                    f" (exit code {state.get('ExitCode')}); last health log: {outputs[-3:]}"
+                )
+            # The wait between reads: ``docker events --until``, as everywhere here.
+            _events(self, "health_status", time.time(), HEALTH_POLL_SECONDS)
 
     def container(self) -> str:
         found = self.compose("ps", "-a", "-q", SERVICE, cause="docker compose ps failed").stdout.split()
