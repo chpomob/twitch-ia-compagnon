@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 
 import conftest
+import test_container
 import test_phase2_trials
 import test_phase3_trials
 import test_phase5_trials
@@ -437,6 +438,7 @@ TRIAL_FILES = {
     "test_phase2_trials.py": test_phase2_trials,
     "test_phase3_trials.py": test_phase3_trials,
     "test_phase5_trials.py": test_phase5_trials,
+    "test_container.py": test_container,
 }
 
 
@@ -487,7 +489,7 @@ def test_no_trial_node_is_exempt_without_its_opt_in(monkeypatch: pytest.MonkeyPa
         for file_name, module in TRIAL_FILES.items()
         for test_name in _trial_nodes(module)
     ]
-    assert len(nodes) == 20
+    assert len(nodes) == 25
     assert [node for node in nodes if trial_opted_in(*node)] == []
 
 

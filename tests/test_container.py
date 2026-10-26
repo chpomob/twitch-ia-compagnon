@@ -4,7 +4,7 @@ The file holds two kinds of node. *Ordinary checks* run in every
 ``python -m pytest tests/`` under the AC33 isolation guard, opening no
 socket and starting no process: they read the files that describe the image
 and drive the UI's settings, records and rules against fakes. *Trial checks*
-(``test_trial_container_*``, added by later steps) need a Docker daemon: each
+(``test_trial_container_*``) need a Docker daemon: each
 is gated on ``TWITCH_IA_COMPAGNON_CONTAINER_TRIAL`` and skips with that reason
 when it is unset, and once it is set a missing daemon is a failure, never a
 skip.
@@ -60,17 +60,35 @@ parsed with PyYAML has one service and one named volume mounted at
 health command as its healthcheck with the Dockerfile's timings, A1's exact
 build context, nothing Docker-Desktop-specific and no other file required;
 its optional credential and token-file entries are comments, not keys.
+
+Last, the container trial itself (R7, AC23's default parts): the five
+``test_trial_container_*`` nodes, each starting with phase 2's
+``required(CONTAINER_TRIAL_VARIABLE)``, build the image from
+``TWITCH_IA_COMPAGNON_BUILD_CONTEXT`` and drive it with ``docker compose``
+under a project name of their own, waiting only through Docker's bounded
+waits and subprocess timeouts, and removing what they created. Whatever they
+run inside the container is piped from strings of this file to its own
+interpreter, never baked. The ordinary checks of this part read the file's
+own shape and run each trial body with ``docker`` unfindable: a failure
+naming it, never a skip.
 """
 
 from __future__ import annotations
 
 import ast
+import base64
+import contextlib
+import hashlib
 import inspect
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
+import time
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +98,7 @@ from typing import Any
 import pytest
 import yaml
 from test_config_ui import _request
+from test_phase2_trials import required
 
 import core.config_ui as config_ui
 from core.config_ui import console, locations
@@ -2378,3 +2397,793 @@ def test_ac14_the_optional_entries_are_comments_not_keys() -> None:
     assert set(document) == {"services", "volumes"}
     assert not {"env_file", "environment", "secrets", "command"} & set(service)
     assert "--token-file" not in json.dumps(document)
+
+
+# -- the container trial (R7, AC7–AC9, AC12, AC13, AC16, AC17, AC21–AC23) ---- #
+
+CONTAINER_TRIAL_VARIABLE = "TWITCH_IA_COMPAGNON_CONTAINER_TRIAL"
+BUILD_CONTEXT_VARIABLE = "TWITCH_IA_COMPAGNON_BUILD_CONTEXT"
+
+#: R7: the trial nodes, exactly these five.
+TRIAL_NODES = (
+    "test_trial_container_image",
+    "test_trial_container_volume",
+    "test_trial_container_secrets",
+    "test_trial_container_health",
+    "test_trial_container_profiles",
+)
+
+SERVICE = "companion"
+#: The per-user directory inside the image (A3).
+DATA_DIRECTORY = "/data/twitch-ia-compagnon"
+#: Bounds of every Docker call: the build, ``up --wait``, anything else.
+BUILD_SECONDS = 1800
+WAIT_SECONDS = 300
+COMMAND_SECONDS = 180
+#: The healthcheck's interval and timeout (the Dockerfile's, AC21's unit).
+HEALTH_INTERVAL_SECONDS = 30
+HEALTH_TIMEOUT_SECONDS = 10
+#: Where the trial writes its measurement (AC13): a run artefact, not a source.
+TRIAL_ARTEFACT = ROOT / "docs" / "runs" / "phase10-container-trial.json"
+#: AC12: ``pyproject.toml``'s dependencies at the brief's HEAD.
+DECLARED_DEPENDENCIES = ["aiohttp>=3.9,<4", "PyYAML>=6,<7"]
+#: AC17 and finding P2: file names no layer of the image may hold.
+FORBIDDEN_NAMES = [
+    "profile.yaml",
+    "*.instance.json",
+    "*.supervisor.json",
+    "*.credentials.json",
+    "*.local.yaml",
+    ".env*",
+]
+#: Finding P2: decoys written into the build context, which must stay out.
+DECOYS = ["profile.yaml", "core/profile.yaml", "x.instance.json"]
+
+#: The broadcaster's channel the fake platform answer names (fixture).
+TRIAL_USER_ID = "41245072"
+TRIAL_IDENTITIES = {"broadcaster_id": TRIAL_USER_ID, "bot_user_id": "90210417"}
+_TRIAL_MODEL = {"model_endpoint": "https://model.invalid/v1", "model_name": "trial-model"}
+#: AC22: the streamer's answers per profile, as phase 9's fixtures give them.
+TRIAL_PARAMETERS: dict[str, dict[str, Any]] = {
+    "chat_qa": {"companion_name": "Nova", **_TRIAL_MODEL},
+    "channel_points": {"reward_id": "5f1c0d7e-reward-fixture", **_TRIAL_MODEL},
+    "spoken_keyword": {
+        "wake_word": "hey nova",
+        "recorder": ["recorder", "--wav", "-"],
+        "detector": {"kind": "command", "argv": ["detector", "--phrase", "hey nova"]},
+        "transcription_endpoint": "https://transcription.invalid/v1",
+        "transcription_model": "trial-transcriber",
+        **_TRIAL_MODEL,
+    },
+    "silent": {},
+}
+#: AC22: each profile's declared dry-run outcome.
+EXPECTED_OUTCOMES = {
+    "chat_qa": "completed",
+    "channel_points": "completed",
+    "spoken_keyword": "completed",
+    "silent": "not_triggered",
+}
+
+
+def _sentinel(name: str) -> str:
+    """AC16: one distinct 24-character value per credential name."""
+
+    return ("sentinel" + hashlib.sha256(name.encode("utf-8")).hexdigest())[:24]
+
+
+def _sentinels() -> dict[str, str]:
+    return {name: _sentinel(name) for name in sorted(_credential_names())}
+
+
+#: Run inside the container: the access URL's exchange, redirects not followed.
+ACCESS_PROOF = """
+import http.client, json
+connection = http.client.HTTPConnection("127.0.0.1", ARGS["port"], timeout=10)
+connection.request("GET", "/?token=" + ARGS["token"])
+response = connection.getresponse()
+print(json.dumps({"status": response.status, "location": response.getheader("Location")}))
+"""
+
+#: Run inside the container: screens 1–5 of the wizard over the default
+#: location, through the image's own ``Wizard`` (a ``ConfigUI`` built like
+#: the serving one); only the platform's validation answer is faked, so no
+#: real platform credential is needed, and screen 5 is the production dry run.
+WIZARD_PROOF = """
+import json
+from core import config_ui
+from core.config_ui import wizard
+
+profile = {item.id: item for item in wizard.load_profiles()}[ARGS["profile"]]
+
+async def platform(method, url, *, headers, body, timeout):
+    answer = {
+        "client_id": ARGS["credentials"]["TWITCH_CLIENT_ID"],
+        "login": "trialchannel",
+        "user_id": ARGS["user_id"],
+        "scopes": list(profile.scopes),
+        "expires_in": 3600,
+    }
+    return wizard.HttpAnswer(200, json.dumps(answer).encode("utf-8"))
+
+settings = config_ui.UISettings.from_argv([])
+ui = config_ui.ConfigUI(settings, wizard_seams=wizard.WizardSeams(platform_transport=platform))
+screens = [
+    [("screen", "1"), ("profile", profile.id)],
+    [("screen", "2")] + [
+        (wizard.CREDENTIAL_FIELD + item.name, ARGS["credentials"][item.name])
+        for item in profile.credentials
+        if item.screen == "platform"
+    ],
+    [("screen", "3")],
+    [("screen", "4")],
+    [("screen", "5")],
+]
+for fields in screens:
+    ui.wizard.post(fields, "")
+print(json.dumps({"passed": list(ui.wizard.passed_screens()), "completed": ui.wizard.state.completed}))
+"""
+
+#: Run inside the container: the files written since the container started
+#: (temporary and kernel trees excluded), and the names the product's own
+#: settings give the files of the default location (AC7).
+FILES_PROOF = """
+import json, os
+from core import config_ui
+
+skipped = {"/proc", "/sys", "/dev", "/run", "/tmp"}
+written = []
+for root, directories, files in os.walk("/"):
+    directories[:] = [name for name in directories if os.path.join(root, name) not in skipped]
+    for name in files:
+        path = os.path.join(root, name)
+        try:
+            if os.lstat(path).st_mtime > ARGS["since"]:
+                written.append(path)
+        except OSError:
+            pass
+settings = config_ui.UISettings.from_argv([])
+named = {
+    "profile": settings.base_path,
+    "overlay": settings.overlay_path,
+    "status": settings.status_path,
+    "feed": settings.feed_path,
+    "wizard": settings.wizard_path,
+    "credentials": settings.credential_path,
+    "instance": settings.instance_path,
+    "supervision": settings.supervision_path,
+}
+print(json.dumps({
+    "written": sorted(written),
+    "named": {role: None if path is None else str(path) for role, path in named.items()},
+    "present": sorted(os.listdir(ARGS["directory"])),
+}))
+"""
+
+#: Run inside the container: one record's content, base64, or null.
+READ_PROOF = """
+import base64, json, os
+path = ARGS["path"]
+print(json.dumps({"content": base64.b64encode(open(path, "rb").read()).decode() if os.path.exists(path) else None}))
+"""
+
+#: Run inside the container: SIGKILL one pid (the runtime, then the UI).
+KILL_PROOF = """
+import json, os, signal
+os.kill(ARGS["pid"], signal.SIGKILL)
+print(json.dumps({"killed": ARGS["pid"]}))
+"""
+
+#: Run inside an image container as root: the files no layer may hold, the
+#: repository's leftovers, ``/data`` and the shipped profiles (AC12, AC17, P2).
+IMAGE_FILES_PROOF = """
+import fnmatch, json, os
+from importlib import metadata
+
+skipped = {"/proc", "/sys", "/dev"}
+forbidden, pyprojects, tests = [], [], []
+for root, directories, files in os.walk("/"):
+    directories[:] = [name for name in directories if os.path.join(root, name) not in skipped]
+    for name in files:
+        path = os.path.join(root, name)
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in ARGS["forbidden"]):
+            forbidden.append(path)
+        if name == "pyproject.toml":
+            pyprojects.append(path)
+        if name in ("test_container.py", "conftest.py"):
+            tests.append(path)
+try:
+    distribution = [str(item) for item in metadata.files("twitch-ia-compagnon") or ()]
+    profiles_directory = None
+    from core.config_ui import wizard
+    profiles_directory = str(wizard.PROFILES_DIRECTORY)
+    profiles = sorted(os.listdir(profiles_directory))
+except (metadata.PackageNotFoundError, ImportError):
+    distribution, profiles = None, []
+print(json.dumps({
+    "forbidden": sorted(forbidden),
+    "pyprojects": sorted(pyprojects),
+    "tests": sorted(tests),
+    "git": os.path.exists("/.git"),
+    "data": sorted(os.listdir("/data")) if os.path.isdir("/data") else None,
+    "distribution_tests": None if distribution is None else [item for item in distribution if item.startswith("tests/")],
+    "profiles": profiles,
+}))
+"""
+
+#: Run inside the image: the uid, and the requirement closure of the two
+#: declared dependencies read from the installed metadata (AC12).
+CLOSURE_PROOF = """
+import json, os
+from importlib import metadata
+from pip._vendor.packaging.requirements import Requirement
+from pip._vendor.packaging.utils import canonicalize_name
+
+installed = {canonicalize_name(item.metadata["Name"]): item for item in metadata.distributions()}
+closure, pending = set(), ["aiohttp", "PyYAML"]
+while pending:
+    name = canonicalize_name(pending.pop())
+    if name in closure:
+        continue
+    closure.add(name)
+    for text in installed[name].requires or ():
+        requirement = Requirement(text)
+        if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
+            pending.append(requirement.name)
+print(json.dumps({"uid": os.getuid(), "closure": sorted(closure)}))
+"""
+
+#: Run inside the container (AC22): the shipped profiles' digests, then each
+#: profile rendered by the wizard's generator with the fixture parameters,
+#: checked by ``twitch-ia-compagnon --check-config`` and dry-run with a fake
+#: model transport; every socket connection is refused and counted.
+PROFILES_PROOF = """
+import asyncio, hashlib, json, os, socket, subprocess, tempfile
+from pathlib import Path
+from core import main as application
+from core.contracts import PROBE_TOOL
+from core.config_ui import wizard
+
+connections = []
+
+def refused(self, address, *args):
+    connections.append(repr(address))
+    raise OSError("the trial refuses every connection")
+
+socket.socket.connect = refused
+socket.socket.connect_ex = refused
+
+
+class Answer:
+    def __init__(self, body):
+        self.status = 200
+        self.body = body
+
+    async def json(self):
+        return self.body
+
+    def release(self):
+        pass
+
+
+class Model:
+    async def post(self, url, **kwargs):
+        body = kwargs.get("json")
+        choice = body.get("tool_choice") if isinstance(body, dict) else None
+        function = choice.get("function") if isinstance(choice, dict) else None
+        if isinstance(function, dict) and function.get("name") == PROBE_TOOL:
+            call = {"id": "call-1", "type": "function", "function": {"name": PROBE_TOOL, "arguments": json.dumps({"ok": True})}}
+            return Answer({"choices": [{"message": {"content": None, "tool_calls": [call]}, "finish_reason": "tool_calls"}]})
+        return Answer({"choices": [{"message": {"content": "bonjour"}}]})
+
+    async def close(self):
+        pass
+
+
+digests = {
+    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(wizard.PROFILES_DIRECTORY.glob("*.json"))
+}
+environ = {**os.environ, **ARGS["credentials"]}
+work = Path(tempfile.mkdtemp())
+results = {}
+for profile in wizard.load_profiles():
+    parameters = ARGS["parameters"][profile.id]
+    document = wizard.generate_profile(profile, parameters, ARGS["identities"])
+    path = work / (profile.id + ".yaml")
+    path.write_text(wizard.render_profile_yaml(document), encoding="utf-8")
+    check = subprocess.run(
+        ["twitch-ia-compagnon", "--config", str(path), "--check-config"],
+        env=environ, capture_output=True, text=True, timeout=120,
+    )
+    event = wizard.dry_run_event(profile, document, parameters)
+    record = asyncio.run(application.dry_run(path, event, environ=environ, model_transport=Model))
+    results[profile.id] = {
+        "check": check.returncode,
+        "diagnostics": check.stderr[-2000:],
+        "outcome": record.outcome,
+        "origin": record.origin,
+    }
+print(json.dumps({"uid": os.getuid(), "digests": digests, "results": results, "connections": connections}))
+"""
+
+
+def _docker() -> str:
+    """The ``docker`` executable; missing, a failure, never a skip (AC23)."""
+
+    found = shutil.which("docker")
+    if found is None:
+        pytest.fail("docker executable not found")
+    return found
+
+
+def _command(
+    argv: list[str],
+    *,
+    cause: str,
+    timeout: float = COMMAND_SECONDS,
+    stdin: str | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """One bounded command; a timeout or (with *check*) a non-zero status
+    is a failure naming *cause* and the command's own error output."""
+
+    try:
+        result = subprocess.run(
+            argv, input=stdin, capture_output=True, text=True, timeout=timeout, env=env
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"{cause}: timed out after {timeout:g} s")
+    if check and result.returncode != 0:
+        pytest.fail(f"{cause}: exit {result.returncode}: {result.stderr.strip()[-3000:]}")
+    return result
+
+
+def _daemon(docker: str) -> None:
+    """An unreachable daemon or a missing Compose plugin is a failure (AC23)."""
+
+    _command([docker, "info", "--format", "{{.ServerVersion}}"], cause="docker daemon unreachable", timeout=60)
+    _command([docker, "compose", "version"], cause="docker compose plugin unavailable", timeout=60)
+
+
+def _build_context() -> str:
+    """``TWITCH_IA_COMPAGNON_BUILD_CONTEXT``, a local path made absolute."""
+
+    value = os.environ.get(BUILD_CONTEXT_VARIABLE, "").strip()
+    if not value:
+        pytest.fail(f"{BUILD_CONTEXT_VARIABLE} is unset; the trial builds the image from it")
+    if "://" in value or value.startswith("git@"):
+        return value
+    return str(Path(value).resolve())
+
+
+def _image() -> str:
+    return str(_service()["image"])
+
+
+def _proof(script: str, arguments: dict[str, Any]) -> str:
+    """*script* with its arguments bound: piped to an interpreter, never baked."""
+
+    return f"import json\nARGS = json.loads({json.dumps(json.dumps(arguments))})\n{script}"
+
+
+def _answered(result: subprocess.CompletedProcess[str], cause: str) -> dict[str, Any]:
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        pytest.fail(f"{cause}: no answer: {result.stderr.strip()[-3000:]}")
+    return json.loads(lines[-1])
+
+
+class _Project:
+    """One trial's compose project: its own name, the shipped compose file
+    (plus, for AC16, an override holding the sentinel environment) and the
+    build context from the environment."""
+
+    def __init__(self, docker: str, node: str, files: list[Path]) -> None:
+        self.docker = docker
+        self.name = f"tiac-{node.removeprefix('test_trial_container_')}-{uuid.uuid4().hex[:8]}"
+        self.files = files
+        self.env = {**os.environ, BUILD_CONTEXT_VARIABLE: _build_context()}
+
+    def compose(self, *arguments: str, cause: str, timeout: float = COMMAND_SECONDS, stdin: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+        files = [word for path in self.files for word in ("-f", str(path))]
+        return _command(
+            [self.docker, "compose", "-p", self.name, *files, *arguments],
+            cause=cause, timeout=timeout, stdin=stdin, env=self.env, check=check,
+        )
+
+    def build(self) -> None:
+        self.compose("build", cause="docker build failed", timeout=BUILD_SECONDS)
+
+    def up(self) -> None:
+        """``up -d`` waiting, within Docker's own bound, for a healthy service."""
+
+        self.compose(
+            "up", "-d", "--wait", "--wait-timeout", str(WAIT_SECONDS),
+            cause="docker compose up did not report the service healthy", timeout=WAIT_SECONDS + 60,
+        )
+
+    def container(self) -> str:
+        found = self.compose("ps", "-a", "-q", SERVICE, cause="docker compose ps failed").stdout.split()
+        if len(found) != 1:
+            pytest.fail(f"docker compose ps: expected 1 container, found {len(found)}")
+        return found[0]
+
+    def python(self, script: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """*script* piped to the container's own interpreter, as its user."""
+
+        result = self.compose(
+            "exec", "-T", SERVICE, "python", "-",
+            cause="the proof code failed in the container", stdin=_proof(script, arguments),
+        )
+        return _answered(result, "the proof code")
+
+    def logs(self) -> str:
+        return self.compose("logs", "--no-color", SERVICE, cause="docker compose logs failed").stdout
+
+    def inspect(self) -> dict[str, Any]:
+        result = _command([self.docker, "inspect", self.container()], cause="docker inspect failed")
+        return json.loads(result.stdout)[0]
+
+    def health(self) -> tuple[str, list[str]]:
+        """The health status and the health log's outputs, oldest first."""
+
+        state = self.inspect()["State"].get("Health") or {}
+        return state.get("Status", ""), [entry["Output"].strip() for entry in state.get("Log") or ()]
+
+    def kill(self) -> None:
+        _command([self.docker, "kill", self.container()], cause="docker kill failed")
+
+    def down(self) -> None:
+        self.compose(
+            "down", "-v", "--remove-orphans", cause="docker compose down failed", check=False,
+            timeout=COMMAND_SECONDS,
+        )
+
+
+@contextlib.contextmanager
+def _project(docker: str, node: str, files: list[Path] | None = None) -> Any:
+    project = _Project(docker, node, files or [COMPOSE])
+    try:
+        project.build()
+        yield project
+    finally:
+        project.down()
+
+
+def _events(project: _Project, event: str, since: float, seconds: float) -> list[str]:
+    """The container's *event* actions from *since* to ``now + seconds``:
+    ``docker events --until`` is the wait, the subprocess timeout its guard."""
+
+    until = time.time() + seconds
+    result = _command(
+        [
+            project.docker, "events",
+            "--filter", f"container={project.container()}",
+            "--filter", f"event={event}",
+            "--since", f"{since:.3f}",
+            "--until", f"{until:.3f}",
+            "--format", "{{.Action}}",
+        ],
+        cause="docker events failed", timeout=seconds + COMMAND_SECONDS,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _tokens(logs: str) -> list[str]:
+    return re.findall(r"\?token=([A-Za-z0-9_-]+)", logs)
+
+
+def _landing(project: _Project) -> str:
+    """Where the latest access URL of the log lands, from inside the container."""
+
+    tokens = _tokens(project.logs())
+    if not tokens:
+        pytest.fail("the container log holds no access URL")
+    answer = project.python(ACCESS_PROOF, {"port": config_ui.DEFAULT_PORT, "token": tokens[-1]})
+    assert answer["status"] in (302, 303), answer["status"]
+    return re.sub(r"^https?://[^/]+", "", answer["location"] or "")
+
+
+def _complete_wizard(project: _Project, credentials: dict[str, str]) -> None:
+    answer = project.python(
+        WIZARD_PROOF, {"profile": "silent", "credentials": credentials, "user_id": TRIAL_USER_ID}
+    )
+    assert answer == {"passed": [1, 2, 3, 4, 5], "completed": True}, answer
+
+
+def _started_at(project: _Project) -> float:
+    started = project.inspect()["State"]["StartedAt"]
+    whole, _, fraction = started.rstrip("Z").partition(".")
+    epoch = datetime.fromisoformat(whole).replace(tzinfo=timezone.utc).timestamp()
+    return epoch + float(f"0.{fraction or '0'}")
+
+
+def _record(project: _Project, path: str) -> bytes | None:
+    content = project.python(READ_PROOF, {"path": path})["content"]
+    return None if content is None else base64.b64decode(content)
+
+
+def _runtime_reports(project: _Project, since: float) -> str:
+    """Wait, through the healthcheck's own runs, for ``ready`` or ``degraded``."""
+
+    def last() -> str:
+        outputs = project.health()[1]
+        return outputs[-1] if outputs else ""
+
+    if not last().startswith(("ready", "degraded")):
+        _events(project, "exec_die", since, 3 * HEALTH_INTERVAL_SECONDS + HEALTH_TIMEOUT_SECONDS)
+    return last()
+
+
+def _git_files() -> list[str]:
+    result = _command(["git", "-C", str(ROOT), "ls-files", "-z"], cause="git ls-files failed")
+    return [name for name in result.stdout.split("\0") if name]
+
+
+def _decoy_context(root: Path) -> Path:
+    """Finding P2: the checkout's tracked files plus the decoys, in *root*."""
+
+    for name in _git_files():
+        source = ROOT / name
+        if source.is_file():
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    for name in DECOYS:
+        (root / name).write_text("decoy: never in the image\n", encoding="utf-8")
+    return root
+
+
+def _image_files(docker: str, image: str) -> dict[str, Any]:
+    result = _command(
+        [docker, "run", "--rm", "-i", "--user", "0", "--entrypoint", "python", image, "-"],
+        cause=f"listing the files of {image} failed",
+        stdin=_proof(IMAGE_FILES_PROOF, {"forbidden": FORBIDDEN_NAMES}),
+    )
+    return _answered(result, "the image listing")
+
+
+def _pip_names(docker: str, image: str) -> set[str]:
+    result = _command(
+        [docker, "run", "--rm", "--entrypoint", "python", image, "-m", "pip", "list", "--format=json", "--disable-pip-version-check"],
+        cause=f"pip list in {image} failed",
+    )
+    return {re.sub(r"[-_.]+", "-", entry["name"]).lower() for entry in json.loads(result.stdout)}
+
+
+def test_trial_container_image(tmp_path: Path) -> None:
+    required(CONTAINER_TRIAL_VARIABLE)
+    # AC12, AC13's measurement, AC17's image part; finding P2's build stage.
+    docker = _docker()
+    _daemon(docker)
+    image = _image()
+    with _project(docker, "test_trial_container_image"):
+        result = _command(
+            [docker, "run", "--rm", "-i", "--entrypoint", "python", image, "-"],
+            cause="the closure proof failed", stdin=_proof(CLOSURE_PROOF, {}),
+        )
+        closure = _answered(result, "the closure proof")
+        assert closure["uid"] == 10001
+        uid = _command([docker, "run", "--rm", "--entrypoint", "id", image, "-u"], cause="id -u failed")
+        assert uid.stdout.strip() == "10001"
+        base = _arguments(_stages()[-1], "FROM")[0].split()[0]
+        added = _pip_names(docker, image) - _pip_names(docker, base)
+        assert added == {"twitch-ia-compagnon", *closure["closure"]}, added
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:  # pragma: no cover - the 3.10 floor reads it through the backport
+            import tomli as tomllib
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+        assert project["dependencies"] == DECLARED_DEPENDENCIES
+
+        files = _image_files(docker, image)
+        assert files["forbidden"] == [] and files["git"] is False
+        assert files["pyprojects"] == [] and files["tests"] == []
+        assert files["distribution_tests"] == [] and files["data"] == []
+        assert files["profiles"] == sorted(path.name for path in PROFILES.glob("*.json"))
+
+        inspected = json.loads(_command([docker, "image", "inspect", image], cause="docker image inspect failed").stdout)[0]
+        config = inspected["Config"]
+        names = [entry.split("=", 1)[0] for entry in config.get("Env") or ()] + list(config.get("Labels") or {})
+        assert not [name for name in names if name in _credential_names() or SECRET_NAME.fullmatch(name)], names
+        size = int(_command([docker, "image", "inspect", "--format", "{{.Size}}", image], cause="docker image inspect failed").stdout.strip())
+        commit = _command(["git", "-C", str(ROOT), "rev-parse", "HEAD"], cause="git rev-parse failed").stdout.strip()
+        TRIAL_ARTEFACT.parent.mkdir(parents=True, exist_ok=True)
+        TRIAL_ARTEFACT.write_text(
+            json.dumps(
+                {"commit": commit, "image": image, "size_bytes": size, "measured_at": datetime.now(timezone.utc).isoformat()},
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        print(f"PHASE10-TRIAL image size: {size} bytes ({size / 1_000_000:.1f} MB)")
+
+        # Finding P2: the build stage itself, over a context holding decoys.
+        context = _decoy_context(tmp_path / "context")
+        throwaway = f"tiac-build-stage:{uuid.uuid4().hex[:12]}"
+        final = f"tiac-final:{uuid.uuid4().hex[:12]}"
+        try:
+            _command([docker, "build", "--target", "build", "-t", throwaway, str(context)], cause="docker build --target build failed", timeout=BUILD_SECONDS)
+            _command([docker, "build", "-t", final, str(context)], cause="docker build of the decoy context failed", timeout=BUILD_SECONDS)
+            for built in (throwaway, final):
+                assert _image_files(docker, built)["forbidden"] == [], built
+        finally:
+            _command([docker, "image", "rm", "-f", throwaway, final], cause="docker image rm failed", check=False)
+
+
+def test_trial_container_volume(tmp_path: Path) -> None:
+    required(CONTAINER_TRIAL_VARIABLE)
+    # AC8 (empty volume → wizard), AC9 (killed, restored → console, same
+    # credentials, runtime running), AC7 (every write under the per-user directory).
+    docker = _docker()
+    _daemon(docker)
+    with _project(docker, "test_trial_container_volume") as project:
+        project.up()
+        since = _started_at(project)
+        assert _landing(project) == config_ui.LANDING_WIZARD
+        _complete_wizard(project, _sentinels())
+        named = project.python(FILES_PROOF, {"since": since, "directory": DATA_DIRECTORY})["named"]
+        before = _record(project, named["credentials"])
+        assert before is not None
+        project.kill()
+        restarted = time.time()
+        project.up()
+        assert project.health()[0] != "unhealthy"
+        assert _landing(project) == config_ui.LANDING_CONSOLE
+        assert _record(project, named["credentials"]) == before
+        last = _runtime_reports(project, restarted)
+        assert last.startswith(("ready", "degraded")), last
+
+        listing = project.python(FILES_PROOF, {"since": since, "directory": DATA_DIRECTORY})
+        outside = [path for path in listing["written"] if not path.startswith(DATA_DIRECTORY + "/")]
+        assert outside == [], outside
+        expected = {
+            Path(path).name
+            for role, path in listing["named"].items()
+            if path is not None and (role != "overlay" or Path(path).name in listing["present"])
+        }
+        assert all(Path(path).parent == Path(DATA_DIRECTORY) for path in listing["named"].values() if path)
+        assert expected <= set(listing["present"]), (expected, listing["present"])
+
+
+def test_trial_container_secrets(tmp_path: Path) -> None:
+    required(CONTAINER_TRIAL_VARIABLE)
+    # AC16: sentinel credentials in the environment and the credential file,
+    # a wizard run and its dry run, a restart; no sentinel in any log.
+    docker = _docker()
+    _daemon(docker)
+    sentinels = _sentinels()
+    override = tmp_path / "compose.secrets.yaml"
+    override.write_text(yaml.safe_dump({"services": {SERVICE: {"environment": sentinels}}}), encoding="utf-8")
+    with _project(docker, "test_trial_container_secrets", [COMPOSE, override]) as project:
+        project.up()
+        _complete_wizard(project, sentinels)
+        project.kill()
+        restarted = time.time()
+        project.up()
+        _runtime_reports(project, restarted)
+        logs = project.logs()
+        _, health_log = project.health()
+        health_text = "\n".join(health_log)
+        for name, value in sentinels.items():
+            assert value not in logs, name
+            assert value not in health_text, name
+        tokens = _tokens(logs)
+        assert len(tokens) == 2 and len(set(tokens)) == 2, len(tokens)
+        for token in tokens:
+            assert logs.count(token) == 1
+            assert token not in health_text
+        assert "token=" not in health_text and "http://" not in health_text
+
+
+def test_trial_container_health(tmp_path: Path) -> None:
+    required(CONTAINER_TRIAL_VARIABLE)
+    # AC21: healthy once serving; the runtime SIGKILLed → unhealthy within 3
+    # intervals, ``unhealthy: runtime exited``; the UI killed → never healthy.
+    docker = _docker()
+    _daemon(docker)
+    with _project(docker, "test_trial_container_health") as project:
+        project.up()
+        assert project.health()[0] == "healthy"
+        _complete_wizard(project, _sentinels())
+        project.kill()
+        project.up()
+        assert project.health()[0] == "healthy"
+        supervision = json.loads(_record(project, f"{DATA_DIRECTORY}/{locations.PROFILE_FILE_NAME}{config_ui.SUPERVISION_SUFFIX}") or b"{}")
+        assert supervision.get("state") == "launched", supervision
+        killed = time.time()
+        project.python(KILL_PROOF, {"pid": supervision["pid"]})
+        statuses = _events(project, "health_status", killed, 3 * HEALTH_INTERVAL_SECONDS + HEALTH_TIMEOUT_SECONDS)
+        assert [status for status in statuses if status.endswith("unhealthy")], statuses
+        status, health_log = project.health()
+        assert status == "unhealthy" and health_log[-1] == "unhealthy: runtime exited", health_log[-1:]
+
+        instance = json.loads(_record(project, f"{DATA_DIRECTORY}/{locations.PROFILE_FILE_NAME}{config_ui.INSTANCE_SUFFIX}") or b"{}")
+        killed = time.time()
+        project.python(KILL_PROOF, {"pid": instance["pid"]})
+        exited = "die" in _events(project, "die", killed, 2 * HEALTH_INTERVAL_SECONDS)
+        state = project.inspect()["State"]
+        assert exited or (state.get("Health") or {}).get("Status") == "unhealthy"
+        assert (state.get("Health") or {}).get("Status") != "healthy"
+
+
+def test_trial_container_profiles(tmp_path: Path) -> None:
+    required(CONTAINER_TRIAL_VARIABLE)
+    # AC22: the shipped profiles byte-identical inside the container, each
+    # rendered, checked and dry-run there as uid 10001, no connection made.
+    docker = _docker()
+    _daemon(docker)
+    with _project(docker, "test_trial_container_profiles") as project:
+        project.up()
+        answer = project.python(
+            PROFILES_PROOF,
+            {"parameters": TRIAL_PARAMETERS, "identities": TRIAL_IDENTITIES, "credentials": _sentinels()},
+        )
+        assert answer["uid"] == 10001
+        assert answer["digests"] == {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(PROFILES.glob("*.json"))
+        }
+        assert set(answer["results"]) == set(EXPECTED_OUTCOMES)
+        for profile_id, outcome in EXPECTED_OUTCOMES.items():
+            result = answer["results"][profile_id]
+            assert result["check"] == 0, (profile_id, result["diagnostics"])
+            assert (result["outcome"], result["origin"]) == (outcome, "dry_run"), (profile_id, result)
+        assert answer["connections"] == []
+
+
+# -- the trial file's own shape (R7, AC23) ----------------------------------- #
+
+#: Spelled in pieces so this file's source never holds them whole.
+NOT_IN_SOURCE = ("skip" "if", "x" "fail", "import" "orskip", "pytest." "skip(")
+
+
+def test_ac23_the_file_has_exactly_the_five_gated_trial_nodes() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    trials = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_trial_")
+    ]
+    assert sorted(node.name for node in trials) == sorted(TRIAL_NODES)
+    for node in trials:
+        first = node.body[0]
+        assert isinstance(first, ast.Expr) and isinstance(first.value, ast.Call), node.name
+        call = first.value
+        assert isinstance(call.func, ast.Name) and call.func.id == "required", node.name
+        assert [ast.dump(argument) for argument in call.args] == [
+            ast.dump(ast.Name(id="CONTAINER_TRIAL_VARIABLE", ctx=ast.Load()))
+        ] and not call.keywords, node.name
+    assert required.__module__ == "test_phase2_trials"
+
+
+def test_ac23_the_file_never_skips_or_expects_a_failure() -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert [word for word in NOT_IN_SOURCE if word in source] == []
+
+
+def test_ac23_the_gate_skips_with_the_variable_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(CONTAINER_TRIAL_VARIABLE, raising=False)
+    with pytest.raises(pytest.skip.Exception, match=f"^{CONTAINER_TRIAL_VARIABLE} is unset$"):
+        required(CONTAINER_TRIAL_VARIABLE)
+    monkeypatch.setenv(CONTAINER_TRIAL_VARIABLE, "  ")
+    with pytest.raises(pytest.skip.Exception, match=f"^{CONTAINER_TRIAL_VARIABLE} is unset$"):
+        required(CONTAINER_TRIAL_VARIABLE)
+
+
+@pytest.mark.parametrize("name", TRIAL_NODES)
+def test_ac23_a_switched_on_trial_fails_naming_docker_when_it_is_unfindable(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Switched on with ``docker`` unfindable, the body fails (not skips)
+    before it starts anything; the AC33 guard would refuse a process."""
+
+    monkeypatch.setenv(CONTAINER_TRIAL_VARIABLE, "1")
+    monkeypatch.setenv(BUILD_CONTEXT_VARIABLE, ".")
+    monkeypatch.setattr(shutil, "which", lambda *args, **kwargs: None)
+    body = globals()[name]
+    arguments = {"tmp_path": tmp_path} if "tmp_path" in inspect.signature(body).parameters else {}
+    with pytest.raises(pytest.fail.Exception, match="docker") as failed:
+        body(**arguments)
+    assert "docker executable not found" in str(failed.value)

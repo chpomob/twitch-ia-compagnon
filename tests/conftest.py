@@ -3871,6 +3871,16 @@ _TRIAL_GATES: dict[str, tuple[str, dict[str, str]]] = {
             "test_trial_screen_watch": "WATCH_TRIAL",
         },
     ),
+    "test_container.py": (
+        "required",
+        {
+            "test_trial_container_image": "CONTAINER_TRIAL_VARIABLE",
+            "test_trial_container_volume": "CONTAINER_TRIAL_VARIABLE",
+            "test_trial_container_secrets": "CONTAINER_TRIAL_VARIABLE",
+            "test_trial_container_health": "CONTAINER_TRIAL_VARIABLE",
+            "test_trial_container_profiles": "CONTAINER_TRIAL_VARIABLE",
+        },
+    ),
 }
 _PHASE5_TRIALS = "test_phase5_trials.py"
 
