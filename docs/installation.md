@@ -426,3 +426,8 @@ hands, and be ready to cut it (`Ctrl` + `C`) if the companion goes somewhere you
 | [`docs/design-v2.md`](design-v2.md) | the overall design: why the parts are modular (also [in French](design-v2.fr.md)) |
 | `config.yaml.example`, `presence.yaml.example` | the complete profiles, commented line by line |
 | `python -m demo --platform fake` | the same demonstration on a second platform, to see that the core depends on none in particular |
+
+To run the companion on a server — a VPS, a NAS, a machine without a desktop — with Docker and no copy
+of the project, follow the self-hosting guide [`docs/self-hosting.md`](self-hosting.md) instead of this
+one: one compose file takes the place of the install, and the setup screens the place of the values and
+the YAML.

@@ -54,6 +54,7 @@ GUIDES = (
     "web-knowledge",
     "triggers",
     "first-run",
+    "self-hosting",
 )
 """The guides that must exist in both languages.
 

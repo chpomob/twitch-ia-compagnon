@@ -830,6 +830,20 @@ l'interface locale existante. Les documents :
 - [`first-run.fr.md`](first-run.fr.md) — sa traduction française ; le texte
   anglais fait foi.
 
+## Phase 10 — distribuer le compagnon
+
+La phase 10 (spec `phase10-distribute`, `docs/campaigns/phase10/spec.md`) ajoute
+l'image (`Dockerfile`), le fichier compose (`compose.yaml`) et le guide
+d'auto-hébergement, pour faire tourner le compagnon sur un serveur avec Docker et
+Compose sans copie du dépôt. Les documents :
+
+- [`self-hosting.md`](self-hosting.md) — le guide d'auto-hébergement (anglais,
+  normatif) : le démarrage rapide, le fichier compose ligne à ligne, le volume
+  `/data` fichier par fichier, les identifiants, le jeton, les quatre profils, la
+  sauvegarde, les états du healthcheck, la taille de l'image et les limites ;
+- [`self-hosting.fr.md`](self-hosting.fr.md) — sa traduction française ; le
+  texte anglais fait foi.
+
 ## Lecture des manifests de runs
 
 [runs/](runs/) conserve les cinq manifests originaux, sans suppression ni

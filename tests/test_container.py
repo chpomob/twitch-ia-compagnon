@@ -67,6 +67,14 @@ the variable set to ``1`` and the build context ``.``; the ``tests`` job's
 steps equal a literal copy of those at the brief's HEAD (``git show`` would
 start a process); and no step pushes, logs in, tags or releases.
 
+Then the self-hosting guide pair (R8, AC24, AC18's and AC25's guide and link
+parts): ``docs/self-hosting.md`` names every file of the ``/data`` volume by
+the name the code derives, every R1 option, A6's five states, uid ``10001``
+and each limit; both guides state the credential precedence; the
+quick start is at most three commands, none a clone or a build; the
+documentation index links the pair and each installation guide links the
+guide of its language.
+
 Last, the container trial itself (R7, AC23's default parts): the five
 ``test_trial_container_*`` nodes, each starting with phase 2's
 ``required(CONTAINER_TRIAL_VARIABLE)``, build the image from
@@ -107,8 +115,9 @@ from test_config_ui import _request
 from test_phase2_trials import required
 
 import core.config_ui as config_ui
-from core.config_ui import console, locations
+from core.config_ui import console, locations, wizard
 from core.config_ui.locations import PRODUCT
+from core.overlay import default_feed_path, default_status_path, implicit_overlay_path
 
 #: A pid no fixture expects to be a real process; liveness is faked for it.
 FOREIGN_PID = 424242
@@ -2481,6 +2490,149 @@ def test_ac23_no_step_publishes_anything() -> None:
             assert [word for word in PUBLISHING if word in text] == [], (name, step)
             uses = step.get("uses", "")
             assert "release" not in uses and not uses.startswith("docker/"), (name, uses)
+
+
+# -- the self-hosting guide pair (R8, AC24, AC25 link parts, AC18 guide part) - #
+
+DOCS = ROOT / "docs"
+GUIDE = DOCS / "self-hosting.md"
+GUIDE_FR = DOCS / "self-hosting.fr.md"
+#: R1's options, each named by the guide.
+R1_OPTIONS = (
+    "--no-browser",
+    "--token-file",
+    "--start-runtime",
+    "--health",
+    "--allow-non-loopback",
+    "--host",
+    "--allowed-host",
+)
+#: A6's five health states.
+HEALTH_STATES = ("ready", "degraded", "starting", "idle", "unhealthy")
+#: R8's limits of container mode, each spelled in the English guide.
+LIMITS = ("no desktop session", "no browser opener", "no launcher", "no microphone", "no native bundle")
+#: AC18's guide part: the precedence, stated in each language.
+PRECEDENCE = {
+    GUIDE: "a stored credential overrides an inherited variable of the same name",
+    GUIDE_FR: "un identifiant enregistré l'emporte sur une variable héritée du même nom",
+}
+_GUIDE_SECTION = re.compile(r"^## (?P<title>.+)$", re.MULTILINE)
+_GUIDE_BLOCK = re.compile(r"^```(?P<language>[a-z]*)\n(?P<body>.*?)^```$", re.MULTILINE | re.DOTALL)
+_SIZE = re.compile(r"\b\d+\.\d MB\b")
+
+
+def _guide_sections(path: Path) -> dict[str, str]:
+    """Each ``##`` section's text, keyed by its title without its number."""
+
+    text = path.read_text(encoding="utf-8")
+    matches = list(_GUIDE_SECTION.finditer(text))
+    sections = {}
+    for match, following in zip(matches, [*matches[1:], None]):
+        end = following.start() if following is not None else len(text)
+        title = re.sub(r"^\d+\. ", "", match.group("title"))
+        sections[title] = text[match.end() : end]
+    return sections
+
+
+def _volume_file_names() -> list[str]:
+    """AC7's files for the image's default profile, named as the code derives them."""
+
+    profile = Path(DATA_DIRECTORY) / locations.PROFILE_FILE_NAME
+    overlay = implicit_overlay_path(profile)
+    assert overlay is not None
+    return [
+        profile.name,
+        overlay.name,
+        default_status_path(profile).name,
+        default_feed_path(profile).name,
+        wizard.state_path(profile).name,
+        locations.credential_file_name(profile),
+        profile.name + config_ui.INSTANCE_SUFFIX,
+        profile.name + config_ui.SUPERVISION_SUFFIX,
+    ]
+
+
+def test_ac24_the_guide_names_every_volume_file_under_the_data_directory() -> None:
+    text = GUIDE.read_text(encoding="utf-8")
+    names = _volume_file_names()
+    assert len(set(names)) == 8
+    for name in names:
+        assert f"`{DATA_DIRECTORY}/{name}`" in text, name
+
+
+def test_ac24_the_guide_names_every_r1_option_the_states_the_user_and_the_limits() -> None:
+    text = GUIDE.read_text(encoding="utf-8")
+    for option in R1_OPTIONS:
+        assert f"`{option}" in text, option
+    for state in HEALTH_STATES:
+        assert f"`{state}`" in text, state
+    assert "`10001`" in text
+    limits = _guide_sections(GUIDE)["Limits"]
+    for limit in LIMITS:
+        assert limit in limits, limit
+
+
+def test_ac24_the_guide_prints_every_health_line_the_command_prints() -> None:
+    lines = [
+        config_ui.HEALTH_NO_INSTANCE,
+        config_ui.HEALTH_NOT_ANSWERING,
+        config_ui.HEALTH_TOKEN_REFUSED,
+        config_ui.HEALTH_ANOTHER_INSTANCE,
+        config_ui.HEALTH_SUPERVISION_UNUSABLE,
+        config_ui.HEALTH_WIZARD_UNFINISHED,
+        config_ui.HEALTH_NOT_STARTED,
+        config_ui.HEALTH_STOPPED,
+        config_ui.HEALTH_RUNTIME_EXITED,
+        config_ui.HEALTH_READY,
+        config_ui.HEALTH_STARTING,
+        config_ui.HEALTH_NOT_READY,
+    ]
+    table = _guide_sections(GUIDE)["Healthcheck states"]
+    for line in lines:
+        assert f"| `{line}` |" in table, line
+    assert f"| `{config_ui.HEALTH_DEGRADED_PREFIX}<names>` |" in table
+
+
+@pytest.mark.parametrize("guide", [GUIDE, GUIDE_FR], ids=lambda path: path.name)
+def test_ac18_each_guide_states_the_precedence(guide: Path) -> None:
+    assert PRECEDENCE[guide] in guide.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("guide", [GUIDE, GUIDE_FR], ids=lambda path: path.name)
+def test_ac15_the_quick_start_is_at_most_three_commands_and_no_clone_or_build(guide: Path) -> None:
+    quick_start = next(iter(_guide_sections(guide).values()))
+    block = _GUIDE_BLOCK.search(quick_start)
+    assert block is not None
+    commands = [line.strip() for line in block.group("body").splitlines() if line.strip()]
+    assert 0 < len(commands) <= 3
+    assert commands[0] == (
+        "curl -fsSLO https://raw.githubusercontent.com/chpomob/twitch-ia-compagnon/main/compose.yaml"
+    )
+    assert "docker compose up -d" in commands
+    for command in commands:
+        assert "git clone" not in command and "docker build" not in command, command
+
+
+@pytest.mark.parametrize("guide", [GUIDE, GUIDE_FR], ids=lambda path: path.name)
+def test_ac13_each_guide_states_one_size_in_mb_to_one_decimal(guide: Path) -> None:
+    (size_section,) = [text for title, text in _guide_sections(guide).items() if "MB" in text]
+    assert len(_SIZE.findall(size_section)) == 1
+
+
+def test_ac25_the_documentation_index_links_both_guides() -> None:
+    text = (DOCS / "README.md").read_text(encoding="utf-8")
+    assert "](self-hosting.md)" in text
+    assert "](self-hosting.fr.md)" in text
+
+
+@pytest.mark.parametrize(
+    ("installation", "guide"),
+    [("installation.md", "self-hosting.md"), ("installation.fr.md", "self-hosting.fr.md")],
+)
+def test_ac25_each_installation_guide_links_the_guide_of_its_language(
+    installation: str, guide: str
+) -> None:
+    assert f"]({guide})" in (DOCS / installation).read_text(encoding="utf-8")
 
 
 # -- the container trial (R7, AC7–AC9, AC12, AC13, AC16, AC17, AC21–AC23) ---- #

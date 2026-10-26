@@ -441,3 +441,8 @@ une direction que vous n'aimez pas.
 | [`docs/design-v2.md`](design-v2.md) | la conception d'ensemble : pourquoi les briques sont modulaires (également [en français](design-v2.fr.md)) |
 | `config.yaml.example`, `presence.yaml.example` | les profils complets, commentés ligne à ligne |
 | `python -m demo --platform fake` | la même démonstration sur une seconde plateforme, pour voir que le cœur ne dépend d'aucune en particulier |
+
+Pour faire tourner le compagnon sur un serveur plutôt — un VPS, un NAS, une machine sans bureau — avec
+Docker et sans copie du projet, suivez le guide d'auto-hébergement
+[`docs/self-hosting.fr.md`](self-hosting.fr.md) plutôt que celui-ci : un seul fichier compose
+remplace l'installation, et les écrans de configuration les valeurs et le YAML.
