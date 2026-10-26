@@ -112,14 +112,61 @@ def no_socket_creation() -> Iterator[None]:
 
 _SHORT_SECRET = "q7Z"
 
+#: The one allowlist of the token filter below (P12F3 M2), by test name.
+#: Reason: these tests assert that the 3-character secret ``q7Z`` never
+#: reaches a page, and every page carries a CSRF token drawn by
+#: ``secrets.token_urlsafe`` — 43 URL-safe characters, which spell ``q7Z``
+#: about once in 6,400 draws (some 226 draws per run of these tests: up to
+#: one run in 30 could fail by chance). Only these tests have such tokens
+#: redrawn; every other test draws tokens as production does. The list is
+#: exactly the tests that use ``q7Z`` (asserted by
+#: ``test_m2_the_token_filter_applies_exactly_to_the_short_secret_tests``).
+_SHORT_SECRET_TESTS = (
+    "test_redaction_covers_values_of_every_length",
+    "test_f2_a_short_secret_in_an_ordinary_setting_is_never_rendered",
+    "test_f2_a_configured_channel_key_never_reaches_a_generated_identifier",
+    "test_n1_a_configured_secret_is_still_never_rendered_beside_the_boolean_tokens",
+    "test_f2_a_secret_used_as_a_list_key_or_value_is_never_rendered",
+    "test_p19f5_a_shifted_hidden_entry_keeps_its_own_value",
+    "test_p19f5_an_unmatched_placeholder_is_refused",
+    "test_n3_an_unmatched_placeholder_fails_check_as_save_refuses_it",
+    "test_p19f7_every_published_secret_length_is_still_never_rendered",
+    "test_n5_keys_that_only_contain_a_secret_stay_distinct_entries",
+    "test_n5_legitimate_stand_in_shaped_text_never_collides",
+    "test_n3_an_edited_stand_in_is_refused_never_written",
+    "test_n3_an_unmatched_placeholder_never_reaches_the_checker",
+    "test_n3_a_stand_in_beside_its_real_key_is_refused_never_resolved",
+    "test_p19f9_gate6_n6_a_visible_value_edit_never_changes_another_entrys_key",
+    "test_p19f9_gate6_n6_reversing_and_appending_keeps_each_key_with_its_entry",
+    "test_p19f9_gate6_n3_an_altered_stand_in_is_never_written",
+    "test_p19f9_a_duplicated_identity_is_refused",
+    "test_p19f9_a_stale_identity_is_refused_never_retargeted",
+    "test_p19f9_an_identity_from_another_page_is_refused",
+    "test_p19f9_an_entry_both_removed_and_edited_is_refused",
+    "test_p19f9_a_legitimate_edit_with_punctuation_or_marker_text_applies",
+    "test_p19f9_no_configured_key_reaches_a_generated_attribute",
+    "test_p19f9_a_withheld_scalar_replacement_is_the_whole_new_value",
+    "test_p19f10_gate7_an_old_identity_after_remove_and_save_is_refused_never_retargeted",
+    "test_p19f10_an_identity_of_an_older_render_of_the_same_page_is_refused",
+    "test_p19f10_an_identity_from_another_session_is_refused",
+    "test_p19f10_gate7_n7_a_withheld_ordinary_scalar_can_be_set_to_the_empty_string",
+    "test_p19f10_clearing_an_optional_overlay_entry_restores_the_base",
+    "test_p19f10_a_withheld_entry_can_be_replaced_by_the_empty_string",
+    "test_p19f10_removal_controls_drop_exactly_their_entry",
+    "test_p19f11_no_render_tag_or_identity_is_ever_reissued",
+    "test_p19f11_gate8_a_foreign_process_identity_with_current_guards_is_refused",
+    "test_p19f11_gate8_an_identity_past_the_old_history_bound_stays_refused",
+)
+
 
 @pytest.fixture(autouse=True)
-def tokens_never_spell_the_short_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The session, CSRF and UI tokens are URL-safe base64 and reach the
-    page; one drawn with ``q7Z`` inside failed a "secret never rendered"
-    assertion by chance. Such a token is redrawn, so those assertions only
-    see a secret the UI itself rendered."""
+def tokens_never_spell_the_short_secret(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """For the tests of :data:`_SHORT_SECRET_TESTS` only, a token drawn with
+    ``q7Z`` inside is redrawn, so their assertions only see a secret the UI
+    itself rendered; any other test is left untouched."""
 
+    if request.node.originalname not in _SHORT_SECRET_TESTS:
+        return
     original = secrets.token_urlsafe
 
     def drawn(nbytes: int | None = None) -> str:
@@ -128,6 +175,24 @@ def tokens_never_spell_the_short_secret(monkeypatch: pytest.MonkeyPatch) -> None
         return token
 
     monkeypatch.setattr(secrets, "token_urlsafe", drawn)
+
+
+def test_m2_the_token_filter_applies_exactly_to_the_short_secret_tests() -> None:
+    """P12F3 M2: the filter's allowlist is enumerated and exact — every test
+    of this module that uses ``q7Z`` (in its body or its parameters), and no
+    other — so adding a node to it is a visible diff."""
+
+    source = Path(__file__).read_text(encoding="utf-8")
+    users = []
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_") and node.name != (
+            "test_m2_the_token_filter_applies_exactly_to_the_short_secret_tests"
+        ):
+            text = "".join(ast.get_source_segment(source, part) or "" for part in [*node.decorator_list, node])
+            if _SHORT_SECRET in text or "_F2_JSON_SECRETS" in text:
+                users.append(node.name)
+    assert list(_SHORT_SECRET_TESTS) == users
+    assert _SHORT_SECRET in _F2_JSON_SECRETS
 
 
 def _the_suite_guard_runs_beside_this_patch(request: pytest.FixtureRequest) -> None:

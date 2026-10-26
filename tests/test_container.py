@@ -48,8 +48,10 @@ default :class:`UISettings` gives; and a credential both inherited and stored
 reaches the supervised child with its stored value.
 
 Then the image's static contracts (R3, R5, AC11, AC17's ``.dockerignore``
-part): the ``Dockerfile``'s two stages, digest-pinned base, wheel-only
-runtime stage, numeric user, A2's default command and the health command;
+part): the ``Dockerfile``'s stages as Amendment A3 allows them (a build
+and a runtime stage on one digest-pinned base, re-based onto ``scratch``),
+wheel-only runtime stage, numeric user, A2's default command and the health
+command;
 and ``.dockerignore`` as an allowlist, judged by a pure-Python model of
 Docker's matching rules over a synthetic path list (no daemon: the trial's
 image inspection is the real check).
@@ -95,6 +97,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -697,7 +700,14 @@ def test_ac2_no_browser_leaves_the_opener_uncalled_and_prints_the_url_once(
     assert status == 0 and len(serve.calls) == 1
     (ui,) = serve.calls
     printed = serve.stdout_before[0] + out
-    assert printed.count(ui.access_url) == 1
+    if calls:
+        assert printed.count(ui.access_url) == 1
+    else:
+        # P12F3 M1: the address and the token on separate, labelled lines.
+        lines = printed.splitlines()
+        assert lines.count("Configuration UI: http://127.0.0.1:8765/") == 1
+        assert lines.count(f"Access token: {ui.token}") == 1
+        assert printed.count(ui.token) == 1 and "token=" not in printed
     assert opened == [ui.access_url] * calls
 
 
@@ -1309,6 +1319,114 @@ LAUNCHED = datetime(2026, 10, 24, 8, 0, 0, tzinfo=timezone.utc).timestamp()
 MODULE_VALUE = "module-value-7d1c2e-never-printed"
 
 
+def _unwritable(directory: Path) -> None:
+    """Take write permission from *directory*, as the gate did to the feed's
+    directory (P12F3 B1); a process that keeps it (root) cannot drive the
+    failed-write path, and the check fails rather than pass without it."""
+
+    directory.chmod(0o500)
+    assert not os.access(directory, os.W_OK), "this check needs a user the directory's mode binds"
+
+
+def _health_of(ui: Any) -> tuple[str, int]:
+    """The health command over *ui*'s own records, its probe answered with
+    the UI's marker and its children judged live."""
+
+    seams = config_ui.HealthSeams(
+        probe=_HealthProbe(_answer(ui.instance_marker)),
+        liveness=lambda pid: True,
+        started_at=lambda pid: None,
+        clock=time.time,
+        platform="linux",
+    )
+    return config_ui.health(ui.settings, seams)
+
+
+def test_b1_a_transition_the_directory_refuses_reads_as_its_failure_never_idle(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """P12F3 B1, through the producer's real failed write: the profile's
+    directory loses its write permission while the UI serves, so Start's
+    ``launched`` cannot create its temporary file. The record left behind
+    said ``not_started``, which the health command read as ``idle: not
+    started``, exit 0; it now names the failure, exit 1."""
+
+    seen: list[Any] = []
+
+    def during(ui: Any, record: Path) -> None:
+        _fake_launches(ui)
+        assert _health_of(ui) == ("idle: not started", 0)
+        _unwritable(record.parent)
+        try:
+            ui.start_runtime()
+            seen.append(_supervision(record))
+            seen.append(_health_of(ui))
+        finally:
+            record.parent.chmod(0o700)
+
+    with caplog.at_level(logging.WARNING, logger=config_ui.logger.name):
+        status, record = _claimed(tmp_path, during)
+    document, (line, exit_status) = seen
+    assert not line.startswith("idle") and exit_status != 0, (line, exit_status)
+    assert (line, exit_status) == ("unhealthy: supervision record not written", 1)
+    assert document == {"version": 1, "marker": document["marker"], "state": "write_failed"}
+    # Marked, the UI keeps serving: the health line already tells the truth.
+    assert status == 0
+    assert "the supervision record could not be written (launched)" in caplog.messages
+
+
+def test_b1_a_record_that_cannot_even_be_marked_ends_serving_and_main_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P12F3 B1's last resort: the record itself is read-only too, so not
+    even ``write_failed`` can replace the stale ``not_started``. The UI asks
+    to stop serving, its child is closed and ``main`` exits non-zero."""
+
+    stops: list[int] = []
+    launched: list[list[_FakeChild]] = []
+
+    def during(ui: Any, record: Path) -> None:
+        launched.append(_fake_launches(ui))
+        ui.stop_serving = lambda: stops.append(1)
+        record.chmod(0o400)
+        _unwritable(record.parent)
+        try:
+            ui.start_runtime()
+        finally:
+            record.parent.chmod(0o700)
+            record.chmod(0o600)
+        assert ui.supervision_lost is True
+
+    status, record = _claimed(tmp_path, during)
+    assert stops == [1]
+    assert status == 2
+    assert [child.poll() for child in launched[0]] == [-15]
+
+
+def test_b1_a_publication_that_cannot_be_written_serves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P12F3 B1 at publication: no record at all would read as idle, so a
+    claimed UI that cannot publish one serves nothing and exits non-zero."""
+
+    base = _profile(tmp_path)
+
+    def refused(path: Path, instance: Path, content: bytes) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(config_ui, "_write_supervision", refused)
+    served: list[Any] = []
+    status = config_ui.main(
+        ["--config", str(base)],
+        opener=lambda url: None,
+        serve=lambda ui, settings: served.append(ui),
+        instance=config_ui.InstanceSeams(platform="linux"),
+    )
+    assert (status, served) == (2, [])
+    assert "the supervision record could not be written; nothing is served" in capsys.readouterr().err
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["config.yaml", "mods"]
+
+
 def _answer(marker: str = HEALTH_MARKER) -> tuple[int, bytes]:
     return 200, json.dumps({"marker": marker, "version": "1.0"}).encode("utf-8")
 
@@ -1482,6 +1600,14 @@ def _supervision_extra_field(case: _Health) -> None:
     case.supervision = {"version": 1, "marker": HEALTH_MARKER, "state": "stopped", "pid": CHILD_PID}
 
 
+def _supervision_write_failed(case: _Health) -> None:
+    case.supervision = {"version": 1, "marker": HEALTH_MARKER, "state": "write_failed"}
+
+
+def _other_write_failed_completed(case: _Health) -> None:
+    case.supervision = {"version": 1, "marker": "e" * 32, "state": "write_failed"}
+
+
 def _no_supervision_unfinished_wizard(case: _Health) -> None:
     case.supervision = None
     case.wizard = False
@@ -1575,12 +1701,14 @@ HEALTH_ROWS = [
     pytest.param(_supervision_no_pid, "unhealthy: supervision record unusable", 1, id="row5_pid"),
     pytest.param(_supervision_bad_launched_at, "unhealthy: supervision record unusable", 1, id="row5_time"),
     pytest.param(_supervision_extra_field, "unhealthy: supervision record unusable", 1, id="row5_extra"),
+    pytest.param(_supervision_write_failed, "unhealthy: supervision record not written", 1, id="row5_not_written"),
     pytest.param(_no_supervision_unfinished_wizard, "idle: wizard unfinished", 0, id="row6_absent"),
     pytest.param(_no_supervision_no_profile, "idle: wizard unfinished", 0, id="row6_no_profile"),
     pytest.param(_other_marker_unfinished_wizard, "idle: wizard unfinished", 0, id="row6_marker"),
     pytest.param(_not_started_unfinished_wizard, "idle: wizard unfinished", 0, id="row6_not_started"),
     pytest.param(_no_supervision_completed, "idle: not started", 0, id="row7_absent"),
     pytest.param(_other_marker_completed, "idle: not started", 0, id="row7_marker"),
+    pytest.param(_other_write_failed_completed, "idle: not started", 0, id="row7_marker_write_failed"),
     pytest.param(_not_started_completed, "idle: not started", 0, id="row7_not_started"),
     pytest.param(_stopped, "idle: stopped", 0, id="row8"),
     pytest.param(_exited, "unhealthy: runtime exited", 1, id="row9_dead"),
@@ -1689,6 +1817,45 @@ def test_ac19_a_degraded_name_that_cannot_stand_in_one_line_is_not_printed(
     case = _Health(tmp_path)
     case.status = case.status_document(CHILD_PID, {"bad\nname": "degraded", "a,b": "degraded"})
     assert case.run(capsys) == ("starting", 0)
+
+
+@pytest.mark.parametrize("fraction", [0.0, 0.0003, 0.1238, 0.9993, 0.9999996])
+def test_b3_launched_at_is_never_earlier_than_its_sample(fraction: float) -> None:
+    """P12F3 B3: ``launched_at`` keeps the status record's millisecond
+    format but is rounded up, never truncated, so it is never earlier than
+    the moment sampled after the child was started."""
+
+    seconds = LAUNCHED + fraction
+    text = config_ui.launch_timestamp(seconds)
+    assert STATUS_TIMESTAMP.fullmatch(text), text
+    written = config_ui._timestamp_seconds(text)
+    assert written is not None and seconds <= written + 1e-6 and written - seconds < 0.001 + 1e-6
+
+
+#: B3's measured case: the runtime forked 0.2 ms before its launch was
+#: sampled, inside one millisecond (the trial measured margins down to
+#: 0.725 ms between a live runtime's start and its ``launched_at``).
+B3_FORK = LAUNCHED + 0.1236
+B3_SAMPLE = LAUNCHED + 0.1238
+
+
+@pytest.mark.parametrize(
+    ("launched_at", "line"),
+    [
+        # The old rule truncated the sample to ``.123``, before the fork:
+        # the live runtime was judged not the one launched, at every probe.
+        pytest.param("2026-10-24T08:00:00.123Z", "unhealthy: runtime exited", id="truncated"),
+        pytest.param(config_ui.launch_timestamp(B3_SAMPLE), "ready", id="rounded_up"),
+    ],
+)
+def test_b3_a_runtime_forked_within_the_launch_millisecond_is_live(
+    launched_at: str, line: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    case = _Health(tmp_path)
+    case.supervision["launched_at"] = launched_at
+    case.started = B3_FORK
+    case.now = B3_SAMPLE + 10.0
+    assert case.run(capsys) == (line, 1 if line.startswith("unhealthy") else 0)
 
 
 def test_ac19_the_records_the_ui_writes_are_usable() -> None:
@@ -2680,6 +2847,7 @@ def test_ac24_the_guide_prints_every_health_line_the_command_prints() -> None:
         config_ui.HEALTH_TOKEN_REFUSED,
         config_ui.HEALTH_ANOTHER_INSTANCE,
         config_ui.HEALTH_SUPERVISION_UNUSABLE,
+        config_ui.HEALTH_SUPERVISION_NOT_WRITTEN,
         config_ui.HEALTH_WIZARD_UNFINISHED,
         config_ui.HEALTH_NOT_STARTED,
         config_ui.HEALTH_STOPPED,
@@ -2829,6 +2997,8 @@ HEALTH_POLL_SECONDS = 5
 #: The healthcheck's interval and timeout (the Dockerfile's, AC21's unit).
 HEALTH_INTERVAL_SECONDS = 30
 HEALTH_TIMEOUT_SECONDS = 10
+#: AC21: the runtime's kill is observed within this many health intervals.
+AC21_INTERVALS = 3
 #: Where the trial writes its measurement (AC13): a run artefact, not a source.
 TRIAL_ARTEFACT = ROOT / "docs" / "runs" / "phase10-container-trial.json"
 #: AC12: ``pyproject.toml``'s dependencies at the brief's HEAD.
@@ -2982,11 +3152,12 @@ path = ARGS["path"]
 print(json.dumps({"content": base64.b64encode(open(path, "rb").read()).decode() if os.path.exists(path) else None}))
 """
 
-#: Run inside the container: SIGKILL one pid (the runtime, then the UI).
+#: Run inside the container: SIGKILL one pid (the runtime, then the UI),
+#: and the wall-clock time just after the signal was sent (AC21's origin).
 KILL_PROOF = """
-import json, os, signal
+import json, os, signal, time
 os.kill(ARGS["pid"], signal.SIGKILL)
-print(json.dumps({"killed": ARGS["pid"]}))
+print(json.dumps({"killed": ARGS["pid"], "at": time.time()}))
 """
 
 #: The fake Twitch the runtime nodes (AC9, AC16, AC21) start beside the
@@ -3321,9 +3492,13 @@ class _Project:
                 return
             if status == "unhealthy" or not state.get("Running") or time.monotonic() >= deadline:
                 outputs = [entry["Output"].strip() for entry in health.get("Log") or ()]
+                # The startup's own lines, so a failure names its cause (P12F3
+                # B3); the token line stays out of the report.
+                lines = [line for line in self.logs().splitlines() if "Access token:" not in line]
                 pytest.fail(
                     f"the service is {status or state.get('Status')!r}, not healthy"
-                    f" (exit code {state.get('ExitCode')}); last health log: {outputs[-3:]}"
+                    f" (exit code {state.get('ExitCode')}); last health log: {outputs[-3:]};"
+                    f" last log lines: {lines[-12:]}"
                 )
             # The wait between reads: ``docker events --until``, as everywhere here.
             _events(self, "health_status", time.time(), HEALTH_POLL_SECONDS)
@@ -3362,6 +3537,16 @@ class _Project:
         state = self.inspect()["State"].get("Health") or {}
         return state.get("Status", ""), [entry["Output"].strip() for entry in state.get("Log") or ()]
 
+    def probes(self) -> list[tuple[float, float, str]]:
+        """The health log's probes, oldest first: start, end (epoch
+        seconds, as Docker recorded them) and output."""
+
+        state = self.inspect()["State"].get("Health") or {}
+        return [
+            (_epoch(entry["Start"]), _epoch(entry["End"]), entry["Output"].strip())
+            for entry in state.get("Log") or ()
+        ]
+
     def kill(self) -> None:
         _command([self.docker, "kill", self.container()], cause="docker kill failed")
 
@@ -3386,7 +3571,31 @@ def _events(project: _Project, event: str, since: float, seconds: float) -> list
     """The container's *event* actions from *since* to ``now + seconds``:
     ``docker events --until`` is the wait, the subprocess timeout its guard."""
 
-    until = time.time() + seconds
+    return [action for _at, action in _timed_events(project, event, since, time.time() + seconds)]
+
+
+def _midway_between_probes(project: _Project) -> None:
+    """Return half a health interval after the latest probe ended, before
+    the next one starts (AC21's kill is placed there)."""
+
+    waited = time.time() + 2 * (HEALTH_INTERVAL_SECONDS + HEALTH_TIMEOUT_SECONDS)
+    while time.time() < waited:
+        probes = project.probes()
+        if probes:
+            midway = probes[-1][1] + HEALTH_INTERVAL_SECONDS / 2
+            if time.time() <= midway:
+                # The waits: ``docker events --until``, as everywhere here.
+                _timed_events(project, "health_status", time.time(), midway)
+                return
+        _events(project, "health_status", time.time(), HEALTH_POLL_SECONDS)
+    raise AssertionError(f"no probe recorded between intervals: {project.probes()}")
+
+
+def _timed_events(project: _Project, event: str, since: float, until: float) -> list[tuple[float, str]]:
+    """The container's *event* actions from *since* to *until* (epoch
+    seconds), each with the time Docker stamped it."""
+
+    seconds = max(until - time.time(), 0.0)
     result = _command(
         [
             project.docker, "events",
@@ -3394,15 +3603,35 @@ def _events(project: _Project, event: str, since: float, seconds: float) -> list
             "--filter", f"event={event}",
             "--since", f"{since:.3f}",
             "--until", f"{until:.3f}",
-            "--format", "{{.Action}}",
+            "--format", "{{.TimeNano}} {{.Action}}",
         ],
         cause="docker events failed", timeout=seconds + COMMAND_SECONDS,
     )
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    events = []
+    for line in result.stdout.splitlines():
+        nanoseconds, _, action = line.strip().partition(" ")
+        if action:
+            events.append((int(nanoseconds) / 1e9, action))
+    return events
+
+
+_STAMP = re.compile(r"(?P<whole>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?P<fraction>\.\d+)?(?P<zone>Z|[+-]\d\d:\d\d)")
+
+
+def _epoch(stamp: str) -> float:
+    """A Docker timestamp (RFC 3339 with up to nanoseconds, ``Z`` or an
+    offset) in epoch seconds."""
+
+    match = _STAMP.fullmatch(stamp)
+    assert match, stamp
+    zone = "+00:00" if match["zone"] == "Z" else match["zone"]
+    return datetime.fromisoformat(match["whole"] + zone).timestamp() + float(match["fraction"] or 0)
 
 
 def _tokens(logs: str) -> list[str]:
-    return re.findall(r"\?token=([A-Za-z0-9_-]+)", logs)
+    """The tokens of the log's ``Access token:`` lines (P12F3 M1)."""
+
+    return re.findall(r"Access token: ([A-Za-z0-9_-]+)$", logs, re.MULTILINE)
 
 
 def _landing(project: _Project) -> str:
@@ -3486,10 +3715,7 @@ def _complete_wizard(project: _Project, credentials: dict[str, str]) -> str:
 
 
 def _started_at(project: _Project) -> float:
-    started = project.inspect()["State"]["StartedAt"]
-    whole, _, fraction = started.rstrip("Z").partition(".")
-    epoch = datetime.fromisoformat(whole).replace(tzinfo=timezone.utc).timestamp()
-    return epoch + float(f"0.{fraction or '0'}")
+    return _epoch(project.inspect()["State"]["StartedAt"])
 
 
 def _record(project: _Project, path: str) -> bytes | None:
@@ -3666,6 +3892,8 @@ def test_trial_container_secrets(tmp_path: Path) -> None:
             assert value not in first_health, name
         first_tokens = _tokens(first_logs)
         assert len(first_tokens) == 1, len(first_tokens)
+        # P12F3 M1: the address line never carries the token.
+        assert "token=" not in first_logs and first_logs.count(first_tokens[0]) == 1
         assert first_tokens[0] not in first_health and first_tokens[0] not in wizard_output
         assert "token=" not in first_health and "http://" not in first_health
 
@@ -3681,6 +3909,7 @@ def test_trial_container_secrets(tmp_path: Path) -> None:
             assert value not in health_text, name
         tokens = _tokens(logs)
         assert len(tokens) == 2 and len(set(tokens)) == 2, len(tokens)
+        assert "token=" not in logs
         for token in tokens:
             assert logs.count(token) == 1
             assert token not in health_text
@@ -3707,10 +3936,23 @@ def test_trial_container_health(tmp_path: Path) -> None:
         assert project.health()[0] == "healthy"
         supervision = json.loads(_record(project, f"{DATA_DIRECTORY}/{locations.PROFILE_FILE_NAME}{config_ui.SUPERVISION_SUFFIX}") or b"{}")
         assert supervision.get("state") == "launched", supervision
-        killed = time.time()
-        project.python(KILL_PROOF, {"pid": supervision["pid"]})
-        statuses = _events(project, "health_status", killed, 3 * HEALTH_INTERVAL_SECONDS + HEALTH_TIMEOUT_SECONDS)
-        assert [status for status in statuses if status.endswith("unhealthy")], statuses
+        # AC21: the kill observed within 3 health intervals, the fixed
+        # deadline 3 × interval after the kill. Docker starts each interval
+        # when the previous probe ends, so the kill is placed half an
+        # interval after a probe: the third failure then ends well before
+        # the deadline, and a later one is a violation, not slack. The trial
+        # watches 3 × (interval + timeout), longer than the deadline, so a
+        # late event is seen and rejected rather than missed. The start
+        # period plays no part: the container already reported healthy, and
+        # Docker counts every failure after a first success.
+        _midway_between_probes(project)
+        killed = project.python(KILL_PROOF, {"pid": supervision["pid"]})["at"]
+        watched = killed + AC21_INTERVALS * (HEALTH_INTERVAL_SECONDS + HEALTH_TIMEOUT_SECONDS)
+        events = _timed_events(project, "health_status", killed, watched)
+        unhealthy = [at for at, action in events if action.endswith(": unhealthy")]
+        assert unhealthy, events
+        deadline = killed + AC21_INTERVALS * HEALTH_INTERVAL_SECONDS
+        assert unhealthy[0] <= deadline, (unhealthy[0] - killed, deadline - killed, project.probes())
         status, health_log = project.health()
         assert status == "unhealthy" and health_log[-1] == "unhealthy: runtime exited", health_log[-1:]
 

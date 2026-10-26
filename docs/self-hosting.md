@@ -24,18 +24,19 @@ docker compose logs companion
 1. The first command downloads the compose file, and only it, into the directory.
 2. `docker compose up -d` starts the companion. **The first `up` builds the image**: no image is
    published in a registry, so Compose builds it from the repository's Git URL named in the compose
-   file. That build needs `git` installed on the host (Compose clones the repository for it) and takes a
-   few minutes; the trial record (`docs/campaigns/phase10/trial-record.md`) gives the time it took
-   there. Later `up` commands reuse the built image. A later phase may replace the build with a
+   file. That build needs `git` installed on the host (Compose clones the repository for it), and it
+   only happens once: later `up` commands reuse the built image. A later phase may replace the build with a
    published image.
-3. `docker compose logs companion` prints the container's log. Its line
-   `Configuration UI: http://127.0.0.1:8765/?token=…` is the access URL; if the log is still empty, the
-   companion is still starting: run the command again. Each start prints a new line; the last one is
-   the valid one (see [The token](#6-the-token)).
+3. `docker compose logs companion` prints the container's log. Two lines give access, each labelled
+   and each copied on its own: `Configuration UI: http://127.0.0.1:8765/` is the page's address and
+   `Access token: …` is the token. If the log is still empty, the companion is still starting: run the
+   command again. Each start prints a new pair; the last one is the valid one (see
+   [The token](#6-the-token)).
 
-Open that URL in a browser on the server itself, or — on a remote server — through an SSH tunnel from
-your own computer (see [The token](#6-the-token)). On an empty volume it opens the setup screens; pass
-them as [`docs/first-run.md`](first-run.md) describes, from screen 1 to the dry run of screen 5.
+The access URL is the address followed by `?token=` and the token:
+`http://127.0.0.1:8765/?token=…`. Open it in a browser on the server itself, or — on a remote
+server — through an SSH tunnel from your own computer (see [The token](#6-the-token)). On an empty
+volume it opens the setup screens; pass them as [`docs/first-run.md`](first-run.md) describes, from screen 1 to the dry run of screen 5.
 
 **If the repository is private**, the first command and the build need read access to it: the raw URL
 then answers 404 to an anonymous `curl`, and the Git build fails. Obtain the compose file another way
@@ -71,8 +72,9 @@ twitch-ia-compagnon-config-ui --host 0.0.0.0 --allow-non-loopback --no-browser -
   its log at each start (`config_ui: warning: bound to 0.0.0.0 port 8765: …`): the page is reachable
   from the network and protected only by the access token. In this compose file, "the network" is the
   host's loopback, through the published port.
-- `--no-browser` never tries to open a browser: there is none in a container. The access URL is still
-  printed once.
+- `--no-browser` never tries to open a browser: there is none in a container. The address and the
+  token are still printed once, on two separate labelled lines (`Configuration UI:` and
+  `Access token:`), so that one can be copied without the other.
 - `--start-runtime` starts the companion once the page is listening, through the same **Start** as the
   console, when the setup is finished. With an unfinished setup, or no profile yet, it starts nothing
   and logs why, without any value.
@@ -152,8 +154,8 @@ No credential value is ever written to the container's log or to the health log.
 ## 6. The token
 
 - **Printed once per start.** Without `--token-file`, the access token is generated at each start of
-  the container, and the access URL that carries it is printed once to the log. A restart makes a new
-  one: read it again with `docker compose logs companion` — the last `Configuration UI:` line is the
+  the container, and printed once to the log on its own `Access token:` line. A restart makes a new
+  one: read it again with `docker compose logs companion` — the last `Access token:` line is the
   valid one. Anyone who can read the container's log can read the token.
 - **A stable token: `--token-file`.** With `--token-file PATH` the token is the content of that file,
   the same across restarts. It must be 43 to 128 characters from `A–Z a–z 0–9 - _`; surrounding
@@ -173,7 +175,7 @@ No credential value is ever written to the container's log or to the health log.
   image.
 - **From your own computer: an SSH tunnel.** The page is published on the server's loopback only. From
   your computer, `ssh -L 8765:127.0.0.1:8765 you@server` forwards it, and the access URL then works in
-  your own browser as printed. Nothing in the compose file changes.
+  your own browser as written above. Nothing in the compose file changes.
 - **Exposing it beyond the host** is an explicit edit, never a default. Change the published address
   (for instance `"8765:8765"` for every interface of the server) and add one `--allowed-host NAME` to
   the command per host name your browser will use to reach it (a name or an address), then replace
@@ -250,6 +252,7 @@ matches decides:
 | `unhealthy: token refused` | the page refuses the recorded token | 1 |
 | `unhealthy: another instance` | something else answers on the port | 1 |
 | `unhealthy: supervision record unusable` | the supervision record cannot be read | 1 |
+| `unhealthy: supervision record not written` | the page could not record a start or a stop (its directory or volume refuses writes): neither idle nor running can be trusted; if not even this can be recorded, the page stops and the container exits | 1 |
 | `idle: wizard unfinished` | the setup is not finished, so nothing is started | 0 |
 | `idle: not started` | the setup is finished, the companion was not started since this page started | 0 |
 | `idle: stopped` | you stopped the companion from the console | 0 |

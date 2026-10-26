@@ -26,18 +26,18 @@ docker compose logs companion
 2. `docker compose up -d` démarre le compagnon. **Le premier `up` construit l'image** : aucune image
    n'est publiée dans un registre, donc Compose la construit depuis l'URL Git du dépôt que nomme le
    fichier compose. Cette construction demande `git` installé sur l'hôte (Compose clone le dépôt pour
-   elle) et prend quelques minutes ; le compte rendu d'essai
-   (`docs/campaigns/phase10/trial-record.md`) donne le temps qu'elle y a pris. Les `up` suivants
-   réutilisent l'image construite. Une phase ultérieure pourra remplacer cette construction par une
+   elle), et elle n'a lieu qu'une fois : les `up` suivants réutilisent l'image construite. Une phase ultérieure pourra remplacer cette construction par une
    image publiée.
-3. `docker compose logs companion` affiche le journal du conteneur. Sa ligne
-   `Configuration UI: http://127.0.0.1:8765/?token=…` est l'adresse d'accès ; si le journal est encore
-   vide, le compagnon démarre encore : relancez la commande. Chaque démarrage imprime une nouvelle
-   ligne ; la dernière est la bonne (voir [Le jeton](#6-le-jeton)).
+3. `docker compose logs companion` affiche le journal du conteneur. Deux lignes donnent l'accès,
+   chacune étiquetée et chacune copiée seule : `Configuration UI: http://127.0.0.1:8765/` est l'adresse
+   de la page et `Access token: …` est le jeton. Si le journal est encore vide, le compagnon démarre
+   encore : relancez la commande. Chaque démarrage imprime une nouvelle paire ; la dernière est la bonne
+   (voir [Le jeton](#6-le-jeton)).
 
-Ouvrez cette adresse dans un navigateur sur le serveur lui-même, ou — sur un serveur distant — à travers
-un tunnel SSH depuis votre propre ordinateur (voir [Le jeton](#6-le-jeton)). Sur un volume vide, elle
-ouvre les écrans de configuration ; passez-les comme le décrit
+L'adresse d'accès est l'adresse suivie de `?token=` et du jeton :
+`http://127.0.0.1:8765/?token=…`. Ouvrez-la dans un navigateur sur le serveur lui-même, ou — sur un
+serveur distant — à travers un tunnel SSH depuis votre propre ordinateur (voir [Le jeton](#6-le-jeton)).
+Sur un volume vide, elle ouvre les écrans de configuration ; passez-les comme le décrit
 [`docs/first-run.fr.md`](first-run.fr.md), de l'écran 1 jusqu'à l'essai à blanc de l'écran 5.
 
 **Si le dépôt est privé**, la première commande et la construction demandent un accès en lecture au
@@ -76,7 +76,8 @@ twitch-ia-compagnon-config-ui --host 0.0.0.0 --allow-non-loopback --no-browser -
   la page est joignable depuis le réseau et protégée seulement par le jeton d'accès. Avec ce fichier
   compose, « le réseau » est la boucle locale de l'hôte, par le port publié.
 - `--no-browser` n'essaie jamais d'ouvrir un navigateur : il n'y en a pas dans un conteneur. L'adresse
-  d'accès est toujours imprimée une fois.
+  et le jeton sont toujours imprimés une fois, sur deux lignes étiquetées distinctes
+  (`Configuration UI:` et `Access token:`), pour pouvoir copier l'un sans l'autre.
 - `--start-runtime` démarre le compagnon dès que la page écoute, par le même **Start** que la console,
   quand la configuration est terminée. Avec une configuration inachevée, ou sans profil, il ne démarre
   rien et journalise pourquoi, sans aucune valeur.
@@ -161,9 +162,9 @@ Aucune valeur d'identifiant n'est jamais écrite dans le journal du conteneur ni
 ## 6. Le jeton
 
 - **Imprimé une fois par démarrage.** Sans `--token-file`, le jeton d'accès est généré à chaque
-  démarrage du conteneur, et l'adresse d'accès qui le porte est imprimée une fois dans le journal. Un
+  démarrage du conteneur, et imprimé une fois dans le journal sur sa propre ligne `Access token:`. Un
   redémarrage en crée un nouveau : relisez-le avec `docker compose logs companion` — la dernière ligne
-  `Configuration UI:` est la bonne. Quiconque peut lire le journal du conteneur peut lire le jeton.
+  `Access token:` est la bonne. Quiconque peut lire le journal du conteneur peut lire le jeton.
 - **Un jeton stable : `--token-file`.** Avec `--token-file PATH` le jeton est le contenu de ce fichier,
   identique d'un redémarrage à l'autre. Il doit faire de 43 à 128 caractères pris dans
   `A–Z a–z 0–9 - _` ; les blancs autour sont ignorés. Un fichier absent, vide ou invalide arrête la page
@@ -181,7 +182,7 @@ Aucune valeur d'identifiant n'est jamais écrite dans le journal du conteneur ni
   ajoutant `--token-file /run/secrets/companion_token`. Le jeton n'est jamais stocké dans l'image.
 - **Depuis votre propre ordinateur : un tunnel SSH.** La page n'est publiée que sur la boucle locale du
   serveur. Depuis votre ordinateur, `ssh -L 8765:127.0.0.1:8765 you@server` la fait suivre, et
-  l'adresse d'accès fonctionne alors telle qu'imprimée dans votre propre navigateur. Rien ne change dans
+  l'adresse d'accès fonctionne alors, écrite comme ci-dessus, dans votre propre navigateur. Rien ne change dans
   le fichier compose.
 - **L'exposer au-delà de l'hôte** est une modification explicite, jamais un défaut. Changez l'adresse
   publiée (par exemple `"8765:8765"` pour toutes les interfaces du serveur) et ajoutez à la commande un
@@ -261,6 +262,7 @@ correspond décide :
 | `unhealthy: token refused` | la page refuse le jeton enregistré | 1 |
 | `unhealthy: another instance` | autre chose répond sur le port | 1 |
 | `unhealthy: supervision record unusable` | l'enregistrement de supervision est illisible | 1 |
+| `unhealthy: supervision record not written` | la page n'a pas pu enregistrer un démarrage ou un arrêt (son répertoire ou son volume refuse l'écriture) : ni « au repos » ni « en marche » n'est fiable ; si même cela ne peut être enregistré, la page s'arrête et le conteneur se termine | 1 |
 | `idle: wizard unfinished` | la configuration n'est pas terminée, donc rien n'est démarré | 0 |
 | `idle: not started` | la configuration est terminée, le compagnon n'a pas été démarré depuis le démarrage de cette page | 0 |
 | `idle: stopped` | vous avez arrêté le compagnon depuis la console | 0 |

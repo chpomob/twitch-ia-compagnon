@@ -131,7 +131,6 @@ from core.main import (
     SECRETS_KEY,
     _STARTUP_DEADLINE_SECONDS,
     _builtin_modules_directory,
-    _utc_timestamp,
     check_config,
 )
 from core.overlay import (
@@ -191,6 +190,9 @@ SUPERVISION_VERSION = 1
 SUPERVISION_NOT_STARTED = "not_started"
 SUPERVISION_LAUNCHED = "launched"
 SUPERVISION_STOPPED = "stopped"
+#: Written over the record in place when a transition could not be written
+#: (P12F3 B1): the record then names the failure, never a stale idle state.
+SUPERVISION_WRITE_FAILED = "write_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -3272,6 +3274,12 @@ class ConfigUI:
         #: by main's claim path; while ``None`` no transition writes one.
         self._supervision: Path | None = None
         self._supervision_lock = threading.Lock()
+        #: A transition could be neither written nor marked failed in the
+        #: record (P12F3 B1): this UI stops serving and :func:`main` exits
+        #: non-zero, so no stale record is left reading as a healthy idle.
+        self.supervision_lost = False
+        #: Set by :func:`serve` while it serves: ends serving, from any thread.
+        self.stop_serving: Callable[[], None] | None = None
         #: The last Apply's report, shown on the pages (R7).
         self.last_apply: ApplyReport | None = None
         #: Called once by :func:`serve` when the listener accepts connections,
@@ -3853,11 +3861,14 @@ class ConfigUI:
     def publish_supervision(self, path: Path) -> None:
         """Publish ``not_started`` at *path*, replacing any record present;
         from now on each transition rewrites it. Only :func:`main`'s claim
-        path calls this, right after the instance record is claimed."""
+        path calls this, right after the instance record is claimed. A
+        failed write raises ``OSError`` and publishes nothing: the caller
+        must not serve (P12F3 B1, fail closed)."""
 
+        content = supervision_document(self.instance_marker, SUPERVISION_NOT_STARTED)
         with self._supervision_lock:
+            _write_supervision(path, self.settings.instance_path, content)
             self._supervision = path
-        self._record_supervision(SUPERVISION_NOT_STARTED)
 
     def release_supervision(self) -> None:
         """Remove the supervision record when it carries this UI's marker;
@@ -3877,7 +3888,12 @@ class ConfigUI:
 
     def _record_supervision(self, state: str, child: Any = None) -> None:
         """Rewrite the supervision record with *state*; nothing while this UI
-        has published none. A failed write is logged, value-free."""
+        has published none. A failed write is logged, value-free, and fails
+        closed (P12F3 B1): the record left behind holds the previous state,
+        which may read as a healthy idle, so it is overwritten in place with
+        ``write_failed`` (the health command's own unhealthy line); when even
+        that fails this UI stops serving, its child is closed with it, and
+        :func:`main` exits non-zero."""
 
         with self._supervision_lock:
             path = self._supervision
@@ -3886,8 +3902,19 @@ class ConfigUI:
             content = supervision_document(self.instance_marker, state, child)
             try:
                 _write_supervision(path, self.settings.instance_path, content)
+                return
             except OSError:
                 logger.warning("the supervision record could not be written (%s)", state)
+            failed = supervision_document(self.instance_marker, SUPERVISION_WRITE_FAILED)
+            try:
+                _overwrite_supervision(path, self.settings.instance_path, failed)
+                return
+            except OSError:
+                logger.warning("the supervision record could not be marked failed: the UI stops serving")
+            self.supervision_lost = True
+            stop = self.stop_serving
+        if stop is not None:
+            stop()
 
     def _child_alive(self) -> bool:
         """Whether this UI's child is still alive, whatever its status record says."""
@@ -6789,17 +6816,27 @@ def serve(ui: ConfigUI, settings: UISettings) -> None:
         await runner.setup()
         try:
             await web.TCPSite(runner, settings.host, settings.port).start()
+            stopped = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def stop_serving() -> None:
+                with suppress(RuntimeError):  # the loop already closed
+                    loop.call_soon_threadsafe(stopped.set)
+
+            # A supervision record that can no longer be written ends serving
+            # (P12F3 B1); every transition comes after this point.
+            ui.stop_serving = stop_serving
             # Only now is anything listening; the hook runs on its own thread
             # so a blocking browser opener never holds the loop.
             if ui.on_listening is not None:
                 threading.Thread(target=ui.on_listening, name="config-ui-opener", daemon=True).start()
-            stopped = asyncio.Event()
             if os.name != "nt":
                 # As aiohttp's run_app did: SIGTERM ends serving through the
                 # finally clauses, so the supervised child is still closed.
-                asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopped.set)
+                loop.add_signal_handler(signal.SIGTERM, stopped.set)
             await stopped.wait()
         finally:
+            ui.stop_serving = None
             await runner.cleanup()
 
     try:
@@ -7366,8 +7403,22 @@ def supervision_document(marker: str, state: str, child: Any = None) -> bytes:
     }
     if state == SUPERVISION_LAUNCHED:
         document["pid"] = child.pid
-        document["launched_at"] = _utc_timestamp()
+        document["launched_at"] = launch_timestamp(time.time())
     return (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+
+
+def launch_timestamp(seconds: float) -> str:
+    """*seconds* (epoch, sampled after ``Supervisor.start`` returned the
+    child) as ``launched_at``: the status record's millisecond format,
+    rounded **up** (P12F3 B3). The child forks less than a millisecond
+    before the sample, so a truncated timestamp could precede its start,
+    and the stale rule (R2) would then judge the live runtime not the one
+    launched: ``unhealthy: runtime exited`` for as long as it runs. Rounded
+    up, ``launched_at`` is never earlier than the child's start."""
+
+    milliseconds = math.ceil(round(seconds * 1000, 6))
+    moment = datetime.fromtimestamp(milliseconds // 1000, timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{milliseconds % 1000:03d}Z"
 
 
 def _write_supervision(path: Path, instance: Path, content: bytes) -> None:
@@ -7393,6 +7444,27 @@ def _write_supervision(path: Path, instance: Path, content: bytes) -> None:
     finally:
         with suppress(OSError):
             os.unlink(temp)
+
+
+def _overwrite_supervision(path: Path, instance: Path, content: bytes) -> None:
+    """Overwrite the existing supervision record at *path* in place with
+    *content* (P12F3 B1): the fallback when :func:`_write_supervision`
+    cannot create its temporary file (a directory no longer writable). It
+    creates nothing and follows no link; a reader may see a truncated
+    record meanwhile, which is unusable, never idle. An ``OSError``
+    propagates."""
+
+    flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    with _instance_lock(instance, exclusive=False):
+        descriptor = os.open(path, flags)
+        try:
+            os.ftruncate(descriptor, 0)
+            view = memoryview(content)
+            while view:
+                view = view[os.write(descriptor, view) :]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _remove_supervision_if(path: Path, instance: Path, marker: str) -> bool:
@@ -7461,6 +7533,7 @@ HEALTH_NOT_ANSWERING = "unhealthy: not answering"
 HEALTH_TOKEN_REFUSED = "unhealthy: token refused"
 HEALTH_ANOTHER_INSTANCE = "unhealthy: another instance"
 HEALTH_SUPERVISION_UNUSABLE = "unhealthy: supervision record unusable"
+HEALTH_SUPERVISION_NOT_WRITTEN = "unhealthy: supervision record not written"
 HEALTH_WIZARD_UNFINISHED = "idle: wizard unfinished"
 HEALTH_NOT_STARTED = "idle: not started"
 HEALTH_STOPPED = "idle: stopped"
@@ -7470,7 +7543,12 @@ HEALTH_DEGRADED_PREFIX = "degraded: "
 HEALTH_STARTING = "starting"
 HEALTH_NOT_READY = "unhealthy: runtime not ready"
 
-_SUPERVISION_STATES = (SUPERVISION_NOT_STARTED, SUPERVISION_LAUNCHED, SUPERVISION_STOPPED)
+_SUPERVISION_STATES = (
+    SUPERVISION_NOT_STARTED,
+    SUPERVISION_LAUNCHED,
+    SUPERVISION_STOPPED,
+    SUPERVISION_WRITE_FAILED,
+)
 
 
 def _health_probe(
@@ -7633,6 +7711,11 @@ def health(settings: UISettings, seams: HealthSeams) -> tuple[str, int]:
         supervision = _read_supervision(settings.supervision_path)
     except (SupervisionUnusable, OverlayError):
         return HEALTH_SUPERVISION_UNUSABLE, 1
+    # Row 5a (P12F3 B1): this UI could not write a transition; whatever it
+    # last wrote is no longer the truth, so neither idle nor running is.
+    if supervision is not None and supervision.marker == record.marker:
+        if supervision.state == SUPERVISION_WRITE_FAILED:
+            return HEALTH_SUPERVISION_NOT_WRITTEN, 1
     # Rows 6–7: nothing launched since this UI started.
     if (
         supervision is None
@@ -7790,9 +7873,22 @@ def main(
         return ended
     try:
         # Claimed: the supervision record is published now, replacing any
-        # present, and removed by the release below (phase 10 R6).
-        ui.publish_supervision(settings.supervision_path)
-        print(f"Configuration UI: {ui.access_url}", flush=True)
+        # present, and removed by the release below (phase 10 R6). Without
+        # it the health command would read an idle instance: nothing is
+        # served (P12F3 B1, fail closed).
+        try:
+            ui.publish_supervision(settings.supervision_path)
+        except OSError:
+            print("config_ui: the supervision record could not be written; nothing is served", file=sys.stderr)
+            return 2
+        if settings.no_browser:
+            # Nothing opens the URL, so a person copies it from the log: the
+            # address and the token on separate, labelled lines, neither
+            # holding the other (brief decision 4, P12F3 M1).
+            print(f"Configuration UI: http://{ui.access_authority}/", flush=True)
+            print(f"Access token: {ui.token}", flush=True)
+        else:
+            print(f"Configuration UI: {ui.access_url}", flush=True)
         logger.info("configuration UI serving on %s", ui.access_authority)
 
         def open_browser() -> None:
@@ -7834,4 +7930,5 @@ def main(
             ui.supervisor.close()
         finally:
             release_instance(ui, seams.platform)
-    return 0
+    # Serving ended because a transition could not be recorded (P12F3 B1).
+    return 2 if ui.supervision_lost else 0
