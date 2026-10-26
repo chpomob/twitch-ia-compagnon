@@ -58,7 +58,9 @@ the state directory has no documented volume.
 - Change a product behaviour to make containerisation easier. If a requirement needs a new setting, it is
   a setting, not a rewrite of how the runtime works.
 - Add a runtime dependency, a second image, or a compose file that assumes Docker Desktop.
-- Publish anything: no registry push, no tag, no release. Building and running locally is the phase.
+- Publish anything: no registry push, no published tag, no release, no GitHub release. A local tag
+  (`twitch-ia-compagnon:local`) and local branch refs are normal and are what the compose file uses;
+  building and running locally is the whole phase.
 
 ## Shape of the work
 

@@ -342,7 +342,18 @@ guide pair for someone who has not read the repository.
   The same records with a pid whose process started before publication are judged as today (the
   existing instance-record and foreign-pid tests pass unchanged), and with an unreadable start time the
   judgement is unchanged.
-- AC11 (R3): `Dockerfile` has exactly 2 `FROM` lines; the final one names an image as
+- **Amendment A3 (2026-10-26) — a `scratch` final stage is allowed, and required where it removes an
+  inherited environment.** AC11 as written demanded exactly two `FROM` lines, and the image could not
+  meet AC17's own prohibition (no build environment in the delivered image) while inheriting
+  `GPG_KEY` from the Python base: `docker image inspect --format '{{json .Config.Env}}'` shows it, and a
+  base image's `ENV` cannot be unset by a later instruction. The delivered filesystem may therefore be
+  re-based onto `FROM scratch` after the wheel has been installed, so that nothing of the base's
+  environment survives. What AC11 protected still holds and is what the checks assert: the stage that
+  installs the project names a Python base pinned by tag **and** `sha256`, the final image runs
+  `id -u` → `10001` (AC12), `python -m pip list` shows exactly the declared closure (AC12), and its
+  environment carries only the variables the specification names (AC17). A third stage that carries
+  anything else — a repository directory, a build tool, a key — remains a defect.
+- AC11 (R3): `Dockerfile` has the stages A3 allows, and its final stage names no image where A3 applies; the final one names an image as
   `python:<3.10–3.13 version>-<variant>@sha256:<64 hex characters>`; the final stage installs a wheel built
   by the first and copies no repository directory; the final stage's `USER` is `10001` (numeric).
 - AC12 (R3): Inside a container of the image, `id -u` prints `10001`; `python -m pip list --format=json`
