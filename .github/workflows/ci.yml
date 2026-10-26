@@ -61,3 +61,30 @@ jobs:
           python -m demo --no-colour > /dev/null
           python -m pip wheel . --no-deps --wheel-dir /tmp/wheel
           ls -1 /tmp/wheel
+
+  container-trial:
+    # Phase 10's container trial (R7): build the image from this checkout, run
+    # it with Docker Compose and probe it. Nothing is pushed, tagged or
+    # released; the runner's preinstalled Docker and Compose v2 are required,
+    # and a missing one fails the job rather than skipping it.
+    name: container trial
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the project with its test extra
+        run: python -m pip install -e ".[test]"
+
+      - name: Container trial
+        env:
+          TWITCH_IA_COMPAGNON_CONTAINER_TRIAL: "1"
+          TWITCH_IA_COMPAGNON_BUILD_CONTEXT: "."
+        run: python -m pytest tests/test_container.py -q -p no:cacheprovider -rs

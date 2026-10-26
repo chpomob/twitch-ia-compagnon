@@ -61,6 +61,12 @@ health command as its healthcheck with the Dockerfile's timings, A1's exact
 build context, nothing Docker-Desktop-specific and no other file required;
 its optional credential and token-file entries are comments, not keys.
 
+Then the CI workflow's static contract (R7, AC23's CI part): ``ci.yml``
+gains exactly the ``container-trial`` job, which runs R7's invocation with
+the variable set to ``1`` and the build context ``.``; the ``tests`` job's
+steps equal a literal copy of those at the brief's HEAD (``git show`` would
+start a process); and no step pushes, logs in, tags or releases.
+
 Last, the container trial itself (R7, AC23's default parts): the five
 ``test_trial_container_*`` nodes, each starting with phase 2's
 ``required(CONTAINER_TRIAL_VARIABLE)``, build the image from
@@ -2397,6 +2403,84 @@ def test_ac14_the_optional_entries_are_comments_not_keys() -> None:
     assert set(document) == {"services", "volumes"}
     assert not {"env_file", "environment", "secrets", "command"} & set(service)
     assert "--token-file" not in json.dumps(document)
+
+
+# -- the CI workflow's static contract (R7, AC23's CI part) ------------------- #
+
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+#: The ``tests`` job's steps as committed at the brief's HEAD (``ff4f523``),
+#: copied here because reading them with ``git show`` would start a process.
+TESTS_STEPS: list[dict[str, Any]] = [
+    {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}},
+    {
+        "uses": "actions/setup-python@v5",
+        "with": {
+            "python-version": "${{ matrix.python-version }}",
+            "cache": "pip",
+            "cache-dependency-path": "pyproject.toml",
+        },
+    },
+    {
+        "name": "Install the project with its test extra",
+        "run": 'python -m pip install --upgrade pip\npython -m pip install -e ".[test]"\n',
+    },
+    {"name": "Test suite", "run": "python -m pytest tests/ -q -p no:cacheprovider"},
+    {
+        "name": "Packaging and entry points",
+        "run": (
+            'python -c "import core.main, core.config_ui; print(\'imports ok\')"\n'
+            "twitch-ia-compagnon --help > /dev/null\n"
+            "twitch-ia-compagnon-config-ui --help > /dev/null\n"
+            "python -m demo --no-colour > /dev/null\n"
+            "python -m pip wheel . --no-deps --wheel-dir /tmp/wheel\n"
+            "ls -1 /tmp/wheel\n"
+        ),
+    },
+]
+#: R7's trial invocation, its variables supplied by the step's ``env:``.
+TRIAL_COMMAND = "python -m pytest tests/test_container.py -q -p no:cacheprovider -rs"
+#: Nothing is published: no step may push, log in, tag or release.
+PUBLISHING = ("docker push", "docker login", "docker tag", "git tag", "gh release")
+
+
+def _jobs() -> dict[str, Any]:
+    document = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    return document["jobs"]
+
+
+def test_ac23_the_workflow_gains_exactly_the_container_trial_job() -> None:
+    assert list(_jobs()) == ["tests", "container-trial"]
+
+
+def test_ac23_the_tests_jobs_steps_are_unchanged() -> None:
+    tests = _jobs()["tests"]
+    assert tests["steps"] == TESTS_STEPS
+    assert tests["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12", "3.13"]
+
+
+def test_ac23_the_container_trial_job_runs_r7s_invocation() -> None:
+    job = _jobs()["container-trial"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert 0 < job["timeout-minutes"] <= 60
+    assert "permissions" not in job  # the workflow's read-only permissions apply
+    steps = job["steps"]
+    assert [step.get("uses") for step in steps[:2]] == ["actions/checkout@v4", "actions/setup-python@v5"]
+    assert steps[1]["with"]["python-version"] == "3.12"
+    assert 'python -m pip install -e ".[test]"' in steps[2]["run"]
+    (trial,) = [step for step in steps if step.get("name") == "Container trial"]
+    assert trial is steps[-1]
+    assert trial["run"].strip() == TRIAL_COMMAND
+    assert trial["env"] == {CONTAINER_TRIAL_VARIABLE: "1", BUILD_CONTEXT_VARIABLE: "."}
+
+
+def test_ac23_no_step_publishes_anything() -> None:
+    for name, job in _jobs().items():
+        for step in job["steps"]:
+            text = json.dumps(step)
+            assert [word for word in PUBLISHING if word in text] == [], (name, step)
+            uses = step.get("uses", "")
+            assert "release" not in uses and not uses.startswith("docker/"), (name, uses)
 
 
 # -- the container trial (R7, AC7–AC9, AC12, AC13, AC16, AC17, AC21–AC23) ---- #
