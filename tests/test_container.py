@@ -46,6 +46,13 @@ bind, the UI ``main`` builds answers its route table, driven in-process, with
 phase 9's three route classes, every class-(iii) refusal equal to the one a
 default :class:`UISettings` gives; and a credential both inherited and stored
 reaches the supervised child with its stored value.
+
+Then the image's static contracts (R3, R5, AC11, AC17's ``.dockerignore``
+part): the ``Dockerfile``'s two stages, digest-pinned base, wheel-only
+runtime stage, numeric user, A2's default command and the health command;
+and ``.dockerignore`` as an allowlist, judged by a pure-Python model of
+Docker's matching rules over a synthetic path list (no daemon: the trial's
+image inspection is the real check).
 """
 
 from __future__ import annotations
@@ -1955,3 +1962,328 @@ def test_ac18_the_stored_credential_wins_in_the_supervised_childs_environment(
     finally:
         ui.supervisor.close()
         config_ui._LOG_REDACTION.sources.discard(ui)
+
+
+# -- the image's static contracts (R3, R5, AC11, AC17) ------------------------ #
+
+ROOT = Path(__file__).resolve().parent.parent
+DOCKERFILE = ROOT / "Dockerfile"
+DOCKERIGNORE = ROOT / ".dockerignore"
+PROFILES = ROOT / "core" / "config_ui" / "profiles"
+
+#: AC11: the final base names a supported Python, a variant and a digest.
+PINNED_BASE = re.compile(r"python:3\.(1[0-3])[^@]*-[a-z0-9]+@sha256:[0-9a-f]{64}")
+#: A2's default command, argument for argument.
+CONTAINER_COMMAND = [
+    "twitch-ia-compagnon-config-ui",
+    "--host",
+    "0.0.0.0",
+    "--allow-non-loopback",
+    "--no-browser",
+    "--start-runtime",
+]
+#: Stage 1 copies these sources by name and nothing else.
+BUILD_SOURCES = ["pyproject.toml", "LICENSE", "core", "modules"]
+#: AC17: names an image environment variable or label must never match.
+SECRET_NAME = re.compile(r".*_KEY|.*_TOKEN|.*_SECRET|.*PASSWORD.*")
+
+
+def _instructions(text: str) -> list[tuple[str, str]]:
+    """The Dockerfile's instructions as ``(KEYWORD, arguments)``, continuations joined."""
+
+    instructions: list[tuple[str, str]] = []
+    pending = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not pending and (not stripped or stripped.startswith("#")):
+            continue
+        if pending and stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        whole = pending + stripped
+        pending = ""
+        keyword, _, arguments = whole.partition(" ")
+        instructions.append((keyword.upper(), arguments.strip()))
+    assert not pending, "the Dockerfile ends inside a continuation"
+    return instructions
+
+
+def _stages() -> list[list[tuple[str, str]]]:
+    """The instructions grouped by stage, each list starting with its ``FROM``."""
+
+    stages: list[list[tuple[str, str]]] = []
+    for keyword, arguments in _instructions(DOCKERFILE.read_text(encoding="utf-8")):
+        if keyword == "FROM":
+            stages.append([])
+        assert stages, f"{keyword} before the first FROM"
+        stages[-1].append((keyword, arguments))
+    return stages
+
+
+def _arguments(stage: list[tuple[str, str]], keyword: str) -> list[str]:
+    return [arguments for name, arguments in stage if name == keyword]
+
+
+def _copy_sources(arguments: str) -> tuple[list[str], list[str]]:
+    """A ``COPY``'s ``--flags`` and its sources (every word but the destination)."""
+
+    words = json.loads(arguments) if arguments.startswith("[") else arguments.split()
+    flags = [word for word in words if word.startswith("--")]
+    paths = [word for word in words if not word.startswith("--")]
+    return flags, paths[:-1]
+
+
+def _env_and_label_names(stage: list[tuple[str, str]]) -> list[str]:
+    names: list[str] = []
+    for keyword, arguments in stage:
+        if keyword in ("ENV", "LABEL"):
+            names.extend(word.split("=", 1)[0].strip('"') for word in arguments.split())
+        if keyword == "ARG":
+            names.append(arguments.split("=", 1)[0])
+    return names
+
+
+def _credential_names() -> set[str]:
+    names = set()
+    for path in sorted(PROFILES.glob("*.json")):
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        names.update(credential["name"] for credential in profile["credentials"])
+    return names
+
+
+def test_ac11_two_stages_on_one_digest_pinned_base() -> None:
+    stages = _stages()
+    assert len(stages) == 2
+    (build_from,), (final_from,) = (_arguments(stage, "FROM") for stage in stages)
+    final_image = final_from.split()[0]
+    assert PINNED_BASE.fullmatch(final_image), final_image
+    build_words = build_from.split()
+    assert build_words[0] == final_image
+    assert [word.lower() for word in build_words[1:]] == ["as", "build"]
+
+
+def test_ac11_the_final_stage_installs_the_first_stages_wheel_and_no_checkout() -> None:
+    build, final = _stages()
+    build_name = _arguments(build, "FROM")[0].split()[-1]
+    copies = [_copy_sources(arguments) for arguments in _arguments(final, "COPY")]
+    assert copies == [([f"--from={build_name}"], ["/wheels"])]
+    assert "/wheels" in " ".join(_arguments(build, "RUN"))
+    assert "--wheel-dir /wheels" in " ".join(_arguments(build, "RUN"))
+    installs = [run for run in _arguments(final, "RUN") if "pip install" in run]
+    assert len(installs) == 1 and re.search(r"pip install [^&]*/wheels/\*\.whl", installs[0])
+    assert not _arguments(final, "ADD")
+
+
+def test_ac11_the_build_stage_copies_only_the_wheels_files_by_name() -> None:
+    for stage in _stages():
+        assert not _arguments(stage, "ADD")
+        for arguments in _arguments(stage, "COPY"):
+            _, sources = _copy_sources(arguments)
+            assert all(source.rstrip("/") not in (".", "./", "") for source in sources), arguments
+    build, _ = _stages()
+    sources = [source for arguments in _arguments(build, "COPY") for source in _copy_sources(arguments)[1]]
+    assert sources == BUILD_SOURCES
+
+
+def test_ac11_the_final_user_is_numeric_10001_with_its_data_volume() -> None:
+    _, final = _stages()
+    assert _arguments(final, "USER")[-1] == "10001"
+    assert _arguments(final, "VOLUME") == ["/data"]
+    assert _arguments(final, "EXPOSE") == ["8765"]
+    environment = " ".join(_arguments(final, "ENV")).split()
+    assert {"XDG_CONFIG_HOME=/data", "HOME=/data", "PYTHONUNBUFFERED=1"} <= set(environment)
+    runs = " ".join(_arguments(final, "RUN"))
+    assert "mkdir -m 0700 /data" in runs and "chown 10001:10001 /data" in runs
+    assert "--uid 10001" in runs and "--gid 10001" in runs and "--home-dir /data" in runs
+
+
+def test_ac11_the_default_command_is_a2s_and_parses_as_container_mode() -> None:
+    _, final = _stages()
+    (command,) = _arguments(final, "CMD")
+    argv = json.loads(command)
+    assert argv == CONTAINER_COMMAND
+    settings = config_ui.UISettings.from_argv(argv[1:])
+    assert settings.host == "0.0.0.0" and settings.allow_non_loopback
+    assert settings.no_browser and settings.start_runtime and settings.default_location
+    assert settings.token_file is None and not settings.health
+
+
+def test_ac11_the_healthcheck_runs_the_health_command() -> None:
+    _, final = _stages()
+    (healthcheck,) = _arguments(final, "HEALTHCHECK")
+    options, _, command = healthcheck.partition(" CMD ")
+    assert json.loads(command) == ["twitch-ia-compagnon-config-ui", "--health"]
+    flags = dict(option.lstrip("-").split("=", 1) for option in options.split())
+    assert flags["timeout"] == "10s"
+    assert {"interval", "start-period"} <= set(flags)
+    assert config_ui.UISettings.from_argv(["--health"]).health
+
+
+def test_ac17_no_image_environment_label_or_argument_names_a_secret() -> None:
+    credentials = _credential_names()
+    assert credentials, "the bundled profiles name no credential"
+    names = [name for stage in _stages() for name in _env_and_label_names(stage)]
+    assert names
+    assert [name for name in names if name in credentials or SECRET_NAME.fullmatch(name)] == []
+
+
+# .dockerignore: Docker's rules modelled in Python (finding P2).
+
+#: AC17's and the plan's deny patterns, in their order after the re-includes.
+DENY_PATTERNS = [
+    ".git",
+    ".venv",
+    "venv",
+    "**/__pycache__",
+    ".pytest_cache",
+    "*.egg-info",
+    "build",
+    "dist",
+    "**/profile.yaml",
+    "**/*.local.yaml",
+    "**/*.status.json",
+    "**/*.credentials.json",
+    "**/*.instance.json",
+    "**/*.supervisor.json",
+    "**/*.wizard.json",
+    "**/*.feed*",
+    "**/.env*",
+    "docs/runs/",
+    "findings.json",
+]
+RE_INCLUDES = ["!pyproject.toml", "!LICENSE", "!core/", "!modules/"]
+EXCLUDED = [
+    "profile.yaml",
+    "config/profile.yaml",
+    "core/profile.yaml",
+    "profile.instance.json",
+    "core/x.instance.json",
+    "profile.supervisor.json",
+    "profile.local.yaml",
+    "profile.credentials.json",
+    "profile.status.json",
+    ".env",
+    ".env.local",
+    "docs/runs/x.md",
+    ".git/config",
+]
+INCLUDED_FIXED = [
+    "pyproject.toml",
+    "LICENSE",
+    "core/config_ui/__init__.py",
+    "core/config_ui/strings/en.json",
+    "modules/twitch/module.yaml",
+]
+
+
+def _patterns() -> list[str]:
+    """``.dockerignore``'s patterns: comments and blank lines dropped, each trimmed."""
+
+    lines = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _pattern_regex(pattern: str) -> re.Pattern[str]:
+    """One pattern as Docker's pattern matcher compiles it (``/`` separators)."""
+
+    pattern = os.path.normpath(pattern).replace(os.sep, "/").lstrip("/")
+    parts: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if pattern.startswith("**", index):
+            index += 2
+            if pattern.startswith("/", index):
+                index += 1
+            parts.append(".*" if index == len(pattern) else "(.*/)?")
+            continue
+        if char == "*":
+            parts.append("[^/]*")
+        elif char == "?":
+            parts.append("[^/]")
+        elif char == "\\" and index + 1 < len(pattern):
+            index += 1
+            parts.append(re.escape(pattern[index]))
+        elif char == "[":
+            end = pattern.index("]", index)
+            parts.append(pattern[index : end + 1])
+            index = end
+        else:
+            parts.append(re.escape(char))
+        index += 1
+    return re.compile("".join(parts))
+
+
+def _excluded(path: str, patterns: list[str]) -> bool:
+    """Whether Docker leaves *path* out of the context: the last matching pattern
+    decides, and a pattern matches a path or any of its parent directories."""
+
+    components = path.split("/")
+    candidates = ["/".join(components[: count + 1]) for count in range(len(components))]
+    excluded = False
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        regex = _pattern_regex(pattern[1:] if negated else pattern)
+        if any(regex.fullmatch(candidate) for candidate in candidates):
+            excluded = not negated
+    return excluded
+
+
+def _included_paths() -> list[str]:
+    bundled = sorted(path.relative_to(ROOT).as_posix() for path in PROFILES.glob("*.json"))
+    assert len(bundled) == 4, bundled
+    return INCLUDED_FIXED + bundled
+
+
+def test_ac17_the_evaluator_follows_dockers_documented_rules() -> None:
+    # The rules the model claims, on patterns unrelated to the file.
+    assert _excluded("a/b/c.txt", ["a"])
+    assert not _excluded("x/a", ["a"])
+    assert _excluded("x/y/a", ["**/a"]) and _excluded("a", ["**/a"])
+    assert not _excluded("x/a.md", ["*.md"]) and _excluded("a.md", ["*.md"])
+    assert not _excluded("keep.md", ["*.md", "!keep.md"])
+    assert _excluded("keep.md", ["!keep.md", "*.md"])
+    assert _excluded("d/e/f", ["d/**"]) and _excluded("d/e", ["d/"])
+    assert not _excluded("d", ["d?"]) and _excluded("dx", ["d?"])
+
+
+def test_ac17_dockerignore_is_an_allowlist_with_the_deny_patterns_after_it() -> None:
+    patterns = _patterns()
+    assert patterns[0] == "*"
+    assert [pattern for pattern in patterns if pattern.startswith("!")] == RE_INCLUDES
+    assert patterns[1 : 1 + len(RE_INCLUDES)] == RE_INCLUDES
+    after = patterns[1 + len(RE_INCLUDES) :]
+    for required in DENY_PATTERNS:
+        assert required in after, required
+    for named in ("**/profile.yaml", "**/*.instance.json", "**/*.supervisor.json", "**/*.wizard.json"):
+        assert named in after
+
+
+def test_ac17_dockerignore_excludes_every_operator_file_and_keeps_the_wheels() -> None:
+    patterns = _patterns()
+    assert {path: _excluded(path, patterns) for path in EXCLUDED} == dict.fromkeys(EXCLUDED, True)
+    included = _included_paths()
+    assert {path: _excluded(path, patterns) for path in included} == dict.fromkeys(included, False)
+
+
+def test_ac17_the_package_data_stays_in_the_context() -> None:
+    """Every shipped manifest, string table and bundled profile survives the rules."""
+
+    patterns = _patterns()
+    shipped = [
+        path.relative_to(ROOT).as_posix()
+        for pattern in ("modules/*/module.yaml", "core/config_ui/strings/*.json", "core/config_ui/profiles/*")
+        for path in sorted(ROOT.glob(pattern))
+    ]
+    assert len(shipped) > 4
+    assert [path for path in shipped if _excluded(path, patterns)] == []
+
+
+def test_ac17_the_instance_and_supervision_records_are_excluded_by_name_too() -> None:
+    """Without the leading ``*`` the records still stay out of the context."""
+
+    by_name = _patterns()[1:]
+    for path in ("profile.instance.json", "core/x.instance.json", "profile.supervisor.json", "a/b.supervisor.json"):
+        assert _excluded(path, by_name), path

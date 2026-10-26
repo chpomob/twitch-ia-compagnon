@@ -1,0 +1,26 @@
+# An allowlist (phase 10, R5): exclude everything, re-include only what the
+# wheel build needs, then deny operator and build files inside those paths.
+*
+!pyproject.toml
+!LICENSE
+!core/
+!modules/
+.git
+.venv
+venv
+**/__pycache__
+.pytest_cache
+*.egg-info
+build
+dist
+**/profile.yaml
+**/*.local.yaml
+**/*.status.json
+**/*.credentials.json
+**/*.instance.json
+**/*.supervisor.json
+**/*.wizard.json
+**/*.feed*
+**/.env*
+docs/runs/
+findings.json
