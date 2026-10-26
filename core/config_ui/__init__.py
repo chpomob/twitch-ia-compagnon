@@ -221,6 +221,8 @@ class UISettings:
     token_file: Path | None = None
     #: ``--start-runtime``: start the supervised runtime once listening (phase 10 R1).
     start_runtime: bool = False
+    #: ``--health``: print the health line and exit (phase 10 R6).
+    health: bool = False
 
     @classmethod
     def from_argv(cls, argv: Sequence[str]) -> UISettings:
@@ -256,6 +258,7 @@ class UISettings:
             no_browser=parsed.no_browser,
             token_file=None if parsed.token_file is None else Path(parsed.token_file),
             start_runtime=parsed.start_runtime,
+            health=parsed.health,
         )
 
     # Every path below is in its one canonical form (``core.overlay.
@@ -374,6 +377,11 @@ def _parser() -> argparse.ArgumentParser:
         "--start-runtime",
         action="store_true",
         help="once listening, start the runtime when a completed profile is present",
+    )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="print the health state of the running UI in one line and exit (0 healthy, 1 not)",
     )
     return parser
 
@@ -1268,8 +1276,11 @@ def process_alive(pid: int, child: ChildHandle | None) -> bool:
 
     The UI's own child handle is authoritative for its child; any other pid
     is probed with signal 0: "no such process" is dead, success or
-    "permission denied" is alive. On Windows, where ``os.kill`` terminates
-    the process, it is queried instead (:func:`_windows_process_alive`).
+    "permission denied" is alive, unless the process is a zombie
+    (:func:`process_is_zombie`): one that exited and that its parent has not
+    reaped yet still answers signal 0. On Windows, where ``os.kill``
+    terminates the process, it is queried instead
+    (:func:`_windows_process_alive`).
     """
 
     if child is not None and child.pid == pid:
@@ -1281,8 +1292,31 @@ def process_alive(pid: int, child: ChildHandle | None) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
-    return True
+        pass
+    return not process_is_zombie(pid)
+
+
+def process_is_zombie(
+    pid: int,
+    *,
+    read_text: Callable[[str], str] | None = None,
+    platform: str | None = None,
+) -> bool:
+    """Whether *pid* has exited but is not reaped yet (Linux: state ``Z``,
+    field 3 of ``/proc/<pid>/stat``, read after the last ``)``). Any other
+    platform, any ``OSError`` and any parse failure is ``False``: signal 0
+    alone then decides. The keyword arguments are test seams."""
+
+    if (sys.platform if platform is None else platform) != "linux":
+        return False
+    read = _read_proc_text if read_text is None else read_text
+    try:
+        stat_text = read(f"/proc/{pid}/stat")
+    except OSError:
+        return False
+    _comm, closing, rest = stat_text.rpartition(")")
+    fields = rest.split()
+    return bool(closing) and bool(fields) and fields[0] == "Z"
 
 
 def _windows_process_alive(pid: int) -> bool:
@@ -6814,33 +6848,48 @@ class _ReceivedAnswer:
         return io.BytesIO(self._data)
 
 
-def _probe_instance(port: int, url: str, timeout: float) -> tuple[int, bytes]:
+def _probe_instance(
+    port: int,
+    url: str,
+    timeout: float,
+    *,
+    host: str | None = None,
+    connect: Callable[..., Any] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> tuple[int, bytes]:
     """The production probe: one GET of ``/instance`` on the recorded port of
     the recorded access URL's loopback host, with its token (R1). The HTTP
     client is built here only, never in a test (AC33).
 
     *timeout* bounds the whole exchange, not each socket operation: every
     step is given only what is left of it, and a peer still sending when it
-    elapses is no answer (``TimeoutError``)."""
+    elapses is no answer (``TimeoutError``). *host* replaces the access
+    URL's host (the health command's ``127.0.0.1``, phase 10 R6);
+    *connect* (``socket.create_connection``) and *clock*
+    (``time.monotonic``) are test seams, looked up when called. The request
+    carries no cookie, so no session is presented or created."""
 
     import http.client
     import socket
     from urllib.parse import quote, urlsplit
 
-    deadline = time.monotonic() + timeout
+    now = time.monotonic if clock is None else clock
+    open_connection = socket.create_connection if connect is None else connect
+    deadline = now() + timeout
 
     def remaining() -> float:
-        left = deadline - time.monotonic()
+        left = deadline - now()
         if left <= 0:
             raise TimeoutError("the probe's bound elapsed")
         return left
 
-    host = urlsplit(url).hostname or DEFAULT_HOST
+    if host is None:
+        host = urlsplit(url).hostname or DEFAULT_HOST
     authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     target = f"{INSTANCE_ROUTE}?token={quote(_url_token(url) or '', safe='')}"
     request = f"GET {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
     received = bytearray()
-    with socket.create_connection((host, port), timeout=remaining()) as connection:
+    with open_connection((host, port), timeout=remaining()) as connection:
         connection.settimeout(remaining())
         connection.sendall(request.encode("ascii"))
         while len(received) <= INSTANCE_MAX_BYTES + PROBE_HEADER_BYTES:
@@ -7383,6 +7432,233 @@ def _release_instance_record(ui: ConfigUI, platform: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The health command (phase 10 R6, A6)
+# ---------------------------------------------------------------------------
+
+#: The health command's whole budget, and so its one probe's (R6).
+HEALTH_DEADLINE_SECONDS = 5.0
+#: The only address the health probe connects to (R6, AC20).
+HEALTH_PROBE_HOST = "127.0.0.1"
+#: A supervision record larger than this is not one a UI wrote: unusable.
+SUPERVISION_MAX_BYTES = 64 * 1024
+
+#: The lines of R6's table, by row; ``degraded:`` is followed by names.
+HEALTH_NO_INSTANCE = "unhealthy: no instance record"
+HEALTH_NOT_ANSWERING = "unhealthy: not answering"
+HEALTH_TOKEN_REFUSED = "unhealthy: token refused"
+HEALTH_ANOTHER_INSTANCE = "unhealthy: another instance"
+HEALTH_SUPERVISION_UNUSABLE = "unhealthy: supervision record unusable"
+HEALTH_WIZARD_UNFINISHED = "idle: wizard unfinished"
+HEALTH_NOT_STARTED = "idle: not started"
+HEALTH_STOPPED = "idle: stopped"
+HEALTH_RUNTIME_EXITED = "unhealthy: runtime exited"
+HEALTH_READY = "ready"
+HEALTH_DEGRADED_PREFIX = "degraded: "
+HEALTH_STARTING = "starting"
+HEALTH_NOT_READY = "unhealthy: runtime not ready"
+
+_SUPERVISION_STATES = (SUPERVISION_NOT_STARTED, SUPERVISION_LAUNCHED, SUPERVISION_STOPPED)
+
+
+def _health_probe(
+    port: int,
+    url: str,
+    timeout: float,
+    *,
+    connect: Callable[..., Any] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> tuple[int, bytes]:
+    """The health command's default probe (R6): :func:`_probe_instance` to
+    ``127.0.0.1:<port>`` whatever host the access URL names, one attempt
+    bounded by *timeout* in total; *connect* and *clock* are its seams."""
+
+    return _probe_instance(port, url, timeout, host=HEALTH_PROBE_HOST, connect=connect, clock=clock)
+
+
+@dataclass(frozen=True)
+class HealthSeams:
+    """What the health command uses beyond the files it reads (R6); tests
+    replace them, production keeps every default. Each default is looked up
+    when called, never captured at import.
+
+    ``probe``: an :data:`InstanceProbe` (:func:`_health_probe`), called
+    once with the recorded port, the recorded access URL (only its token is
+    used) and :data:`HEALTH_DEADLINE_SECONDS`. ``liveness(pid)`` and
+    ``started_at(pid)``: the supervised pid's judgement with the stale rule,
+    ``launched_at`` standing for the publication time
+    (:func:`record_pid_live`). ``clock``: wall-clock epoch seconds, for the
+    Apply window since ``launched_at``. ``platform``: the platform name
+    (``None``: the running one), which decides the instance record's form.
+    """
+
+    probe: InstanceProbe = lambda port, url, timeout: _health_probe(port, url, timeout)
+    liveness: Callable[[int], bool] = lambda pid: process_alive(pid, None)
+    started_at: Callable[[int], float | None] = lambda pid: process_started_at(pid)
+    clock: Callable[[], float] = lambda: time.time()
+    platform: str | None = None
+
+
+@dataclass(frozen=True)
+class SupervisionRecord:
+    """A usable supervision record (R6 item 3)."""
+
+    marker: str
+    state: str
+    pid: int | None = None
+    #: ``launched_at`` in epoch seconds.
+    launched_at: float | None = None
+
+
+class SupervisionUnusable(Exception):
+    """A supervision record that does not parse or has an invalid field."""
+
+
+def parse_supervision_record(raw: bytes) -> SupervisionRecord:
+    """The supervision record *raw* holds, validated strictly (R6): exactly
+    the fields its writer (:func:`supervision_document`) writes for its
+    state, each of its type. Raises :class:`SupervisionUnusable`."""
+
+    if len(raw) > SUPERVISION_MAX_BYTES:
+        raise SupervisionUnusable("too large")
+    try:
+        document = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_pairs, parse_constant=_no_constant
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError, _Unusable):
+        # ``_Unusable``: a duplicate key or a NaN/Infinity constant, raised
+        # by the hooks.
+        raise SupervisionUnusable("not JSON") from None
+    if not isinstance(document, dict):
+        raise SupervisionUnusable("not an object")
+    version, marker, state = document.get("version"), document.get("marker"), document.get("state")
+    if not _is_integer(version) or version != SUPERVISION_VERSION:
+        raise SupervisionUnusable("version")
+    if not isinstance(marker, str) or not marker:
+        raise SupervisionUnusable("marker")
+    if not isinstance(state, str) or state not in _SUPERVISION_STATES:
+        raise SupervisionUnusable("state")
+    if state != SUPERVISION_LAUNCHED:
+        if set(document) != {"version", "marker", "state"}:
+            raise SupervisionUnusable("fields")
+        return SupervisionRecord(marker=marker, state=state)
+    if set(document) != {"version", "marker", "state", "pid", "launched_at"}:
+        raise SupervisionUnusable("fields")
+    pid = document["pid"]
+    if not _is_integer(pid) or not 1 <= pid <= PID_MAX:
+        raise SupervisionUnusable("pid")
+    try:
+        launched_text = _check_timestamp(document, "launched_at")
+    except _Unusable:
+        raise SupervisionUnusable("launched_at") from None
+    launched_at = _timestamp_seconds(launched_text)
+    if launched_at is None:
+        raise SupervisionUnusable("launched_at")
+    return SupervisionRecord(marker=marker, state=state, pid=pid, launched_at=launched_at)
+
+
+def _read_supervision(path: Path) -> SupervisionRecord | None:
+    """The supervision record at *path*, ``None`` when there is none;
+    raises :class:`SupervisionUnusable` for one that cannot be read or used."""
+
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(SUPERVISION_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SupervisionUnusable("unreadable") from None
+    return parse_supervision_record(raw)
+
+
+def _printable_name(name: str) -> bool:
+    """Whether a module name can stand in the one ``degraded:`` line."""
+
+    return name.isprintable() and "," not in name and name.strip() == name
+
+
+def health(settings: UISettings, seams: HealthSeams) -> tuple[str, int]:
+    """The health line and exit status of R6's table, rows 1 → 13 in order,
+    the first that matches deciding (A6).
+
+    It reads the instance record, makes one ``/instance`` probe with the
+    record's token (session-free: no cookie is sent or kept), then reads the
+    supervision record, the status record and the landing decision, and
+    nothing else; it runs no startup check and writes nothing. The line is
+    one of the fixed ``HEALTH_*`` strings, or ``degraded:`` followed by the
+    status record's degraded module names, sorted and comma-separated (names
+    only, never a value); it never holds the token, the access URL, a
+    session or a credential.
+
+    On Windows the instance record holds no access URL (phase 9 persists
+    the token only on POSIX), so there is no token to probe with and row 1
+    ("incomplete") decides; the image is Linux. A status record whose
+    degraded module names cannot stand in one comma-separated line is not a
+    usable one here (rows 12–13 decide), since the line would not be one.
+    """
+
+    platform = seams.platform if seams.platform is not None else locations.running_platform()
+    # Row 1: no instance record, or an incomplete one.
+    try:
+        entry = _read_instance(settings.instance_path)
+    except (OSError, OverlayError):
+        entry = None
+    record = None if entry is None else parse_instance_record(entry[0], platform)
+    if record is None or record.access_url is None:
+        return HEALTH_NO_INSTANCE, 1
+    # Rows 2–4: the one probe.
+    try:
+        status, body = seams.probe(record.port, record.access_url, HEALTH_DEADLINE_SECONDS)
+    except (OSError, ValueError):
+        return HEALTH_NOT_ANSWERING, 1
+    if status == 401:
+        return HEALTH_TOKEN_REFUSED, 1
+    answer = _instance_answer(status, body)
+    if answer is None or answer[0] != record.marker:
+        return HEALTH_ANOTHER_INSTANCE, 1
+    # Row 5: a supervision record present but unusable.
+    try:
+        supervision = _read_supervision(settings.supervision_path)
+    except (SupervisionUnusable, OverlayError):
+        return HEALTH_SUPERVISION_UNUSABLE, 1
+    # Rows 6–7: nothing launched since this UI started.
+    if (
+        supervision is None
+        or supervision.marker != record.marker
+        or supervision.state == SUPERVISION_NOT_STARTED
+    ):
+        try:
+            landing = landing_target(settings, WizardState(settings.base_path))
+        except (WizardStateError, OverlayError, OSError):
+            landing = LANDING_WIZARD
+        if landing == LANDING_WIZARD:
+            return HEALTH_WIZARD_UNFINISHED, 0
+        return HEALTH_NOT_STARTED, 0
+    # Row 8: stopped from the console.
+    if supervision.state == SUPERVISION_STOPPED:
+        return HEALTH_STOPPED, 0
+    assert supervision.pid is not None and supervision.launched_at is not None
+    # Row 9: launched, no longer live.
+    if not record_pid_live(supervision.pid, supervision.launched_at, seams.liveness, seams.started_at):
+        return HEALTH_RUNTIME_EXITED, 1
+    # Rows 10–11: the launched pid reports through a usable status record.
+    try:
+        reading = read_status(settings.status_path)
+    except OverlayError:
+        reading = StatusReading.unusable("status path")
+    reported = reading.record
+    if reported is not None and reported.pid == supervision.pid:
+        degraded = sorted(name for name, state in reported.modules.items() if state != "ready")
+        if all(_printable_name(name) for name in degraded):
+            if not degraded:
+                return HEALTH_READY, 0
+            return HEALTH_DEGRADED_PREFIX + ",".join(degraded), 0
+    # Rows 12–13: not reporting yet, within the Apply window or past it.
+    if seams.clock() - supervision.launched_at <= DEFAULT_APPLY_WINDOW:
+        return HEALTH_STARTING, 0
+    return HEALTH_NOT_READY, 1
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -7424,6 +7700,7 @@ def main(
     serve: Callable[[ConfigUI, UISettings], None] | None = None,
     instance: InstanceSeams | None = None,
     launcher: LauncherSeams | None = None,
+    health_seams: HealthSeams | None = None,
 ) -> int:
     """Run the configuration UI; return the process exit status.
 
@@ -7441,6 +7718,9 @@ def main(
     that is not loopback writes one warning line before serving, and
     ``--start-runtime`` starts the runtime once listening through
     :meth:`ConfigUI.start_runtime_at_listening` (phase 10 R1).
+    ``--health`` prints the one line of :func:`health` over the
+    *health_seams* and returns its exit status, before any startup check,
+    instance record or serve (phase 10 R6).
     """
 
     if opener is None:
@@ -7452,6 +7732,10 @@ def main(
         settings = UISettings.from_argv(sys.argv[1:] if argv is None else argv)
     except SystemExit as exit_:
         return exit_.code if isinstance(exit_.code, int) else 2
+    if settings.health:
+        line, status = health(settings, HealthSeams() if health_seams is None else health_seams)
+        print(line, flush=True)
+        return status
     if settings.install_launcher:
         return _install_launcher(settings, LauncherSeams() if launcher is None else launcher)
     problems = startup_checks(settings)

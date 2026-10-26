@@ -32,6 +32,13 @@ Then ``--start-runtime`` (R1 d, AC4): once listening, the console Start's
 own entry runs exactly once when a completed profile is present, with that
 Start's refusals; with no profile or an unfinished wizard nothing starts and
 one value-free reason line is logged.
+
+Then the health command (R6 rows 1–13, A6, AC19 rows, AC20): against fake
+records, a fake probe, a fake liveness judgement and an injected clock,
+``--health`` prints exactly one of the table's lines and exits with its
+row's status, the earlier row deciding a case that matches two; the probe
+carries the record's token and no cookie, and the default probe connects
+only to ``127.0.0.1`` and, never answered, ends within 5 s of its clock.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ import inspect
 import json
 import os
 import re
+import sys
 import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -1167,3 +1175,558 @@ def test_ac4_without_the_option_nothing_starts(
 def test_r1_start_runtime_is_absent_by_default() -> None:
     assert config_ui.UISettings.from_argv(["--config", "x.yaml"]).start_runtime is False
     assert config_ui.UISettings.from_argv(["--config", "x.yaml", "--start-runtime"]).start_runtime is True
+
+
+# -- the health command (R6 rows 1–13, A6, AC19 rows, AC20) ---------------- #
+
+HEALTH_MARKER = "c" * 32
+#: The recorded token; no health line may hold it.
+HEALTH_TOKEN = "Hk0_health-token-never-printed-AAAAAAAAAAAA"
+assert len(HEALTH_TOKEN) == 43
+HEALTH_PORT = 8765
+HEALTH_URL = f"http://127.0.0.1:{HEALTH_PORT}/?token={HEALTH_TOKEN}"
+#: The supervised child's pid and its ``launched_at``, also in epoch seconds.
+CHILD_PID = 6001
+LAUNCHED_AT = "2026-10-24T08:00:00.000Z"
+LAUNCHED = datetime(2026, 10, 24, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+#: A value a status record entry carries that no line may quote.
+MODULE_VALUE = "module-value-7d1c2e-never-printed"
+
+
+def _answer(marker: str = HEALTH_MARKER) -> tuple[int, bytes]:
+    return 200, json.dumps({"marker": marker, "version": "1.0"}).encode("utf-8")
+
+
+class _HealthProbe:
+    """A fake probe: records each call and answers *outcome* (a status and
+    body), or raises it (an exception)."""
+
+    def __init__(self, outcome: Any) -> None:
+        self.outcome = outcome
+        self.calls: list[tuple[Any, ...]] = []
+
+    def __call__(self, *args: Any, **kwargs: Any) -> tuple[int, bytes]:
+        self.calls.append((*args, *kwargs.items()))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+class _Health:
+    """The records of one health case under ``<root>/config.yaml``, each
+    replaceable; the defaults are row 10's (ready)."""
+
+    def __init__(self, root: Path) -> None:
+        self.base = _profile(root)
+        self.instance: Any = {
+            "pid": os.getpid(),
+            "port": HEALTH_PORT,
+            "marker": HEALTH_MARKER,
+            "access_url": HEALTH_URL,
+        }
+        self.probe = _HealthProbe(_answer())
+        self.supervision: Any = {
+            "version": 1,
+            "marker": HEALTH_MARKER,
+            "state": "launched",
+            "pid": CHILD_PID,
+            "launched_at": LAUNCHED_AT,
+        }
+        self.status: Any = self.status_document(CHILD_PID, {"chat": "ready"})
+        self.wizard: bool | None = None
+        self.live = True
+        self.started: float | None = None
+        self.now = LAUNCHED + 10.0
+
+    @staticmethod
+    def status_document(pid: int, modules: dict[str, str]) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "pid": pid,
+            "started_at": LAUNCHED_AT,
+            "published_at": LAUNCHED_AT,
+            "sequence": 1,
+            "digest": "0" * 64,
+            "state": "ready",
+            "modules": {name: {"state": state, "detail": MODULE_VALUE} for name, state in modules.items()},
+        }
+
+    def _write(self, path: Path, content: Any) -> None:
+        if content is None:
+            return
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(json.dumps(content), encoding="utf-8")
+
+    def run(self, capsys: pytest.CaptureFixture[str]) -> tuple[str, int]:
+        """``main(["--config", base, "--health"])``: the one line and status."""
+
+        settings = config_ui.UISettings.from_argv(["--config", str(self.base)])
+        self._write(settings.instance_path, self.instance)
+        self._write(settings.supervision_path, self.supervision)
+        self._write(settings.status_path, self.status)
+        if self.wizard is not None:
+            _wizard_state(self.base, completed=self.wizard)
+        before = _tree(self.base.parent)
+        seams = config_ui.HealthSeams(
+            probe=self.probe,
+            liveness=lambda pid: self.live and pid == CHILD_PID,
+            started_at=lambda pid: self.started,
+            clock=lambda: self.now,
+            platform="linux",
+        )
+
+        def refuse(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("the health command serves nothing and opens nothing")
+
+        status = config_ui.main(
+            ["--config", str(self.base), "--health"],
+            opener=refuse,
+            serve=refuse,
+            instance=None,
+            health_seams=seams,
+        )
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        lines = captured.out.splitlines()
+        assert len(lines) == 1 and captured.out == lines[0] + "\n"
+        line = lines[0]
+        for value in (HEALTH_TOKEN, TOKEN_TEXT, HEALTH_URL, HEALTH_MARKER, MODULE_VALUE, os.fspath(self.base.parent)):
+            assert value not in line
+        # Nothing is written, created or removed.
+        assert _tree(self.base.parent) == before
+        return line, status
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {
+        os.fspath(path.relative_to(root)): path.read_bytes() if path.is_file() else b"<dir>"
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def _no_instance(case: _Health) -> None:
+    case.instance = None
+
+
+def _incomplete_instance(case: _Health) -> None:
+    del case.instance["access_url"]
+
+
+def _instance_not_json(case: _Health) -> None:
+    case.instance = b"{not json"
+
+
+def _refused(case: _Health) -> None:
+    case.probe.outcome = ConnectionRefusedError("refused")
+
+
+def _silent(case: _Health) -> None:
+    case.probe.outcome = TimeoutError("silent")
+
+
+def _token_refused(case: _Health) -> None:
+    case.probe.outcome = (401, b"401 Unauthorized")
+
+
+def _other_marker(case: _Health) -> None:
+    case.probe.outcome = _answer("d" * 32)
+
+
+def _not_200(case: _Health) -> None:
+    case.probe.outcome = (503, b"busy")
+
+
+def _bad_answer(case: _Health) -> None:
+    case.probe.outcome = (200, b"<html>")
+
+
+def _supervision_not_json(case: _Health) -> None:
+    case.supervision = b"{not json"
+
+
+def _supervision_bad_state(case: _Health) -> None:
+    case.supervision["state"] = "running"
+
+
+def _supervision_bad_version(case: _Health) -> None:
+    case.supervision["version"] = 2
+
+
+def _supervision_no_pid(case: _Health) -> None:
+    del case.supervision["pid"]
+
+
+def _supervision_bad_launched_at(case: _Health) -> None:
+    case.supervision["launched_at"] = "yesterday"
+
+
+def _supervision_extra_field(case: _Health) -> None:
+    case.supervision = {"version": 1, "marker": HEALTH_MARKER, "state": "stopped", "pid": CHILD_PID}
+
+
+def _no_supervision_unfinished_wizard(case: _Health) -> None:
+    case.supervision = None
+    case.wizard = False
+
+
+def _no_supervision_no_profile(case: _Health) -> None:
+    case.supervision = None
+    case.base.unlink()
+
+
+def _other_marker_unfinished_wizard(case: _Health) -> None:
+    case.supervision["marker"] = "e" * 32
+    case.wizard = False
+
+
+def _not_started_unfinished_wizard(case: _Health) -> None:
+    case.supervision = {"version": 1, "marker": HEALTH_MARKER, "state": "not_started"}
+    case.wizard = False
+
+
+def _no_supervision_completed(case: _Health) -> None:
+    case.supervision = None
+    case.wizard = True
+
+
+def _other_marker_completed(case: _Health) -> None:
+    case.supervision["marker"] = "e" * 32
+
+
+def _not_started_completed(case: _Health) -> None:
+    case.supervision = {"version": 1, "marker": HEALTH_MARKER, "state": "not_started"}
+
+
+def _stopped(case: _Health) -> None:
+    case.supervision = {"version": 1, "marker": HEALTH_MARKER, "state": "stopped"}
+
+
+def _exited(case: _Health) -> None:
+    case.live = False
+
+
+def _pid_reused(case: _Health) -> None:
+    # Live, but started after launched_at: not the launched child (R2).
+    case.started = LAUNCHED + 0.001
+
+
+def _ready(case: _Health) -> None:
+    case.started = LAUNCHED - 1.0
+
+
+def _degraded(case: _Health) -> None:
+    case.status = case.status_document(CHILD_PID, {"zeta": "degraded", "mid": "ready", "alpha": "degraded"})
+
+
+def _no_status_within_window(case: _Health) -> None:
+    case.status = None
+    case.now = LAUNCHED + 60.0
+
+
+def _other_pid_within_window(case: _Health) -> None:
+    case.status = case.status_document(CHILD_PID + 1, {"chat": "ready"})
+
+
+def _unusable_status_within_window(case: _Health) -> None:
+    case.status = b"{not json"
+
+
+def _no_status_past_window(case: _Health) -> None:
+    case.status = None
+    case.now = LAUNCHED + 60.001
+
+
+def _other_pid_past_window(case: _Health) -> None:
+    case.status = case.status_document(CHILD_PID + 1, {"chat": "ready"})
+    case.now = LAUNCHED + 3600.0
+
+
+HEALTH_ROWS = [
+    pytest.param(_no_instance, "unhealthy: no instance record", 1, id="row1_absent"),
+    pytest.param(_incomplete_instance, "unhealthy: no instance record", 1, id="row1_incomplete"),
+    pytest.param(_instance_not_json, "unhealthy: no instance record", 1, id="row1_not_json"),
+    pytest.param(_refused, "unhealthy: not answering", 1, id="row2_refused"),
+    pytest.param(_silent, "unhealthy: not answering", 1, id="row2_silent"),
+    pytest.param(_token_refused, "unhealthy: token refused", 1, id="row3"),
+    pytest.param(_other_marker, "unhealthy: another instance", 1, id="row4_marker"),
+    pytest.param(_not_200, "unhealthy: another instance", 1, id="row4_status"),
+    pytest.param(_bad_answer, "unhealthy: another instance", 1, id="row4_body"),
+    pytest.param(_supervision_not_json, "unhealthy: supervision record unusable", 1, id="row5_not_json"),
+    pytest.param(_supervision_bad_state, "unhealthy: supervision record unusable", 1, id="row5_state"),
+    pytest.param(_supervision_bad_version, "unhealthy: supervision record unusable", 1, id="row5_version"),
+    pytest.param(_supervision_no_pid, "unhealthy: supervision record unusable", 1, id="row5_pid"),
+    pytest.param(_supervision_bad_launched_at, "unhealthy: supervision record unusable", 1, id="row5_time"),
+    pytest.param(_supervision_extra_field, "unhealthy: supervision record unusable", 1, id="row5_extra"),
+    pytest.param(_no_supervision_unfinished_wizard, "idle: wizard unfinished", 0, id="row6_absent"),
+    pytest.param(_no_supervision_no_profile, "idle: wizard unfinished", 0, id="row6_no_profile"),
+    pytest.param(_other_marker_unfinished_wizard, "idle: wizard unfinished", 0, id="row6_marker"),
+    pytest.param(_not_started_unfinished_wizard, "idle: wizard unfinished", 0, id="row6_not_started"),
+    pytest.param(_no_supervision_completed, "idle: not started", 0, id="row7_absent"),
+    pytest.param(_other_marker_completed, "idle: not started", 0, id="row7_marker"),
+    pytest.param(_not_started_completed, "idle: not started", 0, id="row7_not_started"),
+    pytest.param(_stopped, "idle: stopped", 0, id="row8"),
+    pytest.param(_exited, "unhealthy: runtime exited", 1, id="row9_dead"),
+    pytest.param(_pid_reused, "unhealthy: runtime exited", 1, id="row9_reused"),
+    pytest.param(_ready, "ready", 0, id="row10"),
+    pytest.param(_degraded, "degraded: alpha,zeta", 0, id="row11"),
+    pytest.param(_no_status_within_window, "starting", 0, id="row12_absent_at_60s"),
+    pytest.param(_other_pid_within_window, "starting", 0, id="row12_other_pid"),
+    pytest.param(_unusable_status_within_window, "starting", 0, id="row12_unusable"),
+    pytest.param(_no_status_past_window, "unhealthy: runtime not ready", 1, id="row13_absent"),
+    pytest.param(_other_pid_past_window, "unhealthy: runtime not ready", 1, id="row13_other_pid"),
+]
+
+
+@pytest.mark.parametrize(("setup", "line", "exit_status"), HEALTH_ROWS)
+def test_ac19_each_row_prints_its_line_and_exits_with_its_status(
+    setup: Callable[[_Health], None],
+    line: str,
+    exit_status: int,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    case = _Health(tmp_path)
+    setup(case)
+    assert case.run(capsys) == (line, exit_status)
+
+
+def test_ac19_every_row_is_covered() -> None:
+    rows = {int(param.id.split("_")[0][3:]) for param in HEALTH_ROWS}  # type: ignore[union-attr]
+    assert rows == set(range(1, 14))
+    lines = {param.values[1] for param in HEALTH_ROWS}
+    fixed = {value for name, value in vars(config_ui).items() if name.startswith("HEALTH_") and isinstance(value, str)}
+    assert lines - {"degraded: alpha,zeta"} == fixed - {
+        config_ui.HEALTH_DEGRADED_PREFIX,
+        config_ui.HEALTH_PROBE_HOST,
+    }
+
+
+def _combined(*setups: Callable[[_Health], None]) -> Callable[[_Health], None]:
+    def setup(case: _Health) -> None:
+        for each in setups:
+            each(case)
+
+    return setup
+
+
+@pytest.mark.parametrize(
+    ("setup", "line"),
+    [
+        pytest.param(_combined(_token_refused, _supervision_not_json), "unhealthy: token refused", id="3_over_5"),
+        pytest.param(_combined(_no_instance, _supervision_not_json), "unhealthy: no instance record", id="1_over_5"),
+        pytest.param(_combined(_refused, _exited), "unhealthy: not answering", id="2_over_9"),
+        pytest.param(_combined(_other_marker, _stopped), "unhealthy: another instance", id="4_over_8"),
+        pytest.param(
+            _combined(_supervision_bad_state, _no_supervision_no_profile),
+            "idle: wizard unfinished",
+            id="absent_supervision_is_not_unusable",
+        ),
+        pytest.param(_combined(_supervision_extra_field, _degraded), "unhealthy: supervision record unusable", id="5_over_11"),
+        pytest.param(_combined(_stopped, _degraded), "idle: stopped", id="8_over_11"),
+        pytest.param(_combined(_exited, _ready), "unhealthy: runtime exited", id="9_over_10"),
+        pytest.param(_combined(_degraded, _no_status_past_window), "unhealthy: runtime not ready", id="13_without_status"),
+    ],
+)
+def test_ac19_a_case_matching_two_rows_takes_the_earlier(
+    setup: Callable[[_Health], None], line: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    case = _Health(tmp_path)
+    setup(case)
+    assert case.run(capsys)[0] == line
+
+
+def test_ac19_the_probe_carries_the_records_token_and_no_session(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    case = _Health(tmp_path)
+    assert case.run(capsys) == ("ready", 0)
+    # One probe, with the record's port, its access URL (for the token only)
+    # and the 5-second budget; nothing else is handed to it, no cookie.
+    assert case.probe.calls == [(HEALTH_PORT, HEALTH_URL, 5.0)]
+    assert config_ui._url_token(case.probe.calls[0][1]) == HEALTH_TOKEN
+
+
+def test_ac19_no_probe_is_made_without_a_usable_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    case = _Health(tmp_path)
+    _incomplete_instance(case)
+    assert case.run(capsys)[0] == "unhealthy: no instance record"
+    assert case.probe.calls == []
+
+
+def test_ac19_the_windows_record_has_no_token_so_row_1_decides(tmp_path: Path) -> None:
+    case = _Health(tmp_path)
+    settings = config_ui.UISettings.from_argv(["--config", str(case.base)])
+    del case.instance["access_url"]
+    settings.instance_path.write_text(json.dumps(case.instance), encoding="utf-8")
+    seams = config_ui.HealthSeams(probe=case.probe, platform=locations.WINDOWS)
+    assert config_ui.health(settings, seams) == ("unhealthy: no instance record", 1)
+    assert case.probe.calls == []
+
+
+def test_ac19_a_degraded_name_that_cannot_stand_in_one_line_is_not_printed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    case = _Health(tmp_path)
+    case.status = case.status_document(CHILD_PID, {"bad\nname": "degraded", "a,b": "degraded"})
+    assert case.run(capsys) == ("starting", 0)
+
+
+def test_ac19_the_records_the_ui_writes_are_usable() -> None:
+    child = SimpleNamespace(pid=CHILD_PID)
+    launched = config_ui.parse_supervision_record(
+        config_ui.supervision_document(HEALTH_MARKER, "launched", child)
+    )
+    assert (launched.marker, launched.state, launched.pid) == (HEALTH_MARKER, "launched", CHILD_PID)
+    assert launched.launched_at is not None
+    for state in ("not_started", "stopped"):
+        parsed = config_ui.parse_supervision_record(config_ui.supervision_document(HEALTH_MARKER, state))
+        assert (parsed.state, parsed.pid, parsed.launched_at) == (state, None, None)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"version": 1, "version": 1, "marker": "m", "state": "stopped"}',
+        b'{"version": 1, "marker": "m", "state": "stopped", "x": NaN}',
+    ],
+    ids=["duplicate_key", "nan"],
+)
+def test_ac19_a_record_the_json_hooks_refuse_is_unusable(raw: bytes) -> None:
+    with pytest.raises(config_ui.SupervisionUnusable):
+        config_ui.parse_supervision_record(raw)
+
+
+def test_ac21_an_unreaped_runtime_is_not_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A runtime killed after startup stays a zombie until its UI reaps it;
+    signal 0 still succeeds, so the default liveness reads its state."""
+
+    monkeypatch.setattr(os, "kill", lambda pid, signal_number: None)
+    monkeypatch.setattr(sys, "platform", "linux")
+    stat = {"text": f"{CHILD_PID} (python3 (rt)) Z 1 2 3"}
+    monkeypatch.setattr(config_ui, "_read_proc_text", lambda path: stat["text"])
+    assert config_ui.process_alive(CHILD_PID, None) is False
+    assert config_ui.HealthSeams().liveness(CHILD_PID) is False
+    stat["text"] = f"{CHILD_PID} (python3) S 1 2 3"
+    assert config_ui.process_alive(CHILD_PID, None) is True
+    assert config_ui.process_is_zombie(CHILD_PID, read_text=lambda path: "garbage") is False
+    assert config_ui.process_is_zombie(CHILD_PID, read_text=lambda path: stat["text"], platform="darwin") is False
+
+
+def test_ac19_health_resolves_the_default_location_and_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], linux_platform: None
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    probe = _HealthProbe(_answer())
+    seams = config_ui.HealthSeams(probe=probe, platform="linux")
+    assert config_ui.main(["--health"], health_seams=seams) == 1
+    assert capsys.readouterr().out == "unhealthy: no instance record\n"
+    assert list(tmp_path.iterdir()) == []
+    directory = tmp_path / PRODUCT
+    directory.mkdir(mode=0o700)
+    record = directory / ("profile.yaml" + config_ui.INSTANCE_SUFFIX)
+    record.write_text(
+        json.dumps({"pid": 1, "port": 9999, "marker": HEALTH_MARKER, "access_url": HEALTH_URL}),
+        encoding="utf-8",
+    )
+    assert config_ui.main(["--health"], health_seams=seams) == 0
+    assert capsys.readouterr().out == "idle: wizard unfinished\n"
+    assert probe.calls == [(9999, HEALTH_URL, 5.0)]
+
+
+def test_r6_health_is_absent_by_default() -> None:
+    assert config_ui.UISettings.from_argv(["--config", "x.yaml"]).health is False
+    assert config_ui.UISettings.from_argv(["--config", "x.yaml", "--health"]).health is True
+
+
+def test_r6_the_default_probe_is_looked_up_when_called(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Any] = []
+    monkeypatch.setattr(config_ui, "_health_probe", lambda *args: calls.append(args) or (200, b""))
+    assert config_ui.HealthSeams().probe(1, "u", 5.0) == (200, b"")
+    assert calls == [(1, "u", 5.0)]
+
+
+# -- AC20: the default probe -------------------------------------------------- #
+
+
+class _Peer:
+    """A fake connection for the default probe: answers *chunks* one per
+    ``recv``; with none left, it never answers (each ``recv`` waits its whole
+    timeout on the fake clock, then times out)."""
+
+    def __init__(self, clock: list[float], chunks: list[bytes]) -> None:
+        self.clock, self.chunks = clock, list(chunks)
+        self.sent = b""
+        self.timeout: float | None = None
+
+    def __enter__(self) -> _Peer:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+
+    def sendall(self, data: bytes) -> None:
+        self.sent += data
+
+    def recv(self, _size: int) -> bytes:
+        if self.chunks:
+            return self.chunks.pop(0)
+        assert self.timeout is not None
+        self.clock[0] += self.timeout
+        raise TimeoutError("silent")
+
+
+class _Connector:
+    def __init__(self, peer: _Peer | None, clock: list[float]) -> None:
+        self.peer, self.clock = peer, clock
+        self.addresses: list[tuple[str, int]] = []
+
+    def __call__(self, address: tuple[str, int], timeout: float) -> _Peer:
+        self.addresses.append(address)
+        if self.peer is None:
+            # A connection that never completes: it waits its timeout.
+            self.clock[0] += timeout
+            raise TimeoutError("no connection")
+        return self.peer
+
+
+def _default_probe(connector: _Connector, clock: list[float]) -> Callable[[int, str, float], tuple[int, bytes]]:
+    def probe(port: int, url: str, timeout: float) -> tuple[int, bytes]:
+        return config_ui._health_probe(port, url, timeout, connect=connector, clock=lambda: clock[0])
+
+    return probe
+
+
+def test_ac20_the_default_probe_targets_loopback_with_the_token_and_no_cookie() -> None:
+    clock = [100.0]
+    body = json.dumps({"marker": HEALTH_MARKER, "version": "1.0"}).encode("utf-8")
+    peer = _Peer(clock, [b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body, b""])
+    connector = _Connector(peer, clock)
+    # Whatever host the access URL names, the probe goes to 127.0.0.1.
+    url = f"http://localhost:{HEALTH_PORT}/?token={HEALTH_TOKEN}"
+    assert _default_probe(connector, clock)(HEALTH_PORT, url, 5.0) == (200, body)
+    assert connector.addresses == [("127.0.0.1", HEALTH_PORT)]
+    head = peer.sent.decode("ascii")
+    assert head.startswith(f"GET /instance?token={HEALTH_TOKEN} HTTP/1.1\r\n")
+    assert f"\r\nHost: 127.0.0.1:{HEALTH_PORT}\r\n" in head
+    assert "cookie" not in head.lower()
+
+
+@pytest.mark.parametrize("connects", [True, False], ids=["silent_peer", "never_connects"])
+def test_ac20_a_probe_that_never_answers_ends_within_5_seconds_unhealthy(
+    connects: bool, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clock = [100.0]
+    connector = _Connector(_Peer(clock, []) if connects else None, clock)
+    case = _Health(tmp_path)
+    case.probe = _default_probe(connector, clock)  # type: ignore[assignment]
+    assert case.run(capsys) == ("unhealthy: not answering", 1)
+    assert connector.addresses == [("127.0.0.1", HEALTH_PORT)]
+    assert 0 < clock[0] - 100.0 <= 5.0
