@@ -52,3 +52,16 @@ green with no daemon and still reports its five skips without the variable, and 
 
 Constraints: no new requirement, no renumbered criterion, no fabricated measurement, no widened health
 contract. One atomic commit per concern, and say which commit carries which.
+
+## Note for the attempt that reads this (added after a killed run)
+
+A previous attempt was killed by an expired token. Its uncommitted work is preserved on the branch
+`wip/phase10-p12f2-leftover` (commit `9a69428`): a change to `process_started_at` making the boot
+time the **upper bound** of the printed `/proc/uptime` value (it is truncated to its last decimal,
+so the computed start could sit up to that unit late and judge a publisher stale against its own
+record), plus 138 lines of unfinished trial tests.
+
+Judge that work — `git diff main...wip/phase10-p12f2-leftover` — and take it only if it is right and
+in scope; it does not answer the question this step is about (why the container is `unhealthy` under
+the trial and healthy by hand). Do not merge the branch blind, and do not let it distract from
+naming that difference.
