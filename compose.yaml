@@ -1,0 +1,61 @@
+# The companion on plain Docker (phase 10, R4): one service, one named volume.
+# `docker compose up -d` builds the image from the repository's Git URL (A1;
+# the host needs git) unless TWITCH_IA_COMPAGNON_BUILD_CONTEXT names another
+# context, such as a local checkout. Then `docker compose logs companion`
+# prints the access URL.
+
+services:
+  companion:
+    build:
+      context: "${TWITCH_IA_COMPAGNON_BUILD_CONTEXT:-https://github.com/chpomob/twitch-ia-compagnon.git#main}"
+    image: twitch-ia-compagnon:local
+    init: true
+    restart: unless-stopped
+    # The host's loopback only (A4). Exposing the UI beyond this host is an
+    # edit: the published address here, plus one `--allowed-host NAME` per
+    # accepted host name in `command`.
+    ports:
+      - "127.0.0.1:8765:8765"
+    # All state: profile, credential file, records (A3).
+    volumes:
+      - "companion-data:/data"
+    # The same timings as the Dockerfile's HEALTHCHECK; the start period
+    # outlasts the 60 s Apply window.
+    healthcheck:
+      test: ["CMD", "twitch-ia-compagnon-config-ui", "--health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    # Optional (R5): credentials given to the container as environment
+    # variables, from a file kept beside this one or listed here. The
+    # profile refers to them as ${NAME}; a credential stored through the UI
+    # overrides an inherited variable of the same name.
+    # env_file:
+    #   - companion.env
+    # environment:
+    #   TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID}
+    #   TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET}
+    #   TWITCH_ACCESS_TOKEN: ${TWITCH_ACCESS_TOKEN}
+    #   MODEL_API_KEY: ${MODEL_API_KEY}
+    # Optional (A5): a stable access token read from a secret file instead
+    # of one generated at each start. Uncomment these lines and the
+    # top-level `secrets:` block below.
+    # secrets:
+    #   - companion_token
+    # command:
+    #   - twitch-ia-compagnon-config-ui
+    #   - --host
+    #   - 0.0.0.0
+    #   - --allow-non-loopback
+    #   - --no-browser
+    #   - --start-runtime
+    #   - --token-file
+    #   - /run/secrets/companion_token
+
+volumes:
+  companion-data: {}
+
+# secrets:
+#   companion_token:
+#     file: ./companion_token.txt

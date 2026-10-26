@@ -53,6 +53,13 @@ runtime stage, numeric user, A2's default command and the health command;
 and ``.dockerignore`` as an allowlist, judged by a pure-Python model of
 Docker's matching rules over a synthetic path list (no daemon: the trial's
 image inspection is the real check).
+
+Then the compose file's static contract (R4, A1, A4, AC14): ``compose.yaml``
+parsed with PyYAML has one service and one named volume mounted at
+``/data``, the loopback-published port, ``init``, a restart policy, the
+health command as its healthcheck with the Dockerfile's timings, A1's exact
+build context, nothing Docker-Desktop-specific and no other file required;
+its optional credential and token-file entries are comments, not keys.
 """
 
 from __future__ import annotations
@@ -71,6 +78,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 from test_config_ui import _request
 
 import core.config_ui as config_ui
@@ -2287,3 +2295,86 @@ def test_ac17_the_instance_and_supervision_records_are_excluded_by_name_too() ->
     by_name = _patterns()[1:]
     for path in ("profile.instance.json", "core/x.instance.json", "profile.supervisor.json", "a/b.supervisor.json"):
         assert _excluded(path, by_name), path
+
+
+# -- the compose file's static contract (R4, A1, A4, AC14) ------------------- #
+
+COMPOSE = ROOT / "compose.yaml"
+#: A1: the Git URL at ``main``, overridable by one environment variable.
+BUILD_CONTEXT = "${TWITCH_IA_COMPAGNON_BUILD_CONTEXT:-https://github.com/chpomob/twitch-ia-compagnon.git#main}"
+
+
+def _compose() -> dict[str, Any]:
+    document = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    return document
+
+
+def _service() -> dict[str, Any]:
+    (service,) = _compose()["services"].values()
+    return service
+
+
+def test_ac14_one_service_and_one_named_volume_mounted_at_data() -> None:
+    document = _compose()
+    assert list(document["services"]) == ["companion"]
+    assert list(document["volumes"]) == ["companion-data"]
+    assert _service()["volumes"] == ["companion-data:/data"]
+
+
+def test_ac14_the_port_is_published_on_the_hosts_loopback() -> None:
+    assert _service()["ports"] == ["127.0.0.1:8765:8765"]
+
+
+def test_ac14_init_restart_and_the_image_name() -> None:
+    service = _service()
+    assert service["init"] is True
+    assert service["restart"] == "unless-stopped"
+    assert service["image"] == "twitch-ia-compagnon:local"
+
+
+def test_ac14_the_healthcheck_runs_the_health_command_with_the_dockerfiles_timings() -> None:
+    healthcheck = _service()["healthcheck"]
+    assert healthcheck["test"] == ["CMD", "twitch-ia-compagnon-config-ui", "--health"]
+    assert "--health" in healthcheck["test"]
+    _, final = _stages()
+    (dockerfile,) = _arguments(final, "HEALTHCHECK")
+    options, _, _ = dockerfile.partition(" CMD ")
+    flags = dict(option.lstrip("-").split("=", 1) for option in options.split())
+    assert healthcheck["interval"] == flags["interval"] == "30s"
+    assert healthcheck["start_period"] == flags["start-period"] == "90s"
+    assert healthcheck["timeout"] == flags["timeout"]
+    assert str(healthcheck["retries"]) == flags["retries"]
+
+
+def test_ac14_the_build_context_is_a1s_git_url_overridable_by_one_variable() -> None:
+    assert _service()["build"] == {"context": BUILD_CONTEXT}
+
+
+def test_ac14_nothing_desktop_specific_and_no_other_file_required() -> None:
+    text = COMPOSE.read_text(encoding="utf-8")
+    for forbidden in ("host.docker.internal", "extensions", "x-docker-desktop"):
+        assert forbidden not in text, forbidden
+
+    def keys(node: object) -> set[str]:
+        if isinstance(node, dict):
+            return set(node).union(*(keys(value) for value in node.values()))
+        if isinstance(node, list):
+            return set().union(*(keys(value) for value in node))
+        return set()
+
+    found = keys(_compose())
+    assert not found & {"extends", "include", "profiles"}
+    assert not [key for key in found if str(key).startswith("x-")]
+
+
+def test_ac14_the_optional_entries_are_comments_not_keys() -> None:
+    """The credential and token-file blocks are offered, never active."""
+
+    text = COMPOSE.read_text(encoding="utf-8")
+    for offered in ("# env_file:", "# environment:", "# secrets:", "--token-file", "/run/secrets/companion_token"):
+        assert offered in text, offered
+    document, service = _compose(), _service()
+    assert set(document) == {"services", "volumes"}
+    assert not {"env_file", "environment", "secrets", "command"} & set(service)
+    assert "--token-file" not in json.dumps(document)

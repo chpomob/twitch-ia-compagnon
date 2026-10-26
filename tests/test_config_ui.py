@@ -110,6 +110,26 @@ def no_socket_creation() -> Iterator[None]:
     assert _SOCKET_ATTEMPTS["count"] == 0, "a test other than the self-test created a socket"
 
 
+_SHORT_SECRET = "q7Z"
+
+
+@pytest.fixture(autouse=True)
+def tokens_never_spell_the_short_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The session, CSRF and UI tokens are URL-safe base64 and reach the
+    page; one drawn with ``q7Z`` inside failed a "secret never rendered"
+    assertion by chance. Such a token is redrawn, so those assertions only
+    see a secret the UI itself rendered."""
+
+    original = secrets.token_urlsafe
+
+    def drawn(nbytes: int | None = None) -> str:
+        while _SHORT_SECRET in (token := original(nbytes)):
+            pass
+        return token
+
+    monkeypatch.setattr(secrets, "token_urlsafe", drawn)
+
+
 def _the_suite_guard_runs_beside_this_patch(request: pytest.FixtureRequest) -> None:
     """AC33: the suite's guard runs on the node, leaves the socket entry
     points to this module's patch and still refuses a process."""
