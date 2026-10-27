@@ -84,7 +84,12 @@ sur une autre machine, lancez l'interface sur cette machine-là.
   pour une écoute générique, celles-ci plus chaque `--allowed-host`). Une requête qui modifie
   l'état (enregistrer, supprimer une surcharge, contrôler, appliquer) doit être un POST muni du
   jeton CSRF de la page, et un en-tête `Origin`, lorsqu'il est présent, doit valoir exactement
-  `http://<autorité acceptée>`. Un GET ne modifie jamais rien.
+  `http://<autorité acceptée>` — ou le littéral `null` qu'un navigateur envoie pour son propre
+  formulaire sous une politique de référent stricte, accepté seulement avec le jeton CSRF de la
+  session. Les pages sont servies avec `Referrer-Policy: same-origin`. Un POST dont le jeton CSRF est
+  périmé (la page est restée ouverte pendant que la session changeait) ne modifie rien et reçoit
+  `403` avec la même page, un jeton neuf et une phrase disant qu'elle a expiré : vérifiez-la et
+  renvoyez-la. Un GET ne modifie jamais rien.
 
 Au plus 16 requêtes sont admises en même temps (4 en cours, les autres attendant un fil
 d'exécution), chacune avec un corps d'au plus 1 Mio. Au-delà, la requête reçoit

@@ -138,6 +138,27 @@ route ne risque rien : le clic suivant sur le lanceur reprend la configuration.
    L'écran affiche ensuite la chaîne que nomme le jeton ; vous ne tapez jamais d'identifiant numérique.
    Pour *Points de chaîne*, les récompenses personnalisées de la chaîne sont listées et vous en
    choisissez une.
+
+   **D'où viennent les trois valeurs.** La configuration ne peut pas les créer pour vous (voir
+   [Ce qui n'est pas prouvé](#7-ce-qui-nest-pas-prouvé)) ; vous les créez une fois, sur le site de
+   Twitch et avec l'outil de Twitch, connecté avec le compte au nom duquel parle le compagnon :
+   1. Ouvrez [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps) et connectez-vous. Twitch
+      vous demande d'abord d'activer l'authentification à deux facteurs si elle est désactivée.
+   2. Choisissez **Register Your Application** : un nom quelconque, OAuth Redirect URL
+      `http://localhost:3000`, catégorie *Chat Bot*, type de client *Confidential*. Enregistrez, puis
+      **Manage**.
+   3. Copiez le **Client ID** dans *client id*. Choisissez **New Secret** et copiez-le tout de suite
+      dans *client secret* : Twitch ne l'affiche qu'une fois.
+   4. Installez la [Twitch CLI](https://dev.twitch.tv/docs/cli/) officielle, lancez `twitch configure`
+      et donnez-lui les mêmes client id et secret, puis lancez
+      `twitch token -u -s "user:read:chat user:write:chat"` (pour *Points de chaîne*, ajoutez
+      `channel:read:redemptions` entre les guillemets ; pour *Silencieux*, `user:read:chat` seul
+      suffit). Une page du navigateur vous demande d'autoriser votre application ; la commande affiche
+      ensuite un **User Access Token** : c'est le *jeton d'accès*. Il doit venir de votre propre
+      application : un jeton fait par un générateur tiers appartient à l'application de ce site, et
+      l'écran le refuse.
+   5. Le jeton expire ; quand Twitch le refuse, refaites l'étape 4 et saisissez le nouveau sur cet
+      écran.
 3. **Le modèle.** Saisissez l'adresse du modèle, son nom et sa clé d'API. Le compagnon envoie une vraie
    requête et ne valide l'écran que si le modèle répond par du texte. Pour *Silencieux*, cet écran est
    marqué *non nécessaire*.
@@ -198,3 +219,9 @@ quinze minutes, sans terminal et sans YAML — ne repose que sur l'essai enregis
 (`docs/campaigns/phase9/trial-record.md`), et ne vaut que pour la plateforme que cet enregistrement
 nomme. L'installation elle-même demande encore un terminal ; cette étape est hors des quinze minutes
 et figure parmi les limites de l'enregistrement.
+
+L'écran 2 est une limite de la configuration telle qu'elle est : il demande un client id, un client
+secret et un jeton d'accès, et rien dans la configuration ne les crée. Un streamer qui n'a jamais
+enregistré d'application Twitch doit suivre les cinq étapes de l'écran 2 — sur le site développeur de
+Twitch et avec l'outil en ligne de commande de Twitch — avant que la configuration puisse continuer.
+Aucune connexion « se connecter avec Twitch » n'existe encore.

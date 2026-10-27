@@ -292,7 +292,11 @@ Le mode conteneur est le même produit sans bureau autour. Ce que cela laisse de
 - **pas de microphone** : `spoken_keyword` ne peut pas vous y entendre (voir
   [Les quatre profils](#7-les-quatre-profils)) ;
 - **pas de paquet natif** : il n'y a ni installateur ni application empaquetée ; l'image est construite
-  depuis le dépôt sur votre hôte et n'est publiée dans aucun registre.
+  depuis le dépôt sur votre hôte et n'est publiée dans aucun registre ;
+- **pas de connexion Twitch** : l'écran 2 de la configuration demande un client id, un client secret et
+  un jeton d'accès qu'il ne peut pas créer pour vous ; le
+  [guide du premier lancement](first-run.fr.md#4-les-cinq-écrans-de-configuration) dit, en cinq
+  étapes, d'où vient chacun.
 
 Les autres limites du projet s'appliquent telles quelles : il n'a jamais tourné sur un vrai stream, et
 ses connexions à Twitch, Kick et YouTube n'ont jamais parlé aux services réels (voir

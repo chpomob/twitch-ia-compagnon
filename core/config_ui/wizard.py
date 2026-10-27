@@ -1549,6 +1549,9 @@ DRY_RUN_INCOMPLETE = "dry_run_incomplete"
 DRY_RUN_UNEXPECTED = "dry_run_unexpected"
 DRY_RUN_TIMED_OUT = "dry_run_timed_out"
 STATE_UNREADABLE = "state_unreadable"
+#: A form posted with a CSRF token that is no longer the session's (P12F4
+#: B6): a stale page, answered with the screen again, never acted on.
+PAGE_EXPIRED = "page_expired"
 
 #: Screen 4's refusal when a profile appeared at the target after the UI
 #: detected the first run (the file is not the wizard's, A7).
@@ -1865,6 +1868,10 @@ _WIZARD_SENTENCES: Mapping[str, Callable[[StringTable, str, Mapping[str, str]], 
         table.sentence(language, "wizard.state_unreadable", path=names["path"]),
         table.sentence(language, "wizard.state_unreadable.next"),
     ),
+    PAGE_EXPIRED: lambda table, language, names: (
+        table.sentence(language, "wizard.page_expired"),
+        table.sentence(language, "wizard.page_expired.next"),
+    ),
 }
 
 
@@ -1940,6 +1947,9 @@ class Wizard:
         self._validations: dict[str, PlatformValidation] = {}
         self._rewards: dict[str, RewardList] = {}
         self._record: Any = None
+        #: The non-secret values of an expired submission, shown in place of
+        #: the recorded ones while :meth:`expired` renders (P12F4 B6).
+        self._draft: dict[str, str] = {}
         self.unreadable = False
         try:
             self.state = WizardState(profile_path)
@@ -2083,6 +2093,38 @@ class Wizard:
                 5: self._submit_dry_run,
             }[screen]
             return self._render(screen, csrf_field, handler(posted))
+
+    def expired(self, fields: Sequence[tuple[str, str]], csrf_field: str) -> WizardPage:
+        """A submission whose CSRF token is no longer the session's (P12F4
+        B6): nothing of it is validated, stored or kept. Its screen — the
+        first open one when it names none or one not open yet — is rendered
+        again (403) with the page-expired notice, a fresh *csrf_field* and the
+        submitted non-secret values in place, so the streamer checks them and
+        sends again. A credential is never echoed: its input stays empty."""
+
+        with self._lock:
+            if self.unreadable:
+                return self._unreadable(csrf_field)
+            posted = {name: text for name, text in fields}
+            screen = self._screen_number(posted.get("screen"))
+            first_open = self._first_open()
+            draft: dict[str, str] = {}
+            if screen is None or screen > first_open:
+                screen = first_open
+            else:
+                draft = {name: text for name, text in posted.items() if not name.startswith(CREDENTIAL_FIELD)}
+            self._draft = draft
+            try:
+                return self._render(screen, csrf_field, self._notice(PAGE_EXPIRED), status=403)
+            finally:
+                self._draft = {}
+
+    def expired_notice(self) -> str:
+        """The page-expired notice's markup, for the pages that are not the
+        wizard's (the console's, the editor's, P12F4 B6)."""
+
+        with self._lock:
+            return self._notice_markup(self._notice(PAGE_EXPIRED))
 
     def set_language(self, language: str) -> bool:
         """Persist *language* in the state file (DD3); ``False`` when it is not
@@ -2576,6 +2618,7 @@ class Wizard:
         )
 
     def _text_input(self, name: str, label: str, value: str) -> str:
+        value = self._draft.get(name, value)
         identifier = self._escape(name.replace(".", "-"))
         return (
             f'<div class="field"><label for="{identifier}">{self._escape(label)}</label> '
@@ -2625,8 +2668,12 @@ class Wizard:
 
     def _choice_screen(self, csrf_field: str, notice: _Notice | None) -> str:
         options = []
+        chosen = self._draft.get("profile", self.state.profile)
+        language = self._draft.get("language", "")
+        if not self.table.offers(language):
+            language = self.language
         for profile in self.profiles:
-            checked = " checked" if profile.id == self.state.profile else ""
+            checked = " checked" if profile.id == chosen else ""
             name = _PROFILE_NAMES.get(profile.name_key)
             description = _PROFILE_NAMES.get(profile.description_key)
             inner = "".join(
@@ -2638,6 +2685,10 @@ class Wizard:
                 for credential in profile.credentials
                 if SCREEN_OF[credential.screen] == 1
             )
+            if not inner:
+                # Nothing of its own on this screen (P12F4 M5): say so where
+                # its inputs would be, so the option does not read as broken.
+                inner = f'<p class="nothing-here">{self._say("wizard.profile.nothing_here")}</p>'
             options.append(
                 f'<fieldset class="profile-option" data-profile="{self._escape(profile.id)}"><legend>'
                 f'<label><input type="radio" name="profile" value="{self._escape(profile.id)}"{checked}> '
@@ -2648,7 +2699,7 @@ class Wizard:
                 f"{inner}</fieldset>"
             )
         languages = "".join(
-            f'<option value="{self._escape(code)}"{" selected" if code == self.language else ""}>'
+            f'<option value="{self._escape(code)}"{" selected" if code == language else ""}>'
             f"{self._escape(display)}</option>"
             for code, display in self.table.languages()
         )
@@ -2678,7 +2729,9 @@ class Wizard:
                 continue
             if rewards is None or not rewards.rewards:
                 continue
-            picked = self.state.parameters.get(parameter.name)
+            picked = self._draft.get(
+                f"{PARAMETER_FIELD}{profile.id}.{parameter.name}", self.state.parameters.get(parameter.name)
+            )
             choices = "".join(
                 f'<label class="reward"><input type="radio" '
                 f'name="{self._escape(f"{PARAMETER_FIELD}{profile.id}.{parameter.name}")}" '
@@ -2786,6 +2839,9 @@ _PLAIN_SENTENCES: Mapping[str, Callable[[StringTable, str], str]] = {
     "wizard.write": lambda table, language: table.sentence(language, "wizard.write"),
     "wizard.view_profile": lambda table, language: table.sentence(language, "wizard.view_profile"),
     "wizard.profile.choose": lambda table, language: table.sentence(language, "wizard.profile.choose"),
+    "wizard.profile.nothing_here": lambda table, language: table.sentence(
+        language, "wizard.profile.nothing_here"
+    ),
     "wizard.dry_run.explain": lambda table, language: table.sentence(language, "wizard.dry_run.explain"),
     "wizard.dry_run.start": lambda table, language: table.sentence(language, "wizard.dry_run.start"),
 }

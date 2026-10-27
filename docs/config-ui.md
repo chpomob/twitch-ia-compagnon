@@ -84,7 +84,13 @@ the UI on that machine.
   `[::1]` with that port; for a wildcard bind those plus each `--allowed-host`).
   A state-changing request (save, remove-override, check, apply) must be a POST
   with the page's CSRF token, and an `Origin` header, when present, must be
-  exactly `http://<accepted authority>`. GET never changes anything.
+  exactly `http://<accepted authority>` — or the literal `null` a browser sends
+  for its own form under a strict referrer policy, accepted only with the
+  session's CSRF token. Pages are served with `Referrer-Policy: same-origin`.
+  A POST whose CSRF token is stale (the page was left open while the session
+  changed) changes nothing and is answered `403` with the same page again, a
+  fresh token and a sentence saying it expired: check it and send it again.
+  GET never changes anything.
 
 At most 16 requests are admitted at once (4 running, the rest waiting for a
 worker), each body at most 1 MiB. A request beyond that is answered

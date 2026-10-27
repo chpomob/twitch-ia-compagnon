@@ -4825,6 +4825,29 @@ def test_ac7_the_choice_screen_offers_four_profiles_in_order(flow, language: str
     ]
 
 
+@pytest.mark.parametrize("language", ["en", "fr"])
+def test_m5_a_profile_with_nothing_on_screen_one_says_so(flow, language: str) -> None:
+    """P12F4 M5: channel points (and silent) have no input of their own on
+    screen 1; their option says so, in place of the inputs, where the
+    others show theirs."""
+
+    run = flow()
+    if language != "en":
+        assert run.post("/language", {"language": language}).status == 303
+    page = _text_of(run.get())
+    option = (
+        r'<fieldset class="profile-option" data-profile="([a-z_]+)">'
+        r'(.*?)</fieldset>(?=<fieldset class="profile-option"|<button)'
+    )
+    options = dict(re.findall(option, page, re.S))
+    sentence = _html.escape(_EN.sentence(language, "wizard.profile.nothing_here"))
+    with_nothing = {pid for pid, markup in options.items() if f'<p class="nothing-here">{sentence}</p>' in markup}
+    assert with_nothing == {"channel_points", "silent"}
+    assert "<input" not in options["channel_points"].split("</legend>", 1)[1]
+    if language == "fr":
+        assert "rien à configurer ici" in _html.unescape(sentence)
+
+
 def test_ac6_french_on_screen_one_renders_the_next_page_in_french_and_survives(flow) -> None:
     """AC6 (choice half, R2, DD3): ``fr`` chosen on screen 1 renders the next
     page with its French sentences, and the choice survives a new ConfigUI

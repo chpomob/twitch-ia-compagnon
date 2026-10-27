@@ -496,9 +496,28 @@ def test_every_response_forbids_caching_referrers_and_framing(config_dir: Path) 
         ui.handle(_request("GET", "/", query={"token": ui.token})),
     ):
         headers = dict(response.headers)
-        assert headers["Referrer-Policy"] == "no-referrer"
+        # same-origin (P12F4 B5): no-referrer made Firefox send Origin: null.
+        assert headers["Referrer-Policy"] == "same-origin"
         assert headers["Cache-Control"] == "no-store"
         assert headers["X-Frame-Options"] == "DENY"
+
+
+def test_m6_the_favicon_answers_204_without_a_session(config_dir: Path) -> None:
+    """P12F4 M6: ``/favicon.ico`` is answered 204 No Content, with or without
+    a session, behind the Host check like every path; it opens no session."""
+
+    ui = _ui(config_dir / "config.yaml")
+    cookie, _csrf = _login(ui)
+    sessions = len(ui._sessions)
+    for method in ("GET", "HEAD"):
+        for headers in ({}, {"cookie": cookie}):
+            response = ui.handle(_request(method, "/favicon.ico", headers=headers))
+            assert (response.status, response.body) == (204, b"")
+            assert not any(name == "Set-Cookie" for name, _ in response.headers)
+            assert dict(response.headers)["Cache-Control"] == "no-store"
+    assert ui.handle(_request("POST", "/favicon.ico", headers={"cookie": cookie})).status == 405
+    assert ui.handle(_request("GET", "/favicon.ico", host="evil.example:8765")).status == 403
+    assert len(ui._sessions) == sessions
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +639,6 @@ def test_ac6_origin_accepted_or_absent(config_dir: Path) -> None:
 @pytest.mark.parametrize(
     "origin",
     [
-        "null",
         "https://127.0.0.1:8765",
         "http://evil.example:8765",
         "http://127.0.0.1:8765/x",
@@ -641,6 +659,154 @@ def test_ac6_refused_origins_get_403_and_change_nothing(
     for path in ("/save", "/remove", "/check", "/apply"):
         assert _post(ui, path, cookie, csrf, origin=origin).status == 403
     assert _snapshot(config_dir) == before
+
+
+def _language_post(ui: ConfigUI, cookie: str, csrf: str, origin: str | None) -> UIResponse:
+    """The operator's Firefox request (P12F4 B5): a form POST of the
+    language, its CSRF token in the body."""
+
+    headers = {"cookie": cookie, "content-type": "application/x-www-form-urlencoded"}
+    if origin is not None:
+        headers["origin"] = origin
+    return ui.handle(_request("POST", "/language", headers=headers, body=f"csrf_token={csrf}&language=fr".encode()))
+
+
+def test_b5_the_null_origin_is_accepted_only_with_a_valid_csrf_token(config_dir: Path) -> None:
+    """P12F4 B5: Firefox serialises a same-origin form POST's origin as the
+    literal ``null``; with the session's token it is answered like the real
+    origin or none, with any other token it is refused and changes nothing."""
+
+    ui = _ui(config_dir / "config.yaml")
+    cookie, csrf = _login(ui)
+    _other_cookie, other_csrf = _login(ui)
+    for origin in ("null", None, "http://127.0.0.1:8765"):
+        response = _language_post(ui, cookie, csrf, origin)
+        assert response.status == 303, origin
+    assert _post(ui, "/save", cookie, csrf, origin="null").status == REACHED_SAVE
+    before = _snapshot(config_dir)
+    for presented in ("", "wrong", csrf[:-1], other_csrf, ui.token):
+        assert _language_post(ui, cookie, presented, "null").status == 403
+        assert _post(ui, "/save", cookie, presented, origin="null").status == 403
+    assert _post(ui, "/save", cookie, None, origin="null").status == 403
+    assert _snapshot(config_dir) == before
+
+
+@pytest.mark.parametrize(
+    "origin", ["http://evil.example", "https://127.0.0.1:8765", "http://127.0.0.1:9999", "Null", "null "]
+)
+def test_b5_a_foreign_origin_stays_refused_with_a_valid_token(origin: str, config_dir: Path) -> None:
+    """P12F4 B5, the case that must never regress: a foreign origin — another
+    host, another scheme, another port, anything but the exact literal
+    ``null`` — is a bare 403 even with the session's own token."""
+
+    ui = _ui(config_dir / "config.yaml")
+    cookie, csrf = _login(ui)
+    before = _snapshot(config_dir)
+    response = _language_post(ui, cookie, csrf, origin)
+    assert (response.status, response.body) == (403, b"403 Forbidden")
+    for path in ("/save", "/remove", "/check", "/apply"):
+        assert _post(ui, path, cookie, csrf, origin=origin).status == 403
+    assert _snapshot(config_dir) == before
+
+
+def _form_post(ui: ConfigUI, path: str, cookie: str, body: str, origin: str | None = "null") -> UIResponse:
+    headers = {"cookie": cookie, "content-type": "application/x-www-form-urlencoded"}
+    if origin is not None:
+        headers["origin"] = origin
+    return ui.handle(_request("POST", path, headers=headers, body=body.encode()))
+
+
+def _wizard_login(ui: ConfigUI) -> tuple[str, str]:
+    """:func:`_login` for a first run, whose access URL lands on the wizard."""
+
+    response = ui.handle(_request("GET", "/", query={"token": ui.token}))
+    assert (response.status, dict(response.headers)["Location"]) == (303, "/wizard")
+    pair = dict(response.headers)["Set-Cookie"].split(";")[0]
+    session = ui._session(_request("GET", "/", headers={"cookie": pair}))
+    assert session is not None
+    return pair, session.csrf_token
+
+
+def _expired_page(response: UIResponse, csrf: str) -> str:
+    """The body of a stale-token answer (P12F4 B6), checked: a 403 page —
+    not the bare refusal — carrying the session's token and the notice."""
+
+    text = response.body.decode("utf-8")
+    assert response.status == 403
+    assert response.content_type.startswith("text/html")
+    assert response.body != b"403 Forbidden"
+    assert 'data-cause="page_expired"' in text
+    assert f'name="csrf_token" value="{csrf}"' in text
+    return text
+
+
+def test_b6_a_stale_wizard_post_is_rendered_again_with_the_sessions_token(tmp_path: Path) -> None:
+    """P12F4 B6: a wizard screen posted with a stale token — with Firefox's
+    null origin or none — is rendered again with the session's token, the
+    page-expired sentence and the submitted values; a credential is never
+    echoed, nothing is written, and sending the page again passes."""
+
+    ui = _ui(tmp_path / "profile.yaml")
+    cookie, csrf = _wizard_login(ui)
+    form = (
+        "screen=1&language=en&profile=chat_qa&parameter.chat_qa.companion_name=Robo"
+        "&credential.TWITCH_CLIENT_ID=not-echoed-q9"
+    )
+    for origin in ("null", None):
+        text = _expired_page(_form_post(ui, "/wizard", cookie, f"csrf_token=stale&{form}", origin), csrf)
+        assert 'data-screen="1"' in text and "stale" not in text
+        assert 'value="Robo"' in text and 'value="chat_qa" checked' in text
+        assert "not-echoed-q9" not in text
+        assert ui.wizard.state.profile is None
+        assert sorted(path.name for path in tmp_path.iterdir()) == []
+    again = _form_post(ui, "/wizard", cookie, f"csrf_token={csrf}&{form}")
+    assert again.status == 200
+    assert 'data-outcome="passed"' in again.body.decode("utf-8")
+    assert ui.wizard.state.profile == "chat_qa"
+
+
+def test_b6_a_stale_language_or_console_post_lands_on_the_page_again(config_dir: Path) -> None:
+    """P12F4 B6: a stale console action or language change starts, stops and
+    changes nothing; the console is rendered again with the notice."""
+
+    ui = _ui(config_dir / "config.yaml")
+    cookie, csrf = _login(ui)
+    before = _snapshot(config_dir)
+    for path in ("/start", "/stop", "/language"):
+        text = _expired_page(_form_post(ui, path, cookie, "csrf_token=stale&language=fr"), csrf)
+        assert 'lang="en"' in text
+    assert ui.child is None
+    assert _snapshot(config_dir) == before
+
+
+@pytest.mark.parametrize("path", ["/save", "/remove", "/check", "/apply"])
+def test_b6_a_stale_editor_post_renders_its_page_again(path: str, config_dir: Path) -> None:
+    """P12F4 B6: an editor form posted with a stale token is answered with
+    the page it names, as it now stands, and the notice; the overlay is
+    unchanged."""
+
+    ui = _ui(config_dir / "config.yaml")
+    cookie, csrf = _login(ui)
+    before = _snapshot(config_dir)
+    core = _expired_page(_form_post(ui, path, cookie, "csrf_token=stale&page=/core"), csrf)
+    assert core.count('data-cause="page_expired"') == 1
+    assert core.split("<body>", 1)[1].startswith('<div class="failure" data-cause="page_expired">')
+    fresh = ui.handle(_request("GET", "/core", headers={"cookie": cookie})).body.decode("utf-8")
+    assert re.findall(r"<h1>.*?</h1>", core) == re.findall(r"<h1>.*?</h1>", fresh)
+    module = _expired_page(_form_post(ui, path, cookie, "csrf_token=stale&page=/module/twitch"), csrf)
+    assert 'data-cause="page_expired"' in module and module != core
+    assert _snapshot(config_dir) == before
+
+
+def test_b6_a_foreign_origin_with_a_stale_token_stays_a_bare_403(tmp_path: Path) -> None:
+    """P12F4 B6: the origin refusal is an attack, not a user — no page, no
+    token, whatever the token."""
+
+    ui = _ui(tmp_path / "profile.yaml")
+    cookie, csrf = _wizard_login(ui)
+    for token in ("stale", csrf):
+        response = _form_post(ui, "/wizard", cookie, f"csrf_token={token}&screen=1", "http://evil.example")
+        assert (response.status, response.body) == (403, b"403 Forbidden")
 
 
 def test_ac6_port_80_is_implicit_in_host_and_origin(config_dir: Path) -> None:

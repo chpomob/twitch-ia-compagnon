@@ -7,7 +7,9 @@ A2), and the access URL lands on the first-run wizard until it is finished. It i
 address unless ``--allow-non-loopback`` is given, every request must carry an
 accepted ``Host`` (A8) and a session derived from the access token printed
 once at startup, and every state-changing request must be a POST with an
-accepted ``Origin`` (when one is sent) and the session's CSRF token.
+accepted ``Origin`` (when one is sent) and the session's CSRF token. The
+literal ``null`` origin a browser sends for a same-origin form under a strict
+referrer policy is accepted only together with a valid CSRF token (P12F4 B5).
 
 The request handling is a pure, synchronous core (:meth:`ConfigUI.handle`
 over the plain :class:`UIRequest`/:class:`UIResponse` dataclasses) so the
@@ -2285,6 +2287,15 @@ def _page(title: str, session: _Session, body: str, *, language: str = "en") -> 
     )
 
 
+def _with_notice(response: UIResponse, notice: str) -> UIResponse:
+    """*response*, a page of :func:`_page`, with *notice* first in its body."""
+
+    body = response.body.replace(b"<body>", b"<body>" + notice.encode("utf-8"), 1)
+    return UIResponse(
+        status=response.status, body=body, content_type=response.content_type, headers=response.headers
+    )
+
+
 def _diagnostics(view: ConfigView) -> str:
     if not view.diagnostics:
         return ""
@@ -3057,6 +3068,10 @@ Handler = Callable[[UIRequest, _Session], UIResponse]
 #: The GET-only, token-authenticated route a second launch probes (R1).
 INSTANCE_ROUTE = "/instance"
 
+#: The icon every browser asks for on each page load (P12F4 M6): answered
+#: 204 No Content, so it fills no console and no access log with 404s.
+FAVICON_ROUTE = "/favicon.ico"
+
 #: Paths whose requests change state: POST only, Origin- and CSRF-checked.
 STATE_CHANGING_PATHS = frozenset(
     {
@@ -3071,6 +3086,10 @@ STATE_CHANGING_PATHS = frozenset(
     }
 )
 
+#: The editor's state-changing paths, each posted from an editor page that
+#: names itself in its ``page`` field (R5, R6).
+EDITOR_WRITE_PATHS = frozenset({"/save", "/remove", "/check", "/apply"})
+
 #: Every discovered module's page lives under this prefix (R4b).
 MODULE_PAGE_PREFIX = "/module/"
 
@@ -3078,12 +3097,22 @@ SESSION_COOKIE = "config_ui_session"
 CSRF_HEADER = "x-csrf-token"
 CSRF_FIELD = "csrf_token"
 
+#: The opaque origin a browser may serialise for a same-origin form POST
+#: (Firefox under a strict referrer policy, P12F4 B5): it names no authority,
+#: so it neither proves nor disproves the request's source. It is accepted
+#: only when the CSRF token validates for the session — the token is the
+#: wall, the origin check the depth.
+NULL_ORIGIN = "null"
+
 #: Bounded session table: the oldest session is dropped past this size.
 MAX_SESSIONS = 32
 
 _SECURITY_HEADERS = (
     ("Cache-Control", "no-store"),
-    ("Referrer-Policy", "no-referrer"),
+    # same-origin, not no-referrer (P12F4 B5): no referrer — so neither the
+    # access URL nor its token — ever reaches another host, while a browser
+    # keeps sending this UI its own origin on a form POST.
+    ("Referrer-Policy", "same-origin"),
     ("X-Content-Type-Options", "nosniff"),
     ("X-Frame-Options", "DENY"),
 )
@@ -3466,6 +3495,11 @@ class ConfigUI:
             if presented is None or not _equal(presented, self.token):
                 return _text(401, _UNAUTHORIZED)
             return handler(request, None)
+        if request.path == FAVICON_ROUTE:
+            # No session needed: the answer is empty, the same for everyone.
+            if method not in {"GET", "HEAD"}:
+                return _text(405, "405 Method Not Allowed", (("Allow", "GET, HEAD"),))
+            return UIResponse(status=204)
         if method == "GET" and request.path == "/" and "token" in request.query:
             if not _equal(request.query["token"], self.token):
                 return _text(401, _UNAUTHORIZED)
@@ -3487,11 +3521,18 @@ class ConfigUI:
             return _text(405, "405 Method Not Allowed", (("Allow", "POST"),))
         if method == "POST":
             origin = request.headers.get("origin")
-            if origin is not None and _origin_authority(origin) not in self.authorities:
+            if (
+                origin is not None
+                and origin != NULL_ORIGIN
+                and _origin_authority(origin) not in self.authorities
+            ):
                 return _text(403, _FORBIDDEN)
             presented = self._csrf(request)
             if presented is None or not _equal(presented, session.csrf_token):
-                return _text(403, _FORBIDDEN)
+                try:
+                    return self._expired(request, session)
+                except LanguageUnavailable as refused:
+                    return _text(503, refused.cause)
         route = self.routes.get(request.path)
         if route is None and request.path.startswith(MODULE_PAGE_PREFIX):
             route = self.routes.get(MODULE_PAGE_PREFIX)
@@ -3509,6 +3550,34 @@ class ConfigUI:
             # The session's language no longer validates: refuse with the
             # plain cause, never render another language (P19F3).
             return _text(503, refused.cause)
+
+    def _expired(self, request: UIRequest, session: _Session) -> UIResponse:
+        """A POST from an accepted origin whose CSRF token is not the
+        session's (P12F4 B6): a stale page — the session changed under it —
+        is a user to bring back, not an attack (a foreign origin is a bare
+        403 before this, and the ``SameSite=Strict`` cookie never rides a
+        cross-site request). Nothing of it is acted on: the screen it was
+        posted from is rendered again, as a 403, with the session's current
+        token and the page-expired sentence — the wizard with the submitted
+        non-secret values in place, an editor page as it now stands, else the
+        landing page. That page is what a GET of it already serves, less the
+        console's feed, which its poll fills."""
+
+        fields = _form_fields(request)
+        if request.path in EDITOR_WRITE_PATHS:
+            view = self.view()
+            page = self._posted_page(fields, view)
+            route = self.routes.get(page) or self.routes[MODULE_PAGE_PREFIX]
+            again = UIRequest(method="GET", path=page, query={}, headers=request.headers, body=b"")
+            response = _with_notice(route[1](again, session), self.wizard.expired_notice())
+        elif self._wizard_open():
+            posted = fields if request.path == WIZARD_ROUTE else []
+            response = self._wizard_response(self.wizard.expired(posted, _csrf_field(session)), session)
+        else:
+            response = _with_notice(
+                self._console_response(session, with_feed=False), self.wizard.expired_notice()
+            )
+        return UIResponse(status=403, body=response.body, content_type=response.content_type)
 
     def _instance_endpoint(self, request: UIRequest, session: _Session | None) -> UIResponse:
         """``/instance`` (R1): the instance marker and the product version,
@@ -3637,13 +3706,16 @@ class ConfigUI:
         return self._console_response(session)
 
     def _console_response(
-        self, session: _Session, outcome: console.RuntimeOutcome | None = None
+        self, session: _Session, outcome: console.RuntimeOutcome | None = None, *, with_feed: bool = True
     ) -> UIResponse:
-        """The console page, with *outcome* (a Start, Stop or Revoke report) first."""
+        """The console page, with *outcome* (a Start, Stop or Revoke report)
+        first. Without *with_feed* the feed is not read: the page starts with
+        none and its own poll of ``/feed`` fills it, so a refused request
+        reads nothing (AC4, P12F4 B6)."""
 
         view = self.view()
         running = self.running_state()
-        feed = console.read_feed(self.settings.feed_path)
+        feed = console.read_feed(self.settings.feed_path) if with_feed else []
         record = running.live_record
         health = console.module_health(
             view.enabled_modules(), None if record is None else record.modules, feed

@@ -128,6 +128,24 @@ resumes the setup.
    valid, belong to that application and carry the permissions the profile needs. The screen then
    shows the channel the token names; you never type numeric identifiers. For *Channel points*, the
    channel's custom rewards are listed and you pick one.
+
+   **Where the three values come from.** The setup cannot make them for you (see
+   [What is not proven](#7-what-is-not-proven)); you make them once, on Twitch's own site and with
+   Twitch's own tool, logged in as the account the companion speaks as:
+   1. Open [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps) and log in. Twitch asks
+      you to turn on two-factor authentication first if it is off.
+   2. Choose **Register Your Application**: any name, OAuth Redirect URL `http://localhost:3000`,
+      category *Chat Bot*, client type *Confidential*. Save, then **Manage**.
+   3. Copy the **Client ID** into *client id*. Choose **New Secret** and copy it into *client secret*
+      at once: Twitch shows it only once.
+   4. Install the official [Twitch CLI](https://dev.twitch.tv/docs/cli/), run `twitch configure` and
+      give it the same client id and secret, then run `twitch token -u -s "user:read:chat user:write:chat"`
+      (for *Channel points* add `channel:read:redemptions` inside the quotes; for *Silent*
+      `user:read:chat` alone is enough). A browser page asks you to authorise your application; the
+      command then prints a **User Access Token**: that is the *access token*. It must come from your
+      own application: a token made by a third-party generator belongs to that site's application,
+      and the screen refuses it.
+   5. The token expires; when Twitch refuses it, repeat step 4 and enter the new one on this screen.
 3. **The model.** Enter the model's address, its name and its API key. The companion sends one real
    request and passes the screen only when the model answers with text. For *Silent*, this screen is
    marked *not needed*.
@@ -182,3 +200,8 @@ The fifteen-minute claim — from a working install to a first run in under fift
 terminal and without YAML — rests only on the recorded trial (`docs/campaigns/phase9/trial-record.md`),
 and holds only for the platform that record names. The install itself still needs a terminal; that
 step is outside the fifteen minutes and is listed among the record's limits.
+
+Screen 2 is a limit of the setup as it stands: it asks for a client id, a client secret and an access
+token, and nothing in the setup makes them. A streamer who has never registered a Twitch application
+has to follow the five steps under screen 2 — on Twitch's developer site and with Twitch's command-line
+tool — before the setup can go on. No sign-in-with-Twitch flow exists yet.

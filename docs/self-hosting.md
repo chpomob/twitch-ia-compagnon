@@ -279,7 +279,10 @@ Container mode is the same product without a desktop around it. What that leaves
 - **no launcher**: `--install-launcher` writes a desktop launcher, which has no meaning in a container;
 - **no microphone**: `spoken_keyword` cannot hear you there (see [The four profiles](#7-the-four-profiles));
 - **no native bundle**: there is no installer and no packaged application; the image is built from the
-  repository on your host and is not published in any registry.
+  repository on your host and is not published in any registry;
+- **no Twitch sign-in**: the setup's screen 2 asks for a client id, a client secret and an access
+  token that it cannot make for you; the [first-run guide](first-run.md#4-the-five-setup-screens)
+  says, in five steps, where each comes from.
 
 The rest of the project's limits apply unchanged: it has never run on a real stream, and its
 connections to Twitch, Kick and YouTube have never talked to the live services (see
