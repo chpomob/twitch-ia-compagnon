@@ -502,22 +502,51 @@ def test_every_response_forbids_caching_referrers_and_framing(config_dir: Path) 
         assert headers["X-Frame-Options"] == "DENY"
 
 
-def test_m6_the_favicon_answers_204_without_a_session(config_dir: Path) -> None:
-    """P12F4 M6: ``/favicon.ico`` is answered 204 No Content, with or without
-    a session, behind the Host check like every path; it opens no session."""
+def test_m6_the_favicon_answers_204_to_a_session(config_dir: Path) -> None:
+    """P12F4 M6, P12F5 F2: ``/favicon.ico`` is answered 204 No Content to a
+    session — the browser sends its cookie with the icon request — and the
+    ordinary 401 without one (R1), behind the Host check like every path; it
+    opens no session."""
 
     ui = _ui(config_dir / "config.yaml")
     cookie, _csrf = _login(ui)
     sessions = len(ui._sessions)
     for method in ("GET", "HEAD"):
-        for headers in ({}, {"cookie": cookie}):
+        response = ui.handle(_request(method, "/favicon.ico", headers={"cookie": cookie}))
+        assert (response.status, response.body) == (204, b"")
+        assert not any(name == "Set-Cookie" for name, _ in response.headers)
+        assert dict(response.headers)["Cache-Control"] == "no-store"
+        for headers in ({}, {"cookie": "config_ui_session=forged"}):
             response = ui.handle(_request(method, "/favicon.ico", headers=headers))
-            assert (response.status, response.body) == (204, b"")
+            assert (response.status, response.body) == (401, config_ui._UNAUTHORIZED.encode())
             assert not any(name == "Set-Cookie" for name, _ in response.headers)
-            assert dict(response.headers)["Cache-Control"] == "no-store"
     assert ui.handle(_request("POST", "/favicon.ico", headers={"cookie": cookie})).status == 405
+    assert ui.handle(_request("POST", "/favicon.ico")).status == 401
     assert ui.handle(_request("GET", "/favicon.ico", host="evil.example:8765")).status == 403
     assert len(ui._sessions) == sessions
+
+
+def test_f2_instance_is_the_only_session_free_route(config_dir: Path) -> None:
+    """P12F5 F2 (R1): without a session, every route of the table and the
+    favicon answer 401 — the access token in the query included — but
+    ``/instance``, which the token alone opens; ``/`` with the token is the
+    access URL, which opens a session rather than answering without one."""
+
+    ui = _ui(config_dir / "config.yaml")
+    paths = {
+        route + "twitch" if route == config_ui.MODULE_PAGE_PREFIX else route for route in ui.routes
+    } | {config_ui.FAVICON_ROUTE}
+    session_free: set[str] = set()
+    for path in sorted(paths):
+        for method in ("GET", "HEAD", "POST"):
+            for query in ({}, {"token": ui.token}):
+                if path == "/" and method == "GET" and query:
+                    continue
+                if ui.handle(_request(method, path, query=query)).status != 401:
+                    session_free.add(path)
+    assert session_free == {config_ui.INSTANCE_ROUTE}
+    assert ui.handle(_request("GET", config_ui.INSTANCE_ROUTE, query={"token": ui.token})).status == 200
+    assert len(ui._sessions) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +825,139 @@ def test_b6_a_stale_editor_post_renders_its_page_again(path: str, config_dir: Pa
     module = _expired_page(_form_post(ui, path, cookie, "csrf_token=stale&page=/module/twitch"), csrf)
     assert 'data-cause="page_expired"' in module and module != core
     assert _snapshot(config_dir) == before
+
+
+def test_f1_a_stale_editor_post_keeps_the_values_typed(config_dir: Path) -> None:
+    """P12F5 F1: an editor form posted with a stale token is rendered again
+    from what was submitted, with the session's token — a non-secret value
+    typed on the screen is still in its control; a credential typed there
+    stays blank, as the ordinary render draws it, and nothing is written."""
+
+    (config_dir / "config.yaml").write_text(f"modules_directory: builtin\n{BASE_TEXT}", encoding="utf-8")
+    ui = _ui(config_dir / "config.yaml")
+    cookie, csrf = _login(ui)
+    before = _snapshot(config_dir)
+    layout = _form_layout(ui, cookie, "/core")
+    core = _expired_page(
+        _form_post(
+            ui, "/save", cookie, f"csrf_token=stale&page=/core&layout={layout}&modules_directory=typed-dir-f1"
+        ),
+        csrf,
+    )
+    assert 'name="modules_directory" value="typed-dir-f1"' in core
+    assert 'name="csrf_token" value="stale"' not in core
+    form = (
+        f"csrf_token=stale&page=/module/twitch&layout={layout}&modules.twitch.companion_name=typed-name-f1"
+        "&%40op%3Amodules.twitch.companion_name=set&modules.twitch.client_secret=not-echoed-f1"
+    )
+    module = _expired_page(_form_post(ui, "/save", cookie, form), csrf)
+    assert 'name="modules.twitch.companion_name" value="typed-name-f1"' in module
+    operation = r'name="@op:modules.twitch.companion_name"[^>]*><option value="unchanged">[^<]*</option>'
+    assert re.search(operation + '<option value="set" selected>', module)
+    assert "not-echoed-f1" not in module
+    assert 'name="modules.twitch.client_secret" value=""' in module
+    assert _snapshot(config_dir) == before
+
+
+def _stale_tmod_ui(tmp_path: Path, first: str, second: str) -> ConfigUI:
+    """A UI over trigger module ``tmod`` with channel policies *first* then
+    *second* in its base file (see :func:`_write_tmod_base`)."""
+
+    _write_manifest(tmp_path / "mods", "tmod", TRIGGER_MANIFEST)
+    _write_tmod_base(tmp_path, first, second)
+    return _ui(tmp_path / "config.yaml", "--status-file", str(tmp_path / "status.json"))
+
+
+def _write_tmod_base(tmp_path: Path, first: str, second: str) -> None:
+    rules = "        combination: any_of\n        rules: [{type: odds, parameters: {odds: 0.5}}]\n"
+    (tmp_path / "config.yaml").write_text(
+        "modules_directory: ./mods\nenabled_modules: [tmod]\nmodules:\n  tmod: {}\n"
+        f"triggers:\n  tmod:\n    channels:\n      {first}:\n{rules}      {second}:\n{rules}",
+        encoding="utf-8",
+    )
+
+
+def test_f1_a_stale_post_over_another_key_order_puts_no_positional_value_back(tmp_path: Path) -> None:
+    """P12F5 review A1: the recovery put a posted positional value back by
+    name without looking at the layout it was rendered from. Reordered on
+    disk, ``@0`` is another channel: the value typed for the first would be
+    shown — and saved by the fresh guard fields — on the other. It is put
+    back only when the posted layout is the current one."""
+
+    from urllib.parse import urlencode
+
+    ui = _stale_tmod_ui(tmp_path, "chan-a", "chan-b")
+    cookie, csrf = _login(ui)
+    page = "/module/tmod"
+    layout = _form_layout(ui, cookie, page)
+    field = "triggers.tmod.channels.@0.combination"
+    selected = rf'name="{re.escape(field)}"[^>]*>(?:<option[^>]*>[^<]*</option>)*?<option value="all_of" selected>'
+    form = [("csrf_token", "stale"), ("page", page), ("layout", layout), (field, "all_of")]
+    same = _expired_page(_form_post(ui, "/save", cookie, urlencode(form)), csrf)
+    assert re.search(selected, same)
+    _write_tmod_base(tmp_path, "chan-b", "chan-a")
+    before = _snapshot(tmp_path)
+    moved = _expired_page(_form_post(ui, "/save", cookie, urlencode(form)), csrf)
+    assert not re.search(selected, moved)
+    assert _snapshot(tmp_path) == before
+
+
+def test_f1_a_stale_add_channel_post_keeps_the_channel_typed(tmp_path: Path) -> None:
+    """P12F5 review A3: the add-channel input is rendered without a value
+    attribute, and the recovery only replaced an existing one — the channel
+    typed was dropped while its parameters were kept."""
+
+    from urllib.parse import urlencode
+
+    ui = _stale_tmod_ui(tmp_path, "chan-a", "chan-b")
+    cookie, csrf = _login(ui)
+    page = "/module/tmod"
+    form = [
+        ("csrf_token", "stale"), ("page", page), ("layout", _form_layout(ui, cookie, page)),
+        ("channel", "typed-chan-a3"), ("parameters", '{"odds": 0.25}'),
+    ]
+    recovered = _expired_page(_form_post(ui, "/save", cookie, urlencode(form)), csrf)
+    assert '<input type="text" name="channel" value="typed-chan-a3">' in recovered
+    assert '"odds": 0.25' in _html.unescape(recovered)
+
+
+def test_f1_a_stale_patch_post_keeps_its_entries_under_the_fresh_names(tmp_path: Path) -> None:
+    """P12F5 review A2: a patch control's name carries its render's tag, so
+    no posted patch name was ever found on the fresh page and an edited
+    entry, or an item appended, beside a withheld sibling was lost. Each is
+    put back in the control the fresh render drew for the same place; the
+    withheld sibling's replacement stays empty and its operation
+    ``unchanged`` (a ``set`` beside an empty text would set it empty); the
+    recovered page, posted again, saves exactly what was typed."""
+
+    from urllib.parse import urlencode
+
+    ui = _n3_ui(tmp_path, "voice-secret-a2", ["kept", "voice-secret-a2"])
+    cookie, csrf = _login(ui)
+    page = f"{MODULE_PAGE_PREFIX}audio_output"
+    editor = _allowed_editor(ui, cookie)
+    changes = {
+        editor["entries"][0]["controls"][config_ui.PATCH_VALUE]: '"edited-a2"',
+        editor["controls"][config_ui.PATCH_ITEM]: '"new-a2"',
+        **_replaced(editor["entries"][1], "typed-secret-a2"),
+    }
+    form = [
+        ("csrf_token", "stale"), ("page", page), ("layout", _form_layout(ui, cookie, page)),
+        *_submitted(editor, changes),
+    ]
+    before = _snapshot(tmp_path)
+    recovered = _expired_page(_form_post(ui, "/save", cookie, urlencode(form)), csrf)
+    assert _snapshot(tmp_path) == before
+    assert "typed-secret-a2" not in recovered
+    fresh = _patch_editor(recovered, "voices.allowed")
+    assert fresh["controls"][config_ui.PATCH_ITEM] != editor["controls"][config_ui.PATCH_ITEM]
+    assert fresh["entries"][0]["values"][config_ui.PATCH_VALUE] == '"edited-a2"'
+    assert fresh["values"][config_ui.PATCH_ITEM] == '"new-a2"'
+    assert fresh["entries"][1]["values"][config_ui.PATCH_VALUE] == ""
+    assert fresh["entries"][1]["values"][config_ui.PATCH_OPERATION] == config_ui.OPERATION_UNCHANGED
+    saved = _write(ui, cookie, "/save", page, _browser(fresh))
+    assert saved.status == 303, _written(saved)
+    assert _saved_allowed(tmp_path) == ["edited-a2", "voice-secret-a2", "new-a2"]
 
 
 def test_b6_a_foreign_origin_with_a_stale_token_stays_a_bare_403(tmp_path: Path) -> None:

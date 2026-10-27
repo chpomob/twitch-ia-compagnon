@@ -2296,6 +2296,137 @@ def _with_notice(response: UIResponse, notice: str) -> UIResponse:
     )
 
 
+_INPUT_TAG = re.compile(r"<input\b[^>]*>")
+_TEXTAREA_TAG = re.compile(r"(<textarea\b[^>]*>)(.*?)(</textarea>)", re.DOTALL)
+_SELECT_TAG = re.compile(r"(<select\b[^>]*>)(.*?)(</select>)", re.DOTALL)
+_OPTION_TAG = re.compile(r'<option value="([^"]*)"( selected)?>')
+_NAME_ATTRIBUTE = re.compile(r'\bname="([^"]*)"')
+_VALUE_ATTRIBUTE = re.compile(r'\bvalue="[^"]*"')
+_TYPE_ATTRIBUTE = re.compile(r'\btype="([^"]*)"')
+
+
+def _credential_names(view: ConfigView) -> frozenset[str]:
+    """The field name of every declared credential path of *view*."""
+
+    names: set[str] = set()
+    for name, module in view.modules.items():
+        for credential in module.declaration.credentials if module.declaration is not None else ():
+            names.add(_field_name((MODULES_KEY, name, *credential), view))
+    return frozenset(names)
+
+
+def _with_posted(
+    response: UIResponse, fields: Sequence[tuple[str, str]], credentials: frozenset[str]
+) -> UIResponse:
+    """*response*, an editor page of :func:`_page`, with the values of
+    *fields* put back in the controls of the same name (P12F5 F1): a stale
+    page is rendered again with what the user typed, not the overlay.
+
+    Only text and number inputs, text areas and selects are filled, so the
+    hidden guard fields keep the fresh render's token, page and fingerprint.
+    A control stays as the render drew it when it stands for a secret: a
+    declared credential (or a value holding one, named by a prefix of its
+    path), a withheld or hidden value, or a posted text the redaction would
+    change — exactly what the ordinary render never places in a page (R8).
+    A select keeps its selection unless the posted value is one of its own
+    options; an explicit operation is put back only beside the control it
+    applies to, once that control was itself put back (review A2): a ``set``
+    beside a withheld replacement left empty would set the empty text. An
+    input rendered with no value attribute gets one (review A3).
+    """
+
+    posted = dict(fields)
+    hidden = html.escape(HIDDEN_LITERAL, quote=True)
+    restored: set[str] = set()
+
+    def restorable(tag: str, shown: str) -> str | None:
+        found = _NAME_ATTRIBUTE.search(tag)
+        if found is None:
+            return None
+        name = html.unescape(found.group(1))
+        value = posted.get(name)
+        if value is None or 'data-withheld="true"' in tag or hidden in tag or hidden in shown:
+            return None
+        if any(item == name or item.startswith(f"{name}.") for item in credentials):
+            return None
+        if _guarded(value) != value or HIDDEN_LITERAL in value:
+            return None
+        restored.add(name)
+        return value
+
+    def input_tag(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        kind = _TYPE_ATTRIBUTE.search(tag)
+        if kind is None or kind.group(1) not in {"text", "number"}:
+            return tag
+        value = restorable(tag, "")
+        if value is None:
+            return tag
+        attribute = f'value="{html.escape(value, quote=True)}"'
+        if _VALUE_ATTRIBUTE.search(tag) is None:
+            return f"{tag[:-1]} {attribute}>"
+        return _VALUE_ATTRIBUTE.sub(lambda _: attribute, tag, count=1)
+
+    def textarea_tag(match: re.Match[str]) -> str:
+        value = restorable(match.group(1), match.group(2))
+        if value is None:
+            return match.group(0)
+        return f"{match.group(1)}{html.escape(value, quote=True)}{match.group(3)}"
+
+    def select_tag(match: re.Match[str]) -> str:
+        found = _NAME_ATTRIBUTE.search(match.group(1))
+        companion = _operation_target(html.unescape(found.group(1))) if found is not None else None
+        if companion is not None and companion not in restored:
+            return match.group(0)
+        value = restorable(match.group(1), match.group(2))
+        if value is None:
+            return match.group(0)
+        options = match.group(2)
+        wanted = html.escape(value, quote=True)
+        if all(option != wanted for option, _ in _OPTION_TAG.findall(options)):
+            return match.group(0)
+        options = _OPTION_TAG.sub(
+            lambda option: f'<option value="{option.group(1)}"'
+            f'{" selected" if option.group(1) == wanted else ""}>',
+            options,
+        )
+        return f"{match.group(1)}{options}{match.group(3)}"
+
+    text = response.body.decode("utf-8")
+    text = _INPUT_TAG.sub(input_tag, text)
+    text = _TEXTAREA_TAG.sub(textarea_tag, text)
+    text = _SELECT_TAG.sub(select_tag, text)
+    return UIResponse(
+        status=response.status,
+        body=text.encode("utf-8"),
+        content_type=response.content_type,
+        headers=response.headers,
+    )
+
+
+def _operation_target(name: str) -> str | None:
+    """The control the explicit operation *name* applies to: ``<name>`` of
+    ``@op:<name>``, the value control of a patch operation; ``None`` for a
+    field that is no operation."""
+
+    if name.startswith(OPERATION_FIELD_PREFIX):
+        return name[len(OPERATION_FIELD_PREFIX) :]
+    operation = f"{PATCH_FIELD_PREFIX}{PATCH_OPERATION}-"
+    if name.startswith(operation):
+        return f"{PATCH_FIELD_PREFIX}{PATCH_VALUE}-{name[len(operation) :]}"
+    return None
+
+
+def _patch_place(control: _PatchControl) -> str:
+    """The place a patch control edits, the same in every render: its page,
+    setting, entry and operation (review A2)."""
+
+    return json.dumps(
+        [control.page, _tagged(control.top), _tagged(control.relative), control.operation],
+        ensure_ascii=False,
+    )
+
+
 def _diagnostics(view: ConfigView) -> str:
     if not view.diagnostics:
         return ""
@@ -3069,7 +3200,8 @@ Handler = Callable[[UIRequest, _Session], UIResponse]
 INSTANCE_ROUTE = "/instance"
 
 #: The icon every browser asks for on each page load (P12F4 M6): answered
-#: 204 No Content, so it fills no console and no access log with 404s.
+#: 204 No Content to a session, so it fills no console and no access log
+#: with 404s; without one it is the ordinary 401 (P12F5 F2).
 FAVICON_ROUTE = "/favicon.ico"
 
 #: Paths whose requests change state: POST only, Origin- and CSRF-checked.
@@ -3495,11 +3627,6 @@ class ConfigUI:
             if presented is None or not _equal(presented, self.token):
                 return _text(401, _UNAUTHORIZED)
             return handler(request, None)
-        if request.path == FAVICON_ROUTE:
-            # No session needed: the answer is empty, the same for everyone.
-            if method not in {"GET", "HEAD"}:
-                return _text(405, "405 Method Not Allowed", (("Allow", "GET, HEAD"),))
-            return UIResponse(status=204)
         if method == "GET" and request.path == "/" and "token" in request.query:
             if not _equal(request.query["token"], self.token):
                 return _text(401, _UNAUTHORIZED)
@@ -3517,6 +3644,12 @@ class ConfigUI:
         session = self._session(request)
         if session is None:
             return _text(401, _UNAUTHORIZED)
+        if request.path == FAVICON_ROUTE:
+            # Behind the session like every route but /instance (R1, P12F5
+            # F2): the browser sends its cookie with the icon request.
+            if method not in {"GET", "HEAD"}:
+                return _text(405, "405 Method Not Allowed", (("Allow", "GET, HEAD"),))
+            return UIResponse(status=204)
         if request.path in STATE_CHANGING_PATHS and method != "POST":
             return _text(405, "405 Method Not Allowed", (("Allow", "POST"),))
         if method == "POST":
@@ -3559,9 +3692,10 @@ class ConfigUI:
         cross-site request). Nothing of it is acted on: the screen it was
         posted from is rendered again, as a 403, with the session's current
         token and the page-expired sentence — the wizard with the submitted
-        non-secret values in place, an editor page as it now stands, else the
-        landing page. That page is what a GET of it already serves, less the
-        console's feed, which its poll fills."""
+        non-secret values in place, an editor page with the submitted values
+        put back in its controls (P12F5 F1, see :func:`_with_posted`), else
+        the landing page. That page is what a GET of it already serves, less
+        the console's feed, which its poll fills."""
 
         fields = _form_fields(request)
         if request.path in EDITOR_WRITE_PATHS:
@@ -3569,7 +3703,10 @@ class ConfigUI:
             page = self._posted_page(fields, view)
             route = self.routes.get(page) or self.routes[MODULE_PAGE_PREFIX]
             again = UIRequest(method="GET", path=page, query={}, headers=request.headers, body=b"")
-            response = _with_notice(route[1](again, session), self.wizard.expired_notice())
+            response = route[1](again, session)
+            restored = self._recovered_fields(fields, view, session, page)
+            response = _with_posted(response, restored, _credential_names(view))
+            response = _with_notice(response, self.wizard.expired_notice())
         elif self._wizard_open():
             posted = fields if request.path == WIZARD_ROUTE else []
             response = self._wizard_response(self.wizard.expired(posted, _csrf_field(session)), session)
@@ -3578,6 +3715,46 @@ class ConfigUI:
                 self._console_response(session, with_feed=False), self.wizard.expired_notice()
             )
         return UIResponse(status=403, body=response.body, content_type=response.content_type)
+
+    def _recovered_fields(
+        self, fields: Sequence[tuple[str, str]], view: ConfigView, session: _Session, page: str
+    ) -> list[tuple[str, str]]:
+        """The posted *fields* a stale editor post's recovery page puts back,
+        under the names of the render *session* now shows for *page*.
+
+        A positional name means the key at its position only in the layout
+        it was rendered from, so ordinary fields are kept only when the
+        posted layout is the current one (review A1): put back over another
+        key order, a value would land on another key, and the fresh guard
+        fields would let it be saved there. A patch control's name carries
+        its render's tag, so it is renamed to the control the fresh render
+        drew for the same place (review A2); the place is read back by
+        rendering the posted tag again over the current configuration, so
+        an identity forged, of another UI, or of an entry changed since
+        matches nothing and is dropped."""
+
+        current_layout = _stale_layout(fields, view) is None
+        renamed: dict[str, str] = {}
+        tags = {_render_tag(name) for name, _text in fields} - {None}
+        with self._sessions_lock:
+            current = session.renders.get(page)
+        if current is not None and len(tags) == 1:
+            fresh = {
+                _patch_place(control): name
+                for name, control in self._controls(view, current).patches.items()
+                if control.page == page
+            }
+            for name, control in self._controls(view, tags.pop()).patches.items():
+                target = fresh.get(_patch_place(control)) if control.page == page else None
+                if target is not None:
+                    renamed[name] = target
+        kept: list[tuple[str, str]] = []
+        for name, text in fields:
+            if name in renamed:
+                kept.append((renamed[name], text))
+            elif current_layout and not name.startswith(PATCH_FIELD_PREFIX):
+                kept.append((name, text))
+        return kept
 
     def _instance_endpoint(self, request: UIRequest, session: _Session | None) -> UIResponse:
         """``/instance`` (R1): the instance marker and the product version,
