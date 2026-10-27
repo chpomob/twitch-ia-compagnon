@@ -35,3 +35,38 @@ Never paste a token, a key, a password or the credential file's contents here.
   - the wizard was driven by the trial's proof code inside the container, not by a person in a browser; AC15's run from a directory holding only `compose.yaml`, with at most 3 typed commands and real credentials, remains the operator's to perform and record
   - the image was built from the local checkout (`TWITCH_IA_COMPAGNON_BUILD_CONTEXT=.`), not from the Git URL default, which builds `main` as pushed
   - one host, one architecture (x86_64); no microphone, so the spoken-keyword profile was proven by its check and dry run only (A7)
+
+## The operator's own trial (AC15) — what happened, and where it stopped
+
+This section is the operator's session, transcribed as it happened. It does not claim a completed first run.
+
+- Who: the operator (the repository's owner), at the keyboard of the machine above, browser **Firefox 158**
+  (the machine's default), private window, fresh session, container started from an empty named volume.
+- Date: 2026-10-27, between 09:0xZ and 10:2xZ.
+
+What he did, and what he saw:
+
+1. Opened the access URL printed at start. The token had to be appended by hand (`?token=…`); the URL line
+   alone answers `401 Unauthorized: open the access URL printed when the UI started`.
+2. Screen 1 rendered. Choosing a profile works as a single choice among four (by design).
+3. Clicking "Change the language" — and "next screen" — answered **`403 Forbidden`** every time, in a fresh
+   private session. Reproduced on the running container with his own request: `Origin: null` → 403, no
+   `Origin` → 303, a real origin → 303. Cause: the UI sent `Referrer-Policy: no-referrer`, and Firefox
+   serialises a same-origin form POST's origin as the literal `null` under that policy, which the guard
+   refused as foreign. **The UI was unusable in Firefox**; Chrome and curl were not affected.
+4. The `channel_points` profile showed a screen 1 with nothing on it and no explanation.
+5. Every page load asked for `/favicon.ico` and got a 404.
+6. Screen 2 asks for `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `TWITCH_ACCESS_TOKEN` and the numeric channel
+   id. **The operator has no Twitch application and did not create one**, so the five screens were **not**
+   completed by a human, no dry run was recorded from his session, and the console's restart view was not
+   exercised by him either.
+
+Defects 3–5 were fixed in P12F4 and P12F5 (policy `same-origin`; `null` accepted only with a valid CSRF token;
+a stale page re-renders with a fresh token **and keeps the values typed**; the empty profile screen explains
+itself; the favicon answers 204 behind the session check). Each carries a regression test built from the
+operator's own request.
+
+**What this trial establishes, and what it does not.** It establishes that a real person, in a real browser,
+reached the wizard and that the wizard was broken there in a way no test had caught — which is exactly what
+AC15 exists to find. It does **not** establish a completed first run: the Twitch wall stopped it, and the
+record says so rather than borrowing the automated walk-through's result.
